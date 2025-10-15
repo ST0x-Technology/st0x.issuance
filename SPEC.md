@@ -71,6 +71,52 @@ settlement layer between Authorized Participants (APs) and us.
 - On-chain address where APs send tokens to redeem
 - We monitor this address for incoming transfers
 
+### ES/CQRS Architecture
+
+The issuance bot uses **Event Sourcing (ES)** and **Command Query Responsibility
+Segregation (CQRS)** patterns to maintain a complete audit trail, enable
+time-travel debugging, and provide a single source of truth for all operations.
+
+**Core Concepts:**
+
+- **Aggregates**: Business entities that encapsulate state and business logic
+  (e.g., `Mint`, `Redemption`, `AccountLink`, `TokenizedAsset`)
+- **Commands**: Requests to perform actions, representing user or system intent
+  (e.g., `InitiateMint`, `ConfirmJournal`)
+- **Events**: Immutable facts about what happened, always in past tense (e.g.,
+  `MintInitiated`, `JournalConfirmed`)
+- **Event Store**: Single source of truth - an append-only log of all domain
+  events stored in SQLite
+- **Views**: Read-optimized projections built from events for efficient querying
+- **Services**: External dependencies that aggregates use (Alpaca API client,
+  blockchain client, monitoring service)
+
+**Key Flow:**
+
+**Critical Methods:**
+
+- `handle(command) -> Result<Vec<Event>, Error>`: Business logic lives here.
+  Validates the command against current aggregate state and returns a list of
+  events (can be 0+ events). For example, `ConfirmJournal` might produce both
+  `JournalConfirmed` and `MintingStarted` events.
+- `apply(event)`: Deterministically updates aggregate state from events. This
+  method is pure and should never fail - events are historical facts that have
+  already occurred.
+
+**Benefits:**
+
+- **Complete Audit Trail**: Every state change is captured as an immutable event
+- **Time Travel Debugging**: Replay events to reconstruct system state at any
+  point in history
+- **Testability**: Business logic tested via Given-When-Then pattern (given
+  events, when command, then expect events)
+- **Rebuild Views**: If a view becomes corrupted or a new projection is needed,
+  simply replay all events
+- **Multiple Projections**: Same events can feed different views (operational
+  dashboard, analytics, Grafana metrics)
+- **Single Source of Truth**: Event store is authoritative; all other data is
+  derived
+
 ## Data Types
 
 Throughout this specification, we use newtypes to provide type safety and
@@ -90,6 +136,208 @@ struct Network(String);
 struct Quantity(Decimal);
 struct Email(String);
 ```
+
+## Aggregates
+
+This section defines the domain aggregates, their commands, and the events they
+produce. Each aggregate represents a business concept with its own lifecycle and
+invariants.
+
+### Mint Aggregate
+
+The `Mint` aggregate manages the complete lifecycle of a mint operation, from
+initial request through journal confirmation to on-chain minting and callback.
+
+**Aggregate State:**
+
+- `issuer_request_id`: Our unique identifier for this mint
+- `tokenization_request_id`: Alpaca's identifier
+- `qty`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
+  details
+- `status`: Current state in the mint lifecycle
+- `tx_hash`, `receipt_id`, `shares_minted`: On-chain transaction details
+- Timestamps for each lifecycle stage
+
+**Commands:**
+
+- `InitiateMint { tokenization_request_id, qty, underlying, token, network, client_id, wallet }` -
+  Create a new mint request from Alpaca
+- `ConfirmJournal { issuer_request_id }` - Alpaca confirmed shares journal
+  transfer
+- `RejectJournal { issuer_request_id, reason }` - Alpaca rejected shares journal
+  transfer
+- `RecordMintSuccess { issuer_request_id, tx_hash, receipt_id, shares_minted, gas_used, block_number }` -
+  On-chain mint transaction succeeded
+- `RecordMintFailure { issuer_request_id, error }` - On-chain mint transaction
+  failed
+- `RecordCallback { issuer_request_id }` - Alpaca callback sent successfully
+- `MarkFailed { issuer_request_id, reason }` - Mark the mint as failed for any
+  reason
+
+**Events:**
+
+- `MintInitiated { issuer_request_id, tokenization_request_id, qty, underlying, token, network, client_id, wallet }` -
+  Mint request created
+- `JournalConfirmed { issuer_request_id }` - Alpaca journal transfer confirmed
+- `JournalRejected { issuer_request_id, reason }` - Alpaca journal transfer
+  rejected
+- `MintingStarted { issuer_request_id }` - Beginning on-chain mint operation
+- `TokensMinted { issuer_request_id, tx_hash, receipt_id, shares_minted, gas_used, block_number }` -
+  On-chain mint succeeded
+- `MintingFailed { issuer_request_id, error }` - On-chain mint failed
+- `CallbackSent { issuer_request_id }` - Alpaca callback completed
+- `MintCompleted { issuer_request_id }` - Entire mint flow completed
+  successfully
+- `MintFailed { issuer_request_id, reason }` - Mint flow failed
+
+**Command → Event Mappings:**
+
+- `InitiateMint` → `[MintInitiated]`
+- `ConfirmJournal` → `[JournalConfirmed, MintingStarted]` - Journal confirmed
+  AND we're starting on-chain mint
+- `RejectJournal` → `[JournalRejected, MintFailed]` - Journal rejected AND mint
+  failed
+- `RecordMintSuccess` → `[TokensMinted]`
+- `RecordMintFailure` → `[MintingFailed, MintFailed]`
+- `RecordCallback` → `[CallbackSent, MintCompleted]` - Callback sent AND mint
+  fully completed
+- `MarkFailed` → `[MintFailed]`
+
+Note: A single command can produce multiple events when one action has several
+state consequences.
+
+### Redemption Aggregate
+
+The `Redemption` aggregate manages the redemption lifecycle, from detecting an
+on-chain transfer through calling Alpaca to burning tokens.
+
+**Aggregate State:**
+
+- `issuer_request_id`: Our unique identifier for this redemption
+- `tokenization_request_id`: Alpaca's identifier (received after calling their
+  API)
+- `underlying`, `token`, `wallet`, `qty`: Redemption details
+- `detected_tx_hash`: On-chain transfer that triggered redemption
+- `status`: Current state in the redemption lifecycle
+- `burn_tx_hash`, `receipt_id`, `shares_burned`: Burn transaction details
+- Timestamps for each lifecycle stage
+
+**Commands:**
+
+- `DetectRedemption { underlying, token, wallet, qty, tx_hash, block_number }` -
+  Transfer to redemption wallet detected
+- `RecordAlpacaCall { issuer_request_id, tokenization_request_id }` - Alpaca
+  redeem API called successfully
+- `RecordAlpacaFailure { issuer_request_id, error }` - Alpaca redeem API call
+  failed
+- `ConfirmAlpacaComplete { issuer_request_id }` - Alpaca journal transfer
+  completed
+- `RecordBurnSuccess { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
+  On-chain burn succeeded
+- `RecordBurnFailure { issuer_request_id, error }` - On-chain burn failed
+- `MarkFailed { issuer_request_id, reason }` - Mark redemption as failed
+
+**Events:**
+
+- `RedemptionDetected { issuer_request_id, underlying, token, wallet, qty, tx_hash, block_number }` -
+  Transfer to redemption wallet detected
+- `AlpacaCalled { issuer_request_id, tokenization_request_id }` - Alpaca redeem
+  endpoint called
+- `AlpacaCallFailed { issuer_request_id, error }` - Alpaca API call failed
+- `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
+  transfer
+- `BurningStarted { issuer_request_id }` - Beginning on-chain burn operation
+- `TokensBurned { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
+  On-chain burn succeeded
+- `BurningFailed { issuer_request_id, error }` - On-chain burn failed
+- `RedemptionCompleted { issuer_request_id }` - Entire redemption flow completed
+- `RedemptionFailed { issuer_request_id, reason }` - Redemption flow failed
+
+### AccountLink Aggregate
+
+The `AccountLink` aggregate manages the relationship between AP accounts and our
+system.
+
+**Aggregate State:**
+
+- `client_id`: Our identifier for the linked account
+- `email`: AP's email address
+- `alpaca_account`: Alpaca account number
+- `status`: Active, suspended, or inactive
+- Timestamps
+
+**Commands:**
+
+- `LinkAccount { email, alpaca_account }` - Create new account link
+- `UnlinkAccount { client_id }` - Remove account link
+- `SuspendAccount { client_id, reason }` - Temporarily suspend account
+- `ReactivateAccount { client_id }` - Reactivate suspended account
+
+**Events:**
+
+- `AccountLinked { client_id, email, alpaca_account }` - Account successfully
+  linked
+- `AccountUnlinked { client_id }` - Account link removed
+- `AccountSuspended { client_id, reason }` - Account suspended
+- `AccountReactivated { client_id }` - Account reactivated
+
+### TokenizedAsset Aggregate
+
+The `TokenizedAsset` aggregate manages which assets are supported for
+tokenization.
+
+**Aggregate State:**
+
+- `underlying`, `token`: Symbol identifiers
+- `network`: Blockchain network
+- `vault_address`: On-chain vault contract address
+- `enabled`: Whether asset is currently available for minting/redeeming
+- Timestamps
+
+**Commands:**
+
+- `AddAsset { underlying, token, network, vault_address }` - Add new supported
+  asset
+- `EnableAsset { underlying }` - Enable asset for minting/redeeming
+- `DisableAsset { underlying, reason }` - Disable asset temporarily
+- `UpdateVaultAddress { underlying, vault_address }` - Update vault contract
+  address
+
+**Events:**
+
+- `AssetAdded { underlying, token, network, vault_address }` - New asset added
+- `AssetEnabled { underlying }` - Asset enabled
+- `AssetDisabled { underlying, reason }` - Asset disabled
+- `VaultAddressUpdated { underlying, vault_address, previous_address }` - Vault
+  address changed
+
+## Services
+
+Aggregates use services to interact with external systems while keeping business
+logic testable and isolated.
+
+**AlpacaService:**
+
+- HTTP client for Alpaca API
+- Methods: `call_redeem_endpoint()`, `send_mint_callback()`,
+  `poll_request_status()`
+- Handles authentication, retries, and error mapping
+
+**BlockchainService:**
+
+- RPC client for blockchain interaction
+- Methods: `mint_tokens()`, `burn_tokens()`, `estimate_gas()`,
+  `get_receipt_balance()`
+- Manages transaction signing, gas estimation, and receipt parsing
+
+**MonitorService:**
+
+- Watches redemption wallet for incoming transfers
+- Methods: `watch_transfers()`, `get_transfer_details()`
+- Uses a WebSocket subscription to detect redemption events
+
+These services are injected into aggregate command handlers, making aggregates
+testable with mock services.
 
 ## Core Functionality
 
@@ -829,7 +1077,9 @@ We call these Alpaca endpoints:
 
 ## Database Schema
 
-### Account Links Table
+The database uses **SQLite** with an event sourcing architecture. The event
+store is the single source of truth, and all other tables are read-optimized
+views derived from events.
 
 ```sql
 CREATE TABLE account_links (
