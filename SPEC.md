@@ -2,29 +2,49 @@
 
 ## Overview
 
-The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network (ITN). It implements the Issuer-side endpoints that Alpaca calls during mint/redeem operations, and coordinates with the Rain `OffchainAssetReceiptVault` contracts to execute the actual on-chain minting and burning of tokenized shares.
+The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network
+(ITN). It implements the Issuer-side endpoints that Alpaca calls during
+mint/redeem operations, and coordinates with the Rain
+`OffchainAssetReceiptVault` contracts to execute the actual on-chain minting and
+burning of tokenized shares.
 
-**This is general infrastructure** - any Authorized Participant (AP) can use it to mint and redeem tokenized equities. The issuance bot serves as the bridge between traditional equity holdings (at Alpaca) and on-chain (semi-fungible) tokenized representations (Rain SFT contracts).
+**This is general infrastructure** - any Authorized Participant (AP) can use it
+to mint and redeem tokenized equities. The issuance bot serves as the bridge
+between traditional equity holdings (at Alpaca) and on-chain (semi-fungible)
+tokenized representations (Rain SFT contracts).
 
 ## Background & Context
 
-**Our Role:** We are the **Issuer** of tokenized equities. Alpaca acts as the settlement layer between Authorized Participants (APs) and us.
+**Our Role:** We are the **Issuer** of tokenized equities. Alpaca acts as the
+settlement layer between Authorized Participants (APs) and us.
 
 **Flow Summary:**
-- **Minting:** AP requests mint → Alpaca calls our endpoint → We validate → Alpaca journals shares from AP to our custodian account → Alpaca confirms journal → We mint tokens on-chain → We call Alpaca's callback
-- **Redeeming:** AP sends tokens to our redemption wallet → We detect redemption → We call Alpaca's redeem endpoint → Alpaca journals shares from our account to AP → We burn tokens on-chain
+
+- **Minting:** AP requests mint → Alpaca calls our endpoint → We validate →
+  Alpaca journals shares from AP to our custodian account → Alpaca confirms
+  journal → We mint tokens on-chain → We call Alpaca's callback
+- **Redeeming:** AP sends tokens to our redemption wallet → We detect redemption
+  → We call Alpaca's redeem endpoint → Alpaca journals shares from our account
+  to AP → We burn tokens on-chain
 
 **Use Cases:**
-- **Market Makers & Arbitrageurs:** Can mint/burn to rebalance inventory and maintain price parity across venues
-- **Institutions:** Can convert equity holdings to tokenized form for on-chain settlement, DeFi integration, or cross-border transfer
+
+- **Market Makers & Arbitrageurs:** Can mint/burn to rebalance inventory and
+  maintain price parity across venues
+- **Institutions:** Can convert equity holdings to tokenized form for on-chain
+  settlement, DeFi integration, or cross-border transfer
 - **Retail Platforms:** Can facilitate tokenized equity access for their users
-- **Our Arbitrage Bot:** Can use this infrastructure to complete the arbitrage cycle by rebalancing on/off-chain holdings. See [st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity) for more details on the bot.
+- **Our Arbitrage Bot:** Can use this infrastructure to complete the arbitrage
+  cycle by rebalancing on/off-chain holdings. See
+  [st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity) for more
+  details on the bot.
 
 ## Architecture
 
 ### Off-Chain Infrastructure
 
 **Our HTTP Server:**
+
 - Implements Alpaca ITN Issuer endpoints
 - Handles account linking, mint requests, and journal confirmations
 - Built with Rust (Axum/Actix web framework)
@@ -32,6 +52,7 @@ The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network
 - Async runtime for coordination
 
 **Alpaca ITN:**
+
 - Alpaca's settlement layer
 - Handles journal transfers between accounts automatically
 - Provides endpoints for callbacks and status queries
@@ -39,18 +60,21 @@ The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network
 ### On-Chain Infrastructure
 
 **Rain OffchainAssetReceiptVault Contract:**
+
 - ERC-1155 receipts tracking individual deposit IDs
 - ERC-20 shares representing vault ownership
 - `deposit()` function for minting
 - `withdraw()` function for burning
 
 **Redemption Wallet:**
+
 - On-chain address where APs send tokens to redeem
 - We monitor this address for incoming transfers
 
 ## Data Types
 
-Throughout this specification, we use newtypes to provide type safety and prevent mixing up different kinds of identifiers and values:
+Throughout this specification, we use newtypes to provide type safety and
+prevent mixing up different kinds of identifiers and values:
 
 ```rust
 use rust_decimal::Decimal;
@@ -71,11 +95,13 @@ struct Email(String);
 
 ### 1. Account Linking (Handshake Process)
 
-Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca account with their account on our platform.
+Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca
+account with their account on our platform.
 
 **Endpoint:** `POST /accounts/connect`
 
 **Request Body:**
+
 ```json
 {
   "email": "customer@firm.com",
@@ -84,6 +110,7 @@ Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca acc
 ```
 
 **Our Response:**
+
 ```json
 {
   "client_id": "5505-1234-ABC-4G45"
@@ -91,11 +118,13 @@ Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca acc
 ```
 
 **Status Codes:**
+
 - `200`: Successful link
 - `404`: Email not found on our platform
 - `409`: Account already linked
 
 **Data Structure:**
+
 ```rust
 struct AccountLinkRequest {
     email: Email,
@@ -114,6 +143,7 @@ Alpaca needs to query which assets we support:
 **Endpoint:** `GET /tokenized-assets`
 
 **Our Response:**
+
 ```json
 [
   {
@@ -130,6 +160,7 @@ Alpaca needs to query which assets we support:
 ```
 
 **Data Structure:**
+
 ```rust
 struct TokenizedAsset {
     #[serde(rename = "underlying_symbol")]
@@ -188,6 +219,7 @@ struct TokenizedAsset {
 **Endpoint:** `POST /inkind/issuance`
 
 **Request Body:**
+
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
@@ -201,6 +233,7 @@ struct TokenizedAsset {
 ```
 
 **Our Validation:**
+
 1. Verify `underlying_symbol` is supported
 2. Verify `token_symbol` matches our convention
 3. Verify `network` is supported (our EVM chain)
@@ -208,9 +241,13 @@ struct TokenizedAsset {
 5. Verify `wallet_address` is valid Ethereum address
 6. Verify `qty` is reasonable (positive, not exceeding limits)
 
-**Note:** We do NOT check if we have sufficient off-chain shares at this stage. The AP is supposed to have sent shares to Alpaca, and Alpaca will journal them to us. We simply validate the request format and respond. If the journal fails in Step 2, we'll find out in Step 3.
+**Note:** We do NOT check if we have sufficient off-chain shares at this stage.
+The AP is supposed to have sent shares to Alpaca, and Alpaca will journal them
+to us. We simply validate the request format and respond. If the journal fails
+in Step 2, we'll find out in Step 3.
 
 **Our Response:**
+
 ```json
 {
   "issuer_request_id": "123-456-ABCD-7890",
@@ -219,6 +256,7 @@ struct TokenizedAsset {
 ```
 
 **Status Codes:**
+
 - `200`: Request validated and created
 - `400`: Invalid request with specific error:
   - "Invalid Wallet: Wallet does not belong to client"
@@ -229,6 +267,7 @@ struct TokenizedAsset {
 **Data Storage:** Store in database with status `pending_journal`
 
 **Data Structures:**
+
 ```rust
 struct AlpacaMintRequest {
     tokenization_request_id: TokenizationRequestId,
@@ -251,7 +290,8 @@ struct MintRequestResponse {
 
 #### Step 2: Alpaca Journals Shares
 
-**Alpaca's Action:** Automatically journals the underlying shares from the AP's account into our designated tokenization account at Alpaca.
+**Alpaca's Action:** Automatically journals the underlying shares from the AP's
+account into our designated tokenization account at Alpaca.
 
 **Our Action:** None - we wait for confirmation in Step 3
 
@@ -260,6 +300,7 @@ struct MintRequestResponse {
 **Endpoint:** `POST /inkind/issuance/confirm`
 
 **Request Body:**
+
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
@@ -269,16 +310,21 @@ struct MintRequestResponse {
 ```
 
 **Status Values:**
+
 - `completed`: Journal succeeded, proceed to mint tokens on-chain
 - `rejected`: Journal failed, mark request as failed and do NOT mint
 
 **Our Response:** `200 OK` (acknowledge receipt)
 
 **Our Actions:**
-- If `completed`: Update database status to `journal_completed` and proceed to Step 4
-- If `rejected`: Update database status to `failed` with reason "journal_rejected"
+
+- If `completed`: Update database status to `journal_completed` and proceed to
+  Step 4
+- If `rejected`: Update database status to `failed` with reason
+  "journal_rejected"
 
 **Data Structure:**
+
 ```rust
 enum AlpacaConfirmationStatus {
     Completed,
@@ -299,11 +345,13 @@ Once journal is confirmed, we mint tokens using the Rain vault.
 **On-Chain Call:** `OffchainAssetReceiptVault.deposit()`
 
 **Parameters:**
+
 - `assets`: Quantity to mint (convert from string to U256, handling decimals)
 - `receiver`: AP's wallet address from original request
 - `receiptInformation`: Metadata bytes (see structure below)
 
 **Receipt Information Structure:**
+
 ```rust
 struct ReceiptInformation {
     alpaca_tokenization_request_id: TokenizationRequestId,
@@ -323,16 +371,20 @@ enum OperationType {
 ```
 
 **Metadata for this mint:**
+
 - Alpaca `tokenization_request_id`
 - Our `issuer_request_id`
 - Symbol and quantity
 - Timestamp
 - Operation type: "mint"
 
-**Authorization Check:**
-Before attempting to mint, verify that our operator address is authorized for the `DEPOSIT` permission on the vault. The `OffchainAssetReceiptVault` uses an authorizer contract to control permissions. If not authorized, the transaction will revert.
+**Authorization Check:** Before attempting to mint, verify that our operator
+address is authorized for the `DEPOSIT` permission on the vault. The
+`OffchainAssetReceiptVault` uses an authorizer contract to control permissions.
+If not authorized, the transaction will revert.
 
 **Gas Management:**
+
 - Estimate gas before submitting transaction
 - Use reasonable gas price (e.g., median + 10% from recent blocks)
 - Set appropriate gas limit with buffer (e.g., estimated * 1.2)
@@ -340,16 +392,19 @@ Before attempting to mint, verify that our operator address is authorized for th
 - Track gas costs per operation for operational metrics
 
 **On Success:**
+
 - Parse transaction receipt to extract:
   - Receipt ID created (from deposit event)
   - Shares minted (from deposit event)
   - Gas used
   - Block number
 - Update database status to `callback_pending`
-- Store transaction details (tx hash, receipt ID, shares, gas used, block number)
+- Store transaction details (tx hash, receipt ID, shares, gas used, block
+  number)
 - Proceed to Step 5
 
 **Data Structure:**
+
 ```rust
 struct MintResult {
     tx_hash: B256,
@@ -362,13 +417,15 @@ struct MintResult {
 
 #### Step 5: Callback to Alpaca
 
-After successful on-chain minting, we call Alpaca's callback endpoint to confirm completion.
+After successful on-chain minting, we call Alpaca's callback endpoint to confirm
+completion.
 
 **Endpoint:** `POST /v1/accounts/{account_id}/tokenization/callback/mint`
 
 Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 **Request Body:**
+
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
@@ -380,12 +437,15 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 ```
 
 **On Success:**
+
 - Update database status to `completed`
 - Record completion timestamp
 
 **On Failure:**
+
 - Retry with exponential backoff
-- If persistent failure, alert operators (mint succeeded on-chain but Alpaca not notified)
+- If persistent failure, alert operators (mint succeeded on-chain but Alpaca not
+  notified)
 - Keep status as `callback_pending` until successful
 
 #### Mint Request State Machine
@@ -469,14 +529,17 @@ enum MintStatus {
 
 #### Step 1: Monitor Redemption Wallet
 
-We continuously monitor our designated redemption wallet for incoming token transfers.
+We continuously monitor our designated redemption wallet for incoming token
+transfers.
 
 **Monitoring Approach:**
+
 - Subscribe to `Transfer` events for the vault's ERC-20 shares
 - Filter for transfers where `to` address is our redemption wallet
 - Can use WebSocket subscription or polling depending on infrastructure
 
 **On Detection:**
+
 - Parse transfer details (from address, amount, tx hash, block number)
 - Determine symbol from vault/token context
 - Convert amount from U256 to decimal quantity string
@@ -485,6 +548,7 @@ We continuously monitor our designated redemption wallet for incoming token tran
 - Proceed to Step 2
 
 **Data Structure:**
+
 ```rust
 struct TransferEvent {
     from: Address,      // AP's wallet that sent the tokens
@@ -505,6 +569,7 @@ When we detect a redemption, we notify Alpaca.
 Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 **Request Body:**
+
 ```json
 {
   "issuer_request_id": "ABC-123-DEF-456",
@@ -519,6 +584,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 ```
 
 **Alpaca's Response:**
+
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
@@ -538,19 +604,23 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 ```
 
 **Status Values:**
+
 - `pending`: Redemption request received, journal in progress
 - `completed`: Journal completed successfully
 - `rejected`: Redemption rejected
 
 **Our Actions:**
+
 - Store `tokenization_request_id` from response
 - Update database status to `alpaca_called`
 - Proceed to Step 3 (polling for completion)
 
-**Client ID Lookup:**
-We need to look up the AP's `client_id` based on their wallet address. This requires maintaining a mapping between wallet addresses and client IDs from the account linking process.
+**Client ID Lookup:** We need to look up the AP's `client_id` based on their
+wallet address. This requires maintaining a mapping between wallet addresses and
+client IDs from the account linking process.
 
 **Data Structures:**
+
 ```rust
 struct AlpacaRedeemRequest {
     issuer_request_id: IssuerRequestId,
@@ -600,13 +670,15 @@ struct AlpacaRedeemResponse {
 
 #### Step 3: Poll for Journal Completion
 
-**Alpaca's Action:** Automatically journals the underlying shares from our tokenization account to the AP's account.
+**Alpaca's Action:** Automatically journals the underlying shares from our
+tokenization account to the AP's account.
 
 **Our Action:** Poll Alpaca's list endpoint to check status.
 
 **Endpoint:** `GET /v1/accounts/{account_id}/tokenization/requests`
 
 **Polling Strategy:**
+
 - Start with 5-second intervals
 - Exponential backoff up to 30-second max
 - Timeout after 1 hour
@@ -620,34 +692,38 @@ Once Alpaca confirms the journal is completed, we burn the tokens on-chain.
 **On-Chain Call:** `OffchainAssetReceiptVault.withdraw()`
 
 **Parameters:**
+
 - `assets`: Quantity to burn (convert from string to U256)
 - `receiver`: Can be zero address (tokens going off-chain)
 - `owner`: Our redemption wallet (owns the shares)
 - `id`: Receipt ID to burn from (need to track which receipt to use)
 - `receiptInformation`: Metadata bytes (similar structure to mint)
 
-**Receipt Tracking:**
-We need to determine which receipt ID has sufficient balance to burn from. This requires:
+**Receipt Tracking:** We need to determine which receipt ID has sufficient
+balance to burn from. This requires:
+
 - Maintaining an inventory of active receipt IDs
 - Querying on-chain balances for the redemption wallet
 - Selecting an appropriate receipt with sufficient balance
 
-**Authorization Check:**
-Verify our operator address is authorized for the `WITHDRAW` permission on the vault.
+**Authorization Check:** Verify our operator address is authorized for the
+`WITHDRAW` permission on the vault.
 
-**Gas Management:**
-Same strategy as minting:
+**Gas Management:** Same strategy as minting:
+
 - Estimate gas before submitting
 - Use reasonable gas price with buffer
 - Monitor and escalate if stuck
 - Track costs
 
 **On Success:**
+
 - Parse transaction receipt to extract shares burned and gas used
 - Update database status to `completed`
 - Record completion timestamp
 
 **Data Structure:**
+
 ```rust
 struct BurnResult {
     tx_hash: B256,
@@ -711,9 +787,12 @@ We run an HTTP server that implements these endpoints for Alpaca to call:
 
 We call these Alpaca endpoints:
 
-1. **`POST /v1/accounts/{account_id}/tokenization/callback/mint`** - Confirm mint completed
-2. **`POST /v1/accounts/{account_id}/tokenization/redeem`** - Initiate redemption
-3. **`GET /v1/accounts/{account_id}/tokenization/requests`** - List/poll requests
+1. **`POST /v1/accounts/{account_id}/tokenization/callback/mint`** - Confirm
+   mint completed
+2. **`POST /v1/accounts/{account_id}/tokenization/redeem`** - Initiate
+   redemption
+3. **`GET /v1/accounts/{account_id}/tokenization/requests`** - List/poll
+   requests
 
 ### Authentication
 
@@ -725,22 +804,28 @@ We call these Alpaca endpoints:
 ### Error Handling
 
 **Mint Request Errors (400 responses):**
+
 - "Invalid Wallet: Wallet does not belong to client"
 - "Invalid Token: Token not available on the network"
 - "Insufficient Eligibility: Client not eligible"
 - "Failed Validation: Invalid data payload"
 
 **Redemption Errors:**
+
 - Journal failed/rejected
 - Insufficient balance in tokenization account
 - Unknown client_id
 - Invalid transaction hash
 
 **Recovery Strategies:**
+
 1. **Journal Failed**: Mark mint as failed, do not mint tokens
-2. **Callback Failed**: Retry callback with exponential backoff, alert if persistent
-3. **Burn Failed**: Tokens stuck in redemption wallet, manual intervention needed
-4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal, reconciliation required
+2. **Callback Failed**: Retry callback with exponential backoff, alert if
+   persistent
+3. **Burn Failed**: Tokens stuck in redemption wallet, manual intervention
+   needed
+4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal,
+   reconciliation required
 
 ## Database Schema
 
@@ -993,7 +1078,9 @@ METRICS_PORT=9090
 
 ### Private Key Management
 
-**TBD** - Private key management strategy needs to be worked out in greater detail including:
+**TBD** - Private key management strategy needs to be worked out in greater
+detail including:
+
 - Storage approach (encrypted file, HSM, KMS)
 - Access controls
 - Rotation procedures
