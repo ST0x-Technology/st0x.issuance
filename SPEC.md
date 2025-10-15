@@ -1293,6 +1293,67 @@ events.
 - Updates: Asset configuration, enabled status
 - Used for: Validating mint/redemption requests, listing available assets
 
+## Framework Wiring
+
+The CQRS framework ties together the event store, aggregates, and views into a
+cohesive system.
+
+**Implementation Note:** While `cqrs-es` doesn't officially support SQLite, the
+`mysql-es` crate uses `sqlx` which supports SQLite as a backend. We'll implement
+our own `SqliteEventRepository` and `SqliteViewRepository` following the pattern
+from `mysql-es` since it uses sqlx (which has SQLite support).
+
+**Setup Steps:**
+
+1. **Configure Event Repository:**
+   - Create SQLite connection pool using `sqlx`
+   - Implement `SqliteEventRepository` following the `mysql-es` pattern
+   - Wrap in `PersistedEventStore`
+
+2. **Create View Repositories:**
+   - For each view, implement a `SqliteViewRepository` following the `mysql-es`
+     pattern
+   - Each repository handles loading, updating, and persisting view state
+
+3. **Wrap Views in GenericQuery:**
+   - Create view instance implementing `View` trait
+   - Wrap in `GenericQuery` with corresponding view repository
+   - `GenericQuery` handles the mechanics of loading, updating, and saving views
+
+4. **Create CQRS Framework:**
+   - Instantiate `CqrsFramework` with event store and vector of queries
+   - Separate frameworks for each aggregate type (Mint, Redemption, AccountLink,
+     TokenizedAsset)
+   - Or single framework if using the same event store for all aggregates
+
+5. **Execute Commands:**
+   - `cqrs.execute(&aggregate_id, command)` - Execute without metadata
+   - `cqrs.execute_with_metadata(&aggregate_id, command, metadata)` - Execute
+     with correlation IDs, etc.
+   - Framework loads aggregate (from snapshot + events), calls `handle()`,
+     persists events, applies to aggregate, updates views
+
+**Example Wiring:**
+
+```mermaid
+graph TB
+    ES[Event Store - SQLite] --> CQRS[CqrsFramework]
+    CQRS --> MA[Mint Aggregate]
+    CQRS --> MV[MintView]
+    CQRS --> RIV[ReceiptInventoryView]
+    CQRS --> ISV[InventorySnapshotView]
+
+    subgraph "Command Execution Flow"
+        CMD[InitiateMint] --> FW[Framework]
+        FW --> LOAD[Load Aggregate]
+        LOAD --> HANDLE[handle]
+        HANDLE --> EVENTS[MintInitiated]
+        EVENTS --> PERSIST[Persist Events]
+        PERSIST --> APPLY[Apply to Aggregate]
+        APPLY --> UPDATE[Update Views]
+    end
+```
+
 ## Configuration
 
 ### Environment Variables
