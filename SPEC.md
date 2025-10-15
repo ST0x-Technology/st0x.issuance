@@ -4,7 +4,7 @@
 
 The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network (ITN). It implements the Issuer-side endpoints that Alpaca calls during mint/redeem operations, and coordinates with the Rain `OffchainAssetReceiptVault` contracts to execute the actual on-chain minting and burning of tokenized shares.
 
-**This is general infrastructure** - any Authorized Participant (AP) can use it to mint and redeem tokenized equities. The issuance bot serves as the bridge between traditional equity holdings (at Alpaca) and on-chain tokenized representations (Rain SFT contracts).
+**This is general infrastructure** - any Authorized Participant (AP) can use it to mint and redeem tokenized equities. The issuance bot serves as the bridge between traditional equity holdings (at Alpaca) and on-chain (semi-fungible) tokenized representations (Rain SFT contracts).
 
 ## Background & Context
 
@@ -18,7 +18,7 @@ The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network
 - **Market Makers & Arbitrageurs:** Can mint/burn to rebalance inventory and maintain price parity across venues
 - **Institutions:** Can convert equity holdings to tokenized form for on-chain settlement, DeFi integration, or cross-border transfer
 - **Retail Platforms:** Can facilitate tokenized equity access for their users
-- **Our Arbitrage Bot:** Can use this infrastructure to complete the arbitrage cycle by rebalancing on/off-chain holdings
+- **Our Arbitrage Bot:** Can use this infrastructure to complete the arbitrage cycle by rebalancing on/off-chain holdings. See [st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity) for more details on the bot.
 
 ## Architecture
 
