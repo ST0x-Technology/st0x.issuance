@@ -192,16 +192,15 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Command → Event Mappings:**
 
-- `InitiateMint` → `[MintInitiated]`
-- `ConfirmJournal` → `[JournalConfirmed, MintingStarted]` - Journal confirmed
-  AND we're starting on-chain mint
-- `RejectJournal` → `[JournalRejected, MintFailed]` - Journal rejected AND mint
-  failed
-- `RecordMintSuccess` → `[TokensMinted]`
-- `RecordMintFailure` → `[MintingFailed, MintFailed]`
-- `RecordCallback` → `[CallbackSent, MintCompleted]` - Callback sent AND mint
-  fully completed
-- `MarkFailed` → `[MintFailed]`
+| Command             | Events Produced                         | Notes                                                           |
+| ------------------- | --------------------------------------- | --------------------------------------------------------------- |
+| `InitiateMint`      | `MintInitiated`                         | Single event - mint request created                             |
+| `ConfirmJournal`    | `JournalConfirmed`<br/>`MintingStarted` | Two events - journal confirmed AND we're starting on-chain mint |
+| `RejectJournal`     | `JournalRejected`<br/>`MintFailed`      | Two events - journal rejected AND mint failed                   |
+| `RecordMintSuccess` | `TokensMinted`                          | Single event - on-chain mint succeeded                          |
+| `RecordMintFailure` | `MintingFailed`<br/>`MintFailed`        | Two events - on-chain mint failed AND overall mint failed       |
+| `RecordCallback`    | `CallbackSent`<br/>`MintCompleted`      | Two events - callback sent AND mint fully completed             |
+| `MarkFailed`        | `MintFailed`                            | Single event - mark mint as failed                              |
 
 Note: A single command can produce multiple events when one action has several
 state consequences.
@@ -253,6 +252,18 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RedemptionCompleted { issuer_request_id }` - Entire redemption flow completed
 - `RedemptionFailed { issuer_request_id, reason }` - Redemption flow failed
 
+**Command → Event Mappings:**
+
+| Command                 | Events Produced                               | Notes                                                 |
+| ----------------------- | --------------------------------------------- | ----------------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`                          | Single event - transfer to redemption wallet detected |
+| `RecordAlpacaCall`      | `AlpacaCalled`                                | Single event - Alpaca redeem API called               |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`<br/>`RedemptionFailed`     | Two events - API call failed AND redemption failed    |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`<br/>`BurningStarted` | Two events - Alpaca done AND we're starting burn      |
+| `RecordBurnSuccess`     | `TokensBurned`<br/>`RedemptionCompleted`      | Two events - burned AND redemption fully done         |
+| `RecordBurnFailure`     | `BurningFailed`<br/>`RedemptionFailed`        | Two events - burn failed AND redemption failed        |
+| `MarkFailed`            | `RedemptionFailed`                            | Single event - mark redemption as failed              |
+
 ### AccountLink Aggregate
 
 The `AccountLink` aggregate manages the relationship between AP accounts and our
@@ -280,6 +291,15 @@ system.
 - `AccountUnlinked { client_id }` - Account link removed
 - `AccountSuspended { client_id, reason }` - Account suspended
 - `AccountReactivated { client_id }` - Account reactivated
+
+**Command → Event Mappings:**
+
+| Command             | Events Produced      | Notes                         |
+| ------------------- | -------------------- | ----------------------------- |
+| `LinkAccount`       | `AccountLinked`      | New account link created      |
+| `UnlinkAccount`     | `AccountUnlinked`    | Account link removed          |
+| `SuspendAccount`    | `AccountSuspended`   | Account temporarily suspended |
+| `ReactivateAccount` | `AccountReactivated` | Suspended account reactivated |
 
 ### TokenizedAsset Aggregate
 
@@ -310,6 +330,15 @@ tokenization.
 - `AssetDisabled { underlying, reason }` - Asset disabled
 - `VaultAddressUpdated { underlying, vault_address, previous_address }` - Vault
   address changed
+
+**Command → Event Mappings:**
+
+| Command              | Events Produced       | Notes                                       |
+| -------------------- | --------------------- | ------------------------------------------- |
+| `AddAsset`           | `AssetAdded`          | New tokenized asset added to supported list |
+| `EnableAsset`        | `AssetEnabled`        | Asset enabled for minting/redeeming         |
+| `DisableAsset`       | `AssetDisabled`       | Asset temporarily disabled                  |
+| `UpdateVaultAddress` | `VaultAddressUpdated` | Vault contract address changed              |
 
 ## Services
 
