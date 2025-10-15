@@ -93,6 +93,15 @@ time-travel debugging, and provide a single source of truth for all operations.
 
 **Key Flow:**
 
+```mermaid
+graph LR
+    A[Command] --> B[Aggregate.handle]
+    B --> C[Validate & Produce Events]
+    C --> D[Persist Events]
+    D --> E[Apply to Aggregate]
+    E --> F[Update Views]
+```
+
 **Critical Methods:**
 
 - `handle(command) -> Result<Vec<Event>, Error>`: Business logic lives here.
@@ -452,43 +461,32 @@ struct TokenizedAsset {
 
 #### Complete Mint Flow
 
-```
-[AP wants to mint 10 AAPL tokens]
-         │
-         ├─> AP calls Alpaca API with mint request
-         │
-         ├─> Alpaca validates AP account & authorization
-         │
-         ├─> Alpaca calls our POST /inkind/issuance
-         │     {tokenization_request_id, qty: "10", underlying_symbol: "AAPL", ...}
-         │
-         ├─> We validate request & respond
-         │     {issuer_request_id, status: "created"}
-         │     DB Status: pending_journal
-         │
-         ├─> Alpaca journals 10 AAPL shares
-         │     From: AP's Alpaca account
-         │     To: Our tokenization account
-         │
-         ├─> Alpaca calls our POST /inkind/issuance/confirm
-         │     {tokenization_request_id, issuer_request_id, status: "completed"}
-         │     DB Status: journal_completed
-         │
-         ├─> We mint tokens on-chain
-         │     vault.deposit(10 * 1e18, ap_wallet, receipt_info)
-         │     DB Status: minting
-         │
-         ├─> On-chain transaction confirms
-         │     Shares minted: 10 * 1e18
-         │     Receipt ID: 123
-         │     DB Status: callback_pending
-         │
-         ├─> We call Alpaca's callback endpoint
-         │     POST /v1/accounts/{id}/tokenization/callback/mint
-         │     {tokenization_request_id, tx_hash, wallet_address, ...}
-         │     DB Status: completed
-         │
-         └─> AP now has 10 AAPL0x tokens in their wallet ✓
+```mermaid
+sequenceDiagram
+    participant AP as Authorized Participant
+    participant Alpaca as Alpaca ITN
+    participant Us as Issuance Bot
+    participant Blockchain as Blockchain
+
+    AP->>Alpaca: Mint request (10 AAPL)
+    Alpaca->>Alpaca: Validate AP account & authorization
+    Alpaca->>Us: POST /inkind/issuance
+    Note right of Us: InitiateMint command<br/>Event: MintInitiated<br/>Status: pending_journal
+    Us->>Alpaca: {issuer_request_id, status: "created"}
+
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP → To: Issuer account
+    Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
+    Note right of Us: ConfirmJournal command<br/>Events: JournalConfirmed,<br/>MintingStarted<br/>Status: minting
+
+    Us->>Blockchain: vault.deposit(10 AAPL, ap_wallet)
+    Blockchain->>Us: Transaction confirmed
+    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted<br/>Status: callback_pending
+
+    Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
+    Note right of Us: RecordCallback command<br/>Events: CallbackSent,<br/>MintCompleted<br/>Status: completed
+
+    Alpaca->>AP: Mint completed ✓
+    Note left of AP: AP now has 10 AAPL0x<br/>tokens in their wallet
 ```
 
 #### Step 1: Receive Mint Request from Alpaca
@@ -727,11 +725,19 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 #### Mint Request State Machine
 
-```
-pending_journal ──> journal_completed ──> minting ──> callback_pending ──> completed
-     │                    │                  │               │
-     │                    │                  │               │
-     └────────────────────┴──────────────────┴───────────────┴──> failed
+```mermaid
+stateDiagram-v2
+    [*] --> PendingJournal: InitiateMint
+    PendingJournal --> JournalCompleted: ConfirmJournal
+    PendingJournal --> Failed: RejectJournal
+    JournalCompleted --> Minting: MintingStarted
+    JournalCompleted --> Failed: Error
+    Minting --> CallbackPending: RecordMintSuccess
+    Minting --> Failed: RecordMintFailure
+    CallbackPending --> Completed: RecordCallback
+    CallbackPending --> Failed: Error
+    Failed --> [*]
+    Completed --> [*]
 ```
 
 **Data Structures:**
@@ -766,42 +772,36 @@ enum MintStatus {
 
 #### Complete Redemption Flow
 
-```
-[AP wants to redeem 10 AAPL0x tokens]
-         │
-         ├─> AP sends 10 AAPL0x tokens to our redemption wallet
-         │     On-chain Transfer event emitted
-         │
-         ├─> Our monitor detects the transfer
-         │     Parse Transfer(from, to: redemption_wallet, amount: 10)
-         │     DB Status: detected
-         │
-         ├─> We call Alpaca's redeem endpoint
-         │     POST /v1/accounts/{id}/tokenization/redeem
-         │     {issuer_request_id, underlying_symbol, qty: "10", tx_hash, ...}
-         │     DB Status: alpaca_called
-         │
-         ├─> Alpaca responds with tokenization_request_id
-         │     {tokenization_request_id, status: "pending", ...}
-         │
-         ├─> Alpaca journals 10 AAPL shares
-         │     From: Our tokenization account
-         │     To: AP's Alpaca account
-         │
-         ├─> We poll Alpaca's list endpoint
-         │     GET /v1/accounts/{id}/tokenization/requests
-         │     Wait for status: "completed"
-         │     DB Status: alpaca_completed
-         │
-         ├─> We burn tokens on-chain
-         │     vault.withdraw(10 * 1e18, address(0), redemption_wallet, receipt_id, ...)
-         │     DB Status: burning
-         │
-         ├─> On-chain transaction confirms
-         │     Shares burned: 10 * 1e18
-         │     DB Status: completed
-         │
-         └─> AP now has 10 AAPL shares in their Alpaca account ✓
+```mermaid
+sequenceDiagram
+    participant AP as Authorized Participant
+    participant Blockchain as Blockchain
+    participant Us as Issuance Bot
+    participant Alpaca as Alpaca ITN
+
+    AP->>Blockchain: Transfer 10 AAPL0x to redemption wallet
+    Blockchain->>Us: Transfer event detected
+    Note right of Us: DetectRedemption command<br/>Event: RedemptionDetected<br/>Status: detected
+
+    Us->>Alpaca: POST /tokenization/redeem<br/>{issuer_request_id, qty, tx_hash}
+    Alpaca->>Us: {tokenization_request_id, status: "pending"}
+    Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
+
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account → To: AP
+
+    loop Poll for completion
+        Us->>Alpaca: GET /tokenization/requests
+        Alpaca->>Us: {status: "pending" | "completed"}
+    end
+
+    Note right of Us: ConfirmAlpacaComplete command<br/>Events: AlpacaJournalCompleted,<br/>BurningStarted<br/>Status: burning
+
+    Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
+    Blockchain->>Us: Transaction confirmed
+    Note right of Us: RecordBurnSuccess command<br/>Events: TokensBurned,<br/>RedemptionCompleted<br/>Status: completed
+
+    Us->>AP: Redemption completed ✓
+    Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
 ```
 
 #### Step 1: Monitor Redemption Wallet
@@ -1013,11 +1013,19 @@ struct BurnResult {
 
 #### Redemption Request State Machine
 
-```
-detected ──> alpaca_called ──> alpaca_completed ──> burning ──> completed
-     │              │                  │               │
-     │              │                  │               │
-     └──────────────┴──────────────────┴───────────────┴──> failed
+```mermaid
+stateDiagram-v2
+    [*] --> Detected: DetectRedemption
+    Detected --> AlpacaCalled: RecordAlpacaCall
+    Detected --> Failed: Error
+    AlpacaCalled --> AlpacaCompleted: ConfirmAlpacaComplete
+    AlpacaCalled --> Failed: RecordAlpacaFailure
+    AlpacaCompleted --> Burning: BurningStarted
+    AlpacaCompleted --> Failed: Error
+    Burning --> Completed: RecordBurnSuccess
+    Burning --> Failed: RecordBurnFailure
+    Failed --> [*]
+    Completed --> [*]
 ```
 
 **Data Structures:**
