@@ -1118,173 +1118,125 @@ The database uses **SQLite** with an event sourcing architecture. The event
 store is the single source of truth, and all other tables are read-optimized
 views derived from events.
 
-```sql
-CREATE TABLE account_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id TEXT NOT NULL UNIQUE,
-    email TEXT NOT NULL,
-    alpaca_account TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL
-);
+### Event Store Tables
 
-CREATE INDEX idx_account_links_email ON account_links(email);
-CREATE INDEX idx_account_links_alpaca ON account_links(alpaca_account);
-```
-
-### Authorized Participants Table
+These tables store the immutable event log that serves as the authoritative
+source of truth.
 
 ```sql
-CREATE TABLE authorized_participants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id TEXT NOT NULL UNIQUE,
-    email TEXT NOT NULL UNIQUE,
-    name TEXT,
-    status TEXT NOT NULL, -- 'active', 'suspended', 'inactive'
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+-- Events table: stores all domain events
+CREATE TABLE events (
+    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'AccountLink', 'TokenizedAsset'
+    aggregate_id TEXT NOT NULL,        -- Unique identifier for the aggregate instance
+    sequence BIGINT NOT NULL,          -- Sequence number for this aggregate (starts at 1)
+    event_type TEXT NOT NULL,          -- Event name (e.g., 'MintInitiated', 'TokensMinted')
+    event_version TEXT NOT NULL,       -- Event schema version (e.g., '1.0')
+    payload JSON NOT NULL,             -- Event data as JSON
+    metadata JSON NOT NULL,            -- Correlation IDs, timestamps, user context, etc.
+    PRIMARY KEY (aggregate_type, aggregate_id, sequence)
 );
 
-CREATE INDEX idx_aps_email ON authorized_participants(email);
-CREATE INDEX idx_aps_status ON authorized_participants(status);
+CREATE INDEX idx_events_type ON events(aggregate_type);
+CREATE INDEX idx_events_aggregate ON events(aggregate_id);
+
+-- Snapshots table: aggregate state cache for performance
+CREATE TABLE snapshots (
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    last_sequence BIGINT NOT NULL,    -- Last event sequence included in this snapshot
+    payload JSON NOT NULL,             -- Serialized aggregate state
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (aggregate_type, aggregate_id)
+);
 ```
 
-### Mint Requests Table
+**Note on Snapshots**: The snapshots table is a performance optimization that
+caches aggregate state at specific sequence numbers. When loading an aggregate,
+the framework loads the latest snapshot (if any) and replays only events since
+that snapshot, rather than replaying all events from the beginning. Snapshots
+can be deleted at any time - aggregates can always be rebuilt from the event
+store alone.
+
+### View Tables
+
+These tables are read-optimized projections built from events. They can be
+rebuilt at any time by replaying events.
 
 ```sql
-CREATE TABLE mint_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    
-    -- Alpaca identifiers
-    tokenization_request_id TEXT NOT NULL UNIQUE,
-    issuer_request_id TEXT NOT NULL UNIQUE,
-    
-    -- Request details
-    qty TEXT NOT NULL,
-    underlying_symbol TEXT NOT NULL,
-    token_symbol TEXT NOT NULL,
-    network TEXT NOT NULL,
-    client_id TEXT NOT NULL,
-    wallet_address TEXT NOT NULL,
-    
-    -- Status tracking
-    status TEXT NOT NULL, -- 'pending_journal', 'journal_completed', 'minting', 'callback_pending', 'completed', 'failed'
-    error_message TEXT,
-    
-    -- On-chain tracking
-    tx_hash BLOB,
-    receipt_id TEXT,  -- U256 as string
-    shares_minted TEXT,  -- U256 as string
-    block_number INTEGER,
-    gas_used INTEGER,
-    
-    -- Timestamps
-    created_at TEXT NOT NULL,
-    journal_confirmed_at TEXT,
-    minted_at TEXT,
-    callback_sent_at TEXT,
-    completed_at TEXT
+-- Mint view: current state of mint operations
+CREATE TABLE mint_view (
+    view_id TEXT PRIMARY KEY,         -- issuer_request_id
+    version BIGINT NOT NULL,          -- Last event sequence applied to this view
+    payload JSON NOT NULL             -- Current mint state as JSON
 );
 
-CREATE INDEX idx_mint_tokenization_id ON mint_requests(tokenization_request_id);
-CREATE INDEX idx_mint_issuer_id ON mint_requests(issuer_request_id);
-CREATE INDEX idx_mint_status ON mint_requests(status);
-CREATE INDEX idx_mint_symbol ON mint_requests(underlying_symbol);
-CREATE INDEX idx_mint_client ON mint_requests(client_id);
-```
+CREATE INDEX idx_mint_view_payload ON mint_view(json_extract(payload, '$.status'));
+CREATE INDEX idx_mint_view_client ON mint_view(json_extract(payload, '$.client_id'));
+CREATE INDEX idx_mint_view_symbol ON mint_view(json_extract(payload, '$.underlying'));
 
-### Redemption Requests Table
-
-```sql
-CREATE TABLE redemption_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    
-    -- Our identifier
-    issuer_request_id TEXT NOT NULL UNIQUE,
-    
-    -- Alpaca identifier (received after calling redeem endpoint)
-    tokenization_request_id TEXT UNIQUE,
-    
-    -- Request details
-    underlying_symbol TEXT NOT NULL,
-    token_symbol TEXT NOT NULL,
-    wallet_address TEXT NOT NULL,
-    qty TEXT NOT NULL,
-    network TEXT NOT NULL,
-    client_id TEXT,
-    
-    -- Detection
-    detected_tx_hash TEXT NOT NULL,  -- On-chain transfer to redemption wallet
-    detected_block_number INTEGER,
-    detected_block_timestamp INTEGER,
-    
-    -- Alpaca tracking
-    alpaca_fees TEXT,
-    
-    -- Status tracking
-    status TEXT NOT NULL, -- 'detected', 'alpaca_called', 'alpaca_completed', 'burning', 'completed', 'failed'
-    error_message TEXT,
-    
-    -- On-chain burn tracking
-    burn_tx_hash BLOB,
-    receipt_id TEXT,  -- Which receipt we burned from
-    shares_burned TEXT,  -- U256 as string
-    burn_block_number INTEGER,
-    burn_gas_used INTEGER,
-    
-    -- Timestamps
-    detected_at TEXT NOT NULL,
-    alpaca_called_at TEXT,
-    alpaca_completed_at TEXT,
-    burned_at TEXT,
-    completed_at TEXT
+-- Redemption view: current state of redemption operations
+CREATE TABLE redemption_view (
+    view_id TEXT PRIMARY KEY,         -- issuer_request_id
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL
 );
 
-CREATE INDEX idx_redemption_issuer_id ON redemption_requests(issuer_request_id);
-CREATE INDEX idx_redemption_tokenization_id ON redemption_requests(tokenization_request_id);
-CREATE INDEX idx_redemption_status ON redemption_requests(status);
-CREATE INDEX idx_redemption_symbol ON redemption_requests(underlying_symbol);
-CREATE INDEX idx_redemption_tx ON redemption_requests(detected_tx_hash);
-```
+CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
+CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
 
-### Supported Symbols Table
-
-```sql
-CREATE TABLE supported_symbols (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    underlying_symbol TEXT NOT NULL UNIQUE,
-    token_symbol TEXT NOT NULL UNIQUE,
-    network TEXT NOT NULL,
-    vault_address BLOB NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TEXT NOT NULL
+-- Account link view: current account links
+CREATE TABLE account_link_view (
+    view_id TEXT PRIMARY KEY,         -- client_id
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
 );
 
-CREATE INDEX idx_symbols_underlying ON supported_symbols(underlying_symbol);
-CREATE INDEX idx_symbols_enabled ON supported_symbols(enabled);
-```
+CREATE INDEX idx_account_link_email ON account_link_view(json_extract(payload, '$.email'));
+CREATE INDEX idx_account_link_alpaca ON account_link_view(json_extract(payload, '$.alpaca_account'));
+CREATE INDEX idx_account_link_status ON account_link_view(json_extract(payload, '$.status'));
 
-### Receipt Tracking Table
-
-```sql
--- Track which receipts have been issued and their current balances
-CREATE TABLE receipt_inventory (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    receipt_id TEXT NOT NULL,  -- U256 as string
-    vault_address BLOB NOT NULL,
-    symbol TEXT NOT NULL,
-    initial_amount TEXT NOT NULL,  -- U256 as string
-    current_balance TEXT NOT NULL,  -- U256 as string, updated as burned
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    
-    UNIQUE(receipt_id, vault_address)
+-- Tokenized asset view: current supported assets
+CREATE TABLE tokenized_asset_view (
+    view_id TEXT PRIMARY KEY,         -- underlying symbol
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL             -- {token, network, vault_address, enabled, timestamps}
 );
 
-CREATE INDEX idx_receipts_vault ON receipt_inventory(vault_address);
-CREATE INDEX idx_receipts_symbol ON receipt_inventory(symbol);
-CREATE INDEX idx_receipts_balance ON receipt_inventory(current_balance);
+CREATE INDEX idx_asset_view_enabled ON tokenized_asset_view(json_extract(payload, '$.enabled'));
+
+-- Receipt inventory view: built from TokensMinted and TokensBurned events
+CREATE TABLE receipt_inventory_view (
+    view_id TEXT PRIMARY KEY,         -- receipt_id:vault_address
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL             -- {receipt_id, vault_address, symbol, initial_amount, current_balance, timestamps}
+);
+
+CREATE INDEX idx_receipt_vault ON receipt_inventory_view(json_extract(payload, '$.vault_address'));
+CREATE INDEX idx_receipt_symbol ON receipt_inventory_view(json_extract(payload, '$.symbol'));
+
+-- Inventory snapshot view: periodic inventory metrics for Grafana
+CREATE TABLE inventory_snapshot_view (
+    view_id TEXT PRIMARY KEY,         -- symbol:timestamp
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL             -- {symbol, onchain_balance, offchain_balance, total_balance, onchain_ratio, timestamp}
+);
+
+CREATE INDEX idx_snapshot_symbol ON inventory_snapshot_view(json_extract(payload, '$.symbol'));
+CREATE INDEX idx_snapshot_timestamp ON inventory_snapshot_view(json_extract(payload, '$.timestamp'));
 ```
 
+**Note on Views**: All view tables follow the same pattern - `view_id` (primary
+key), `version` (last event sequence applied), and `payload` (JSON containing
+the view state). Views implement the `View` trait and are automatically updated
+by `GenericQuery` processors when events are committed. If a view becomes
+corrupted or a new projection is needed, simply drop the table and replay all
+events to rebuild it.
+
+CREATE INDEX idx_receipts_vault ON receipt_inventory(vault_address); CREATE
+INDEX idx_receipts_symbol ON receipt_inventory(symbol); CREATE INDEX
+idx_receipts_balance ON receipt_inventory(current_balance);
+
+````
 ### Inventory Snapshots Table
 
 ```sql
@@ -1300,7 +1252,7 @@ CREATE TABLE inventory_snapshots (
 
 CREATE INDEX idx_inventory_symbol ON inventory_snapshots(symbol);
 CREATE INDEX idx_inventory_timestamp ON inventory_snapshots(timestamp);
-```
+````
 
 ### Reconciliation Table
 
@@ -1339,8 +1291,7 @@ ALPACA_BASE_URL=https://broker-api.alpaca.markets
 ALPACA_TOKENIZATION_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
 
 # Blockchain Configuration
-RPC_URL=<ethereum_rpc_url>
-RPC_WS_URL=<ethereum_websocket_url>  # For monitoring redemption wallet
+RPC_WS_URL=<ethereum_websocket_url>
 CHAIN_ID=8453  # Base
 CHAIN_NAME=base
 VAULT_ADDRESS=<offchain_asset_receipt_vault_address>
