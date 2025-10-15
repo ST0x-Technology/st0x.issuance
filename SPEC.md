@@ -48,6 +48,25 @@ The issuance bot acts as the **Issuer** in Alpaca's Instant Tokenization Network
 - On-chain address where APs send tokens to redeem
 - We monitor this address for incoming transfers
 
+## Data Types
+
+Throughout this specification, we use newtypes to provide type safety and prevent mixing up different kinds of identifiers and values:
+
+```rust
+use rust_decimal::Decimal;
+use chrono::{DateTime, Utc};
+
+struct TokenizationRequestId(String);
+struct IssuerRequestId(String);
+struct ClientId(String);
+struct AlpacaAccountNumber(String);
+struct UnderlyingSymbol(String);
+struct TokenSymbol(String);
+struct Network(String);
+struct Quantity(Decimal);
+struct Email(String);
+```
+
 ## Core Functionality
 
 ### 1. Account Linking (Handshake Process)
@@ -78,13 +97,13 @@ Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca acc
 
 **Data Structure:**
 ```rust
-pub struct AccountLinkRequest {
-    pub email: String,
-    pub account: String,  // Alpaca account number
+struct AccountLinkRequest {
+    email: Email,
+    account: AlpacaAccountNumber,
 }
 
-pub struct AccountLinkResponse {
-    pub client_id: String,
+struct AccountLinkResponse {
+    client_id: ClientId,
 }
 ```
 
@@ -112,10 +131,12 @@ Alpaca needs to query which assets we support:
 
 **Data Structure:**
 ```rust
-pub struct TokenizedAsset {
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub network: String,
+struct TokenizedAsset {
+    #[serde(rename = "underlying_symbol")]
+    underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    token: TokenSymbol,
+    network: Network,
 }
 ```
 
@@ -209,19 +230,22 @@ pub struct TokenizedAsset {
 
 **Data Structures:**
 ```rust
-pub struct AlpacaMintRequest {
-    pub tokenization_request_id: String,
-    pub qty: String,  // Can be fractional
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub network: String,
-    pub client_id: String,
-    pub wallet_address: String,
+struct AlpacaMintRequest {
+    tokenization_request_id: TokenizationRequestId,
+    qty: Quantity,
+    #[serde(rename = "underlying_symbol")]
+    underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    token: TokenSymbol,
+    network: Network,
+    client_id: ClientId,
+    #[serde(rename = "wallet_address")]
+    wallet: Address,
 }
 
-pub struct MintRequestResponse {
-    pub issuer_request_id: String,
-    pub status: String,  // "created"
+struct MintRequestResponse {
+    issuer_request_id: IssuerRequestId,
+    status: String,  // "created"
 }
 ```
 
@@ -256,10 +280,15 @@ pub struct MintRequestResponse {
 
 **Data Structure:**
 ```rust
-pub struct AlpacaJournalConfirmation {
-    pub tokenization_request_id: String,
-    pub issuer_request_id: String,
-    pub status: String,  // "completed" or "rejected"
+enum AlpacaConfirmationStatus {
+    Completed,
+    Rejected,
+}
+
+struct AlpacaJournalConfirmation {
+    tokenization_request_id: TokenizationRequestId,
+    issuer_request_id: IssuerRequestId,
+    status: AlpacaConfirmationStatus,
 }
 ```
 
@@ -276,17 +305,18 @@ Once journal is confirmed, we mint tokens using the Rain vault.
 
 **Receipt Information Structure:**
 ```rust
-pub struct ReceiptInformation {
-    pub alpaca_tokenization_request_id: String,
-    pub issuer_request_id: String,
-    pub symbol: String,
-    pub quantity: String,
-    pub operation_type: OperationType, // Mint or Redeem
-    pub timestamp: u64,
-    pub notes: Option<String>,
+struct ReceiptInformation {
+    alpaca_tokenization_request_id: TokenizationRequestId,
+    issuer_request_id: IssuerRequestId,
+    #[serde(rename = "underlying_symbol")]
+    underlying: UnderlyingSymbol,
+    quantity: Quantity,
+    operation_type: OperationType,
+    timestamp: chrono::DateTime<Utc>,
+    notes: Option<String>,
 }
 
-pub enum OperationType {
+enum OperationType {
     Mint,
     Redeem,
 }
@@ -321,12 +351,12 @@ Before attempting to mint, verify that our operator address is authorized for th
 
 **Data Structure:**
 ```rust
-pub struct MintResult {
-    pub tx_hash: FixedBytes<32>,
-    pub receipt_id: U256,
-    pub shares_minted: U256,
-    pub gas_used: u64,
-    pub block_number: u64,
+struct MintResult {
+    tx_hash: B256,
+    receipt_id: U256,
+    shares_minted: U256,
+    gas_used: u64,
+    block_number: u64,
 }
 ```
 
@@ -370,22 +400,22 @@ pending_journal ──> journal_completed ──> minting ──> callback_pendi
 **Data Structures:**
 
 ```rust
-pub struct StoredMintRequest {
-    pub id: i64,
-    pub tokenization_request_id: String,
-    pub issuer_request_id: String,
-    pub qty: String,
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub network: String,
-    pub client_id: String,
-    pub wallet_address: String,
-    pub status: MintStatus,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+struct StoredMintRequest {
+    id: i64,
+    tokenization_request_id: TokenizationRequestId,
+    issuer_request_id: IssuerRequestId,
+    qty: Quantity,
+    underlying: UnderlyingSymbol,
+    token: TokenSymbol,
+    network: Network,
+    client_id: ClientId,
+    wallet: Address,
+    status: MintStatus,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
-pub enum MintStatus {
+enum MintStatus {
     PendingJournal,
     JournalCompleted,
     Minting,
@@ -456,13 +486,13 @@ We continuously monitor our designated redemption wallet for incoming token tran
 
 **Data Structure:**
 ```rust
-pub struct TransferEvent {
-    pub from: Address,      // AP's wallet that sent the tokens
-    pub to: Address,        // Our redemption wallet
-    pub amount: U256,       // Token amount transferred
-    pub tx_hash: FixedBytes<32>,
-    pub block_number: u64,
-    pub block_timestamp: u64,
+struct TransferEvent {
+    from: Address,      // AP's wallet that sent the tokens
+    to: Address,        // Our redemption wallet
+    amount: U256,       // Token amount transferred
+    tx_hash: B256,
+    block_number: u64,
+    block_timestamp: u64,
 }
 ```
 
@@ -522,31 +552,49 @@ We need to look up the AP's `client_id` based on their wallet address. This requ
 
 **Data Structures:**
 ```rust
-pub struct AlpacaRedeemRequest {
-    pub issuer_request_id: String,
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub client_id: String,
-    pub qty: String,
-    pub network: String,
-    pub wallet_address: String,
-    pub tx_hash: String,
+struct AlpacaRedeemRequest {
+    issuer_request_id: IssuerRequestId,
+    #[serde(rename = "underlying_symbol")]
+    underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    token: TokenSymbol,
+    client_id: ClientId,
+    qty: Quantity,
+    network: Network,
+    #[serde(rename = "wallet_address")]
+    wallet: Address,
+    tx_hash: B256,
 }
 
-pub struct AlpacaRedeemResponse {
-    pub tokenization_request_id: String,
-    pub issuer_request_id: String,
-    pub created_at: String,
-    pub request_type: String,  // "redeem"
-    pub status: String,  // "pending", "completed", "rejected"
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub qty: String,
-    pub issuer: String,
-    pub network: String,
-    pub wallet_address: String,
-    pub tx_hash: String,
-    pub fees: String,
+enum RedeemRequestType {
+    Redeem,
+}
+
+enum RedeemRequestStatus {
+    Pending,
+    Completed,
+    Rejected,
+}
+
+struct Fees(Decimal);
+
+struct AlpacaRedeemResponse {
+    tokenization_request_id: TokenizationRequestId,
+    issuer_request_id: IssuerRequestId,
+    created_at: DateTime<Utc>,
+    request_type: RedeemRequestType,
+    status: RedeemRequestStatus,
+    #[serde(rename = "underlying_symbol")]
+    underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    token: TokenSymbol,
+    qty: Quantity,
+    issuer: String,
+    network: Network,
+    #[serde(rename = "wallet_address")]
+    wallet: Address,
+    tx_hash: B256,
+    fees: Fees,
 }
 ```
 
@@ -601,12 +649,12 @@ Same strategy as minting:
 
 **Data Structure:**
 ```rust
-pub struct BurnResult {
-    pub tx_hash: FixedBytes<32>,
-    pub receipt_id: U256,
-    pub shares_burned: U256,
-    pub gas_used: u64,
-    pub block_number: u64,
+struct BurnResult {
+    tx_hash: B256,
+    receipt_id: U256,
+    shares_burned: U256,
+    gas_used: u64,
+    block_number: u64,
 }
 ```
 
@@ -622,23 +670,23 @@ detected ──> alpaca_called ──> alpaca_completed ──> burning ──> 
 **Data Structures:**
 
 ```rust
-pub struct StoredRedemption {
-    pub id: i64,
-    pub issuer_request_id: String,
-    pub tokenization_request_id: Option<String>,  // From Alpaca response
-    pub underlying_symbol: String,
-    pub token_symbol: String,
-    pub wallet_address: String,
-    pub tx_hash: String,  // On-chain transfer to redemption wallet
-    pub qty: String,
-    pub status: RedemptionStatus,
-    pub detected_at: DateTime<Utc>,
-    pub alpaca_called_at: Option<DateTime<Utc>>,
-    pub alpaca_completed_at: Option<DateTime<Utc>>,
-    pub burned_at: Option<DateTime<Utc>>,
+struct StoredRedemption {
+    id: i64,
+    issuer_request_id: IssuerRequestId,
+    tokenization_request_id: Option<TokenizationRequestId>,
+    underlying: UnderlyingSymbol,
+    token: TokenSymbol,
+    wallet: Address,
+    tx_hash: B256,
+    qty: Quantity,
+    status: RedemptionStatus,
+    detected_at: DateTime<Utc>,
+    alpaca_called_at: Option<DateTime<Utc>>,
+    alpaca_completed_at: Option<DateTime<Utc>>,
+    burned_at: Option<DateTime<Utc>>,
 }
 
-pub enum RedemptionStatus {
+enum RedemptionStatus {
     Detected,
     AlpacaCalled,
     AlpacaCompleted,
