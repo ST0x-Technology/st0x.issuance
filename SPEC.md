@@ -1232,47 +1232,66 @@ by `GenericQuery` processors when events are committed. If a view becomes
 corrupted or a new projection is needed, simply drop the table and replay all
 events to rebuild it.
 
-CREATE INDEX idx_receipts_vault ON receipt_inventory(vault_address); CREATE
-INDEX idx_receipts_symbol ON receipt_inventory(symbol); CREATE INDEX
-idx_receipts_balance ON receipt_inventory(current_balance);
+## Views and Queries
 
-````
-### Inventory Snapshots Table
+Views are read models that listen to events and maintain queryable state. Each
+view implements the `View` trait with an `update()` method that processes
+events.
 
-```sql
-CREATE TABLE inventory_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    onchain_balance REAL NOT NULL,
-    offchain_balance REAL NOT NULL,
-    total_balance REAL NOT NULL,
-    onchain_ratio REAL NOT NULL,
-    timestamp TEXT NOT NULL
-);
+**How Views Work:**
 
-CREATE INDEX idx_inventory_symbol ON inventory_snapshots(symbol);
-CREATE INDEX idx_inventory_timestamp ON inventory_snapshots(timestamp);
-````
+1. When events are committed to the event store, the `CqrsFramework` dispatches
+   them to all registered queries
+2. Each `GenericQuery` loads the current view state, applies the new events via
+   the `update()` method, and persists the updated view
+3. Views track the last event sequence they've processed to ensure exactly-once
+   processing
+4. If a view is missing or outdated, it can be rebuilt by replaying all events
+   for that aggregate type
 
-### Reconciliation Table
+**Example View Implementations:**
 
-```sql
-CREATE TABLE reconciliation_issues (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    operation_type TEXT NOT NULL, -- 'mint' or 'redemption'
-    operation_id INTEGER NOT NULL, -- References mint_requests.id or redemption_requests.id
-    issue_type TEXT NOT NULL, -- 'alpaca_failed_onchain_success', 'onchain_failed_alpaca_success', 'amount_mismatch'
-    description TEXT NOT NULL,
-    resolved BOOLEAN DEFAULT FALSE,
-    resolved_at TEXT,
-    resolved_by TEXT,
-    resolution_notes TEXT,
-    created_at TEXT NOT NULL
-);
+**MintView** - Maintains current state of mint operations:
 
-CREATE INDEX idx_reconciliation_resolved ON reconciliation_issues(resolved);
-CREATE INDEX idx_reconciliation_type ON reconciliation_issues(operation_type);
-```
+- Listens to: `MintInitiated`, `JournalConfirmed`, `TokensMinted`,
+  `MintCompleted`, etc.
+- Updates: Status, timestamps, transaction details
+- Used for: Querying current mint status, operational dashboards, API responses
+
+**RedemptionView** - Maintains current state of redemptions:
+
+- Listens to: `RedemptionDetected`, `AlpacaCalled`, `TokensBurned`,
+  `RedemptionCompleted`, etc.
+- Updates: Status, timestamps, transaction details
+- Used for: Tracking redemption progress, status queries
+
+**ReceiptInventoryView** - Tracks receipt balances:
+
+- Listens to: `TokensMinted` (increases balance), `TokensBurned` (decreases
+  balance)
+- Updates: Current balance for each receipt ID
+- Used for: Selecting which receipt to burn from, inventory management
+
+**InventorySnapshotView** - Periodic inventory metrics:
+
+- Listens to: `TokensMinted`, `TokensBurned`
+- Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
+- Used for: Grafana dashboards, monitoring, alerting
+
+**AccountLinkView** - Current account links:
+
+- Listens to: `AccountLinked`, `AccountUnlinked`, `AccountSuspended`,
+  `AccountReactivated`
+- Updates: Account status, relationship data
+- Used for: Validating client IDs, looking up accounts by email or Alpaca
+  account number
+
+**TokenizedAssetView** - Supported assets:
+
+- Listens to: `AssetAdded`, `AssetEnabled`, `AssetDisabled`,
+  `VaultAddressUpdated`
+- Updates: Asset configuration, enabled status
+- Used for: Validating mint/redemption requests, listing available assets
 
 ## Configuration
 
