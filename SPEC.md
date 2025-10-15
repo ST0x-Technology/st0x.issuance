@@ -1354,6 +1354,76 @@ graph TB
     end
 ```
 
+## Testing Domain Logic
+
+ES/CQRS enables highly testable business logic through the Given-When-Then
+pattern.
+
+**Testing Approach:**
+
+- **Given**: Set up initial aggregate state by providing previous events
+- **When**: Execute a command
+- **Then**: Assert expected events are produced (or expected error)
+
+**Example Tests:**
+
+```rust
+// Happy path: mint initiated successfully
+#[test]
+fn test_initiate_mint() {
+    MintTestFramework::with(mock_services)
+        .given_no_previous_events()
+        .when(InitiateMint {
+            tokenization_request_id: "alp-123",
+            qty: Decimal::from(100),
+            // ...
+        })
+        .then_expect_events(vec![
+            MintInitiated { /* ... */ }
+        ]);
+}
+
+// Journal confirmed triggers minting
+#[test]
+fn test_journal_confirmed() {
+    MintTestFramework::with(mock_services)
+        .given(vec![
+            MintInitiated { issuer_request_id: "iss-456", /* ... */ }
+        ])
+        .when(ConfirmJournal { issuer_request_id: "iss-456" })
+        .then_expect_events(vec![
+            JournalConfirmed { /* ... */ },
+            MintingStarted { /* ... */ }
+        ]);
+}
+
+// Journal rejected causes mint failure
+#[test]
+fn test_journal_rejected() {
+    MintTestFramework::with(mock_services)
+        .given(vec![
+            MintInitiated { issuer_request_id: "iss-789", /* ... */ }
+        ])
+        .when(RejectJournal {
+            issuer_request_id: "iss-789",
+            reason: "insufficient funds"
+        })
+        .then_expect_events(vec![
+            JournalRejected { reason: "insufficient funds" },
+            MintFailed { reason: "journal rejected" }
+        ]);
+}
+
+// Error case: can't confirm journal for non-existent mint
+#[test]
+fn test_journal_confirmed_for_missing_mint() {
+    MintTestFramework::with(mock_services)
+        .given_no_previous_events()
+        .when(ConfirmJournal { issuer_request_id: "unknown" })
+        .then_expect_error("Mint not found or already completed");
+}
+```
+
 ## Configuration
 
 ### Environment Variables
