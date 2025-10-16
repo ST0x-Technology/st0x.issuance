@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rocket = "0.5.1"
+sqlx = { version = "0.8.6", features = [
+  "sqlite",
+  "chrono",
+  "runtime-tokio-rustls",
+] }
+tracing = "0.1.41"
 
 [lints.rust]
 unsafe_code = "forbid"
