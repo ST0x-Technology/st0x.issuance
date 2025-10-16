@@ -302,19 +302,19 @@ Note: Keep struct and methods private or `pub(crate)` - use minimal visibility.
 
 ---
 
-## Task 3. Implement Event Repository Core
+## Task 3. Implement Event Repository Core ✅
 
 ### Subtasks
 
-- [ ] Create `crates/sqlite-es/src/event_repository.rs`
-- [ ] Define `SqliteAggregateError` enum inline using thiserror
-- [ ] Define `SqliteEventRepository` struct
-- [ ] Implement repository constructor and builder methods
-- [ ] Implement event retrieval methods
-- [ ] Implement event persistence methods
-- [ ] Implement snapshot methods
-- [ ] Implement optimistic locking for concurrent writes
-- [ ] Use minimal visibility levels
+- [x] Create `crates/sqlite-es/src/event_repository.rs`
+- [x] Define `SqliteAggregateError` enum inline using thiserror
+- [x] Define `SqliteEventRepository` struct
+- [x] Implement repository constructor and builder methods
+- [x] Implement event retrieval methods
+- [x] Implement event persistence methods
+- [x] Implement snapshot methods
+- [x] Implement optimistic locking for concurrent writes
+- [x] Use minimal visibility levels
 
 ### Implementation Details
 

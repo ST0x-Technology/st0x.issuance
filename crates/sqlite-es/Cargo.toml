@@ -11,6 +11,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 sqlx = { workspace = true, features = ["sqlite", "runtime-tokio-rustls"] }
+chrono = "0.4.42"
+tokio = { version = "1.48.0", features = ["rt", "sync"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
