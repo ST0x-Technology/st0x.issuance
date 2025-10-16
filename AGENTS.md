@@ -2,6 +2,12 @@
 
 This file provides guidance to AI agents working with code in this repository.
 
+Relevant docs:
+
+- README.md
+- ROADMAP.md
+- SPEC.md
+
 ## Plan & Review
 
 ### Before starting work
