@@ -1,27 +1,31 @@
 # Issuance Bot Implementation Plan
 
-**Total: ~44 issues, all assigned to @0xgleb**
+**Total: ~TBD issues, all assigned to @0xgleb**
+
+**Approach: Feature-by-feature development** - Each phase implements a complete
+vertical slice (HTTP endpoints → commands/events → aggregates → views → wiring →
+tests) to avoid dead code and enable incremental delivery.
 
 ---
 
 ## Phase 0: Project Bootstrap (3 issues, `enhancement`)
 
-1. Setup Nix flake with Rust toolchain + Cargo workspace structure
+1. Setup Nix flake with Rust toolchain + Cargo project (starting with a single
+   crate)
 2. Setup Rocket.rs web framework skeleton + SQLite with sqlx
 3. Setup CI (GitHub Actions - linting, tests)
 
 ---
 
-## Phase 1: ES/CQRS Foundation (3 issues, `enhancement`)
+## Phase 1: ES/CQRS Foundation (2 issues, `enhancement`)
+
+Foundation needed before any features can be implemented.
 
 1. **Implement SqliteEventRepository in crates/sqlite-es** - Custom event store
    implementation for SQLite following postgres-es pattern, includes events and
    snapshots tables
 2. **Implement SqliteViewRepository in crates/sqlite-es** - Repository trait
    implementation for persisting views to SQLite
-3. **Configure CqrsFramework instances** - Wire up event stores with queries
-   using `CqrsFramework::new()` for each aggregate type (Mint, Redemption,
-   AccountLink, TokenizedAsset)
 
 ---
 
