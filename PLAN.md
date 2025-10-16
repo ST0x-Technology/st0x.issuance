@@ -1,6 +1,6 @@
 # Issuance Bot Implementation Plan
 
-**Total: 32 issues, all assigned to @0xgleb**
+**Total: 31 issues, all assigned to @0xgleb**
 
 **Approach: Feature-by-feature development** - Each phase implements a complete
 vertical slice (HTTP endpoints → commands/events → aggregates → views → wiring →
@@ -56,7 +56,7 @@ Simple feature to start with - links AP accounts to our system.
 
 ---
 
-## Phase 3: Asset Management Feature (3 issues, `enhancement`)
+## Phase 3: Asset Management Feature (2 issues, `enhancement`)
 
 Manage which tokenized assets we support.
 
@@ -64,24 +64,19 @@ Manage which tokenized assets we support.
 
 - GET /tokenized-assets (read-only, lists supported assets)
 
-**Admin functionality:**
-
-- AddAsset command (invoked via script/CLI to seed assets)
-
 **Issues:**
 
 1. **Add GET /tokenized-assets endpoint stub**
    - Returns hardcoded list of assets
    - Define response types (UnderlyingSymbol, TokenSymbol, Network newtypes)
-2. **Implement AddAsset feature**
+2. **Implement AddAsset feature and connect endpoint**
    - AddAsset command, AssetAdded event, DomainEvent trait
    - TokenizedAsset aggregate (handle AddAsset → produce AssetAdded)
    - TokenizedAssetView (update on AssetAdded)
    - Wire up CqrsFramework
-   - Create CLI/script to invoke AddAsset for seeding
-   - Add tests
-3. **Connect GET /tokenized-assets to TokenizedAssetView**
-   - Make endpoint query view for asset list
+   - Seed assets on server startup (execute AddAsset commands for initial
+     assets)
+   - Connect GET /tokenized-assets endpoint to query TokenizedAssetView
    - Add tests
 
 ---
@@ -115,7 +110,7 @@ status
 
 ---
 
-## Phase 5: Mint Execution Feature (6 issues, `enhancement`)
+## Phase 5: Mint Execution Feature (5 issues, `enhancement`)
 
 Complete the mint flow - journal confirmation through callback.
 
@@ -151,10 +146,7 @@ Complete the mint flow - journal confirmation through callback.
      RecordMintSuccess/Failure
    - Add contract bindings generation (alloy) as subtask
    - Add tests
-4. **Implement ReceiptInventoryView**
-   - Listens to TokensMinted events (TokensBurned will come later in Phase 6)
-   - Tracks receipt IDs and balances
-5. **Implement AlpacaService and mint callback**
+4. **Implement AlpacaService and mint callback**
    - Define AlpacaService trait with send_mint_callback() method
    - Create mock implementation for testing
    - Use apca crate for real implementation
@@ -164,7 +156,7 @@ Complete the mint flow - journal confirmation through callback.
    - Wire orchestrator: listen to TokensMinted → call send_mint_callback() →
      execute RecordCallback
    - Add tests
-6. **End-to-end mint flow tests**
+5. **End-to-end mint flow tests**
    - Test complete flow from POST /inkind/issuance through callback
    - Test error scenarios (journal rejected, mint failed, callback failed)
 
