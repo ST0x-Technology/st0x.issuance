@@ -7,3 +7,6 @@ mod cqrs;
 mod event_repository;
 mod sql_query;
 pub mod testing;
+
+pub use cqrs::*;
+pub use event_repository::*;

@@ -109,6 +109,7 @@ impl PersistedEventRepository for SqliteEventRepository {
 }
 
 impl SqliteEventRepository {
+    #[must_use]
     pub fn new(pool: Pool<Sqlite>) -> Self {
         Self {
             pool,
@@ -120,6 +121,7 @@ impl SqliteEventRepository {
         }
     }
 
+    #[must_use]
     pub const fn with_tables(
         pool: Pool<Sqlite>,
         events_table: String,
@@ -132,6 +134,7 @@ impl SqliteEventRepository {
         }
     }
 
+    #[must_use]
     pub const fn with_stream_channel_size(
         mut self,
         stream_channel_size: usize,

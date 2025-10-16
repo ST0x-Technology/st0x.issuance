@@ -499,13 +499,13 @@ This provides a clean API for users to create CQRS frameworks backed by SQLite.
 
 ---
 
-## Task 6. Update Public API
+## Task 6. Update Public API ✅
 
 ### Subtasks
 
-- [ ] Update `lib.rs` with public API
-- [ ] Re-export necessary modules
-- [ ] Add crate-level documentation
+- [x] Update `lib.rs` with public API
+- [x] Re-export necessary modules
+- [x] Add crate-level documentation
 
 ### Implementation Details
 
