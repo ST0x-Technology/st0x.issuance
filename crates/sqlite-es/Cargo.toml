@@ -1,0 +1,16 @@
+[package]
+name = "sqlite-es"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cqrs-es.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio-rustls"] }
+
+[lints]
+workspace = true
