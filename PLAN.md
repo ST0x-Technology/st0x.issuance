@@ -230,16 +230,16 @@ touch src/view_repository.rs
 
 ---
 
-## Task 2. Implement SQL Query Factory
+## Task 2. Implement SQL Query Factory ✅
 
 ### Subtasks
 
-- [ ] Create `crates/sqlite-es/src/sql_query.rs`
-- [ ] Implement `SqlQueryFactory` struct with configurable table names
-- [ ] Implement event table queries (select, insert, stream)
-- [ ] Implement snapshot table queries (select, insert, update)
-- [ ] Use SQLite `?` placeholders
-- [ ] Split long SELECT lists line-by-line
+- [x] Create `crates/sqlite-es/src/sql_query.rs`
+- [x] Implement `SqlQueryFactory` struct with configurable table names
+- [x] Implement event table queries (select, insert, stream)
+- [x] Implement snapshot table queries (select, insert, update)
+- [x] Use SQLite `?` placeholders
+- [x] Split long SELECT lists line-by-line
 
 ### Implementation Details
 
