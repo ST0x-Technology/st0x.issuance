@@ -422,14 +422,14 @@ fn stream_all_events<A: Aggregate>(
 
 ---
 
-## Task 4. Implement PersistedEventRepository Trait
+## Task 4. Implement PersistedEventRepository Trait ✅
 
 ### Subtasks
 
-- [ ] Implement `PersistedEventRepository` trait for `SqliteEventRepository`
-- [ ] Ensure all trait methods delegate to internal implementation
-- [ ] Use `?` operator for error propagation (no boxing)
-- [ ] Verify compatibility with cqrs-es framework
+- [x] Implement `PersistedEventRepository` trait for `SqliteEventRepository`
+- [x] Ensure all trait methods delegate to internal implementation
+- [x] Use `?` operator for error propagation (no boxing)
+- [x] Verify compatibility with cqrs-es framework
 
 ### Implementation Details
 
