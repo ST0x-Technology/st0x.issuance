@@ -1,6 +1,6 @@
 # Issuance Bot Implementation Plan
 
-**Total: 31 issues, all assigned to @0xgleb**
+**Total: 32 issues, all assigned to @0xgleb**
 
 **Approach: Feature-by-feature development** - Each phase implements a complete
 vertical slice (HTTP endpoints → commands/events → aggregates → views → wiring →
@@ -162,7 +162,7 @@ Complete the mint flow - journal confirmation through callback.
 
 ---
 
-## Phase 6: Redemption Feature (5 issues, `enhancement`)
+## Phase 6: Redemption Feature (6 issues, `enhancement`)
 
 Complete redemption flow - detect transfer through burn.
 
@@ -207,22 +207,26 @@ on-chain
    - Wire orchestrator: listen to AlpacaCalled → poll until complete → execute
      ConfirmAlpacaComplete
    - Add tests
-4. **Implement token burning feature**
+4. **Implement ReceiptInventoryView**
+   - Listens to TokensMinted and TokensBurned events
+   - Tracks receipt IDs and balances
+   - Built from historical events (includes TokensMinted from Phase 5)
+5. **Implement token burning feature**
    - Add RecordBurnSuccess and RecordBurnFailure commands
    - Add TokensBurned, BurningFailed, RedemptionCompleted events
    - Extend Redemption aggregate to handle these commands
    - Extend BlockchainService with burn_tokens() method
-   - Extend ReceiptInventoryView to handle TokensBurned
+   - Use ReceiptInventoryView to select receipt for burning
    - Wire orchestrator: listen to BurningStarted → call burn_tokens() → execute
      RecordBurnSuccess/Failure
    - Add tests
-5. **End-to-end redemption flow tests**
+6. **End-to-end redemption flow tests**
    - Test complete flow from detection through burn
    - Test error scenarios (Alpaca call failed, burn failed)
 
 ---
 
-## Phase 7: Operations & Deployment (6 issues, `enhancement`)
+## Phase 7: Operations & Deployment (7 issues, `enhancement`)
 
 Operational concerns for production deployment.
 
@@ -239,18 +243,22 @@ Operational concerns for production deployment.
 3. **Setup configuration and secrets management**
    - Environment-based configuration
    - Secure secrets handling (not in git)
-4. **Integrate HyperDX for observability**
-   - Add HyperDX SDK
+4. **Integrate OpenTelemetry tracing with HyperDX**
+   - Add OpenTelemetry Rust tracing crates
    - Instrument key flows (mint, redemption)
+   - Configure HyperDX as OpenTelemetry tracing backend
    - Add distributed tracing
 5. **Integrate Grafana for metrics**
    - Export Prometheus metrics
    - Create Grafana dashboards
    - Add alerting rules
 6. **Setup CD (GitHub Actions)**
-   - Deployment pipeline
-   - Environment promotion (staging → prod)
+   - Deployment pipeline to production
    - Rollback procedures
+7. **Add staging environment** (nice-to-have)
+   - Create staging environment configuration
+   - Add staging deployment to CD pipeline
+   - Setup environment promotion workflow (staging → prod)
 
 ---
 
