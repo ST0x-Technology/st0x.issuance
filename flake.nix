@@ -10,7 +10,7 @@
   outputs = { flake-utils, rainix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let pkgs = rainix.pkgs.${system};
-      in rec {
+      in {
         packages = rainix.packages.${system};
 
         devShell = pkgs.mkShell {
