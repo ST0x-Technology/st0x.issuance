@@ -22,15 +22,14 @@ The cqrs-es framework uses a layered architecture:
 
 Based on postgres-es and mysql-es structure:
 
-1. **event_repository.rs** - Core `SqliteEventRepository` struct and
-   `PersistedEventRepository` trait implementation
+1. **event_repository.rs** - Core `SqliteEventRepository` struct,
+   `PersistedEventRepository` trait implementation, and repository-specific
+   error types
 2. **sql_query.rs** - SQL query generation factory for SQLite
-3. **error.rs** - SQLite-specific error types
-4. **types.rs** - Type aliases and convenience types
-5. **lib.rs** - Public API and re-exports
-6. **cqrs.rs** - CQRS framework integration
-7. **testing.rs** - Test utilities and helpers
-8. **view_repository.rs** - Stub for future view repository (issue #9)
+3. **cqrs.rs** - CQRS framework integration and type aliases
+4. **lib.rs** - Public API and re-exports
+5. **testing.rs** - Test utilities and helpers
+6. **view_repository.rs** - Stub for future view repository (issue #9)
 
 ### SQLite-Specific Considerations
 
@@ -85,27 +84,39 @@ Create a workspace member at `crates/sqlite-es` with:
 - SQLite-specific optimizations where appropriate
 - Full integration with cqrs-es framework
 - Comprehensive error handling
+- Minimal visibility levels (private by default, then `pub(crate)`, then `pub`
+  only when necessary)
 
 ### Dependencies
 
-Required crates (to be added via `cargo add`):
+Dependencies will be configured at the workspace level where appropriate:
 
-- `cqrs-es` - Core CQRS/ES framework
-- `sqlx` with features: sqlite, runtime-tokio-rustls
-- `async-trait` - Async trait support
+**Workspace-level dependencies** (in root `Cargo.toml`):
+
+- `cqrs-es` - Core CQRS/ES framework (used by main bot and sqlite-es)
+- `async-trait`
 - `serde` with features: derive
-- `serde_json` - JSON serialization for events
-- `thiserror` - Error handling
-- `tracing` - Logging
+- `serde_json`
+- `thiserror`
+- `tracing`
+
+**Crate-specific dependencies** (only in `crates/sqlite-es`):
+
+- `sqlx` with features: sqlite, runtime-tokio-rustls - SQLite database adapter
+
+All lints will be inherited from workspace level.
 
 ### Error Handling
 
-Define SQLite-specific errors:
+Define errors inline in modules where they're needed using thiserror. Use
+`#[from]` attribute to compose errors across module boundaries.
+
+Repository errors will be defined in `event_repository.rs`:
 
 1. **OptimisticLock** - Concurrent modification detected
-2. **ConnectionError** - Database connection issues
-3. **DeserializationError** - Event/snapshot deserialization failures
-4. **UnknownError** - Catch-all for unexpected errors
+2. **Connection** - Database connection issues (via `#[from] sqlx::Error`)
+3. **Deserialization** - Event/snapshot deserialization failures (via
+   `#[from] serde_json::Error`)
 
 ---
 
@@ -113,37 +124,26 @@ Define SQLite-specific errors:
 
 ### Subtasks
 
+- [ ] Update root `Cargo.toml` to add workspace configuration
+- [ ] Add shared dependencies at workspace level
+- [ ] Configure workspace lints
 - [ ] Create `crates/sqlite-es` directory
-- [ ] Update root `Cargo.toml` to include workspace member
 - [ ] Run `cargo init --lib` in `crates/sqlite-es`
-- [ ] Add dependencies using `cargo add`
-- [ ] Configure lints in `crates/sqlite-es/Cargo.toml`
+- [ ] Add sqlite-es to workspace members
+- [ ] Add crate-specific dependencies using `cargo add`
+- [ ] Configure crate to inherit workspace lints
 - [ ] Create `crates/sqlite-es/src` directory structure
 - [ ] Create basic `lib.rs` with module declarations
 
 ### Implementation Details
 
-**Step 1: Create directory and initialize:**
+**Step 1: Add dependencies to get latest versions:**
 
 ```bash
-mkdir -p crates/sqlite-es
-cd crates/sqlite-es
-cargo init --lib
-```
-
-**Step 2: Add workspace to root Cargo.toml:**
-
-```toml
-[workspace]
-members = [".", "crates/sqlite-es"]
-```
-
-**Step 3: Add dependencies:**
-
-```bash
-cd crates/sqlite-es
+# Add dependencies to root package - this gets latest versions
+cargo add rocket
+cargo add sqlx --features sqlite,chrono,runtime-tokio-rustls
 cargo add cqrs-es
-cargo add sqlx --features sqlite,runtime-tokio-rustls
 cargo add async-trait
 cargo add serde --features derive
 cargo add serde_json
@@ -151,13 +151,21 @@ cargo add thiserror
 cargo add tracing
 ```
 
-**Step 4: Configure lints manually in Cargo.toml:**
+**Step 2: Manually update root Cargo.toml for workspace structure:**
+
+Move the dependencies added in Step 1 from `[dependencies]` to
+`[workspace.dependencies]`, then add workspace configuration and update root
+package to use workspace dependencies:
 
 ```toml
-[lints.rust]
+[workspace]
+members = [".", "crates/sqlite-es"]
+resolver = "2"
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 unwrap_used = "deny"
 enum_glob_use = "deny"
 pedantic = { level = "deny", priority = -1 }
@@ -165,51 +173,64 @@ nursery = { level = "deny", priority = -1 }
 doc_markdown = "allow"
 items_after_statements = "allow"
 redundant_pub_crate = "allow"
+
+[workspace.dependencies]
+# Move dependencies added in Step 1 here
+
+[dependencies]
+rocket.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
 ```
 
-**Step 5: Create module structure:**
+**Step 3: Create and initialize sqlite-es crate:**
+
+```bash
+mkdir -p crates/sqlite-es
+cd crates/sqlite-es
+cargo init --lib
+```
+
+**Step 4: Add dependencies to sqlite-es:**
+
+```bash
+cd crates/sqlite-es
+cargo add sqlx --features sqlite,runtime-tokio-rustls
+```
+
+**Step 5: Configure sqlite-es to use workspace dependencies:**
+
+Edit `crates/sqlite-es/Cargo.toml` to add workspace dependencies and lints
+
+```toml
+[dependencies]
+cqrs-es.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+```
+
+**Step 6: Create module structure:**
 
 ```bash
 touch src/cqrs.rs
-touch src/error.rs
 touch src/event_repository.rs
 touch src/sql_query.rs
 touch src/testing.rs
-touch src/types.rs
 touch src/view_repository.rs
 ```
 
 ---
 
-## Task 2. Implement Error Types
-
-### Subtasks
-
-- [ ] Create `crates/sqlite-es/src/error.rs`
-- [ ] Define `SqliteAggregateError` enum
-- [ ] Implement `std::fmt::Display` for errors
-- [ ] Implement `std::error::Error` trait
-- [ ] Map sqlx errors to domain errors
-
-### Implementation Details
-
-The error module should provide:
-
-- Clear error variants for all failure modes
-- Conversion from sqlx errors
-- Helpful error messages with context
-- Compatibility with cqrs-es error handling
-
-Error variants needed:
-
-1. **OptimisticLock** - When sequence numbers conflict (concurrent writes)
-2. **ConnectionError** - Database connection/query failures
-3. **DeserializationError** - JSON parsing failures
-4. **UnknownError** - Catch-all for unexpected scenarios
-
----
-
-## Task 3. Implement SQL Query Factory
+## Task 2. Implement SQL Query Factory
 
 ### Subtasks
 
@@ -217,7 +238,8 @@ Error variants needed:
 - [ ] Implement `SqlQueryFactory` struct with configurable table names
 - [ ] Implement event table queries (select, insert, stream)
 - [ ] Implement snapshot table queries (select, insert, update)
-- [ ] Adapt parameter binding for SQLite `?` placeholders
+- [ ] Use SQLite `?` placeholders
+- [ ] Split long SELECT lists line-by-line
 
 ### Implementation Details
 
@@ -242,24 +264,31 @@ The `SqlQueryFactory` generates SQL queries for:
 - Use `INSERT OR REPLACE` for snapshot updates
 - Handle TEXT storage for BIGINT values
 
-Example factory structure:
+Example factory structure with proper SELECT formatting:
 
 ```rust
-pub struct SqlQueryFactory {
+pub(crate) struct SqlQueryFactory {
     events_table: String,
     snapshots_table: String,
 }
 
 impl SqlQueryFactory {
-    pub fn new(events_table: String, snapshots_table: String) -> Self {
+    pub(crate) fn new(events_table: String, snapshots_table: String) -> Self {
         Self { events_table, snapshots_table }
     }
 
-    pub fn select_events(&self) -> String {
+    pub(crate) fn select_events(&self) -> String {
         format!(
-            "SELECT aggregate_type, aggregate_id, sequence, event_type, \
-             event_version, payload, metadata \
-             FROM {} WHERE aggregate_type = ? AND aggregate_id = ? \
+            "SELECT
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+             FROM {}
+             WHERE aggregate_type = ? AND aggregate_id = ?
              ORDER BY sequence",
             self.events_table
         )
@@ -269,21 +298,41 @@ impl SqlQueryFactory {
 }
 ```
 
+Note: Keep struct and methods private or `pub(crate)` - use minimal visibility.
+
 ---
 
-## Task 4. Implement Event Repository Core
+## Task 3. Implement Event Repository Core
 
 ### Subtasks
 
 - [ ] Create `crates/sqlite-es/src/event_repository.rs`
+- [ ] Define `SqliteAggregateError` enum inline using thiserror
 - [ ] Define `SqliteEventRepository` struct
 - [ ] Implement repository constructor and builder methods
 - [ ] Implement event retrieval methods
 - [ ] Implement event persistence methods
 - [ ] Implement snapshot methods
 - [ ] Implement optimistic locking for concurrent writes
+- [ ] Use minimal visibility levels
 
 ### Implementation Details
+
+**Error types (defined inline in this module):**
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum SqliteAggregateError {
+    #[error("Optimistic lock error: aggregate has been modified concurrently")]
+    OptimisticLock,
+
+    #[error("Database connection error: {0}")]
+    Connection(#[from] sqlx::Error),
+
+    #[error("Event deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+}
+```
 
 The `SqliteEventRepository` struct:
 
@@ -364,17 +413,22 @@ fn stream_all_events<A: Aggregate>(
 - Events stored as JSON in `payload` column
 - Metadata stored as JSON in `metadata` column
 - Use serde_json for serialization/deserialization
-- Handle deserialization errors gracefully
+- Use `?` operator for error propagation
+
+**Visibility:**
+
+- Keep internal helpers private or `pub(crate)` - use minimal visibility
+- Only expose what needs to be public for the trait implementation
 
 ---
 
-## Task 5. Implement PersistedEventRepository Trait
+## Task 4. Implement PersistedEventRepository Trait
 
 ### Subtasks
 
 - [ ] Implement `PersistedEventRepository` trait for `SqliteEventRepository`
 - [ ] Ensure all trait methods delegate to internal implementation
-- [ ] Add proper error mapping and handling
+- [ ] Use `?` operator for error propagation (no boxing)
 - [ ] Verify compatibility with cqrs-es framework
 
 ### Implementation Details
@@ -389,9 +443,7 @@ impl PersistedEventRepository for SqliteEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<EventEnvelope<A>>, PersistenceError> {
-        self.get_events(aggregate_id)
-            .await
-            .map_err(|e| PersistenceError::new(Box::new(e)))
+        self.get_events(aggregate_id).await?
     }
 
     // ... implement all other trait methods
@@ -401,13 +453,14 @@ impl PersistedEventRepository for SqliteEventRepository {
 All methods should:
 
 - Delegate to internal implementation
-- Map errors to cqrs-es error types
+- Use `?` operator for error propagation
+- Use `#[from]` conversions defined in error types
 - Maintain async semantics
 - Preserve transaction boundaries
 
 ---
 
-## Task 6. Implement CQRS Integration
+## Task 5. Implement CQRS Integration
 
 ### Subtasks
 
@@ -415,12 +468,17 @@ All methods should:
 - [ ] Define `SqliteCqrs<A>` type alias
 - [ ] Implement helper functions for creating CQRS framework
 - [ ] Add convenience constructors
+- [ ] Use appropriate visibility levels
 
 ### Implementation Details
 
 Provide type aliases and helpers for easy integration:
 
 ```rust
+use cqrs_es::{Aggregate, CqrsFramework, PersistedEventStore};
+use sqlx::{Pool, Sqlite};
+use crate::SqliteEventRepository;
+
 pub type SqliteCqrs<A> = CqrsFramework<A, PersistedEventStore<SqliteEventRepository, A>>;
 
 pub fn sqlite_cqrs<A>(
@@ -441,26 +499,15 @@ This provides a clean API for users to create CQRS frameworks backed by SQLite.
 
 ---
 
-## Task 7. Implement Type Aliases and Public API
+## Task 6. Update Public API
 
 ### Subtasks
 
-- [ ] Create `crates/sqlite-es/src/types.rs`
-- [ ] Define convenience type aliases
 - [ ] Update `lib.rs` with public API
-- [ ] Re-export necessary types from cqrs-es
+- [ ] Re-export necessary modules
 - [ ] Add crate-level documentation
 
 ### Implementation Details
-
-**types.rs:**
-
-```rust
-use cqrs_es::{Aggregate, CqrsFramework, PersistedEventStore};
-use crate::SqliteEventRepository;
-
-pub type SqliteCqrs<A> = CqrsFramework<A, PersistedEventStore<SqliteEventRepository, A>>;
-```
 
 **lib.rs:**
 
@@ -471,82 +518,56 @@ pub type SqliteCqrs<A> = CqrsFramework<A, PersistedEventStore<SqliteEventReposit
 //! framework. It follows the same pattern as postgres-es and mysql-es.
 
 mod cqrs;
-mod error;
 mod event_repository;
 mod sql_query;
 pub mod testing;
-mod types;
 
 // Re-exports
 pub use cqrs::*;
-pub use error::*;
 pub use event_repository::*;
-pub use types::*;
 ```
 
 ---
 
-## Task 8. Implement Testing Utilities
+## Task 7. Implement Testing Utilities
 
 ### Subtasks
 
 - [ ] Create `crates/sqlite-es/src/testing.rs`
-- [ ] Implement in-memory database helpers
+- [ ] Implement in-memory database helpers using `sqlx::migrate!()`
 - [ ] Add test data builders
-- [ ] Create helper functions for test setup/teardown
+- [ ] Create helper functions for test setup
 - [ ] Add example test demonstrating usage
 
 ### Implementation Details
 
-Provide testing utilities for users:
+Provide testing utilities that use migrations:
 
 ```rust
 use sqlx::{Pool, Sqlite};
 
+/// Creates an in-memory SQLite database with migrations applied
 pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
     let pool = Pool::<Sqlite>::connect(":memory:").await?;
-    init_tables(&pool).await?;
+    sqlx::migrate!().run(&pool).await?;
     Ok(pool)
-}
-
-pub async fn init_tables(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "CREATE TABLE events (
-            aggregate_type TEXT NOT NULL,
-            aggregate_id TEXT NOT NULL,
-            sequence BIGINT NOT NULL,
-            event_type TEXT NOT NULL,
-            event_version TEXT NOT NULL,
-            payload JSON NOT NULL,
-            metadata JSON NOT NULL,
-            PRIMARY KEY (aggregate_type, aggregate_id, sequence)
-        )"
-    ).execute(pool).await?;
-
-    sqlx::query(
-        "CREATE TABLE snapshots (
-            aggregate_type TEXT NOT NULL,
-            aggregate_id TEXT NOT NULL,
-            last_sequence BIGINT NOT NULL,
-            payload JSON NOT NULL,
-            timestamp TEXT NOT NULL,
-            PRIMARY KEY (aggregate_type, aggregate_id)
-        )"
-    ).execute(pool).await?;
-
-    Ok(())
 }
 ```
 
+Key points:
+
+- Use `sqlx::migrate!()` to run migrations from the migrations folder
+- Don't manually create tables in Rust code
+- Keep visibility appropriate (likely `pub` for testing utilities)
+
 ---
 
-## Task 9. Add View Repository Stub
+## Task 8. Add View Repository Stub
 
 ### Subtasks
 
 - [ ] Create `crates/sqlite-es/src/view_repository.rs`
-- [ ] Add module stub with TODO comment
-- [ ] Reference issue #9 in comments
+- [ ] Add module stub with TODO comment referencing issue #9
 - [ ] Export from lib.rs
 
 ### Implementation Details
@@ -556,33 +577,26 @@ Create a stub file that will be implemented in issue #9:
 ```rust
 //! View repository implementation for SQLite
 //!
-//! TODO: Implement SqliteViewRepository (Issue #9)
+//! TODO(#9): Implement SqliteViewRepository
 //! This will provide view persistence for read models in the CQRS pattern.
 ```
 
-This keeps the crate structure consistent with postgres-es/mysql-es while
-deferring the actual implementation.
+Format: `TODO(#issue_number): description`
 
 ---
 
-## Task 10. Create Database Migration
+## Task 9. Populate Database Migration
 
 ### Subtasks
 
-- [ ] Create migration file for events and snapshots tables
-- [ ] Add proper indexes as specified in SPEC.md
-- [ ] Test migration with sqlx migrate
+- [ ] Reset the database using `sqlx migrate reset -y`
+- [ ] Populate the existing `migrations/20251016210348_init.sql` file
+- [ ] Add events and snapshots tables with proper indexes
+- [ ] Test migration with `sqlx migrate run`
 
 ### Implementation Details
 
-Create migration in the root project's migrations directory:
-
-```bash
-cd /path/to/root
-sqlx migrate add create_event_store_tables
-```
-
-Then populate `migrations/XXXXXX_create_event_store_tables.sql`:
+Edit the existing `migrations/20251016210348_init.sql` file:
 
 ```sql
 -- Events table: stores all domain events
@@ -597,8 +611,10 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (aggregate_type, aggregate_id, sequence)
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(aggregate_type);
-CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id);
+CREATE INDEX IF NOT EXISTS idx_events_type
+    ON events(aggregate_type);
+CREATE INDEX IF NOT EXISTS idx_events_aggregate
+    ON events(aggregate_id);
 
 -- Snapshots table: aggregate state cache for performance
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -611,11 +627,19 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 ```
 
-**Note:** This follows the exact schema from SPEC.md.
+Then run:
+
+```bash
+sqlx migrate reset -y
+sqlx migrate run
+```
+
+**Note:** This follows the exact schema from SPEC.md and uses the existing
+migration file.
 
 ---
 
-## Task 11. Integration Testing
+## Task 10. Integration Testing
 
 ### Subtasks
 
@@ -661,7 +685,8 @@ mod tests {
 
 Tests should:
 
-- Use in-memory SQLite databases for isolation
+- Use in-memory SQLite databases for isolation via `create_test_pool()`
+- Use `sqlx::migrate!()` to apply migrations
 - Cover happy paths and error conditions
 - Verify serialization/deserialization
 - Test concurrent access scenarios
@@ -669,7 +694,7 @@ Tests should:
 
 ---
 
-## Task 12. Documentation and Examples
+## Task 11. Documentation and Examples
 
 ### Subtasks
 
@@ -717,7 +742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Task 13. Final Integration and Testing
+## Task 12. Final Integration and Testing
 
 ### Subtasks
 
@@ -761,18 +786,20 @@ cargo fmt
 
 The implementation is complete when:
 
-1. ✅ `crates/sqlite-es` crate is created with proper structure
-2. ✅ `SqliteEventRepository` implements `PersistedEventRepository` trait
-3. ✅ Events can be persisted and retrieved from SQLite
-4. ✅ Snapshots can be created and updated
-5. ✅ Optimistic locking prevents concurrent modification issues
-6. ✅ Database migration creates required tables
-7. ✅ All tests pass without warnings
-8. ✅ Code passes clippy with deny warnings
-9. ✅ Code is properly formatted
-10. ✅ Documentation is comprehensive and accurate
-11. ✅ Integration with cqrs-es framework is verified
-12. ✅ Testing utilities are available for downstream users
+1. ✅ Workspace configuration includes shared dependencies and lints
+2. ✅ `crates/sqlite-es` crate is created with proper structure
+3. ✅ `SqliteEventRepository` implements `PersistedEventRepository` trait
+4. ✅ Events can be persisted and retrieved from SQLite
+5. ✅ Snapshots can be created and updated
+6. ✅ Optimistic locking prevents concurrent modification issues
+7. ✅ Database migration populates existing init migration file
+8. ✅ All tests pass without warnings
+9. ✅ Code passes clippy with deny warnings
+10. ✅ Code is properly formatted
+11. ✅ Documentation is comprehensive and accurate
+12. ✅ Integration with cqrs-es framework is verified
+13. ✅ Testing utilities use `sqlx::migrate!()` for setup
+14. ✅ Visibility levels are minimal (prefer `pub(crate)`)
 
 ---
 
