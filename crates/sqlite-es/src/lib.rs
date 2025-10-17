@@ -7,6 +7,9 @@ mod cqrs;
 mod event_repository;
 mod sql_query;
 pub mod testing;
+mod view_repository;
 
-pub use cqrs::*;
-pub use event_repository::*;
+pub use cqrs::{SqliteCqrs, sqlite_cqrs};
+pub use cqrs_es::persist::ViewContext;
+pub use event_repository::{SqliteAggregateError, SqliteEventRepository};
+pub use view_repository::SqliteViewError;

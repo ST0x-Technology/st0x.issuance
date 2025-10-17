@@ -111,22 +111,22 @@ VALUES (?, ?, ?)
 The upsert query uses SQLite's `INSERT OR REPLACE` syntax to handle both initial
 inserts and subsequent updates.
 
-## Task 2. Implement SqliteViewError Type
+## Task 2. Implement SqliteViewError Type ✅
 
 Create error types specific to view repository operations.
 
 ### Subtasks
 
-- [ ] Define `SqliteViewError` enum in a new `view_repository.rs` file
-- [ ] Add error variants:
+- [x] Define `SqliteViewError` enum in a new `view_repository.rs` file
+- [x] Add error variants:
   - `OptimisticLock` - concurrent modification detected
   - `Connection` - database connection/query error
   - `Serialization` - view serialization error
   - `Deserialization` - view deserialization error
   - `TryFromInt` - integer conversion error
-- [ ] Implement `Display` and `Error` traits via `thiserror`
-- [ ] Implement `From<SqliteViewError> for PersistenceError` conversion
-- [ ] Map error variants to appropriate `PersistenceError` types
+- [x] Implement `Display` and `Error` traits via `thiserror`
+- [x] Implement `From<SqliteViewError> for PersistenceError` conversion
+- [x] Map error variants to appropriate `PersistenceError` types
 
 ### Implementation Notes
 
