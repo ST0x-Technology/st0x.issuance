@@ -44,14 +44,14 @@ the same module structure as `src/account/`.
 
 **File:** `src/tokenized_asset/view.rs`
 
-- [ ] Create `TokenizedAssetView` struct with all asset fields
-- [ ] Implement `Default` trait (placeholder values)
-- [ ] Implement `View<TokenizedAsset>` trait with `update()` method
-- [ ] Create
+- [x] Create `TokenizedAssetView` struct with all asset fields
+- [x] Implement `Default` trait (placeholder values)
+- [x] Implement `View<TokenizedAsset>` trait with `update()` method
+- [x] Create
       `list_enabled_assets(pool: &Pool<Sqlite>) -> Result<Vec<TokenizedAssetView>>`
       query function
-- [ ] Create `TokenizedAssetViewError` enum
-- [ ] Add view tests (update from event, query functions)
+- [x] Create `TokenizedAssetViewError` enum
+- [x] Add view tests (update from event, query functions)
 
 ## Task 5. Create Database Migration
 

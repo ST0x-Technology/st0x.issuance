@@ -1,6 +1,7 @@
 mod api;
 mod cmd;
 mod event;
+mod view;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) use api::list_tokenized_assets;
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
+pub(crate) use view::TokenizedAssetView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnderlyingSymbol(pub(crate) String);
