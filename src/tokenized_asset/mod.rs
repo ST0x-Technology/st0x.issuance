@@ -1,5 +1,5 @@
+mod api;
 mod cmd;
-mod endpoint;
 mod event;
 
 use async_trait::async_trait;
@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
+pub(crate) use api::list_tokenized_assets;
 pub(crate) use cmd::TokenizedAssetCommand;
-pub(crate) use endpoint::list_tokenized_assets;
 pub(crate) use event::TokenizedAssetEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

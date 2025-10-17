@@ -63,7 +63,7 @@ the same module structure as `src/account/`.
 
 ## Task 6. Update Endpoint to Query View
 
-**File:** `src/tokenized_asset/endpoint.rs`
+**File:** `src/tokenized_asset/api.rs`
 
 - [ ] Update `list_tokenized_assets()` to accept `State<Pool<Sqlite>>`
 - [ ] Call `list_enabled_assets()` from view module
@@ -95,9 +95,10 @@ the same module structure as `src/account/`.
 ### Module Structure
 
 - Follow `src/account/` pattern exactly
-- cmd.rs, event.rs, view.rs, endpoint.rs submodules
+- api.rs, cmd.rs, event.rs, view.rs submodules
 - Aggregate and main types in mod.rs
 - Seeding logic in main.rs (simple startup function)
+- api.rs comes first alphabetically for better code navigation
 
 ### Aggregate ID
 
