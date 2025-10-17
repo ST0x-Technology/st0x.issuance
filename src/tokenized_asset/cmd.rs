@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Network, TokenSymbol, UnderlyingSymbol};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VaultAddress(pub(crate) String);
+use super::{Network, TokenSymbol, UnderlyingSymbol, VaultAddress};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedAssetCommand {

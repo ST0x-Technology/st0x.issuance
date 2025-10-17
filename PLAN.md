@@ -26,19 +26,19 @@ the same module structure as `src/account/`.
 
 **File:** `src/tokenized_asset/mod.rs`
 
-- [ ] Create `VaultAddress` newtype (String wrapper)
-- [ ] Create `TokenizedAsset` enum:
+- [x] Create `VaultAddress` newtype (String wrapper)
+- [x] Create `TokenizedAsset` enum:
   - `NotAdded` variant (initial state)
   - `Added` variant with fields: underlying, token, network, vault_address,
     enabled, added_at
-- [ ] Implement `Default` trait (returns `NotAdded`)
-- [ ] Implement `Aggregate` trait:
+- [x] Implement `Default` trait (returns `NotAdded`)
+- [x] Implement `Aggregate` trait:
   - `aggregate_type()` returns "TokenizedAsset"
   - `handle()` validates and produces `AssetAdded` event
   - `apply()` transitions from `NotAdded` to `Added` (with enabled = true)
-- [ ] Create `TokenizedAssetError` enum
-- [ ] Add aggregate tests (Given-When-Then pattern)
-- [ ] Update module declarations and re-exports
+- [x] Create `TokenizedAssetError` enum
+- [x] Add aggregate tests (Given-When-Then pattern)
+- [x] Update module declarations and re-exports
 
 ## Task 4. Create TokenizedAssetView
 

@@ -2,8 +2,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use super::{Network, TokenSymbol, UnderlyingSymbol};
-use super::cmd::VaultAddress;
+use super::{Network, TokenSymbol, UnderlyingSymbol, VaultAddress};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetEvent {
