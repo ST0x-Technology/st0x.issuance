@@ -109,26 +109,50 @@ where
             .await
             .map_err(SqliteViewError::Connection)?;
 
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let payload_str: String = row
-                    .try_get("payload")
-                    .map_err(SqliteViewError::Connection)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-                let view: V = serde_json::from_str(&payload_str)
-                    .map_err(SqliteViewError::Deserialization)?;
+        let payload_str: String =
+            row.try_get("payload").map_err(SqliteViewError::Connection)?;
 
-                Ok(Some(view))
-            }
-        }
+        let view: V = serde_json::from_str(&payload_str)
+            .map_err(SqliteViewError::Deserialization)?;
+
+        Ok(Some(view))
     }
 
     async fn load_with_context(
         &self,
-        _view_id: &str,
+        view_id: &str,
     ) -> Result<Option<(V, ViewContext)>, PersistenceError> {
-        todo!()
+        let query = SqlQueryFactory::select_view(&self.view_table);
+
+        let row = sqlx::query(&query)
+            .bind(view_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(SqliteViewError::Connection)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let view_id_str: String =
+            row.try_get("view_id").map_err(SqliteViewError::Connection)?;
+
+        let version_i64: i64 =
+            row.try_get("version").map_err(SqliteViewError::Connection)?;
+
+        let payload_str: String =
+            row.try_get("payload").map_err(SqliteViewError::Connection)?;
+
+        let view: V = serde_json::from_str(&payload_str)
+            .map_err(SqliteViewError::Deserialization)?;
+
+        let context = ViewContext::new(view_id_str, version_i64);
+
+        Ok(Some((view, context)))
     }
 
     async fn update_view(
@@ -286,6 +310,50 @@ mod tests {
         let loaded_view = result.unwrap();
         assert_eq!(loaded_view.count, 42);
         assert_eq!(loaded_view.values, vec!["foo", "bar"]);
+    }
+
+    #[tokio::test]
+    async fn test_load_with_context() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let test_view =
+            TestView { count: 100, values: vec!["alpha".to_string()] };
+        let payload = serde_json::to_string(&test_view).unwrap();
+
+        sqlx::query(
+            "INSERT INTO test_view (view_id, version, payload) VALUES (?, ?, ?)",
+        )
+        .bind("test-456")
+        .bind(7_i64)
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let result = repo.load_with_context("test-456").await.unwrap();
+
+        assert!(result.is_some());
+        let (loaded_view, context) = result.unwrap();
+        assert_eq!(loaded_view.count, 100);
+        assert_eq!(loaded_view.values, vec!["alpha"]);
+        assert_eq!(context.view_instance_id, "test-456");
+        assert_eq!(context.version, 7);
     }
 
     #[test]

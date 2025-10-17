@@ -187,21 +187,21 @@ Query:
 SELECT payload FROM {view_table} WHERE view_id = ?
 ```
 
-## Task 5. Implement ViewRepository::load_with_context Method
+## Task 5. Implement ViewRepository::load_with_context Method ✅
 
 Implement loading a view with version information for optimistic locking.
 
 ### Subtasks
 
-- [ ] Implement `load_with_context(&self, view_id: &str)` method
-- [ ] Build SELECT query to fetch both payload and version
-- [ ] Execute query with sqlx
-- [ ] Handle case when view doesn't exist (return `Ok(None)`)
-- [ ] Extract version from database row (i64 type)
-- [ ] Deserialize JSON payload to view type `V`
-- [ ] Construct `ViewContext` with view_id and version
-- [ ] Return tuple `(V, ViewContext)` wrapped in Option
-- [ ] Map errors appropriately
+- [x] Implement `load_with_context(&self, view_id: &str)` method
+- [x] Build SELECT query to fetch both payload and version
+- [x] Execute query with sqlx
+- [x] Handle case when view doesn't exist (return `Ok(None)`)
+- [x] Extract version from database row (i64 type)
+- [x] Deserialize JSON payload to view type `V`
+- [x] Construct `ViewContext` with view_id and version
+- [x] Return tuple `(V, ViewContext)` wrapped in Option
+- [x] Map errors appropriately
 
 ### Implementation Notes
 
