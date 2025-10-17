@@ -78,9 +78,8 @@ Implement the view projection in `src/account.rs`:
 - [x] Implement `View` trait with `update()` method:
   - `AccountLinked`: Create new view entry with Active status
 - [x] Add query methods:
-  - `find_by_email()`: Look up account by email
-  - `find_by_alpaca_account()`: Look up by Alpaca account number
-  - `find_by_client_id()`: Look up by client_id
+  - `find_by_email()`: Look up account by email (only this method needed for
+    current feature)
 - [x] Switch from `sqlx::query()` to `sqlx::query!()` macro for compile-time SQL
       verification
 
@@ -119,11 +118,11 @@ Create migration for the account_view table:
 
 Integrate the aggregate and view with the CQRS framework:
 
-- [ ] Update `src/main.rs` to create database connection pool
-- [ ] Create `SqliteEventRepository` for Account aggregate
-- [ ] Create `SqliteViewRepository` for AccountView
-- [ ] Wire up `CqrsFramework` with event store and views
-- [ ] Pass framework to the endpoint handler via Rocket state
+- [x] Update `src/main.rs` to create database connection pool
+- [x] Create `SqliteEventRepository` for Account aggregate
+- [x] Create `SqliteViewRepository` for AccountView
+- [x] Wire up `CqrsFramework` with event store and views
+- [x] Pass framework to the endpoint handler via Rocket state
 
 **Design Notes:**
 
@@ -136,14 +135,14 @@ Integrate the aggregate and view with the CQRS framework:
 
 Replace the stub endpoint with actual aggregate integration:
 
-- [ ] Update `connect_account()` to accept framework from Rocket state
-- [ ] Execute `LinkAccount` command via framework
-- [ ] Handle errors and return appropriate HTTP status codes:
+- [x] Update `connect_account()` to accept framework from Rocket state
+- [x] Execute `LinkAccount` command via framework
+- [x] Handle errors and return appropriate HTTP status codes:
   - 200: Successful link
   - 404: Email not found (for now, we'll auto-create - spec unclear)
   - 409: Account already linked
-- [ ] Query view to get the created account link
-- [ ] Return `AccountLinkResponse` with the generated client_id
+- [x] Query view to get the created account link
+- [x] Return `AccountLinkResponse` with the generated client_id
 
 **Design Notes:**
 

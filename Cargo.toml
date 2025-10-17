@@ -27,6 +27,8 @@ sqlx = { version = "0.8.6", features = [
   "sqlite",
   "chrono",
   "runtime-tokio-rustls",
+  "macros",
+  "migrate",
 ] }
 thiserror = "2.0.17"
 tracing = "0.1.41"
@@ -51,3 +53,6 @@ async-trait.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros"] }

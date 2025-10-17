@@ -11,10 +11,7 @@ use uuid::Uuid;
 
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
-pub(crate) use view::{
-    AccountView, AccountViewError, find_by_alpaca_account, find_by_client_id,
-    find_by_email,
-};
+pub(crate) use view::{AccountView, find_by_email};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Email(String);
@@ -142,10 +139,8 @@ pub(crate) enum AccountError {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccountLinkRequest {
-    #[serde(rename = "email")]
-    pub(crate) _email: Email,
-    #[serde(rename = "account")]
-    pub(crate) _account: AlpacaAccountNumber,
+    pub(crate) email: Email,
+    pub(crate) account: AlpacaAccountNumber,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,13 +148,29 @@ pub(crate) struct AccountLinkResponse {
     pub(crate) client_id: ClientId,
 }
 
-#[post("/accounts/connect", format = "json", data = "<_request>")]
-pub(crate) fn connect_account(
-    _request: Json<AccountLinkRequest>,
-) -> Json<AccountLinkResponse> {
-    Json(AccountLinkResponse {
-        client_id: ClientId("stub-client-id-123".to_string()),
-    })
+#[post("/accounts/connect", format = "json", data = "<request>")]
+pub(crate) async fn connect_account(
+    cqrs: &rocket::State<crate::AccountCqrs>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    request: Json<AccountLinkRequest>,
+) -> Result<Json<AccountLinkResponse>, rocket::http::Status> {
+    let command = AccountCommand::LinkAccount {
+        email: request.email.clone(),
+        alpaca_account: request.account.clone(),
+    };
+
+    let aggregate_id = request.email.as_str();
+
+    cqrs.execute(aggregate_id, command)
+        .await
+        .map_err(|_| rocket::http::Status::Conflict)?;
+
+    let account_view = find_by_email(pool.inner(), &request.email)
+        .await
+        .map_err(|_| rocket::http::Status::InternalServerError)?
+        .ok_or(rocket::http::Status::InternalServerError)?;
+
+    Ok(Json(AccountLinkResponse { client_id: account_view.client_id }))
 }
 
 #[cfg(test)]
@@ -170,7 +181,6 @@ mod tests {
     };
     use cqrs_es::{Aggregate, test::TestFramework};
     use rocket::http::{ContentType, Status};
-    use rocket::local::blocking::Client;
 
     type AccountTestFramework = TestFramework<Account>;
 
@@ -279,9 +289,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_connect_account_returns_client_id() {
-        let client = Client::tracked(rocket()).expect("valid rocket instance");
+    #[tokio::test]
+    async fn test_connect_account_returns_client_id() {
+        use cqrs_es::persist::GenericQuery;
+        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<super::AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
 
         let request_body = serde_json::json!({
             "email": "customer@firm.com",
@@ -292,19 +336,16 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .body(request_body.to_string())
-            .dispatch();
+            .dispatch()
+            .await;
 
         assert_eq!(response.status(), Status::Ok);
 
         let response_body: AccountLinkResponse = serde_json::from_str(
-            &response.into_string().expect("valid response body"),
+            &response.into_string().await.expect("valid response body"),
         )
         .expect("valid JSON response");
 
         assert!(!response_body.client_id.0.is_empty());
-    }
-
-    fn rocket() -> rocket::Rocket<rocket::Build> {
-        rocket::build().mount("/", routes![super::connect_account])
     }
 }
