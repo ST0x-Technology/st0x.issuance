@@ -57,9 +57,9 @@ the same module structure as `src/account/`.
 
 **File:** `migrations/YYYYMMDDHHMMSS_create_tokenized_asset_view.sql`
 
-- [ ] Run `sqlx migrate add create_tokenized_asset_view`
-- [ ] Create `tokenized_asset_view` table (view_id, version, payload)
-- [ ] Add indexes for enabled and network JSON fields
+- [x] Run `sqlx migrate add create_tokenized_asset_view`
+- [x] Create `tokenized_asset_view` table (view_id, version, payload)
+- [x] Add indexes for enabled and network JSON fields
 
 ## Task 6. Update Endpoint to Query View
 
