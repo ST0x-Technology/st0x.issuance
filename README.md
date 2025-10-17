@@ -104,7 +104,8 @@ cargo run                # Run the HTTP server
 ### Testing
 
 ```bash
-cargo test -q            # Run all tests
+cargo test --workspace   # Run all tests (including crates/)
+cargo test -q            # Run all tests quietly
 cargo test -q --lib      # Run library tests only
 cargo test -q <name>     # Run specific test
 ```

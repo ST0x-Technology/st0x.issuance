@@ -7,17 +7,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  rainix:
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        task: [rainix-rs-test, rainix-rs-static]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
-
+  test:
+    runs-on: ubuntu-latest
     env:
       DATABASE_URL: "sqlite:issuance.db"
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,5 +35,34 @@ jobs:
       - run: nix develop -c sqlx db create
       - run: nix develop -c sqlx migrate run
 
-      - name: Run ${{ matrix.task }}
-        run: nix develop -c ${{ matrix.task }}
+      - name: Run tests
+        run: nix develop -c cargo test --workspace
+
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+
+      - run: nix flake check
+
+      - name: Check formatting
+        run: nix develop -c cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings

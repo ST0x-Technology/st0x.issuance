@@ -37,7 +37,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rocket.workspace = true
+rocket = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 sqlite-es = { path = "crates/sqlite-es" }
