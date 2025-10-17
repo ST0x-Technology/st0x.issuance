@@ -7,10 +7,10 @@ the same module structure as `src/account/`.
 
 **File:** `src/tokenized_asset/cmd.rs`
 
-- [ ] Create `TokenizedAssetCommand` enum with `AddAsset` variant
-- [ ] Fields: `underlying: UnderlyingSymbol`, `token: TokenSymbol`,
+- [x] Create `TokenizedAssetCommand` enum with `AddAsset` variant
+- [x] Fields: `underlying: UnderlyingSymbol`, `token: TokenSymbol`,
       `network: Network`, `vault_address: VaultAddress`
-- [ ] Derive `Debug`, `Clone`, `Serialize`, `Deserialize`
+- [x] Derive `Debug`, `Clone`, `Serialize`, `Deserialize`
 
 ## Task 2. Create TokenizedAssetEvent and DomainEvent Implementation
 
