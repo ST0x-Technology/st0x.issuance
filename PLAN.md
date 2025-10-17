@@ -16,11 +16,11 @@ the same module structure as `src/account/`.
 
 **File:** `src/tokenized_asset/event.rs`
 
-- [ ] Create `TokenizedAssetEvent` enum with `AssetAdded` variant
-- [ ] Fields: Same as command + `added_at: DateTime<Utc>`
-- [ ] Implement `DomainEvent` trait (event_type = "AssetAdded", event_version =
+- [x] Create `TokenizedAssetEvent` enum with `AssetAdded` variant
+- [x] Fields: Same as command + `added_at: DateTime<Utc>`
+- [x] Implement `DomainEvent` trait (event_type = "AssetAdded", event_version =
       "1.0")
-- [ ] Derive `Debug`, `Clone`, `Serialize`, `Deserialize`, `PartialEq`
+- [x] Derive `Debug`, `Clone`, `Serialize`, `Deserialize`, `PartialEq`
 
 ## Task 3. Create VaultAddress Newtype and TokenizedAsset Aggregate
 
