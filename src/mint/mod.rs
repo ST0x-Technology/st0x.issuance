@@ -1,10 +1,12 @@
 mod api;
+mod cmd;
 
 use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 pub(crate) use api::initiate_mint;
+pub(crate) use cmd::MintCommand;
 
 pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{

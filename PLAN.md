@@ -1,8 +1,8 @@
-# Implementation Plan: Issue #15 - InitiateMint Feature
+# Implementation Plan: Issue #15 - Initiate Mint Feature
 
 ## Overview
 
-This plan implements the InitiateMint feature for the mint flow, enabling the
+This plan implements the Initiate mint feature for the mint flow, enabling the
 issuance bot to receive and validate mint requests from Alpaca. The
 implementation follows the ES/CQRS architecture already established in the
 codebase.
@@ -96,25 +96,25 @@ established in account and tokenized_asset modules.
 
 ---
 
-## Task 2. Implement InitiateMint Command
+## Task 2. Implement Initiate Command
 
 Create `src/mint/cmd.rs` with the command enum.
 
-- [ ] Create InitiateMint command with all required fields
-- [ ] Use newtype wrappers for type safety
-- [ ] Add Serialize/Deserialize derives
-- [ ] Export from mod.rs
+- [x] Create MintCommand::Initiate with all required fields
+- [x] Use newtype wrappers for type safety
+- [x] Add Serialize/Deserialize derives
+- [x] Export from mod.rs
 
 ---
 
-## Task 3. Implement MintInitiated Event
+## Task 3. Implement Initiated Event
 
 Create `src/mint/event.rs` with the event enum and DomainEvent implementation.
 
-- [ ] Create MintEvent enum with MintInitiated variant
-- [ ] Include all fields from the InitiateMint command plus generated
+- [ ] Create MintEvent enum with Initiated variant
+- [ ] Include all fields from the Initiate command plus generated
       issuer_request_id
-- [ ] Implement DomainEvent trait with event_type() returning "MintInitiated"
+- [ ] Implement DomainEvent trait with event_type() returning "Initiated"
 - [ ] Set event_version() to "1.0"
 - [ ] Add Serialize/Deserialize derives
 - [ ] Export from mod.rs
@@ -130,11 +130,11 @@ Add the Mint aggregate to `src/mint/mod.rs` with handle() and apply() methods.
 - [ ] Implement Aggregate trait with:
   - [ ] Associated types (Command, Event, Error, Services)
   - [ ] aggregate_type() returning "Mint"
-  - [ ] handle() method for InitiateMint command
+  - [ ] handle() method for MintCommand::Initiate
     - [ ] Check state is NotInitiated
     - [ ] Generate issuer_request_id using UUID v4
-    - [ ] Return vec![MintInitiated event]
-  - [ ] apply() method for MintInitiated event
+    - [ ] Return vec![MintEvent::Initiated]
+  - [ ] apply() method for MintEvent::Initiated
     - [ ] Transition from NotInitiated to Initiated state
 - [ ] Define MintError enum with appropriate error variants
 - [ ] Add comprehensive aggregate tests using TestFramework
@@ -188,7 +188,7 @@ Update `src/mint/api.rs` to connect the endpoint to the CQRS framework.
   - [ ] Validate wallet is valid Ethereum address
   - [ ] Validate network matches expected value (e.g., "base")
   - [ ] Return 400 with appropriate error message if validation fails
-- [ ] Execute InitiateMint command via CQRS framework
+- [ ] Execute MintCommand::Initiate via CQRS framework
 - [ ] Query MintView to get created mint
 - [ ] Return response with issuer_request_id and status "created"
 - [ ] Update response DTO to match Alpaca's expected format
@@ -235,11 +235,11 @@ Add comprehensive tests to `src/mint/api.rs`.
 Ensure comprehensive unit test coverage for all components.
 
 - [ ] Aggregate tests in mod.rs:
-  - [ ] InitiateMint command creates MintInitiated event
-  - [ ] Apply MintInitiated transitions state correctly
+  - [ ] MintCommand::Initiate creates MintEvent::Initiated
+  - [ ] Apply MintEvent::Initiated transitions state correctly
   - [ ] Cannot initiate already-initiated mint
 - [ ] View tests in view.rs:
-  - [ ] Update from MintInitiated event works correctly
+  - [ ] Update from MintEvent::Initiated works correctly
   - [ ] Query functions return correct results
 - [ ] Follow Given-When-Then pattern from existing tests
 
@@ -306,7 +306,7 @@ Some types are shared across modules:
 
 ### Future Extensions
 
-This plan only implements InitiateMint (the first command in the mint
+This plan only implements the Initiate command (the first command in the mint
 lifecycle). Future issues will add:
 
 - ConfirmJournal command and events
