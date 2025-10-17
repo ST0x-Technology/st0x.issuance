@@ -54,8 +54,9 @@ implemented.
 - [x] [#8](https://github.com/ST0x-Technology/st0x.issuance/issues/8) -
       Implement SqliteEventRepository in crates/sqlite-es
   - **PR:** [#40](https://github.com/ST0x-Technology/st0x.issuance/pull/40)
-- [ ] [#9](https://github.com/ST0x-Technology/st0x.issuance/issues/9) -
+- [x] [#9](https://github.com/ST0x-Technology/st0x.issuance/issues/9) -
       Implement SqliteViewRepository in crates/sqlite-es
+  - **PR:** [#40](https://github.com/ST0x-Technology/st0x.issuance/pull/40)
 
 ---
 
