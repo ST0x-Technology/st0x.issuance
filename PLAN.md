@@ -87,12 +87,12 @@ collisions.
 Add newtypes and domain types to `src/mint/mod.rs` following the pattern
 established in account and tokenized_asset modules.
 
-- [ ] Move existing types from mod.rs to proper locations
-- [ ] Add ClientId newtype (import from account module)
-- [ ] Add UnderlyingSymbol, TokenSymbol, Network newtypes (import from
+- [x] Move existing types from mod.rs to proper locations
+- [x] Add ClientId newtype (import from account module)
+- [x] Add UnderlyingSymbol, TokenSymbol, Network newtypes (import from
       tokenized_asset module)
-- [ ] Add Address type from alloy
-- [ ] Ensure all types have proper Serialize/Deserialize derives
+- [x] Add Address type from alloy
+- [x] Ensure all types have proper Serialize/Deserialize derives
 
 ---
 
