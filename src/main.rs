@@ -76,7 +76,10 @@ async fn rocket() -> _ {
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    seed_initial_assets(&tokenized_asset_cqrs).await;
+    seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
+        eprintln!("Failed to seed initial assets: {e}");
+        std::process::exit(1);
+    });
 
     rocket::build()
         .manage(account_cqrs)
@@ -91,7 +94,9 @@ async fn rocket() -> _ {
         )
 }
 
-async fn seed_initial_assets(cqrs: &TokenizedAssetCqrs) {
+async fn seed_initial_assets(
+    cqrs: &TokenizedAssetCqrs,
+) -> Result<(), Box<dyn std::error::Error>> {
     let assets = vec![
         (
             "AAPL",
@@ -121,8 +126,10 @@ async fn seed_initial_assets(cqrs: &TokenizedAssetCqrs) {
             vault_address,
         };
 
-        let _ = cqrs.execute(underlying, command).await;
+        cqrs.execute(underlying, command).await?;
     }
+
+    Ok(())
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {

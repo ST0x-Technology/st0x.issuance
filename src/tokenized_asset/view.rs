@@ -77,12 +77,7 @@ pub(crate) async fn list_enabled_assets(
         .map(|row| serde_json::from_str(&row.payload))
         .collect::<Result<_, _>>()?;
 
-    Ok(views
-        .into_iter()
-        .filter(|view| {
-            matches!(view, TokenizedAssetView::Asset { enabled: true, .. })
-        })
-        .collect())
+    Ok(views)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use tracing::error;
 
 use super::{Network, TokenSymbol, UnderlyingSymbol, view::TokenizedAssetView};
 
@@ -15,9 +16,11 @@ pub(crate) struct TokenizedAssetResponse {
 pub(crate) async fn list_tokenized_assets(
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<Vec<TokenizedAssetResponse>>, rocket::http::Status> {
-    let views = super::view::list_enabled_assets(pool.inner())
-        .await
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    let views =
+        super::view::list_enabled_assets(pool.inner()).await.map_err(|e| {
+            error!("Failed to list enabled assets: {e}");
+            rocket::http::Status::InternalServerError
+        })?;
 
     let assets = views
         .into_iter()
