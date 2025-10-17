@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Sqlite};
 
 use super::{
     Account, AccountEvent, AlpacaAccountNumber, ClientId, Email,
@@ -64,17 +64,22 @@ pub(crate) async fn find_by_client_id(
     pool: &Pool<Sqlite>,
     client_id: &ClientId,
 ) -> Result<Option<AccountView>, AccountViewError> {
-    let row = sqlx::query("SELECT payload FROM account_view WHERE view_id = ?")
-        .bind(&client_id.0)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE view_id = ?
+        "#,
+        client_id.0
+    )
+    .fetch_optional(pool)
+    .await?;
 
     let Some(row) = row else {
         return Ok(None);
     };
 
-    let payload_str: String = row.try_get("payload")?;
-    let view: AccountView = serde_json::from_str(&payload_str)?;
+    let view: AccountView = serde_json::from_str(&row.payload)?;
 
     Ok(Some(view))
 }
@@ -83,10 +88,15 @@ pub(crate) async fn find_by_email(
     pool: &Pool<Sqlite>,
     email: &Email,
 ) -> Result<Option<AccountView>, AccountViewError> {
-    let row = sqlx::query(
-        "SELECT payload FROM account_view WHERE json_extract(payload, '$.email') = ?",
+    let email_str = email.as_str();
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE json_extract(payload, '$.email') = ?
+        "#,
+        email_str
     )
-    .bind(email.as_str())
     .fetch_optional(pool)
     .await?;
 
@@ -94,8 +104,7 @@ pub(crate) async fn find_by_email(
         return Ok(None);
     };
 
-    let payload_str: String = row.try_get("payload")?;
-    let view: AccountView = serde_json::from_str(&payload_str)?;
+    let view: AccountView = serde_json::from_str(&row.payload)?;
 
     Ok(Some(view))
 }
@@ -104,10 +113,14 @@ pub(crate) async fn find_by_alpaca_account(
     pool: &Pool<Sqlite>,
     alpaca_account: &AlpacaAccountNumber,
 ) -> Result<Option<AccountView>, AccountViewError> {
-    let row = sqlx::query(
-        "SELECT payload FROM account_view WHERE json_extract(payload, '$.alpaca_account') = ?",
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE json_extract(payload, '$.alpaca_account') = ?
+        "#,
+        alpaca_account.0
     )
-    .bind(&alpaca_account.0)
     .fetch_optional(pool)
     .await?;
 
@@ -115,8 +128,7 @@ pub(crate) async fn find_by_alpaca_account(
         return Ok(None);
     };
 
-    let payload_str: String = row.try_get("payload")?;
-    let view: AccountView = serde_json::from_str(&payload_str)?;
+    let view: AccountView = serde_json::from_str(&row.payload)?;
 
     Ok(Some(view))
 }

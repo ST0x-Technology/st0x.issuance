@@ -81,8 +81,8 @@ Implement the view projection in `src/account.rs`:
   - `find_by_email()`: Look up account by email
   - `find_by_alpaca_account()`: Look up by Alpaca account number
   - `find_by_client_id()`: Look up by client_id
-- [ ] **TODO**: Switch from `sqlx::query()` to `sqlx::query!()` macro once
-      migrations are in place for compile-time SQL verification
+- [x] Switch from `sqlx::query()` to `sqlx::query!()` macro for compile-time SQL
+      verification
 
 **Design Notes:**
 
@@ -91,8 +91,7 @@ Implement the view projection in `src/account.rs`:
 - Views enable efficient queries without replaying events
 - Store as JSON in database for flexibility
 - **YAGNI**: Only handling AccountLinked event for now
-- Query methods currently use `sqlx::query()` - will be updated to `query!()`
-  after migrations
+- Query methods use `sqlx::query!()` for compile-time SQL verification
 
 ## Task 4. Add Database Migrations
 
