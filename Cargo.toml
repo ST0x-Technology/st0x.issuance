@@ -1,0 +1,21 @@
+[package]
+name = "st0x-issuance"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+enum_glob_use = "deny"
+
+# `priority = -1` allow for allowing lints enabled by a group to be re-disabled
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+doc_markdown = "allow"
+items_after_statements = "allow"
+redundant_pub_crate = "allow"
