@@ -9,8 +9,8 @@ functional account linking system.
 Issue #10 created the endpoint stub with basic types. This issue implements the
 full ES/CQRS backend:
 
-- AccountLink aggregate with commands and events
-- AccountLinkView for querying account links
+- Account aggregate with commands and events
+- AccountView for querying accounts
 - Database migrations
 - CQRS framework wiring
 - Comprehensive tests
@@ -74,13 +74,15 @@ Implement the `Aggregate` trait for `Account` in `src/account/`:
 
 Implement the view projection in `src/account.rs`:
 
-- [ ] Create `AccountView` struct with fields matching the spec
-- [ ] Implement `View` trait with `update()` method:
+- [x] Create `AccountView` struct with fields matching the spec
+- [x] Implement `View` trait with `update()` method:
   - `AccountLinked`: Create new view entry with Active status
-- [ ] Add query methods:
+- [x] Add query methods:
   - `find_by_email()`: Look up account by email
   - `find_by_alpaca_account()`: Look up by Alpaca account number
   - `find_by_client_id()`: Look up by client_id
+- [ ] **TODO**: Switch from `sqlx::query()` to `sqlx::query!()` macro once
+      migrations are in place for compile-time SQL verification
 
 **Design Notes:**
 
@@ -89,41 +91,45 @@ Implement the view projection in `src/account.rs`:
 - Views enable efficient queries without replaying events
 - Store as JSON in database for flexibility
 - **YAGNI**: Only handling AccountLinked event for now
+- Query methods currently use `sqlx::query()` - will be updated to `query!()`
+  after migrations
 
 ## Task 4. Add Database Migrations
 
-Create migration for the account_link_view table:
+Create migration for the account_view table:
 
-- [ ] Create migration file in `migrations/` directory
-- [ ] Define `account_link_view` table schema:
+- [x] Create migration file in `migrations/` directory
+- [x] Define `account_view` table schema:
   - `view_id TEXT PRIMARY KEY` (client_id)
   - `version BIGINT NOT NULL` (last event sequence applied)
   - `payload JSON NOT NULL` (view state as JSON)
-- [ ] Add indexes:
-  - `idx_account_link_email` on `json_extract(payload, '$.email')`
-  - `idx_account_link_alpaca` on `json_extract(payload, '$.alpaca_account')`
-  - `idx_account_link_status` on `json_extract(payload, '$.status')`
+- [x] Add indexes:
+  - `idx_account_view_email` on `json_extract(payload, '$.email')`
+  - `idx_account_view_alpaca` on `json_extract(payload, '$.alpaca_account')`
+  - `idx_account_view_status` on `json_extract(payload, '$.status')`
 
 **Design Notes:**
 
 - Follows the same pattern as other view tables (mint_view, redemption_view)
 - JSON storage allows flexible schema evolution
 - Indexes enable efficient lookups by email and Alpaca account
+- **DDD Naming**: Table is `account_view` (not `account_link_view`) because the
+  aggregate is `Account` - linking is just one operation on the account
 
 ## Task 5. Wire Up CQRS Framework
 
 Integrate the aggregate and view with the CQRS framework:
 
 - [ ] Update `src/main.rs` to create database connection pool
-- [ ] Create `SqliteEventRepository` for AccountLink aggregate
-- [ ] Create `SqliteViewRepository` for AccountLinkView
+- [ ] Create `SqliteEventRepository` for Account aggregate
+- [ ] Create `SqliteViewRepository` for AccountView
 - [ ] Wire up `CqrsFramework` with event store and views
 - [ ] Pass framework to the endpoint handler via Rocket state
 
 **Design Notes:**
 
 - Use `sqlite_cqrs()` helper from sqlite-es crate
-- Register AccountLinkView with framework
+- Register AccountView with framework
 - Store framework in Rocket state for access from endpoints
 - Framework handles command execution and view updates
 
@@ -163,7 +169,7 @@ Write Given-When-Then tests for the aggregate:
 - Use `cqrs_es::test::TestFramework` for aggregate testing
 - Given-When-Then pattern makes tests clear and maintainable
 - Test both happy paths and error cases
-- Mock services if needed (though AccountLink doesn't need external services)
+- Mock services if needed (though Account doesn't need external services)
 - **YAGNI**: Only testing LinkAccount command for now
 
 ## Task 8. Add View Tests

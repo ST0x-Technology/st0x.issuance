@@ -90,10 +90,17 @@ time-travel debugging, and provide a single source of truth for all operations.
 
 ### Database Management
 
+- **CRITICAL: Always use `sqlx migrate add` to create migrations** - NEVER
+  manually create migration files
+  - `sqlx migrate add` automatically generates the migration file with proper
+    timestamp
+  - Example: `sqlx migrate add create_account_view` (NOT manually creating
+    `20251017000000_create_account_view.sql`)
+  - After the file is created, edit it to add the SQL
 - `sqlx db create` - Create the database
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration
-- `sqlx migrate reset -y` - Drop the database and re-run all migrations
+- `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
 
 ### Development Tools
@@ -602,16 +609,16 @@ CREATE TABLE redemption_view (
 CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
 CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
 
--- Account link view: current account links
-CREATE TABLE account_link_view (
+-- Account view: current account state
+CREATE TABLE account_view (
     view_id TEXT PRIMARY KEY,         -- client_id
     version BIGINT NOT NULL,
     payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
 );
 
-CREATE INDEX idx_account_link_email ON account_link_view(json_extract(payload, '$.email'));
-CREATE INDEX idx_account_link_alpaca ON account_link_view(json_extract(payload, '$.alpaca_account'));
-CREATE INDEX idx_account_link_status ON account_link_view(json_extract(payload, '$.status'));
+CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
+CREATE INDEX idx_account_view_alpaca ON account_view(json_extract(payload, '$.alpaca_account'));
+CREATE INDEX idx_account_view_status ON account_view(json_extract(payload, '$.status'));
 
 -- Tokenized asset view: current supported assets
 CREATE TABLE tokenized_asset_view (
