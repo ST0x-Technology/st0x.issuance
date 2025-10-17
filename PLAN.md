@@ -143,17 +143,16 @@ Add the Mint aggregate to `src/mint/mod.rs` with handle() and apply() methods.
 
 ---
 
-## Task 5. Implement MintView
+## Task 5. Create Database Migration
 
-Create `src/mint/view.rs` with the view struct and View trait implementation.
+Create migration for mint_view table following the established pattern.
 
-- [ ] Define MintView enum mirroring aggregate states
-- [ ] Implement Default trait returning Unavailable
-- [ ] Implement View&lt;Mint&gt; trait with update() method
-- [ ] Add helper query functions:
-  - [ ] find_by_issuer_request_id() for querying specific mints
-- [ ] Add view update tests
-- [ ] Export from mod.rs
+- [x] Run `sqlx migrate add create_mint_view`
+- [x] Add CREATE TABLE statement with view_id, version, payload columns
+- [x] Add indexes for common query patterns:
+  - [x] Index on client_id (extracted from JSON)
+  - [x] Index on underlying symbol (extracted from JSON)
+  - [x] Index on tokenization_request_id (extracted from JSON)
 
 ---
 
