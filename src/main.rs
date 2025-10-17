@@ -121,7 +121,7 @@ async fn seed_initial_assets(
     ];
 
     for (underlying, token, network, vault_address) in assets {
-        let command = tokenized_asset::TokenizedAssetCommand::AddAsset {
+        let command = tokenized_asset::TokenizedAssetCommand::Add {
             underlying: tokenized_asset::UnderlyingSymbol::new(underlying),
             token: tokenized_asset::TokenSymbol::new(token),
             network: tokenized_asset::Network::new(network),

@@ -5,7 +5,7 @@ use super::{Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedAssetCommand {
-    AddAsset {
+    Add {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,

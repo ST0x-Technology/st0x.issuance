@@ -111,13 +111,14 @@ Create `src/mint/cmd.rs` with the command enum.
 
 Create `src/mint/event.rs` with the event enum and DomainEvent implementation.
 
-- [ ] Create MintEvent enum with Initiated variant
-- [ ] Include all fields from the Initiate command plus generated
+- [x] Create MintEvent enum with Initiated variant
+- [x] Include all fields from the Initiate command plus generated
       issuer_request_id
-- [ ] Implement DomainEvent trait with event_type() returning "Initiated"
-- [ ] Set event_version() to "1.0"
-- [ ] Add Serialize/Deserialize derives
-- [ ] Export from mod.rs
+- [x] Implement DomainEvent trait with event_type() returning
+      "MintEvent::Initiated"
+- [x] Set event_version() to "1.0"
+- [x] Add Serialize/Deserialize derives
+- [x] Export from mod.rs
 
 ---
 

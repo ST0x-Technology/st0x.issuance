@@ -39,7 +39,7 @@ impl Default for TokenizedAssetView {
 impl View<TokenizedAsset> for TokenizedAssetView {
     fn update(&mut self, event: &EventEnvelope<TokenizedAsset>) {
         match &event.payload {
-            TokenizedAssetEvent::AssetAdded {
+            TokenizedAssetEvent::Added {
                 underlying,
                 token,
                 network,
@@ -113,7 +113,7 @@ mod tests {
             address!("0x1234567890abcdef1234567890abcdef12345678");
         let added_at = Utc::now();
 
-        let event = TokenizedAssetEvent::AssetAdded {
+        let event = TokenizedAssetEvent::Added {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),

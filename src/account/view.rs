@@ -38,7 +38,7 @@ impl Default for AccountView {
 impl View<Account> for AccountView {
     fn update(&mut self, event: &EventEnvelope<Account>) {
         match &event.payload {
-            AccountEvent::AccountLinked {
+            AccountEvent::Linked {
                 client_id,
                 email,
                 alpaca_account,
@@ -110,7 +110,7 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
         let linked_at = Utc::now();
 
-        let event = AccountEvent::AccountLinked {
+        let event = AccountEvent::Linked {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),

@@ -4,5 +4,5 @@ use super::{AlpacaAccountNumber, Email};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum AccountCommand {
-    LinkAccount { email: Email, alpaca_account: AlpacaAccountNumber },
+    Link { email: Email, alpaca_account: AlpacaAccountNumber },
 }

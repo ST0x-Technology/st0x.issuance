@@ -7,7 +7,7 @@ use super::{Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetEvent {
-    AssetAdded {
+    Added {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
@@ -19,7 +19,7 @@ pub(crate) enum TokenizedAssetEvent {
 impl DomainEvent for TokenizedAssetEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::AssetAdded { .. } => "AssetAdded".to_string(),
+            Self::Added { .. } => "TokenizedAssetEvent::Added".to_string(),
         }
     }
 

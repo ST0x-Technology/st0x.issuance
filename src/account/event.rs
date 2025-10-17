@@ -6,7 +6,7 @@ use super::{AlpacaAccountNumber, ClientId, Email};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum AccountEvent {
-    AccountLinked {
+    Linked {
         client_id: ClientId,
         email: Email,
         alpaca_account: AlpacaAccountNumber,
@@ -17,7 +17,7 @@ pub(crate) enum AccountEvent {
 impl DomainEvent for AccountEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::AccountLinked { .. } => "AccountLinked".to_string(),
+            Self::Linked { .. } => "AccountEvent::Linked".to_string(),
         }
     }
 

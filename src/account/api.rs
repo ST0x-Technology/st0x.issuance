@@ -21,7 +21,7 @@ pub(crate) async fn connect_account(
     request: Json<AccountLinkRequest>,
 ) -> Result<Json<AccountLinkResponse>, rocket::http::Status> {
     let aggregate_id = request.email.as_str();
-    let command = super::AccountCommand::LinkAccount {
+    let command = super::AccountCommand::Link {
         email: request.email.clone(),
         alpaca_account: request.account.clone(),
     };
@@ -284,7 +284,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].aggregate_id, email);
-        assert_eq!(events[0].event_type, "AccountLinked");
+        assert_eq!(events[0].event_type, "AccountEvent::Linked");
         assert_eq!(events[0].sequence, 1);
     }
 
