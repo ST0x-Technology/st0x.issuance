@@ -113,6 +113,7 @@ First part of mint flow - receive and validate mint requests from Alpaca.
   - **PR:** [#46](https://github.com/ST0x-Technology/st0x.issuance/pull/46)
 - [x] [#15](https://github.com/ST0x-Technology/st0x.issuance/issues/15) -
       Implement InitiateMint feature and connect endpoint
+  - **PR:** [#47](https://github.com/ST0x-Technology/st0x.issuance/pull/47)
 
 ---
 
@@ -127,8 +128,9 @@ callback.
 
 ### Issues
 
-- [ ] [#16](https://github.com/ST0x-Technology/st0x.issuance/issues/16) - Add
+- [x] [#16](https://github.com/ST0x-Technology/st0x.issuance/issues/16) - Add
       POST /inkind/issuance/confirm endpoint stub
+  - **PR:** [#48](https://github.com/ST0x-Technology/st0x.issuance/pull/48)
 - [ ] [#17](https://github.com/ST0x-Technology/st0x.issuance/issues/17) -
       Implement ConfirmJournal and RejectJournal features
 - [ ] [#18](https://github.com/ST0x-Technology/st0x.issuance/issues/18) -
