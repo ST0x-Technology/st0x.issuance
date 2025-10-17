@@ -24,9 +24,12 @@ pub(crate) struct AccountView {
     pub(crate) alpaca_account: AlpacaAccountNumber,
     pub(crate) status: LinkedAccountStatus,
     pub(crate) linked_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
 }
 
+// Required by cqrs_es::View trait. This Default impl creates a placeholder view
+// with invalid domain values (empty strings, UNIX_EPOCH timestamp) that should
+// never be used directly. The cqrs-es framework uses Default::default() internally
+// when constructing views, but immediately populates them via the update() method.
 impl Default for AccountView {
     fn default() -> Self {
         Self {
@@ -35,7 +38,6 @@ impl Default for AccountView {
             alpaca_account: AlpacaAccountNumber(String::new()),
             status: LinkedAccountStatus::Active,
             linked_at: DateTime::UNIX_EPOCH,
-            updated_at: DateTime::UNIX_EPOCH,
         }
     }
 }
@@ -54,7 +56,6 @@ impl View<Account> for AccountView {
                 self.alpaca_account = alpaca_account.clone();
                 self.status = LinkedAccountStatus::Active;
                 self.linked_at = *linked_at;
-                self.updated_at = *linked_at;
             }
         }
     }
@@ -69,7 +70,7 @@ pub(crate) async fn find_by_email(
         r#"
         SELECT payload as "payload: String"
         FROM account_view
-        WHERE json_extract(payload, '$.email') = ?
+        WHERE email_indexed = ?
         "#,
         email_str
     )
@@ -89,8 +90,23 @@ pub(crate) async fn find_by_email(
 mod tests {
     use super::*;
     use cqrs_es::EventEnvelope;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+
+    async fn setup_test_db() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
 
     #[test]
     fn test_view_update_from_account_linked_event() {
@@ -121,21 +137,11 @@ mod tests {
         assert_eq!(view.alpaca_account, alpaca_account);
         assert_eq!(view.status, LinkedAccountStatus::Active);
         assert_eq!(view.linked_at, linked_at);
-        assert_eq!(view.updated_at, linked_at);
     }
 
     #[tokio::test]
     async fn test_find_by_email_returns_view() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
+        let pool = setup_test_db().await;
 
         let client_id = ClientId("test-client-456".to_string());
         let email = Email("test@example.com".to_string());
@@ -148,7 +154,6 @@ mod tests {
             alpaca_account: alpaca_account.clone(),
             status: LinkedAccountStatus::Active,
             linked_at,
-            updated_at: linked_at,
         };
 
         let payload =
@@ -179,16 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_email_returns_none_when_not_found() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
+        let pool = setup_test_db().await;
 
         let email = Email("nonexistent@example.com".to_string());
 

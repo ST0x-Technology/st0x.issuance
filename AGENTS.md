@@ -343,8 +343,23 @@ Environment variables (can be set via `.env` file):
   do top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
-- **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase
+- **CRITICAL: Zero Tolerance for Panics in Non-Test Code**: This is a
+  mission-critical financial application. ANY panic in production code is
+  completely unacceptable and can lead to catastrophic failures.
+  - **FORBIDDEN**: `unwrap()`, `expect()`, `panic!()`, `unreachable!()`,
+    `unimplemented!()` in any non-test code
+  - **FORBIDDEN**: Index operations that can panic (e.g., `vec[i]`), use
+    `.get(i)` instead
+  - **FORBIDDEN**: Division operations without checking for zero
+  - **FORBIDDEN**: Any operation that can panic at runtime
+  - **REQUIRED**: Use `?` operator for proper error propagation
+  - **REQUIRED**: Use `Result` and `Option` with explicit error handling
+  - **REQUIRED**: All fallible operations must return `Result` with descriptive
+    errors
+  - **Exception**: `unwrap()` and `expect()` are ONLY allowed in test code
+    (`#[cfg(test)]` modules and `#[test]` functions)
+  - Panics in production code are deployment-blocking bugs that must be fixed
+    immediately
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the

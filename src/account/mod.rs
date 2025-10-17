@@ -18,9 +18,19 @@ pub(crate) struct Email(String);
 
 impl Email {
     pub(crate) fn new(email: String) -> Result<Self, AccountError> {
-        if !email.contains('@') {
+        let parts: Vec<&str> = email.split('@').collect();
+
+        if parts.len() != 2 {
             return Err(AccountError::InvalidEmail { email });
         }
+
+        let local = parts[0];
+        let domain = parts[1];
+
+        if local.is_empty() || domain.is_empty() {
+            return Err(AccountError::InvalidEmail { email });
+        }
+
         Ok(Self(email))
     }
 
@@ -60,7 +70,6 @@ pub(crate) enum Account {
         alpaca_account: AlpacaAccountNumber,
         status: LinkedAccountStatus,
         linked_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
     },
 }
 
@@ -121,7 +130,6 @@ impl Aggregate for Account {
                     alpaca_account,
                     status: LinkedAccountStatus::Active,
                     linked_at,
-                    updated_at: linked_at,
                 };
             }
         }
@@ -222,15 +230,37 @@ mod tests {
 
     #[test]
     fn test_email_smart_constructor_validates() {
-        let result = Email::new("not-an-email".to_string());
-
         assert!(matches!(
-            result,
+            Email::new("not-an-email".to_string()),
             Err(AccountError::InvalidEmail { email }) if email == "not-an-email"
         ));
 
-        let valid_result = Email::new("user@example.com".to_string());
-        assert!(valid_result.is_ok());
+        assert!(matches!(
+            Email::new("@".to_string()),
+            Err(AccountError::InvalidEmail { email }) if email == "@"
+        ));
+
+        assert!(matches!(
+            Email::new("user@".to_string()),
+            Err(AccountError::InvalidEmail { email }) if email == "user@"
+        ));
+
+        assert!(matches!(
+            Email::new("@domain".to_string()),
+            Err(AccountError::InvalidEmail { email }) if email == "@domain"
+        ));
+
+        assert!(matches!(
+            Email::new("user@@domain.com".to_string()),
+            Err(AccountError::InvalidEmail { email }) if email == "user@@domain.com"
+        ));
+
+        assert!(matches!(
+            Email::new("user@domain@com".to_string()),
+            Err(AccountError::InvalidEmail { email }) if email == "user@domain@com"
+        ));
+
+        assert!(Email::new("user@example.com".to_string()).is_ok());
     }
 
     #[test]
@@ -276,14 +306,12 @@ mod tests {
                 alpaca_account: linked_alpaca,
                 status,
                 linked_at: linked_at_timestamp,
-                updated_at,
             } => {
                 assert_eq!(linked_client_id, client_id);
                 assert_eq!(linked_email, email);
                 assert_eq!(linked_alpaca, alpaca_account);
                 assert_eq!(status, LinkedAccountStatus::Active);
                 assert_eq!(linked_at_timestamp, linked_at);
-                assert_eq!(updated_at, linked_at);
             }
             Account::NotLinked => panic!("Expected account to be linked"),
         }

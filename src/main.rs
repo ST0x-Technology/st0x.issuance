@@ -38,7 +38,15 @@ struct Config {
 async fn rocket() -> _ {
     let config = Config::parse();
 
-    let pool = create_pool(&config).await;
+    let pool = create_pool(&config).await.unwrap_or_else(|e| {
+        eprintln!("Failed to create database pool: {e}");
+        std::process::exit(1);
+    });
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap_or_else(|e| {
+        eprintln!("Failed to run database migrations: {e}");
+        std::process::exit(1);
+    });
 
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
@@ -57,10 +65,9 @@ async fn rocket() -> _ {
         .mount("/", routes![account::connect_account])
 }
 
-async fn create_pool(config: &Config) -> Pool<Sqlite> {
+async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
     SqlitePoolOptions::new()
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
-        .expect("Failed to create database pool")
 }
