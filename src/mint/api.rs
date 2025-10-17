@@ -12,7 +12,6 @@ use super::{
 use crate::account::{
     AccountView, LinkedAccountStatus, view::find_by_client_id,
 };
-use crate::tokenized_asset::{TokenizedAssetView, view::list_enabled_assets};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MintRequest {
@@ -184,26 +183,31 @@ async fn validate_asset_exists(
     token: &TokenSymbol,
     network: &Network,
 ) -> Result<(), MintApiError> {
-    let enabled_assets = list_enabled_assets(pool).await.map_err(|e| {
-        error!("Failed to list enabled assets: {e}");
-        MintApiError::AssetQueryFailed(e)
+    let underlying_str = &underlying.0;
+    let token_str = &token.0;
+    let network_str = &network.0;
+
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) as "count: i64"
+        FROM tokenized_asset_view
+        WHERE json_extract(payload, '$.Asset.underlying') = ?
+            AND json_extract(payload, '$.Asset.token') = ?
+            AND json_extract(payload, '$.Asset.network') = ?
+            AND json_extract(payload, '$.Asset.enabled') = 1
+        "#,
+        underlying_str,
+        token_str,
+        network_str
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to query asset: {e}");
+        MintApiError::AssetQueryFailed(e.into())
     })?;
 
-    let asset_exists = enabled_assets.iter().any(|asset| match asset {
-        TokenizedAssetView::Asset {
-            underlying: asset_underlying,
-            token: asset_token,
-            network: asset_network,
-            ..
-        } => {
-            *asset_underlying == *underlying
-                && *asset_token == *token
-                && *asset_network == *network
-        }
-        TokenizedAssetView::Unavailable => false,
-    });
-
-    if !asset_exists {
+    if count == 0 {
         return Err(MintApiError::AssetNotAvailable);
     }
 

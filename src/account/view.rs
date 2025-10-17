@@ -90,7 +90,7 @@ pub(crate) async fn find_by_client_id(
         r#"
         SELECT payload as "payload: String"
         FROM account_view
-        WHERE json_extract(payload, '$.Account.client_id') = ?
+        WHERE client_id_indexed = ?
         "#,
         client_id_str
     )
@@ -235,6 +235,74 @@ mod tests {
 
         let result =
             find_by_email(&pool, &email).await.expect("Query should succeed");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_client_id_returns_view() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId("test-client-789".to_string());
+        let email = Email("client@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
+        let linked_at = Utc::now();
+
+        let view = AccountView::Account {
+            client_id: client_id.clone(),
+            email: email.clone(),
+            alpaca_account: alpaca_account.clone(),
+            status: LinkedAccountStatus::Active,
+            linked_at,
+        };
+
+        let payload =
+            serde_json::to_string(&view).expect("Failed to serialize view");
+
+        sqlx::query!(
+            r"
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            client_id.0,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert view");
+
+        let result = find_by_client_id(&pool, &client_id)
+            .await
+            .expect("Query should succeed");
+
+        assert!(result.is_some());
+
+        let AccountView::Account {
+            client_id: found_client_id,
+            email: found_email,
+            alpaca_account: found_alpaca,
+            status,
+            linked_at: _,
+        } = result.unwrap()
+        else {
+            panic!("Expected Account, got Unavailable")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+        assert_eq!(found_alpaca, alpaca_account);
+        assert_eq!(status, LinkedAccountStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_client_id_returns_none_when_not_found() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId("nonexistent-client".to_string());
+
+        let result = find_by_client_id(&pool, &client_id)
+            .await
+            .expect("Query should succeed");
 
         assert!(result.is_none());
     }
