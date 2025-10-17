@@ -103,7 +103,8 @@ async fn rocket() -> _ {
             routes![
                 account::connect_account,
                 tokenized_asset::list_tokenized_assets,
-                mint::initiate_mint
+                mint::initiate_mint,
+                mint::confirm_journal
             ],
         )
 }

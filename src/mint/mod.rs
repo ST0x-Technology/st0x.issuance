@@ -10,7 +10,7 @@ use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-pub(crate) use api::initiate_mint;
+pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
 pub(crate) use view::MintView;
