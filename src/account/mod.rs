@@ -11,8 +11,27 @@ use uuid::Uuid;
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Email(pub(crate) String);
+
+impl Email {
+    pub(crate) fn new(email: String) -> Result<Self, AccountError> {
+        if !email.contains('@') {
+            return Err(AccountError::InvalidEmail { email });
+        }
+        Ok(Self(email))
+    }
+}
+
+impl<'de> Deserialize<'de> for Email {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Email::new(s).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
@@ -63,10 +82,6 @@ impl Aggregate for Account {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             AccountCommand::LinkAccount { email, alpaca_account } => {
-                if !is_valid_email(&email.0) {
-                    return Err(AccountError::InvalidEmail { email: email.0 });
-                }
-
                 if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
                         email: email.0,
@@ -105,10 +120,6 @@ impl Aggregate for Account {
             }
         }
     }
-}
-
-fn is_valid_email(email: &str) -> bool {
-    email.contains('@')
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
