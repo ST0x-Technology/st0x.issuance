@@ -29,17 +29,14 @@ pub(crate) enum LinkedAccountStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Account {
     NotLinked,
-    Linked(LinkedAccount),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LinkedAccount {
-    pub(crate) client_id: ClientId,
-    pub(crate) email: Email,
-    pub(crate) alpaca_account: AlpacaAccountNumber,
-    pub(crate) status: LinkedAccountStatus,
-    pub(crate) linked_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
+    Linked {
+        client_id: ClientId,
+        email: Email,
+        alpaca_account: AlpacaAccountNumber,
+        status: LinkedAccountStatus,
+        linked_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Account {
@@ -70,7 +67,7 @@ impl Aggregate for Account {
                     return Err(AccountError::InvalidEmail { email: email.0 });
                 }
 
-                if matches!(self, Self::Linked(_)) {
+                if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
                         email: email.0,
                     });
@@ -97,14 +94,14 @@ impl Aggregate for Account {
                 alpaca_account,
                 linked_at,
             } => {
-                *self = Self::Linked(LinkedAccount {
+                *self = Self::Linked {
                     client_id,
                     email,
                     alpaca_account,
                     status: LinkedAccountStatus::Active,
                     linked_at,
                     updated_at: linked_at,
-                });
+                };
             }
         }
     }
@@ -246,13 +243,20 @@ mod tests {
         });
 
         match account {
-            Account::Linked(linked) => {
-                assert_eq!(linked.client_id, client_id);
-                assert_eq!(linked.email, email);
-                assert_eq!(linked.alpaca_account, alpaca_account);
-                assert_eq!(linked.status, LinkedAccountStatus::Active);
-                assert_eq!(linked.linked_at, linked_at);
-                assert_eq!(linked.updated_at, linked_at);
+            Account::Linked {
+                client_id: linked_client_id,
+                email: linked_email,
+                alpaca_account: linked_alpaca,
+                status,
+                linked_at: linked_at_timestamp,
+                updated_at,
+            } => {
+                assert_eq!(linked_client_id, client_id);
+                assert_eq!(linked_email, email);
+                assert_eq!(linked_alpaca, alpaca_account);
+                assert_eq!(status, LinkedAccountStatus::Active);
+                assert_eq!(linked_at_timestamp, linked_at);
+                assert_eq!(updated_at, linked_at);
             }
             Account::NotLinked => panic!("Expected account to be linked"),
         }
