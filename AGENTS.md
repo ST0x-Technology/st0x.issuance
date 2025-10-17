@@ -70,6 +70,17 @@ time-travel debugging, and provide a single source of truth for all operations.
 - `cargo build` - Build the project
 - `cargo run` - Run the HTTP server
 
+### Dependency Management
+
+- **CRITICAL: Always use `cargo add` to add dependencies** - NEVER manually edit
+  version numbers in Cargo.toml
+  - `cargo add` automatically selects the latest compatible version
+  - Once `cargo add` has determined the version, you can then modify Cargo.toml
+    with that knowledge if needed
+  - Example: `cargo add chrono` (NOT manually adding `chrono = "0.4.40"`)
+  - For workspace dependencies: `cargo add --workspace chrono`, then add to
+    package with `chrono.workspace = true`
+
 ### Testing
 
 - `cargo test --workspace` - Run all tests (including crates/)
@@ -79,10 +90,17 @@ time-travel debugging, and provide a single source of truth for all operations.
 
 ### Database Management
 
+- **CRITICAL: Always use `sqlx migrate add` to create migrations** - NEVER
+  manually create migration files
+  - `sqlx migrate add` automatically generates the migration file with proper
+    timestamp
+  - Example: `sqlx migrate add create_account_view` (NOT manually creating
+    `20251017000000_create_account_view.sql`)
+  - After the file is created, edit it to add the SQL
 - `sqlx db create` - Create the database
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration
-- `sqlx migrate reset -y` - Drop the database and re-run all migrations
+- `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
 
 ### Development Tools
@@ -111,7 +129,7 @@ Segregation (CQRS)** patterns as its architectural foundation.
 **Core Concepts:**
 
 - **Aggregates**: Business entities that encapsulate state and business logic
-  (e.g., `Mint`, `Redemption`, `AccountLink`, `TokenizedAsset`)
+  (e.g., `Mint`, `Redemption`, `Account`, `TokenizedAsset`)
 - **Commands**: Requests to perform actions, representing user or system intent
   (e.g., `InitiateMint`, `ConfirmJournal`)
 - **Events**: Immutable facts about what happened, always in past tense (e.g.,
@@ -153,6 +171,17 @@ Command → Aggregate.handle() → Validate & Produce Events → Persist Events
 - **Single Source of Truth**: Event store is authoritative; all other data is
   derived
 
+**CRITICAL: Events Are Permanent:**
+
+- **Events can NEVER be removed or changed** once committed to the event store
+- Changing event schemas requires complex migration/upcasting strategies
+- Think carefully before adding new event types - they are a permanent addition
+- **Only add events you actually need NOW** - you can always add more later
+- You can change aggregates, views, and commands freely, but events are forever
+- Ask yourself: "Do I need this event for a feature I'm implementing right now?"
+  If not, don't add it yet
+- YAGNI (You Aren't Gonna Need It) applies especially to events
+
 ### Aggregates
 
 **Mint Aggregate**: Manages the complete lifecycle of a mint operation, from
@@ -161,7 +190,7 @@ initial request through journal confirmation to on-chain minting and callback.
 **Redemption Aggregate**: Manages the redemption lifecycle, from detecting an
 on-chain transfer through calling Alpaca to burning tokens.
 
-**AccountLink Aggregate**: Manages the relationship between AP accounts and our
+**Account Aggregate**: Manages the relationship between AP accounts and our
 system.
 
 **TokenizedAsset Aggregate**: Manages which assets are supported for
@@ -254,18 +283,42 @@ Environment variables (can be set via `.env` file):
 
 ### Code Quality & Best Practices
 
+- **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
+  language primitives or technical layers. ALWAYS organize by business
+  feature/domain.
+  - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
+    `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs` (when used
+    as catch-all technical layer modules)
+  - **CORRECT**: `account.rs`, `mint.rs`, `redemption.rs` (organized by business
+    domain), with submodules like `account/cmd.rs`, `account/event.rs` if needed
+  - Each feature module should contain ALL related code: types, errors,
+    commands, events, aggregates, views, and endpoints
+  - This makes it easy to understand and modify a feature without jumping
+    between unrelated files
+  - Example: `src/account/` contains everything related to account linking -
+    newtypes (Email, ClientId), commands (LinkAccount), events (AccountLinked),
+    aggregate (Account), view (AccountView), errors (AccountError), and endpoint
+    (connect_account)
 - **Event-Driven Architecture**: Commands produce events which update views
 - **SQLite Persistence**: Event store and view repositories backed by SQLite
 - **Comprehensive Error Handling**: Custom error types with proper propagation
-- **Type Modeling**: Make invalid states unrepresentable through the type
-  system. Use algebraic data types (ADTs) and enums to encode business rules and
-  state transitions directly in types rather than relying on runtime validation.
-  Examples:
-  - Use enum variants to represent mutually exclusive states instead of multiple
-    boolean flags
-  - Encode state-specific data within enum variants rather than using nullable
-    fields
-  - Use newtypes for domain concepts to prevent mixing incompatible values
+- **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
+  principle of type modeling in this codebase. Use algebraic data types (ADTs)
+  and enums to encode business rules and state transitions directly in types
+  rather than relying on runtime validation.
+  - **FORBIDDEN**: Aggregates or domain types with all/most fields as `Option`
+    (e.g., `struct Foo { a: Option<A>, b: Option<B>, c: Option<C> }`)
+  - **FORBIDDEN**: Multiple nullable fields that can contradict each other
+  - **FORBIDDEN**: String-based status fields with Option fields that should be
+    present for certain statuses
+  - **CORRECT**: Use enum variants to represent mutually exclusive states
+  - **CORRECT**: Encode state-specific data within enum variants rather than
+    using nullable fields
+  - **CORRECT**: Use newtypes for domain concepts to prevent mixing incompatible
+    values
+  - Example: An aggregate that can be NotLinked or Linked should be
+    `enum Account { NotLinked, Linked { client_id, email, ... } }`, NOT
+    `struct Account { client_id: Option<ClientId>, email: Option<Email>, ... }`
   - Leverage the type system to enforce invariants at compile time
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
@@ -290,8 +343,23 @@ Environment variables (can be set via `.env` file):
   do top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
-- **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase
+- **CRITICAL: Zero Tolerance for Panics in Non-Test Code**: This is a
+  mission-critical financial application. ANY panic in production code is
+  completely unacceptable and can lead to catastrophic failures.
+  - **FORBIDDEN**: `unwrap()`, `expect()`, `panic!()`, `unreachable!()`,
+    `unimplemented!()` in any non-test code
+  - **FORBIDDEN**: Index operations that can panic (e.g., `vec[i]`), use
+    `.get(i)` instead
+  - **FORBIDDEN**: Division operations without checking for zero
+  - **FORBIDDEN**: Any operation that can panic at runtime
+  - **REQUIRED**: Use `?` operator for proper error propagation
+  - **REQUIRED**: Use `Result` and `Option` with explicit error handling
+  - **REQUIRED**: All fallible operations must return `Result` with descriptive
+    errors
+  - **Exception**: `unwrap()` and `expect()` are ONLY allowed in test code
+    (`#[cfg(test)]` modules and `#[test]` functions)
+  - Panics in production code are deployment-blocking bugs that must be fixed
+    immediately
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the
@@ -498,7 +566,7 @@ source of truth.
 ```sql
 -- Events table: stores all domain events
 CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'AccountLink', 'TokenizedAsset'
+    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'Account', 'TokenizedAsset'
     aggregate_id TEXT NOT NULL,        -- Unique identifier for the aggregate instance
     sequence BIGINT NOT NULL,          -- Sequence number for this aggregate (starts at 1)
     event_type TEXT NOT NULL,          -- Event name (e.g., 'MintInitiated', 'TokensMinted')
@@ -556,16 +624,16 @@ CREATE TABLE redemption_view (
 CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
 CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
 
--- Account link view: current account links
-CREATE TABLE account_link_view (
+-- Account view: current account state
+CREATE TABLE account_view (
     view_id TEXT PRIMARY KEY,         -- client_id
     version BIGINT NOT NULL,
     payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
 );
 
-CREATE INDEX idx_account_link_email ON account_link_view(json_extract(payload, '$.email'));
-CREATE INDEX idx_account_link_alpaca ON account_link_view(json_extract(payload, '$.alpaca_account'));
-CREATE INDEX idx_account_link_status ON account_link_view(json_extract(payload, '$.status'));
+CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
+CREATE INDEX idx_account_view_alpaca ON account_view(json_extract(payload, '$.alpaca_account'));
+CREATE INDEX idx_account_view_status ON account_view(json_extract(payload, '$.status'));
 
 -- Tokenized asset view: current supported assets
 CREATE TABLE tokenized_asset_view (
@@ -733,16 +801,16 @@ quantities.
 
 ### CRITICAL: Lint Policy
 
-**NEVER add `#[allow(clippy::*)]` attributes or disable any lints without
-explicit permission.** This is strictly forbidden. When clippy reports issues,
-you MUST fix the underlying code problems, not suppress the warnings.
+**NEVER add `#[allow(...)]` attributes or disable any lints without explicit
+user permission.** This applies to ALL lint attributes:
 
-**Required approach for clippy issues:**
+**Required approach for lint/warning issues:**
 
 1. **Refactor the code** to address the root cause of the lint violation
 2. **Break down large functions** into smaller, more focused functions
 3. **Improve code structure** to meet clippy's standards
 4. **Use proper error handling** instead of suppressing warnings
+5. **Remove unused code** instead of allowing dead_code warnings
 
 **Examples of FORBIDDEN practices:**
 
@@ -753,6 +821,12 @@ fn large_function() { /* ... */ }
 
 #[allow(clippy::needless_continue)]
 // ❌ NEVER DO THIS - Fix the code structure instead
+
+#[allow(dead_code)]
+struct Unused { /* ... */ }  // ❌ Remove the unused code instead
+
+#[allow(unused_imports)]
+use some_module::Thing;  // ❌ Remove the unused import instead
 ```
 
 **Required approach:**

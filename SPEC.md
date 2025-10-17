@@ -273,9 +273,9 @@ on-chain transfer through calling Alpaca to burning tokens.
 | `RecordBurnFailure`     | `BurningFailed`<br/>`RedemptionFailed`        | Two events - burn failed AND redemption failed        |
 | `MarkFailed`            | `RedemptionFailed`                            | Single event - mark redemption as failed              |
 
-### AccountLink Aggregate
+### Account Aggregate
 
-The `AccountLink` aggregate manages the relationship between AP accounts and our
+The `Account` aggregate manages the relationship between AP accounts and our
 system.
 
 **Aggregate State:**
@@ -283,32 +283,23 @@ system.
 - `client_id`: Our identifier for the linked account
 - `email`: AP's email address
 - `alpaca_account`: Alpaca account number
-- `status`: Active, suspended, or inactive
+- `status`: Active or inactive
 - Timestamps
 
 **Commands:**
 
 - `LinkAccount { email, alpaca_account }` - Create new account link
-- `UnlinkAccount { client_id }` - Remove account link
-- `SuspendAccount { client_id, reason }` - Temporarily suspend account
-- `ReactivateAccount { client_id }` - Reactivate suspended account
 
 **Events:**
 
-- `AccountLinked { client_id, email, alpaca_account }` - Account successfully
-  linked
-- `AccountUnlinked { client_id }` - Account link removed
-- `AccountSuspended { client_id, reason }` - Account suspended
-- `AccountReactivated { client_id }` - Account reactivated
+- `AccountLinked { client_id, email, alpaca_account, linked_at }` - Account
+  successfully linked
 
 **Command → Event Mappings:**
 
-| Command             | Events Produced      | Notes                         |
-| ------------------- | -------------------- | ----------------------------- |
-| `LinkAccount`       | `AccountLinked`      | New account link created      |
-| `UnlinkAccount`     | `AccountUnlinked`    | Account link removed          |
-| `SuspendAccount`    | `AccountSuspended`   | Account temporarily suspended |
-| `ReactivateAccount` | `AccountReactivated` | Suspended account reactivated |
+| Command       | Events Produced | Notes                    |
+| ------------- | --------------- | ------------------------ |
+| `LinkAccount` | `AccountLinked` | New account link created |
 
 ### TokenizedAsset Aggregate
 
@@ -1126,7 +1117,7 @@ source of truth.
 ```sql
 -- Events table: stores all domain events
 CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'AccountLink', 'TokenizedAsset'
+    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'Account', 'TokenizedAsset'
     aggregate_id TEXT NOT NULL,        -- Unique identifier for the aggregate instance
     sequence BIGINT NOT NULL,          -- Sequence number for this aggregate (starts at 1)
     event_type TEXT NOT NULL,          -- Event name (e.g., 'MintInitiated', 'TokensMinted')
@@ -1278,10 +1269,9 @@ events.
 - Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
 - Used for: Grafana dashboards, monitoring, alerting
 
-**AccountLinkView** - Current account links:
+**AccountView** - Current accounts:
 
-- Listens to: `AccountLinked`, `AccountUnlinked`, `AccountSuspended`,
-  `AccountReactivated`
+- Listens to: `AccountLinked`
 - Updates: Account status, relationship data
 - Used for: Validating client IDs, looking up accounts by email or Alpaca
   account number
