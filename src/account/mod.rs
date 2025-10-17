@@ -1,5 +1,6 @@
 mod cmd;
 mod event;
+mod view;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,9 +11,13 @@ use uuid::Uuid;
 
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
+pub(crate) use view::{
+    AccountView, AccountViewError, find_by_alpaca_account, find_by_client_id,
+    find_by_email,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Email(pub(crate) String);
+pub(crate) struct Email(String);
 
 impl Email {
     pub(crate) fn new(email: String) -> Result<Self, AccountError> {
@@ -20,6 +25,10 @@ impl Email {
             return Err(AccountError::InvalidEmail { email });
         }
         Ok(Self(email))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -29,7 +38,7 @@ impl<'de> Deserialize<'de> for Email {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Email::new(s).map_err(serde::de::Error::custom)
+        Self::new(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -84,7 +93,7 @@ impl Aggregate for Account {
             AccountCommand::LinkAccount { email, alpaca_account } => {
                 if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
-                        email: email.0,
+                        email: email.as_str().to_string(),
                     });
                 }
 
@@ -202,19 +211,16 @@ mod tests {
     }
 
     #[test]
-    fn test_link_account_with_invalid_email_returns_error() {
-        let invalid_email = Email("not-an-email".to_string());
-        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+    fn test_email_smart_constructor_validates() {
+        let result = Email::new("not-an-email".to_string());
 
-        AccountTestFramework::with(())
-            .given_no_previous_events()
-            .when(AccountCommand::LinkAccount {
-                email: invalid_email,
-                alpaca_account,
-            })
-            .then_expect_error(AccountError::InvalidEmail {
-                email: "not-an-email".to_string(),
-            });
+        assert!(matches!(
+            result,
+            Err(AccountError::InvalidEmail { email }) if email == "not-an-email"
+        ));
+
+        let valid_result = Email::new("user@example.com".to_string());
+        assert!(valid_result.is_ok());
     }
 
     #[test]
