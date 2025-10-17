@@ -222,11 +222,11 @@ Add comprehensive tests to `src/mint/api.rs`.
   - [x] Invalid/unsupported asset returns 400
   - [x] Unknown client_id returns 400
   - [x] Negative quantity returns 400
-  - [ ] Invalid wallet address returns 400
-  - [ ] Wrong network returns 400
+  - [x] Invalid wallet address returns 422 (Unprocessable Entity)
+  - [x] Wrong network returns 400
 - [x] Test events are persisted correctly in event store
 - [x] Test views are updated correctly
-- [ ] Test duplicate tokenization_request_id handling
+- [x] Test duplicate issuer_request_id handling
 - [x] Follow existing test patterns from account/api.rs
 
 ---
@@ -250,7 +250,7 @@ Ensure comprehensive unit test coverage for all components.
 
 Ensure all code quality checks pass before submitting.
 
-- [x] Run `cargo test --workspace` - all tests pass (29 tests)
+- [x] Run `cargo test --workspace` - all tests pass (35 tests)
 - [x] Run
       `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
       no warnings

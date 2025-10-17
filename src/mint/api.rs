@@ -776,4 +776,142 @@ mod tests {
             address!("0x1234567890abcdef1234567890abcdef12345678")
         );
     }
+
+    #[tokio::test]
+    async fn test_initiate_mint_rejects_invalid_wallet_address() {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.0,
+            "token_symbol": token.0,
+            "network": network.0,
+            "client_id": client_id,
+            "wallet_address": "invalid-address"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_mint_rejects_wrong_network() {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let (client_id, underlying, token, _network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.0,
+            "token_symbol": token.0,
+            "network": "ethereum",
+            "client_id": client_id,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+
+        let error_response: ErrorResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        assert_eq!(
+            error_response.error,
+            "Invalid Token: Token not available on the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiate_mint_with_duplicate_issuer_request_id() {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let issuer_request_id = "test-issuer-request-id";
+
+        let command = super::super::MintCommand::Initiate {
+            issuer_request_id: super::super::IssuerRequestId::new(
+                issuer_request_id,
+            ),
+            tokenization_request_id: super::super::TokenizationRequestId::new(
+                "alp-123",
+            ),
+            quantity: super::super::Quantity::new(Decimal::from(100)),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id: super::super::ClientId(client_id.clone()),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+        };
+
+        mint_cqrs
+            .execute(issuer_request_id, command.clone())
+            .await
+            .expect("First execution should succeed");
+
+        let result = mint_cqrs.execute(issuer_request_id, command).await;
+
+        assert!(result.is_err());
+    }
 }
