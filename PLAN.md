@@ -17,60 +17,66 @@ full ES/CQRS backend:
 
 ## Task 1. Define Domain Types
 
-Create the complete type system for account linking in `src/account.rs`:
+Create the type system for account linking in `src/account/`:
 
-- [ ] Add `AccountStatus` enum (Active, Suspended, Inactive)
-- [ ] Add `AccountLink` aggregate state structure
-- [ ] Define commands: `LinkAccount`, `UnlinkAccount`, `SuspendAccount`,
-      `ReactivateAccount`
-- [ ] Define events: `AccountLinked`, `AccountUnlinked`, `AccountSuspended`,
-      `AccountReactivated`
-- [ ] Add error type `AccountLinkError` for domain errors
+- [x] Add `LinkedAccountStatus` enum (Active, Inactive)
+- [x] Add `Account` aggregate state structure
+- [x] Define command: `LinkAccount` (wrapped in `AccountCommand` enum)
+- [x] Define event: `AccountLinked` (wrapped in `AccountEvent` enum)
+- [x] Add error type `AccountError` for domain errors
 
 **Design Notes:**
 
 - Commands represent intent (imperative mood)
 - Events represent facts (past tense)
-- Aggregate state captures all information needed for business logic
-- Status enum encodes valid account states
-- Error type covers validation failures and state transition errors
+- Aggregate uses proper type modeling to make invalid states unrepresentable:
+  - `enum Account { NotLinked, Linked(LinkedAccount) }` instead of struct with
+    all Option fields
+  - LinkedAccount contains all required fields (client_id, email, etc.) without
+    Options
+  - LinkedAccountStatus enum with Active/Inactive variants
+- Error type covers validation failures
+- **YAGNI for Events**: Only implementing LinkAccount for POST /accounts/connect
+  endpoint. Additional events can be added later if needed.
+- **DDD Naming**: Aggregate is named `Account` (not `AccountLink`) as the
+  business concept is "Account" - the link is just one operation
 
-## Task 2. Implement AccountLink Aggregate
+## Task 2. Implement Account Aggregate
 
-Implement the `Aggregate` trait for `AccountLink` in `src/account.rs`:
+Implement the `Aggregate` trait for `Account` in `src/account/`:
 
-- [ ] Implement `Aggregate::handle()` for each command:
-  - `LinkAccount`: Validate email format, generate client_id, produce
-    `AccountLinked` event
-  - `UnlinkAccount`: Check if linked, produce `AccountUnlinked` event
-  - `SuspendAccount`: Check if active, produce `AccountSuspended` event
-  - `ReactivateAccount`: Check if suspended, produce `AccountReactivated` event
-- [ ] Implement `Aggregate::apply()` for each event:
-  - Update aggregate state deterministically from events
-  - Never fail - events are historical facts
-- [ ] Add validation logic:
-  - Email format validation (basic check for @ symbol)
-  - State transition validation (can't unlink non-existent account, etc.)
+- [x] Implement `Aggregate::handle()` for LinkAccount command:
+  - Validate email format (basic check for @ symbol)
+  - Check if account already linked (prevent duplicates)
+  - Generate client_id using UUID v4
+  - Produce `AccountLinked` event wrapped in `AccountEvent` enum
+- [x] Implement `Aggregate::apply()` for AccountLinked event:
+  - Update aggregate state deterministically from event
+  - Never fails - events are historical facts
+- [x] Add validation logic:
+  - Email format validation
+  - Duplicate link prevention
   - Client ID generation using UUID v4
 
 **Design Notes:**
 
 - `handle()` contains all business logic and validation
 - `handle()` returns `Result<Vec<Event>, Error>` - can return multiple events
+  (though LinkAccount only produces one)
 - `apply()` is pure state updates only, never fails
-- Aggregate ID is the client_id
+- Aggregate ID is the email (used to prevent duplicate links)
 - For LinkAccount, generate a new UUID-based client_id
+- **YAGNI**: Only implementing what we need for POST /accounts/connect.
+  Additional commands (unlink, suspend, reactivate) can be added later if
+  needed.
 
-## Task 3. Create AccountLinkView
+## Task 3. Create AccountView
 
 Implement the view projection in `src/account.rs`:
 
-- [ ] Create `AccountLinkView` struct with fields matching the spec
+- [ ] Create `AccountView` struct with fields matching the spec
 - [ ] Implement `View` trait with `update()` method:
-  - `AccountLinked`: Create new view entry
-  - `AccountUnlinked`: Mark as inactive
-  - `AccountSuspended`: Update status to suspended
-  - `AccountReactivated`: Update status to active
+  - `AccountLinked`: Create new view entry with Active status
 - [ ] Add query methods:
   - `find_by_email()`: Look up account by email
   - `find_by_alpaca_account()`: Look up by Alpaca account number
@@ -82,6 +88,7 @@ Implement the view projection in `src/account.rs`:
 - Each event updates the view state
 - Views enable efficient queries without replaying events
 - Store as JSON in database for flexibility
+- **YAGNI**: Only handling AccountLinked event for now
 
 ## Task 4. Add Database Migrations
 
@@ -147,24 +154,16 @@ Write Given-When-Then tests for the aggregate:
 
 - [ ] Test `LinkAccount` command:
   - Happy path: Creates new account link
-  - Error: Email format validation
-- [ ] Test `UnlinkAccount` command:
-  - Happy path: Unlinks existing account
-  - Error: Cannot unlink non-existent account
-- [ ] Test `SuspendAccount` command:
-  - Happy path: Suspends active account
-  - Error: Cannot suspend non-existent account
-- [ ] Test `ReactivateAccount` command:
-  - Happy path: Reactivates suspended account
-  - Error: Cannot reactivate non-existent account
+  - Error: Invalid email format
+  - Error: Account already linked (duplicate prevention)
 
 **Design Notes:**
 
 - Use `cqrs_es::test::TestFramework` for aggregate testing
 - Given-When-Then pattern makes tests clear and maintainable
 - Test both happy paths and error cases
-- Mock services if needed (though AccountLink likely doesn't need external
-  services)
+- Mock services if needed (though AccountLink doesn't need external services)
+- **YAGNI**: Only testing LinkAccount command for now
 
 ## Task 8. Add View Tests
 
