@@ -13,7 +13,7 @@ pub(crate) enum MintEvent {
     Initiated {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
-        qty: Quantity,
+        quantity: Quantity,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,

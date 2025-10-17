@@ -16,7 +16,7 @@ following the "make invalid states unrepresentable" principle:
 
 ```rust
 enum Mint {
-    NotInitiated,
+    Uninitialized,
     Initiated {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -126,19 +126,20 @@ Create `src/mint/event.rs` with the event enum and DomainEvent implementation.
 
 Add the Mint aggregate to `src/mint/mod.rs` with handle() and apply() methods.
 
-- [ ] Define Mint enum with NotInitiated and Initiated states
-- [ ] Implement Default trait returning NotInitiated
-- [ ] Implement Aggregate trait with:
-  - [ ] Associated types (Command, Event, Error, Services)
-  - [ ] aggregate_type() returning "Mint"
-  - [ ] handle() method for MintCommand::Initiate
-    - [ ] Check state is NotInitiated
-    - [ ] Generate issuer_request_id using UUID v4
-    - [ ] Return vec![MintEvent::Initiated]
-  - [ ] apply() method for MintEvent::Initiated
-    - [ ] Transition from NotInitiated to Initiated state
-- [ ] Define MintError enum with appropriate error variants
-- [ ] Add comprehensive aggregate tests using TestFramework
+- [x] Define Mint enum with Uninitialized and Initiated states
+- [x] Implement Default trait returning Uninitialized
+- [x] Implement Aggregate trait with:
+  - [x] Associated types (Command, Event, Error, Services)
+  - [x] aggregate_type() returning "Mint"
+  - [x] handle() method for MintCommand::Initiate
+    - [x] Check state is Uninitialized
+    - [x] Generate issuer_request_id using UUID v4
+    - [x] Return vec![MintEvent::Initiated]
+  - [x] apply() method for MintEvent::Initiated
+    - [x] Transition from Uninitialized to Initiated state
+- [x] Define MintError enum with appropriate error variants
+- [x] Add comprehensive aggregate tests using TestFramework
+- [x] Refactor qty → quantity throughout mint module
 
 ---
 

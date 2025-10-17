@@ -10,7 +10,7 @@ use super::{
 pub(crate) enum MintCommand {
     Initiate {
         tokenization_request_id: TokenizationRequestId,
-        qty: Quantity,
+        quantity: Quantity,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
