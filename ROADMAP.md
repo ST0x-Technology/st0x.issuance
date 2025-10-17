@@ -30,12 +30,15 @@ CI/CD setup.
 - [x] [#3](https://github.com/ST0x-Technology/st0x.issuance/issues/3) - Create
       ROADMAP.md for bot implementation
   - **PR:** [#4](https://github.com/ST0x-Technology/st0x.issuance/pull/4)
-- [ ] [#5](https://github.com/ST0x-Technology/st0x.issuance/issues/5) - Setup
+- [x] [#5](https://github.com/ST0x-Technology/st0x.issuance/issues/5) - Setup
       Nix flake with Rust toolchain + Cargo project
-- [ ] [#6](https://github.com/ST0x-Technology/st0x.issuance/issues/6) - Setup
+  - **PR:** [#37](https://github.com/ST0x-Technology/st0x.issuance/pull/37)
+- [x] [#6](https://github.com/ST0x-Technology/st0x.issuance/issues/6) - Setup
       Rocket.rs web framework skeleton + SQLite with sqlx
-- [ ] [#7](https://github.com/ST0x-Technology/st0x.issuance/issues/7) - Setup CI
+  - **PR:** [#38](https://github.com/ST0x-Technology/st0x.issuance/pull/38)
+- [x] [#7](https://github.com/ST0x-Technology/st0x.issuance/issues/7) - Setup CI
       (GitHub Actions - linting, tests)
+  - **PR:** [#39](https://github.com/ST0x-Technology/st0x.issuance/pull/39)
 
 ---
 
@@ -48,8 +51,9 @@ implemented.
 
 ### Issues
 
-- [ ] [#8](https://github.com/ST0x-Technology/st0x.issuance/issues/8) -
+- [x] [#8](https://github.com/ST0x-Technology/st0x.issuance/issues/8) -
       Implement SqliteEventRepository in crates/sqlite-es
+  - **PR:** [#40](https://github.com/ST0x-Technology/st0x.issuance/pull/40)
 - [ ] [#9](https://github.com/ST0x-Technology/st0x.issuance/issues/9) -
       Implement SqliteViewRepository in crates/sqlite-es
 

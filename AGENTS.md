@@ -37,6 +37,13 @@ Relevant docs:
 - PLAN.md should NEVER appear in pull requests or be merged to main/master
 - The plan is for development tracking only - final documentation goes in commit
   messages, docstrings, and permanent markdown documents
+- **CRITICAL**: Update ROADMAP.md to mark completed tasks as done with the PR
+  link
+  - When you complete a task that corresponds to an issue in ROADMAP.md, update
+    the roadmap to mark it as complete `[x]` and add the PR link
+  - Format: `- [x] [#N](issue-url) - Task description`
+  - Add PR reference: `- **PR:** [#N](pr-url)`
+  - This ensures the roadmap accurately reflects progress when the PR is merged
 
 ## Project Overview
 
