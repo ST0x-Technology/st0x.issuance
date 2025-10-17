@@ -174,9 +174,9 @@ Write Given-When-Then tests for the aggregate:
 
 Write tests for the view projection:
 
-- [ ] Test view updates from each event type
-- [ ] Test query methods (find_by_email, find_by_alpaca_account)
-- [ ] Test that views are correctly built from event stream
+- [x] Test view updates from each event type
+- [x] Test query methods (find_by_email)
+- [x] Test that views are correctly built from event stream
 
 **Design Notes:**
 
@@ -188,11 +188,11 @@ Write tests for the view projection:
 
 Write end-to-end tests for the endpoint:
 
-- [ ] Test successful account link
-- [ ] Test duplicate account link (409 error)
-- [ ] Test invalid email format (400 error)
-- [ ] Test that events are persisted correctly
-- [ ] Test that views are updated correctly
+- [x] Test successful account link
+- [x] Test duplicate account link (409 error)
+- [x] Test invalid email format (400 error)
+- [x] Test that events are persisted correctly
+- [x] Test that views are updated correctly
 
 **Design Notes:**
 
@@ -205,11 +205,11 @@ Write end-to-end tests for the endpoint:
 
 Add required dependencies:
 
-- [ ] Add `cqrs-es` to Cargo.toml
-- [ ] Add `async-trait` if needed for async aggregate methods
-- [ ] Add `uuid` for generating client IDs
-- [ ] Add `chrono` for timestamps
-- [ ] Ensure `sqlite-es` crate is properly linked
+- [x] Add `cqrs-es` to Cargo.toml
+- [x] Add `async-trait` if needed for async aggregate methods
+- [x] Add `uuid` for generating client IDs
+- [x] Add `chrono` for timestamps
+- [x] Ensure `sqlite-es` crate is properly linked
 
 **Design Notes:**
 
@@ -228,10 +228,10 @@ Add required dependencies:
 
 ## Success Criteria
 
-- [ ] POST /accounts/connect creates account link with generated client_id
-- [ ] Events are persisted in the event store
-- [ ] Views are updated from events
-- [ ] Duplicate links return 409 error
-- [ ] All tests pass
-- [ ] Clippy passes
-- [ ] Code is formatted
+- [x] POST /accounts/connect creates account link with generated client_id
+- [x] Events are persisted in the event store
+- [x] Views are updated from events
+- [x] Duplicate links return 409 error
+- [x] All tests pass
+- [x] Clippy passes
+- [x] Code is formatted

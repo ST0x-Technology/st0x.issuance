@@ -348,4 +348,262 @@ mod tests {
 
         assert!(!response_body.client_id.0.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_duplicate_account_link_returns_409() {
+        use cqrs_es::persist::GenericQuery;
+        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<super::AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "duplicate@example.com",
+            "account": "ALPACA789"
+        });
+
+        let response1 = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response1.status(), Status::Ok);
+
+        let response2 = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response2.status(), Status::Conflict);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_email_format_returns_400() {
+        use cqrs_es::persist::GenericQuery;
+        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<super::AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "not-an-email",
+            "account": "ALPACA999"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[tokio::test]
+    async fn test_events_are_persisted_correctly() {
+        use cqrs_es::persist::GenericQuery;
+        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<super::AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(account_cqrs)
+            .manage(pool.clone())
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let email = "events@example.com";
+        let request_body = serde_json::json!({
+            "email": email,
+            "account": "ALPACA001"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let events = sqlx::query!(
+            r"
+            SELECT aggregate_id, event_type, sequence
+            FROM events
+            WHERE aggregate_id = ? AND aggregate_type = 'Account'
+            ORDER BY sequence
+            ",
+            email
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].aggregate_id, email);
+        assert_eq!(events[0].event_type, "AccountLinked");
+        assert_eq!(events[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn test_views_are_updated_correctly() {
+        use cqrs_es::persist::GenericQuery;
+        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<super::AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(account_cqrs)
+            .manage(pool.clone())
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let email = "view@example.com";
+        let alpaca_account = "ALPACA002";
+
+        let request_body = serde_json::json!({
+            "email": email,
+            "account": alpaca_account
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let response_body: AccountLinkResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        let view = super::find_by_email(&pool, &Email(email.to_string()))
+            .await
+            .expect("Failed to query view")
+            .expect("View should exist");
+
+        assert_eq!(view.client_id, response_body.client_id);
+        assert_eq!(view.email.as_str(), email);
+        assert_eq!(view.alpaca_account.0, alpaca_account);
+        assert_eq!(view.status, LinkedAccountStatus::Active);
+    }
 }
