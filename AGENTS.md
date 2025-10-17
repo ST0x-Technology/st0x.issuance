@@ -725,9 +725,10 @@ quantities.
 
 - **Always run tests, clippy, and formatters before handing over a piece of
   work**
-  - Run tests first, as changing tests can break clippy
-  - Run clippy next, as fixing linting errors can break formatting
-  - Deny warnings when running clippy
+  - Run `cargo test --workspace` first, as changing tests can break clippy
+  - Run
+    `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+    next, as fixing linting errors can break formatting
   - Always run `cargo fmt` last to ensure clean code formatting
 
 ### CRITICAL: Lint Policy
