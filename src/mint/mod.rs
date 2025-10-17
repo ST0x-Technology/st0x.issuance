@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 pub(crate) use api::initiate_mint;
 pub(crate) use cmd::MintCommand;
@@ -89,6 +88,7 @@ impl Aggregate for Mint {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             MintCommand::Initiate {
+                issuer_request_id,
                 tokenization_request_id,
                 quantity,
                 underlying,
@@ -103,8 +103,6 @@ impl Aggregate for Mint {
                     });
                 }
 
-                let issuer_request_id =
-                    IssuerRequestId::new(Uuid::new_v4().to_string());
                 let now = Utc::now();
 
                 Ok(vec![MintEvent::Initiated {
@@ -174,6 +172,7 @@ mod tests {
 
     #[test]
     fn test_initiate_mint_creates_event() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -185,6 +184,7 @@ mod tests {
         let validator = MintTestFramework::with(())
             .given_no_previous_events()
             .when(MintCommand::Initiate {
+                issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 quantity: quantity.clone(),
                 underlying: underlying.clone(),
@@ -202,7 +202,7 @@ mod tests {
 
                 match &events[0] {
                     MintEvent::Initiated {
-                        issuer_request_id,
+                        issuer_request_id: event_issuer_id,
                         tokenization_request_id: event_tokenization_id,
                         quantity: event_quantity,
                         underlying: event_underlying,
@@ -212,7 +212,7 @@ mod tests {
                         wallet: event_wallet,
                         initiated_at,
                     } => {
-                        assert!(!issuer_request_id.0.is_empty());
+                        assert_eq!(event_issuer_id, &issuer_request_id);
                         assert_eq!(
                             event_tokenization_id,
                             &tokenization_request_id
@@ -233,6 +233,7 @@ mod tests {
 
     #[test]
     fn test_initiate_mint_when_already_initiated_returns_error() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-789");
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -243,7 +244,7 @@ mod tests {
 
         MintTestFramework::with(())
             .given(vec![MintEvent::Initiated {
-                issuer_request_id: super::IssuerRequestId::new("iss-789"),
+                issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 quantity: quantity.clone(),
                 underlying: underlying.clone(),
@@ -254,6 +255,7 @@ mod tests {
                 initiated_at: chrono::Utc::now(),
             }])
             .when(MintCommand::Initiate {
+                issuer_request_id,
                 tokenization_request_id: tokenization_request_id.clone(),
                 quantity,
                 underlying,
