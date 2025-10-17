@@ -4,9 +4,17 @@ use sqlx::{Pool, Sqlite};
 
 use crate::event_repository::SqliteEventRepository;
 
+/// Type alias for a CQRS framework backed by SQLite
 pub type SqliteCqrs<A> =
     CqrsFramework<A, PersistedEventStore<SqliteEventRepository, A>>;
 
+/// Creates a new CQRS framework with SQLite event storage
+///
+/// # Arguments
+///
+/// * `pool` - SQLite connection pool
+/// * `query_processor` - Vector of query processors for building read models
+/// * `services` - Services required by the aggregate
 pub fn sqlite_cqrs<A>(
     pool: Pool<Sqlite>,
     query_processor: Vec<Box<dyn Query<A>>>,

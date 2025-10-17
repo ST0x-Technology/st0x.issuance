@@ -10,17 +10,22 @@ use sqlx::{Pool, Row, Sqlite};
 
 use crate::sql_query::SqlQueryFactory;
 
+/// Errors that can occur during SQLite event repository operations
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteAggregateError {
+    /// Optimistic locking conflict - the aggregate was modified concurrently
     #[error("Optimistic lock error: aggregate has been modified concurrently")]
     OptimisticLock,
 
+    /// Database connection or query error
     #[error("Database connection error: {0}")]
     Connection(#[from] sqlx::Error),
 
+    /// Event or snapshot deserialization error
     #[error("Event deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
 
+    /// Integer conversion error (e.g., sequence number overflow)
     #[error("Integer conversion error: {0}")]
     TryFromInt(#[from] std::num::TryFromIntError),
 }
@@ -42,6 +47,12 @@ impl From<SqliteAggregateError> for PersistenceError {
     }
 }
 
+/// SQLite implementation of the `PersistedEventRepository` trait
+///
+/// Provides event sourcing persistence backed by SQLite, including:
+/// - Event storage with optimistic locking
+/// - Snapshot support for performance optimization
+/// - Event streaming capabilities
 pub struct SqliteEventRepository {
     pool: Pool<Sqlite>,
     query_factory: SqlQueryFactory,
@@ -109,6 +120,9 @@ impl PersistedEventRepository for SqliteEventRepository {
 }
 
 impl SqliteEventRepository {
+    /// Creates a new `SqliteEventRepository` with default table names
+    ///
+    /// Uses "events" and "snapshots" as the table names with a default stream channel size of 1000.
     #[must_use]
     pub fn new(pool: Pool<Sqlite>) -> Self {
         Self {
@@ -121,6 +135,9 @@ impl SqliteEventRepository {
         }
     }
 
+    /// Creates a new `SqliteEventRepository` with custom table names
+    ///
+    /// Allows specifying custom names for the events and snapshots tables.
     #[must_use]
     pub const fn with_tables(
         pool: Pool<Sqlite>,
@@ -134,6 +151,9 @@ impl SqliteEventRepository {
         }
     }
 
+    /// Sets the channel size for event streaming
+    ///
+    /// The stream channel size determines how many events can be buffered during streaming operations.
     #[must_use]
     pub const fn with_stream_channel_size(
         mut self,
