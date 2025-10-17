@@ -112,13 +112,21 @@ impl SqlQueryFactory {
         )
     }
 
-    pub(crate) fn insert_or_update_view(view_table: &str) -> String {
+    pub(crate) fn insert_view(view_table: &str) -> String {
         format!(
-            "INSERT OR REPLACE INTO {view_table} (
+            "INSERT INTO {view_table} (
                 view_id,
                 version,
                 payload
             ) VALUES (?, ?, ?)"
+        )
+    }
+
+    pub(crate) fn update_view(view_table: &str) -> String {
+        format!(
+            "UPDATE {view_table}
+             SET version = ?, payload = ?
+             WHERE view_id = ? AND version = ?"
         )
     }
 }
@@ -224,14 +232,23 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_or_update_view_query() {
-        let query = SqlQueryFactory::insert_or_update_view("test_view");
+    fn test_insert_view_query() {
+        let query = SqlQueryFactory::insert_view("test_view");
 
-        assert!(query.contains("INSERT OR REPLACE INTO test_view"));
+        assert!(query.contains("INSERT INTO test_view"));
         assert!(query.contains("view_id"));
         assert!(query.contains("version"));
         assert!(query.contains("payload"));
         assert!(query.contains("VALUES (?, ?, ?)"));
+    }
+
+    #[test]
+    fn test_update_view_query() {
+        let query = SqlQueryFactory::update_view("test_view");
+
+        assert!(query.contains("UPDATE test_view"));
+        assert!(query.contains("SET version = ?, payload = ?"));
+        assert!(query.contains("WHERE view_id = ? AND version = ?"));
     }
 
     #[test]
@@ -243,12 +260,18 @@ mod tests {
         assert!(mint_view_select.contains("FROM mint_view"));
         assert!(redemption_view_select.contains("FROM redemption_view"));
 
-        let mint_view_upsert =
-            SqlQueryFactory::insert_or_update_view("mint_view");
-        let redemption_view_upsert =
-            SqlQueryFactory::insert_or_update_view("redemption_view");
+        let mint_view_insert = SqlQueryFactory::insert_view("mint_view");
+        let redemption_view_insert =
+            SqlQueryFactory::insert_view("redemption_view");
 
-        assert!(mint_view_upsert.contains("INTO mint_view"));
-        assert!(redemption_view_upsert.contains("INTO redemption_view"));
+        assert!(mint_view_insert.contains("INTO mint_view"));
+        assert!(redemption_view_insert.contains("INTO redemption_view"));
+
+        let mint_view_update = SqlQueryFactory::update_view("mint_view");
+        let redemption_view_update =
+            SqlQueryFactory::update_view("redemption_view");
+
+        assert!(mint_view_update.contains("UPDATE mint_view"));
+        assert!(redemption_view_update.contains("UPDATE redemption_view"));
     }
 }

@@ -155,12 +155,48 @@ where
         Ok(Some((view, context)))
     }
 
+    /// Optimistic locking strategy: version 0 means initial insert, subsequent
+    /// updates check the current version matches the expected version. If the
+    /// UPDATE affects 0 rows, it means the view was modified concurrently and
+    /// an OptimisticLockError is returned.
     async fn update_view(
         &self,
-        _view: V,
-        _context: ViewContext,
+        view: V,
+        context: ViewContext,
     ) -> Result<(), PersistenceError> {
-        todo!()
+        let payload = serde_json::to_string(&view)
+            .map_err(SqliteViewError::Serialization)?;
+
+        let new_version = context.version + 1;
+
+        if context.version == 0 {
+            let insert_query = SqlQueryFactory::insert_view(&self.view_table);
+
+            sqlx::query(&insert_query)
+                .bind(&context.view_instance_id)
+                .bind(new_version)
+                .bind(&payload)
+                .execute(&self.pool)
+                .await
+                .map_err(SqliteViewError::Connection)?;
+        } else {
+            let update_query = SqlQueryFactory::update_view(&self.view_table);
+
+            let result = sqlx::query(&update_query)
+                .bind(new_version)
+                .bind(&payload)
+                .bind(&context.view_instance_id)
+                .bind(context.version)
+                .execute(&self.pool)
+                .await
+                .map_err(SqliteViewError::Connection)?;
+
+            if result.rows_affected() == 0 {
+                return Err(SqliteViewError::OptimisticLock.into());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -412,5 +448,219 @@ mod tests {
         let json_err = serde_json::from_str::<i32>("invalid").unwrap_err();
         let err = SqliteViewError::Deserialization(json_err);
         assert!(err.to_string().contains("View deserialization error"));
+    }
+
+    #[tokio::test]
+    async fn test_update_view_insert() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool.clone(),
+            "test_view".to_string(),
+        );
+
+        let test_view =
+            TestView { count: 10, values: vec!["test".to_string()] };
+
+        let context = ViewContext::new("test-insert".to_string(), 0);
+
+        repo.update_view(test_view.clone(), context).await.unwrap();
+
+        let loaded = repo.load("test-insert").await.unwrap();
+        assert!(loaded.is_some());
+        let loaded_view = loaded.unwrap();
+        assert_eq!(loaded_view.count, 10);
+        assert_eq!(loaded_view.values, vec!["test"]);
+
+        let row =
+            sqlx::query("SELECT version FROM test_view WHERE view_id = ?")
+                .bind("test-insert")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let version: i64 = row.try_get("version").unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_view_increment_version() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool.clone(),
+            "test_view".to_string(),
+        );
+
+        let initial_view =
+            TestView { count: 1, values: vec!["first".to_string()] };
+
+        let context_v0 = ViewContext::new("test-increment".to_string(), 0);
+        repo.update_view(initial_view, context_v0).await.unwrap();
+
+        let updated_view = TestView {
+            count: 2,
+            values: vec!["first".to_string(), "second".to_string()],
+        };
+
+        let context_v1 = ViewContext::new("test-increment".to_string(), 1);
+        repo.update_view(updated_view, context_v1).await.unwrap();
+
+        let (loaded_view, loaded_context) =
+            repo.load_with_context("test-increment").await.unwrap().unwrap();
+
+        assert_eq!(loaded_view.count, 2);
+        assert_eq!(loaded_view.values, vec!["first", "second"]);
+        assert_eq!(loaded_context.version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_view_serialization_roundtrip() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let original_view = TestView {
+            count: 42,
+            values: vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ],
+        };
+
+        let context = ViewContext::new("test-roundtrip".to_string(), 0);
+        repo.update_view(original_view.clone(), context).await.unwrap();
+
+        let loaded_view = repo.load("test-roundtrip").await.unwrap().unwrap();
+
+        assert_eq!(loaded_view, original_view);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_views() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let view1 = TestView { count: 1, values: vec!["one".to_string()] };
+        let view2 = TestView { count: 2, values: vec!["two".to_string()] };
+        let view3 = TestView { count: 3, values: vec!["three".to_string()] };
+
+        let context1 = ViewContext::new("view-1".to_string(), 0);
+        let context2 = ViewContext::new("view-2".to_string(), 0);
+        let context3 = ViewContext::new("view-3".to_string(), 0);
+
+        repo.update_view(view1.clone(), context1).await.unwrap();
+        repo.update_view(view2.clone(), context2).await.unwrap();
+        repo.update_view(view3.clone(), context3).await.unwrap();
+
+        let loaded1 = repo.load("view-1").await.unwrap().unwrap();
+        let loaded2 = repo.load("view-2").await.unwrap().unwrap();
+        let loaded3 = repo.load("view-3").await.unwrap().unwrap();
+
+        assert_eq!(loaded1, view1);
+        assert_eq!(loaded2, view2);
+        assert_eq!(loaded3, view3);
+    }
+
+    #[tokio::test]
+    async fn test_optimistic_locking() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let initial_view =
+            TestView { count: 1, values: vec!["initial".to_string()] };
+
+        let context_v0 = ViewContext::new("test-lock".to_string(), 0);
+        repo.update_view(initial_view, context_v0).await.unwrap();
+
+        let updated_view =
+            TestView { count: 2, values: vec!["updated".to_string()] };
+
+        let context_v1 = ViewContext::new("test-lock".to_string(), 1);
+        repo.update_view(updated_view, context_v1).await.unwrap();
+
+        let stale_view =
+            TestView { count: 99, values: vec!["stale".to_string()] };
+
+        let stale_context_v1 = ViewContext::new("test-lock".to_string(), 1);
+        let result = repo.update_view(stale_view, stale_context_v1).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            PersistenceError::OptimisticLockError
+        ));
+
+        let (loaded_view, loaded_context) =
+            repo.load_with_context("test-lock").await.unwrap().unwrap();
+
+        assert_eq!(loaded_view.count, 2);
+        assert_eq!(loaded_view.values, vec!["updated"]);
+        assert_eq!(loaded_context.version, 2);
     }
 }
