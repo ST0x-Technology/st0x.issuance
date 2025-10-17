@@ -114,7 +114,7 @@ fn is_valid_email(email: &str) -> bool {
     email.contains('@')
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub(crate) enum AccountError {
     #[error("Invalid email format: {email}")]
     InvalidEmail { email: String },
@@ -147,12 +147,115 @@ pub(crate) fn connect_account(
 
 #[cfg(test)]
 mod tests {
-    use super::AccountLinkResponse;
+    use super::{
+        Account, AccountCommand, AccountError, AccountEvent,
+        AccountLinkResponse, AlpacaAccountNumber, Email, LinkedAccountStatus,
+    };
+    use cqrs_es::{Aggregate, test::TestFramework};
     use rocket::http::{ContentType, Status};
     use rocket::local::blocking::Client;
 
-    fn rocket() -> rocket::Rocket<rocket::Build> {
-        rocket::build().mount("/", routes![super::connect_account])
+    type AccountTestFramework = TestFramework<Account>;
+
+    #[test]
+    fn test_link_account_creates_new_account() {
+        let email = Email("user@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+
+        let validator = AccountTestFramework::with(())
+            .given_no_previous_events()
+            .when(AccountCommand::LinkAccount {
+                email: email.clone(),
+                alpaca_account: alpaca_account.clone(),
+            });
+
+        let result = validator.inspect_result();
+
+        match result {
+            Ok(events) => {
+                assert_eq!(events.len(), 1);
+
+                match &events[0] {
+                    AccountEvent::AccountLinked {
+                        client_id,
+                        email: event_email,
+                        alpaca_account: event_alpaca,
+                        linked_at,
+                    } => {
+                        assert!(!client_id.0.is_empty());
+                        assert_eq!(event_email, &email);
+                        assert_eq!(event_alpaca, &alpaca_account);
+                        assert!(linked_at.timestamp() > 0);
+                    }
+                }
+            }
+            Err(e) => panic!("Expected success, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_link_account_with_invalid_email_returns_error() {
+        let invalid_email = Email("not-an-email".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+
+        AccountTestFramework::with(())
+            .given_no_previous_events()
+            .when(AccountCommand::LinkAccount {
+                email: invalid_email,
+                alpaca_account,
+            })
+            .then_expect_error(AccountError::InvalidEmail {
+                email: "not-an-email".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_link_account_when_already_linked_returns_error() {
+        let email = Email("user@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+
+        AccountTestFramework::with(())
+            .given(vec![AccountEvent::AccountLinked {
+                client_id: super::ClientId("existing-client-id".to_string()),
+                email: email.clone(),
+                alpaca_account: AlpacaAccountNumber("ALPACA456".to_string()),
+                linked_at: chrono::Utc::now(),
+            }])
+            .when(AccountCommand::LinkAccount { email, alpaca_account })
+            .then_expect_error(AccountError::AccountAlreadyExists {
+                email: "user@example.com".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_apply_account_linked_updates_state() {
+        let mut account = Account::default();
+
+        assert!(matches!(account, Account::NotLinked));
+
+        let client_id = super::ClientId("test-client-123".to_string());
+        let email = Email("user@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+        let linked_at = chrono::Utc::now();
+
+        account.apply(AccountEvent::AccountLinked {
+            client_id: client_id.clone(),
+            email: email.clone(),
+            alpaca_account: alpaca_account.clone(),
+            linked_at,
+        });
+
+        match account {
+            Account::Linked(linked) => {
+                assert_eq!(linked.client_id, client_id);
+                assert_eq!(linked.email, email);
+                assert_eq!(linked.alpaca_account, alpaca_account);
+                assert_eq!(linked.status, LinkedAccountStatus::Active);
+                assert_eq!(linked.linked_at, linked_at);
+                assert_eq!(linked.updated_at, linked_at);
+            }
+            Account::NotLinked => panic!("Expected account to be linked"),
+        }
     }
 
     #[test]
@@ -178,5 +281,9 @@ mod tests {
         .expect("valid JSON response");
 
         assert!(!response_body.client_id.0.is_empty());
+    }
+
+    fn rocket() -> rocket::Rocket<rocket::Build> {
+        rocket::build().mount("/", routes![super::connect_account])
     }
 }

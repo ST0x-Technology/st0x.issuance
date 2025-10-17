@@ -152,10 +152,11 @@ Replace the stub endpoint with actual aggregate integration:
 
 Write Given-When-Then tests for the aggregate:
 
-- [ ] Test `LinkAccount` command:
+- [x] Test `LinkAccount` command:
   - Happy path: Creates new account link
   - Error: Invalid email format
   - Error: Account already linked (duplicate prevention)
+- [x] Test `apply()` method updates aggregate state correctly
 
 **Design Notes:**
 
