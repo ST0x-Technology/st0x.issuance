@@ -12,7 +12,11 @@ pub(crate) struct ClientId(pub(crate) String);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccountLinkRequest {
+    #[allow(dead_code)]
+    // TODO: Remove in #11 when full account linking is implemented
     pub(crate) email: Email,
+    #[allow(dead_code)]
+    // TODO: Remove in #11 when full account linking is implemented
     pub(crate) account: AlpacaAccountNumber,
 }
 
