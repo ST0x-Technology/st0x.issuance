@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod account;
+mod tokenized_asset;
 
 use clap::Parser;
 use cqrs_es::persist::GenericQuery;
@@ -59,10 +60,13 @@ async fn rocket() -> _ {
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-    rocket::build()
-        .manage(account_cqrs)
-        .manage(pool)
-        .mount("/", routes![account::connect_account])
+    rocket::build().manage(account_cqrs).manage(pool).mount(
+        "/",
+        routes![
+            account::connect_account,
+            tokenized_asset::list_tokenized_assets
+        ],
+    )
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
