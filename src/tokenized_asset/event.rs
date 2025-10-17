@@ -1,8 +1,9 @@
+use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use super::{Network, TokenSymbol, UnderlyingSymbol, VaultAddress};
+use super::{Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetEvent {
@@ -10,7 +11,7 @@ pub(crate) enum TokenizedAssetEvent {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: VaultAddress,
+        vault_address: Address,
         added_at: DateTime<Utc>,
     },
 }

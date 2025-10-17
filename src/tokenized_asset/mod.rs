@@ -3,6 +3,7 @@ mod cmd;
 mod event;
 mod view;
 
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -16,14 +17,29 @@ pub(crate) use view::TokenizedAssetView;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnderlyingSymbol(pub(crate) String);
 
+impl UnderlyingSymbol {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(crate) String);
+
+impl TokenSymbol {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Network(pub(crate) String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VaultAddress(pub(crate) String);
+impl Network {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedAsset {
@@ -32,7 +48,7 @@ pub(crate) enum TokenizedAsset {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: VaultAddress,
+        vault_address: Address,
         enabled: bool,
         added_at: DateTime<Utc>,
     },
@@ -116,21 +132,23 @@ pub(crate) enum TokenizedAssetError {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
+    use cqrs_es::{Aggregate, test::TestFramework};
+
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetError, TokenizedAssetEvent, UnderlyingSymbol,
-        VaultAddress,
     };
-    use cqrs_es::{Aggregate, test::TestFramework};
 
     type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
 
     #[test]
     fn test_add_asset_creates_new_asset() {
-        let underlying = UnderlyingSymbol("AAPL".to_string());
-        let token = TokenSymbol("stAAPL".to_string());
-        let network = Network("base".to_string());
-        let vault_address = VaultAddress("0x1234567890abcdef".to_string());
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault_address =
+            address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let validator = TokenizedAssetTestFramework::with(())
             .given_no_previous_events()
@@ -138,7 +156,7 @@ mod tests {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
-                vault_address: vault_address.clone(),
+                vault_address,
             });
 
         let result = validator.inspect_result();
@@ -169,21 +187,24 @@ mod tests {
 
     #[test]
     fn test_add_asset_when_already_added_returns_error() {
-        let underlying = UnderlyingSymbol("AAPL".to_string());
-        let token = TokenSymbol("stAAPL".to_string());
-        let network = Network("base".to_string());
-        let vault_address = VaultAddress("0x1234567890abcdef".to_string());
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault_address =
+            address!("0x1234567890abcdef1234567890abcdef12345678");
 
         TokenizedAssetTestFramework::with(())
             .given(vec![TokenizedAssetEvent::AssetAdded {
-                underlying: underlying.clone(),
-                token: TokenSymbol("stAAPL".to_string()),
-                network: Network("base".to_string()),
-                vault_address: VaultAddress("0xabcdef".to_string()),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault_address: address!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::AddAsset {
-                underlying: underlying.clone(),
+                underlying,
                 token,
                 network,
                 vault_address,
@@ -199,17 +220,18 @@ mod tests {
 
         assert!(matches!(asset, TokenizedAsset::NotAdded));
 
-        let underlying = UnderlyingSymbol("TSLA".to_string());
-        let token = TokenSymbol("stTSLA".to_string());
-        let network = Network("base".to_string());
-        let vault_address = VaultAddress("0xfedcba".to_string());
+        let underlying = UnderlyingSymbol::new("TSLA");
+        let token = TokenSymbol::new("tTSLA");
+        let network = Network::new("base");
+        let vault_address =
+            address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
         let added_at = chrono::Utc::now();
 
         asset.apply(TokenizedAssetEvent::AssetAdded {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),
-            vault_address: vault_address.clone(),
+            vault_address,
             added_at,
         });
 

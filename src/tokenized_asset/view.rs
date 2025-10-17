@@ -1,11 +1,11 @@
+use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
 use super::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetEvent,
-    UnderlyingSymbol, VaultAddress,
+    Network, TokenSymbol, TokenizedAsset, TokenizedAssetEvent, UnderlyingSymbol,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +24,7 @@ pub(crate) enum TokenizedAssetView {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: VaultAddress,
+        vault_address: Address,
         enabled: bool,
         added_at: DateTime<Utc>,
     },
@@ -50,7 +50,7 @@ impl View<TokenizedAsset> for TokenizedAssetView {
                     underlying: underlying.clone(),
                     token: token.clone(),
                     network: network.clone(),
-                    vault_address: vault_address.clone(),
+                    vault_address: *vault_address,
                     enabled: true,
                     added_at: *added_at,
                 };
@@ -87,10 +87,12 @@ pub(crate) async fn list_enabled_assets(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use alloy::primitives::address;
     use cqrs_es::EventEnvelope;
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+
+    use super::*;
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -109,17 +111,18 @@ mod tests {
 
     #[test]
     fn test_view_update_from_asset_added_event() {
-        let underlying = UnderlyingSymbol("AAPL".to_string());
-        let token = TokenSymbol("stAAPL".to_string());
-        let network = Network("base".to_string());
-        let vault_address = VaultAddress("0x1234567890abcdef".to_string());
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault_address =
+            address!("0x1234567890abcdef1234567890abcdef12345678");
         let added_at = Utc::now();
 
         let event = TokenizedAssetEvent::AssetAdded {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),
-            vault_address: vault_address.clone(),
+            vault_address,
             added_at,
         };
 
@@ -160,22 +163,26 @@ mod tests {
     async fn test_list_enabled_assets_returns_only_enabled() {
         let pool = setup_test_db().await;
 
-        let enabled_underlying = UnderlyingSymbol("AAPL".to_string());
+        let enabled_underlying = UnderlyingSymbol::new("AAPL");
         let enabled_view = TokenizedAssetView::Asset {
             underlying: enabled_underlying.clone(),
-            token: TokenSymbol("stAAPL".to_string()),
-            network: Network("base".to_string()),
-            vault_address: VaultAddress("0xaaaa".to_string()),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            vault_address: address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
             enabled: true,
             added_at: Utc::now(),
         };
 
-        let disabled_underlying = UnderlyingSymbol("TSLA".to_string());
+        let disabled_underlying = UnderlyingSymbol::new("TSLA");
         let disabled_view = TokenizedAssetView::Asset {
             underlying: disabled_underlying.clone(),
-            token: TokenSymbol("stTSLA".to_string()),
-            network: Network("base".to_string()),
-            vault_address: VaultAddress("0xbbbb".to_string()),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::new("base"),
+            vault_address: address!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
             enabled: false,
             added_at: Utc::now(),
         };

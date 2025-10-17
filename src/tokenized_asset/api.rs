@@ -1,51 +1,113 @@
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
 
-use super::{Network, TokenSymbol, UnderlyingSymbol};
+use super::{Network, TokenSymbol, UnderlyingSymbol, view::TokenizedAssetView};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TokenizedAsset {
+pub(crate) struct TokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
     pub(crate) network: Network,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TokenizedAssetsResponse {
-    pub(crate) assets: Vec<TokenizedAsset>,
-}
-
 #[get("/tokenized-assets")]
-pub(crate) async fn list_tokenized_assets() -> Json<TokenizedAssetsResponse> {
-    let assets = vec![
-        TokenizedAsset {
-            underlying: UnderlyingSymbol("AAPL".to_string()),
-            token: TokenSymbol("stAAPL".to_string()),
-            network: Network("base".to_string()),
-        },
-        TokenizedAsset {
-            underlying: UnderlyingSymbol("TSLA".to_string()),
-            token: TokenSymbol("stTSLA".to_string()),
-            network: Network("base".to_string()),
-        },
-        TokenizedAsset {
-            underlying: UnderlyingSymbol("NVDA".to_string()),
-            token: TokenSymbol("stNVDA".to_string()),
-            network: Network("base".to_string()),
-        },
-    ];
+pub(crate) async fn list_tokenized_assets(
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<Vec<TokenizedAssetResponse>>, rocket::http::Status> {
+    let views = super::view::list_enabled_assets(pool.inner())
+        .await
+        .map_err(|_| rocket::http::Status::InternalServerError)?;
 
-    Json(TokenizedAssetsResponse { assets })
+    let assets = views
+        .into_iter()
+        .filter_map(|view| match view {
+            TokenizedAssetView::Asset {
+                underlying, token, network, ..
+            } => Some(TokenizedAssetResponse { underlying, token, network }),
+            TokenizedAssetView::Unavailable => None,
+        })
+        .collect();
+
+    Ok(Json(assets))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use alloy::primitives::address;
+    use chrono::Utc;
     use rocket::http::Status;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
 
     #[tokio::test]
-    async fn test_list_tokenized_assets_returns_hardcoded_list() {
-        let rocket = rocket::build().mount("/", routes![list_tokenized_assets]);
+    async fn test_list_tokenized_assets_returns_enabled_assets() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let enabled_view = TokenizedAssetView::Asset {
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            vault_address: address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            enabled: true,
+            added_at: Utc::now(),
+        };
+
+        let disabled_view = TokenizedAssetView::Asset {
+            underlying: UnderlyingSymbol::new("TSLA"),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::new("base"),
+            vault_address: address!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            enabled: false,
+            added_at: Utc::now(),
+        };
+
+        let enabled_payload =
+            serde_json::to_string(&enabled_view).expect("Failed to serialize");
+        let disabled_payload =
+            serde_json::to_string(&disabled_view).expect("Failed to serialize");
+
+        sqlx::query!(
+            r"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            "AAPL",
+            enabled_payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert enabled view");
+
+        sqlx::query!(
+            r"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            "TSLA",
+            disabled_payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert disabled view");
+
+        let rocket = rocket::build()
+            .manage(pool)
+            .mount("/", routes![list_tokenized_assets]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
             .await
@@ -55,50 +117,47 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: TokenizedAssetsResponse = serde_json::from_str(
+        let assets: Vec<TokenizedAssetResponse> = serde_json::from_str(
             &response.into_string().await.expect("valid response body"),
         )
         .expect("valid JSON response");
 
-        assert_eq!(response_body.assets.len(), 3);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].underlying, UnderlyingSymbol::new("AAPL"));
+        assert_eq!(assets[0].token, TokenSymbol::new("tAAPL"));
+        assert_eq!(assets[0].network, Network::new("base"));
+    }
 
-        assert_eq!(
-            response_body.assets[0].underlying,
-            UnderlyingSymbol("AAPL".to_string())
-        );
-        assert_eq!(
-            response_body.assets[0].token,
-            TokenSymbol("stAAPL".to_string())
-        );
-        assert_eq!(
-            response_body.assets[0].network,
-            Network("base".to_string())
-        );
+    #[tokio::test]
+    async fn test_list_tokenized_assets_returns_empty_when_none() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
 
-        assert_eq!(
-            response_body.assets[1].underlying,
-            UnderlyingSymbol("TSLA".to_string())
-        );
-        assert_eq!(
-            response_body.assets[1].token,
-            TokenSymbol("stTSLA".to_string())
-        );
-        assert_eq!(
-            response_body.assets[1].network,
-            Network("base".to_string())
-        );
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
 
-        assert_eq!(
-            response_body.assets[2].underlying,
-            UnderlyingSymbol("NVDA".to_string())
-        );
-        assert_eq!(
-            response_body.assets[2].token,
-            TokenSymbol("stNVDA".to_string())
-        );
-        assert_eq!(
-            response_body.assets[2].network,
-            Network("base".to_string())
-        );
+        let rocket = rocket::build()
+            .manage(pool)
+            .mount("/", routes![list_tokenized_assets]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/tokenized-assets").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let assets: Vec<TokenizedAssetResponse> = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        assert!(assets.is_empty());
     }
 }

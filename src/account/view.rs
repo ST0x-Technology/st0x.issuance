@@ -157,7 +157,7 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("ALPACA456".to_string());
         let linked_at = Utc::now();
 
-        let view = AccountView::Available {
+        let view = AccountView::Account {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
@@ -185,23 +185,21 @@ mod tests {
 
         assert!(result.is_some());
 
-        match result.unwrap() {
-            AccountView::Available {
-                client_id: found_client_id,
-                email: found_email,
-                alpaca_account: found_alpaca,
-                status,
-                linked_at: _,
-            } => {
-                assert_eq!(found_client_id, client_id);
-                assert_eq!(found_email, email);
-                assert_eq!(found_alpaca, alpaca_account);
-                assert_eq!(status, LinkedAccountStatus::Active);
-            }
-            AccountView::Unavailable => {
-                panic!("Expected Available, got Unavailable")
-            }
-        }
+        let AccountView::Account {
+            client_id: found_client_id,
+            email: found_email,
+            alpaca_account: found_alpaca,
+            status,
+            linked_at: _,
+        } = result.unwrap()
+        else {
+            panic!("Expected Account, got Unavailable")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+        assert_eq!(found_alpaca, alpaca_account);
+        assert_eq!(status, LinkedAccountStatus::Active);
     }
 
     #[tokio::test]

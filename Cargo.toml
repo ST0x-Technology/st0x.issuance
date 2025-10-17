@@ -51,6 +51,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 cqrs-es.workspace = true
 async-trait.workspace = true
 clap = { version = "4.5.49", features = ["derive", "env"] }
+alloy = "1.0.41"
 
 [lints]
 workspace = true
