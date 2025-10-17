@@ -91,19 +91,6 @@ impl SqlQueryFactory {
         )
     }
 
-    pub(crate) fn insert_snapshot(&self) -> String {
-        format!(
-            "INSERT INTO {} (
-                aggregate_type,
-                aggregate_id,
-                last_sequence,
-                payload,
-                timestamp
-            ) VALUES (?, ?, ?, ?, ?)",
-            self.snapshots_table
-        )
-    }
-
     pub(crate) fn update_snapshot(&self) -> String {
         format!(
             "INSERT OR REPLACE INTO {} (
@@ -183,16 +170,6 @@ mod tests {
         assert!(
             query.contains("WHERE aggregate_type = ? AND aggregate_id = ?")
         );
-    }
-
-    #[test]
-    fn test_insert_snapshot_query() {
-        let factory =
-            SqlQueryFactory::new("events".to_string(), "snapshots".to_string());
-        let query = factory.insert_snapshot();
-
-        assert!(query.contains("INSERT INTO snapshots"));
-        assert!(query.contains("VALUES (?, ?, ?, ?, ?)"));
     }
 
     #[test]
