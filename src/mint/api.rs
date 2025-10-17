@@ -1,40 +1,299 @@
+use alloy::primitives::Address;
 use rocket::serde::json::Json;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
-use super::{IssuerRequestId, Quantity, TokenizationRequestId};
+use super::{
+    ClientId, IssuerRequestId, MintCommand, MintView, Network, Quantity,
+    TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+    view::find_by_issuer_request_id,
+};
+use crate::account::{LinkedAccountStatus, view::find_by_client_id};
+use crate::tokenized_asset::view::list_enabled_assets;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct MintRequest {
     pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) qty: Quantity,
-    pub(crate) underlying: String,
+    #[serde(rename = "qty")]
+    pub(crate) quantity: Decimal,
+    #[serde(rename = "underlying_symbol")]
+    pub(crate) underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) client_id: String,
+    #[serde(rename = "wallet_address")]
+    pub(crate) wallet: Address,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MintResponse {
     pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) status: String,
 }
 
-#[post("/inkind/issuance", data = "<request>")]
-pub(crate) async fn initiate_mint(
-    request: Json<MintRequest>,
-) -> Json<MintResponse> {
-    let _request = request.into_inner();
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ErrorResponse {
+    pub(crate) error: String,
+}
 
-    Json(MintResponse {
-        issuer_request_id: IssuerRequestId::new("iss-stub-123"),
-    })
+#[post("/inkind/issuance", format = "json", data = "<request>")]
+pub(crate) async fn initiate_mint(
+    cqrs: &rocket::State<crate::MintCqrs>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    request: Json<MintRequest>,
+) -> Result<Json<MintResponse>, (rocket::http::Status, Json<ErrorResponse>)> {
+    let request = request.into_inner();
+
+    if request.quantity <= Decimal::ZERO {
+        return Err((
+            rocket::http::Status::BadRequest,
+            Json(ErrorResponse {
+                error: "Failed Validation: Invalid data payload".to_string(),
+            }),
+        ));
+    }
+
+    let enabled_assets =
+        list_enabled_assets(pool.inner()).await.map_err(|e| {
+            error!("Failed to list enabled assets: {e}");
+            (
+                rocket::http::Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+    let asset_exists = enabled_assets.iter().any(|asset| match asset {
+        crate::tokenized_asset::TokenizedAssetView::Asset {
+            underlying,
+            token,
+            network,
+            ..
+        } => {
+            *underlying == request.underlying
+                && *token == request.token
+                && *network == request.network
+        }
+        _ => false,
+    });
+
+    if !asset_exists {
+        return Err((
+            rocket::http::Status::BadRequest,
+            Json(ErrorResponse {
+                error: "Invalid Token: Token not available on the network"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    let client_id = ClientId(request.client_id.clone());
+
+    let account_view =
+        find_by_client_id(pool.inner(), &client_id).await.map_err(|e| {
+            error!("Failed to find account by client_id: {e}");
+            (
+                rocket::http::Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+    if let Some(crate::account::AccountView::Account { status, .. }) =
+        account_view
+    {
+        if status != LinkedAccountStatus::Active {
+            return Err((
+                rocket::http::Status::BadRequest,
+                Json(ErrorResponse {
+                    error: "Insufficient Eligibility: Client not eligible"
+                        .to_string(),
+                }),
+            ));
+        }
+    } else {
+        return Err((
+            rocket::http::Status::BadRequest,
+            Json(ErrorResponse {
+                error: "Insufficient Eligibility: Client not eligible"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    let command = MintCommand::Initiate {
+        tokenization_request_id: request.tokenization_request_id,
+        quantity: Quantity::new(request.quantity),
+        underlying: request.underlying,
+        token: request.token,
+        network: request.network,
+        client_id,
+        wallet: request.wallet,
+    };
+
+    let aggregate_id = uuid::Uuid::new_v4().to_string();
+
+    cqrs.execute(&aggregate_id, command).await.map_err(|e| {
+        error!("Failed to execute mint command: {e}");
+        (
+            rocket::http::Status::Conflict,
+            Json(ErrorResponse { error: "Mint already initiated".to_string() }),
+        )
+    })?;
+
+    let mint_view = find_by_issuer_request_id(
+        pool.inner(),
+        &IssuerRequestId::new(&aggregate_id),
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to find mint by issuer_request_id: {e}");
+        (
+            rocket::http::Status::InternalServerError,
+            Json(ErrorResponse { error: "Internal server error".to_string() }),
+        )
+    })?
+    .ok_or((
+        rocket::http::Status::InternalServerError,
+        Json(ErrorResponse { error: "Internal server error".to_string() }),
+    ))?;
+
+    let MintView::Initiated { issuer_request_id, .. } = mint_view else {
+        return Err((
+            rocket::http::Status::InternalServerError,
+            Json(ErrorResponse { error: "Internal server error".to_string() }),
+        ));
+    };
+
+    Ok(Json(MintResponse { issuer_request_id, status: "created".to_string() }))
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
+    use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Status};
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::account::{
+        Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
+        view::find_by_email,
+    };
+    use crate::mint::Mint;
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
+    };
+
+    async fn setup_test_environment() -> (
+        sqlx::Pool<sqlx::Sqlite>,
+        crate::AccountCqrs,
+        crate::TokenizedAssetCqrs,
+        crate::MintCqrs,
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+        let account_query = GenericQuery::new(account_view_repo);
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let tokenized_asset_query =
+            GenericQuery::new(tokenized_asset_view_repo);
+        let tokenized_asset_cqrs = sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(tokenized_asset_query)],
+            (),
+        );
+
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
+        let mint_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
+
+        (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs)
+    }
 
     #[tokio::test]
     async fn test_initiate_mint_returns_issuer_request_id() {
-        let rocket = rocket::build().mount("/", routes![initiate_mint]);
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let email = Email::new("test@placeholder.com".to_string())
+            .expect("Valid email");
+        let account_cmd = AccountCommand::Link {
+            email: email.clone(),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+        };
+        account_cqrs
+            .execute(email.as_str(), account_cmd)
+            .await
+            .expect("Failed to link account");
+
+        let account_view = find_by_email(&pool, &email)
+            .await
+            .expect("Failed to query account")
+            .expect("Account should exist");
+
+        let crate::account::AccountView::Account { client_id, .. } =
+            account_view
+        else {
+            panic!("Expected Account variant");
+        };
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault_address =
+            address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let asset_cmd = TokenizedAssetCommand::Add {
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            vault_address,
+        };
+        tokenized_asset_cqrs
+            .execute(&underlying.0, asset_cmd)
+            .await
+            .expect("Failed to add asset");
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
             .await
@@ -43,7 +302,11 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying": "AAPL"
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "network": "base",
+            "client_id": client_id.0,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
         let response = client
@@ -60,22 +323,102 @@ mod tests {
         )
         .expect("valid JSON response");
 
+        assert!(!mint_response.issuer_request_id.0.is_empty());
+        assert_eq!(mint_response.status, "created");
+    }
+
+    #[tokio::test]
+    async fn test_initiate_mint_rejects_unknown_asset() {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let email = Email::new("test@placeholder.com".to_string())
+            .expect("Valid email");
+        let account_cmd = AccountCommand::Link {
+            email: email.clone(),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+        };
+        account_cqrs
+            .execute(email.as_str(), account_cmd)
+            .await
+            .expect("Failed to link account");
+
+        let account_view = find_by_email(&pool, &email)
+            .await
+            .expect("Failed to query account")
+            .expect("Account should exist");
+
+        let crate::account::AccountView::Account { client_id, .. } =
+            account_view
+        else {
+            panic!("Expected Account variant");
+        };
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": "UNKNOWN",
+            "token_symbol": "tUNKNOWN",
+            "network": "base",
+            "client_id": client_id.0,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+
+        let error_response: ErrorResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
         assert_eq!(
-            mint_response.issuer_request_id,
-            IssuerRequestId::new("iss-stub-123")
+            error_response.error,
+            "Invalid Token: Token not available on the network"
         );
     }
 
     #[tokio::test]
-    async fn test_initiate_mint_rejects_malformed_request() {
-        let rocket = rocket::build().mount("/", routes![initiate_mint]);
+    async fn test_initiate_mint_rejects_negative_quantity() {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
             .await
             .expect("valid rocket instance");
 
         let request_body = serde_json::json!({
-            "invalid_field": "value"
+            "tokenization_request_id": "alp-123",
+            "qty": "-10",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "network": "base",
+            "client_id": "test",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
         let response = client
@@ -85,40 +428,16 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(response.status(), Status::UnprocessableEntity);
-    }
+        assert_eq!(response.status(), Status::BadRequest);
 
-    #[tokio::test]
-    async fn test_initiate_mint_accepts_decimal_quantity() {
-        let rocket = rocket::build().mount("/", routes![initiate_mint]);
-
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
-
-        let request_body = serde_json::json!({
-            "tokenization_request_id": "alp-456",
-            "qty": "99.999",
-            "underlying": "TSLA"
-        });
-
-        let response = client
-            .post("/inkind/issuance")
-            .header(ContentType::JSON)
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
-
-        assert_eq!(response.status(), Status::Ok);
-
-        let mint_response: MintResponse = serde_json::from_str(
+        let error_response: ErrorResponse = serde_json::from_str(
             &response.into_string().await.expect("valid response body"),
         )
         .expect("valid JSON response");
 
         assert_eq!(
-            mint_response.issuer_request_id,
-            IssuerRequestId::new("iss-stub-123")
+            error_response.error,
+            "Failed Validation: Invalid data payload"
         );
     }
 }

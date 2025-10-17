@@ -1,7 +1,7 @@
 mod api;
 mod cmd;
 mod event;
-mod view;
+pub(crate) mod view;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;

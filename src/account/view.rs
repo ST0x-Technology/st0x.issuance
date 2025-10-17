@@ -81,6 +81,31 @@ pub(crate) async fn find_by_email(
     Ok(Some(view))
 }
 
+pub(crate) async fn find_by_client_id(
+    pool: &Pool<Sqlite>,
+    client_id: &ClientId,
+) -> Result<Option<AccountView>, AccountViewError> {
+    let client_id_str = &client_id.0;
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE json_extract(payload, '$.Account.client_id') = ?
+        "#,
+        client_id_str
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let view: AccountView = serde_json::from_str(&row.payload)?;
+
+    Ok(Some(view))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

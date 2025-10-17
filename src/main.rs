@@ -13,10 +13,12 @@ use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 
 use account::{Account, AccountView};
+use mint::Mint;
 use tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 type AccountCqrs = SqliteCqrs<Account>;
 type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
+type MintCqrs = SqliteCqrs<Mint>;
 
 #[derive(Debug, Parser)]
 #[command(name = "st0x-issuance")]
