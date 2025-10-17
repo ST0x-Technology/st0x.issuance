@@ -43,7 +43,7 @@ The MintView will mirror the aggregate states but use query-oriented naming:
 
 ```rust
 enum MintView {
-    Unavailable,  // Not initiated or doesn't exist
+    NotFound,     // Mint not found in view
     Initiated {   // Mint has been initiated, waiting for journal
         // ... same fields as aggregate
     },
@@ -156,17 +156,17 @@ Create migration for mint_view table following the established pattern.
 
 ---
 
-## Task 6. Create Database Migration
+## Task 6. Implement MintView
 
-Create migration for mint_view table following the established pattern.
+Create `src/mint/view.rs` with the view struct and View trait implementation.
 
-- [ ] Run `sqlx migrate add create_mint_view`
-- [ ] Add CREATE TABLE statement with view_id, version, payload columns
-- [ ] Add indexes for common query patterns:
-  - [ ] Index on client_id (extracted from JSON)
-  - [ ] Index on underlying symbol (extracted from JSON)
-  - [ ] Index on tokenization_request_id (extracted from JSON)
-- [ ] Add issued_request_id_indexed column for efficient lookups
+- [x] Define MintView enum mirroring aggregate states
+- [x] Implement Default trait returning Unavailable
+- [x] Implement View&lt;Mint&gt; trait with update() method
+- [x] Add helper query functions:
+  - [x] find_by_issuer_request_id() for querying specific mints
+- [x] Add view update tests
+- [x] Export from mod.rs
 
 ---
 

@@ -1,6 +1,7 @@
 mod api;
 mod cmd;
 mod event;
+mod view;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 pub(crate) use api::initiate_mint;
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
+pub(crate) use view::MintView;
 
 pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{
