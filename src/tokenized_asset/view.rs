@@ -20,7 +20,7 @@ pub(crate) enum TokenizedAssetViewError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetView {
     Unavailable,
-    Available {
+    Asset {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
@@ -46,7 +46,7 @@ impl View<TokenizedAsset> for TokenizedAssetView {
                 vault_address,
                 added_at,
             } => {
-                *self = Self::Available {
+                *self = Self::Asset {
                     underlying: underlying.clone(),
                     token: token.clone(),
                     network: network.clone(),
@@ -66,7 +66,7 @@ pub(crate) async fn list_enabled_assets(
         r#"
         SELECT payload as "payload: String"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Available.enabled') = 1
+        WHERE json_extract(payload, '$.Asset.enabled') = 1
         "#
     )
     .fetch_all(pool)
@@ -80,7 +80,7 @@ pub(crate) async fn list_enabled_assets(
     Ok(views
         .into_iter()
         .filter(|view| {
-            matches!(view, TokenizedAssetView::Available { enabled: true, .. })
+            matches!(view, TokenizedAssetView::Asset { enabled: true, .. })
         })
         .collect())
 }
@@ -131,22 +131,38 @@ mod tests {
         };
 
         let mut view = TokenizedAssetView::default();
+
+        assert!(matches!(view, TokenizedAssetView::Unavailable));
+
         view.update(&envelope);
 
-        assert_eq!(view.underlying, underlying);
-        assert_eq!(view.token, token);
-        assert_eq!(view.network, network);
-        assert_eq!(view.vault_address, vault_address);
-        assert!(view.enabled);
-        assert_eq!(view.added_at, added_at);
+        let TokenizedAssetView::Asset {
+            underlying: view_underlying,
+            token: view_token,
+            network: view_network,
+            vault_address: view_vault_address,
+            enabled,
+            added_at: view_added_at,
+        } = view
+        else {
+            panic!("Expected Asset, got Unavailable")
+        };
+
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(view_network, network);
+        assert_eq!(view_vault_address, vault_address);
+        assert!(enabled);
+        assert_eq!(view_added_at, added_at);
     }
 
     #[tokio::test]
     async fn test_list_enabled_assets_returns_only_enabled() {
         let pool = setup_test_db().await;
 
-        let enabled_view = TokenizedAssetView {
-            underlying: UnderlyingSymbol("AAPL".to_string()),
+        let enabled_underlying = UnderlyingSymbol("AAPL".to_string());
+        let enabled_view = TokenizedAssetView::Asset {
+            underlying: enabled_underlying.clone(),
             token: TokenSymbol("stAAPL".to_string()),
             network: Network("base".to_string()),
             vault_address: VaultAddress("0xaaaa".to_string()),
@@ -154,8 +170,9 @@ mod tests {
             added_at: Utc::now(),
         };
 
-        let disabled_view = TokenizedAssetView {
-            underlying: UnderlyingSymbol("TSLA".to_string()),
+        let disabled_underlying = UnderlyingSymbol("TSLA".to_string());
+        let disabled_view = TokenizedAssetView::Asset {
+            underlying: disabled_underlying.clone(),
             token: TokenSymbol("stTSLA".to_string()),
             network: Network("base".to_string()),
             vault_address: VaultAddress("0xbbbb".to_string()),
@@ -173,7 +190,7 @@ mod tests {
             INSERT INTO tokenized_asset_view (view_id, version, payload)
             VALUES (?, 1, ?)
             ",
-            enabled_view.underlying.0,
+            enabled_underlying.0,
             enabled_payload
         )
         .execute(&pool)
@@ -185,7 +202,7 @@ mod tests {
             INSERT INTO tokenized_asset_view (view_id, version, payload)
             VALUES (?, 1, ?)
             ",
-            disabled_view.underlying.0,
+            disabled_underlying.0,
             disabled_payload
         )
         .execute(&pool)
@@ -196,8 +213,14 @@ mod tests {
             list_enabled_assets(&pool).await.expect("Query should succeed");
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].underlying, enabled_view.underlying);
-        assert!(result[0].enabled);
+
+        let TokenizedAssetView::Asset { underlying, enabled, .. } = &result[0]
+        else {
+            panic!("Expected Asset, got Unavailable")
+        };
+
+        assert_eq!(underlying, &enabled_underlying);
+        assert!(enabled);
     }
 
     #[tokio::test]

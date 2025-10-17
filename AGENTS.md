@@ -199,6 +199,39 @@ tokenization.
 See SPEC.md for detailed command/event mappings and state machines for each
 aggregate.
 
+### Aggregates vs Views: Naming and Purpose
+
+Both aggregates and views use enum-based type modeling, but serve fundamentally
+different purposes which should be reflected in their naming.
+
+**Aggregates:**
+
+- Represent entity state, reconstructed by replaying events (O(n) cost)
+- Enforce business rules, validate commands, maintain domain invariants
+- Naming reflects **entity lifecycle**: `NotLinked`/`Linked`,
+  `NotAdded`/`Added`, etc.
+- Names communicate where the entity is in its domain-specific lifecycle
+
+**Views:**
+
+- Materialized projections for efficient querying
+- Optimized for read operations, filtered access, cross-entity queries
+- Naming is done from the perspective of a query, e.g. `Unavailable` instead of
+  `NotAdded` or `Removed`
+
+**Why the distinction matters:**
+
+- Views can map multiple aggregate states to a single view state
+- Query-oriented naming makes it clear views serve a different architectural
+  purpose
+- Prevents confusion between entity state (aggregate) and data availability
+  (view)
+
+**Avoid Option wrappers for views:** The `cqrs-es` framework's
+`GenericQuery.load()` already returns `Option<V>`, so
+`Option<View(Option<Data>)>` creates confusing nested Options. Use enum variants
+instead.
+
 ### HTTP Integration
 
 **Our HTTP Server (Rocket.rs):**
