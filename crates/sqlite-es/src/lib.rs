@@ -12,4 +12,4 @@ mod view_repository;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{SqliteAggregateError, SqliteEventRepository};
-pub use view_repository::SqliteViewError;
+pub use view_repository::{SqliteViewError, SqliteViewRepository};

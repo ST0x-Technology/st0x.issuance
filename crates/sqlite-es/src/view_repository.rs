@@ -1,4 +1,7 @@
 use cqrs_es::persist::PersistenceError;
+use cqrs_es::{Aggregate, View};
+use sqlx::{Pool, Sqlite};
+use std::marker::PhantomData;
 
 /// Errors that can occur during SQLite view repository operations
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +42,52 @@ impl From<SqliteViewError> for PersistenceError {
             }
             SqliteViewError::TryFromInt(e) => Self::UnknownError(Box::new(e)),
         }
+    }
+}
+
+/// SQLite implementation of the `ViewRepository` trait
+///
+/// Provides view persistence backed by SQLite for use with the `GenericQuery`
+/// processor in the cqrs-es framework.
+///
+/// # Type Parameters
+///
+/// * `V` - The view type that implements `View<A>`
+/// * `A` - The aggregate type that the view projects from
+///
+/// # Example
+///
+/// ```ignore
+/// let pool = Pool::<Sqlite>::connect("sqlite::memory:").await?;
+/// let view_repo = SqliteViewRepository::<MintView, Mint>::new(
+///     pool,
+///     "mint_view".to_string()
+/// );
+/// ```
+pub struct SqliteViewRepository<V, A>
+where
+    V: View<A>,
+    A: Aggregate,
+{
+    pool: Pool<Sqlite>,
+    view_table: String,
+    _phantom: PhantomData<(V, A)>,
+}
+
+impl<V, A> SqliteViewRepository<V, A>
+where
+    V: View<A>,
+    A: Aggregate,
+{
+    /// Creates a new `SqliteViewRepository` for a specific view table
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - SQLite connection pool
+    /// * `view_table` - Name of the table storing this view (e.g., "mint_view")
+    #[must_use]
+    pub const fn new(pool: Pool<Sqlite>, view_table: String) -> Self {
+        Self { pool, view_table, _phantom: PhantomData }
     }
 }
 
