@@ -583,15 +583,15 @@ migration file.
 
 ---
 
-## Task 8. Implement Testing Utilities
+## Task 8. Implement Testing Utilities ✅
 
 ### Subtasks
 
-- [ ] Create `crates/sqlite-es/src/testing.rs`
-- [ ] Implement in-memory database helpers using `sqlx::migrate!()`
-- [ ] Add test data builders
-- [ ] Create helper functions for test setup
-- [ ] Add example test demonstrating usage
+- [x] Create `crates/sqlite-es/src/testing.rs`
+- [x] Implement in-memory database helpers using `sqlx::migrate!()`
+- [x] Add test data builders
+- [x] Create helper functions for test setup
+- [x] Add example test demonstrating usage
 
 ### Implementation Details
 

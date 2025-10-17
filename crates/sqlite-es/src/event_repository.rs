@@ -365,6 +365,7 @@ fn is_optimistic_lock_error(err: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::create_test_pool;
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
@@ -428,45 +429,9 @@ mod tests {
         }
     }
 
-    async fn create_test_pool() -> Pool<Sqlite> {
-        let pool = Pool::<Sqlite>::connect(":memory:").await.unwrap();
-
-        sqlx::query(
-            "CREATE TABLE events (
-                aggregate_type TEXT NOT NULL,
-                aggregate_id TEXT NOT NULL,
-                sequence BIGINT NOT NULL,
-                event_type TEXT NOT NULL,
-                event_version TEXT NOT NULL,
-                payload JSON NOT NULL,
-                metadata JSON NOT NULL,
-                PRIMARY KEY (aggregate_type, aggregate_id, sequence)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE snapshots (
-                aggregate_type TEXT NOT NULL,
-                aggregate_id TEXT NOT NULL,
-                last_sequence BIGINT NOT NULL,
-                payload JSON NOT NULL,
-                timestamp TEXT NOT NULL,
-                PRIMARY KEY (aggregate_type, aggregate_id)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        pool
-    }
-
     #[tokio::test]
     async fn test_persist_and_load_events() {
-        let pool = create_test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool);
 
         let event = SerializedEvent {
@@ -492,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimistic_locking() {
-        let pool = create_test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool);
 
         let event = SerializedEvent {
@@ -514,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_operations() {
-        let pool = create_test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool);
 
         let aggregate = serde_json::json!({"state": "data"});
@@ -540,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_events_since() {
-        let pool = create_test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool);
 
         let events = vec![
