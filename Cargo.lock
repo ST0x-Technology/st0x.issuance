@@ -1449,6 +1449,7 @@ dependencies = [
  "rocket_codegen",
  "rocket_http",
  "serde",
+ "serde_json",
  "state",
  "tempfile",
  "time",
@@ -1983,6 +1984,8 @@ name = "st0x-issuance"
 version = "0.1.0"
 dependencies = [
  "rocket",
+ "serde",
+ "serde_json",
  "sqlite-es",
  "sqlx",
  "tracing",

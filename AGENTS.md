@@ -25,9 +25,10 @@ Relevant docs:
 
 ### While implementing
 
-- You should update PLAN.md every time you complete a section
-- Upon completing a planned task, add detailed descriptions of the changes you
-  made to ease the review process
+- Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
+- Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
+  sections or verbose changelogs
+- The code diffs themselves should be self-explanatory and easy to review
 
 ### Before creating a PR
 
@@ -71,7 +72,8 @@ time-travel debugging, and provide a single source of truth for all operations.
 
 ### Testing
 
-- `cargo test -q` - Run all tests
+- `cargo test --workspace` - Run all tests (including crates/)
+- `cargo test -q` - Run all tests quietly
 - `cargo test -q --lib` - Run library tests only
 - `cargo test -q <test_name>` - Run specific test
 
@@ -85,9 +87,9 @@ time-travel debugging, and provide a single source of truth for all operations.
 
 ### Development Tools
 
-- `rainix-rs-static` - Run Rust static analysis
-- `cargo clippy --all-targets --all-features -- -D clippy::all` - Run Clippy for
-  linting
+- `cargo fmt --all -- --check` - Check code formatting
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
+  Run Clippy with all warnings denied
 - `cargo fmt` - Format code
 
 ### Nix Development Environment
@@ -723,9 +725,10 @@ quantities.
 
 - **Always run tests, clippy, and formatters before handing over a piece of
   work**
-  - Run tests first, as changing tests can break clippy
-  - Run clippy next, as fixing linting errors can break formatting
-  - Deny warnings when running clippy
+  - Run `cargo test --workspace` first, as changing tests can break clippy
+  - Run
+    `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+    next, as fixing linting errors can break formatting
   - Always run `cargo fmt` last to ensure clean code formatting
 
 ### CRITICAL: Lint Policy

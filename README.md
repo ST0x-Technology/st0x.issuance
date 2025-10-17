@@ -104,7 +104,8 @@ cargo run                # Run the HTTP server
 ### Testing
 
 ```bash
-cargo test -q            # Run all tests
+cargo test --workspace   # Run all tests (including crates/)
+cargo test -q            # Run all tests quietly
 cargo test -q --lib      # Run library tests only
 cargo test -q <name>     # Run specific test
 ```
@@ -121,9 +122,9 @@ sqlx migrate reset -y    # Drop DB and re-run all migrations
 ### Code Quality
 
 ```bash
-cargo fmt                                                            # Format code
-cargo clippy --all-targets --all-features -- -D clippy::all         # Run linting
-rainix-rs-static                                                    # Run static analysis
+cargo fmt                                                                                  # Format code
+cargo fmt --all -- --check                                                                 # Check formatting
+cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings        # Run linting
 ```
 
 ## Project Structure

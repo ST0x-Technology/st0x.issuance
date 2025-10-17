@@ -70,8 +70,9 @@ Simple feature to start with - links AP accounts to our system.
 
 ### Issues
 
-- [ ] [#10](https://github.com/ST0x-Technology/st0x.issuance/issues/10) - Add
+- [x] [#10](https://github.com/ST0x-Technology/st0x.issuance/issues/10) - Add
       POST /accounts/connect endpoint stub
+  - **PR:** [#42](https://github.com/ST0x-Technology/st0x.issuance/pull/42)
 - [ ] [#11](https://github.com/ST0x-Technology/st0x.issuance/issues/11) -
       Implement LinkAccount feature and connect endpoint
 
