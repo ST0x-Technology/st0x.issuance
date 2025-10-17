@@ -529,70 +529,14 @@ pub use event_repository::*;
 
 ---
 
-## Task 7. Implement Testing Utilities
+## Task 7. Populate Database Migration ✅
 
 ### Subtasks
 
-- [ ] Create `crates/sqlite-es/src/testing.rs`
-- [ ] Implement in-memory database helpers using `sqlx::migrate!()`
-- [ ] Add test data builders
-- [ ] Create helper functions for test setup
-- [ ] Add example test demonstrating usage
-
-### Implementation Details
-
-Provide testing utilities that use migrations:
-
-```rust
-use sqlx::{Pool, Sqlite};
-
-/// Creates an in-memory SQLite database with migrations applied
-pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
-    let pool = Pool::<Sqlite>::connect(":memory:").await?;
-    sqlx::migrate!().run(&pool).await?;
-    Ok(pool)
-}
-```
-
-Key points:
-
-- Use `sqlx::migrate!()` to run migrations from the migrations folder
-- Don't manually create tables in Rust code
-- Keep visibility appropriate (likely `pub` for testing utilities)
-
----
-
-## Task 8. Add View Repository Stub
-
-### Subtasks
-
-- [ ] Create `crates/sqlite-es/src/view_repository.rs`
-- [ ] Add module stub with TODO comment referencing issue #9
-- [ ] Export from lib.rs
-
-### Implementation Details
-
-Create a stub file that will be implemented in issue #9:
-
-```rust
-//! View repository implementation for SQLite
-//!
-//! TODO(#9): Implement SqliteViewRepository
-//! This will provide view persistence for read models in the CQRS pattern.
-```
-
-Format: `TODO(#issue_number): description`
-
----
-
-## Task 9. Populate Database Migration
-
-### Subtasks
-
-- [ ] Reset the database using `sqlx migrate reset -y`
-- [ ] Populate the existing `migrations/20251016210348_init.sql` file
-- [ ] Add events and snapshots tables with proper indexes
-- [ ] Test migration with `sqlx migrate run`
+- [x] Reset the database using `sqlx migrate reset -y`
+- [x] Populate the existing `migrations/20251016210348_init.sql` file
+- [x] Add events and snapshots tables with proper indexes
+- [x] Test migration with `sqlx migrate run`
 
 ### Implementation Details
 
@@ -636,6 +580,62 @@ sqlx migrate run
 
 **Note:** This follows the exact schema from SPEC.md and uses the existing
 migration file.
+
+---
+
+## Task 8. Implement Testing Utilities
+
+### Subtasks
+
+- [ ] Create `crates/sqlite-es/src/testing.rs`
+- [ ] Implement in-memory database helpers using `sqlx::migrate!()`
+- [ ] Add test data builders
+- [ ] Create helper functions for test setup
+- [ ] Add example test demonstrating usage
+
+### Implementation Details
+
+Provide testing utilities that use migrations:
+
+```rust
+use sqlx::{Pool, Sqlite};
+
+/// Creates an in-memory SQLite database with migrations applied
+pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
+    let pool = Pool::<Sqlite>::connect(":memory:").await?;
+    sqlx::migrate!().run(&pool).await?;
+    Ok(pool)
+}
+```
+
+Key points:
+
+- Use `sqlx::migrate!()` to run migrations from the migrations folder
+- Don't manually create tables in Rust code
+- Keep visibility appropriate (likely `pub` for testing utilities)
+
+---
+
+## Task 9. Add View Repository Stub
+
+### Subtasks
+
+- [ ] Create `crates/sqlite-es/src/view_repository.rs`
+- [ ] Add module stub with TODO comment referencing issue #9
+- [ ] Export from lib.rs
+
+### Implementation Details
+
+Create a stub file that will be implemented in issue #9:
+
+```rust
+//! View repository implementation for SQLite
+//!
+//! TODO(#9): Implement SqliteViewRepository
+//! This will provide view persistence for read models in the CQRS pattern.
+```
+
+Format: `TODO(#issue_number): description`
 
 ---
 
