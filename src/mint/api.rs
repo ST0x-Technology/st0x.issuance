@@ -9,8 +9,10 @@ use super::{
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     view::find_by_issuer_request_id,
 };
-use crate::account::{LinkedAccountStatus, view::find_by_client_id};
-use crate::tokenized_asset::view::list_enabled_assets;
+use crate::account::{
+    AccountView, LinkedAccountStatus, view::find_by_client_id,
+};
+use crate::tokenized_asset::{TokenizedAssetView, view::list_enabled_assets};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MintRequest {
@@ -38,92 +40,109 @@ pub(crate) struct ErrorResponse {
     pub(crate) error: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MintApiError {
+    #[error("Invalid quantity: must be greater than zero")]
+    InvalidQuantity,
+
+    #[error("Asset not available on network")]
+    AssetNotAvailable,
+
+    #[error("Client not eligible")]
+    ClientNotEligible,
+
+    #[error("Failed to query enabled assets")]
+    AssetQueryFailed(
+        #[source] crate::tokenized_asset::view::TokenizedAssetViewError,
+    ),
+
+    #[error("Failed to query account")]
+    AccountQueryFailed(#[source] crate::account::view::AccountViewError),
+
+    #[error("Failed to execute mint command")]
+    CommandExecutionFailed(#[source] Box<dyn std::error::Error + Send>),
+
+    #[error("Failed to query mint view")]
+    MintViewQueryFailed(#[source] super::view::MintViewError),
+
+    #[error("Mint view not found after creation")]
+    MintViewNotFound,
+
+    #[error("Unexpected mint state")]
+    UnexpectedMintState,
+}
+
+impl<'r> rocket::response::Responder<'r, 'static> for MintApiError {
+    fn respond_to(
+        self,
+        _: &'r rocket::Request<'_>,
+    ) -> rocket::response::Result<'static> {
+        let (status, message) = match self {
+            Self::InvalidQuantity => (
+                rocket::http::Status::BadRequest,
+                "Failed Validation: Invalid data payload",
+            ),
+            Self::AssetNotAvailable => (
+                rocket::http::Status::BadRequest,
+                "Invalid Token: Token not available on the network",
+            ),
+            Self::ClientNotEligible => (
+                rocket::http::Status::BadRequest,
+                "Insufficient Eligibility: Client not eligible",
+            ),
+            Self::CommandExecutionFailed(_) => {
+                (rocket::http::Status::Conflict, "Mint already initiated")
+            }
+            Self::AssetQueryFailed(_)
+            | Self::AccountQueryFailed(_)
+            | Self::MintViewQueryFailed(_)
+            | Self::MintViewNotFound
+            | Self::UnexpectedMintState => (
+                rocket::http::Status::InternalServerError,
+                "Internal server error",
+            ),
+        };
+
+        let response = ErrorResponse { error: message.to_string() };
+
+        rocket::response::Response::build()
+            .status(status)
+            .header(rocket::http::ContentType::JSON)
+            .sized_body(
+                None,
+                std::io::Cursor::new(
+                    serde_json::to_string(&response).unwrap_or_else(|_| {
+                        r#"{"error":"Internal server error"}"#.to_string()
+                    }),
+                ),
+            )
+            .ok()
+    }
+}
+
 #[post("/inkind/issuance", format = "json", data = "<request>")]
 pub(crate) async fn initiate_mint(
     cqrs: &rocket::State<crate::MintCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<MintRequest>,
-) -> Result<Json<MintResponse>, (rocket::http::Status, Json<ErrorResponse>)> {
+) -> Result<Json<MintResponse>, MintApiError> {
     let request = request.into_inner();
 
     if request.quantity <= Decimal::ZERO {
-        return Err((
-            rocket::http::Status::BadRequest,
-            Json(ErrorResponse {
-                error: "Failed Validation: Invalid data payload".to_string(),
-            }),
-        ));
+        return Err(MintApiError::InvalidQuantity);
     }
 
-    let enabled_assets =
-        list_enabled_assets(pool.inner()).await.map_err(|e| {
-            error!("Failed to list enabled assets: {e}");
-            (
-                rocket::http::Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-
-    let asset_exists = enabled_assets.iter().any(|asset| match asset {
-        crate::tokenized_asset::TokenizedAssetView::Asset {
-            underlying,
-            token,
-            network,
-            ..
-        } => {
-            *underlying == request.underlying
-                && *token == request.token
-                && *network == request.network
-        }
-        _ => false,
-    });
-
-    if !asset_exists {
-        return Err((
-            rocket::http::Status::BadRequest,
-            Json(ErrorResponse {
-                error: "Invalid Token: Token not available on the network"
-                    .to_string(),
-            }),
-        ));
-    }
+    validate_asset_exists(
+        pool.inner(),
+        &request.underlying,
+        &request.token,
+        &request.network,
+    )
+    .await?;
 
     let client_id = ClientId(request.client_id.clone());
 
-    let account_view =
-        find_by_client_id(pool.inner(), &client_id).await.map_err(|e| {
-            error!("Failed to find account by client_id: {e}");
-            (
-                rocket::http::Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-
-    if let Some(crate::account::AccountView::Account { status, .. }) =
-        account_view
-    {
-        if status != LinkedAccountStatus::Active {
-            return Err((
-                rocket::http::Status::BadRequest,
-                Json(ErrorResponse {
-                    error: "Insufficient Eligibility: Client not eligible"
-                        .to_string(),
-                }),
-            ));
-        }
-    } else {
-        return Err((
-            rocket::http::Status::BadRequest,
-            Json(ErrorResponse {
-                error: "Insufficient Eligibility: Client not eligible"
-                    .to_string(),
-            }),
-        ));
-    }
+    validate_client_eligible(pool.inner(), &client_id).await?;
 
     let command = MintCommand::Initiate {
         tokenization_request_id: request.tokenization_request_id,
@@ -139,10 +158,7 @@ pub(crate) async fn initiate_mint(
 
     cqrs.execute(&aggregate_id, command).await.map_err(|e| {
         error!("Failed to execute mint command: {e}");
-        (
-            rocket::http::Status::Conflict,
-            Json(ErrorResponse { error: "Mint already initiated".to_string() }),
-        )
+        MintApiError::CommandExecutionFailed(Box::new(e))
     })?;
 
     let mint_view = find_by_issuer_request_id(
@@ -152,24 +168,68 @@ pub(crate) async fn initiate_mint(
     .await
     .map_err(|e| {
         error!("Failed to find mint by issuer_request_id: {e}");
-        (
-            rocket::http::Status::InternalServerError,
-            Json(ErrorResponse { error: "Internal server error".to_string() }),
-        )
+        MintApiError::MintViewQueryFailed(e)
     })?
-    .ok_or((
-        rocket::http::Status::InternalServerError,
-        Json(ErrorResponse { error: "Internal server error".to_string() }),
-    ))?;
+    .ok_or(MintApiError::MintViewNotFound)?;
 
     let MintView::Initiated { issuer_request_id, .. } = mint_view else {
-        return Err((
-            rocket::http::Status::InternalServerError,
-            Json(ErrorResponse { error: "Internal server error".to_string() }),
-        ));
+        return Err(MintApiError::UnexpectedMintState);
     };
 
     Ok(Json(MintResponse { issuer_request_id, status: "created".to_string() }))
+}
+
+async fn validate_asset_exists(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    underlying: &UnderlyingSymbol,
+    token: &TokenSymbol,
+    network: &Network,
+) -> Result<(), MintApiError> {
+    let enabled_assets = list_enabled_assets(pool).await.map_err(|e| {
+        error!("Failed to list enabled assets: {e}");
+        MintApiError::AssetQueryFailed(e)
+    })?;
+
+    let asset_exists = enabled_assets.iter().any(|asset| match asset {
+        TokenizedAssetView::Asset {
+            underlying: asset_underlying,
+            token: asset_token,
+            network: asset_network,
+            ..
+        } => {
+            *asset_underlying == *underlying
+                && *asset_token == *token
+                && *asset_network == *network
+        }
+        TokenizedAssetView::Unavailable => false,
+    });
+
+    if !asset_exists {
+        return Err(MintApiError::AssetNotAvailable);
+    }
+
+    Ok(())
+}
+
+async fn validate_client_eligible(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    client_id: &ClientId,
+) -> Result<(), MintApiError> {
+    let account_view =
+        find_by_client_id(pool, client_id).await.map_err(|e| {
+            error!("Failed to find account by client_id: {e}");
+            MintApiError::AccountQueryFailed(e)
+        })?;
+
+    if let Some(AccountView::Account { status, .. }) = account_view {
+        if status != LinkedAccountStatus::Active {
+            return Err(MintApiError::ClientNotEligible);
+        }
+    } else {
+        return Err(MintApiError::ClientNotEligible);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,9 +325,7 @@ mod tests {
             .expect("Failed to query account")
             .expect("Account should exist");
 
-        let crate::account::AccountView::Account { client_id, .. } =
-            account_view
-        else {
+        let AccountView::Account { client_id, .. } = account_view else {
             panic!("Expected Account variant");
         };
 
@@ -348,9 +406,7 @@ mod tests {
             .expect("Failed to query account")
             .expect("Account should exist");
 
-        let crate::account::AccountView::Account { client_id, .. } =
-            account_view
-        else {
+        let AccountView::Account { client_id, .. } = account_view else {
             panic!("Expected Account variant");
         };
 

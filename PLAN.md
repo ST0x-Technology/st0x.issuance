@@ -174,29 +174,29 @@ Create `src/mint/view.rs` with the view struct and View trait implementation.
 
 Update `src/mint/api.rs` to connect the endpoint to the CQRS framework.
 
-- [ ] Add complete request DTO matching Alpaca's API spec:
-  - [ ] tokenization_request_id
-  - [ ] qty
-  - [ ] underlying_symbol (renamed to underlying in domain)
-  - [ ] token_symbol (renamed to token in domain)
-  - [ ] network
-  - [ ] client_id
-  - [ ] wallet_address (renamed to wallet in domain)
-- [ ] Implement validation logic:
-  - [ ] Query TokenizedAssetView to verify asset exists and enabled
-  - [ ] Query AccountView to verify client_id exists and active
-  - [ ] Validate qty is positive
-  - [ ] Validate wallet is valid Ethereum address
-  - [ ] Validate network matches expected value (e.g., "base")
-  - [ ] Return 400 with appropriate error message if validation fails
-- [ ] Execute MintCommand::Initiate via CQRS framework
-- [ ] Query MintView to get created mint
-- [ ] Return response with issuer_request_id and status "created"
-- [ ] Update response DTO to match Alpaca's expected format
-- [ ] Add proper error handling with appropriate HTTP status codes:
-  - [ ] 200 for success
-  - [ ] 400 for validation failures with specific error messages
-  - [ ] 500 for internal errors
+- [x] Add complete request DTO matching Alpaca's API spec:
+  - [x] tokenization_request_id
+  - [x] qty
+  - [x] underlying_symbol (renamed to underlying in domain)
+  - [x] token_symbol (renamed to token in domain)
+  - [x] network
+  - [x] client_id
+  - [x] wallet_address (renamed to wallet in domain)
+- [x] Implement validation logic:
+  - [x] Query TokenizedAssetView to verify asset exists and enabled
+  - [x] Query AccountView to verify client_id exists and active
+  - [x] Validate qty is positive
+  - [x] Validate wallet is valid Ethereum address
+  - [x] Validate network matches expected value (e.g., "base")
+  - [x] Return 400 with appropriate error message if validation fails
+- [x] Execute MintCommand::Initiate via CQRS framework
+- [x] Query MintView to get created mint
+- [x] Return response with issuer_request_id and status "created"
+- [x] Update response DTO to match Alpaca's expected format
+- [x] Add proper error handling with appropriate HTTP status codes:
+  - [x] 200 for success
+  - [x] 400 for validation failures with specific error messages
+  - [x] 500 for internal errors
 
 ---
 
@@ -204,12 +204,12 @@ Update `src/mint/api.rs` to connect the endpoint to the CQRS framework.
 
 Update `src/main.rs` to wire up the Mint aggregate with the CQRS framework.
 
-- [ ] Import Mint and MintView types
-- [ ] Create SqliteViewRepository for MintView
-- [ ] Create GenericQuery wrapping the view repository
-- [ ] Create MintCqrs using sqlite_cqrs()
-- [ ] Add MintCqrs to Rocket state management
-- [ ] Ensure migration runs on startup
+- [x] Import Mint and MintView types
+- [x] Create SqliteViewRepository for MintView
+- [x] Create GenericQuery wrapping the view repository
+- [x] Create MintCqrs using sqlite_cqrs()
+- [x] Add MintCqrs to Rocket state management
+- [x] Ensure migration runs on startup
 
 ---
 
@@ -217,17 +217,17 @@ Update `src/main.rs` to wire up the Mint aggregate with the CQRS framework.
 
 Add comprehensive tests to `src/mint/api.rs`.
 
-- [ ] Test successful mint initiation returns issuer_request_id
-- [ ] Test validation failures:
-  - [ ] Invalid/unsupported asset returns 400
+- [x] Test successful mint initiation returns issuer_request_id
+- [x] Test validation failures:
+  - [x] Invalid/unsupported asset returns 400
   - [ ] Unknown client_id returns 400
-  - [ ] Negative quantity returns 400
+  - [x] Negative quantity returns 400
   - [ ] Invalid wallet address returns 400
   - [ ] Wrong network returns 400
 - [ ] Test events are persisted correctly in event store
 - [ ] Test views are updated correctly
 - [ ] Test duplicate tokenization_request_id handling
-- [ ] Follow existing test patterns from account/api.rs
+- [x] Follow existing test patterns from account/api.rs
 
 ---
 
@@ -235,14 +235,14 @@ Add comprehensive tests to `src/mint/api.rs`.
 
 Ensure comprehensive unit test coverage for all components.
 
-- [ ] Aggregate tests in mod.rs:
-  - [ ] MintCommand::Initiate creates MintEvent::Initiated
-  - [ ] Apply MintEvent::Initiated transitions state correctly
-  - [ ] Cannot initiate already-initiated mint
-- [ ] View tests in view.rs:
-  - [ ] Update from MintEvent::Initiated works correctly
-  - [ ] Query functions return correct results
-- [ ] Follow Given-When-Then pattern from existing tests
+- [x] Aggregate tests in mod.rs:
+  - [x] MintCommand::Initiate creates MintEvent::Initiated
+  - [x] Apply MintEvent::Initiated transitions state correctly
+  - [x] Cannot initiate already-initiated mint
+- [x] View tests in view.rs:
+  - [x] Update from MintEvent::Initiated works correctly
+  - [x] Query functions return correct results
+- [x] Follow Given-When-Then pattern from existing tests
 
 ---
 
@@ -250,11 +250,11 @@ Ensure comprehensive unit test coverage for all components.
 
 Ensure all code quality checks pass before submitting.
 
-- [ ] Run `cargo test --workspace` - all tests pass
-- [ ] Run
+- [x] Run `cargo test --workspace` - all tests pass
+- [x] Run
       `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
       no warnings
-- [ ] Run `cargo fmt` - code is formatted
+- [x] Run `cargo fmt` - code is formatted
 - [ ] Manual testing with curl/httpie to verify endpoint works correctly
 
 ---

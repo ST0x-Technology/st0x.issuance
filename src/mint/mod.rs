@@ -25,6 +25,7 @@ pub(crate) use crate::tokenized_asset::{
 pub(crate) struct TokenizationRequestId(pub(crate) String);
 
 impl TokenizationRequestId {
+    #[cfg(test)]
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -43,7 +44,7 @@ impl IssuerRequestId {
 pub(crate) struct Quantity(pub(crate) Decimal);
 
 impl Quantity {
-    pub(crate) fn new(value: Decimal) -> Self {
+    pub(crate) const fn new(value: Decimal) -> Self {
         Self(value)
     }
 }
