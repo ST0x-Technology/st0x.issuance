@@ -1,7 +1,10 @@
-use cqrs_es::persist::PersistenceError;
+use async_trait::async_trait;
+use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 use std::marker::PhantomData;
+
+use crate::sql_query::SqlQueryFactory;
 
 /// Errors that can occur during SQLite view repository operations
 #[derive(Debug, thiserror::Error)]
@@ -91,9 +94,199 @@ where
     }
 }
 
+#[async_trait]
+impl<V, A> ViewRepository<V, A> for SqliteViewRepository<V, A>
+where
+    V: View<A>,
+    A: Aggregate,
+{
+    async fn load(&self, view_id: &str) -> Result<Option<V>, PersistenceError> {
+        let query = SqlQueryFactory::select_view(&self.view_table);
+
+        let row = sqlx::query(&query)
+            .bind(view_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(SqliteViewError::Connection)?;
+
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let payload_str: String = row
+                    .try_get("payload")
+                    .map_err(SqliteViewError::Connection)?;
+
+                let view: V = serde_json::from_str(&payload_str)
+                    .map_err(SqliteViewError::Deserialization)?;
+
+                Ok(Some(view))
+            }
+        }
+    }
+
+    async fn load_with_context(
+        &self,
+        _view_id: &str,
+    ) -> Result<Option<(V, ViewContext)>, PersistenceError> {
+        todo!()
+    }
+
+    async fn update_view(
+        &self,
+        _view: V,
+        _context: ViewContext,
+    ) -> Result<(), PersistenceError> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use cqrs_es::{DomainEvent, EventEnvelope};
+    use serde::{Deserialize, Serialize};
+    use std::fmt::{self, Display};
+
     use super::*;
+    use crate::testing::create_test_pool;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    struct TestAggregate;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    enum TestEvent {
+        Created,
+        Updated { value: String },
+    }
+
+    impl DomainEvent for TestEvent {
+        fn event_type(&self) -> String {
+            match self {
+                Self::Created => "Created".to_string(),
+                Self::Updated { .. } => "Updated".to_string(),
+            }
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestError;
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "test error")
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    #[async_trait]
+    impl Aggregate for TestAggregate {
+        type Command = ();
+        type Event = TestEvent;
+        type Error = TestError;
+        type Services = ();
+
+        fn aggregate_type() -> String {
+            "TestAggregate".to_string()
+        }
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
+
+        fn apply(&mut self, _event: Self::Event) {}
+    }
+
+    #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+    struct TestView {
+        count: i64,
+        values: Vec<String>,
+    }
+
+    impl View<TestAggregate> for TestView {
+        fn update(&mut self, event: &EventEnvelope<TestAggregate>) {
+            match &event.payload {
+                TestEvent::Created => self.count += 1,
+                TestEvent::Updated { value } => self.values.push(value.clone()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_nonexistent_view() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let result = repo.load("nonexistent").await.unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_view() {
+        let pool = create_test_pool().await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let test_view = TestView {
+            count: 42,
+            values: vec!["foo".to_string(), "bar".to_string()],
+        };
+        let payload = serde_json::to_string(&test_view).unwrap();
+
+        sqlx::query(
+            "INSERT INTO test_view (view_id, version, payload) VALUES (?, ?, ?)",
+        )
+        .bind("test-123")
+        .bind(5_i64)
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "test_view".to_string(),
+        );
+
+        let result = repo.load("test-123").await.unwrap();
+
+        assert!(result.is_some());
+        let loaded_view = result.unwrap();
+        assert_eq!(loaded_view.count, 42);
+        assert_eq!(loaded_view.values, vec!["foo", "bar"]);
+    }
 
     #[test]
     fn test_optimistic_lock_error_conversion() {

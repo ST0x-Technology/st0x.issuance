@@ -161,19 +161,19 @@ The struct uses `PhantomData` because it doesn't directly store values of type
 implementation. The `view_table` parameter allows using different table names
 for different view types (e.g., "mint_view", "redemption_view").
 
-## Task 4. Implement ViewRepository::load Method
+## Task 4. Implement ViewRepository::load Method ✅
 
 Implement loading a view instance by ID without version context.
 
 ### Subtasks
 
-- [ ] Implement `load(&self, view_id: &str)` method
-- [ ] Build SELECT query using table name
-- [ ] Execute query with sqlx, binding view_id parameter
-- [ ] Handle case when view doesn't exist (return `Ok(None)`)
-- [ ] Deserialize JSON payload to view type `V`
-- [ ] Map database/deserialization errors to `PersistenceError`
-- [ ] Add comprehensive error handling
+- [x] Implement `load(&self, view_id: &str)` method
+- [x] Build SELECT query using table name
+- [x] Execute query with sqlx, binding view_id parameter
+- [x] Handle case when view doesn't exist (return `Ok(None)`)
+- [x] Deserialize JSON payload to view type `V`
+- [x] Map database/deserialization errors to `PersistenceError`
+- [x] Add comprehensive error handling
 
 ### Implementation Notes
 
