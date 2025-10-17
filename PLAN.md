@@ -81,19 +81,19 @@ with conversion to `PersistenceError`.
 - `From<SqliteViewError> for PersistenceError` enables easy error propagation
 - Consistent with error handling in `SqliteEventRepository`
 
-## Task 1. Create View Table SQL Query Factory
+## Task 1. Create View Table SQL Query Factory ✅
 
 Extend `SqlQueryFactory` to generate SQL queries for view operations.
 
 ### Subtasks
 
-- [ ] Add view table name field to `SqlQueryFactory` struct
-- [ ] Update constructors (`new`, `with_tables`) to accept view table name
+- [x] Add view table name field to `SqlQueryFactory` struct
+- [x] Update constructors (`new`, `with_tables`) to accept view table name
       parameter
-- [ ] Implement `select_view()` method that generates query to load view by ID
-- [ ] Implement `insert_or_update_view()` method that generates upsert query
-- [ ] Add unit tests for new query generation methods
-- [ ] Update existing `SqlQueryFactory` tests if needed
+- [x] Implement `select_view()` method that generates query to load view by ID
+- [x] Implement `insert_or_update_view()` method that generates upsert query
+- [x] Add unit tests for new query generation methods
+- [x] Update existing `SqlQueryFactory` tests if needed
 
 ### Implementation Notes
 
