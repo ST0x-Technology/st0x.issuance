@@ -95,6 +95,17 @@ impl Default for Mint {
     }
 }
 
+impl Mint {
+    const fn state_name(&self) -> &'static str {
+        match self {
+            Self::Uninitialized => "Uninitialized",
+            Self::Initiated { .. } => "Initiated",
+            Self::JournalConfirmed { .. } => "JournalConfirmed",
+            Self::JournalRejected { .. } => "JournalRejected",
+        }
+    }
+}
+
 #[async_trait]
 impl Aggregate for Mint {
     type Command = MintCommand;
@@ -142,31 +153,52 @@ impl Aggregate for Mint {
                     initiated_at: now,
                 }])
             }
-            MintCommand::ConfirmJournal { issuer_request_id } => {
-                if !matches!(self, Self::Initiated { .. }) {
+            MintCommand::ConfirmJournal { issuer_request_id: provided_id } => {
+                let Self::Initiated { issuer_request_id: expected_id, .. } =
+                    self
+                else {
                     return Err(MintError::NotInInitiatedState {
-                        current_state: format!("{self:?}"),
+                        current_state: self.state_name().to_string(),
+                    });
+                };
+
+                if provided_id != *expected_id {
+                    return Err(MintError::IssuerRequestIdMismatch {
+                        expected: expected_id.0.clone(),
+                        provided: provided_id.0,
                     });
                 }
 
                 let now = Utc::now();
 
                 Ok(vec![MintEvent::JournalConfirmed {
-                    issuer_request_id,
+                    issuer_request_id: provided_id,
                     confirmed_at: now,
                 }])
             }
-            MintCommand::RejectJournal { issuer_request_id, reason } => {
-                if !matches!(self, Self::Initiated { .. }) {
+            MintCommand::RejectJournal {
+                issuer_request_id: provided_id,
+                reason,
+            } => {
+                let Self::Initiated { issuer_request_id: expected_id, .. } =
+                    self
+                else {
                     return Err(MintError::NotInInitiatedState {
-                        current_state: format!("{self:?}"),
+                        current_state: self.state_name().to_string(),
+                    });
+                };
+
+                if provided_id != *expected_id {
+                    return Err(MintError::IssuerRequestIdMismatch {
+                        expected: expected_id.0.clone(),
+                        provided: provided_id.0,
                     });
                 }
 
                 let now = Utc::now();
 
                 Ok(vec![MintEvent::JournalRejected {
-                    issuer_request_id,
+                    issuer_request_id: provided_id,
                     reason,
                     rejected_at: now,
                 }])
@@ -278,6 +310,11 @@ pub(crate) enum MintError {
 
     #[error("Mint not in Initiated state. Current state: {current_state}")]
     NotInInitiatedState { current_state: String },
+
+    #[error(
+        "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
+    )]
+    IssuerRequestIdMismatch { expected: String, provided: String },
 }
 
 #[cfg(test)]
@@ -590,5 +627,74 @@ mod tests {
         let result = validator.inspect_result();
 
         assert!(matches!(result, Err(MintError::NotInInitiatedState { .. })));
+    }
+
+    #[test]
+    fn test_confirm_journal_with_mismatched_issuer_request_id_fails() {
+        let correct_issuer_request_id =
+            super::IssuerRequestId::new("iss-correct");
+        let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        MintTestFramework::with(())
+            .given(vec![MintEvent::Initiated {
+                issuer_request_id: correct_issuer_request_id,
+                tokenization_request_id,
+                quantity,
+                underlying,
+                token,
+                network,
+                client_id,
+                wallet,
+                initiated_at: Utc::now(),
+            }])
+            .when(MintCommand::ConfirmJournal {
+                issuer_request_id: wrong_issuer_request_id,
+            })
+            .then_expect_error(MintError::IssuerRequestIdMismatch {
+                expected: "iss-correct".to_string(),
+                provided: "iss-wrong".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_reject_journal_with_mismatched_issuer_request_id_fails() {
+        let correct_issuer_request_id =
+            super::IssuerRequestId::new("iss-correct");
+        let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        MintTestFramework::with(())
+            .given(vec![MintEvent::Initiated {
+                issuer_request_id: correct_issuer_request_id,
+                tokenization_request_id,
+                quantity,
+                underlying,
+                token,
+                network,
+                client_id,
+                wallet,
+                initiated_at: Utc::now(),
+            }])
+            .when(MintCommand::RejectJournal {
+                issuer_request_id: wrong_issuer_request_id,
+                reason: "Test reason".to_string(),
+            })
+            .then_expect_error(MintError::IssuerRequestIdMismatch {
+                expected: "iss-correct".to_string(),
+                provided: "iss-wrong".to_string(),
+            });
     }
 }

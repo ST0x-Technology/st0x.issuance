@@ -25,6 +25,7 @@ pub(crate) struct JournalConfirmationRequest {
     pub(crate) tokenization_request_id: TokenizationRequestId,
     pub(crate) issuer_request_id: IssuerRequestId,
     pub(crate) status: JournalStatus,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +259,7 @@ pub(crate) async fn confirm_journal(
         tokenization_request_id,
         issuer_request_id,
         status,
+        reason,
     } = request.into_inner();
 
     info!(
@@ -272,7 +274,8 @@ pub(crate) async fn confirm_journal(
         },
         JournalStatus::Rejected => MintCommand::RejectJournal {
             issuer_request_id: issuer_request_id.clone(),
-            reason: "Journal rejected by Alpaca".to_string(),
+            reason: reason
+                .unwrap_or_else(|| "Journal rejected by Alpaca".to_string()),
         },
     };
 
