@@ -453,4 +453,142 @@ mod tests {
         assert_eq!(applied_wallet, wallet);
         assert_eq!(applied_initiated_at, initiated_at);
     }
+
+    #[test]
+    fn test_confirm_journal_produces_event() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let validator = MintTestFramework::with(())
+            .given(vec![MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id,
+                quantity,
+                underlying,
+                token,
+                network,
+                client_id,
+                wallet,
+                initiated_at: Utc::now(),
+            }])
+            .when(MintCommand::ConfirmJournal { issuer_request_id });
+
+        let events = validator.inspect_result().unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], MintEvent::JournalConfirmed { .. }));
+    }
+
+    #[test]
+    fn test_confirm_journal_for_uninitialized_mint_fails() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-999");
+
+        let validator = MintTestFramework::with(())
+            .given_no_previous_events()
+            .when(MintCommand::ConfirmJournal { issuer_request_id });
+
+        let result = validator.inspect_result();
+
+        assert!(matches!(result, Err(MintError::NotInInitiatedState { .. })));
+    }
+
+    #[test]
+    fn test_confirm_journal_for_already_confirmed_mint_fails() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let validator = MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::ConfirmJournal { issuer_request_id });
+
+        let result = validator.inspect_result();
+
+        assert!(matches!(result, Err(MintError::NotInInitiatedState { .. })));
+    }
+
+    #[test]
+    fn test_reject_journal_produces_event() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let reason = "Insufficient funds";
+
+        let validator = MintTestFramework::with(())
+            .given(vec![MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id,
+                quantity,
+                underlying,
+                token,
+                network,
+                client_id,
+                wallet,
+                initiated_at: Utc::now(),
+            }])
+            .when(MintCommand::RejectJournal {
+                issuer_request_id,
+                reason: reason.to_string(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+
+        assert_eq!(events.len(), 1);
+
+        let MintEvent::JournalRejected { reason: event_reason, .. } =
+            &events[0]
+        else {
+            panic!("Expected JournalRejected event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_reason, reason);
+    }
+
+    #[test]
+    fn test_reject_journal_for_uninitialized_mint_fails() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-999");
+
+        let validator = MintTestFramework::with(())
+            .given_no_previous_events()
+            .when(MintCommand::RejectJournal {
+                issuer_request_id,
+                reason: "Test reason".to_string(),
+            });
+
+        let result = validator.inspect_result();
+
+        assert!(matches!(result, Err(MintError::NotInInitiatedState { .. })));
+    }
 }
