@@ -123,7 +123,7 @@ impl Aggregate for Mint {
                 wallet,
             } => {
                 if matches!(self, Self::Initiated { .. }) {
-                    return Err(MintError::MintAlreadyInitiated {
+                    return Err(MintError::AlreadyInitiated {
                         tokenization_request_id: tokenization_request_id.0,
                     });
                 }
@@ -274,12 +274,16 @@ pub(crate) enum MintError {
     #[error(
         "Mint already initiated for tokenization request: {tokenization_request_id}"
     )]
-    MintAlreadyInitiated { tokenization_request_id: String },
+    AlreadyInitiated { tokenization_request_id: String },
+
+    #[error("Mint not in Initiated state. Current state: {current_state}")]
+    NotInInitiatedState { current_state: String },
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use chrono::Utc;
     use cqrs_es::{Aggregate, test::TestFramework};
     use rust_decimal::Decimal;
 
@@ -345,6 +349,13 @@ mod tests {
                         assert_eq!(event_wallet, &wallet);
                         assert!(initiated_at.timestamp() > 0);
                     }
+                    MintEvent::JournalConfirmed { .. }
+                    | MintEvent::JournalRejected { .. } => {
+                        panic!(
+                            "Expected MintInitiated event, got {:?}",
+                            &events[0]
+                        )
+                    }
                 }
             }
             Err(e) => panic!("Expected success, got error: {e}"),
@@ -384,7 +395,7 @@ mod tests {
                 client_id,
                 wallet,
             })
-            .then_expect_error(MintError::MintAlreadyInitiated {
+            .then_expect_error(MintError::AlreadyInitiated {
                 tokenization_request_id: tokenization_request_id.0,
             });
     }

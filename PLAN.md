@@ -276,9 +276,9 @@ Extend `MintError` enum with new error types for validation failures.
 
 **Steps**:
 
-- [ ] Add `MintNotFound` error
-- [ ] Add `MintNotInInitiatedState { current_state: String }` error
-- [ ] Ensure all errors have descriptive messages using `#[error(...)]`
+- [x] Add `MintNotFound` error
+- [x] Add `MintNotInInitiatedState { current_state: String }` error
+- [x] Ensure all errors have descriptive messages using `#[error(...)]`
       attribute
 
 **Acceptance Criteria**:
