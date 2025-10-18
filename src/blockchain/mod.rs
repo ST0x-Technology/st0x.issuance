@@ -7,6 +7,18 @@ use crate::mint::{
     IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 
+pub(crate) mod mock;
+
+#[async_trait]
+pub(crate) trait BlockchainService: Send + Sync {
+    async fn mint_tokens(
+        &self,
+        assets: U256,
+        receiver: Address,
+        receipt_info: ReceiptInformation,
+    ) -> Result<MintResult, BlockchainError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MintResult {
     pub(crate) tx_hash: B256,
@@ -31,16 +43,6 @@ pub(crate) struct ReceiptInformation {
 pub(crate) enum OperationType {
     Mint,
     Redeem,
-}
-
-#[async_trait]
-pub(crate) trait BlockchainService: Send + Sync {
-    async fn mint_tokens(
-        &self,
-        assets: U256,
-        receiver: Address,
-        receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, BlockchainError>;
 }
 
 #[derive(Debug, thiserror::Error)]

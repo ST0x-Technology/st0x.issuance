@@ -60,37 +60,37 @@ operations.
 
 Create a mock implementation for use in aggregate and conductor tests.
 
-- [ ] Create `src/blockchain/mock.rs`
-  - [ ] Define `MockBlockchainService` struct:
-    - [ ] Field `should_succeed: bool` - whether mint_tokens returns success or
+- [x] Create `src/blockchain/mock.rs`
+  - [x] Define `MockBlockchainService` struct:
+    - [x] Field `should_succeed: bool` - whether mint_tokens returns success or
           error
-    - [ ] Field `failure_reason: Option<String>` - error message if
+    - [x] Field `failure_reason: Option<String>` - error message if
           should_succeed is false
-    - [ ] Field `mint_delay_ms: u64` - simulated async delay
-    - [ ] Field `call_count: Arc<Mutex<usize>>` - tracks number of mint_tokens
+    - [x] Field `mint_delay_ms: u64` - simulated async delay
+    - [x] Field `call_count: Arc<Mutex<usize>>` - tracks number of mint_tokens
           calls
-    - [ ] Field
+    - [x] Field
           `last_call: Arc<Mutex<Option<(U256, Address, ReceiptInformation)>>>` -
           captures last call arguments
-  - [ ] Implement `BlockchainService` trait
-    - [ ] In `mint_tokens()`: sleep for `mint_delay_ms`, increment `call_count`,
+  - [x] Implement `BlockchainService` trait
+    - [x] In `mint_tokens()`: sleep for `mint_delay_ms`, increment `call_count`,
           store arguments in `last_call`
-    - [ ] On success: return deterministic `MintResult` with predictable values
+    - [x] On success: return deterministic `MintResult` with predictable values
           (fixed tx_hash, receipt_id=1, shares=assets, gas_used=21000,
           block_number=1000)
-    - [ ] On failure: return
+    - [x] On failure: return
           `BlockchainError::TransactionFailed { reason: failure_reason.clone() }`
-- [ ] Add constructor methods
-  - [ ] `new_success()` - creates mock that always succeeds
-  - [ ] `new_failure(reason: impl Into<String>)` - creates mock that always
+- [x] Add constructor methods
+  - [x] `new_success()` - creates mock that always succeeds
+  - [x] `new_failure(reason: impl Into<String>)` - creates mock that always
         fails with given reason
-  - [ ] `with_delay(mut self, delay_ms: u64) -> Self` - builder method to set
+  - [x] `with_delay(mut self, delay_ms: u64) -> Self` - builder method to set
         delay
-- [ ] Add test helper methods
-  - [ ] `get_call_count(&self) -> usize` - returns number of mint_tokens calls
-  - [ ] `get_last_call(&self) -> Option<(U256, Address, ReceiptInformation)>` -
+- [x] Add test helper methods
+  - [x] `get_call_count(&self) -> usize` - returns number of mint_tokens calls
+  - [x] `get_last_call(&self) -> Option<(U256, Address, ReceiptInformation)>` -
         returns last call arguments
-  - [ ] `reset(&self)` - resets call_count and last_call
+  - [x] `reset(&self)` - resets call_count and last_call
 
 **Design Rationale:**
 
@@ -102,13 +102,13 @@ Create a mock implementation for use in aggregate and conductor tests.
 
 **Tests:**
 
-- [ ] Write tests in `#[cfg(test)] mod tests` within `mock.rs`
-  - [ ] Test `new_success()` returns `MintResult` with expected values
-  - [ ] Test `new_failure()` returns error with correct reason
-  - [ ] Test `get_call_count()` increments on each call
-  - [ ] Test `get_last_call()` captures arguments correctly
-  - [ ] Test `with_delay()` causes appropriate delay (use tokio::time::Instant)
-  - [ ] Test `reset()` clears call_count and last_call
+- [x] Write tests in `#[cfg(test)] mod tests` within `mock.rs`
+  - [x] Test `new_success()` returns `MintResult` with expected values
+  - [x] Test `new_failure()` returns error with correct reason
+  - [x] Test `get_call_count()` increments on each call
+  - [x] Test `get_last_call()` captures arguments correctly
+  - [x] Test `with_delay()` causes appropriate delay (use tokio::time::Instant)
+  - [x] Test `reset()` clears call_count and last_call
 
 ## Task 3. Extend Mint Aggregate with New Commands, Events, and States
 
