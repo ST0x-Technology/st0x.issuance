@@ -62,6 +62,31 @@ pub(crate) enum Mint {
         wallet: Address,
         initiated_at: DateTime<Utc>,
     },
+    JournalConfirmed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+    },
+    JournalRejected {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Mint {
@@ -117,6 +142,35 @@ impl Aggregate for Mint {
                     initiated_at: now,
                 }])
             }
+            MintCommand::ConfirmJournal { issuer_request_id } => {
+                if !matches!(self, Self::Initiated { .. }) {
+                    return Err(MintError::NotInInitiatedState {
+                        current_state: format!("{self:?}"),
+                    });
+                }
+
+                let now = Utc::now();
+
+                Ok(vec![MintEvent::JournalConfirmed {
+                    issuer_request_id,
+                    confirmed_at: now,
+                }])
+            }
+            MintCommand::RejectJournal { issuer_request_id, reason } => {
+                if !matches!(self, Self::Initiated { .. }) {
+                    return Err(MintError::NotInInitiatedState {
+                        current_state: format!("{self:?}"),
+                    });
+                }
+
+                let now = Utc::now();
+
+                Ok(vec![MintEvent::JournalRejected {
+                    issuer_request_id,
+                    reason,
+                    rejected_at: now,
+                }])
+            }
         }
     }
 
@@ -143,6 +197,72 @@ impl Aggregate for Mint {
                     client_id,
                     wallet,
                     initiated_at,
+                };
+            }
+            MintEvent::JournalConfirmed {
+                issuer_request_id: _,
+                confirmed_at,
+            } => {
+                let Self::Initiated {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                } = self.clone()
+                else {
+                    return;
+                };
+
+                *self = Self::JournalConfirmed {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    journal_confirmed_at: confirmed_at,
+                };
+            }
+            MintEvent::JournalRejected {
+                issuer_request_id: _,
+                reason,
+                rejected_at,
+            } => {
+                let Self::Initiated {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                } = self.clone()
+                else {
+                    return;
+                };
+
+                *self = Self::JournalRejected {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    reason,
+                    rejected_at,
                 };
             }
         }

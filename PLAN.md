@@ -174,11 +174,11 @@ rejection states.
 
 **Steps**:
 
-- [ ] Add `JournalConfirmed` variant with all fields from `Initiated` +
+- [x] Add `JournalConfirmed` variant with all fields from `Initiated` +
       `journal_confirmed_at`
-- [ ] Add `JournalRejected` variant with all fields from `Initiated` + `reason`,
+- [x] Add `JournalRejected` variant with all fields from `Initiated` + `reason`,
       `rejected_at`
-- [ ] Keep existing `Uninitialized` and `Initiated` variants unchanged
+- [x] Keep existing `Uninitialized` and `Initiated` variants unchanged
 
 **Acceptance Criteria**:
 
