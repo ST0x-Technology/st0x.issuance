@@ -106,8 +106,9 @@ graph LR
 
 - `handle(command) -> Result<Vec<Event>, Error>`: Business logic lives here.
   Validates the command against current aggregate state and returns a list of
-  events (can be 0+ events). For example, `ConfirmJournal` might produce both
-  `JournalConfirmed` and `MintingStarted` events.
+  events (can be 0+ events). Most commands produce a single event, but some
+  commands may produce multiple events when one action has several state
+  consequences.
 - `apply(event)`: Deterministically updates aggregate state from events. This
   method is pure and should never fail - events are historical facts that have
   already occurred.
@@ -189,30 +190,28 @@ initial request through journal confirmation to on-chain minting and callback.
   Mint request created
 - `JournalConfirmed { issuer_request_id }` - Alpaca journal transfer confirmed
 - `JournalRejected { issuer_request_id, reason }` - Alpaca journal transfer
-  rejected
-- `MintingStarted { issuer_request_id }` - Beginning on-chain mint operation
+  rejected (terminal failure state)
 - `TokensMinted { issuer_request_id, tx_hash, receipt_id, shares_minted, gas_used, block_number }` -
   On-chain mint succeeded
-- `MintingFailed { issuer_request_id, error }` - On-chain mint failed
+- `MintingFailed { issuer_request_id, error }` - On-chain mint failed (terminal
+  failure state)
 - `CallbackSent { issuer_request_id }` - Alpaca callback completed
 - `MintCompleted { issuer_request_id }` - Entire mint flow completed
-  successfully
-- `MintFailed { issuer_request_id, reason }` - Mint flow failed
+  successfully (terminal success state)
 
 **Command → Event Mappings:**
 
-| Command             | Events Produced                         | Notes                                                           |
-| ------------------- | --------------------------------------- | --------------------------------------------------------------- |
-| `InitiateMint`      | `MintInitiated`                         | Single event - mint request created                             |
-| `ConfirmJournal`    | `JournalConfirmed`<br/>`MintingStarted` | Two events - journal confirmed AND we're starting on-chain mint |
-| `RejectJournal`     | `JournalRejected`<br/>`MintFailed`      | Two events - journal rejected AND mint failed                   |
-| `RecordMintSuccess` | `TokensMinted`                          | Single event - on-chain mint succeeded                          |
-| `RecordMintFailure` | `MintingFailed`<br/>`MintFailed`        | Two events - on-chain mint failed AND overall mint failed       |
-| `RecordCallback`    | `CallbackSent`<br/>`MintCompleted`      | Two events - callback sent AND mint fully completed             |
-| `MarkFailed`        | `MintFailed`                            | Single event - mark mint as failed                              |
+| Command             | Events Produced                    | Notes                                                  |
+| ------------------- | ---------------------------------- | ------------------------------------------------------ |
+| `InitiateMint`      | `MintInitiated`                    | Single event - mint request created                    |
+| `ConfirmJournal`    | `JournalConfirmed`                 | Single event - journal transfer confirmed              |
+| `RejectJournal`     | `JournalRejected`                  | Single event - journal rejected (terminal failure)     |
+| `RecordMintSuccess` | `TokensMinted`                     | Single event - on-chain mint succeeded                 |
+| `RecordMintFailure` | `MintingFailed`                    | Single event - on-chain mint failed (terminal failure) |
+| `RecordCallback`    | `CallbackSent`<br/>`MintCompleted` | Two events - callback sent AND mint fully completed    |
 
-Note: A single command can produce multiple events when one action has several
-state consequences.
+Note: Most commands produce a single event. Some commands produce multiple
+events when one action has several state consequences.
 
 ### Redemption Aggregate
 
@@ -252,26 +251,26 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCalled { issuer_request_id, tokenization_request_id }` - Alpaca redeem
   endpoint called
 - `AlpacaCallFailed { issuer_request_id, error }` - Alpaca API call failed
+  (terminal failure state)
 - `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
   transfer
-- `BurningStarted { issuer_request_id }` - Beginning on-chain burn operation
 - `TokensBurned { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
   On-chain burn succeeded
-- `BurningFailed { issuer_request_id, error }` - On-chain burn failed
+- `BurningFailed { issuer_request_id, error }` - On-chain burn failed (terminal
+  failure state)
 - `RedemptionCompleted { issuer_request_id }` - Entire redemption flow completed
-- `RedemptionFailed { issuer_request_id, reason }` - Redemption flow failed
+  (terminal success state)
 
 **Command → Event Mappings:**
 
-| Command                 | Events Produced                               | Notes                                                 |
-| ----------------------- | --------------------------------------------- | ----------------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`                          | Single event - transfer to redemption wallet detected |
-| `RecordAlpacaCall`      | `AlpacaCalled`                                | Single event - Alpaca redeem API called               |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`<br/>`RedemptionFailed`     | Two events - API call failed AND redemption failed    |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`<br/>`BurningStarted` | Two events - Alpaca done AND we're starting burn      |
-| `RecordBurnSuccess`     | `TokensBurned`<br/>`RedemptionCompleted`      | Two events - burned AND redemption fully done         |
-| `RecordBurnFailure`     | `BurningFailed`<br/>`RedemptionFailed`        | Two events - burn failed AND redemption failed        |
-| `MarkFailed`            | `RedemptionFailed`                            | Single event - mark redemption as failed              |
+| Command                 | Events Produced                          | Notes                                                 |
+| ----------------------- | ---------------------------------------- | ----------------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`                     | Single event - transfer to redemption wallet detected |
+| `RecordAlpacaCall`      | `AlpacaCalled`                           | Single event - Alpaca redeem API called               |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`                       | Single event - API call failed (terminal failure)     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`                 | Single event - Alpaca journal transfer completed      |
+| `RecordBurnSuccess`     | `TokensBurned`<br/>`RedemptionCompleted` | Two events - burned AND redemption fully done         |
+| `RecordBurnFailure`     | `BurningFailed`                          | Single event - burn failed (terminal failure)         |
 
 ### Account Aggregate
 
@@ -467,11 +466,11 @@ sequenceDiagram
 
     Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP → To: Issuer account
     Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
-    Note right of Us: ConfirmJournal command<br/>Events: JournalConfirmed,<br/>MintingStarted<br/>Status: minting
+    Note right of Us: ConfirmJournal command<br/>Event: JournalConfirmed
 
     Us->>Blockchain: vault.deposit(10 AAPL, ap_wallet)
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted<br/>Status: callback_pending
+    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted
 
     Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
     Note right of Us: RecordCallback command<br/>Events: CallbackSent,<br/>MintCompleted<br/>Status: completed
@@ -785,11 +784,11 @@ sequenceDiagram
         Alpaca->>Us: {status: "pending" | "completed"}
     end
 
-    Note right of Us: ConfirmAlpacaComplete command<br/>Events: AlpacaJournalCompleted,<br/>BurningStarted<br/>Status: burning
+    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordBurnSuccess command<br/>Events: TokensBurned,<br/>RedemptionCompleted<br/>Status: completed
+    Note right of Us: RecordBurnSuccess command<br/>Events: TokensBurned,<br/>RedemptionCompleted
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -1373,7 +1372,7 @@ fn test_initiate_mint() {
         ]);
 }
 
-// Journal confirmed triggers minting
+// Journal confirmed
 #[test]
 fn test_journal_confirmed() {
     MintTestFramework::with(mock_services)
@@ -1382,12 +1381,11 @@ fn test_journal_confirmed() {
         ])
         .when(ConfirmJournal { issuer_request_id: "iss-456" })
         .then_expect_events(vec![
-            JournalConfirmed { /* ... */ },
-            MintingStarted { /* ... */ }
+            JournalConfirmed { /* ... */ }
         ]);
 }
 
-// Journal rejected causes mint failure
+// Journal rejected (terminal failure)
 #[test]
 fn test_journal_rejected() {
     MintTestFramework::with(mock_services)
@@ -1399,8 +1397,7 @@ fn test_journal_rejected() {
             reason: "insufficient funds"
         })
         .then_expect_events(vec![
-            JournalRejected { reason: "insufficient funds" },
-            MintFailed { reason: "journal rejected" }
+            JournalRejected { reason: "insufficient funds" }
         ]);
 }
 
