@@ -22,29 +22,29 @@ checks pass after completion.
 Define the blockchain service abstraction and associated types for on-chain
 operations.
 
-- [ ] Create `src/blockchain/mod.rs` module with core types
-  - [ ] Define `MintResult` struct:
+- [x] Create `src/blockchain/mod.rs` module with core types
+  - [x] Define `MintResult` struct:
     - Fields: `tx_hash: B256`, `receipt_id: U256`, `shares_minted: U256`,
       `gas_used: u64`, `block_number: u64`
     - Derive: `Debug`, `Clone`, `PartialEq`, `Serialize`, `Deserialize`
-  - [ ] Define `ReceiptInformation` struct for on-chain metadata:
+  - [x] Define `ReceiptInformation` struct for on-chain metadata:
     - Fields: `tokenization_request_id: TokenizationRequestId`,
       `issuer_request_id: IssuerRequestId`, `underlying: UnderlyingSymbol`,
       `quantity: Quantity`, `operation_type: OperationType`,
       `timestamp: DateTime<Utc>`, `notes: Option<String>`
     - Derive: `Debug`, `Clone`, `Serialize`, `Deserialize`
-  - [ ] Define `OperationType` enum with variants: `Mint`, `Redeem`
+  - [x] Define `OperationType` enum with variants: `Mint`, `Redeem`
     - Derive: `Debug`, `Clone`, `Serialize`, `Deserialize`
-- [ ] Define `BlockchainService` trait
-  - [ ] Add method signature:
+- [x] Define `BlockchainService` trait
+  - [x] Add method signature:
         `async fn mint_tokens(&self, assets: U256, receiver: Address, receipt_info: ReceiptInformation) -> Result<MintResult, BlockchainError>`
-  - [ ] Add trait bounds: `Send + Sync`
-- [ ] Define `BlockchainError` enum
-  - [ ] Variants: `TransactionFailed { reason: String }`, `InvalidReceipt`,
-        `GasEstimationFailed`, `RpcError { source: String }`,
+  - [x] Add trait bounds: `Send + Sync`
+- [x] Define `BlockchainError` enum
+  - [x] Variants: `TransactionFailed { reason: String }`, `InvalidReceipt`,
+        `GasEstimationFailed`, `RpcError { message: String }`,
         `EventNotFound { tx_hash: String }`
-  - [ ] Derive `Debug` and `thiserror::Error` with proper error messages
-- [ ] Re-export types in `src/lib.rs` or create appropriate module structure
+  - [x] Derive `Debug` and `thiserror::Error` with proper error messages
+- [x] Add blockchain module to `src/main.rs`
 
 **Design Rationale:**
 
