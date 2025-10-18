@@ -315,14 +315,14 @@ based on journal status.
 
 **Steps**:
 
-- [ ] Update `confirm_journal` endpoint to accept `MintCqrs` state
-- [ ] Match on `JournalStatus`:
-  - [ ] `Completed` → execute `ConfirmJournal` command
-  - [ ] `Rejected` → execute `RejectJournal` command with reason "Journal
+- [x] Update `confirm_journal` endpoint to accept `MintCqrs` state
+- [x] Match on `JournalStatus`:
+  - [x] `Completed` → execute `ConfirmJournal` command
+  - [x] `Rejected` → execute `RejectJournal` command with reason "Journal
         rejected by Alpaca"
-- [ ] Handle command execution errors appropriately
-- [ ] Return 200 OK on success (acknowledgement only, no response body needed)
-- [ ] Log errors but still return 200 OK (endpoint is acknowledgement-based)
+- [x] Handle command execution errors appropriately
+- [x] Return 200 OK on success (acknowledgement only, no response body needed)
+- [x] Log errors but still return 200 OK (endpoint is acknowledgement-based)
 
 **Acceptance Criteria**:
 

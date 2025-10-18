@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use rocket::serde::json::Json;
+use rocket::{State, serde::json::Json};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -251,6 +251,7 @@ async fn validate_client_eligible(
 
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
+    cqrs: &State<crate::MintCqrs>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
     let JournalConfirmationRequest {
@@ -264,6 +265,24 @@ pub(crate) async fn confirm_journal(
          tokenization_request_id={}, status={:?}",
         issuer_request_id.0, tokenization_request_id.0, status
     );
+
+    let command = match status {
+        JournalStatus::Completed => MintCommand::ConfirmJournal {
+            issuer_request_id: issuer_request_id.clone(),
+        },
+        JournalStatus::Rejected => MintCommand::RejectJournal {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: "Journal rejected by Alpaca".to_string(),
+        },
+    };
+
+    if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
+        error!(
+            "Failed to execute journal confirmation command for \
+             issuer_request_id={}: {}",
+            issuer_request_id.0, e
+        );
+    }
 
     rocket::http::Status::Ok
 }
