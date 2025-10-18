@@ -231,15 +231,15 @@ Add handlers for `ConfirmJournal` and `RejectJournal` in the `Mint` aggregate.
 
 **Steps**:
 
-- [ ] Add `ConfirmJournal` handler in `handle()` method:
-  - [ ] Validate mint is in `Initiated` state, return error otherwise
-  - [ ] Return single event: `JournalConfirmed`
-  - [ ] Use `Utc::now()` for timestamp
-- [ ] Add `RejectJournal` handler in `handle()` method:
-  - [ ] Validate mint is in `Initiated` state, return error otherwise
-  - [ ] Return single event: `JournalRejected`
-  - [ ] Use `Utc::now()` for timestamp
-  - [ ] Include reason from command in event
+- [x] Add `ConfirmJournal` handler in `handle()` method:
+  - [x] Validate mint is in `Initiated` state, return error otherwise
+  - [x] Return single event: `JournalConfirmed`
+  - [x] Use `Utc::now()` for timestamp
+- [x] Add `RejectJournal` handler in `handle()` method:
+  - [x] Validate mint is in `Initiated` state, return error otherwise
+  - [x] Return single event: `JournalRejected`
+  - [x] Use `Utc::now()` for timestamp
+  - [x] Include reason from command in event
 
 **Acceptance Criteria**:
 
@@ -255,12 +255,12 @@ Update the `apply()` method to handle new events and update aggregate state.
 
 **Steps**:
 
-- [ ] Add `JournalConfirmed` case:
-  - [ ] Transition from `Initiated` to `JournalConfirmed`
-  - [ ] Carry over all fields from `Initiated` + add `journal_confirmed_at`
-- [ ] Add `JournalRejected` case:
-  - [ ] Transition from `Initiated` to `JournalRejected`
-  - [ ] Carry over all fields from `Initiated` + add `reason` and `rejected_at`
+- [x] Add `JournalConfirmed` case:
+  - [x] Transition from `Initiated` to `JournalConfirmed`
+  - [x] Carry over all fields from `Initiated` + add `journal_confirmed_at`
+- [x] Add `JournalRejected` case:
+  - [x] Transition from `Initiated` to `JournalRejected`
+  - [x] Carry over all fields from `Initiated` + add `reason` and `rejected_at`
 
 **Acceptance Criteria**:
 
