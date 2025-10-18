@@ -194,9 +194,9 @@ Extend `MintCommand` enum with `ConfirmJournal` and `RejectJournal` commands.
 
 **Steps**:
 
-- [ ] Add `ConfirmJournal` variant with `issuer_request_id` field
-- [ ] Add `RejectJournal` variant with `issuer_request_id` and `reason` fields
-- [ ] Keep existing `Initiate` variant unchanged
+- [x] Add `ConfirmJournal` variant with `issuer_request_id` field
+- [x] Add `RejectJournal` variant with `issuer_request_id` and `reason` fields
+- [x] Keep existing `Initiate` variant unchanged
 
 **Acceptance Criteria**:
 
