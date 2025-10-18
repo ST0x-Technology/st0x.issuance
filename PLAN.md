@@ -211,11 +211,11 @@ Extend `MintEvent` enum with new events according to updated SPEC.md.
 
 **Steps**:
 
-- [ ] Add `JournalConfirmed` event with `issuer_request_id`, `confirmed_at`
-- [ ] Add `JournalRejected` event with `issuer_request_id`, `reason`,
+- [x] Add `JournalConfirmed` event with `issuer_request_id`, `confirmed_at`
+- [x] Add `JournalRejected` event with `issuer_request_id`, `reason`,
       `rejected_at`
-- [ ] Update `event_type()` method in `DomainEvent` impl to handle new events
-- [ ] Keep `event_version()` as "1.0" for all events
+- [x] Update `event_type()` method in `DomainEvent` impl to handle new events
+- [x] Keep `event_version()` as "1.0" for all events
 
 **Acceptance Criteria**:
 
