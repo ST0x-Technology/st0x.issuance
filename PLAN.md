@@ -294,12 +294,12 @@ Update `MintView` to handle new events and add new state variants.
 
 **Steps**:
 
-- [ ] Add `JournalConfirmed` variant with all query-relevant fields
-- [ ] Add `JournalRejected` variant with query-relevant fields (including
+- [x] Add `JournalConfirmed` variant with all query-relevant fields
+- [x] Add `JournalRejected` variant with query-relevant fields (including
       reason, timestamps)
-- [ ] Update `View::update()` method to handle new events:
-  - [ ] `JournalConfirmed` → transition to `JournalConfirmed` state
-  - [ ] `JournalRejected` → transition to `JournalRejected` state
+- [x] Update `View::update()` method to handle new events:
+  - [x] `JournalConfirmed` → transition to `JournalConfirmed` state
+  - [x] `JournalRejected` → transition to `JournalRejected` state
 
 **Acceptance Criteria**:
 
