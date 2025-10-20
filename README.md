@@ -36,7 +36,7 @@ Segregation (CQRS)** patterns:
 - **Events**: Immutable facts about what happened (e.g., `MintInitiated`,
   `TokensMinted`)
 - **Aggregates**: Business entities that process commands and produce events
-  (`Mint`, `Redemption`, `AccountLink`, `TokenizedAsset`)
+  (`Mint`, `Redemption`, `Account`, `TokenizedAsset`)
 - **Views**: Read-optimized projections built from events for efficient querying
 - **Event Store**: Single source of truth - append-only log of all domain events
   in SQLite
@@ -132,12 +132,21 @@ cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warni
 ```
 st0x.issuance/
 ├── src/
-│   ├── aggregates/          # Domain aggregates (Mint, Redemption, etc.)
-│   ├── commands/            # Command definitions
-│   ├── events/              # Event definitions
-│   ├── views/               # Read model projections
-│   ├── services/            # External service clients (Alpaca, Blockchain)
-│   ├── http/                # HTTP endpoints
+│   ├── account/             # Account aggregate and endpoints
+│   │   ├── mod.rs           # Aggregate, commands, events
+│   │   ├── api.rs           # HTTP endpoints
+│   │   └── view.rs          # Read model projections
+│   ├── mint/                # Mint aggregate and endpoints
+│   │   ├── mod.rs           # Aggregate, commands, events
+│   │   ├── cmd.rs           # Command definitions
+│   │   ├── event.rs         # Event definitions
+│   │   ├── api.rs           # HTTP endpoints
+│   │   └── view.rs          # Read model projections
+│   ├── tokenized_asset/     # TokenizedAsset aggregate and endpoints
+│   │   └── ...              # Similar structure to above
+│   ├── blockchain/          # Blockchain service and types
+│   │   ├── mod.rs           # Service trait and types
+│   │   └── mock.rs          # Mock implementation for testing
 │   └── main.rs              # Application entry point
 ├── crates/
 │   └── sqlite-es/           # SQLite event store implementation
@@ -148,6 +157,11 @@ st0x.issuance/
 ├── ROADMAP.md               # Development roadmap
 └── README.md                # This file
 ```
+
+**Note**: This project uses **package by feature** organization, not package by
+layer. Each feature module (`account/`, `mint/`, `tokenized_asset/`) contains
+all related code: types, errors, commands, events, aggregates, views, and
+endpoints.
 
 ## API Endpoints
 

@@ -47,7 +47,7 @@ settlement layer between Authorized Participants (APs) and us.
 
 - Implements Alpaca ITN Issuer endpoints
 - Handles account linking, mint requests, and journal confirmations
-- Built with Rust (Axum/Actix web framework)
+- Built with Rust (Rocket.rs web framework)
 - SQLite database for tracking operations
 - Async runtime for coordination
 
@@ -80,7 +80,7 @@ time-travel debugging, and provide a single source of truth for all operations.
 **Core Concepts:**
 
 - **Aggregates**: Business entities that encapsulate state and business logic
-  (e.g., `Mint`, `Redemption`, `AccountLink`, `TokenizedAsset`)
+  (e.g., `Mint`, `Redemption`, `Account`, `TokenizedAsset`)
 - **Commands**: Requests to perform actions, representing user or system intent
   (e.g., `InitiateMint`, `ConfirmJournal`)
 - **Events**: Immutable facts about what happened, always in past tense (e.g.,
@@ -1174,16 +1174,16 @@ CREATE TABLE redemption_view (
 CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
 CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
 
--- Account link view: current account links
-CREATE TABLE account_link_view (
+-- Account view: current account state
+CREATE TABLE account_view (
     view_id TEXT PRIMARY KEY,         -- client_id
     version BIGINT NOT NULL,
     payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
 );
 
-CREATE INDEX idx_account_link_email ON account_link_view(json_extract(payload, '$.email'));
-CREATE INDEX idx_account_link_alpaca ON account_link_view(json_extract(payload, '$.alpaca_account'));
-CREATE INDEX idx_account_link_status ON account_link_view(json_extract(payload, '$.status'));
+CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
+CREATE INDEX idx_account_view_alpaca ON account_view(json_extract(payload, '$.alpaca_account'));
+CREATE INDEX idx_account_view_status ON account_view(json_extract(payload, '$.status'));
 
 -- Tokenized asset view: current supported assets
 CREATE TABLE tokenized_asset_view (
@@ -1311,7 +1311,7 @@ from `mysql-es` since it uses sqlx (which has SQLite support).
 
 4. **Create CQRS Framework:**
    - Instantiate `CqrsFramework` with event store and vector of queries
-   - Separate frameworks for each aggregate type (Mint, Redemption, AccountLink,
+   - Separate frameworks for each aggregate type (Mint, Redemption, Account,
      TokenizedAsset)
    - Or single framework if using the same event store for all aggregates
 
