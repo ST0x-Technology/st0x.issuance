@@ -25,6 +25,21 @@ Relevant docs:
 
 ### While implementing
 
+- **CRITICAL: Complete tasks one at a time and wait for review**
+  - When asked to complete a task from a plan, complete ONLY that task
+  - Do NOT proceed to the next task until the user reviews and approves your
+    changes
+  - The user manually reviews all git diffs, so changes must be minimal and
+    focused
+  - Exception: If the user explicitly asks you to "complete the whole plan" or
+    "complete the GitHub issue", you may work through multiple tasks
+  - By default, always work one task at a time
+- **CRITICAL: Tasks must be ordered correctly in plans**
+  - When creating implementation plans, ensure tasks are in the correct order
+  - Earlier tasks MUST NOT depend on code from later tasks
+  - All checks (tests, clippy, fmt) SHOULD pass at the end of each task whenever
+    possible
+  - Focused git diffs and passing checks make reviewing much easier
 - Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
 - Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
   sections or verbose changelogs
@@ -35,16 +50,32 @@ Relevant docs:
 - **CRITICAL**: Delete PLAN.md before submitting changes for review
 - PLAN.md is a transient development file that should ONLY exist on development
   branches
-- PLAN.md should NEVER appear in pull requests or be merged to main/master
+- PLAN.MD should NEVER appear in pull requests or be merged to main/master
 - The plan is for development tracking only - final documentation goes in commit
   messages, docstrings, and permanent markdown documents
-- **CRITICAL**: Update ROADMAP.md to mark completed tasks as done with the PR
-  link
-  - When you complete a task that corresponds to an issue in ROADMAP.md, update
-    the roadmap to mark it as complete `[x]` and add the PR link
-  - Format: `- [x] [#N](issue-url) - Task description`
-  - Add PR reference: `- **PR:** [#N](pr-url)`
-  - This ensures the roadmap accurately reflects progress when the PR is merged
+- **CRITICAL**: Update all documentation to reflect your changes
+  - **ROADMAP.md**: Mark completed tasks as done with the PR link
+    - When you complete a task that corresponds to an issue in ROADMAP.md,
+      update the roadmap to mark it as complete `[x]` and add the PR link
+    - Format: `- [x] [#N](issue-url) - Task description`
+    - Add PR reference: `- **PR:** [#N](pr-url)`
+    - This ensures the roadmap accurately reflects progress when the PR is
+      merged
+  - **README.md**: Review and update if your changes affect:
+    - Project structure (new directories, modules)
+    - Key features or capabilities
+    - Development commands or workflows
+    - API endpoints
+    - Architecture overview
+  - **SPEC.md**: Review and update if your changes affect:
+    - Aggregates, commands, or events
+    - State machines or flows
+    - Data structures or APIs
+    - Integration points with external systems
+  - **AGENTS.md**: Update if you introduce new patterns, practices, or
+    conventions that other developers should follow
+  - Out-of-date documentation has negative value - it confuses more than it
+    clarifies
 
 ## Project Overview
 
