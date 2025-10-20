@@ -7,8 +7,12 @@ use crate::mint::{
     IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 
+mod service;
+
 #[cfg(test)]
 pub(crate) mod mock;
+
+pub(crate) use service::RealBlockchainService;
 
 #[async_trait]
 pub(crate) trait BlockchainService: Send + Sync {

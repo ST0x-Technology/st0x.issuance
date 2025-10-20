@@ -342,72 +342,50 @@ workflow using `forge install` instead of manual submodule management.
 Implement the production blockchain service that interacts with the actual
 on-chain vault contract.
 
-### Utility Functions (in `src/blockchain/contract.rs`)
-
-- [ ] Create `src/blockchain/contract.rs` module
-- [ ] Add
-      `encode_receipt_information(info: &ReceiptInformation) -> Result<Bytes, serde_json::Error>`
-  - [ ] JSON encode the struct
-  - [ ] Convert to Alloy `Bytes`
-- [ ] Add
-      `parse_deposit_event(receipt: &TransactionReceipt) -> Result<(U256, U256), BlockchainError>`
-  - [ ] Find Deposit event in transaction receipt logs
-  - [ ] Extract `receipt_id` and `shares` from event data
-  - [ ] Return `EventNotFound` error if Deposit event is missing
-- [ ] Add `mod contract;` to `src/blockchain/mod.rs`
-- [ ] Add tests in `src/blockchain/contract.rs`:
-  - [ ] `test_encode_receipt_information` - verify JSON encoding produces valid
-        bytes
-  - [ ] `test_parse_deposit_event_success` - mock TransactionReceipt with
-        Deposit event
-  - [ ] `test_parse_deposit_event_missing` - mock receipt without Deposit event
-
 ### Service Implementation (in `src/blockchain/service.rs`)
 
-- [ ] Create `src/blockchain/service.rs` module
-- [ ] Define `RealBlockchainService` struct
-  - [ ] Field `provider: Arc<RootProvider<Http<Client>>>` - Alloy RPC provider
-  - [ ] Field `signer: PrivateKeySigner` - Private key for signing transactions
-  - [ ] Field `vault_address: Address` - OffchainAssetReceiptVault contract
+- [x] Create `src/blockchain/service.rs` module
+- [x] Define `RealBlockchainService<P>` generic over `Provider`
+  - [x] Field `provider: P` - Alloy provider (generic for testability)
+  - [x] Field `vault_address: Address` - OffchainAssetReceiptVault contract
         address
-  - [ ] Field `chain_id: u64` - Chain ID (e.g., 8453 for Base)
-- [ ] Implement constructor
-      `new(rpc_url: String, private_key: String, vault_address: Address, chain_id: u64) -> Result<Self, BlockchainError>`
-  - [ ] Parse private_key into `PrivateKeySigner`
-  - [ ] Create provider from RPC URL
-  - [ ] Return configured service
-- [ ] Implement `BlockchainService` trait
-  - [ ] Implement `mint_tokens()` method:
-    - [ ] Encode `ReceiptInformation` to bytes using
-          `encode_receipt_information()`
-    - [ ] Create contract instance using vault_address and provider
-    - [ ] Build deposit transaction:
-          `vault.deposit(assets, receiver, receipt_info_bytes)`
-    - [ ] Estimate gas with buffer: `estimated_gas * 120 / 100` (1.2x)
-    - [ ] Fetch current gas price and add 10% buffer
-    - [ ] Send transaction with gas settings
-    - [ ] Wait for transaction confirmation (1 confirmation)
-    - [ ] Get transaction receipt
-    - [ ] Parse receipt to extract Deposit event using `parse_deposit_event()`
-    - [ ] Extract `receipt_id` and `shares_minted` from event
-    - [ ] Return `MintResult` with tx_hash, receipt_id, shares_minted, gas_used,
+- [x] Implement constructor
+      `const fn new(provider: P, vault_address: Address) -> Self`
+- [x] Implement `BlockchainService` trait for
+      `RealBlockchainService<P: Provider + Clone + Send + Sync>`
+  - [x] Implement `mint_tokens()` method:
+    - [x] Encode `ReceiptInformation` to bytes using `serde_json::to_vec`
+    - [x] Create contract instance using vault_address and provider
+    - [x] Build deposit transaction with `price_per_share = 1`:
+          `vault.deposit(assets, receiver, price_per_share, receipt_info_bytes)`
+    - [x] Send transaction with `.send().await`
+    - [x] Get transaction receipt with `.get_receipt().await`
+    - [x] Parse receipt to extract Deposit event using `find_map` with
+          `log_decode`
+    - [x] Extract `receipt_id` and `shares_minted` from event
+    - [x] Return `MintResult` with tx_hash, receipt_id, shares_minted, gas_used,
           block_number
-    - [ ] Map errors to `BlockchainError` variants (use `?` operator with proper
+    - [x] Map errors to `BlockchainError` variants (use `?` operator with proper
           error conversion)
-- [ ] Add `mod service;` to `src/blockchain/mod.rs`
-- [ ] Add integration tests in `src/blockchain/service.rs` (mark as `#[ignore]`
-      by default)
-  - [ ] `test_mint_tokens_success` - requires testnet RPC and funded account
-  - [ ] For MVP, rely on manual testing with mock service
-  - [ ] Add note: "Integration tests require RPC_URL and PRIVATE_KEY env vars"
+- [x] Add `mod service;` and `pub(crate) use service::RealBlockchainService;` to
+      `src/blockchain/mod.rs`
+- [x] Add tests in `src/blockchain/service.rs`
+  - [x] `test_mint_tokens_success` - use mock provider with Asserter
+  - [x] `test_mint_tokens_missing_deposit_event` - verify error handling when
+        Deposit event is not in receipt
+  - [x] Mock all RPC calls that `.send()` and `.get_receipt()` make
 
 **Design Rationale:**
 
-- Utility functions separate contract interaction concerns from service logic
-- Real service provides production blockchain interaction
-- Configuration injected via constructor for flexibility
-- Gas estimation and buffering prevents transaction failures
-- Event parsing extracts on-chain results for recording in events
+- Generic provider pattern enables both production and test providers
+- Inline receipt info encoding keeps logic simple (no separate utility module
+  needed)
+- Using `.get_receipt()` directly (instead of `.watch()` + manual fetch)
+  simplifies code
+- Functional programming with `find_map` for event parsing
+- Mock provider with Asserter enables comprehensive unit testing without
+  blockchain
+- Gas estimation handled automatically by Alloy provider
 - Error mapping provides clear error messages for debugging
 
 ## Task 8. Create Conductor for Mint Flow

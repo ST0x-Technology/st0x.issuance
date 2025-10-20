@@ -303,6 +303,15 @@ instead.
 - ERC-20 shares representing vault ownership
 - `deposit()` function for minting
 - `withdraw()` function for burning
+- **Contract Documentation**: The Rain contracts are thoroughly documented with
+  extensive inline comments explaining parameters, behavior, and design
+  rationale. When working with blockchain integration:
+  - Primary contract:
+    `lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol`
+  - Base implementation: `lib/ethgild/src/abstract/ReceiptVault.sol`
+  - Always consult the Solidity source for authoritative documentation on
+    contract behavior, parameter meanings, and mathematical formulas
+  - The contracts use 18-decimal fixed-point arithmetic for share ratios
 
 **Redemption Wallet:**
 
