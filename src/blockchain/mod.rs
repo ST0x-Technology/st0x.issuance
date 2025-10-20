@@ -7,6 +7,7 @@ use crate::mint::{
     IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 
+#[cfg(test)]
 pub(crate) mod mock;
 
 #[async_trait]

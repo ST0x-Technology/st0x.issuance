@@ -174,35 +174,35 @@ comprehensive tests.
 
 ### Command Handlers (in `src/mint/mod.rs`)
 
-- [ ] Implement `RecordMintSuccess` handler in `Mint::handle()`
-  - [ ] Validate current state is `JournalConfirmed` (return
+- [x] Implement `RecordMintSuccess` handler in `Mint::handle()`
+  - [x] Validate current state is `JournalConfirmed` (return
         `NotInJournalConfirmedState` error otherwise)
-  - [ ] Validate `issuer_request_id` matches the aggregate's ID (return
+  - [x] Validate `issuer_request_id` matches the aggregate's ID (return
         `IssuerRequestIdMismatch` error otherwise)
-  - [ ] Generate `TokensMinted` event with provided transaction details
-  - [ ] Set `minted_at` to current timestamp (`Utc::now()`)
-- [ ] Implement `RecordMintFailure` handler in `Mint::handle()`
-  - [ ] Validate current state is `JournalConfirmed`
-  - [ ] Validate `issuer_request_id` matches
-  - [ ] Generate `MintingFailed` event with error details
-  - [ ] Set `failed_at` to current timestamp
+  - [x] Generate `TokensMinted` event with provided transaction details
+  - [x] Set `minted_at` to current timestamp (`Utc::now()`)
+- [x] Implement `RecordMintFailure` handler in `Mint::handle()`
+  - [x] Validate current state is `JournalConfirmed`
+  - [x] Validate `issuer_request_id` matches
+  - [x] Generate `MintingFailed` event with error details
+  - [x] Set `failed_at` to current timestamp
 
 ### Event Application (in `src/mint/mod.rs`)
 
-- [ ] Handle `TokensMinted` event in `Mint::apply()`
-  - [ ] Extract current state fields from `JournalConfirmed` variant (use
+- [x] Handle `TokensMinted` event in `Mint::apply()`
+  - [x] Extract current state fields from `JournalConfirmed` variant (use
         pattern matching)
-  - [ ] Transition to `CallbackPending` state, carrying forward all previous
+  - [x] Transition to `CallbackPending` state, carrying forward all previous
         fields plus transaction details
-  - [ ] If current state is not `JournalConfirmed`, return early (graceful
+  - [x] If current state is not `JournalConfirmed`, return early (graceful
         handling for event replay)
-- [ ] Handle `MintingFailed` event in `Mint::apply()`
-  - [ ] Extract current state fields from `JournalConfirmed` variant
-  - [ ] Transition to `MintingFailed` state, carrying forward fields plus error
+- [x] Handle `MintingFailed` event in `Mint::apply()`
+  - [x] Extract current state fields from `JournalConfirmed` variant
+  - [x] Transition to `MintingFailed` state, carrying forward fields plus error
         details
-  - [ ] If current state is not `JournalConfirmed`, return early
-- [ ] Update `state_name()` helper method
-  - [ ] Add matches for new states: `"CallbackPending"`, `"MintingFailed"`
+  - [x] If current state is not `JournalConfirmed`, return early
+- [x] Update `state_name()` helper method
+  - [x] Add matches for new states: `"CallbackPending"`, `"MintingFailed"`
 
 **Design Rationale:**
 
@@ -216,32 +216,32 @@ comprehensive tests.
 
 **Tests:**
 
-- [ ] Add tests to `#[cfg(test)] mod tests` in `src/mint/mod.rs`
-  - [ ] `test_record_mint_success_from_journal_confirmed_state`
+- [x] Add tests to `#[cfg(test)] mod tests` in `src/mint/mod.rs`
+  - [x] `test_record_mint_success_from_journal_confirmed_state`
     - Given: Mint in JournalConfirmed state
     - When: RecordMintSuccess command
     - Then: TokensMinted event produced with correct fields
-  - [ ] `test_record_mint_success_from_wrong_state_fails`
+  - [x] `test_record_mint_success_from_wrong_state_fails`
     - Given: Mint in Initiated state
     - When: RecordMintSuccess command
     - Then: Error NotInJournalConfirmedState
-  - [ ] `test_record_mint_failure_from_journal_confirmed_state`
+  - [x] `test_record_mint_failure_from_journal_confirmed_state`
     - Given: Mint in JournalConfirmed state
     - When: RecordMintFailure command
     - Then: MintingFailed event produced with error
-  - [ ] `test_record_mint_failure_from_wrong_state_fails`
+  - [x] `test_record_mint_failure_from_wrong_state_fails`
     - Given: Mint in Initiated state
     - When: RecordMintFailure command
     - Then: Error NotInJournalConfirmedState
-  - [ ] `test_apply_tokens_minted_event_updates_state`
+  - [x] `test_apply_tokens_minted_event_updates_state`
     - Given: Mint in JournalConfirmed state
     - When: Apply TokensMinted event
     - Then: State transitions to CallbackPending with tx details
-  - [ ] `test_apply_minting_failed_event_updates_state`
+  - [x] `test_apply_minting_failed_event_updates_state`
     - Given: Mint in JournalConfirmed state
     - When: Apply MintingFailed event
     - Then: State transitions to MintingFailed with error
-  - [ ] `test_record_mint_success_with_mismatched_issuer_request_id_fails`
+  - [x] `test_record_mint_success_with_mismatched_issuer_request_id_fails`
     - Given: Mint with issuer_request_id "iss-123"
     - When: RecordMintSuccess with issuer_request_id "iss-456"
     - Then: Error IssuerRequestIdMismatch

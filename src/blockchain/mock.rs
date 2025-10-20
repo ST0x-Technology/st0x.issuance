@@ -1,6 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
 
 use super::{
     BlockchainError, BlockchainService, MintResult, ReceiptInformation,
@@ -35,7 +36,7 @@ impl MockBlockchainService {
         }
     }
 
-    pub(crate) fn with_delay(mut self, delay_ms: u64) -> Self {
+    pub(crate) const fn with_delay(mut self, delay_ms: u64) -> Self {
         self.mint_delay_ms = delay_ms;
         self
     }
@@ -210,7 +211,7 @@ mod tests {
         mock.mint_tokens(assets, receiver, receipt_info).await.unwrap();
         let elapsed = start.elapsed();
 
-        assert!(elapsed.as_millis() >= delay_ms as u128);
+        assert!(elapsed.as_millis() >= u128::from(delay_ms));
     }
 
     #[tokio::test]
