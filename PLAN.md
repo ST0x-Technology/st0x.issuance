@@ -294,26 +294,24 @@ matching the aggregate pattern.
 Set up Foundry infrastructure and generate Rust bindings using Alloy's `sol!`
 macro, following the pattern from st0x.liquidity-a.
 
+**IMPORTANT**: Use the actual OffchainAssetReceiptVault contract from
+gildlab/ethgild repo at `src/concrete/vault/OffchainAssetReceiptVault.sol`
+instead of defining our own interface.
+
 ### Add Foundry Project Structure
 
 - [ ] Create contracts directory structure
   - [ ] Create `contracts/src/` directory
   - [ ] Create `contracts/foundry.toml` with basic configuration: `src = "src"`,
         `out = "out"`, `libs = ["../lib"]`
-- [ ] Create OffchainAssetReceiptVault interface
-  - [ ] Create `contracts/src/IOffchainAssetReceiptVault.sol`
-  - [ ] Add SPDX license and pragma: `pragma solidity ^0.8.18;`
-  - [ ] Import IERC1155 and IERC20 from forge-std or openzeppelin
-  - [ ] Define interface extending both:
-        `interface IOffchainAssetReceiptVault is IERC1155, IERC20`
-  - [ ] Add `deposit()` function signature:
-        `function deposit(uint256 assets, address receiver, bytes calldata receiptInformation) external returns (uint256 id, uint256 shares)`
-  - [ ] Add `withdraw()` function signature (for future redemption support):
-        `function withdraw(uint256 assets, address receiver, address owner, uint256 id, bytes calldata receiptInformation) external returns (uint256 shares)`
-  - [ ] Add `Deposit` event:
-        `event Deposit(address indexed sender, address indexed receiver, uint256 assets, uint256 shares, uint256 id, bytes receiptInformation)`
-  - [ ] Add `Withdraw` event (for future use):
-        `event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares, uint256 id, bytes receiptInformation)`
+- [ ] Add gildlab/ethgild as dependency
+  - [ ] Add git submodule:
+        `git submodule add https://github.com/gildlab/ethgild lib/ethgild`
+  - [ ] Update `.gitmodules` file
+  - [ ] Run: `git submodule update --init --recursive`
+  - [ ] Create a wrapper file `contracts/src/OffchainAssetReceiptVault.sol` that
+        imports from
+        `lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol`
 
 ### Setup Foundry Dependencies
 
@@ -373,14 +371,12 @@ macro, following the pattern from st0x.liquidity-a.
 **Design Rationale:**
 
 - Foundry provides reproducible builds via Nix for contract artifacts
-- Creating an interface allows us to define the minimal ABI we need without
-  requiring the full contract
+- Using the actual OffchainAssetReceiptVault contract from gildlab/ethgild
+  ensures we have the correct ABI and behavior
 - The `sol!` macro generates type-safe Rust bindings from the forge-built JSON
   artifacts
 - This approach matches st0x.liquidity-a and ensures CI can build everything
   deterministically
-- Interface can be updated later when we have access to the actual
-  OffchainAssetReceiptVault contract
 - Building contracts before Rust compilation ensures ABI artifacts are always
   available
 
