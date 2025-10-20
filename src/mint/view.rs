@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,38 @@ pub(crate) enum MintView {
         initiated_at: DateTime<Utc>,
         reason: String,
         rejected_at: DateTime<Utc>,
+    },
+    CallbackPending {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    },
+    MintingFailed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        error: String,
+        failed_at: DateTime<Utc>,
     },
 }
 
@@ -157,8 +189,86 @@ impl View<Mint> for MintView {
                     rejected_at: *rejected_at,
                 };
             }
-            MintEvent::TokensMinted { .. }
-            | MintEvent::MintingFailed { .. } => {}
+            MintEvent::TokensMinted {
+                issuer_request_id: _,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+                minted_at,
+            } => {
+                let Self::JournalConfirmed {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    journal_confirmed_at,
+                } = self.clone()
+                else {
+                    return;
+                };
+
+                *self = Self::CallbackPending {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    journal_confirmed_at,
+                    tx_hash: *tx_hash,
+                    receipt_id: *receipt_id,
+                    shares_minted: *shares_minted,
+                    gas_used: *gas_used,
+                    block_number: *block_number,
+                    minted_at: *minted_at,
+                };
+            }
+            MintEvent::MintingFailed {
+                issuer_request_id: _,
+                error,
+                failed_at,
+            } => {
+                let Self::JournalConfirmed {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    journal_confirmed_at,
+                } = self.clone()
+                else {
+                    return;
+                };
+
+                *self = Self::MintingFailed {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at,
+                    journal_confirmed_at,
+                    error: error.clone(),
+                    failed_at: *failed_at,
+                };
+            }
         }
     }
 }
@@ -190,7 +300,7 @@ pub(crate) async fn find_by_issuer_request_id(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{address, b256, uint};
     use cqrs_es::EventEnvelope;
     use rust_decimal::Decimal;
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
@@ -470,5 +580,141 @@ mod tests {
         assert_eq!(view_issuer_id, issuer_request_id);
         assert_eq!(view_reason, reason);
         assert_eq!(view_rejected_at, rejected_at);
+    }
+
+    #[test]
+    fn test_view_update_from_tokens_minted_event() {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+
+        let mut view = MintView::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+        };
+
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+        let receipt_id = uint!(1_U256);
+        let shares_minted = uint!(100_000000000000000000_U256);
+        let gas_used = 50000;
+        let block_number = 1000;
+        let minted_at = Utc::now();
+
+        let event = MintEvent::TokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 3,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let MintView::CallbackPending {
+            issuer_request_id: view_issuer_id,
+            tx_hash: view_tx_hash,
+            receipt_id: view_receipt_id,
+            shares_minted: view_shares_minted,
+            gas_used: view_gas_used,
+            block_number: view_block_number,
+            minted_at: view_minted_at,
+            ..
+        } = view
+        else {
+            panic!("Expected CallbackPending variant, got {view:?}");
+        };
+
+        assert_eq!(view_issuer_id, issuer_request_id);
+        assert_eq!(view_tx_hash, tx_hash);
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_shares_minted, shares_minted);
+        assert_eq!(view_gas_used, gas_used);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_minted_at, minted_at);
+    }
+
+    #[test]
+    fn test_view_update_from_minting_failed_event() {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+
+        let mut view = MintView::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+        };
+
+        let error_message = "Transaction failed: insufficient gas";
+        let failed_at = Utc::now();
+
+        let event = MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: error_message.to_string(),
+            failed_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 3,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let MintView::MintingFailed {
+            issuer_request_id: view_issuer_id,
+            error: view_error,
+            failed_at: view_failed_at,
+            ..
+        } = view
+        else {
+            panic!("Expected MintingFailed variant, got {view:?}");
+        };
+
+        assert_eq!(view_issuer_id, issuer_request_id);
+        assert_eq!(view_error, error_message);
+        assert_eq!(view_failed_at, failed_at);
     }
 }

@@ -253,18 +253,18 @@ matching the aggregate pattern.
 
 ### View Updates (in `src/mint/view.rs`)
 
-- [ ] Add `CallbackPending` variant to `MintView` enum
-  - [ ] Carry forward all fields from `JournalConfirmed`
-  - [ ] Add transaction details: `tx_hash: B256`, `receipt_id: U256`,
+- [x] Add `CallbackPending` variant to `MintView` enum
+  - [x] Carry forward all fields from `JournalConfirmed`
+  - [x] Add transaction details: `tx_hash: B256`, `receipt_id: U256`,
         `shares_minted: U256`, `gas_used: u64`, `block_number: u64`,
         `minted_at: DateTime<Utc>`
-- [ ] Add `MintingFailed` variant to `MintView` enum
-  - [ ] Carry forward all fields from `JournalConfirmed`
-  - [ ] Add error details: `error: String`, `failed_at: DateTime<Utc>`
-- [ ] Update `MintView::update()` method
-  - [ ] Handle `TokensMinted` event: extract fields from `JournalConfirmed`
+- [x] Add `MintingFailed` variant to `MintView` enum
+  - [x] Carry forward all fields from `JournalConfirmed`
+  - [x] Add error details: `error: String`, `failed_at: DateTime<Utc>`
+- [x] Update `MintView::update()` method
+  - [x] Handle `TokensMinted` event: extract fields from `JournalConfirmed`
         variant, transition to `CallbackPending` with transaction details
-  - [ ] Handle `MintingFailed` event: extract fields from `JournalConfirmed`
+  - [x] Handle `MintingFailed` event: extract fields from `JournalConfirmed`
         variant, transition to `MintingFailed` with error
 
 **Design Rationale:**
@@ -277,13 +277,13 @@ matching the aggregate pattern.
 
 **Tests:**
 
-- [ ] Add tests to `#[cfg(test)] mod tests` in `src/mint/view.rs`
-  - [ ] `test_view_update_from_tokens_minted_event`
+- [x] Add tests to `#[cfg(test)] mod tests` in `src/mint/view.rs`
+  - [x] `test_view_update_from_tokens_minted_event`
     - Start with view in `JournalConfirmed` variant
     - Apply `TokensMinted` event
     - Verify view transitions to `CallbackPending`
     - Verify all transaction details are present
-  - [ ] `test_view_update_from_minting_failed_event`
+  - [x] `test_view_update_from_minting_failed_event`
     - Start with view in `JournalConfirmed` variant
     - Apply `MintingFailed` event
     - Verify view transitions to `MintingFailed`
