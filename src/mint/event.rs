@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,20 @@ pub(crate) enum MintEvent {
         reason: String,
         rejected_at: DateTime<Utc>,
     },
+    TokensMinted {
+        issuer_request_id: IssuerRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    },
+    MintingFailed {
+        issuer_request_id: IssuerRequestId,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
@@ -41,6 +55,10 @@ impl DomainEvent for MintEvent {
             }
             Self::JournalRejected { .. } => {
                 "MintEvent::JournalRejected".to_string()
+            }
+            Self::TokensMinted { .. } => "MintEvent::TokensMinted".to_string(),
+            Self::MintingFailed { .. } => {
+                "MintEvent::MintingFailed".to_string()
             }
         }
     }

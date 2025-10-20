@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -24,5 +24,17 @@ pub(crate) enum MintCommand {
     RejectJournal {
         issuer_request_id: IssuerRequestId,
         reason: String,
+    },
+    RecordMintSuccess {
+        issuer_request_id: IssuerRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+    },
+    RecordMintFailure {
+        issuer_request_id: IssuerRequestId,
+        error: String,
     },
 }

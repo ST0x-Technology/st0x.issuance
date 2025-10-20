@@ -117,41 +117,41 @@ tests alongside implementation.
 
 ### Commands (in `src/mint/cmd.rs`)
 
-- [ ] Add `RecordMintSuccess` variant to `MintCommand` enum
-  - [ ] Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
+- [x] Add `RecordMintSuccess` variant to `MintCommand` enum
+  - [x] Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
         `receipt_id: U256`, `shares_minted: U256`, `gas_used: u64`,
         `block_number: u64`
-- [ ] Add `RecordMintFailure` variant to `MintCommand` enum
-  - [ ] Fields: `issuer_request_id: IssuerRequestId`, `error: String`
+- [x] Add `RecordMintFailure` variant to `MintCommand` enum
+  - [x] Fields: `issuer_request_id: IssuerRequestId`, `error: String`
 
 ### Events (in `src/mint/event.rs`)
 
-- [ ] Add `TokensMinted` variant to `MintEvent` enum
-  - [ ] Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
+- [x] Add `TokensMinted` variant to `MintEvent` enum
+  - [x] Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
         `receipt_id: U256`, `shares_minted: U256`, `gas_used: u64`,
         `block_number: u64`, `minted_at: DateTime<Utc>`
-  - [ ] Implement `DomainEvent` trait: event_type "MintEvent::TokensMinted",
+  - [x] Implement `DomainEvent` trait: event_type "MintEvent::TokensMinted",
         version "1.0"
-- [ ] Add `MintingFailed` variant to `MintEvent` enum
-  - [ ] Fields: `issuer_request_id: IssuerRequestId`, `error: String`,
+- [x] Add `MintingFailed` variant to `MintEvent` enum
+  - [x] Fields: `issuer_request_id: IssuerRequestId`, `error: String`,
         `failed_at: DateTime<Utc>`
-  - [ ] Implement `DomainEvent` trait: event_type "MintEvent::MintingFailed",
+  - [x] Implement `DomainEvent` trait: event_type "MintEvent::MintingFailed",
         version "1.0"
 
 ### Aggregate States (in `src/mint/mod.rs`)
 
-- [ ] Add `CallbackPending` variant to `Mint` enum
-  - [ ] Carry forward all fields from `JournalConfirmed`
-  - [ ] Add transaction details: `tx_hash: B256`, `receipt_id: U256`,
+- [x] Add `CallbackPending` variant to `Mint` enum
+  - [x] Carry forward all fields from `JournalConfirmed`
+  - [x] Add transaction details: `tx_hash: B256`, `receipt_id: U256`,
         `shares_minted: U256`, `gas_used: u64`, `block_number: u64`,
         `minted_at: DateTime<Utc>`
-- [ ] Add `MintingFailed` variant to `Mint` enum (terminal failure state)
-  - [ ] Carry forward all fields from `JournalConfirmed`
-  - [ ] Add error details: `error: String`, `failed_at: DateTime<Utc>`
+- [x] Add `MintingFailed` variant to `Mint` enum (terminal failure state)
+  - [x] Carry forward all fields from `JournalConfirmed`
+  - [x] Add error details: `error: String`, `failed_at: DateTime<Utc>`
 
 ### Error Types
 
-- [ ] Add `NotInJournalConfirmedState { current_state: String }` variant to
+- [x] Add `NotInJournalConfirmedState { current_state: String }` variant to
       `MintError` enum
 
 **Design Rationale:**

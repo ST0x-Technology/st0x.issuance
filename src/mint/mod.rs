@@ -3,7 +3,7 @@ mod cmd;
 mod event;
 mod view;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -87,6 +87,38 @@ pub(crate) enum Mint {
         reason: String,
         rejected_at: DateTime<Utc>,
     },
+    CallbackPending {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    },
+    MintingFailed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Mint {
@@ -102,6 +134,8 @@ impl Mint {
             Self::Initiated { .. } => "Initiated",
             Self::JournalConfirmed { .. } => "JournalConfirmed",
             Self::JournalRejected { .. } => "JournalRejected",
+            Self::CallbackPending { .. } => "CallbackPending",
+            Self::MintingFailed { .. } => "MintingFailed",
         }
     }
 }
@@ -203,6 +237,8 @@ impl Aggregate for Mint {
                     rejected_at: now,
                 }])
             }
+            MintCommand::RecordMintSuccess { .. } => Ok(vec![]),
+            MintCommand::RecordMintFailure { .. } => Ok(vec![]),
         }
     }
 
@@ -297,6 +333,8 @@ impl Aggregate for Mint {
                     rejected_at,
                 };
             }
+            MintEvent::TokensMinted { .. } => {}
+            MintEvent::MintingFailed { .. } => {}
         }
     }
 }
@@ -310,6 +348,11 @@ pub(crate) enum MintError {
 
     #[error("Mint not in Initiated state. Current state: {current_state}")]
     NotInInitiatedState { current_state: String },
+
+    #[error(
+        "Mint not in JournalConfirmed state. Current state: {current_state}"
+    )]
+    NotInJournalConfirmedState { current_state: String },
 
     #[error(
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
@@ -387,7 +430,9 @@ mod tests {
                         assert!(initiated_at.timestamp() > 0);
                     }
                     MintEvent::JournalConfirmed { .. }
-                    | MintEvent::JournalRejected { .. } => {
+                    | MintEvent::JournalRejected { .. }
+                    | MintEvent::TokensMinted { .. }
+                    | MintEvent::MintingFailed { .. } => {
                         panic!(
                             "Expected MintInitiated event, got {:?}",
                             &events[0]

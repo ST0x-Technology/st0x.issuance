@@ -157,6 +157,8 @@ impl View<Mint> for MintView {
                     rejected_at: *rejected_at,
                 };
             }
+            MintEvent::TokensMinted { .. } => {}
+            MintEvent::MintingFailed { .. } => {}
         }
     }
 }
