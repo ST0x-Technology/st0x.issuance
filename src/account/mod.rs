@@ -1,5 +1,5 @@
+mod api;
 mod cmd;
-mod endpoint;
 mod event;
 mod view;
 
@@ -9,8 +9,8 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub(crate) use api::connect_account;
 pub(crate) use cmd::AccountCommand;
-pub(crate) use endpoint::connect_account;
 pub(crate) use event::AccountEvent;
 pub(crate) use view::AccountView;
 

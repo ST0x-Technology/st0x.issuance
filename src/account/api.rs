@@ -35,7 +35,11 @@ pub(crate) async fn connect_account(
         .map_err(|_| rocket::http::Status::InternalServerError)?
         .ok_or(rocket::http::Status::InternalServerError)?;
 
-    Ok(Json(AccountLinkResponse { client_id: account_view.client_id }))
+    let super::AccountView::Account { client_id, .. } = account_view else {
+        return Err(rocket::http::Status::InternalServerError);
+    };
+
+    Ok(Json(AccountLinkResponse { client_id }))
 }
 
 #[cfg(test)]
@@ -346,9 +350,20 @@ mod tests {
             .expect("Failed to query view")
             .expect("View should exist");
 
-        assert_eq!(view.client_id, response_body.client_id);
-        assert_eq!(view.email.as_str(), email);
-        assert_eq!(view.alpaca_account.0, alpaca_account);
-        assert_eq!(view.status, super::super::LinkedAccountStatus::Active);
+        let super::super::AccountView::Account {
+            client_id,
+            email: view_email,
+            alpaca_account: view_alpaca_account,
+            status,
+            ..
+        } = view
+        else {
+            panic!("Expected Account, got Unavailable");
+        };
+
+        assert_eq!(client_id, response_body.client_id);
+        assert_eq!(view_email.as_str(), email);
+        assert_eq!(view_alpaca_account.0, alpaca_account);
+        assert_eq!(status, super::super::LinkedAccountStatus::Active);
     }
 }

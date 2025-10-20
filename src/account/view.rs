@@ -18,27 +18,20 @@ pub(crate) enum AccountViewError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct AccountView {
-    pub(crate) client_id: ClientId,
-    pub(crate) email: Email,
-    pub(crate) alpaca_account: AlpacaAccountNumber,
-    pub(crate) status: LinkedAccountStatus,
-    pub(crate) linked_at: DateTime<Utc>,
+pub(crate) enum AccountView {
+    Unavailable,
+    Account {
+        client_id: ClientId,
+        email: Email,
+        alpaca_account: AlpacaAccountNumber,
+        status: LinkedAccountStatus,
+        linked_at: DateTime<Utc>,
+    },
 }
 
-// Required by cqrs_es::View trait. This Default impl creates a placeholder view
-// with invalid domain values (empty strings, UNIX_EPOCH timestamp) that should
-// never be used directly. The cqrs-es framework uses Default::default() internally
-// when constructing views, but immediately populates them via the update() method.
 impl Default for AccountView {
     fn default() -> Self {
-        Self {
-            client_id: ClientId(String::new()),
-            email: Email(String::new()),
-            alpaca_account: AlpacaAccountNumber(String::new()),
-            status: LinkedAccountStatus::Active,
-            linked_at: DateTime::UNIX_EPOCH,
-        }
+        Self::Unavailable
     }
 }
 
@@ -51,11 +44,13 @@ impl View<Account> for AccountView {
                 alpaca_account,
                 linked_at,
             } => {
-                self.client_id = client_id.clone();
-                self.email = email.clone();
-                self.alpaca_account = alpaca_account.clone();
-                self.status = LinkedAccountStatus::Active;
-                self.linked_at = *linked_at;
+                *self = Self::Account {
+                    client_id: client_id.clone(),
+                    email: email.clone(),
+                    alpaca_account: alpaca_account.clone(),
+                    status: LinkedAccountStatus::Active,
+                    linked_at: *linked_at,
+                };
             }
         }
     }
@@ -130,13 +125,27 @@ mod tests {
         };
 
         let mut view = AccountView::default();
+
+        assert!(matches!(view, AccountView::Unavailable));
+
         view.update(&envelope);
 
-        assert_eq!(view.client_id, client_id);
-        assert_eq!(view.email, email);
-        assert_eq!(view.alpaca_account, alpaca_account);
-        assert_eq!(view.status, LinkedAccountStatus::Active);
-        assert_eq!(view.linked_at, linked_at);
+        let AccountView::Account {
+            client_id: view_client_id,
+            email: view_email,
+            alpaca_account: view_alpaca,
+            status,
+            linked_at: view_linked_at,
+        } = view
+        else {
+            panic!("Expected Account, got Unavailable")
+        };
+
+        assert_eq!(view_client_id, client_id);
+        assert_eq!(view_email, email);
+        assert_eq!(view_alpaca, alpaca_account);
+        assert_eq!(status, LinkedAccountStatus::Active);
+        assert_eq!(view_linked_at, linked_at);
     }
 
     #[tokio::test]
@@ -148,7 +157,7 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("ALPACA456".to_string());
         let linked_at = Utc::now();
 
-        let view = AccountView {
+        let view = AccountView::Account {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
@@ -175,11 +184,22 @@ mod tests {
             find_by_email(&pool, &email).await.expect("Query should succeed");
 
         assert!(result.is_some());
-        let found_view = result.unwrap();
-        assert_eq!(found_view.client_id, client_id);
-        assert_eq!(found_view.email, email);
-        assert_eq!(found_view.alpaca_account, alpaca_account);
-        assert_eq!(found_view.status, LinkedAccountStatus::Active);
+
+        let AccountView::Account {
+            client_id: found_client_id,
+            email: found_email,
+            alpaca_account: found_alpaca,
+            status,
+            linked_at: _,
+        } = result.unwrap()
+        else {
+            panic!("Expected Account, got Unavailable")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+        assert_eq!(found_alpaca, alpaca_account);
+        assert_eq!(status, LinkedAccountStatus::Active);
     }
 
     #[tokio::test]

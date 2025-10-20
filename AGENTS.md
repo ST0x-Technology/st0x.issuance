@@ -97,6 +97,11 @@ time-travel debugging, and provide a single source of truth for all operations.
   - Example: `sqlx migrate add create_account_view` (NOT manually creating
     `20251017000000_create_account_view.sql`)
   - After the file is created, edit it to add the SQL
+- **CRITICAL: Fix migrations in place during development** - When working on a
+  feature tracked in PLAN.md, if you discover a migration you added is
+  incorrect, fix the original migration file directly. NEVER add a new migration
+  to fix another migration added as part of the same task/feature. Only add fix
+  migrations for issues in migrations that have already been merged to main.
 - `sqlx db create` - Create the database
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration
@@ -198,6 +203,39 @@ tokenization.
 
 See SPEC.md for detailed command/event mappings and state machines for each
 aggregate.
+
+### Aggregates vs Views: Naming and Purpose
+
+Both aggregates and views use enum-based type modeling, but serve fundamentally
+different purposes which should be reflected in their naming.
+
+**Aggregates:**
+
+- Represent entity state, reconstructed by replaying events (O(n) cost)
+- Enforce business rules, validate commands, maintain domain invariants
+- Naming reflects **entity lifecycle**: `NotLinked`/`Linked`,
+  `NotAdded`/`Added`, etc.
+- Names communicate where the entity is in its domain-specific lifecycle
+
+**Views:**
+
+- Materialized projections for efficient querying
+- Optimized for read operations, filtered access, cross-entity queries
+- Naming is done from the perspective of a query, e.g. `Unavailable` instead of
+  `NotAdded` or `Removed`
+
+**Why the distinction matters:**
+
+- Views can map multiple aggregate states to a single view state
+- Query-oriented naming makes it clear views serve a different architectural
+  purpose
+- Prevents confusion between entity state (aggregate) and data availability
+  (view)
+
+**Avoid Option wrappers for views:** The `cqrs-es` framework's
+`GenericQuery.load()` already returns `Option<V>`, so
+`Option<View(Option<Data>)>` creates confusing nested Options. Use enum variants
+instead.
 
 ### HTTP Integration
 

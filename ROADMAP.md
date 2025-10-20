@@ -73,8 +73,9 @@ Simple feature to start with - links AP accounts to our system.
 - [x] [#10](https://github.com/ST0x-Technology/st0x.issuance/issues/10) - Add
       POST /accounts/connect endpoint stub
   - **PR:** [#42](https://github.com/ST0x-Technology/st0x.issuance/pull/42)
-- [ ] [#11](https://github.com/ST0x-Technology/st0x.issuance/issues/11) -
+- [x] [#11](https://github.com/ST0x-Technology/st0x.issuance/issues/11) -
       Implement LinkAccount feature and connect endpoint
+  - **PR:** [#43](https://github.com/ST0x-Technology/st0x.issuance/pull/43)
 
 ---
 
@@ -88,10 +89,12 @@ Manage which tokenized assets we support.
 
 ### Issues
 
-- [ ] [#12](https://github.com/ST0x-Technology/st0x.issuance/issues/12) - Add
+- [x] [#12](https://github.com/ST0x-Technology/st0x.issuance/issues/12) - Add
       GET /tokenized-assets endpoint stub
-- [ ] [#13](https://github.com/ST0x-Technology/st0x.issuance/issues/13) -
+  - **PR:** [#44](https://github.com/ST0x-Technology/st0x.issuance/pull/44)
+- [x] [#13](https://github.com/ST0x-Technology/st0x.issuance/issues/13) -
       Implement AddAsset feature and connect endpoint
+  - **PR:** [#45](https://github.com/ST0x-Technology/st0x.issuance/pull/45)
 
 ---
 
