@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod account;
+mod bindings;
 mod blockchain;
 mod mint;
 mod tokenized_asset;

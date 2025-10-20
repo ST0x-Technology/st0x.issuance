@@ -298,78 +298,31 @@ macro, following the pattern from st0x.liquidity-a.
 gildlab/ethgild repo at `src/concrete/vault/OffchainAssetReceiptVault.sol`
 instead of defining our own interface.
 
+**NOTE**: The subtasks below were updated to reflect the correct Foundry
+workflow using `forge install` instead of manual submodule management.
+
 ### Add Foundry Project Structure
 
-- [ ] Create contracts directory structure
-  - [ ] Create `contracts/src/` directory
-  - [ ] Create `contracts/foundry.toml` with basic configuration: `src = "src"`,
-        `out = "out"`, `libs = ["../lib"]`
-- [ ] Add gildlab/ethgild as dependency
-  - [ ] Add git submodule:
-        `git submodule add https://github.com/gildlab/ethgild lib/ethgild`
-  - [ ] Update `.gitmodules` file
-  - [ ] Run: `git submodule update --init --recursive`
-  - [ ] Create a wrapper file `contracts/src/OffchainAssetReceiptVault.sol` that
-        imports from
-        `lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol`
-
-### Setup Foundry Dependencies
-
-- [ ] Add forge-std as git submodule
-  - [ ] Run:
-        `git submodule add https://github.com/foundry-rs/forge-std lib/forge-std`
-  - [ ] Update `.gitmodules` file
-  - [ ] Run: `git submodule update --init --recursive`
+- [x] Add gildlab/ethgild as dependency
+  - [x] Run: `forge install gildlab/ethgild` (automatically handles submodules
+        and `.gitmodules`)
 
 ### Update Nix Flake
 
-- [ ] Read current `flake.nix` to understand structure
-- [ ] Add `prepSolArtifacts` task to `flake.nix` packages section:
-
-  ```nix
-  prepSolArtifacts = rainix.mkTask.${system} {
-    name = "prep-sol-artifacts";
-    additionalBuildInputs = rainix.sol-build-inputs.${system};
-    body = ''
-      set -euxo pipefail
-      (cd contracts && forge build)
-      (cd lib/forge-std && forge build)
-    '';
-  };
-  ```
-
-- [ ] Add `packages.prepSolArtifacts` to devShell buildInputs
-- [ ] Check for CI workflow in `.github/workflows/` and update to run
-      `prepSolArtifacts` before Rust builds (if CI exists)
+- [x] Add `prepSolArtifacts` task to `flake.nix` packages section that builds
+      contracts in `lib/ethgild`
+- [x] Add `packages.prepSolArtifacts` to devShell buildInputs
 
 ### Generate Rust Bindings
 
-- [ ] Create `src/blockchain/bindings.rs`
-  - [ ] Use `sol!` macro to generate bindings:
-
-    ```rust
-    use alloy::sol;
-
-    sol!(
-        #![sol(all_derives = true, rpc)]
-        #[allow(clippy::too_many_arguments)]
-        #[derive(serde::Serialize, serde::Deserialize)]
-        IOffchainAssetReceiptVault,
-        "contracts/out/IOffchainAssetReceiptVault.sol/IOffchainAssetReceiptVault.json"
-    );
-    ```
-
-  - [ ] Add re-exports: `pub use IOffchainAssetReceiptVault::*;`
-- [ ] Add `mod bindings;` to `src/blockchain/mod.rs`
-- [ ] Add utility functions in `src/blockchain/contract.rs`
-  - [ ] `encode_receipt_information(info: &ReceiptInformation) -> Result<Bytes, serde_json::Error>` -
-        JSON encode then convert to bytes
-  - [ ] `parse_deposit_event(receipt: &TransactionReceipt) -> Result<(U256, U256), BlockchainError>` -
-        extract receipt_id and shares_minted from Deposit event
-  - [ ] Add error handling for missing events or malformed receipts
+- [x] Create `src/bindings.rs` with `sol!` macro:
+  - [x] Generate bindings for OffchainAssetReceiptVault from
+        `lib/ethgild/out/OffchainAssetReceiptVault.sol/OffchainAssetReceiptVault.json`
+- [x] Add `mod bindings;` to `src/main.rs`
 
 **Design Rationale:**
 
+- Using `forge install` automatically manages git submodules and `.gitmodules`
 - Foundry provides reproducible builds via Nix for contract artifacts
 - Using the actual OffchainAssetReceiptVault contract from gildlab/ethgild
   ensures we have the correct ABI and behavior
@@ -382,21 +335,36 @@ instead of defining our own interface.
 
 **Tests:**
 
-- [ ] Add tests in `src/blockchain/contract.rs`
-  - [ ] `test_encode_receipt_information` - verify JSON encoding produces valid
-        bytes
-  - [ ] `test_parse_deposit_event_success` - mock TransactionReceipt with
-        Deposit event, verify extraction
-  - [ ] `test_parse_deposit_event_missing` - mock receipt without Deposit event,
-        verify error
+- None (bindings are generated code)
 
 ## Task 7. Implement Real BlockchainService
 
 Implement the production blockchain service that interacts with the actual
 on-chain vault contract.
 
+### Utility Functions (in `src/blockchain/contract.rs`)
+
+- [ ] Create `src/blockchain/contract.rs` module
+- [ ] Add
+      `encode_receipt_information(info: &ReceiptInformation) -> Result<Bytes, serde_json::Error>`
+  - [ ] JSON encode the struct
+  - [ ] Convert to Alloy `Bytes`
+- [ ] Add
+      `parse_deposit_event(receipt: &TransactionReceipt) -> Result<(U256, U256), BlockchainError>`
+  - [ ] Find Deposit event in transaction receipt logs
+  - [ ] Extract `receipt_id` and `shares` from event data
+  - [ ] Return `EventNotFound` error if Deposit event is missing
+- [ ] Add `mod contract;` to `src/blockchain/mod.rs`
+- [ ] Add tests in `src/blockchain/contract.rs`:
+  - [ ] `test_encode_receipt_information` - verify JSON encoding produces valid
+        bytes
+  - [ ] `test_parse_deposit_event_success` - mock TransactionReceipt with
+        Deposit event
+  - [ ] `test_parse_deposit_event_missing` - mock receipt without Deposit event
+
 ### Service Implementation (in `src/blockchain/service.rs`)
 
+- [ ] Create `src/blockchain/service.rs` module
 - [ ] Define `RealBlockchainService` struct
   - [ ] Field `provider: Arc<RootProvider<Http<Client>>>` - Alloy RPC provider
   - [ ] Field `signer: PrivateKeySigner` - Private key for signing transactions
@@ -426,22 +394,21 @@ on-chain vault contract.
           block_number
     - [ ] Map errors to `BlockchainError` variants (use `?` operator with proper
           error conversion)
-
-**Design Rationale:**
-
-- Real service provides production blockchain interaction
-- Configuration injected via constructor for flexibility
-- Gas estimation and buffering prevents transaction failures
-- Event parsing extracts on-chain results for recording in events
-- Error mapping provides clear error messages for debugging
-
-**Tests:**
-
+- [ ] Add `mod service;` to `src/blockchain/mod.rs`
 - [ ] Add integration tests in `src/blockchain/service.rs` (mark as `#[ignore]`
       by default)
   - [ ] `test_mint_tokens_success` - requires testnet RPC and funded account
   - [ ] For MVP, rely on manual testing with mock service
   - [ ] Add note: "Integration tests require RPC_URL and PRIVATE_KEY env vars"
+
+**Design Rationale:**
+
+- Utility functions separate contract interaction concerns from service logic
+- Real service provides production blockchain interaction
+- Configuration injected via constructor for flexibility
+- Gas estimation and buffering prevents transaction failures
+- Event parsing extracts on-chain results for recording in events
+- Error mapping provides clear error messages for debugging
 
 ## Task 8. Create Conductor for Mint Flow
 
