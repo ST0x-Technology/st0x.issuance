@@ -31,6 +31,9 @@ Relevant docs:
     changes
   - The user manually reviews all git diffs, so changes must be minimal and
     focused
+  - **Any diff not required to complete the task is a guideline violation** - no
+    drive-by improvements, refactorings, or style changes unless explicitly
+    included in the scope of the task or requested by the user
   - Exception: If the user explicitly asks you to "complete the whole plan" or
     "complete the GitHub issue", you may work through multiple tasks
   - By default, always work one task at a time
