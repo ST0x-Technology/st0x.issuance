@@ -6,19 +6,29 @@ use super::{
     BlockchainError, BlockchainService, MintResult, ReceiptInformation,
 };
 
+#[derive(Debug, Clone)]
+pub(crate) struct MintTokensCall {
+    pub(crate) assets: U256,
+    pub(crate) receiver: Address,
+    pub(crate) receipt_info: ReceiptInformation,
+}
+
+enum MockBehavior {
+    Success,
+    Failure { reason: String },
+}
+
 pub(crate) struct MockBlockchainService {
-    should_succeed: bool,
-    failure_reason: Option<String>,
+    behavior: MockBehavior,
     mint_delay_ms: u64,
     call_count: Arc<Mutex<usize>>,
-    last_call: Arc<Mutex<Option<(U256, Address, ReceiptInformation)>>>,
+    last_call: Arc<Mutex<Option<MintTokensCall>>>,
 }
 
 impl MockBlockchainService {
     pub(crate) fn new_success() -> Self {
         Self {
-            should_succeed: true,
-            failure_reason: None,
+            behavior: MockBehavior::Success,
             mint_delay_ms: 0,
             call_count: Arc::new(Mutex::new(0)),
             last_call: Arc::new(Mutex::new(None)),
@@ -27,8 +37,7 @@ impl MockBlockchainService {
 
     pub(crate) fn new_failure(reason: impl Into<String>) -> Self {
         Self {
-            should_succeed: false,
-            failure_reason: Some(reason.into()),
+            behavior: MockBehavior::Failure { reason: reason.into() },
             mint_delay_ms: 0,
             call_count: Arc::new(Mutex::new(0)),
             last_call: Arc::new(Mutex::new(None)),
@@ -44,9 +53,7 @@ impl MockBlockchainService {
         *self.call_count.lock().unwrap()
     }
 
-    pub(crate) fn get_last_call(
-        &self,
-    ) -> Option<(U256, Address, ReceiptInformation)> {
+    pub(crate) fn get_last_call(&self) -> Option<MintTokensCall> {
         self.last_call.lock().unwrap().clone()
     }
 
@@ -74,23 +81,21 @@ impl BlockchainService for MockBlockchainService {
         *self.call_count.lock().unwrap() += 1;
 
         *self.last_call.lock().unwrap() =
-            Some((assets, receiver, receipt_info));
+            Some(MintTokensCall { assets, receiver, receipt_info });
 
-        if self.should_succeed {
-            Ok(MintResult {
+        match &self.behavior {
+            MockBehavior::Success => Ok(MintResult {
                 tx_hash: B256::from([0x42; 32]),
                 receipt_id: U256::from(1),
                 shares_minted: assets,
                 gas_used: 21000,
                 block_number: 1000,
-            })
-        } else {
-            Err(BlockchainError::TransactionFailed {
-                reason: self
-                    .failure_reason
-                    .clone()
-                    .unwrap_or_else(|| "Mock failure".to_string()),
-            })
+            }),
+            MockBehavior::Failure { reason } => {
+                Err(BlockchainError::TransactionFailed {
+                    reason: reason.clone(),
+                })
+            }
         }
     }
 }
@@ -188,12 +193,11 @@ mod tests {
         let last_call = mock.get_last_call();
         assert!(last_call.is_some());
 
-        let (captured_assets, captured_receiver, captured_info) =
-            last_call.unwrap();
-        assert_eq!(captured_assets, assets);
-        assert_eq!(captured_receiver, receiver);
+        let call = last_call.unwrap();
+        assert_eq!(call.assets, assets);
+        assert_eq!(call.receiver, receiver);
         assert_eq!(
-            captured_info.tokenization_request_id.0,
+            call.receipt_info.tokenization_request_id.0,
             receipt_info.tokenization_request_id.0
         );
     }
