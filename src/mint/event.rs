@@ -21,12 +21,27 @@ pub(crate) enum MintEvent {
         wallet: Address,
         initiated_at: DateTime<Utc>,
     },
+    JournalConfirmed {
+        issuer_request_id: IssuerRequestId,
+        confirmed_at: DateTime<Utc>,
+    },
+    JournalRejected {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Initiated { .. } => "MintEvent::Initiated".to_string(),
+            Self::JournalConfirmed { .. } => {
+                "MintEvent::JournalConfirmed".to_string()
+            }
+            Self::JournalRejected { .. } => {
+                "MintEvent::JournalRejected".to_string()
+            }
         }
     }
 

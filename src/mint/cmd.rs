@@ -18,4 +18,11 @@ pub(crate) enum MintCommand {
         client_id: ClientId,
         wallet: Address,
     },
+    ConfirmJournal {
+        issuer_request_id: IssuerRequestId,
+    },
+    RejectJournal {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+    },
 }

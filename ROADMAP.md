@@ -131,8 +131,9 @@ callback.
 - [x] [#16](https://github.com/ST0x-Technology/st0x.issuance/issues/16) - Add
       POST /inkind/issuance/confirm endpoint stub
   - **PR:** [#48](https://github.com/ST0x-Technology/st0x.issuance/pull/48)
-- [ ] [#17](https://github.com/ST0x-Technology/st0x.issuance/issues/17) -
+- [x] [#17](https://github.com/ST0x-Technology/st0x.issuance/issues/17) -
       Implement ConfirmJournal and RejectJournal features
+  - **PR:** [#49](https://github.com/ST0x-Technology/st0x.issuance/pull/49)
 - [ ] [#18](https://github.com/ST0x-Technology/st0x.issuance/issues/18) -
       Implement BlockchainService and on-chain minting
 - [ ] [#19](https://github.com/ST0x-Technology/st0x.issuance/issues/19) -
