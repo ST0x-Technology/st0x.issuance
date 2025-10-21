@@ -1,6 +1,6 @@
 mod api;
 mod cmd;
-mod conductor;
+pub(crate) mod conductor;
 mod event;
 mod view;
 

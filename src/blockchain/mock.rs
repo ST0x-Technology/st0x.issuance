@@ -1,7 +1,6 @@
-use std::sync::{Arc, Mutex};
-
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 
 use super::{
     BlockchainError, BlockchainService, MintResult, ReceiptInformation,

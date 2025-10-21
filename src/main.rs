@@ -4,44 +4,29 @@ extern crate rocket;
 mod account;
 mod bindings;
 mod blockchain;
+mod config;
 mod mint;
 mod tokenized_asset;
 
 use alloy::primitives::address;
 use clap::Parser;
-use cqrs_es::persist::GenericQuery;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use sqlite_es::{
+    SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
+};
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 
 use account::{Account, AccountView};
-use mint::{Mint, MintView};
+use config::Config;
+use mint::{Mint, MintView, conductor::MintConductor};
 use tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 type AccountCqrs = SqliteCqrs<Account>;
 type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
-type MintCqrs = SqliteCqrs<Mint>;
-
-#[derive(Debug, Parser)]
-#[command(name = "st0x-issuance")]
-#[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-struct Config {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite:data.db",
-        help = "SQLite database URL"
-    )]
-    database_url: String,
-
-    #[arg(
-        long,
-        env = "DATABASE_MAX_CONNECTIONS",
-        default_value = "5",
-        help = "Maximum number of database connections in the pool"
-    )]
-    database_max_connections: u32,
-}
+type MintCqrs = Arc<SqliteCqrs<Mint>>;
+type MintConductorType =
+    Arc<MintConductor<PersistedEventStore<SqliteEventRepository, Mint>>>;
 
 #[launch]
 async fn rocket() -> _ {
@@ -88,17 +73,29 @@ async fn rocket() -> _ {
 
     let mint_query = GenericQuery::new(mint_view_repo);
 
-    let mint_cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
+    let mint_cqrs_raw =
+        sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
+    let mint_cqrs = Arc::new(mint_cqrs_raw);
 
     seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
         eprintln!("Failed to seed initial assets: {e}");
         std::process::exit(1);
     });
 
+    let blockchain_service =
+        config.create_blockchain_service().unwrap_or_else(|e| {
+            eprintln!("Failed to create blockchain service: {e}");
+            std::process::exit(1);
+        });
+
+    let mint_conductor =
+        Arc::new(MintConductor::new(blockchain_service, mint_cqrs.clone()));
+
     rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
+        .manage(mint_conductor)
         .manage(pool)
         .mount(
             "/",
@@ -114,6 +111,7 @@ async fn rocket() -> _ {
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // dummy values
     let assets = vec![
         (
             "AAPL",

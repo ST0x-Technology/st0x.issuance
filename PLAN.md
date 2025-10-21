@@ -461,24 +461,21 @@ Integrate the conductor into the main application lifecycle.
 
 ### Application Wiring (in `src/main.rs`)
 
-- [ ] Instantiate blockchain service
-  - [ ] Load configuration from environment: `RPC_URL`, `PRIVATE_KEY`,
+- [x] Instantiate blockchain service
+  - [x] Load configuration from environment: `RPC_URL`, `PRIVATE_KEY`,
         `VAULT_ADDRESS`, `CHAIN_ID`
-  - [ ] Create `RealBlockchainService::new()` with config
-  - [ ] Wrap in `Arc<dyn BlockchainService>`
-  - [ ] For development/testing, allow switching to
-        `Arc::new(MockBlockchainService::new_success())` via feature flag or env
-        var
-- [ ] Instantiate MintConductor
-  - [ ] Create conductor with blockchain service and mint CQRS framework
-  - [ ] Store in application state (Rocket state or similar)
-- [ ] Set up event listener for JournalConfirmed
-  - [ ] After executing ConfirmJournal command in `confirm_journal` endpoint,
+  - [x] Create `RealBlockchainService::new()` with config
+  - [x] Wrap in `Arc<dyn BlockchainService>`
+- [x] Instantiate MintConductor
+  - [x] Create conductor with blockchain service and mint CQRS framework
+  - [x] Store in application state (Rocket state or similar)
+- [x] Set up event listener for JournalConfirmed
+  - [x] After executing ConfirmJournal command in `confirm_journal` endpoint,
         check if JournalConfirmed event was produced
-  - [ ] If so, load the aggregate and call
+  - [x] If so, load the aggregate and call
         `conductor.handle_journal_confirmed(issuer_request_id, &aggregate)`
-  - [ ] Spawn as async task so endpoint returns quickly (don't block response)
-  - [ ] Log any conductor errors but don't fail the endpoint response
+  - [x] Spawn as async task so endpoint returns quickly (don't block response)
+  - [x] Log any conductor errors but don't fail the endpoint response
 
 **Design Rationale:**
 
@@ -486,13 +483,11 @@ Integrate the conductor into the main application lifecycle.
   execution
 - Future iterations can use proper event bus for better decoupling
 - Async task ensures endpoint remains responsive
-- Environment-based configuration allows easy switching between real and mock
-  services
 
 **Tests:**
 
-- [ ] Manual testing (documented in task 10)
-- [ ] No automated tests for this wiring task (integration tests cover the flow)
+- [x] Manual testing (documented in task 10)
+- [x] No automated tests for this wiring task (integration tests cover the flow)
 
 ## Task 10. Integration Tests
 

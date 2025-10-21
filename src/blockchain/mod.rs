@@ -7,10 +7,9 @@ use crate::mint::{
     IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 
-mod service;
-
 #[cfg(test)]
 pub(crate) mod mock;
+pub(crate) mod service;
 
 #[async_trait]
 pub(crate) trait BlockchainService: Send + Sync {
@@ -52,16 +51,10 @@ pub(crate) enum OperationType {
 pub(crate) enum BlockchainError {
     #[error("Transaction failed: {reason}")]
     TransactionFailed { reason: String },
-
     #[error("Invalid receipt")]
     InvalidReceipt,
-
-    #[error("Gas estimation failed")]
-    GasEstimationFailed,
-
     #[error("RPC error: {message}")]
     RpcError { message: String },
-
     #[error("Event not found in transaction: {tx_hash}")]
     EventNotFound { tx_hash: String },
 }
