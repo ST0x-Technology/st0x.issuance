@@ -272,15 +272,22 @@ pub(crate) async fn confirm_journal(
         issuer_request_id.0, tokenization_request_id.0, status
     );
 
-    let command = match &status {
-        JournalStatus::Completed => MintCommand::ConfirmJournal {
-            issuer_request_id: issuer_request_id.clone(),
-        },
-        JournalStatus::Rejected => MintCommand::RejectJournal {
-            issuer_request_id: issuer_request_id.clone(),
-            reason: reason
-                .unwrap_or_else(|| "Journal rejected by Alpaca".to_string()),
-        },
+    let (command, should_trigger_conductor) = match status {
+        JournalStatus::Completed => (
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            true,
+        ),
+        JournalStatus::Rejected => (
+            MintCommand::RejectJournal {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: reason.unwrap_or_else(|| {
+                    "Journal rejected by Alpaca".to_string()
+                }),
+            },
+            false,
+        ),
     };
 
     if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
@@ -292,7 +299,7 @@ pub(crate) async fn confirm_journal(
         return rocket::http::Status::Ok;
     }
 
-    if matches!(status, JournalStatus::Completed) {
+    if should_trigger_conductor {
         let conductor = conductor.inner().clone();
         let issuer_request_id_clone = issuer_request_id.clone();
         let pool_clone = pool.inner().clone();
@@ -361,9 +368,10 @@ mod tests {
         Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
         view::find_by_email,
     };
+    use crate::blockchain::mock::MockBlockchainService;
     use crate::mint::{
         Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
-        view::find_by_issuer_request_id,
+        conductor::MintConductor, view::find_by_issuer_request_id,
     };
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
@@ -372,10 +380,6 @@ mod tests {
     fn create_test_conductor(
         mint_cqrs: crate::MintCqrs,
     ) -> crate::MintConductorType {
-        use crate::blockchain::mock::MockBlockchainService;
-        use crate::mint::conductor::MintConductor;
-        use std::sync::Arc;
-
         let blockchain_service = Arc::new(MockBlockchainService::new_success())
             as Arc<dyn crate::blockchain::BlockchainService>;
 
