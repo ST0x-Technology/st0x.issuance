@@ -53,7 +53,7 @@ Relevant docs:
 - **CRITICAL**: Delete PLAN.md before submitting changes for review
 - PLAN.md is a transient development file that should ONLY exist on development
   branches
-- PLAN.MD should NEVER appear in pull requests or be merged to main/master
+- PLAN.md should NEVER appear in pull requests or be merged to main/master
 - The plan is for development tracking only - final documentation goes in commit
   messages, docstrings, and permanent markdown documents
 - **CRITICAL**: Update all documentation to reflect your changes
