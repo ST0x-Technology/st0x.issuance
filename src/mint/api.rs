@@ -2,7 +2,7 @@ use alloy::primitives::Address;
 use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, info};
 
 use super::{
     ClientId, IssuerRequestId, MintCommand, MintView, Network, Quantity,
@@ -12,6 +12,20 @@ use super::{
 use crate::account::{
     AccountView, LinkedAccountStatus, view::find_by_client_id,
 };
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum JournalStatus {
+    Completed,
+    Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JournalConfirmationRequest {
+    pub(crate) tokenization_request_id: TokenizationRequestId,
+    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) status: JournalStatus,
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MintRequest {
@@ -235,6 +249,25 @@ async fn validate_client_eligible(
     Ok(())
 }
 
+#[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
+pub(crate) async fn confirm_journal(
+    request: Json<JournalConfirmationRequest>,
+) -> rocket::http::Status {
+    let JournalConfirmationRequest {
+        tokenization_request_id,
+        issuer_request_id,
+        status,
+    } = request.into_inner();
+
+    info!(
+        "Received journal confirmation for issuer_request_id={}, \
+         tokenization_request_id={}, status={:?}",
+        issuer_request_id.0, tokenization_request_id.0, status
+    );
+
+    rocket::http::Status::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
@@ -247,7 +280,7 @@ mod tests {
     use std::sync::Arc;
     use tracing::debug;
 
-    use super::{ErrorResponse, MintResponse, initiate_mint};
+    use super::{ErrorResponse, MintResponse, confirm_journal, initiate_mint};
     use crate::account::{
         Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
         view::find_by_email,
@@ -917,5 +950,65 @@ mod tests {
         let result = mint_cqrs.execute(issuer_request_id, command).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_journal_completed_returns_ok() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(pool)
+            .mount("/", routes![confirm_journal]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "issuer_request_id": "iss-456",
+            "status": "completed"
+        });
+
+        let response = client
+            .post("/inkind/issuance/confirm")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_journal_rejected_returns_ok() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(pool)
+            .mount("/", routes![confirm_journal]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "issuer_request_id": "iss-456",
+            "status": "rejected"
+        });
+
+        let response = client
+            .post("/inkind/issuance/confirm")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
     }
 }
