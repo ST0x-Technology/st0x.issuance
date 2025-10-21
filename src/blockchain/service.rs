@@ -19,7 +19,7 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
 }
 
 #[async_trait]
-impl<P: Provider + Clone + Send + Sync> BlockchainService
+impl<P: Provider + Clone + Send + Sync + 'static> BlockchainService
     for RealBlockchainService<P>
 {
     async fn mint_tokens(

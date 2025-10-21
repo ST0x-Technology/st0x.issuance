@@ -395,28 +395,28 @@ the minting process.
 
 ### Conductor Implementation (in `src/mint/conductor.rs`)
 
-- [ ] Define `MintConductor` struct
-  - [ ] Field `blockchain_service: Arc<dyn BlockchainService>` - blockchain
+- [x] Define `MintConductor` struct
+  - [x] Field `blockchain_service: Arc<dyn BlockchainService>` - blockchain
         service for minting
-  - [ ] Field `cqrs: Arc<CqrsFramework<Mint>>` - CQRS framework for executing
+  - [x] Field `cqrs: Arc<CqrsFramework<Mint>>` - CQRS framework for executing
         commands
-- [ ] Implement `new(blockchain_service, cqrs) -> Self` constructor
-- [ ] Implement `handle_journal_confirmed()` async method
-  - [ ] Parameters: `issuer_request_id: &IssuerRequestId`, `aggregate: &Mint`
-  - [ ] Extract mint details from aggregate (quantity, receiver, symbol, etc.)
-  - [ ] Convert quantity from `Decimal` to `U256` (handle 18 decimal places:
+- [x] Implement `new(blockchain_service, cqrs) -> Self` constructor
+- [x] Implement `handle_journal_confirmed()` async method
+  - [x] Parameters: `issuer_request_id: &IssuerRequestId`, `aggregate: &Mint`
+  - [x] Extract mint details from aggregate (quantity, receiver, symbol, etc.)
+  - [x] Convert quantity from `Decimal` to `U256` (handle 18 decimal places:
         multiply by 10^18)
-  - [ ] Build `ReceiptInformation` struct with all required fields
-  - [ ] Call `blockchain_service.mint_tokens(assets, receiver, receipt_info)`
-  - [ ] On success: execute `RecordMintSuccess` command with MintResult details
-  - [ ] On failure: execute `RecordMintFailure` command with error message
-  - [ ] Log all steps with tracing (info for success, warn for failure)
-  - [ ] Return `Result<(), ConductorError>` where ConductorError wraps both
+  - [x] Build `ReceiptInformation` struct with all required fields
+  - [x] Call `blockchain_service.mint_tokens(assets, receiver, receipt_info)`
+  - [x] On success: execute `RecordMintSuccess` command with MintResult details
+  - [x] On failure: execute `RecordMintFailure` command with error message
+  - [x] Log all steps with tracing (info for success, warn for failure)
+  - [x] Return `Result<(), ConductorError>` where ConductorError wraps both
         BlockchainError and CqrsError
-- [ ] Define `ConductorError` enum
-  - [ ] Variants: `Blockchain(BlockchainError)`, `Cqrs(String)`,
+- [x] Define `ConductorError` enum
+  - [x] Variants: `Blockchain(BlockchainError)`, `Cqrs(String)`,
         `InvalidAggregateState { current_state: String }`
-  - [ ] Derive `Debug`, `thiserror::Error`
+  - [x] Derive `Debug`, `thiserror::Error`
 
 **Design Rationale:**
 
@@ -431,27 +431,29 @@ the minting process.
 
 **Tests:**
 
-- [ ] Add tests in `#[cfg(test)] mod tests` in `src/mint/conductor.rs`
-  - [ ] `test_handle_journal_confirmed_with_success`
+- [x] Add tests in `#[cfg(test)] mod tests` in `src/mint/conductor.rs`
+  - [x] `test_handle_journal_confirmed_with_success`
     - Use `MockBlockchainService::new_success()`
     - Create aggregate in JournalConfirmed state
     - Call `handle_journal_confirmed()`
     - Verify blockchain service was called (check call_count)
     - Verify RecordMintSuccess command was executed (load aggregate, check state
       is CallbackPending)
-  - [ ] `test_handle_journal_confirmed_with_blockchain_failure`
+  - [x] `test_handle_journal_confirmed_with_blockchain_failure`
     - Use `MockBlockchainService::new_failure("network error")`
     - Create aggregate in JournalConfirmed state
     - Call `handle_journal_confirmed()`
     - Verify RecordMintFailure command was executed (check state is
       MintingFailed)
-  - [ ] `test_handle_journal_confirmed_with_wrong_state_fails`
+  - [x] `test_handle_journal_confirmed_with_wrong_state_fails`
     - Create aggregate in Initiated state (not JournalConfirmed)
     - Call `handle_journal_confirmed()`
     - Verify error `InvalidAggregateState`
-  - [ ] `test_decimal_to_u256_conversion`
-    - Test converting Decimal(100.5) to U256 with 18 decimals
-    - Verify result is 100.5 * 10^18
+  - [x] `test_quantity_to_u256_conversion` (implemented as domain-specific
+        method)
+    - Test converting Quantity to U256 with 18 decimals
+    - Test fractional value error handling
+    - Test overflow error handling
 
 ## Task 9. Wire Conductor into Application
 

@@ -1,5 +1,6 @@
 mod api;
 mod cmd;
+mod conductor;
 mod event;
 mod view;
 
@@ -7,7 +8,7 @@ use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use api::{confirm_journal, initiate_mint};
@@ -46,6 +47,41 @@ impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
         Self(value)
     }
+
+    pub(crate) fn to_u256_with_18_decimals(
+        &self,
+    ) -> Result<U256, QuantityConversionError> {
+        let Self(value) = self;
+
+        let multiplier = 10_u128.pow(18);
+        let scaled = value
+            .checked_mul(Decimal::from(multiplier))
+            .ok_or(QuantityConversionError::Overflow)?;
+
+        if scaled.fract() != Decimal::ZERO {
+            return Err(QuantityConversionError::FractionalValue {
+                value: scaled,
+            });
+        }
+
+        let integer_part = scaled.to_u128().ok_or(
+            QuantityConversionError::ConversionFailed { value: scaled },
+        )?;
+
+        Ok(U256::from(integer_part))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuantityConversionError {
+    #[error("Arithmetic overflow during conversion")]
+    Overflow,
+
+    #[error("Fractional value after scaling: {value}")]
+    FractionalValue { value: Decimal },
+
+    #[error("Cannot convert to u128: {value}")]
+    ConversionFailed { value: Decimal },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
