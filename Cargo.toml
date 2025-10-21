@@ -52,6 +52,7 @@ cqrs-es.workspace = true
 async-trait.workspace = true
 clap = { version = "4.5.49", features = ["derive", "env"] }
 alloy = "1.0.41"
+rust_decimal = { version = "1.39.0", features = ["serde"] }
 
 [lints]
 workspace = true

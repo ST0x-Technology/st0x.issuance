@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod account;
+mod mint;
 mod tokenized_asset;
 
 use alloy::primitives::address;
@@ -89,7 +90,8 @@ async fn rocket() -> _ {
             "/",
             routes![
                 account::connect_account,
-                tokenized_asset::list_tokenized_assets
+                tokenized_asset::list_tokenized_assets,
+                mint::initiate_mint
             ],
         )
 }
