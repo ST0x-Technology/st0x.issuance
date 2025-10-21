@@ -7,12 +7,23 @@ use super::{
 };
 use crate::bindings::OffchainAssetReceiptVault;
 
+/// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
+/// contract.
+///
+/// Generic over the provider type to support both production RPC providers and mock providers
+/// for testing.
 pub(crate) struct RealBlockchainService<P> {
     provider: P,
     vault_address: Address,
 }
 
 impl<P: Provider + Clone> RealBlockchainService<P> {
+    /// Creates a new blockchain service instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - Alloy provider for blockchain communication
+    /// * `vault_address` - Address of the OffchainAssetReceiptVault contract
     pub(crate) const fn new(provider: P, vault_address: Address) -> Self {
         Self { provider, vault_address }
     }

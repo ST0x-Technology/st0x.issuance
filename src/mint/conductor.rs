@@ -11,12 +11,26 @@ use crate::tokenized_asset::UnderlyingSymbol;
 
 use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
 
+/// Orchestrates the on-chain minting process in response to JournalConfirmed events.
+///
+/// The conductor bridges ES/CQRS aggregates with external blockchain services. It reacts to
+/// JournalConfirmed events by calling the blockchain service to mint tokens, then records
+/// the result (success or failure) back into the Mint aggregate via commands.
+///
+/// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
+/// integration with external systems.
 pub(crate) struct MintConductor<ES: EventStore<Mint>> {
     blockchain_service: Arc<dyn BlockchainService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
 }
 
 impl<ES: EventStore<Mint>> MintConductor<ES> {
+    /// Creates a new mint conductor.
+    ///
+    /// # Arguments
+    ///
+    /// * `blockchain_service` - Service for on-chain minting operations
+    /// * `cqrs` - CQRS framework for executing commands on the Mint aggregate
     pub(crate) const fn new(
         blockchain_service: Arc<dyn BlockchainService>,
         cqrs: Arc<CqrsFramework<Mint, ES>>,
@@ -24,6 +38,31 @@ impl<ES: EventStore<Mint>> MintConductor<ES> {
         Self { blockchain_service, cqrs }
     }
 
+    /// Handles a JournalConfirmed event by minting tokens on-chain.
+    ///
+    /// This method orchestrates the complete on-chain minting flow:
+    /// 1. Validates the aggregate is in JournalConfirmed state
+    /// 2. Converts quantity to U256 with 18 decimals
+    /// 3. Calls blockchain service to mint tokens
+    /// 4. Records success (RecordMintSuccess) or failure (RecordMintFailure) via commands
+    ///
+    /// # Arguments
+    ///
+    /// * `issuer_request_id` - ID of the mint request
+    /// * `aggregate` - Current state of the Mint aggregate (must be JournalConfirmed)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if minting succeeded and RecordMintSuccess command was executed.
+    /// Returns `Err(ConductorError::Blockchain)` if minting failed (RecordMintFailure
+    /// command is still executed to record the failure).
+    ///
+    /// # Errors
+    ///
+    /// * `ConductorError::InvalidAggregateState` - Aggregate is not in JournalConfirmed state
+    /// * `ConductorError::QuantityConversion` - Quantity cannot be converted to U256
+    /// * `ConductorError::Blockchain` - Blockchain transaction failed
+    /// * `ConductorError::Cqrs` - Command execution failed
     pub(crate) async fn handle_journal_confirmed(
         &self,
         issuer_request_id: &IssuerRequestId,
