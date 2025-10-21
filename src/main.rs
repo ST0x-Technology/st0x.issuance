@@ -13,10 +13,12 @@ use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 
 use account::{Account, AccountView};
+use mint::{Mint, MintView};
 use tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 type AccountCqrs = SqliteCqrs<Account>;
 type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
+type MintCqrs = SqliteCqrs<Mint>;
 
 #[derive(Debug, Parser)]
 #[command(name = "st0x-issuance")]
@@ -77,6 +79,15 @@ async fn rocket() -> _ {
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
+    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+        pool.clone(),
+        "mint_view".to_string(),
+    ));
+
+    let mint_query = GenericQuery::new(mint_view_repo);
+
+    let mint_cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
+
     seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
         eprintln!("Failed to seed initial assets: {e}");
         std::process::exit(1);
@@ -85,6 +96,7 @@ async fn rocket() -> _ {
     rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
+        .manage(mint_cqrs)
         .manage(pool)
         .mount(
             "/",
@@ -121,7 +133,7 @@ async fn seed_initial_assets(
     ];
 
     for (underlying, token, network, vault_address) in assets {
-        let command = tokenized_asset::TokenizedAssetCommand::AddAsset {
+        let command = tokenized_asset::TokenizedAssetCommand::Add {
             underlying: tokenized_asset::UnderlyingSymbol::new(underlying),
             token: tokenized_asset::TokenSymbol::new(token),
             network: tokenized_asset::Network::new(network),

@@ -1,7 +1,7 @@
 mod api;
 mod cmd;
 mod event;
-mod view;
+pub(crate) mod view;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -77,7 +77,7 @@ impl Aggregate for TokenizedAsset {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            TokenizedAssetCommand::AddAsset {
+            TokenizedAssetCommand::Add {
                 underlying,
                 token,
                 network,
@@ -91,7 +91,7 @@ impl Aggregate for TokenizedAsset {
 
                 let now = Utc::now();
 
-                Ok(vec![TokenizedAssetEvent::AssetAdded {
+                Ok(vec![TokenizedAssetEvent::Added {
                     underlying,
                     token,
                     network,
@@ -104,7 +104,7 @@ impl Aggregate for TokenizedAsset {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
-            TokenizedAssetEvent::AssetAdded {
+            TokenizedAssetEvent::Added {
                 underlying,
                 token,
                 network,
@@ -152,7 +152,7 @@ mod tests {
 
         let validator = TokenizedAssetTestFramework::with(())
             .given_no_previous_events()
-            .when(TokenizedAssetCommand::AddAsset {
+            .when(TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
@@ -166,7 +166,7 @@ mod tests {
                 assert_eq!(events.len(), 1);
 
                 match &events[0] {
-                    TokenizedAssetEvent::AssetAdded {
+                    TokenizedAssetEvent::Added {
                         underlying: event_underlying,
                         token: event_token,
                         network: event_network,
@@ -194,7 +194,7 @@ mod tests {
             address!("0x1234567890abcdef1234567890abcdef12345678");
 
         TokenizedAssetTestFramework::with(())
-            .given(vec![TokenizedAssetEvent::AssetAdded {
+            .given(vec![TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::new("base"),
@@ -203,7 +203,7 @@ mod tests {
                 ),
                 added_at: chrono::Utc::now(),
             }])
-            .when(TokenizedAssetCommand::AddAsset {
+            .when(TokenizedAssetCommand::Add {
                 underlying,
                 token,
                 network,
@@ -227,7 +227,7 @@ mod tests {
             address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
         let added_at = chrono::Utc::now();
 
-        asset.apply(TokenizedAssetEvent::AssetAdded {
+        asset.apply(TokenizedAssetEvent::Added {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),

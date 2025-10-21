@@ -1,7 +1,7 @@
 mod api;
 mod cmd;
 mod event;
-mod view;
+pub(crate) mod view;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -97,7 +97,7 @@ impl Aggregate for Account {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            AccountCommand::LinkAccount { email, alpaca_account } => {
+            AccountCommand::Link { email, alpaca_account } => {
                 if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
                         email: email.as_str().to_string(),
@@ -107,7 +107,7 @@ impl Aggregate for Account {
                 let client_id = ClientId(Uuid::new_v4().to_string());
                 let now = Utc::now();
 
-                Ok(vec![AccountEvent::AccountLinked {
+                Ok(vec![AccountEvent::Linked {
                     client_id,
                     email,
                     alpaca_account,
@@ -119,7 +119,7 @@ impl Aggregate for Account {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
-            AccountEvent::AccountLinked {
+            AccountEvent::Linked {
                 client_id,
                 email,
                 alpaca_account,
@@ -163,7 +163,7 @@ mod tests {
 
         let validator = AccountTestFramework::with(())
             .given_no_previous_events()
-            .when(AccountCommand::LinkAccount {
+            .when(AccountCommand::Link {
                 email: email.clone(),
                 alpaca_account: alpaca_account.clone(),
             });
@@ -175,7 +175,7 @@ mod tests {
                 assert_eq!(events.len(), 1);
 
                 match &events[0] {
-                    AccountEvent::AccountLinked {
+                    AccountEvent::Linked {
                         client_id,
                         email: event_email,
                         alpaca_account: event_alpaca,
@@ -233,13 +233,13 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
 
         AccountTestFramework::with(())
-            .given(vec![AccountEvent::AccountLinked {
+            .given(vec![AccountEvent::Linked {
                 client_id: super::ClientId("existing-client-id".to_string()),
                 email: email.clone(),
                 alpaca_account: AlpacaAccountNumber("ALPACA456".to_string()),
                 linked_at: chrono::Utc::now(),
             }])
-            .when(AccountCommand::LinkAccount { email, alpaca_account })
+            .when(AccountCommand::Link { email, alpaca_account })
             .then_expect_error(AccountError::AccountAlreadyExists {
                 email: "user@example.com".to_string(),
             });
@@ -256,7 +256,7 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
         let linked_at = chrono::Utc::now();
 
-        account.apply(AccountEvent::AccountLinked {
+        account.apply(AccountEvent::Linked {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
