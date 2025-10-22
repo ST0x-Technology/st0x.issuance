@@ -507,6 +507,12 @@ impl Aggregate for Mint {
             MintCommand::RecordMintFailure { issuer_request_id, error } => {
                 self.handle_record_mint_failure(issuer_request_id, error)
             }
+            MintCommand::RecordCallback { .. } => {
+                // Handler to be implemented in Task 3
+                Err(MintError::NotInCallbackPendingState {
+                    current_state: self.state_name().to_string(),
+                })
+            }
         }
     }
 
@@ -565,6 +571,9 @@ impl Aggregate for Mint {
                 error,
                 failed_at,
             } => self.apply_minting_failed(error, failed_at),
+            MintEvent::MintCompleted { .. } => {
+                // Apply handler to be implemented in Task 3
+            }
         }
     }
 }
@@ -583,6 +592,11 @@ pub(crate) enum MintError {
         "Mint not in JournalConfirmed state. Current state: {current_state}"
     )]
     NotInJournalConfirmedState { current_state: String },
+
+    #[error(
+        "Mint not in CallbackPending state. Current state: {current_state}"
+    )]
+    NotInCallbackPendingState { current_state: String },
 
     #[error(
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
@@ -662,7 +676,8 @@ mod tests {
                     MintEvent::JournalConfirmed { .. }
                     | MintEvent::JournalRejected { .. }
                     | MintEvent::TokensMinted { .. }
-                    | MintEvent::MintingFailed { .. } => {
+                    | MintEvent::MintingFailed { .. }
+                    | MintEvent::MintCompleted { .. } => {
                         panic!(
                             "Expected MintInitiated event, got {:?}",
                             &events[0]

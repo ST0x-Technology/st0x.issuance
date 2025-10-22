@@ -141,9 +141,9 @@ RecordCallback {
 
 **Subtasks:**
 
-- [ ] Add `RecordCallback` variant to `MintCommand` enum in `src/mint/cmd.rs`
-- [ ] Add `MintCompleted` variant to `MintEvent` enum in `src/mint/event.rs`
-- [ ] Ensure event includes `issuer_request_id` and `completed_at` timestamp
+- [x] Add `RecordCallback` variant to `MintCommand` enum in `src/mint/cmd.rs`
+- [x] Add `MintCompleted` variant to `MintEvent` enum in `src/mint/event.rs`
+- [x] Ensure event includes `issuer_request_id` and `completed_at` timestamp
 
 ## Task 3. Add Completed state to Mint aggregate
 

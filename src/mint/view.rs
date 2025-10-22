@@ -308,6 +308,9 @@ impl View<Mint> for MintView {
             MintEvent::MintingFailed { error, failed_at, .. } => {
                 self.handle_minting_failed(error.clone(), *failed_at);
             }
+            MintEvent::MintCompleted { .. } => {
+                // View handler to be implemented in Task 5
+            }
         }
     }
 }

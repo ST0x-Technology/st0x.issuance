@@ -37,4 +37,7 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerRequestId,
         error: String,
     },
+    RecordCallback {
+        issuer_request_id: IssuerRequestId,
+    },
 }
