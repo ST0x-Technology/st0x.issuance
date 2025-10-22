@@ -15,6 +15,8 @@ use cqrs_es::persist::GenericQuery;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
+use tracing::error;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use account::{Account, AccountView};
 use config::Config;
@@ -27,15 +29,23 @@ type MintCqrs = Arc<SqliteCqrs<Mint>>;
 
 #[launch]
 async fn rocket() -> _ {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .init();
+
     let config = Config::parse();
 
     let pool = create_pool(&config).await.unwrap_or_else(|e| {
-        eprintln!("Failed to create database pool: {e}");
+        error!("Failed to create database pool: {e}");
         std::process::exit(1);
     });
 
     sqlx::migrate!("./migrations").run(&pool).await.unwrap_or_else(|e| {
-        eprintln!("Failed to run database migrations: {e}");
+        error!("Failed to run database migrations: {e}");
         std::process::exit(1);
     });
 
@@ -75,13 +85,13 @@ async fn rocket() -> _ {
     let mint_cqrs = Arc::new(mint_cqrs_raw);
 
     seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
-        eprintln!("Failed to seed initial assets: {e}");
+        error!("Failed to seed initial assets: {e}");
         std::process::exit(1);
     });
 
     let blockchain_service =
         config.create_blockchain_service().unwrap_or_else(|e| {
-            eprintln!("Failed to create blockchain service: {e}");
+            error!("Failed to create blockchain service: {e}");
             std::process::exit(1);
         });
 

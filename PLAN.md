@@ -300,11 +300,11 @@ structured in the app. This may require:
 
 **Subtasks:**
 
-- [ ] Identify where to hook into event flow (likely in `main.rs` setup)
-- [ ] Create `CallbackManager` instance with real/mock `AlpacaService`
-- [ ] Wire up event listener or polling mechanism
-- [ ] Add proper error handling and logging
-- [ ] Document the wiring approach in code comments
+- [x] Identify where to hook into event flow (likely in `main.rs` setup)
+- [x] Create `CallbackManager` instance with real/mock `AlpacaService`
+- [x] Wire up event listener or polling mechanism
+- [x] Add proper error handling and logging
+- [x] Document the wiring approach in code comments
 
 ## Task 9. Add Alpaca configuration to Config struct
 

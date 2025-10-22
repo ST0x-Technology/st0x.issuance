@@ -13,7 +13,6 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use api::{confirm_journal, initiate_mint};
-pub(crate) use callback_manager::CallbackManager;
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
 pub(crate) use view::MintView;

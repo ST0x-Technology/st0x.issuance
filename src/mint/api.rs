@@ -326,7 +326,7 @@ pub(crate) async fn confirm_journal(
                     error!(
                         issuer_request_id = %issuer_request_id_clone.0,
                         error = %e,
-                        "Failed to load aggregate"
+                        "Failed to load aggregate for mint manager"
                     );
                     return;
                 }
@@ -381,7 +381,7 @@ mod tests {
         TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
     };
 
-    fn create_test_manager(
+    fn create_test_mint_manager(
         mint_cqrs: crate::MintCqrs,
     ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>
     {
@@ -1055,7 +1055,7 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1088,7 +1088,7 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1151,7 +1151,7 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1230,7 +1230,7 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1312,7 +1312,7 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1391,7 +1391,7 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -1445,7 +1445,7 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let mint_manager = create_test_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
