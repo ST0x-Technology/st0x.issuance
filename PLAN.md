@@ -280,33 +280,7 @@ Following the testing pattern from `src/mint/manager.rs::tests`.
 - Use `MockAlpacaService` configured for success/failure
 - Verify aggregate transitions to `Completed` state on success
 
-## Task 8. Wire CallbackManager into main event loop
-
-The manager needs to be invoked when `TokensMinted` events occur. This wiring
-will happen in `main.rs` or a dedicated orchestration module.
-
-**Integration points:**
-
-- After `TokensMinted` event is committed, load the aggregate
-- Call `CallbackManager::handle_tokens_minted()`
-- Handle errors (retry logic can be added later)
-
-**Note:** The exact wiring mechanism depends on how event listeners are
-structured in the app. This may require:
-
-- Setting up event subscribers/listeners
-- Or polling for mints in `CallbackPending` state
-- Or using the CQRS framework's query/view mechanism to trigger actions
-
-**Subtasks:**
-
-- [x] Identify where to hook into event flow (likely in `main.rs` setup)
-- [x] Create `CallbackManager` instance with real/mock `AlpacaService`
-- [x] Wire up event listener or polling mechanism
-- [x] Add proper error handling and logging
-- [x] Document the wiring approach in code comments
-
-## Task 9. Add Alpaca configuration to Config struct
+## Task 8. Add Alpaca configuration to Config struct
 
 Following the pattern from `create_blockchain_service()` in `src/config.rs`.
 
@@ -364,7 +338,7 @@ pub(crate) fn create_alpaca_service(
 - [ ] Implement `create_alpaca_service()` factory method
 - [ ] Update `.env.example` or documentation with required env vars
 
-## Task 10. Implement RealAlpacaService
+## Task 9. Implement RealAlpacaService
 
 Concrete HTTP-based implementation using `reqwest`.
 
@@ -497,6 +471,43 @@ where
 - [ ] Add integration test that verifies JSON serialization format matches
       SPEC.md
 
+## Task 10. Wire CallbackManager into event loop
+
+The manager needs to be invoked when `TokensMinted` events occur. This wiring
+happens in two places:
+
+1. `src/mint/api.rs` - Callback manager invocation in confirm_journal endpoint
+2. `src/main.rs` - Creating and managing the CallbackManager instance
+
+**Integration points:**
+
+- After `TokensMinted` event is committed (after MintManager succeeds), load the
+  aggregate
+- Call `CallbackManager::handle_tokens_minted()`
+- Handle errors (retry logic can be added later)
+
+**Note:** The wiring follows the same pattern as MintManager - spawn a
+background task after MintManager succeeds, load the aggregate (now in
+CallbackPending state), and invoke the callback manager.
+
+**Subtasks:**
+
+- [ ] Add CallbackManager to confirm_journal endpoint in `src/mint/api.rs`
+  - [ ] Add callback_manager parameter to function signature
+  - [ ] Chain callback manager after mint manager in spawned task
+  - [ ] Load aggregate again after MintManager succeeds
+  - [ ] Call `callback_manager.handle_tokens_minted()`
+  - [ ] Add proper error handling and logging
+  - [ ] Update all test functions to include callback_manager
+- [ ] Wire up in `src/main.rs`
+  - [ ] Add import: `use mint::CallbackManager;`
+  - [ ] Re-export CallbackManager in `src/mint/mod.rs`
+  - [ ] Create AlpacaService via `config.create_alpaca_service()`
+  - [ ] Create CallbackManager:
+        `Arc::new(CallbackManager::new(alpaca_service,
+    mint_cqrs.clone()))`
+  - [ ] Add `.manage(callback_manager)` to rocket::build() chain
+
 ## Task 11. Integration test for complete mint flow
 
 Create an end-to-end test that exercises the entire mint flow from initiation
@@ -553,9 +564,11 @@ Tasks must be completed in order:
   (CallbackManager)
 - Tasks 2-4 (Aggregate changes and tests) before Task 6 (CallbackManager)
 - Task 5 (View updates) can be done in parallel with Task 6
-- Tasks 6-7 (CallbackManager implementation and tests) before Task 8 (wiring)
-- Task 9 (Config) and Task 10 (RealAlpacaService) can be done after Task 1
-- Task 8 (wiring) before Task 11 (integration test)
+- Tasks 6-7 (CallbackManager implementation and tests) complete
+- Task 8 (Alpaca Config) next
+- Task 9 (RealAlpacaService) after Task 8
+- Task 10 (Wire CallbackManager) after Tasks 8-9 are complete
+- Task 11 (Integration test) after Task 10
 - Tasks 12-13 (docs and checks) at the end
 
 ## Technical Decisions
