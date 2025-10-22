@@ -655,7 +655,7 @@ impl Aggregate for Mint {
                 failed_at,
             } => self.apply_minting_failed(error, failed_at),
             MintEvent::MintCompleted { issuer_request_id: _, completed_at } => {
-                self.apply_mint_completed(completed_at)
+                self.apply_mint_completed(completed_at);
             }
         }
     }
@@ -1796,12 +1796,12 @@ mod tests {
 
         mint.apply(MintEvent::Initiated {
             issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            quantity: quantity.clone(),
-            underlying: underlying.clone(),
-            token: token.clone(),
-            network: network.clone(),
-            client_id: client_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
             wallet,
             initiated_at,
         });

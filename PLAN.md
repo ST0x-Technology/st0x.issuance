@@ -460,15 +460,15 @@ where
 
 **Subtasks:**
 
-- [ ] Implement `RealAlpacaService` struct in `src/alpaca/service.rs`
-- [ ] Add constructor taking base_url, account_id, api_key, api_secret
-- [ ] Implement `send_mint_callback()` with POST request to correct endpoint
-- [ ] Use Basic Auth with `basic_auth()` method
-- [ ] Handle response status codes: 200 OK, 401/403 auth errors, other errors
-- [ ] Add custom serializers for `Address` and `B256` types to format as hex
+- [x] Implement `RealAlpacaService` struct in `src/alpaca/service.rs`
+- [x] Add constructor taking base_url, account_id, api_key, api_secret
+- [x] Implement `send_mint_callback()` with POST request to correct endpoint
+- [x] Use Basic Auth with `basic_auth()` method
+- [x] Handle response status codes: 200 OK, 401/403 auth errors, other errors
+- [x] Add custom serializers for `Address` and `B256` types to format as hex
       strings
-- [ ] Add unit tests using `httpmock` or similar for HTTP client testing
-- [ ] Add integration test that verifies JSON serialization format matches
+- [x] Add unit tests using `httpmock` or similar for HTTP client testing
+- [x] Add integration test that verifies JSON serialization format matches
       SPEC.md
 
 ## Task 10. Wire CallbackManager into event loop

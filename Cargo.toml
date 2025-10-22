@@ -61,4 +61,5 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 workspace = true
 
 [dev-dependencies]
+httpmock = "0.8.2"
 tokio = { version = "1.48.0", features = ["macros"] }
