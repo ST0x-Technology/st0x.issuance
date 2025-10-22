@@ -6,6 +6,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 
+use crate::alpaca::AlpacaConfig;
 use crate::blockchain::{BlockchainService, service::RealBlockchainService};
 
 #[derive(Debug, Parser)]
@@ -47,6 +48,9 @@ pub(crate) struct Config {
 
     #[arg(long, env = "CHAIN_ID", help = "Blockchain network chain ID")]
     chain_id: Option<u64>,
+
+    #[command(flatten)]
+    pub(crate) alpaca: AlpacaConfig,
 }
 
 impl Config {

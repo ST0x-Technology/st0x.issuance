@@ -333,10 +333,10 @@ pub(crate) fn create_alpaca_service(
 
 **Subtasks:**
 
-- [ ] Add Alpaca config fields to `Config` struct in `src/config.rs`
-- [ ] Add corresponding `ConfigError` variants for missing Alpaca config
-- [ ] Implement `create_alpaca_service()` factory method
-- [ ] Update `.env.example` or documentation with required env vars
+- [x] Add Alpaca config fields to `Config` struct in `src/config.rs`
+- [x] Add corresponding `ConfigError` variants for missing Alpaca config
+- [x] Implement `create_alpaca_service()` factory method
+- [x] Create stub `RealAlpacaService` for compilation
 
 ## Task 9. Implement RealAlpacaService
 
