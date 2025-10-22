@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod account;
+mod alpaca;
 mod bindings;
 mod blockchain;
 mod config;

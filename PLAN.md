@@ -36,16 +36,16 @@ Following the same pattern as `BlockchainService`:
 - Add Alpaca configuration to `Config` struct following the blockchain service
   pattern
 
-## Task 1. Define AlpacaService trait and error types
+## Task 1. Define AlpacaService trait, types, and mock implementation
 
 Add a new module `src/alpaca/mod.rs` following the pattern from
-`src/blockchain/mod.rs`.
+`src/blockchain/mod.rs`. This task sets up the complete service interface and
+test infrastructure.
 
 **Files to create:**
 
 - `src/alpaca/mod.rs` - Module definition with trait, types, and re-exports
 - `src/alpaca/mock.rs` - Mock implementation for testing
-- `src/alpaca/service.rs` - Real implementation (placeholder/stub for now)
 
 **AlpacaService trait:**
 
@@ -78,13 +78,30 @@ pub(crate) struct MintCallbackRequest {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaError {
     #[error("HTTP request failed: {message}")]
-    HttpError { message: String },
+    Http { message: String },
 
     #[error("Authentication failed: {reason}")]
-    AuthError { reason: String },
+    Auth { reason: String },
 
     #[error("API error: {status_code} - {message}")]
-    ApiError { status_code: u16, message: String },
+    Api { status_code: u16, message: String },
+}
+```
+
+**MockAlpacaService:** Following the pattern from `src/blockchain/mock.rs`,
+create a mock implementation that can be configured to succeed or fail.
+
+```rust
+pub(crate) struct MockAlpacaService {
+    should_succeed: bool,
+    error_message: Option<String>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl MockAlpacaService {
+    pub(crate) fn new_success() -> Self { ... }
+    pub(crate) fn new_failure(error_message: impl Into<String>) -> Self { ... }
+    pub(crate) fn get_call_count(&self) -> usize { ... }
 }
 ```
 
@@ -94,37 +111,16 @@ pub(crate) enum AlpacaError {
 - [ ] Create `src/alpaca/mod.rs` with trait definition and types
 - [ ] Add `AlpacaError` enum with proper error variants
 - [ ] Add `MintCallbackRequest` struct matching SPEC.md format
-- [ ] Add serde rename attributes to match Alpaca's snake_case API
-- [ ] Update `src/main.rs` to include `mod alpaca;`
-
-## Task 2. Create mock AlpacaService for testing
-
-Following the pattern from `src/blockchain/mock.rs`, create a mock
-implementation that can be configured to succeed or fail.
-
-**Mock implementation pattern:**
-
-```rust
-pub(crate) struct MockAlpacaService {
-    should_succeed: bool,
-    call_count: Arc<Mutex<usize>>,
-}
-
-impl MockAlpacaService {
-    pub(crate) fn new_success() -> Self { ... }
-    pub(crate) fn new_failure() -> Self { ... }
-    pub(crate) fn get_call_count(&self) -> usize { ... }
-}
-```
-
-**Subtasks:**
-
+- [ ] Add serde rename attributes and custom serializers for Alloy types
 - [ ] Create `src/alpaca/mock.rs` with `MockAlpacaService`
 - [ ] Implement `new_success()` and `new_failure()` constructors
 - [ ] Implement `AlpacaService` trait for mock
 - [ ] Add call counting for verification in tests
+- [ ] Add tests for mock service (success, failure, call tracking)
+- [ ] Add tests for JSON serialization of `MintCallbackRequest`
+- [ ] Update `src/main.rs` to include `mod alpaca;`
 
-## Task 3. Add RecordCallback command
+## Task 2. Add RecordCallback command
 
 Extend the `Mint` aggregate to handle the callback recording.
 
@@ -149,7 +145,7 @@ RecordCallback {
 - [ ] Add `MintCompleted` variant to `MintEvent` enum in `src/mint/event.rs`
 - [ ] Ensure event includes `issuer_request_id` and `completed_at` timestamp
 
-## Task 4. Add Completed state to Mint aggregate
+## Task 3. Add Completed state to Mint aggregate
 
 The mint flow needs a terminal success state after callback completes.
 
@@ -190,7 +186,7 @@ Completed {
 - [ ] Update `Aggregate::handle()` match to call `handle_record_callback()`
 - [ ] Update `Aggregate::apply()` match to handle `MintCompleted` event
 
-## Task 5. Add tests for RecordCallback command
+## Task 4. Add tests for RecordCallback command
 
 Following TDD and the testing patterns from `src/mint/mod.rs::tests`.
 
@@ -204,7 +200,7 @@ Following TDD and the testing patterns from `src/mint/mod.rs::tests`.
 - [ ] Integration test showing full flow: `Initiated` → `JournalConfirmed` →
       `CallbackPending` → `Completed`
 
-## Task 6. Update MintView to handle new events
+## Task 5. Update MintView to handle new events
 
 The view needs to reflect callback and completion status.
 
@@ -220,7 +216,7 @@ The view needs to reflect callback and completion status.
 - [ ] Add `completed_at` timestamp field to view payload
 - [ ] Update tests in view module to verify event is processed correctly
 
-## Task 7. Create CallbackConductor
+## Task 6. Create CallbackConductor
 
 Following the pattern from `MintConductor` in `src/mint/conductor.rs`.
 
@@ -266,7 +262,7 @@ impl<ES: EventStore<Mint>> CallbackConductor<ES> {
 - [ ] Update `src/mint/mod.rs` to
       `pub(crate) use callback_conductor::CallbackConductor;`
 
-## Task 8. Add tests for CallbackConductor
+## Task 7. Add tests for CallbackConductor
 
 Following the testing pattern from `src/mint/conductor.rs::tests`.
 
@@ -285,7 +281,7 @@ Following the testing pattern from `src/mint/conductor.rs::tests`.
 - Use `MockAlpacaService` configured for success/failure
 - Verify aggregate transitions to `Completed` state on success
 
-## Task 9. Wire CallbackConductor into main event loop
+## Task 8. Wire CallbackConductor into main event loop
 
 The conductor needs to be invoked when `TokensMinted` events occur. This wiring
 will happen in `main.rs` or a dedicated orchestration module.
@@ -311,7 +307,7 @@ structured in the app. This may require:
 - [ ] Add proper error handling and logging
 - [ ] Document the wiring approach in code comments
 
-## Task 10. Add Alpaca configuration to Config struct
+## Task 9. Add Alpaca configuration to Config struct
 
 Following the pattern from `create_blockchain_service()` in `src/config.rs`.
 
@@ -369,7 +365,7 @@ pub(crate) fn create_alpaca_service(
 - [ ] Implement `create_alpaca_service()` factory method
 - [ ] Update `.env.example` or documentation with required env vars
 
-## Task 11. Implement RealAlpacaService
+## Task 10. Implement RealAlpacaService
 
 Concrete HTTP-based implementation using `reqwest`.
 
@@ -502,7 +498,7 @@ where
 - [ ] Add integration test that verifies JSON serialization format matches
       SPEC.md
 
-## Task 12. Integration test for complete mint flow
+## Task 11. Integration test for complete mint flow
 
 Create an end-to-end test that exercises the entire mint flow from initiation
 through callback completion.
@@ -524,7 +520,7 @@ through callback completion.
 - [ ] Verify final aggregate state is `Completed`
 - [ ] Verify `MintView` shows status as "completed" with all timestamps
 
-## Task 13. Update documentation
+## Task 12. Update documentation
 
 Ensure all changes are properly documented.
 
@@ -535,7 +531,7 @@ Ensure all changes are properly documented.
 - [ ] Update SPEC.md if any implementation details diverge from spec
 - [ ] Add inline comments explaining conductor wiring
 
-## Task 14. Run checks before completion
+## Task 13. Run checks before completion
 
 Ensure code quality and all tests pass.
 
@@ -554,13 +550,14 @@ Ensure code quality and all tests pass.
 
 Tasks must be completed in order:
 
-- Tasks 1-2 (AlpacaService infrastructure) before Task 7 (CallbackConductor)
-- Tasks 3-5 (Aggregate changes and tests) before Task 7 (CallbackConductor)
-- Task 6 (View updates) can be done in parallel with Task 7
-- Tasks 7-8 (CallbackConductor implementation and tests) before Task 9 (wiring)
-- Task 10 (Config) and Task 11 (RealAlpacaService) can be done after Task 1
-- Task 9 (wiring) before Task 12 (integration test)
-- Tasks 13-14 (docs and checks) at the end
+- Task 1 (AlpacaService infrastructure including mock) before Task 6
+  (CallbackConductor)
+- Tasks 2-4 (Aggregate changes and tests) before Task 6 (CallbackConductor)
+- Task 5 (View updates) can be done in parallel with Task 6
+- Tasks 6-7 (CallbackConductor implementation and tests) before Task 8 (wiring)
+- Task 9 (Config) and Task 10 (RealAlpacaService) can be done after Task 1
+- Task 8 (wiring) before Task 11 (integration test)
+- Tasks 12-13 (docs and checks) at the end
 
 ## Technical Decisions
 
