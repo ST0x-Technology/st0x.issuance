@@ -211,10 +211,10 @@ The view needs to reflect callback and completion status.
 
 **Subtasks:**
 
-- [ ] Update `MintView::update()` in `src/mint/view.rs` to handle
+- [x] Update `MintView::update()` in `src/mint/view.rs` to handle
       `MintCompleted`
-- [ ] Add `completed_at` timestamp field to view payload
-- [ ] Update tests in view module to verify event is processed correctly
+- [x] Add `completed_at` timestamp field to view payload
+- [x] Update tests in view module to verify event is processed correctly
 
 ## Task 6. Create CallbackConductor
 
