@@ -1554,4 +1554,302 @@ mod tests {
                 provided: "iss-wrong".to_string(),
             });
     }
+
+    #[test]
+    fn test_record_callback_from_callback_pending_state() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+
+        let validator = MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+                MintEvent::TokensMinted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash,
+                    receipt_id: uint!(1_U256),
+                    shares_minted: uint!(100_000000000000000000_U256),
+                    gas_used: 50000,
+                    block_number: 1000,
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::RecordCallback { issuer_request_id });
+
+        let events = validator.inspect_result().unwrap();
+
+        assert_eq!(events.len(), 1);
+
+        let MintEvent::MintCompleted { completed_at, .. } = &events[0] else {
+            panic!("Expected MintCompleted event, got {:?}", &events[0]);
+        };
+
+        assert!(completed_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_record_callback_from_wrong_state_fails() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::RecordCallback { issuer_request_id })
+            .then_expect_error(MintError::NotInCallbackPendingState {
+                current_state: "JournalConfirmed".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_record_callback_with_mismatched_issuer_request_id_fails() {
+        let correct_issuer_request_id =
+            super::IssuerRequestId::new("iss-correct");
+        let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+
+        MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: correct_issuer_request_id.clone(),
+                    tokenization_request_id,
+                    quantity,
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: correct_issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+                MintEvent::TokensMinted {
+                    issuer_request_id: correct_issuer_request_id,
+                    tx_hash,
+                    receipt_id: uint!(1_U256),
+                    shares_minted: uint!(100_000000000000000000_U256),
+                    gas_used: 50000,
+                    block_number: 1000,
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::RecordCallback {
+                issuer_request_id: wrong_issuer_request_id,
+            })
+            .then_expect_error(MintError::IssuerRequestIdMismatch {
+                expected: "iss-correct".to_string(),
+                provided: "iss-wrong".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_apply_mint_completed_event_updates_state() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+        let receipt_id = uint!(1_U256);
+        let shares_minted = uint!(100_000000000000000000_U256);
+        let gas_used = 50000;
+        let block_number = 1000;
+        let minted_at = Utc::now();
+
+        let mut mint = Mint::CallbackPending {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        };
+
+        let completed_at = Utc::now();
+
+        mint.apply(MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at,
+        });
+
+        let Mint::Completed {
+            issuer_request_id: state_issuer_id,
+            tx_hash: state_tx_hash,
+            receipt_id: state_receipt_id,
+            shares_minted: state_shares_minted,
+            gas_used: state_gas_used,
+            block_number: state_block_number,
+            minted_at: state_minted_at,
+            completed_at: state_completed_at,
+            ..
+        } = mint
+        else {
+            panic!("Expected Completed state, got {mint:?}");
+        };
+
+        assert_eq!(state_issuer_id, issuer_request_id);
+        assert_eq!(state_tx_hash, tx_hash);
+        assert_eq!(state_receipt_id, receipt_id);
+        assert_eq!(state_shares_minted, shares_minted);
+        assert_eq!(state_gas_used, gas_used);
+        assert_eq!(state_block_number, block_number);
+        assert_eq!(state_minted_at, minted_at);
+        assert_eq!(state_completed_at, completed_at);
+    }
+
+    #[test]
+    fn test_full_mint_flow_to_completed() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-flow-123");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-flow-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-flow-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let confirmed_at = Utc::now();
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+        let receipt_id = uint!(1_U256);
+        let shares_minted = uint!(100_000000000000000000_U256);
+        let gas_used = 50000;
+        let block_number = 1000;
+        let minted_at = Utc::now();
+        let completed_at = Utc::now();
+
+        let mut mint = Mint::default();
+
+        mint.apply(MintEvent::Initiated {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id: client_id.clone(),
+            wallet,
+            initiated_at,
+        });
+
+        assert!(
+            matches!(mint, Mint::Initiated { .. }),
+            "Expected Initiated state, got {mint:?}"
+        );
+
+        mint.apply(MintEvent::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            confirmed_at,
+        });
+
+        assert!(
+            matches!(mint, Mint::JournalConfirmed { .. }),
+            "Expected JournalConfirmed state, got {mint:?}"
+        );
+
+        mint.apply(MintEvent::TokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        });
+
+        assert!(
+            matches!(mint, Mint::CallbackPending { .. }),
+            "Expected CallbackPending state, got {mint:?}"
+        );
+
+        mint.apply(MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at,
+        });
+
+        let Mint::Completed {
+            issuer_request_id: final_id,
+            completed_at: final_completed_at,
+            ..
+        } = mint
+        else {
+            panic!("Expected Completed state, got {mint:?}");
+        };
+
+        assert_eq!(final_id, issuer_request_id);
+        assert_eq!(final_completed_at, completed_at);
+    }
 }

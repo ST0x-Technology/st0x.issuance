@@ -192,12 +192,12 @@ Following TDD and the testing patterns from `src/mint/mod.rs::tests`.
 
 **Test cases:**
 
-- [ ] `test_record_callback_from_callback_pending_state` - Happy path
-- [ ] `test_record_callback_from_wrong_state_fails` - Error case
-- [ ] `test_record_callback_with_mismatched_issuer_request_id_fails` -
+- [x] `test_record_callback_from_callback_pending_state` - Happy path
+- [x] `test_record_callback_from_wrong_state_fails` - Error case
+- [x] `test_record_callback_with_mismatched_issuer_request_id_fails` -
       Validation
-- [ ] `test_apply_mint_completed_event_updates_state` - Event application
-- [ ] Integration test showing full flow: `Initiated` → `JournalConfirmed` →
+- [x] `test_apply_mint_completed_event_updates_state` - Event application
+- [x] Integration test showing full flow: `Initiated` → `JournalConfirmed` →
       `CallbackPending` → `Completed`
 
 ## Task 5. Update MintView to handle new events
