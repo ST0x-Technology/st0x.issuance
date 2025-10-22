@@ -692,13 +692,20 @@ pub(crate) enum MintError {
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::{Aggregate, test::TestFramework};
+    use cqrs_es::{
+        Aggregate, AggregateContext, CqrsFramework, EventStore,
+        mem_store::MemStore, test::TestFramework,
+    };
     use rust_decimal::Decimal;
+    use std::sync::Arc;
 
     use super::{
-        ClientId, Mint, MintCommand, MintError, MintEvent, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        CallbackManager, ClientId, Mint, MintCommand, MintError, MintEvent,
+        Network, Quantity, TokenSymbol, TokenizationRequestId,
+        UnderlyingSymbol, mint_manager::MintManager,
     };
+    use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::blockchain::{BlockchainService, mock::MockBlockchainService};
 
     type MintTestFramework = TestFramework<Mint>;
 
@@ -1853,5 +1860,141 @@ mod tests {
 
         assert_eq!(final_id, issuer_request_id);
         assert_eq!(final_completed_at, completed_at);
+    }
+
+    #[cfg(test)]
+    fn create_test_mint_manager(
+        cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+    ) -> MintManager<MemStore<Mint>> {
+        let blockchain_service = Arc::new(MockBlockchainService::new_success())
+            as Arc<dyn BlockchainService>;
+
+        MintManager::new(blockchain_service, cqrs)
+    }
+
+    #[cfg(test)]
+    fn create_test_callback_manager(
+        cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+    ) -> CallbackManager<MemStore<Mint>> {
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn AlpacaService>;
+
+        CallbackManager::new(alpaca_service, cqrs)
+    }
+
+    #[cfg(test)]
+    struct TestMintData {
+        issuer_request_id: super::IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: alloy::primitives::Address,
+    }
+
+    #[cfg(test)]
+    impl TestMintData {
+        fn new() -> Self {
+            Self {
+                issuer_request_id: super::IssuerRequestId::new(
+                    "iss-integration-123",
+                ),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-integration-456",
+                ),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                client_id: ClientId("client-integration-789".to_string()),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_mint_flow_with_managers() {
+        let store = Arc::new(MemStore::<Mint>::default());
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+
+        let mint_manager = create_test_mint_manager(cqrs.clone());
+        let callback_manager = create_test_callback_manager(cqrs.clone());
+
+        let data = TestMintData::new();
+
+        cqrs.execute(
+            &data.issuer_request_id.0,
+            MintCommand::Initiate {
+                issuer_request_id: data.issuer_request_id.clone(),
+                tokenization_request_id: data.tokenization_request_id.clone(),
+                quantity: data.quantity.clone(),
+                underlying: data.underlying.clone(),
+                token: data.token.clone(),
+                network: data.network.clone(),
+                client_id: data.client_id.clone(),
+                wallet: data.wallet,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            &data.issuer_request_id.0,
+            MintCommand::ConfirmJournal {
+                issuer_request_id: data.issuer_request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let context =
+            store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
+        mint_manager
+            .handle_journal_confirmed(
+                &data.issuer_request_id,
+                context.aggregate(),
+            )
+            .await
+            .unwrap();
+
+        let context =
+            store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
+        callback_manager
+            .handle_tokens_minted(&data.issuer_request_id, context.aggregate())
+            .await
+            .unwrap();
+
+        let context =
+            store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
+
+        assert!(
+            matches!(context.aggregate(), Mint::Completed { .. }),
+            "Expected Completed state, got {:?}",
+            context.aggregate()
+        );
+
+        let events =
+            store.load_events(&data.issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 4, "Expected 4 events in the flow");
+
+        assert!(
+            matches!(&events[0].payload, MintEvent::Initiated { .. }),
+            "First event should be Initiated"
+        );
+        assert!(
+            matches!(&events[1].payload, MintEvent::JournalConfirmed { .. }),
+            "Second event should be JournalConfirmed"
+        );
+        assert!(
+            matches!(&events[2].payload, MintEvent::TokensMinted { .. }),
+            "Third event should be TokensMinted"
+        );
+        assert!(
+            matches!(&events[3].payload, MintEvent::MintCompleted { .. }),
+            "Fourth event should be MintCompleted"
+        );
     }
 }

@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use cqrs_es::{CqrsFramework, EventStore};
+use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
-
 use super::{IssuerRequestId, Mint, MintCommand};
+use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 
 /// Orchestrates the Alpaca callback process in response to TokensMinted events.
 ///
@@ -155,24 +153,25 @@ pub(crate) enum CallbackManagerError {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
-    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use cqrs_es::{
+        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
+    };
     use rust_decimal::Decimal;
     use std::sync::Arc;
 
     use super::{CallbackManager, CallbackManagerError};
-    use crate::alpaca::mock::MockAlpacaService;
+    use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
     use crate::mint::{
         ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
 
-    type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
+    type TestCqrs = CqrsFramework<Mint, MemStore<Mint>>;
     type TestStore = MemStore<Mint>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
         (cqrs, store)
     }
 
@@ -254,8 +253,8 @@ mod tests {
     async fn test_handle_tokens_minted_with_success() {
         let (cqrs, store) = setup_test_cqrs();
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
-        let alpaca_service = alpaca_service_mock.clone()
-            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_service =
+            alpaca_service_mock.clone() as Arc<dyn AlpacaService>;
         let manager = CallbackManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id =
@@ -288,8 +287,8 @@ mod tests {
         let (cqrs, store) = setup_test_cqrs();
         let alpaca_service_mock =
             Arc::new(MockAlpacaService::new_failure("API error: 500"));
-        let alpaca_service = alpaca_service_mock.clone()
-            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_service =
+            alpaca_service_mock.clone() as Arc<dyn AlpacaService>;
         let manager = CallbackManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-callback-fail-456");
@@ -323,7 +322,7 @@ mod tests {
     async fn test_handle_tokens_minted_with_wrong_state_fails() {
         let (cqrs, store) = setup_test_cqrs();
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
+            as Arc<dyn AlpacaService>;
         let manager = CallbackManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
