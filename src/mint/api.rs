@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy::primitives::Address;
 use cqrs_es::{AggregateContext, EventStore, persist::PersistedEventStore};
 use rocket::{State, serde::json::Json};
@@ -7,9 +9,9 @@ use sqlite_es::SqliteEventRepository;
 use tracing::{error, info};
 
 use super::{
-    ClientId, IssuerRequestId, MintCommand, MintView, Network, Quantity,
+    ClientId, IssuerRequestId, Mint, MintCommand, MintView, Network, Quantity,
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
-    view::find_by_issuer_request_id,
+    mint_manager::MintManager, view::find_by_issuer_request_id,
 };
 use crate::account::{
     AccountView, LinkedAccountStatus, view::find_by_client_id,
@@ -255,7 +257,9 @@ async fn validate_client_eligible(
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     cqrs: &State<crate::MintCqrs>,
-    conductor: &State<crate::MintConductorType>,
+    mint_manager: &State<
+        Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
+    >,
     pool: &State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
@@ -272,7 +276,7 @@ pub(crate) async fn confirm_journal(
         issuer_request_id.0, tokenization_request_id.0, status
     );
 
-    let (command, should_trigger_conductor) = match status {
+    let (command, should_trigger_manager) = match status {
         JournalStatus::Completed => (
             MintCommand::ConfirmJournal {
                 issuer_request_id: issuer_request_id.clone(),
@@ -299,15 +303,15 @@ pub(crate) async fn confirm_journal(
         return rocket::http::Status::Ok;
     }
 
-    if should_trigger_conductor {
-        let conductor = conductor.inner().clone();
+    if should_trigger_manager {
+        let mint_manager = mint_manager.inner().clone();
         let issuer_request_id_clone = issuer_request_id.clone();
         let pool_clone = pool.inner().clone();
 
         rocket::tokio::spawn(async move {
             info!(
                 issuer_request_id = %issuer_request_id_clone.0,
-                "Triggering conductor to handle journal confirmation"
+                "Triggering mint manager to handle journal confirmation"
             );
 
             let event_repo = SqliteEventRepository::new(pool_clone);
@@ -330,19 +334,19 @@ pub(crate) async fn confirm_journal(
 
             let aggregate = aggregate_context.aggregate();
 
-            if let Err(e) = conductor
+            if let Err(e) = mint_manager
                 .handle_journal_confirmed(&issuer_request_id_clone, aggregate)
                 .await
             {
                 error!(
                     issuer_request_id = %issuer_request_id_clone.0,
                     error = %e,
-                    "Conductor failed to handle journal confirmation"
+                    "Mint manager failed to handle journal confirmation"
                 );
             } else {
                 info!(
                     issuer_request_id = %issuer_request_id_clone.0,
-                    "Conductor successfully handled journal confirmation"
+                    "Mint manager successfully handled journal confirmation"
                 );
             }
         });
@@ -354,10 +358,10 @@ pub(crate) async fn confirm_journal(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use cqrs_es::persist::GenericQuery;
+    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
     use rocket::http::{ContentType, Status};
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -371,19 +375,20 @@ mod tests {
     use crate::blockchain::mock::MockBlockchainService;
     use crate::mint::{
         Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
-        conductor::MintConductor, view::find_by_issuer_request_id,
+        mint_manager::MintManager, view::find_by_issuer_request_id,
     };
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
     };
 
-    fn create_test_conductor(
+    fn create_test_manager(
         mint_cqrs: crate::MintCqrs,
-    ) -> crate::MintConductorType {
+    ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>
+    {
         let blockchain_service = Arc::new(MockBlockchainService::new_success())
             as Arc<dyn crate::blockchain::BlockchainService>;
 
-        Arc::new(MintConductor::new(blockchain_service, mint_cqrs))
+        Arc::new(MintManager::new(blockchain_service, mint_cqrs))
     }
 
     async fn setup_test_environment() -> (
@@ -1050,11 +1055,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1083,11 +1088,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1146,11 +1151,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1225,11 +1230,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1307,11 +1312,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1386,11 +1391,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1440,11 +1445,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let conductor = create_test_conductor(mint_cqrs.clone());
+        let mint_manager = create_test_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
-            .manage(conductor)
+            .manage(mint_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 

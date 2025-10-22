@@ -30,7 +30,7 @@ Following the same pattern as `BlockchainService`:
 - Add `reqwest` dependency with JSON features
 - Add `RecordCallback` command to `Mint` aggregate
 - Add `MintCompleted` event (single event, not two)
-- Create `CallbackConductor` to orchestrate the callback flow
+- Create `CallbackManager` to orchestrate the callback flow
 - Wire up event listening: `TokensMinted` → call `send_mint_callback()` →
   execute `RecordCallback`
 - Add Alpaca configuration to `Config` struct following the blockchain service
@@ -216,11 +216,11 @@ The view needs to reflect callback and completion status.
 - [x] Add `completed_at` timestamp field to view payload
 - [x] Update tests in view module to verify event is processed correctly
 
-## Task 6. Create CallbackConductor
+## Task 6. Create CallbackManager
 
-Following the pattern from `MintConductor` in `src/mint/conductor.rs`.
+Following the pattern from `MintManager` in `src/mint/manager.rs`.
 
-**Conductor responsibilities:**
+**Manager responsibilities:**
 
 1. React to `TokensMinted` event (or `CallbackPending` state)
 2. Extract necessary data from aggregate
@@ -230,17 +230,17 @@ Following the pattern from `MintConductor` in `src/mint/conductor.rs`.
 **Implementation:**
 
 ```rust
-pub(crate) struct CallbackConductor<ES: EventStore<Mint>> {
+pub(crate) struct CallbackManager<ES: EventStore<Mint>> {
     alpaca_service: Arc<dyn AlpacaService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
 }
 
-impl<ES: EventStore<Mint>> CallbackConductor<ES> {
+impl<ES: EventStore<Mint>> CallbackManager<ES> {
     pub(crate) async fn handle_tokens_minted(
         &self,
         issuer_request_id: &IssuerRequestId,
         aggregate: &Mint,
-    ) -> Result<(), ConductorError> {
+    ) -> Result<(), ManagerError> {
         // 1. Validate aggregate is in CallbackPending state
         // 2. Build MintCallbackRequest from aggregate data
         // 3. Call alpaca_service.send_mint_callback()
@@ -252,19 +252,18 @@ impl<ES: EventStore<Mint>> CallbackConductor<ES> {
 
 **Subtasks:**
 
-- [ ] Create `src/mint/callback_conductor.rs`
-- [ ] Implement `CallbackConductor` struct with `new()` and
+- [x] Create `src/mint/callback_manager.rs`
+- [x] Implement `CallbackManager` struct with `new()` and
       `handle_tokens_minted()` methods
-- [ ] Add proper error handling and logging (use `tracing::info!` and
+- [x] Add proper error handling and logging (use `tracing::info!` and
       `tracing::warn!`)
-- [ ] Define `CallbackConductorError` enum (can reuse or extend
-      `ConductorError`)
-- [ ] Update `src/mint/mod.rs` to
-      `pub(crate) use callback_conductor::CallbackConductor;`
+- [x] Define `CallbackManagerError` enum (can reuse or extend `ManagerError`)
+- [x] Update `src/mint/mod.rs` to
+      `pub(crate) use callback_manager::CallbackManager;`
 
-## Task 7. Add tests for CallbackConductor
+## Task 7. Add tests for CallbackManager
 
-Following the testing pattern from `src/mint/conductor.rs::tests`.
+Following the testing pattern from `src/mint/manager.rs::tests`.
 
 **Test cases:**
 
@@ -281,15 +280,15 @@ Following the testing pattern from `src/mint/conductor.rs::tests`.
 - Use `MockAlpacaService` configured for success/failure
 - Verify aggregate transitions to `Completed` state on success
 
-## Task 8. Wire CallbackConductor into main event loop
+## Task 8. Wire CallbackManager into main event loop
 
-The conductor needs to be invoked when `TokensMinted` events occur. This wiring
+The manager needs to be invoked when `TokensMinted` events occur. This wiring
 will happen in `main.rs` or a dedicated orchestration module.
 
 **Integration points:**
 
 - After `TokensMinted` event is committed, load the aggregate
-- Call `CallbackConductor::handle_tokens_minted()`
+- Call `CallbackManager::handle_tokens_minted()`
 - Handle errors (retry logic can be added later)
 
 **Note:** The exact wiring mechanism depends on how event listeners are
@@ -302,7 +301,7 @@ structured in the app. This may require:
 **Subtasks:**
 
 - [ ] Identify where to hook into event flow (likely in `main.rs` setup)
-- [ ] Create `CallbackConductor` instance with real/mock `AlpacaService`
+- [ ] Create `CallbackManager` instance with real/mock `AlpacaService`
 - [ ] Wire up event listener or polling mechanism
 - [ ] Add proper error handling and logging
 - [ ] Document the wiring approach in code comments
@@ -507,8 +506,8 @@ through callback completion.
 
 1. Execute `InitiateMint` command → `Initiated` state
 2. Execute `ConfirmJournal` command → `JournalConfirmed` state
-3. `MintConductor` mints tokens → `CallbackPending` state
-4. `CallbackConductor` sends callback → `Completed` state
+3. `MintManager` mints tokens → `CallbackPending` state
+4. `CallbackManager` sends callback → `Completed` state
 5. Verify all events were produced and view was updated
 
 **Subtasks:**
@@ -516,7 +515,7 @@ through callback completion.
 - [ ] Create integration test in `src/mint/mod.rs::tests` or separate
       integration test file
 - [ ] Use `MockBlockchainService` and `MockAlpacaService`
-- [ ] Exercise full flow with both conductors
+- [ ] Exercise full flow with both managers
 - [ ] Verify final aggregate state is `Completed`
 - [ ] Verify `MintView` shows status as "completed" with all timestamps
 
@@ -527,9 +526,9 @@ Ensure all changes are properly documented.
 **Subtasks:**
 
 - [ ] Add doc comments to `AlpacaService` trait and methods
-- [ ] Add doc comments to `CallbackConductor` and its methods
+- [ ] Add doc comments to `CallbackManager` and its methods
 - [ ] Update SPEC.md if any implementation details diverge from spec
-- [ ] Add inline comments explaining conductor wiring
+- [ ] Add inline comments explaining manager wiring
 
 ## Task 13. Run checks before completion
 
@@ -551,10 +550,10 @@ Ensure code quality and all tests pass.
 Tasks must be completed in order:
 
 - Task 1 (AlpacaService infrastructure including mock) before Task 6
-  (CallbackConductor)
-- Tasks 2-4 (Aggregate changes and tests) before Task 6 (CallbackConductor)
+  (CallbackManager)
+- Tasks 2-4 (Aggregate changes and tests) before Task 6 (CallbackManager)
 - Task 5 (View updates) can be done in parallel with Task 6
-- Tasks 6-7 (CallbackConductor implementation and tests) before Task 8 (wiring)
+- Tasks 6-7 (CallbackManager implementation and tests) before Task 8 (wiring)
 - Task 9 (Config) and Task 10 (RealAlpacaService) can be done after Task 1
 - Task 8 (wiring) before Task 11 (integration test)
 - Tasks 12-13 (docs and checks) at the end
@@ -597,9 +596,9 @@ All other fields serialize naturally via serde derives.
 ## Notes
 
 - Follow the same architectural patterns as `BlockchainService` and
-  `MintConductor`
+  `MintManager`
 - Keep aggregates pure - no I/O in command handlers, all external interactions
-  via conductors
+  via managers
 - Maintain complete test coverage for all business logic
 - `RecordCallback` produces single `MintCompleted` event following DDD/ES
   principles (one command = one domain fact = one event)
