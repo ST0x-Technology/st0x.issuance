@@ -692,6 +692,7 @@ pub(crate) enum MintError {
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
+    use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
         mem_store::MemStore, test::TestFramework,
@@ -701,7 +702,7 @@ mod tests {
 
     use super::{
         CallbackManager, ClientId, Mint, MintCommand, MintError, MintEvent,
-        Network, Quantity, TokenSymbol, TokenizationRequestId,
+        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
         UnderlyingSymbol, mint_manager::MintManager,
     };
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
@@ -1862,7 +1863,6 @@ mod tests {
         assert_eq!(final_completed_at, completed_at);
     }
 
-    #[cfg(test)]
     fn create_test_mint_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
     ) -> MintManager<MemStore<Mint>> {
@@ -1872,7 +1872,6 @@ mod tests {
         MintManager::new(blockchain_service, cqrs)
     }
 
-    #[cfg(test)]
     fn create_test_callback_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
     ) -> CallbackManager<MemStore<Mint>> {
@@ -1882,7 +1881,6 @@ mod tests {
         CallbackManager::new(alpaca_service, cqrs)
     }
 
-    #[cfg(test)]
     struct TestMintData {
         issuer_request_id: super::IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -1894,7 +1892,6 @@ mod tests {
         wallet: alloy::primitives::Address,
     }
 
-    #[cfg(test)]
     impl TestMintData {
         fn new() -> Self {
             Self {
@@ -1996,5 +1993,33 @@ mod tests {
             matches!(&events[3].payload, MintEvent::MintCompleted { .. }),
             "Fourth event should be MintCompleted"
         );
+
+        let mut view = MintView::default();
+        for event in &events {
+            view.update(event);
+        }
+
+        let MintView::Completed {
+            issuer_request_id: view_issuer_id,
+            tx_hash: view_tx_hash,
+            completed_at: view_completed_at,
+            initiated_at: view_initiated_at,
+            journal_confirmed_at: view_journal_confirmed_at,
+            minted_at: view_minted_at,
+            ..
+        } = view
+        else {
+            panic!("Expected Completed view, got {view:?}");
+        };
+
+        assert_eq!(view_issuer_id, data.issuer_request_id);
+        assert!(view_tx_hash != alloy::primitives::B256::ZERO);
+        assert!(view_initiated_at.timestamp() > 0);
+        assert!(view_journal_confirmed_at.timestamp() > 0);
+        assert!(view_minted_at.timestamp() > 0);
+        assert!(view_completed_at.timestamp() > 0);
+        assert!(view_completed_at >= view_minted_at);
+        assert!(view_minted_at >= view_journal_confirmed_at);
+        assert!(view_journal_confirmed_at >= view_initiated_at);
     }
 }
