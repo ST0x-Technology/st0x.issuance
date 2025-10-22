@@ -151,3 +151,217 @@ pub(crate) enum CallbackManagerError {
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{address, b256};
+    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use rust_decimal::Decimal;
+    use std::sync::Arc;
+
+    use super::{CallbackManager, CallbackManagerError};
+    use crate::alpaca::mock::MockAlpacaService;
+    use crate::mint::{
+        ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+    };
+
+    type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
+    type TestStore = MemStore<Mint>;
+
+    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
+        let store = Arc::new(MemStore::default());
+        let cqrs =
+            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        (cqrs, store)
+    }
+
+    async fn create_test_mint_in_callback_pending_state(
+        cqrs: &TestCqrs,
+        store: &TestStore,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Mint {
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            MintCommand::Initiate {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                quantity: quantity.clone(),
+                underlying: underlying.clone(),
+                token: token.clone(),
+                network: network.clone(),
+                client_id: client_id.clone(),
+                wallet,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+        let receipt_id =
+            alloy::primitives::U256::from_str_radix("123", 10).unwrap();
+        let shares_minted = alloy::primitives::U256::from_str_radix(
+            "100000000000000000000",
+            10,
+        )
+        .unwrap();
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            MintCommand::RecordMintSuccess {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used: 50000,
+                block_number: 12345,
+            },
+        )
+        .await
+        .unwrap();
+
+        load_aggregate(store, issuer_request_id).await
+    }
+
+    async fn load_aggregate(
+        store: &TestStore,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Mint {
+        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        context.aggregate().clone()
+    }
+
+    #[tokio::test]
+    async fn test_handle_tokens_minted_with_success() {
+        let (cqrs, store) = setup_test_cqrs();
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = CallbackManager::new(alpaca_service, cqrs.clone());
+
+        let issuer_request_id =
+            IssuerRequestId::new("iss-callback-success-123");
+        let aggregate = create_test_mint_in_callback_pending_state(
+            &cqrs,
+            &store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result =
+            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+
+        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 1);
+
+        let updated_aggregate =
+            load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(updated_aggregate, Mint::Completed { .. }),
+            "Expected Completed state, got {updated_aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_tokens_minted_with_alpaca_failure() {
+        let (cqrs, store) = setup_test_cqrs();
+        let alpaca_service_mock =
+            Arc::new(MockAlpacaService::new_failure("API error: 500"));
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = CallbackManager::new(alpaca_service, cqrs.clone());
+
+        let issuer_request_id = IssuerRequestId::new("iss-callback-fail-456");
+        let aggregate = create_test_mint_in_callback_pending_state(
+            &cqrs,
+            &store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result =
+            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+
+        assert!(
+            matches!(result, Err(CallbackManagerError::Alpaca(_))),
+            "Expected Alpaca error, got {result:?}"
+        );
+
+        assert_eq!(alpaca_service_mock.get_call_count(), 1);
+
+        let updated_aggregate =
+            load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(updated_aggregate, Mint::CallbackPending { .. }),
+            "Expected state to remain CallbackPending after failure, got {updated_aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_tokens_minted_with_wrong_state_fails() {
+        let (cqrs, store) = setup_test_cqrs();
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = CallbackManager::new(alpaca_service, cqrs.clone());
+
+        let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            MintCommand::Initiate {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id,
+                quantity,
+                underlying,
+                token,
+                network,
+                client_id,
+                wallet,
+            },
+        )
+        .await
+        .unwrap();
+
+        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+
+        let result =
+            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(CallbackManagerError::InvalidAggregateState { .. })
+            ),
+            "Expected InvalidAggregateState error, got {result:?}"
+        );
+    }
+}

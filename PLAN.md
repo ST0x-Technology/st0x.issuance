@@ -267,10 +267,10 @@ Following the testing pattern from `src/mint/manager.rs::tests`.
 
 **Test cases:**
 
-- [ ] `test_handle_tokens_minted_with_success` - Callback succeeds
-- [ ] `test_handle_tokens_minted_with_alpaca_failure` - Callback fails but error
+- [x] `test_handle_tokens_minted_with_success` - Callback succeeds
+- [x] `test_handle_tokens_minted_with_alpaca_failure` - Callback fails but error
       is recorded
-- [ ] `test_handle_tokens_minted_with_wrong_state_fails` - Validates state
+- [x] `test_handle_tokens_minted_with_wrong_state_fails` - Validates state
 
 **Test setup:**
 
