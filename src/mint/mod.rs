@@ -155,6 +155,25 @@ pub(crate) enum Mint {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    Completed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Mint {
@@ -172,6 +191,7 @@ impl Mint {
             Self::JournalRejected { .. } => "JournalRejected",
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
+            Self::Completed { .. } => "Completed",
         }
     }
 
@@ -272,6 +292,27 @@ impl Mint {
             issuer_request_id: provided_id,
             error,
             failed_at: now,
+        }])
+    }
+
+    fn handle_record_callback(
+        &self,
+        provided_id: IssuerRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let Self::CallbackPending { issuer_request_id: expected_id, .. } = self
+        else {
+            return Err(MintError::NotInCallbackPendingState {
+                current_state: self.state_name().to_string(),
+            });
+        };
+
+        Self::validate_issuer_request_id(expected_id, &provided_id)?;
+
+        let now = Utc::now();
+
+        Ok(vec![MintEvent::MintCompleted {
+            issuer_request_id: provided_id,
+            completed_at: now,
         }])
     }
 
@@ -434,6 +475,50 @@ impl Mint {
             failed_at,
         };
     }
+
+    fn apply_mint_completed(&mut self, completed_at: DateTime<Utc>) {
+        let Self::CallbackPending {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::Completed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+            completed_at,
+        };
+    }
 }
 
 #[async_trait]
@@ -507,11 +592,8 @@ impl Aggregate for Mint {
             MintCommand::RecordMintFailure { issuer_request_id, error } => {
                 self.handle_record_mint_failure(issuer_request_id, error)
             }
-            MintCommand::RecordCallback { .. } => {
-                // Handler to be implemented in Task 3
-                Err(MintError::NotInCallbackPendingState {
-                    current_state: self.state_name().to_string(),
-                })
+            MintCommand::RecordCallback { issuer_request_id } => {
+                self.handle_record_callback(issuer_request_id)
             }
         }
     }
@@ -571,8 +653,8 @@ impl Aggregate for Mint {
                 error,
                 failed_at,
             } => self.apply_minting_failed(error, failed_at),
-            MintEvent::MintCompleted { .. } => {
-                // Apply handler to be implemented in Task 3
+            MintEvent::MintCompleted { issuer_request_id: _, completed_at } => {
+                self.apply_mint_completed(completed_at)
             }
         }
     }

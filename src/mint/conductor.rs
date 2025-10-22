@@ -179,6 +179,7 @@ const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
         Mint::JournalRejected { .. } => "JournalRejected",
         Mint::CallbackPending { .. } => "CallbackPending",
         Mint::MintingFailed { .. } => "MintingFailed",
+        Mint::Completed { .. } => "Completed",
     }
 }
 

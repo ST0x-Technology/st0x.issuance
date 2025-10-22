@@ -176,15 +176,15 @@ Completed {
 
 **Subtasks:**
 
-- [ ] Add `Completed` variant to `Mint` enum in `src/mint/mod.rs`
-- [ ] Update `state_name()` method to include `Completed` state
-- [ ] Add `handle_record_callback()` method that validates state is
+- [x] Add `Completed` variant to `Mint` enum in `src/mint/mod.rs`
+- [x] Update `state_name()` method to include `Completed` state
+- [x] Add `handle_record_callback()` method that validates state is
       `CallbackPending`
-- [ ] Implement event handler that produces `MintCompleted` event (single event)
-- [ ] Add `apply_mint_completed()` method that transitions `CallbackPending` →
+- [x] Implement event handler that produces `MintCompleted` event (single event)
+- [x] Add `apply_mint_completed()` method that transitions `CallbackPending` →
       `Completed`
-- [ ] Update `Aggregate::handle()` match to call `handle_record_callback()`
-- [ ] Update `Aggregate::apply()` match to handle `MintCompleted` event
+- [x] Update `Aggregate::handle()` match to call `handle_record_callback()`
+- [x] Update `Aggregate::apply()` match to handle `MintCompleted` event
 
 ## Task 4. Add tests for RecordCallback command
 
