@@ -257,10 +257,17 @@ async fn validate_client_eligible(
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     cqrs: &State<crate::MintCqrs>,
+    event_store: &State<Arc<PersistedEventStore<SqliteEventRepository, Mint>>>,
     mint_manager: &State<
         Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
     >,
-    pool: &State<sqlx::Pool<sqlx::Sqlite>>,
+    callback_manager: &State<
+        Arc<
+            super::CallbackManager<
+                PersistedEventStore<SqliteEventRepository, Mint>,
+            >,
+        >,
+    >,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
     let JournalConfirmationRequest {
@@ -276,80 +283,90 @@ pub(crate) async fn confirm_journal(
         issuer_request_id.0, tokenization_request_id.0, status
     );
 
-    let (command, should_trigger_manager) = match status {
-        JournalStatus::Completed => (
-            MintCommand::ConfirmJournal {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-            true,
-        ),
-        JournalStatus::Rejected => (
-            MintCommand::RejectJournal {
+    match status {
+        JournalStatus::Rejected => {
+            let command = MintCommand::RejectJournal {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: reason.unwrap_or_else(|| {
                     "Journal rejected by Alpaca".to_string()
                 }),
-            },
-            false,
-        ),
-    };
-
-    if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
-        error!(
-            "Failed to execute journal confirmation command for \
-             issuer_request_id={}: {}",
-            issuer_request_id.0, e
-        );
-        return rocket::http::Status::Ok;
-    }
-
-    if should_trigger_manager {
-        let mint_manager = mint_manager.inner().clone();
-        let issuer_request_id_clone = issuer_request_id.clone();
-        let pool_clone = pool.inner().clone();
-
-        rocket::tokio::spawn(async move {
-            info!(
-                issuer_request_id = %issuer_request_id_clone.0,
-                "Triggering mint manager to handle journal confirmation"
-            );
-
-            let event_repo = SqliteEventRepository::new(pool_clone);
-            let event_store = PersistedEventStore::new_event_store(event_repo);
-
-            let aggregate_context = match event_store
-                .load_aggregate(&issuer_request_id_clone.0)
-                .await
-            {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    error!(
-                        issuer_request_id = %issuer_request_id_clone.0,
-                        error = %e,
-                        "Failed to load aggregate for mint manager"
-                    );
-                    return;
-                }
             };
 
-            let aggregate = aggregate_context.aggregate();
-
-            if let Err(e) = mint_manager
-                .handle_journal_confirmed(&issuer_request_id_clone, aggregate)
-                .await
-            {
+            if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
                 error!(
-                    issuer_request_id = %issuer_request_id_clone.0,
-                    error = %e,
-                    "Mint manager failed to handle journal confirmation"
+                    "Failed to execute journal rejection command for \
+                     issuer_request_id={}: {}",
+                    issuer_request_id.0, e
                 );
-            } else {
-                info!(
-                    issuer_request_id = %issuer_request_id_clone.0,
-                    "Mint manager successfully handled journal confirmation"
-                );
+                return rocket::http::Status::InternalServerError;
             }
-        });
+        }
+
+        JournalStatus::Completed => {
+            let command = MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            };
+
+            if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
+                error!(
+                    "Failed to execute journal confirmation command for \
+                     issuer_request_id={}: {}",
+                    issuer_request_id.0, e
+                );
+                return rocket::http::Status::InternalServerError;
+            }
+
+            let event_store = event_store.inner().clone();
+            let mint_manager = mint_manager.inner().clone();
+            let callback_manager = callback_manager.inner().clone();
+            let issuer_request_id_clone = issuer_request_id.clone();
+
+            rocket::tokio::spawn(async move {
+                let Ok(mint_context) = event_store
+                    .load_aggregate(&issuer_request_id_clone.0)
+                    .await
+                else {
+                    error!(
+                        issuer_request_id = %issuer_request_id_clone.0,
+                        "Failed to load mint aggregate for mint manager"
+                    );
+                    return;
+                };
+
+                if mint_manager
+                    .handle_journal_confirmed(
+                        &issuer_request_id_clone,
+                        mint_context.aggregate(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let Ok(mint_ctx) = event_store
+                    .load_aggregate(&issuer_request_id_clone.0)
+                    .await
+                else {
+                    error!(
+                        issuer_request_id = %issuer_request_id_clone.0,
+                        "Failed to reload mint aggregate for callback manager"
+                    );
+                    return;
+                };
+
+                let Mint::CallbackPending { .. } = mint_ctx.aggregate() else {
+                    return;
+                };
+
+                let _ = callback_manager
+                    .handle_tokens_minted(
+                        &issuer_request_id_clone,
+                        mint_ctx.aggregate(),
+                    )
+                    .await;
+            });
+        }
     }
 
     rocket::http::Status::Ok
@@ -389,6 +406,27 @@ mod tests {
             as Arc<dyn crate::blockchain::BlockchainService>;
 
         Arc::new(MintManager::new(blockchain_service, mint_cqrs))
+    }
+
+    fn create_test_callback_manager(
+        mint_cqrs: crate::MintCqrs,
+    ) -> Arc<
+        crate::mint::CallbackManager<
+            PersistedEventStore<SqliteEventRepository, Mint>,
+        >,
+    > {
+        let alpaca_service =
+            Arc::new(crate::alpaca::mock::MockAlpacaService::new_success())
+                as Arc<dyn crate::alpaca::AlpacaService>;
+
+        Arc::new(crate::mint::CallbackManager::new(alpaca_service, mint_cqrs))
+    }
+
+    fn create_test_event_store(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+    ) -> Arc<PersistedEventStore<SqliteEventRepository, Mint>> {
+        let event_repo = SqliteEventRepository::new(pool.clone());
+        Arc::new(PersistedEventStore::new_event_store(event_repo))
     }
 
     async fn setup_test_environment() -> (
@@ -1052,14 +1090,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
-        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let issuer_request_id =
+            super::super::IssuerRequestId::new("iss-ok-test");
+        let tokenization_request_id =
+            super::super::TokenizationRequestId::new("alp-ok-test");
+
+        let initiate_cmd = super::super::MintCommand::Initiate {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: super::super::Quantity::new(Decimal::from(100)),
+            underlying,
+            token,
+            network,
+            client_id: super::super::ClientId(client_id),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+        };
+
+        mint_cqrs
+            .execute(&issuer_request_id.0, initiate_cmd)
+            .await
+            .expect("Failed to initiate mint");
+
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1068,8 +1139,8 @@ mod tests {
             .expect("valid rocket instance");
 
         let request_body = serde_json::json!({
-            "tokenization_request_id": "alp-123",
-            "issuer_request_id": "iss-456",
+            "tokenization_request_id": tokenization_request_id.0,
+            "issuer_request_id": issuer_request_id.0,
             "status": "completed"
         });
 
@@ -1085,14 +1156,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_rejected_returns_ok() {
-        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let issuer_request_id =
+            super::super::IssuerRequestId::new("iss-reject-ok-test");
+        let tokenization_request_id =
+            super::super::TokenizationRequestId::new("alp-reject-ok-test");
+
+        let initiate_cmd = super::super::MintCommand::Initiate {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: super::super::Quantity::new(Decimal::from(100)),
+            underlying,
+            token,
+            network,
+            client_id: super::super::ClientId(client_id),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+        };
+
+        mint_cqrs
+            .execute(&issuer_request_id.0, initiate_cmd)
+            .await
+            .expect("Failed to initiate mint");
+
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1101,8 +1205,8 @@ mod tests {
             .expect("valid rocket instance");
 
         let request_body = serde_json::json!({
-            "tokenization_request_id": "alp-123",
-            "issuer_request_id": "iss-456",
+            "tokenization_request_id": tokenization_request_id.0,
+            "issuer_request_id": issuer_request_id.0,
             "status": "rejected"
         });
 
@@ -1151,11 +1255,15 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1230,11 +1338,15 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1312,11 +1424,15 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1391,11 +1507,15 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1441,15 +1561,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_confirm_journal_for_nonexistent_mint_returns_ok() {
+    async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
+     {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(event_store)
             .manage(mint_manager)
+            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1470,6 +1595,6 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), Status::InternalServerError);
     }
 }

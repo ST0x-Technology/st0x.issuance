@@ -492,21 +492,22 @@ CallbackPending state), and invoke the callback manager.
 
 **Subtasks:**
 
-- [ ] Add CallbackManager to confirm_journal endpoint in `src/mint/api.rs`
-  - [ ] Add callback_manager parameter to function signature
-  - [ ] Chain callback manager after mint manager in spawned task
-  - [ ] Load aggregate again after MintManager succeeds
-  - [ ] Call `callback_manager.handle_tokens_minted()`
-  - [ ] Add proper error handling and logging
-  - [ ] Update all test functions to include callback_manager
-- [ ] Wire up in `src/main.rs`
-  - [ ] Add import: `use mint::CallbackManager;`
-  - [ ] Re-export CallbackManager in `src/mint/mod.rs`
-  - [ ] Create AlpacaService via `config.create_alpaca_service()`
-  - [ ] Create CallbackManager:
+- [x] Add CallbackManager to confirm_journal endpoint in `src/mint/api.rs`
+  - [x] Add callback_manager parameter to function signature
+  - [x] Chain callback manager after mint manager in spawned task
+  - [x] Load aggregate again after MintManager succeeds
+  - [x] Call `callback_manager.handle_tokens_minted()`
+  - [x] Add proper error handling and logging
+  - [x] Update all test functions to include callback_manager
+- [x] Wire up in `src/main.rs`
+  - [x] Add import: `use mint::CallbackManager;`
+  - [x] Re-export CallbackManager in `src/mint/mod.rs`
+  - [x] Create AlpacaService via `config.alpaca.service()`
+  - [x] Create CallbackManager:
         `Arc::new(CallbackManager::new(alpaca_service,
     mint_cqrs.clone()))`
-  - [ ] Add `.manage(callback_manager)` to rocket::build() chain
+  - [x] Add `.manage(callback_manager)` to rocket::build() chain
+  - [x] Create and manage MintEventStore in main.rs and pass to endpoint
 
 ## Task 11. Integration test for complete mint flow
 

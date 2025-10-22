@@ -11,8 +11,10 @@ mod tokenized_asset;
 
 use alloy::primitives::address;
 use clap::Parser;
-use cqrs_es::persist::GenericQuery;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use sqlite_es::{
+    SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
+};
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::error;
@@ -20,12 +22,13 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use account::{Account, AccountView};
 use config::Config;
-use mint::{Mint, MintView, mint_manager::MintManager};
+use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 type AccountCqrs = SqliteCqrs<Account>;
 type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
 type MintCqrs = Arc<SqliteCqrs<Mint>>;
+type MintEventStore = Arc<PersistedEventStore<SqliteEventRepository, Mint>>;
 
 #[launch]
 async fn rocket() -> _ {
@@ -84,6 +87,10 @@ async fn rocket() -> _ {
         sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
     let mint_cqrs = Arc::new(mint_cqrs_raw);
 
+    let mint_event_repo = SqliteEventRepository::new(pool.clone());
+    let mint_event_store: MintEventStore =
+        Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
+
     seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
         error!("Failed to seed initial assets: {e}");
         std::process::exit(1);
@@ -98,11 +105,17 @@ async fn rocket() -> _ {
     let mint_manager =
         Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
 
+    let alpaca_service = config.alpaca.service();
+    let callback_manager =
+        Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
+
     rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
+        .manage(mint_event_store)
         .manage(mint_manager)
+        .manage(callback_manager)
         .manage(pool)
         .mount(
             "/",
