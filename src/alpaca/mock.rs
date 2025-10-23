@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
@@ -11,7 +12,7 @@ use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 pub(crate) struct MockAlpacaService {
     should_succeed: bool,
     error_message: Option<String>,
-    call_count: Arc<Mutex<usize>>,
+    call_count: Arc<AtomicUsize>,
 }
 
 impl MockAlpacaService {
@@ -20,7 +21,7 @@ impl MockAlpacaService {
         Self {
             should_succeed: true,
             error_message: None,
-            call_count: Arc::new(Mutex::new(0)),
+            call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -33,16 +34,13 @@ impl MockAlpacaService {
         Self {
             should_succeed: false,
             error_message: Some(error_message.into()),
-            call_count: Arc::new(Mutex::new(0)),
+            call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Returns the number of times `send_mint_callback()` was called.
     pub(crate) fn get_call_count(&self) -> usize {
-        *self
-            .call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.call_count.load(Ordering::Relaxed)
     }
 }
 
@@ -52,10 +50,7 @@ impl AlpacaService for MockAlpacaService {
         &self,
         _request: MintCallbackRequest,
     ) -> Result<(), AlpacaError> {
-        *self
-            .call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.call_count.fetch_add(1, Ordering::Relaxed);
 
         if self.should_succeed {
             Ok(())

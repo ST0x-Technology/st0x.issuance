@@ -40,17 +40,22 @@ async fn rocket() -> _ {
         )
         .init();
 
+    match initialize_rocket().await {
+        Ok(rocket) => rocket,
+        Err(e) => {
+            error!("Failed to initialize application: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn initialize_rocket()
+-> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
     let config = Config::parse();
 
-    let pool = create_pool(&config).await.unwrap_or_else(|e| {
-        error!("Failed to create database pool: {e}");
-        std::process::exit(1);
-    });
+    let pool = create_pool(&config).await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap_or_else(|e| {
-        error!("Failed to run database migrations: {e}");
-        std::process::exit(1);
-    });
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
@@ -91,25 +96,18 @@ async fn rocket() -> _ {
     let mint_event_store: MintEventStore =
         Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
 
-    seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
-        error!("Failed to seed initial assets: {e}");
-        std::process::exit(1);
-    });
+    seed_initial_assets(&tokenized_asset_cqrs).await?;
 
-    let blockchain_service =
-        config.create_blockchain_service().unwrap_or_else(|e| {
-            error!("Failed to create blockchain service: {e}");
-            std::process::exit(1);
-        });
+    let blockchain_service = config.create_blockchain_service()?;
 
     let mint_manager =
         Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
 
-    let alpaca_service = config.alpaca.service();
+    let alpaca_service = config.alpaca.service()?;
     let callback_manager =
         Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
 
-    rocket::build()
+    Ok(rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
@@ -125,7 +123,7 @@ async fn rocket() -> _ {
                 mint::initiate_mint,
                 mint::confirm_journal
             ],
-        )
+        ))
 }
 
 async fn seed_initial_assets(

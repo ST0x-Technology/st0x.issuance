@@ -69,7 +69,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
         } = aggregate
         else {
             return Err(CallbackManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(aggregate).to_string(),
+                current_state: aggregate.state_name().to_string(),
             });
         };
 
@@ -123,18 +123,6 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                 Err(CallbackManagerError::Alpaca(e))
             }
         }
-    }
-}
-
-const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
-    match aggregate {
-        Mint::Uninitialized => "Uninitialized",
-        Mint::Initiated { .. } => "Initiated",
-        Mint::JournalConfirmed { .. } => "JournalConfirmed",
-        Mint::JournalRejected { .. } => "JournalRejected",
-        Mint::CallbackPending { .. } => "CallbackPending",
-        Mint::MintingFailed { .. } => "MintingFailed",
-        Mint::Completed { .. } => "Completed",
     }
 }
 

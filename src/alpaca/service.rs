@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::Args;
@@ -8,31 +9,46 @@ use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 #[derive(Debug, Args)]
 pub(crate) struct AlpacaConfig {
     #[arg(
-        long,
-        env,
+        long = "alpaca-api-base-url",
+        env = "ALPACA_API_BASE_URL",
         default_value = "https://broker-api.alpaca.markets",
         help = "Alpaca API base URL"
     )]
     api_base_url: String,
 
-    #[arg(long, env, help = "Alpaca tokenization account ID")]
+    #[arg(
+        long = "alpaca-account-id",
+        env = "ALPACA_ACCOUNT_ID",
+        help = "Alpaca tokenization account ID"
+    )]
     account_id: String,
 
-    #[arg(long, env, help = "Alpaca API key ID")]
+    #[arg(
+        long = "alpaca-api-key",
+        env = "ALPACA_API_KEY",
+        help = "Alpaca API key ID"
+    )]
     api_key: String,
 
-    #[arg(long, env, help = "Alpaca API secret key")]
+    #[arg(
+        long = "alpaca-api-secret",
+        env = "ALPACA_API_SECRET",
+        help = "Alpaca API secret key"
+    )]
     api_secret: String,
 }
 
 impl AlpacaConfig {
-    pub(crate) fn service(&self) -> Arc<dyn AlpacaService> {
-        Arc::new(RealAlpacaService::new(
+    pub(crate) fn service(
+        &self,
+    ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
+        let service = RealAlpacaService::new(
             self.api_base_url.clone(),
             self.account_id.clone(),
             self.api_key.clone(),
             self.api_secret.clone(),
-        ))
+        )?;
+        Ok(Arc::new(service))
     }
 }
 
@@ -50,9 +66,15 @@ impl RealAlpacaService {
         account_id: String,
         api_key: String,
         api_secret: String,
-    ) -> Self {
-        let client = reqwest::Client::new();
-        Self { client, base_url, account_id, api_key, api_secret }
+    ) -> Result<Self, AlpacaError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AlpacaError::Http {
+                message: format!("Failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self { client, base_url, account_id, api_key, api_secret })
     }
 }
 
@@ -64,7 +86,8 @@ impl AlpacaService for RealAlpacaService {
     ) -> Result<(), AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/callback/mint",
-            self.base_url, self.account_id
+            self.base_url.trim_end_matches('/'),
+            self.account_id
         );
 
         let response = self
@@ -79,9 +102,17 @@ impl AlpacaService for RealAlpacaService {
         match response.status() {
             reqwest::StatusCode::OK => Ok(()),
             reqwest::StatusCode::UNAUTHORIZED
-            | reqwest::StatusCode::FORBIDDEN => Err(AlpacaError::Auth {
-                reason: "Authentication failed".to_string(),
-            }),
+            | reqwest::StatusCode::FORBIDDEN => {
+                let body =
+                    response.text().await.unwrap_or_else(|_| String::new());
+                let snippet = body.chars().take(200).collect::<String>();
+                let reason = if snippet.is_empty() {
+                    "Authentication failed".to_string()
+                } else {
+                    format!("Authentication failed: {snippet}")
+                };
+                Err(AlpacaError::Auth { reason })
+            }
             status => {
                 let message = response
                     .text()
@@ -138,7 +169,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -162,7 +194,8 @@ mod tests {
             "test-account".to_string(),
             "wrong-key".to_string(),
             "wrong-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -186,7 +219,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -210,7 +244,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -249,7 +284,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -274,7 +310,8 @@ mod tests {
             "test-account".to_string(),
             "mykey".to_string(),
             "mysecret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
@@ -299,7 +336,8 @@ mod tests {
             "my-special-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-        );
+        )
+        .unwrap();
 
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;

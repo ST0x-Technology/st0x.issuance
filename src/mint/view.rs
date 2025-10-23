@@ -1153,4 +1153,40 @@ mod tests {
 
         assert_eq!(view, original_view);
     }
+
+    #[test]
+    fn test_handle_mint_completed_from_minting_failed_state_does_not_change() {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let error = "Transaction failed: insufficient gas".to_string();
+        let failed_at = Utc::now();
+
+        let mut view = MintView::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            error,
+            failed_at,
+        };
+        let original_view = view.clone();
+
+        view.handle_mint_completed(Utc::now());
+
+        assert_eq!(view, original_view);
+    }
 }
