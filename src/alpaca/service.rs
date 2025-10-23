@@ -1,9 +1,8 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use clap::Args;
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 
