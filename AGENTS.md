@@ -849,6 +849,40 @@ fn test_journal_confirmed_for_missing_mint() {
 - In-memory SQLite databases for testing database-specific logic
 - Each test gets its own isolated database
 
+### End-to-End Tests
+
+**End-to-end tests** exercise the complete system from the perspective of an
+external consumer. These tests:
+
+- Live in the project-root `tests/` directory (not nested in feature modules)
+- Start the full HTTP server (Rocket) with real wiring
+- Use in-memory SQLite database (real database operations, not MemStore)
+- Make HTTP requests like an external client would
+- Use mock external services (MockBlockchainService, MockAlpacaService) to avoid
+  external dependencies
+- Verify complete flows: HTTP request → CQRS → Managers → Database → Async
+  processing
+- Validate state transitions and event persistence across the full stack
+
+**Distinction from other test types:**
+
+- **Aggregate tests** (`src/mint/mod.rs`): Test CQRS logic in isolation with
+  MemStore
+- **Endpoint tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints with
+  mocked dependencies
+- **End-to-end tests** (`tests/*.rs`): Test the complete system as an external
+  consumer would use it
+
+**Public API Surface:**
+
+End-to-end tests help shape what will become the public API for the Rust client
+library. When exposing types for end-to-end tests, be intentional about what
+will eventually be part of the client library interface. The progression is:
+
+1. Expose minimal public API for end-to-end tests (#20)
+2. Package exposed types into proper client library (#52)
+3. Refactor end-to-end tests to use the client library
+
 ### General Testing Guidelines
 
 - **Edge Case Coverage**: Comprehensive error scenario testing for all workflows

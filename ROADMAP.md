@@ -140,6 +140,8 @@ callback.
       Implement AlpacaService and mint callback
 - [ ] [#20](https://github.com/ST0x-Technology/st0x.issuance/issues/20) -
       End-to-end mint flow tests
+- [ ] [#52](https://github.com/ST0x-Technology/st0x.issuance/issues/52) - Create
+      Rust client library for issuance bot
 
 ---
 
