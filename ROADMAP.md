@@ -134,12 +134,15 @@ callback.
 - [x] [#17](https://github.com/ST0x-Technology/st0x.issuance/issues/17) -
       Implement ConfirmJournal and RejectJournal features
   - **PR:** [#49](https://github.com/ST0x-Technology/st0x.issuance/pull/49)
-- [ ] [#18](https://github.com/ST0x-Technology/st0x.issuance/issues/18) -
+- [x] [#18](https://github.com/ST0x-Technology/st0x.issuance/issues/18) -
       Implement BlockchainService and on-chain minting
-- [ ] [#19](https://github.com/ST0x-Technology/st0x.issuance/issues/19) -
+  - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
+- [x] [#19](https://github.com/ST0x-Technology/st0x.issuance/issues/19) -
       Implement AlpacaService and mint callback
-- [ ] [#20](https://github.com/ST0x-Technology/st0x.issuance/issues/20) -
+  - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
+- [x] [#20](https://github.com/ST0x-Technology/st0x.issuance/issues/20) -
       End-to-end mint flow tests
+  - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
 - [ ] [#52](https://github.com/ST0x-Technology/st0x.issuance/issues/52) - Create
       Rust client library for issuance bot
 
