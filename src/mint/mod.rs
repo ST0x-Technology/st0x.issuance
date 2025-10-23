@@ -197,6 +197,22 @@ impl Mint {
         }
     }
 
+    pub(crate) const fn tokenization_request_id(
+        &self,
+    ) -> Option<&TokenizationRequestId> {
+        match self {
+            Self::Initiated { tokenization_request_id, .. }
+            | Self::JournalConfirmed { tokenization_request_id, .. }
+            | Self::JournalRejected { tokenization_request_id, .. }
+            | Self::CallbackPending { tokenization_request_id, .. }
+            | Self::MintingFailed { tokenization_request_id, .. }
+            | Self::Completed { tokenization_request_id, .. } => {
+                Some(tokenization_request_id)
+            }
+            Self::Uninitialized => None,
+        }
+    }
+
     fn handle_confirm_journal(
         &self,
         provided_id: IssuerRequestId,

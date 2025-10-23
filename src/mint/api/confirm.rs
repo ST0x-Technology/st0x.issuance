@@ -51,6 +51,33 @@ pub(crate) async fn confirm_journal(
         issuer_request_id.0, tokenization_request_id.0, status
     );
 
+    let mint_ctx = match event_store.load_aggregate(&issuer_request_id.0).await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!(
+                "Failed to load mint aggregate for issuer_request_id={}: {}",
+                issuer_request_id.0, e
+            );
+            return rocket::http::Status::InternalServerError;
+        }
+    };
+
+    if let Some(expected_tokenization_id) =
+        mint_ctx.aggregate().tokenization_request_id()
+    {
+        if &tokenization_request_id != expected_tokenization_id {
+            error!(
+                "Tokenization request ID mismatch for issuer_request_id={}. \
+                 Expected: {}, provided: {}",
+                issuer_request_id.0,
+                expected_tokenization_id.0,
+                tokenization_request_id.0
+            );
+            return rocket::http::Status::BadRequest;
+        }
+    }
+
     match status {
         JournalStatus::Rejected => {
             let command = MintCommand::RejectJournal {
@@ -640,6 +667,74 @@ mod tests {
         assert_eq!(view_issuer_id, issuer_request_id);
         assert_eq!(reason, "Journal rejected by Alpaca");
         assert!(rejected_at.timestamp() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_journal_with_mismatched_tokenization_request_id_returns_bad_request()
+     {
+        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(
+                &pool,
+                &account_cqrs,
+                &tokenized_asset_cqrs,
+            )
+            .await;
+
+        let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
+        let correct_tokenization_request_id =
+            TokenizationRequestId::new("alp-correct");
+        let wrong_tokenization_request_id =
+            TokenizationRequestId::new("alp-wrong");
+
+        let initiate_cmd = MintCommand::Initiate {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: correct_tokenization_request_id.clone(),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying,
+            token,
+            network,
+            client_id: ClientId(client_id),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+        };
+
+        mint_cqrs
+            .execute(&issuer_request_id.0, initiate_cmd)
+            .await
+            .expect("Failed to initiate mint");
+
+        let event_store = create_test_event_store(&pool);
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+
+        let rocket = rocket::build()
+            .manage(mint_cqrs)
+            .manage(event_store)
+            .manage(mint_manager)
+            .manage(callback_manager)
+            .manage(pool)
+            .mount("/", routes![confirm_journal]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": wrong_tokenization_request_id.0,
+            "issuer_request_id": issuer_request_id.0,
+            "status": "completed"
+        });
+
+        let response = client
+            .post("/inkind/issuance/confirm")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
     }
 
     #[tokio::test]
