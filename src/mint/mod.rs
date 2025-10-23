@@ -12,6 +12,8 @@ use cqrs_es::Aggregate;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
+pub use api::MintResponse;
+
 pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use callback_manager::CallbackManager;
 pub(crate) use cmd::MintCommand;
@@ -34,7 +36,7 @@ impl TokenizationRequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct IssuerRequestId(pub(crate) String);
+pub struct IssuerRequestId(pub String);
 
 impl IssuerRequestId {
     pub(crate) fn new(value: impl Into<String>) -> Self {

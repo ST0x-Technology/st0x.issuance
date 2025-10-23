@@ -8,8 +8,8 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 
 use crate::account::{Account, AccountView};
-use crate::alpaca::MockAlpacaService;
-use crate::blockchain::MockBlockchainService;
+use crate::alpaca::mock::MockAlpacaService;
+use crate::blockchain::mock::MockBlockchainService;
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
@@ -17,18 +17,16 @@ use crate::tokenized_asset::{
     TokenizedAssetView, UnderlyingSymbol,
 };
 
-/// Test environment containing a configured Rocket instance and mock services.
-pub struct TestEnv {
-    pub rocket: rocket::Rocket<rocket::Build>,
-    pub blockchain_service: Arc<MockBlockchainService>,
-    pub alpaca_service: Arc<MockAlpacaService>,
-}
-
 /// Sets up a test Rocket instance with in-memory database and mock services.
+///
+/// This function is NOT behind `#[cfg(test)]` because E2E tests in the `tests/` directory
+/// need to call it. The mock services it constructs are also NOT behind `#[cfg(test)]` for
+/// the same reason. However, all mock services are internal implementation details - E2E
+/// tests should only interact with the returned Rocket instance through its public HTTP API.
 ///
 /// # Panics
 /// Panics if database creation, migrations, or asset seeding fails.
-pub async fn setup_test_rocket() -> TestEnv {
+pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
     // Create in-memory database
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -86,23 +84,19 @@ pub async fn setup_test_rocket() -> TestEnv {
     // Seed initial assets
     seed_test_assets(&tokenized_asset_cqrs).await;
 
-    // Create mock services
-    let blockchain_service = Arc::new(MockBlockchainService::new_success());
-    let alpaca_service = Arc::new(MockAlpacaService::new_success());
-
-    // Create managers
+    // Create managers with mock services
     let mint_manager = Arc::new(MintManager::new(
-        blockchain_service.clone(),
+        Arc::new(MockBlockchainService::new_success()),
         mint_cqrs.clone(),
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(
-        alpaca_service.clone(),
+        Arc::new(MockAlpacaService::new_success()),
         mint_cqrs.clone(),
     ));
 
     // Build rocket
-    let rocket = rocket::build()
+    rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
@@ -118,9 +112,7 @@ pub async fn setup_test_rocket() -> TestEnv {
                 crate::mint::initiate_mint,
                 crate::mint::confirm_journal
             ],
-        );
-
-    TestEnv { rocket, blockchain_service, alpaca_service }
+        )
 }
 
 async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {

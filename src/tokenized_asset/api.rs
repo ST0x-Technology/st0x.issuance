@@ -1,3 +1,4 @@
+use rocket::get;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
@@ -40,6 +41,7 @@ mod tests {
     use alloy::primitives::address;
     use chrono::Utc;
     use rocket::http::Status;
+    use rocket::routes;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;

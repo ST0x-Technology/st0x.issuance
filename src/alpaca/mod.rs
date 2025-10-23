@@ -6,12 +6,8 @@ use crate::account::ClientId;
 use crate::mint::TokenizationRequestId;
 use crate::tokenized_asset::Network;
 
-pub(crate) mod service;
-
-#[cfg(test)]
 pub(crate) mod mock;
-
-pub(crate) use service::AlpacaConfig;
+pub(crate) mod service;
 
 /// Service abstraction for Alpaca API operations.
 ///
