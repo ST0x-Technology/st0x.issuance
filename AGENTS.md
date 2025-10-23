@@ -864,14 +864,30 @@ external consumer. These tests:
   processing
 - Validate state transitions and event persistence across the full stack
 
+**Test Coverage Strategy:**
+
+End-to-end tests are slower and more complex than unit/integration tests, so
+focus them on:
+
+- **Happy path flows** - Verify primary use cases work correctly end-to-end
+- **Critical error scenarios** - Test major failure modes that affect the whole
+  system (e.g., blockchain unavailable, external service down)
+
+Leave exhaustive edge case testing to faster, more focused tests:
+
+- **Unit tests** (aggregate tests) - Exhaustive edge cases, validation rules,
+  business logic in isolation
+- **Integration tests** (endpoint tests) - Thorough error handling, database
+  operations, detailed scenarios
+
 **Distinction from other test types:**
 
 - **Aggregate tests** (`src/mint/mod.rs`): Test CQRS logic in isolation with
-  MemStore
+  MemStore (fast, exhaustive edge cases)
 - **Endpoint tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints with
-  mocked dependencies
+  mocked dependencies (thorough error scenarios)
 - **End-to-end tests** (`tests/*.rs`): Test the complete system as an external
-  consumer would use it
+  consumer would use it (happy paths + critical failures)
 
 **Public API Surface:**
 
