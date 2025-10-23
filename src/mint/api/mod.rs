@@ -1,3 +1,6 @@
+use rocket::http::{ContentType, Status};
+use rocket::response::{self, Responder};
+use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -60,50 +63,112 @@ pub(crate) enum MintApiError {
     UnexpectedMintState,
 }
 
-impl<'r> rocket::response::Responder<'r, 'static> for MintApiError {
+impl<'r> Responder<'r, 'static> for MintApiError {
     fn respond_to(
         self,
-        _: &'r rocket::Request<'_>,
-    ) -> rocket::response::Result<'static> {
-        let (status, message) = match self {
-            Self::InvalidQuantity => (
-                rocket::http::Status::BadRequest,
+        req: &'r rocket::Request<'_>,
+    ) -> response::Result<'static> {
+        let response = match self {
+            Self::InvalidQuantity => MintErrorResponse::bad_request(
                 "Failed Validation: Invalid data payload",
             ),
-            Self::AssetNotAvailable => (
-                rocket::http::Status::BadRequest,
+            Self::AssetNotAvailable => MintErrorResponse::bad_request(
                 "Invalid Token: Token not available on the network",
             ),
-            Self::ClientNotEligible => (
-                rocket::http::Status::BadRequest,
+            Self::ClientNotEligible => MintErrorResponse::bad_request(
                 "Insufficient Eligibility: Client not eligible",
             ),
-            Self::CommandExecutionFailed(_) => {
-                (rocket::http::Status::Conflict, "Mint already initiated")
+            Self::CommandExecutionFailed(e) => {
+                Self::handle_command_execution_error(e.as_ref())
             }
-            Self::AssetQueryFailed(_)
-            | Self::AccountQueryFailed(_)
-            | Self::MintViewQueryFailed(_)
-            | Self::MintViewNotFound
-            | Self::UnexpectedMintState => (
-                rocket::http::Status::InternalServerError,
-                "Internal server error",
-            ),
+            Self::AssetQueryFailed(e) => {
+                Self::handle_query_error(&e, "Failed to query enabled assets")
+            }
+            Self::AccountQueryFailed(e) => {
+                Self::handle_query_error(&e, "Failed to query account")
+            }
+            Self::MintViewQueryFailed(e) => {
+                Self::handle_query_error(&e, "Failed to query mint view")
+            }
+            Self::MintViewNotFound => {
+                error!("Mint view not found after creation");
+                MintErrorResponse::internal_server_error(
+                    "Internal server error",
+                )
+            }
+            Self::UnexpectedMintState => {
+                error!("Unexpected mint state");
+                MintErrorResponse::internal_server_error(
+                    "Internal server error",
+                )
+            }
         };
 
-        let response = ErrorResponse { error: message.to_string() };
+        response.respond_to(req)
+    }
+}
 
-        rocket::response::Response::build()
-            .status(status)
-            .header(rocket::http::ContentType::JSON)
-            .sized_body(
-                None,
-                std::io::Cursor::new(
-                    serde_json::to_string(&response).unwrap_or_else(|_| {
-                        r#"{"error":"Internal server error"}"#.to_string()
-                    }),
-                ),
+impl MintApiError {
+    fn handle_command_execution_error(
+        e: &(dyn std::error::Error + Send),
+    ) -> MintErrorResponse {
+        error!(error = %e, "Failed to execute mint command");
+
+        let error_msg = e.to_string().to_lowercase();
+        if error_msg.contains("already") || error_msg.contains("duplicate") {
+            MintErrorResponse::conflict("Mint already initiated")
+        } else {
+            MintErrorResponse::internal_server_error(
+                "Failed to execute mint command",
             )
+        }
+    }
+
+    fn handle_query_error<E: std::fmt::Display>(
+        e: &E,
+        message: &str,
+    ) -> MintErrorResponse {
+        error!(error = %e, "{message}");
+        MintErrorResponse::internal_server_error("Internal server error")
+    }
+}
+
+struct MintErrorResponse {
+    status: Status,
+    body: Json<ErrorResponse>,
+}
+
+impl MintErrorResponse {
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: Status::BadRequest,
+            body: Json(ErrorResponse { error: message.to_string() }),
+        }
+    }
+
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: Status::Conflict,
+            body: Json(ErrorResponse { error: message.to_string() }),
+        }
+    }
+
+    fn internal_server_error(message: &str) -> Self {
+        Self {
+            status: Status::InternalServerError,
+            body: Json(ErrorResponse { error: message.to_string() }),
+        }
+    }
+}
+
+impl<'r> Responder<'r, 'static> for MintErrorResponse {
+    fn respond_to(
+        self,
+        req: &'r rocket::Request<'_>,
+    ) -> response::Result<'static> {
+        response::Response::build_from(self.body.respond_to(req)?)
+            .status(self.status)
+            .header(ContentType::JSON)
             .ok()
     }
 }

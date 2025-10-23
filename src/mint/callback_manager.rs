@@ -1,6 +1,6 @@
 use cqrs_es::{CqrsFramework, EventStore};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::{IssuerRequestId, Mint, MintCommand};
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
@@ -37,7 +37,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     /// This method orchestrates the complete callback flow:
     /// 1. Validates the aggregate is in CallbackPending state
     /// 2. Builds MintCallbackRequest from aggregate data
-    /// 3. Calls AlpacaService to send the callback
+    /// 3. Calls AlpacaService to send the callback (with retries for transient failures)
     /// 4. Records success (RecordCallback) via command
     ///
     /// # Arguments

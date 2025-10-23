@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use backon::{ExponentialBuilder, Retryable};
 use clap::Args;
 
 use super::{AlpacaError, AlpacaService, MintCallbackRequest};
@@ -36,6 +37,22 @@ pub(crate) struct AlpacaConfig {
         help = "Alpaca API secret key"
     )]
     api_secret: String,
+
+    #[arg(
+        long = "alpaca-connect-timeout-secs",
+        env = "ALPACA_CONNECT_TIMEOUT_SECS",
+        default_value = "10",
+        help = "Alpaca API connection timeout in seconds"
+    )]
+    connect_timeout_secs: u64,
+
+    #[arg(
+        long = "alpaca-request-timeout-secs",
+        env = "ALPACA_REQUEST_TIMEOUT_SECS",
+        default_value = "30",
+        help = "Alpaca API request timeout in seconds"
+    )]
+    request_timeout_secs: u64,
 }
 
 impl AlpacaConfig {
@@ -47,6 +64,8 @@ impl AlpacaConfig {
             self.account_id.clone(),
             self.api_key.clone(),
             self.api_secret.clone(),
+            self.connect_timeout_secs,
+            self.request_timeout_secs,
         )?;
         Ok(Arc::new(service))
     }
@@ -66,10 +85,12 @@ impl RealAlpacaService {
         account_id: String,
         api_key: String,
         api_secret: String,
+        connect_timeout_secs: u64,
+        request_timeout_secs: u64,
     ) -> Result<Self, AlpacaError> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(|e| AlpacaError::Http {
                 message: format!("Failed to build HTTP client: {e}"),
@@ -90,37 +111,58 @@ impl AlpacaService for RealAlpacaService {
             self.account_id
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
+        (|| async {
+            let response = self
+                .client
+                .post(&url)
+                .basic_auth(&self.api_key, Some(&self.api_secret))
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
 
-        match response.status() {
-            reqwest::StatusCode::OK => Ok(()),
-            reqwest::StatusCode::UNAUTHORIZED
-            | reqwest::StatusCode::FORBIDDEN => {
-                let body =
-                    response.text().await.unwrap_or_else(|_| String::new());
-                let snippet = body.chars().take(200).collect::<String>();
-                let reason = if snippet.is_empty() {
-                    "Authentication failed".to_string()
-                } else {
-                    format!("Authentication failed: {snippet}")
-                };
-                Err(AlpacaError::Auth { reason })
+            let status = response.status();
+
+            match status {
+                reqwest::StatusCode::OK => Ok(()),
+                reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN => {
+                    let body =
+                        response.text().await.unwrap_or_else(|_| String::new());
+                    let snippet = body.chars().take(200).collect::<String>();
+                    let reason = if snippet.is_empty() {
+                        "Authentication failed".to_string()
+                    } else {
+                        format!("Authentication failed: {snippet}")
+                    };
+                    Err(AlpacaError::Auth { reason })
+                }
+                status => {
+                    let message = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "Unknown error".to_string());
+                    Err(AlpacaError::Api {
+                        status_code: status.as_u16(),
+                        message,
+                    })
+                }
             }
-            status => {
-                let message = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                Err(AlpacaError::Api { status_code: status.as_u16(), message })
-            }
-        }
+        })
+        .retry(ExponentialBuilder::default().with_max_times(5).with_jitter())
+        .when(|e: &AlpacaError| {
+            matches!(
+                e,
+                AlpacaError::Http { .. }
+                    | AlpacaError::Api { status_code: 500..=599 | 429, .. }
+            )
+        })
+        .notify(|err: &AlpacaError, dur: std::time::Duration| {
+            tracing::warn!(
+                "Alpaca API call failed with {err}, retrying after {dur:?}"
+            );
+        })
+        .await
     }
 }
 
@@ -169,6 +211,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -194,6 +238,8 @@ mod tests {
             "test-account".to_string(),
             "wrong-key".to_string(),
             "wrong-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -219,6 +265,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -236,7 +284,7 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/mint");
-            then.status(500).body("Internal Server Error");
+            then.status(400).body("Bad Request");
         });
 
         let service = RealAlpacaService::new(
@@ -244,6 +292,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -252,8 +302,8 @@ mod tests {
 
         match result {
             Err(AlpacaError::Api { status_code, message }) => {
-                assert_eq!(status_code, 500);
-                assert_eq!(message, "Internal Server Error");
+                assert_eq!(status_code, 400);
+                assert_eq!(message, "Bad Request");
             }
             _ => panic!("Expected AlpacaError::Api, got {result:?}"),
         }
@@ -284,6 +334,8 @@ mod tests {
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -310,6 +362,8 @@ mod tests {
             "test-account".to_string(),
             "mykey".to_string(),
             "mysecret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
@@ -336,6 +390,8 @@ mod tests {
             "my-special-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
+            10,
+            30,
         )
         .unwrap();
 
