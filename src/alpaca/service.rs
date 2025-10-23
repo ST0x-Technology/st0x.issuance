@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub(crate) struct AlpacaConfig {
     #[arg(
         long = "alpaca-api-base-url",
@@ -52,6 +52,19 @@ pub(crate) struct AlpacaConfig {
         help = "Alpaca API request timeout in seconds"
     )]
     request_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for AlpacaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlpacaConfig")
+            .field("api_base_url", &self.api_base_url)
+            .field("account_id", &self.account_id)
+            .field("api_key", &"<redacted>")
+            .field("api_secret", &"<redacted>")
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .finish()
+    }
 }
 
 impl AlpacaConfig {
