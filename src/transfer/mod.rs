@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
+pub(crate) mod mock;
+
+#[derive(Debug, Clone)]
 pub(crate) struct Transfer {
     pub(crate) issuer_request_id: IssuerRequestId,
     pub(crate) from: Address,
