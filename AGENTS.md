@@ -858,7 +858,7 @@ external consumer. These tests:
 - Start the full HTTP server (Rocket) with real wiring
 - Use in-memory SQLite database (real database operations, not MemStore)
 - Make HTTP requests like an external client would
-- Use mock external services (MockBlockchainService, MockAlpacaService) to avoid
+- Use mock external services (MockVaultService, MockAlpacaService) to avoid
   external dependencies
 - Verify complete flows: HTTP request → CQRS → Managers → Database → Async
   processing

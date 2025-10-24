@@ -17,13 +17,13 @@ use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
 use crate::vault::VaultService;
-use crate::vault::mock::MockBlockchainService;
+use crate::vault::mock::MockVaultService;
 
 pub(super) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,
 ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
-    let blockchain_service = Arc::new(MockBlockchainService::new_success())
-        as Arc<dyn VaultService>;
+    let blockchain_service =
+        Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
 
     Arc::new(MintManager::new(blockchain_service, mint_cqrs))
 }

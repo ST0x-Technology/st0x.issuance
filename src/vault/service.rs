@@ -117,13 +117,14 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
 
+    use super::RealBlockchainService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::{
         IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::vault::{OperationType, ReceiptInformation, VaultError, VaultService};
-
-    use super::RealBlockchainService;
+    use crate::vault::{
+        OperationType, ReceiptInformation, VaultError, VaultService,
+    };
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation {

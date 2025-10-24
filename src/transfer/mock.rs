@@ -12,9 +12,13 @@ use super::{Transfer, TransferError, TransferService};
 /// may need it. However, the Failure variant IS behind `#[cfg(test)]` because E2E tests only
 /// need the happy path and compile the library without `#[cfg(test)]` enabled.
 enum MockBehavior {
-    Success { transfers: Vec<Transfer> },
+    Success {
+        transfers: Vec<Transfer>,
+    },
     #[cfg(test)]
-    Failure { reason: String },
+    Failure {
+        reason: String,
+    },
 }
 
 /// Mock transfer service for testing.
@@ -49,9 +53,7 @@ impl MockTransferService {
     #[cfg(test)]
     pub(crate) fn new_failure(reason: impl Into<String>) -> Self {
         Self {
-            behavior: MockBehavior::Failure {
-                reason: reason.into(),
-            },
+            behavior: MockBehavior::Failure { reason: reason.into() },
             call_count: Arc::new(AtomicUsize::new(0)),
             last_call_timestamp: Arc::new(Mutex::new(None)),
         }
@@ -94,11 +96,10 @@ impl TransferService for MockTransferService {
 mod tests {
     use alloy::primitives::{address, b256, uint};
 
+    use super::MockTransferService;
     use crate::mint::IssuerRequestId;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::transfer::{Transfer, TransferService};
-
-    use super::MockTransferService;
 
     fn create_test_transfer() -> Transfer {
         Transfer {

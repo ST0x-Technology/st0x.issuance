@@ -35,7 +35,7 @@ enum MockBehavior {
 /// `#[cfg(test)]` because E2E tests only exercise the happy path and compile the library
 /// without `#[cfg(test)]` enabled. Unit tests (inside the crate) can access `#[cfg(test)]`
 /// code, so they get full mock functionality including failures and timing behavior.
-pub(crate) struct MockBlockchainService {
+pub(crate) struct MockVaultService {
     behavior: MockBehavior,
     mint_delay_ms: u64,
     call_count: Arc<AtomicUsize>,
@@ -43,7 +43,7 @@ pub(crate) struct MockBlockchainService {
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
 }
 
-impl MockBlockchainService {
+impl MockVaultService {
     #[must_use]
     pub(crate) fn new_success() -> Self {
         Self {
@@ -90,7 +90,7 @@ impl MockBlockchainService {
 }
 
 #[async_trait]
-impl VaultService for MockBlockchainService {
+impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
     async fn mint_tokens(
         &self,
@@ -126,9 +126,7 @@ impl VaultService for MockBlockchainService {
             }),
             #[cfg(test)]
             MockBehavior::Failure { reason } => {
-                Err(VaultError::TransactionFailed {
-                    reason: reason.clone(),
-                })
+                Err(VaultError::TransactionFailed { reason: reason.clone() })
             }
         }
     }
@@ -140,12 +138,13 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
 
+    use super::MockVaultService;
     use crate::mint::{
         IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::vault::{OperationType, ReceiptInformation, VaultError, VaultService};
-
-    use super::MockBlockchainService;
+    use crate::vault::{
+        OperationType, ReceiptInformation, VaultError, VaultService,
+    };
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation {
@@ -165,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_success_returns_mint_result() {
-        let mock = MockBlockchainService::new_success();
+        let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
@@ -182,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_failure_returns_error() {
-        let mock = MockBlockchainService::new_failure("network error");
+        let mock = MockVaultService::new_failure("network error");
         let assets = U256::from(1000);
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
@@ -198,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_call_count_increments() {
-        let mock = MockBlockchainService::new_success();
+        let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
         let receiver = test_receiver();
 
@@ -213,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_last_call_captures_arguments() {
-        let mock = MockBlockchainService::new_success();
+        let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
@@ -237,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_delay_causes_delay() {
         let delay_ms = 50;
-        let mock = MockBlockchainService::new_success().with_delay(delay_ms);
+        let mock = MockVaultService::new_success().with_delay(delay_ms);
         let assets = U256::from(1000);
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
@@ -251,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_clears_state() {
-        let mock = MockBlockchainService::new_success();
+        let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
