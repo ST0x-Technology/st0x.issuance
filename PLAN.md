@@ -818,13 +818,13 @@ mod tests {
 }
 ```
 
-- [ ] Add `#[cfg(test)] mod tests` section to `mod.rs`
-- [ ] Implement `test_detect_redemption_creates_event`
-- [ ] Implement `test_detect_redemption_when_already_detected_returns_error`
-- [ ] Implement `test_apply_detected_event_updates_state`
-- [ ] Run `cargo test -q redemption` to verify tests pass
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Add `#[cfg(test)] mod tests` section to `mod.rs`
+- [x] Implement `test_detect_redemption_creates_event`
+- [x] Implement `test_detect_redemption_when_already_detected_returns_error`
+- [x] Implement `test_apply_detected_event_updates_state`
+- [x] Run `cargo test -q redemption` to verify tests pass
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 12. Add View Tests
 
