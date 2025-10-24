@@ -12,6 +12,7 @@ use crate::mint::{IssuerRequestId, Quantity};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
+pub(crate) use view::RedemptionView;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Redemption {

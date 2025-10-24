@@ -14,6 +14,7 @@ use std::sync::Arc;
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use redemption::{Redemption, RedemptionView};
 use tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
@@ -206,6 +207,17 @@ pub async fn initialize_rocket()
     let mint_event_store: MintEventStore =
         Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
 
+    let redemption_view_repo =
+        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+            pool.clone(),
+            "redemption_view".to_string(),
+        ));
+
+    let redemption_query = GenericQuery::new(redemption_view_repo);
+
+    let redemption_cqrs =
+        sqlite_cqrs(pool.clone(), vec![Box::new(redemption_query)], ());
+
     seed_initial_assets(&tokenized_asset_cqrs).await?;
 
     let blockchain_service = config.create_blockchain_service()?;
@@ -224,6 +236,7 @@ pub async fn initialize_rocket()
         .manage(mint_event_store)
         .manage(mint_manager)
         .manage(callback_manager)
+        .manage(redemption_cqrs)
         .manage(pool)
         .mount(
             "/",

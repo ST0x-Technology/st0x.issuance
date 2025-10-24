@@ -638,16 +638,16 @@ cargo run
 
 You should see the server start without errors and the redemption view should be created in the database.
 
-- [ ] Add `redemption` imports to `lib.rs`
-- [ ] Add `RedemptionCqrs` type alias
-- [ ] Create redemption view repository in `initialize_rocket()`
-- [ ] Create `GenericQuery` for redemption
-- [ ] Create redemption CQRS framework instance
-- [ ] Add redemption CQRS to Rocket state
-- [ ] Run `cargo build` to verify wiring compiles
-- [ ] Run `cargo run` and verify application starts successfully
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Add `redemption` imports to `lib.rs`
+- [x] Add `RedemptionCqrs` type alias
+- [x] Create redemption view repository in `initialize_rocket()`
+- [x] Create `GenericQuery` for redemption
+- [x] Create redemption CQRS framework instance
+- [x] Add redemption CQRS to Rocket state
+- [x] Run `cargo build` to verify wiring compiles
+- [x] Run `cargo run` and verify application starts successfully
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 11. Add Aggregate Tests
 

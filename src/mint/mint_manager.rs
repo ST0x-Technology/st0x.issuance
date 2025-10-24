@@ -5,7 +5,9 @@ use cqrs_es::{CqrsFramework, EventStore};
 use tracing::{info, warn};
 
 use crate::tokenized_asset::UnderlyingSymbol;
-use crate::vault::{OperationType, ReceiptInformation, VaultError, VaultService};
+use crate::vault::{
+    OperationType, ReceiptInformation, VaultError, VaultService,
+};
 
 use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
 
@@ -208,7 +210,7 @@ mod tests {
         ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
         TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::vault::mock::MockBlockchainService;
+    use crate::vault::mock::MockVaultService;
 
     use super::{MintManager, MintManagerError};
 
@@ -274,8 +276,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_success() {
         let (cqrs, store) = setup_test_cqrs();
-        let blockchain_service_mock =
-            Arc::new(MockBlockchainService::new_success());
+        let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
@@ -308,9 +309,8 @@ mod tests {
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_blockchain_failure() {
         let (cqrs, store) = setup_test_cqrs();
-        let blockchain_service_mock = Arc::new(
-            MockBlockchainService::new_failure("Network error: timeout"),
-        );
+        let blockchain_service_mock =
+            Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
@@ -350,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_wrong_state_fails() {
         let (cqrs, store) = setup_test_cqrs();
-        let blockchain_service = Arc::new(MockBlockchainService::new_success())
+        let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
 
