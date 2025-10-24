@@ -207,13 +207,13 @@ impl Default for Redemption {
 
 **Note:** Field names match the event exactly, except `tx_hash` becomes `detected_tx_hash` for clarity since this is the transaction that triggered the redemption.
 
-- [ ] Replace `Redemption` struct with enum in `mod.rs`
-- [ ] Add `Uninitialized` and `Detected` variants
-- [ ] Implement `Default` trait
-- [ ] Add necessary imports following two-group pattern
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Replace `Redemption` struct with enum in `mod.rs`
+- [x] Add `Uninitialized` and `Detected` variants
+- [x] Implement `Default` trait
+- [x] Add necessary imports following two-group pattern
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 5. Implement Aggregate Trait for Redemption
 
