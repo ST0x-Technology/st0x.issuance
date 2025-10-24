@@ -151,11 +151,11 @@ pub(crate) enum RedemptionCommand {
 }
 ```
 
-- [ ] Update `cmd.rs` with `RedemptionCommand::Detect` variant
-- [ ] Add all necessary imports following two-group pattern
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Update `cmd.rs` with `RedemptionCommand::Detect` variant
+- [x] Add all necessary imports following two-group pattern
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 4. Define Redemption Aggregate Enum
 
