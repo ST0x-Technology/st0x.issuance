@@ -13,20 +13,22 @@ use std::sync::Arc;
 
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
-use blockchain::{BlockchainService, service::RealBlockchainService};
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
 };
+use vault::{VaultService, service::RealBlockchainService};
 
 pub mod account;
-pub mod alpaca;
-pub mod blockchain;
 pub mod mint;
 pub mod redemption;
 pub mod test_utils;
 pub mod tokenized_asset;
+
+pub(crate) mod alpaca;
+pub(crate) mod transfer;
+pub(crate) mod vault;
 
 mod bindings;
 
@@ -87,7 +89,7 @@ pub(crate) struct Config {
 impl Config {
     pub(crate) fn create_blockchain_service(
         &self,
-    ) -> Result<Arc<dyn BlockchainService>, ConfigError> {
+    ) -> Result<Arc<dyn VaultService>, ConfigError> {
         let rpc_url =
             self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
 

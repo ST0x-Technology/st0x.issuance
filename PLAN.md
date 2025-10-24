@@ -448,11 +448,17 @@ This will drop the database, re-run all migrations (including the new one), and 
 - [x] Verify database schema with `sqlite3 issuance.db ".schema redemption_view"`
 - [x] Run `cargo build` to ensure sqlx is happy
 
-## Task 8. Define MonitorService Trait
+## Task 8. Define TransferService Trait
 
-Create the service trait for monitoring blockchain transfers.
+Create the service trait for monitoring blockchain transfers to the redemption wallet.
 
-**Create `src/monitor/mod.rs`:**
+**Rationale:** After analyzing the actual redemption flow, we determined that the blockchain services should be organized as:
+- `blockchain/vault.rs` - `VaultService` trait for vault operations (deposit/withdraw)
+- `blockchain/transfer.rs` - `TransferService` trait for watching ERC-20 transfers
+
+The existing `BlockchainService` will be renamed to `VaultService` and moved to `vault.rs` in a future refactoring. For now, we add `TransferService` alongside it.
+
+**Create `src/blockchain/transfer.rs`:**
 
 ```rust
 use alloy::primitives::{Address, B256, U256};
@@ -472,12 +478,12 @@ pub(crate) struct TransferDetected {
 }
 
 #[async_trait]
-pub(crate) trait MonitorService: Send + Sync {
-    async fn watch_transfers(&self) -> Result<Vec<TransferDetected>, MonitorError>;
+pub(crate) trait TransferService: Send + Sync {
+    async fn watch_transfers(&self) -> Result<Vec<TransferDetected>, TransferError>;
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MonitorError {
+pub(crate) enum TransferError {
     #[error("Failed to connect to blockchain: {0}")]
     ConnectionFailed(String),
 
@@ -489,42 +495,43 @@ pub(crate) enum MonitorError {
 }
 ```
 
-**Update `src/lib.rs`:**
-Add `pub(crate) mod monitor;` after the other module declarations.
+**Update `src/blockchain/mod.rs`:**
+Add `pub(crate) mod transfer;` after the existing module declarations.
 
 **Design Notes:**
 
-- `TransferDetected` is the domain event representing a detected transfer
-- Contains `from` address (wallet that sent tokens) and `amount` as U256
+- `TransferDetected` represents an ERC-20 Transfer event to our redemption wallet
+- Contains `from` address (the AP initiating redemption) and `amount` as U256
 - Service returns `Vec<TransferDetected>` to support batch processing
 - `watch_transfers()` is a pull-based API (manager polls for transfers)
+- Lives in `blockchain/` module alongside vault operations (read/write separation)
 
-- [ ] Create `src/monitor/` directory
-- [ ] Create `mod.rs` with `MonitorService` trait
+- [ ] Create `transfer.rs` in `src/blockchain/`
+- [ ] Define `TransferService` trait
 - [ ] Define `TransferDetected` struct
-- [ ] Define `MonitorError` enum
-- [ ] Add `pub(crate) mod monitor;` to `src/lib.rs`
+- [ ] Define `TransferError` enum
+- [ ] Add `pub(crate) mod transfer;` to `src/blockchain/mod.rs`
 - [ ] Run `cargo build` to verify compilation
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [ ] Run `cargo fmt`
 
-## Task 9. Implement MockMonitorService
+## Task 9. Implement MockTransferService
 
 Create a mock implementation for testing.
 
-**Create `src/monitor/mock.rs`:**
+**Create `src/blockchain/transfer_mock.rs`:**
 
 ```rust
 use async_trait::async_trait;
 
-use super::{MonitorError, MonitorService, TransferDetected};
+use super::transfer::{TransferDetected, TransferError, TransferService};
 
-pub(crate) struct MockMonitorService {
+pub(crate) struct MockTransferService {
     transfers: Vec<TransferDetected>,
     should_fail: bool,
 }
 
-impl MockMonitorService {
+impl MockTransferService {
     #[cfg(test)]
     pub(crate) fn new_with_transfers(transfers: Vec<TransferDetected>) -> Self {
         Self {
@@ -551,10 +558,10 @@ impl MockMonitorService {
 }
 
 #[async_trait]
-impl MonitorService for MockMonitorService {
-    async fn watch_transfers(&self) -> Result<Vec<TransferDetected>, MonitorError> {
+impl TransferService for MockTransferService {
+    async fn watch_transfers(&self) -> Result<Vec<TransferDetected>, TransferError> {
         if self.should_fail {
-            return Err(MonitorError::FetchFailed(
+            return Err(TransferError::FetchFailed(
                 "Mock failure".to_string(),
             ));
         }
@@ -563,8 +570,8 @@ impl MonitorService for MockMonitorService {
 }
 ```
 
-**Update `src/monitor/mod.rs`:**
-Add `pub(crate) mod mock;` at the top of the file.
+**Update `src/blockchain/mod.rs`:**
+Add `pub(crate) mod transfer_mock;` after `pub(crate) mod transfer;`.
 
 **Design Notes:**
 
@@ -575,10 +582,10 @@ The mock enables testing different scenarios:
 
 All constructors are `#[cfg(test)]` since the mock is only for testing.
 
-- [ ] Create `mock.rs` in `src/monitor/`
-- [ ] Implement `MockMonitorService` struct
+- [ ] Create `transfer_mock.rs` in `src/blockchain/`
+- [ ] Implement `MockTransferService` struct
 - [ ] Implement test constructors with `#[cfg(test)]`
-- [ ] Implement `MonitorService` trait
+- [ ] Implement `TransferService` trait
 - [ ] Export mock from `mod.rs`
 - [ ] Run `cargo build` to verify compilation
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`

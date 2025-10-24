@@ -724,7 +724,7 @@ mod tests {
         UnderlyingSymbol, mint_manager::MintManager,
     };
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
-    use crate::blockchain::{BlockchainService, mock::MockBlockchainService};
+    use crate::vault::{VaultService, mock::MockBlockchainService};
 
     type MintTestFramework = TestFramework<Mint>;
 
@@ -1885,7 +1885,7 @@ mod tests {
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
     ) -> MintManager<MemStore<Mint>> {
         let blockchain_service = Arc::new(MockBlockchainService::new_success())
-            as Arc<dyn BlockchainService>;
+            as Arc<dyn VaultService>;
 
         MintManager::new(blockchain_service, cqrs)
     }

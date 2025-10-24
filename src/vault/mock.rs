@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{
-    BlockchainError, BlockchainService, MintResult, ReceiptInformation,
-};
+use super::{MintResult, ReceiptInformation, VaultError, VaultService};
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -92,14 +90,14 @@ impl MockBlockchainService {
 }
 
 #[async_trait]
-impl BlockchainService for MockBlockchainService {
+impl VaultService for MockBlockchainService {
     #[cfg_attr(not(test), allow(unused_variables))]
     async fn mint_tokens(
         &self,
         assets: U256,
         receiver: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, BlockchainError> {
+    ) -> Result<MintResult, VaultError> {
         if self.mint_delay_ms > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 self.mint_delay_ms,
@@ -128,7 +126,7 @@ impl BlockchainService for MockBlockchainService {
             }),
             #[cfg(test)]
             MockBehavior::Failure { reason } => {
-                Err(BlockchainError::TransactionFailed {
+                Err(VaultError::TransactionFailed {
                     reason: reason.clone(),
                 })
             }
@@ -142,12 +140,10 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
 
-    use crate::{
-        blockchain::{BlockchainService, OperationType, ReceiptInformation},
-        mint::{
-            IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
-        },
+    use crate::mint::{
+        IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::vault::{OperationType, ReceiptInformation, VaultError, VaultService};
 
     use super::MockBlockchainService;
 
@@ -196,7 +192,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            crate::blockchain::BlockchainError::TransactionFailed { reason } if reason == "network error"
+            VaultError::TransactionFailed { reason } if reason == "network error"
         ));
     }
 
