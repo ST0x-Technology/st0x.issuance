@@ -910,12 +910,12 @@ mod tests {
 }
 ```
 
-- [ ] Add `#[cfg(test)] mod tests` section to `view.rs`
-- [ ] Implement `test_view_starts_as_unavailable`
-- [ ] Implement `test_view_updates_on_detected_event`
-- [ ] Run `cargo test -q redemption::view` to verify tests pass
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Add `#[cfg(test)] mod tests` section to `view.rs`
+- [x] Implement `test_view_starts_as_unavailable`
+- [x] Implement `test_view_updates_on_detected_event`
+- [x] Run `cargo test -q redemption::view` to verify tests pass
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 13. Documentation and Final Quality Checks
 
