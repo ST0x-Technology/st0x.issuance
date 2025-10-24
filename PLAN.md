@@ -70,15 +70,15 @@ pub(crate) enum RedemptionView {}
 **Update `src/lib.rs`:**
 Add `pub mod redemption;` after the other module declarations (around line 27).
 
-- [ ] Create `src/redemption/` directory
-- [ ] Create `mod.rs` with minimal `Redemption` struct
-- [ ] Create `cmd.rs` with empty `RedemptionCommand` enum
-- [ ] Create `event.rs` with empty `RedemptionEvent` enum
-- [ ] Create `view.rs` with empty `RedemptionView` enum
-- [ ] Add `pub mod redemption;` to `src/lib.rs`
-- [ ] Run `cargo build` to verify module compiles
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Create `src/redemption/` directory
+- [x] Create `mod.rs` with minimal `Redemption` struct
+- [x] Create `cmd.rs` with empty `RedemptionCommand` enum
+- [x] Create `event.rs` with empty `RedemptionEvent` enum
+- [x] Create `view.rs` with empty `RedemptionView` enum
+- [x] Add `pub mod redemption;` to `src/lib.rs`
+- [x] Run `cargo build` to verify module compiles
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 2. Define RedemptionEvent
 
