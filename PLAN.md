@@ -116,11 +116,11 @@ pub(crate) enum RedemptionEvent {
 - Empty line
 - Internal crates: `crate::mint`, `crate::tokenized_asset`
 
-- [ ] Update `event.rs` with `RedemptionEvent::Detected` variant
-- [ ] Add all necessary imports following two-group pattern
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Update `event.rs` with `RedemptionEvent::Detected` variant
+- [x] Add all necessary imports following two-group pattern
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 3. Define RedemptionCommand
 
