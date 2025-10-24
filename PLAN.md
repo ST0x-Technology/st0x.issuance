@@ -1013,15 +1013,15 @@ Instead of creating a service, directly spawn a background task that:
 - Connection drops are fatal (task exits, relies on process restart)
 - Individual event processing errors are logged but don't stop the stream
 
-- [ ] Verify Transfer event exists in vault bindings
-- [ ] Add WebSocket config fields to `Config` struct
-- [ ] Update `initialize_rocket()` to spawn WebSocket monitoring task
-- [ ] Implement event filter for redemption wallet address
-- [ ] Implement stream processing loop with error handling
-- [ ] Remove TransferService (keep trait for mock only)
-- [ ] Run `cargo build`
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Verify Transfer event exists in vault bindings
+- [x] Add WebSocket config fields to `Config` struct
+- [x] Update `initialize_rocket()` to spawn WebSocket monitoring task
+- [x] Implement event filter for redemption wallet address
+- [x] Implement stream processing loop with error handling
+- [x] Remove TransferService (keep trait for mock only)
+- [x] Run `cargo build`
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 15. Add RedemptionDetector Tests
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use cqrs_es::{CqrsFramework, EventStore};
+use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use tracing::{info, warn};
 
 use crate::tokenized_asset::UnderlyingSymbol;
@@ -9,7 +9,9 @@ use crate::vault::{
     OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
-use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
+use super::{
+    IssuerRequestId, Mint, MintCommand, MintError, QuantityConversionError,
+};
 
 /// Orchestrates the on-chain minting process in response to JournalConfirmed events.
 ///
@@ -132,8 +134,7 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
                             block_number: result.block_number,
                         },
                     )
-                    .await
-                    .map_err(|e| MintManagerError::Cqrs(e.to_string()))?;
+                    .await?;
 
                 info!(
                     issuer_request_id = %issuer_request_id_str,
@@ -157,8 +158,7 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
                             error: e.to_string(),
                         },
                     )
-                    .await
-                    .map_err(|err| MintManagerError::Cqrs(err.to_string()))?;
+                    .await?;
 
                 info!(
                     issuer_request_id = %issuer_request_id_str,
@@ -189,7 +189,7 @@ pub(crate) enum MintManagerError {
     Blockchain(#[from] VaultError),
 
     #[error("CQRS error: {0}")]
-    Cqrs(String),
+    Cqrs(#[from] AggregateError<MintError>),
 
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },

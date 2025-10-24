@@ -1,8 +1,8 @@
-use cqrs_es::{CqrsFramework, EventStore};
+use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::{IssuerRequestId, Mint, MintCommand};
+use super::{IssuerRequestId, Mint, MintCommand, MintError};
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 
 /// Orchestrates the Alpaca callback process in response to TokensMinted events.
@@ -103,8 +103,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                             issuer_request_id: issuer_request_id.clone(),
                         },
                     )
-                    .await
-                    .map_err(|e| CallbackManagerError::Cqrs(e.to_string()))?;
+                    .await?;
 
                 info!(
                     issuer_request_id = %issuer_request_id_str,
@@ -130,10 +129,8 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
 pub(crate) enum CallbackManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
-
     #[error("CQRS error: {0}")]
-    Cqrs(String),
-
+    Cqrs(#[from] AggregateError<MintError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
 }
