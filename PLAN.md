@@ -917,34 +917,113 @@ mod tests {
 - [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [x] Run `cargo fmt`
 
-## Task 13. Create RedemptionDetector Manager
+## Task 13. Create RedemptionDetector Manager and Wire CQRS
 
-Create a manager that uses TransferService to watch for transfers and execute Detect commands.
+Create the detector manager infrastructure. The real transfer monitoring will be added in Task 14.
 
 **Create `src/redemption/detector.rs`:**
 
 The detector manager bridges the TransferService with the Redemption aggregate by:
-1. Polling TransferService for new transfers
+1. Using TransferService to get detected transfers
 2. Converting Transfer data to RedemptionCommand::Detect
 3. Executing commands via the CQRS framework
 
-```rust
-use std::sync::Arc;
-use cqrs_es::CqrsFramework;
-use crate::redemption::{Redemption, RedemptionCommand};
-use crate::transfer::{Transfer, TransferService};
-```
+**Wire into application:**
 
-- [ ] Create `src/redemption/detector.rs`
-- [ ] Define `RedemptionDetector` struct
-- [ ] Implement `detect_transfers()` method
-- [ ] Add conversion from `Transfer` to `RedemptionCommand::Detect`
-- [ ] Add module to `src/redemption/mod.rs`
+Add CQRS and detector to application state with MockTransferService (real monitoring in Task 14).
+
+- [x] Move `Quantity` and `QuantityConversionError` from `mint` to `lib.rs` (shared type)
+- [x] Add `from_u256_with_18_decimals()` method to `Quantity`
+- [x] Create `src/redemption/detector.rs`
+- [x] Define `RedemptionDetector` struct
+- [x] Implement `detect_transfers()` method using functional iterator chains
+- [x] Add module to `src/redemption/mod.rs`
+- [x] Add `RedemptionCqrs` type alias to `lib.rs`
+- [x] Wire redemption CQRS in `initialize_rocket()`
+- [x] Create detector with `MockTransferService::new_empty()` in `initialize_rocket()`
+- [x] Add detector to Rocket state
 - [ ] Run `cargo build` to verify compilation
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [ ] Run `cargo fmt`
 
-## Task 14. Add RedemptionDetector Tests
+## Task 14. Implement Transfer Monitoring via WebSocket Subscription
+
+Implement real blockchain transfer monitoring using Alloy's WebSocket provider and event subscription patterns.
+
+**Alloy WebSocket Pattern (from official docs):**
+```rust
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::sol;
+
+// 1. Connect via WebSocket
+let ws = WsConnect::new("wss://eth-mainnet.example.com");
+let provider = ProviderBuilder::new().connect_ws(ws).await?;
+
+// 2. Create contract instance with sol! macro bindings
+let contract = MyContractInstance::new(contract_address, &provider);
+
+// 3. Create event filter and subscribe
+let filter = contract.MyEvent_filter().filter;
+let sub = provider.subscribe_logs(&filter).await?;
+let mut stream = sub.into_stream();
+
+// 4. Process events in loop
+while let Some(log) = stream.next().await {
+    // Decode and handle event
+}
+```
+
+**Implementation:**
+
+**Update `src/bindings.rs`:**
+- The vault bindings should already have Transfer event from ERC-20
+- Verify `Transfer(address indexed from, address indexed to, uint256 value)` event exists
+- This is standard ERC-20, should be in OffchainAssetReceiptVault bindings
+
+**Spawn monitoring task in `initialize_rocket()`:**
+
+Instead of creating a service, directly spawn a background task that:
+1. Connects to WebSocket: `ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?`
+2. Creates vault contract instance: `VaultInstance::new(vault_address, &provider)`
+3. Creates Transfer event filter with redemption wallet as `to` address
+4. Subscribes: `provider.subscribe_logs(&filter).await?.into_stream()`
+5. Loops forever processing events:
+   ```rust
+   while let Some(log) = stream.next().await {
+       // Decode Transfer event
+       // Build Transfer struct
+       // Call detector.detect_transfers()
+       // Log errors but keep running
+   }
+   ```
+6. If connection drops, log error and exit (Rocket will handle restart)
+
+**Update `src/lib.rs` Config:**
+- Add `ws_rpc_url: String` field with env var `WS_RPC_URL`
+- Add `redemption_wallet_address: Address` field with env var `REDEMPTION_WALLET_ADDRESS`
+- `vault_address` already exists
+
+**Remove TransferService abstraction:**
+- Delete `src/transfer/service.rs` (not needed)
+- Keep `TransferService` trait for `MockTransferService` in tests only
+- Background task directly calls CQRS, no service layer needed
+
+**Error handling:**
+- Background task logs errors but keeps running
+- Connection drops are fatal (task exits, relies on process restart)
+- Individual event processing errors are logged but don't stop the stream
+
+- [ ] Verify Transfer event exists in vault bindings
+- [ ] Add WebSocket config fields to `Config` struct
+- [ ] Update `initialize_rocket()` to spawn WebSocket monitoring task
+- [ ] Implement event filter for redemption wallet address
+- [ ] Implement stream processing loop with error handling
+- [ ] Remove TransferService (keep trait for mock only)
+- [ ] Run `cargo build`
+- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [ ] Run `cargo fmt`
+
+## Task 15. Add RedemptionDetector Tests
 
 Test the detector manager with mock transfer service.
 
@@ -956,7 +1035,7 @@ Test the detector manager with mock transfer service.
 - [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [ ] Run `cargo fmt`
 
-## Task 15. Documentation and Final Quality Checks
+## Task 16. Documentation and Final Quality Checks
 
 Ensure code quality and adherence to project guidelines.
 
