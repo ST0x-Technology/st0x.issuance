@@ -139,10 +139,10 @@ callback.
   - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
 - [x] [#19](https://github.com/ST0x-Technology/st0x.issuance/issues/19) -
       Implement AlpacaService and mint callback
-  - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
+  - **PR:** [#51](https://github.com/ST0x-Technology/st0x.issuance/pull/51)
 - [x] [#20](https://github.com/ST0x-Technology/st0x.issuance/issues/20) -
       End-to-end mint flow tests
-  - **PR:** [#50](https://github.com/ST0x-Technology/st0x.issuance/pull/50)
+  - **PR:** [#53](https://github.com/ST0x-Technology/st0x.issuance/pull/53)
 - [ ] [#52](https://github.com/ST0x-Technology/st0x.issuance/issues/52) - Create
       Rust client library for issuance bot
 

@@ -266,7 +266,12 @@ async fn seed_initial_assets(
             vault_address,
         };
 
-        cqrs.execute(underlying, command).await?;
+        match cqrs.execute(underlying, command).await {
+            Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
+            Err(e) => {
+                return Err(Box::new(e));
+            }
+        }
     }
 
     Ok(())
