@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
-use crate::blockchain::mock::MockBlockchainService;
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
+use crate::vault::mock::MockBlockchainService;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,

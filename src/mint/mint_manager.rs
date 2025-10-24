@@ -4,10 +4,8 @@ use chrono::Utc;
 use cqrs_es::{CqrsFramework, EventStore};
 use tracing::{info, warn};
 
-use crate::blockchain::{
-    BlockchainError, BlockchainService, OperationType, ReceiptInformation,
-};
 use crate::tokenized_asset::UnderlyingSymbol;
+use crate::vault::{OperationType, ReceiptInformation, VaultError, VaultService};
 
 use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
 
@@ -20,7 +18,7 @@ use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
 /// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
 /// integration with external systems.
 pub(crate) struct MintManager<ES: EventStore<Mint>> {
-    blockchain_service: Arc<dyn BlockchainService>,
+    blockchain_service: Arc<dyn VaultService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
 }
 
@@ -32,7 +30,7 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     /// * `blockchain_service` - Service for on-chain minting operations
     /// * `cqrs` - CQRS framework for executing commands on the Mint aggregate
     pub(crate) const fn new(
-        blockchain_service: Arc<dyn BlockchainService>,
+        blockchain_service: Arc<dyn VaultService>,
         cqrs: Arc<CqrsFramework<Mint, ES>>,
     ) -> Self {
         Self { blockchain_service, cqrs }
@@ -186,7 +184,7 @@ const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MintManagerError {
     #[error("Blockchain error: {0}")]
-    Blockchain(#[from] BlockchainError),
+    Blockchain(#[from] VaultError),
 
     #[error("CQRS error: {0}")]
     Cqrs(String),
@@ -206,13 +204,11 @@ mod tests {
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
 
-    use crate::{
-        blockchain::mock::MockBlockchainService,
-        mint::{
-            ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
-            TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
-        },
+    use crate::mint::{
+        ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::vault::mock::MockBlockchainService;
 
     use super::{MintManager, MintManagerError};
 
@@ -281,7 +277,7 @@ mod tests {
         let blockchain_service_mock =
             Arc::new(MockBlockchainService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
-            as Arc<dyn crate::blockchain::BlockchainService>;
+            as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-success-123");
@@ -316,7 +312,7 @@ mod tests {
             MockBlockchainService::new_failure("Network error: timeout"),
         );
         let blockchain_service = blockchain_service_mock.clone()
-            as Arc<dyn crate::blockchain::BlockchainService>;
+            as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-failure-456");
@@ -355,7 +351,7 @@ mod tests {
     async fn test_handle_journal_confirmed_with_wrong_state_fails() {
         let (cqrs, store) = setup_test_cqrs();
         let blockchain_service = Arc::new(MockBlockchainService::new_success())
-            as Arc<dyn crate::blockchain::BlockchainService>;
+            as Arc<dyn crate::vault::VaultService>;
         let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");

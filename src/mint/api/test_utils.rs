@@ -9,8 +9,6 @@ use crate::account::{
     view::find_by_email,
 };
 use crate::alpaca::AlpacaService;
-use crate::blockchain::BlockchainService;
-use crate::blockchain::mock::MockBlockchainService;
 use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
@@ -18,12 +16,14 @@ use crate::mint::{
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
+use crate::vault::VaultService;
+use crate::vault::mock::MockBlockchainService;
 
 pub(super) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,
 ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
     let blockchain_service = Arc::new(MockBlockchainService::new_success())
-        as Arc<dyn BlockchainService>;
+        as Arc<dyn VaultService>;
 
     Arc::new(MintManager::new(blockchain_service, mint_cqrs))
 }
