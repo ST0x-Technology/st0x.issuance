@@ -2,13 +2,16 @@ mod cmd;
 mod event;
 mod view;
 
+pub(crate) mod detector;
+
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
-use crate::mint::{IssuerRequestId, Quantity};
+use crate::Quantity;
+use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;

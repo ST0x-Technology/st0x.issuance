@@ -58,11 +58,11 @@ impl View<Redemption> for RedemptionView {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use alloy::primitives::{address, b256};
     use chrono::Utc;
     use cqrs_es::{EventEnvelope, View};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
 
     use super::RedemptionView;
     use crate::mint::{IssuerRequestId, Quantity};
