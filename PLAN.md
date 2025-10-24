@@ -395,14 +395,14 @@ impl View<Redemption> for RedemptionView {
 
 **Naming Decision:** View uses `Unavailable` instead of `Uninitialized` to reflect query perspective (data not available) vs entity lifecycle (entity not created).
 
-- [ ] Update `view.rs` with `RedemptionView` enum
-- [ ] Add `Unavailable` and `Detected` variants
-- [ ] Implement `Default` trait
-- [ ] Implement `View<Redemption>` trait with `update` method
-- [ ] Add necessary imports following two-group pattern
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Update `view.rs` with `RedemptionView` enum
+- [x] Add `Unavailable` and `Detected` variants
+- [x] Implement `Default` trait
+- [x] Implement `View<Redemption>` trait with `update` method
+- [x] Add necessary imports following two-group pattern
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 7. Create Database Migration for redemption_view Table
 
