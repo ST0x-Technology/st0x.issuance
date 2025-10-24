@@ -441,12 +441,12 @@ sqlx db reset -y
 
 This will drop the database, re-run all migrations (including the new one), and verify SQL is valid.
 
-- [ ] Run `sqlx migrate add create_redemption_view`
-- [ ] Edit generated migration file with CREATE TABLE statement
-- [ ] Add indexes for common queries
-- [ ] Run `sqlx db reset -y` to test migration
-- [ ] Verify database schema with `sqlite3 data.db ".schema redemption_view"`
-- [ ] Run `cargo build` to ensure sqlx is happy
+- [x] Run `sqlx migrate add create_redemption_view`
+- [x] Edit generated migration file with CREATE TABLE statement
+- [x] Add indexes for common queries
+- [x] Run `sqlx db reset -y` to test migration
+- [x] Verify database schema with `sqlite3 issuance.db ".schema redemption_view"`
+- [x] Run `cargo build` to ensure sqlx is happy
 
 ## Task 8. Define MonitorService Trait
 
