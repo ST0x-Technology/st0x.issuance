@@ -917,7 +917,46 @@ mod tests {
 - [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [x] Run `cargo fmt`
 
-## Task 13. Documentation and Final Quality Checks
+## Task 13. Create RedemptionDetector Manager
+
+Create a manager that uses TransferService to watch for transfers and execute Detect commands.
+
+**Create `src/redemption/detector.rs`:**
+
+The detector manager bridges the TransferService with the Redemption aggregate by:
+1. Polling TransferService for new transfers
+2. Converting Transfer data to RedemptionCommand::Detect
+3. Executing commands via the CQRS framework
+
+```rust
+use std::sync::Arc;
+use cqrs_es::CqrsFramework;
+use crate::redemption::{Redemption, RedemptionCommand};
+use crate::transfer::{Transfer, TransferService};
+```
+
+- [ ] Create `src/redemption/detector.rs`
+- [ ] Define `RedemptionDetector` struct
+- [ ] Implement `detect_transfers()` method
+- [ ] Add conversion from `Transfer` to `RedemptionCommand::Detect`
+- [ ] Add module to `src/redemption/mod.rs`
+- [ ] Run `cargo build` to verify compilation
+- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [ ] Run `cargo fmt`
+
+## Task 14. Add RedemptionDetector Tests
+
+Test the detector manager with mock transfer service.
+
+- [ ] Add test module to `detector.rs`
+- [ ] Test successful transfer detection
+- [ ] Test transfer service failure handling
+- [ ] Test empty transfer list
+- [ ] Run `cargo test -q redemption::detector`
+- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [ ] Run `cargo fmt`
+
+## Task 15. Documentation and Final Quality Checks
 
 Ensure code quality and adherence to project guidelines.
 
