@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
+use cqrs_es::{AggregateContext, EventStore, persist::PersistedEventStore};
 use rocket::{State, serde::json::Json};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteEventRepository;
 use tracing::{error, info};
 
 use super::{
@@ -253,6 +255,8 @@ async fn validate_client_eligible(
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     cqrs: &State<crate::MintCqrs>,
+    conductor: &State<crate::MintConductorType>,
+    pool: &State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
     let JournalConfirmationRequest {
@@ -268,15 +272,22 @@ pub(crate) async fn confirm_journal(
         issuer_request_id.0, tokenization_request_id.0, status
     );
 
-    let command = match status {
-        JournalStatus::Completed => MintCommand::ConfirmJournal {
-            issuer_request_id: issuer_request_id.clone(),
-        },
-        JournalStatus::Rejected => MintCommand::RejectJournal {
-            issuer_request_id: issuer_request_id.clone(),
-            reason: reason
-                .unwrap_or_else(|| "Journal rejected by Alpaca".to_string()),
-        },
+    let (command, should_trigger_conductor) = match status {
+        JournalStatus::Completed => (
+            MintCommand::ConfirmJournal {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+            true,
+        ),
+        JournalStatus::Rejected => (
+            MintCommand::RejectJournal {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: reason.unwrap_or_else(|| {
+                    "Journal rejected by Alpaca".to_string()
+                }),
+            },
+            false,
+        ),
     };
 
     if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
@@ -285,6 +296,56 @@ pub(crate) async fn confirm_journal(
              issuer_request_id={}: {}",
             issuer_request_id.0, e
         );
+        return rocket::http::Status::Ok;
+    }
+
+    if should_trigger_conductor {
+        let conductor = conductor.inner().clone();
+        let issuer_request_id_clone = issuer_request_id.clone();
+        let pool_clone = pool.inner().clone();
+
+        rocket::tokio::spawn(async move {
+            info!(
+                issuer_request_id = %issuer_request_id_clone.0,
+                "Triggering conductor to handle journal confirmation"
+            );
+
+            let event_repo = SqliteEventRepository::new(pool_clone);
+            let event_store = PersistedEventStore::new_event_store(event_repo);
+
+            let aggregate_context = match event_store
+                .load_aggregate(&issuer_request_id_clone.0)
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    error!(
+                        issuer_request_id = %issuer_request_id_clone.0,
+                        error = %e,
+                        "Failed to load aggregate"
+                    );
+                    return;
+                }
+            };
+
+            let aggregate = aggregate_context.aggregate();
+
+            if let Err(e) = conductor
+                .handle_journal_confirmed(&issuer_request_id_clone, aggregate)
+                .await
+            {
+                error!(
+                    issuer_request_id = %issuer_request_id_clone.0,
+                    error = %e,
+                    "Conductor failed to handle journal confirmation"
+                );
+            } else {
+                info!(
+                    issuer_request_id = %issuer_request_id_clone.0,
+                    "Conductor successfully handled journal confirmation"
+                );
+            }
+        });
     }
 
     rocket::http::Status::Ok
@@ -307,13 +368,23 @@ mod tests {
         Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
         view::find_by_email,
     };
+    use crate::blockchain::mock::MockBlockchainService;
     use crate::mint::{
         Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
-        view::find_by_issuer_request_id,
+        conductor::MintConductor, view::find_by_issuer_request_id,
     };
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
     };
+
+    fn create_test_conductor(
+        mint_cqrs: crate::MintCqrs,
+    ) -> crate::MintConductorType {
+        let blockchain_service = Arc::new(MockBlockchainService::new_success())
+            as Arc<dyn crate::blockchain::BlockchainService>;
+
+        Arc::new(MintConductor::new(blockchain_service, mint_cqrs))
+    }
 
     async fn setup_test_environment() -> (
         sqlx::Pool<sqlx::Sqlite>,
@@ -363,7 +434,7 @@ mod tests {
             ));
         let mint_query = GenericQuery::new(mint_view_repo);
         let mint_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
+            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
 
         (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs)
     }
@@ -979,8 +1050,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1009,8 +1083,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1069,8 +1146,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1145,8 +1225,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1224,8 +1307,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1300,8 +1386,11 @@ mod tests {
             .await
             .expect("Failed to initiate mint");
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -1351,8 +1440,11 @@ mod tests {
         let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let conductor = create_test_conductor(mint_cqrs.clone());
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
+            .manage(conductor)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 

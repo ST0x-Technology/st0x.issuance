@@ -10,14 +10,24 @@
   outputs = { flake-utils, rainix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let pkgs = rainix.pkgs.${system};
-      in {
-        packages = rainix.packages.${system};
+      in rec {
+        packages = let rainixPkgs = rainix.packages.${system};
+        in rainixPkgs // {
+          prepSolArtifacts = rainix.mkTask.${system} {
+            name = "prep-sol-artifacts";
+            additionalBuildInputs = rainix.sol-build-inputs.${system};
+            body = ''
+              set -euxo pipefail
+              (cd lib/ethgild && forge build)
+            '';
+          };
+        };
 
         devShell = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           buildInputs = with pkgs;
-            [ bacon sqlx-cli cargo-expand ]
+            [ bacon sqlx-cli cargo-expand packages.prepSolArtifacts ]
             ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
