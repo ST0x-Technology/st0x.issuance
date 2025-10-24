@@ -24,6 +24,7 @@ pub mod account;
 pub mod alpaca;
 pub mod blockchain;
 pub mod mint;
+pub mod redemption;
 pub mod test_utils;
 pub mod tokenized_asset;
 
