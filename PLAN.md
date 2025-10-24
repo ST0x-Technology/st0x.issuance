@@ -316,14 +316,14 @@ use chrono::Utc;
 use cqrs_es::Aggregate;
 ```
 
-- [ ] Define `RedemptionError` enum
-- [ ] Implement `Aggregate` trait for `Redemption`
-- [ ] Implement `handle` method with validation and event production
-- [ ] Implement `apply` method for state transitions
-- [ ] Add necessary imports
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt`
+- [x] Define `RedemptionError` enum
+- [x] Implement `Aggregate` trait for `Redemption`
+- [x] Implement `handle` method with validation and event production
+- [x] Implement `apply` method for state transitions
+- [x] Add necessary imports
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] Run `cargo fmt`
 
 ## Task 6. Implement RedemptionView
 
