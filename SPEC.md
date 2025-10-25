@@ -280,17 +280,18 @@ system.
 - `client_id`: Our identifier for the linked account
 - `email`: AP's email address
 - `alpaca_account`: Alpaca account number
+- `wallet`: On-chain wallet address for redemption lookups
 - `status`: Active or inactive
 - Timestamps
 
 **Commands:**
 
-- `LinkAccount { email, alpaca_account }` - Create new account link
+- `LinkAccount { email, alpaca_account, wallet }` - Create new account link
 
 **Events:**
 
-- `AccountLinked { client_id, email, alpaca_account, linked_at }` - Account
-  successfully linked
+- `AccountLinked { client_id, email, alpaca_account, wallet, linked_at }` -
+  Account successfully linked
 
 **Command → Event Mappings:**
 
@@ -379,7 +380,8 @@ account with their account on our platform.
 ```json
 {
   "email": "customer@firm.com",
-  "account": "alpaca_account_number"
+  "account": "alpaca_account_number",
+  "wallet": "0x1234567890abcdef1234567890abcdef12345678"
 }
 ```
 
@@ -403,6 +405,7 @@ account with their account on our platform.
 struct AccountLinkRequest {
     email: Email,
     account: AlpacaAccountNumber,
+    wallet: Address,
 }
 
 struct AccountLinkResponse {
