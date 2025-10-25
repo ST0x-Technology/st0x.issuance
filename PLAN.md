@@ -35,19 +35,19 @@ SPEC.md.
 
 ## Task 2. Add RecordAlpacaCall and RecordAlpacaFailure commands to Redemption aggregate
 
-- [ ] Add `RecordAlpacaCall` command variant to `RedemptionCommand` enum in
+- [x] Add `RecordAlpacaCall` command variant to `RedemptionCommand` enum in
       `src/redemption/cmd.rs`
   - Fields: `issuer_request_id`, `tokenization_request_id`
-- [ ] Add `RecordAlpacaFailure` command variant to `RedemptionCommand` enum
+- [x] Add `RecordAlpacaFailure` command variant to `RedemptionCommand` enum
   - Fields: `issuer_request_id`, `error: String`
-- [ ] Add `RedemptionError::InvalidState` variant for state validation errors
-- [ ] Update `Redemption::handle()` to process `RecordAlpacaCall` command
+- [x] Add `RedemptionError::InvalidState` variant for state validation errors
+- [x] Update `Redemption::handle()` to process `RecordAlpacaCall` command
   - Validate aggregate is in `Detected` state
   - Return `AlpacaCalled` event with tokenization_request_id
-- [ ] Update `Redemption::handle()` to process `RecordAlpacaFailure` command
+- [x] Update `Redemption::handle()` to process `RecordAlpacaFailure` command
   - Validate aggregate is in `Detected` state
   - Return `AlpacaCallFailed` event with error message
-- [ ] Add aggregate tests for both new commands (happy path + error cases)
+- [x] Add aggregate tests for both new commands (happy path + error cases)
 
 ## Task 3. Extend AlpacaService with call_redeem_endpoint() method
 
