@@ -51,30 +51,30 @@ SPEC.md.
 
 ## Task 3. Extend AlpacaService with call_redeem_endpoint() method
 
-- [ ] Add `RedeemRequest` struct to `src/alpaca/mod.rs`
+- [x] Add `RedeemRequest` struct to `src/alpaca/mod.rs`
   - Fields per SPEC.md: `issuer_request_id`, `underlying_symbol`,
     `token_symbol`, `client_id`, `qty`, `network`, `wallet_address`, `tx_hash`
   - Derive `Debug, Clone, Serialize`
   - Use serde field renaming for `underlying_symbol`, `token_symbol`,
     `wallet_address` (snake_case)
-- [ ] Add `RedeemResponse` struct to `src/alpaca/mod.rs`
+- [x] Add `RedeemResponse` struct to `src/alpaca/mod.rs`
   - Fields per SPEC.md: `tokenization_request_id`, `issuer_request_id`,
     `created_at`, `request_type`, `status`, `underlying_symbol`, `token_symbol`,
     `qty`, `issuer`, `network`, `wallet_address`, `tx_hash`, `fees`
   - Derive `Debug, Clone, Deserialize`
   - Use serde field renaming for snake_case fields
-- [ ] Add `RedeemRequestType` and `RedeemRequestStatus` enums per SPEC.md
-- [ ] Add `Fees` newtype wrapper for decimal fees
-- [ ] Add `call_redeem_endpoint()` method to `AlpacaService` trait
+- [x] Add `RedeemRequestType` and `RedeemRequestStatus` enums per SPEC.md
+- [x] Add `Fees` newtype wrapper for decimal fees
+- [x] Add `call_redeem_endpoint()` method to `AlpacaService` trait
   - Signature:
     `async fn call_redeem_endpoint(&self, request: RedeemRequest) -> Result<RedeemResponse, AlpacaError>`
-- [ ] Implement `call_redeem_endpoint()` in `RealAlpacaService`
+- [x] Implement `call_redeem_endpoint()` in `RealAlpacaService`
   - URL: `POST /v1/accounts/{account_id}/tokenization/redeem`
   - Use basic auth (same as mint callback)
   - Parse JSON response to `RedeemResponse`
   - Apply same retry logic as mint callback (exponential backoff with jitter)
   - Handle auth errors (401/403), API errors (400/500), and HTTP errors
-- [ ] Add comprehensive tests for `call_redeem_endpoint()`:
+- [x] Add comprehensive tests for `call_redeem_endpoint()`:
   - Success case (200 OK with valid response)
   - Unauthorized (401)
   - Forbidden (403)
@@ -85,12 +85,12 @@ SPEC.md.
 
 ## Task 4. Extend MockAlpacaService for testing
 
-- [ ] Add `call_redeem_endpoint()` implementation to `MockAlpacaService` in
+- [x] Add `call_redeem_endpoint()` implementation to `MockAlpacaService` in
       `src/alpaca/mock.rs`
   - Support both success and failure modes
   - Track call count
   - Return mock `RedeemResponse` with configurable tokenization_request_id
-- [ ] Add tests for mock implementation
+- [x] Add tests for mock implementation
 
 ## Task 5. Create RedemptionManager orchestrator
 

@@ -1,10 +1,12 @@
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::account::ClientId;
-use crate::mint::TokenizationRequestId;
-use crate::tokenized_asset::Network;
+use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 pub(crate) mod mock;
 pub(crate) mod service;
@@ -34,6 +36,11 @@ pub(crate) trait AlpacaService: Send + Sync {
         &self,
         request: MintCallbackRequest,
     ) -> Result<(), AlpacaError>;
+
+    async fn call_redeem_endpoint(
+        &self,
+        request: RedeemRequest,
+    ) -> Result<RedeemResponse, AlpacaError>;
 }
 
 /// Request payload for Alpaca's mint callback endpoint.
@@ -68,6 +75,60 @@ where
 {
     s.serialize_str(&format!("{hash:#x}"))
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RedeemRequest {
+    pub(crate) issuer_request_id: IssuerRequestId,
+    #[serde(rename = "underlying_symbol")]
+    pub(crate) underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    pub(crate) token: TokenSymbol,
+    pub(crate) client_id: ClientId,
+    pub(crate) qty: Quantity,
+    pub(crate) network: Network,
+    #[serde(rename = "wallet_address", serialize_with = "serialize_address")]
+    pub(crate) wallet: Address,
+    #[serde(serialize_with = "serialize_b256")]
+    pub(crate) tx_hash: B256,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RedeemResponse {
+    pub(crate) tokenization_request_id: TokenizationRequestId,
+    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) created_at: DateTime<Utc>,
+    #[serde(rename = "type")]
+    pub(crate) request_type: RedeemRequestType,
+    pub(crate) status: RedeemRequestStatus,
+    #[serde(rename = "underlying_symbol")]
+    pub(crate) underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    pub(crate) token: TokenSymbol,
+    pub(crate) qty: Quantity,
+    pub(crate) issuer: String,
+    pub(crate) network: Network,
+    #[serde(rename = "wallet_address")]
+    pub(crate) wallet: Address,
+    pub(crate) tx_hash: B256,
+    pub(crate) fees: Fees,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RedeemRequestType {
+    Redeem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RedeemRequestStatus {
+    Pending,
+    Completed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Fees(pub(crate) Decimal);
 
 /// Errors that can occur during Alpaca API operations.
 #[derive(Debug, thiserror::Error)]
