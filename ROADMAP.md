@@ -160,8 +160,9 @@ Complete redemption flow - detect transfer through burn.
 
 - [ ] [#21](https://github.com/ST0x-Technology/st0x.issuance/issues/21) -
       Implement DetectRedemption feature and MonitorService
-- [ ] [#22](https://github.com/ST0x-Technology/st0x.issuance/issues/22) -
+- [x] [#22](https://github.com/ST0x-Technology/st0x.issuance/issues/22) -
       Implement Alpaca redeem call feature
+  - **PR:** [#55](https://github.com/ST0x-Technology/st0x.issuance/pull/55)
 - [ ] [#23](https://github.com/ST0x-Technology/st0x.issuance/issues/23) -
       Implement Alpaca journal polling feature
 - [ ] [#24](https://github.com/ST0x-Technology/st0x.issuance/issues/24) -
