@@ -149,13 +149,14 @@ pub(crate) enum AlpacaError {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
+    use rust_decimal::Decimal;
     use serde_json::json;
 
     use crate::account::ClientId;
-    use crate::mint::TokenizationRequestId;
-    use crate::tokenized_asset::Network;
+    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
-    use super::MintCallbackRequest;
+    use super::{MintCallbackRequest, RedeemRequest};
 
     #[test]
     fn test_mint_callback_request_serialization() {
@@ -191,6 +192,41 @@ mod tests {
             )
         );
         assert_eq!(serialized["network"], json!("base"));
+    }
+
+    #[test]
+    fn test_redeem_request_serialization() {
+        let request = RedeemRequest {
+            issuer_request_id: IssuerRequestId::new("red-abc123"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            client_id: ClientId("5505-1234-ABC-4G45".to_string()),
+            qty: Quantity::new(Decimal::new(10050, 2)),
+            network: Network::new("base"),
+            wallet: address!("0x9999999999999999999999999999999999999999"),
+            tx_hash: b256!(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            ),
+        };
+
+        let serialized = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(serialized["issuer_request_id"], json!("red-abc123"));
+        assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
+        assert_eq!(serialized["token_symbol"], json!("tAAPL"));
+        assert_eq!(serialized["client_id"], json!("5505-1234-ABC-4G45"));
+        assert_eq!(serialized["qty"], json!("100.50"));
+        assert_eq!(serialized["network"], json!("base"));
+        assert_eq!(
+            serialized["wallet_address"],
+            json!("0x9999999999999999999999999999999999999999")
+        );
+        assert_eq!(
+            serialized["tx_hash"],
+            json!(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            )
+        );
     }
 
     #[test]
