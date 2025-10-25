@@ -8,23 +8,7 @@ Alpaca's redeem endpoint to initiate the journal transfer of shares from our
 account to the AP's account. This is Step 2 in the redemption flow outlined in
 SPEC.md.
 
-## Task 1. Add RecordAlpacaCall and RecordAlpacaFailure commands to Redemption aggregate
-
-- [ ] Add `RecordAlpacaCall` command variant to `RedemptionCommand` enum in
-      `src/redemption/cmd.rs`
-  - Fields: `issuer_request_id`, `tokenization_request_id`
-- [ ] Add `RecordAlpacaFailure` command variant to `RedemptionCommand` enum
-  - Fields: `issuer_request_id`, `error: String`
-- [ ] Update `Redemption::handle()` to process `RecordAlpacaCall` command
-  - Validate aggregate is in `Detected` state
-  - Return `AlpacaCalled` event with tokenization_request_id
-- [ ] Update `Redemption::handle()` to process `RecordAlpacaFailure` command
-  - Validate aggregate is in `Detected` state
-  - Return `AlpacaCallFailed` event with error message
-- [ ] Add `RedemptionError::InvalidState` variant for state validation errors
-- [ ] Add aggregate tests for both new commands (happy path + error cases)
-
-## Task 2. Add AlpacaCalled, AlpacaCallFailed, and RedemptionFailed events
+## Task 1. Add AlpacaCalled, AlpacaCallFailed, and RedemptionFailed events
 
 - [ ] Add `AlpacaCalled` event variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
@@ -38,6 +22,9 @@ SPEC.md.
     AlpacaCallFailed
 - [ ] Update `DomainEvent` impl to return correct event_type strings for all new
       events
+- [ ] Add new aggregate states to `Redemption` enum in `src/redemption/mod.rs`:
+  - `AlpacaCalled { issuer_request_id, tokenization_request_id, underlying, token, wallet, quantity, detected_tx_hash, block_number, detected_at, called_at }`
+  - `Failed { issuer_request_id, reason, failed_at }`
 - [ ] Update `Redemption::apply()` to handle `AlpacaCalled` event
   - Transition aggregate to `AlpacaCalled` state with tokenization_request_id
     and timestamp
@@ -45,14 +32,25 @@ SPEC.md.
   - Transition aggregate to `Failed` state with error and timestamp
 - [ ] Update `Redemption::apply()` to handle `RedemptionFailed` event
   - Transition aggregate to `Failed` state with reason and timestamp
-- [ ] Add new aggregate states to `Redemption` enum in `src/redemption/mod.rs`:
-  - `AlpacaCalled { issuer_request_id, tokenization_request_id, underlying, token, wallet, quantity, detected_tx_hash, block_number, detected_at, called_at }`
-  - `Failed { issuer_request_id, reason, failed_at }`
+
+## Task 2. Add RecordAlpacaCall and RecordAlpacaFailure commands to Redemption aggregate
+
+- [ ] Add `RecordAlpacaCall` command variant to `RedemptionCommand` enum in
+      `src/redemption/cmd.rs`
+  - Fields: `issuer_request_id`, `tokenization_request_id`
+- [ ] Add `RecordAlpacaFailure` command variant to `RedemptionCommand` enum
+  - Fields: `issuer_request_id`, `error: String`
+- [ ] Add `RedemptionError::InvalidState` variant for state validation errors
+- [ ] Update `Redemption::handle()` to process `RecordAlpacaCall` command
+  - Validate aggregate is in `Detected` state
+  - Return `AlpacaCalled` event with tokenization_request_id
+- [ ] Update `Redemption::handle()` to process `RecordAlpacaFailure` command
+  - Validate aggregate is in `Detected` state
+  - Return `AlpacaCallFailed` event with error message
+- [ ] Add aggregate tests for both new commands (happy path + error cases)
 
 ## Task 3. Extend AlpacaService with call_redeem_endpoint() method
 
-- [ ] Add `TokenizationRequestId` to redemption types (import from mint module
-      or make it shared)
 - [ ] Add `RedeemRequest` struct to `src/alpaca/mod.rs`
   - Fields per SPEC.md: `issuer_request_id`, `underlying_symbol`,
     `token_symbol`, `client_id`, `qty`, `network`, `wallet_address`, `tx_hash`
@@ -160,6 +158,23 @@ Detected → (RecordAlpacaCall) → AlpacaCalled
 Detected → (RecordAlpacaFailure) → Failed
 ```
 
+### Task Ordering Rationale
+
+**Why events before commands?**
+
+- Events are data structures that must exist before command handlers can produce
+  them
+- The `handle()` method returns events, so events must be defined first
+- Aggregate states correspond to events, so they're defined together with events
+- Commands are processed by `handle()` to produce events, so they come after
+
+This ordering ensures:
+
+1. All tests pass after each task
+2. No forward dependencies (earlier tasks don't depend on later tasks)
+3. Logical progression: data structures → handlers → external services →
+   orchestration
+
 ### Design Rationale
 
 **Why separate AlpacaCalled and AlpacaCallFailed events?**
@@ -201,13 +216,15 @@ Detected → (RecordAlpacaFailure) → Failed
 
 **Modified files:**
 
-- `src/redemption/cmd.rs` - Add new commands
-- `src/redemption/event.rs` - Add new events
-- `src/redemption/mod.rs` - Add new aggregate states, export manager
+- `src/redemption/event.rs` - Add new events (Task 1)
+- `src/redemption/mod.rs` - Add new aggregate states (Task 1), export manager
+  (Task 5)
+- `src/redemption/cmd.rs` - Add new commands (Task 2)
 - `src/alpaca/mod.rs` - Add redeem request/response types and trait method
-- `src/alpaca/service.rs` - Implement call_redeem_endpoint
-- `src/alpaca/mock.rs` - Add mock implementation
-- `src/main.rs` - Wire manager (if applicable)
+  (Task 3)
+- `src/alpaca/service.rs` - Implement call_redeem_endpoint (Task 3)
+- `src/alpaca/mock.rs` - Add mock implementation (Task 4)
+- `src/main.rs` - Wire manager (Task 6)
 
 ### Dependencies
 
