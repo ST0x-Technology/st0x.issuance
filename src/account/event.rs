@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ pub(crate) enum AccountEvent {
         client_id: ClientId,
         email: Email,
         alpaca_account: AlpacaAccountNumber,
+        wallet: Address,
         linked_at: DateTime<Utc>,
     },
 }

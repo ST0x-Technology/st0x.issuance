@@ -94,13 +94,13 @@ SPEC.md.
 
 ## Task 5. Create RedemptionManager orchestrator
 
-- [ ] Create `src/redemption/alpaca_manager.rs` following the pattern from
+- [x] Create `src/redemption/alpaca_manager.rs` following the pattern from
       `MintManager`
-- [ ] Implement `AlpacaManager` struct:
+- [x] Implement `AlpacaManager` struct:
   - Fields: `alpaca_service: Arc<dyn AlpacaService>`,
     `cqrs: Arc<CqrsFramework<Redemption, ES>>`
   - Constructor: `new(alpaca_service, cqrs) -> Self`
-- [ ] Implement `handle_redemption_detected()` method:
+- [x] Implement `handle_redemption_detected()` method:
   - Accept `issuer_request_id` and `aggregate: &Redemption` parameters
   - Validate aggregate is in `Detected` state
   - Extract redemption details (underlying, token, wallet, quantity, tx_hash)
@@ -113,29 +113,28 @@ SPEC.md.
     `tokenization_request_id`
   - On failure: execute `RecordAlpacaFailure` command with error message
   - Return `Result<(), AlpacaManagerError>`
-- [ ] Define `AlpacaManagerError` enum:
+- [x] Define `AlpacaManagerError` enum:
   - `Alpaca(AlpacaError)` - API call failed
   - `Cqrs(AggregateError<RedemptionError>)` - Command execution failed
   - `InvalidAggregateState { current_state: String }` - Wrong state for
     operation
-- [ ] Add comprehensive tests using `MemStore` and `MockAlpacaService`:
+- [x] Add comprehensive tests using `MemStore` and `MockAlpacaService`:
   - Success path: Detected → call API → RecordAlpacaCall → AlpacaCalled state
   - Failure path: Detected → API failure → RecordAlpacaFailure → Failed state
   - Invalid state: Cannot call from non-Detected state
-- [ ] Export `AlpacaManager` from `src/redemption/mod.rs`
+- [x] Export `AlpacaManager` from `src/redemption/mod.rs`
 
 ## Task 6. Wire orchestrator to listen for RedemptionDetected events
 
-- [ ] Add `alpaca_manager` module declaration in `src/redemption/mod.rs`
-- [ ] Update application wiring in `src/main.rs` (or wherever CQRS framework is
-      instantiated):
+- [x] Add `alpaca_manager` module declaration in `src/redemption/mod.rs`
+- [x] Update application wiring in `src/lib.rs`:
   - Create `AlpacaManager` instance with alpaca_service and redemption_cqrs
-  - Register event listener for `RedemptionDetected` events
-  - Event listener should: load aggregate → call
-    `alpaca_manager.handle_redemption_detected()`
-  - Handle errors appropriately (log and potentially retry)
-- [ ] Note: Full integration will be completed in issue #26 (end-to-end tests),
-      this task focuses on the manager itself
+  - Create redemption_event_store for loading aggregates
+  - Update `RedemptionDetector` to accept and use `AlpacaManager`
+  - Call `alpaca_manager.handle_redemption_detected()` after detecting
+    redemption
+  - Handle errors appropriately (log failures)
+- [x] Note: Issue #26 will add end-to-end tests for the complete flow
 
 ## Implementation Notes
 

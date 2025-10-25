@@ -4,12 +4,13 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
-use cqrs_es::{CqrsFramework, EventStore};
+use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 use url::Url;
 
+use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::bindings;
 use crate::tokenized_asset::TokenizedAssetView;
 use crate::tokenized_asset::view::{
@@ -17,7 +18,10 @@ use crate::tokenized_asset::view::{
 };
 use crate::{Quantity, QuantityConversionError};
 
-use super::{Redemption, RedemptionCommand, RedemptionError};
+use super::{
+    Redemption, RedemptionCommand, RedemptionError,
+    alpaca_manager::AlpacaManager,
+};
 
 /// Orchestrates the WebSocket monitoring process for redemption detection.
 ///
@@ -29,7 +33,9 @@ pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
     vault_address: Address,
     redemption_wallet: Address,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    event_store: Arc<ES>,
     pool: Pool<Sqlite>,
+    alpaca_manager: Arc<AlpacaManager<ES>>,
 }
 
 impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
@@ -41,15 +47,27 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
     /// * `vault_address` - Address of the OffchainAssetReceiptVault contract
     /// * `redemption_wallet` - Address where APs send tokens to initiate redemption
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
+    /// * `event_store` - Event store for loading aggregates
     /// * `pool` - Database connection pool for querying tokenized assets
+    /// * `alpaca_manager` - Manager for handling Alpaca redeem calls
     pub(crate) const fn new(
         rpc_url: Url,
         vault_address: Address,
         redemption_wallet: Address,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        event_store: Arc<ES>,
         pool: Pool<Sqlite>,
+        alpaca_manager: Arc<AlpacaManager<ES>>,
     ) -> Self {
-        Self { rpc_url, vault_address, redemption_wallet, cqrs, pool }
+        Self {
+            rpc_url,
+            vault_address,
+            redemption_wallet,
+            cqrs,
+            event_store,
+            pool,
+            alpaca_manager,
+        }
     }
 
     /// Runs the monitoring loop with automatic reconnection on errors.
@@ -124,15 +142,18 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
 
         let assets = list_enabled_assets(&self.pool).await?;
 
-        let (underlying, token) = assets
+        let (underlying, token, network) = assets
             .into_iter()
             .find_map(|view| match view {
                 TokenizedAssetView::Asset {
                     underlying,
                     token,
+                    network,
                     vault_address: addr,
                     ..
-                } if addr == self.vault_address => Some((underlying, token)),
+                } if addr == self.vault_address => {
+                    Some((underlying, token, network))
+                }
                 _ => None,
             })
             .ok_or(RedemptionMonitorError::NoMatchingAsset {
@@ -174,6 +195,40 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
             "Redemption detection recorded successfully"
         );
 
+        let account_view = find_by_wallet(&self.pool, &transfer_event.from)
+            .await?
+            .ok_or(RedemptionMonitorError::AccountNotFound {
+                wallet: transfer_event.from,
+            })?;
+
+        let crate::account::AccountView::Account { client_id, .. } =
+            account_view
+        else {
+            return Err(RedemptionMonitorError::AccountNotLinked {
+                wallet: transfer_event.from,
+            });
+        };
+
+        let aggregate_ctx =
+            self.event_store.load_aggregate(&issuer_request_id.0).await?;
+
+        if let Err(e) = self
+            .alpaca_manager
+            .handle_redemption_detected(
+                &issuer_request_id,
+                aggregate_ctx.aggregate(),
+                client_id,
+                network,
+            )
+            .await
+        {
+            warn!(
+                issuer_request_id = %issuer_request_id_str,
+                error = ?e,
+                "handle_redemption_detected failed"
+            );
+        }
+
         Ok(())
     }
 }
@@ -196,6 +251,12 @@ pub(crate) enum RedemptionMonitorError {
     QuantityConversion(#[from] QuantityConversionError),
     #[error("Failed to record redemption detection: {0}")]
     CqrsExecution(#[from] cqrs_es::AggregateError<RedemptionError>),
+    #[error("Failed to query account: {0}")]
+    AccountQuery(#[from] AccountViewError),
+    #[error("No account found for wallet {wallet}")]
+    AccountNotFound { wallet: Address },
+    #[error("Account not linked for wallet {wallet}")]
+    AccountNotLinked { wallet: Address },
     #[error("Stream ended unexpectedly")]
     StreamEnded,
 }
@@ -214,7 +275,8 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use super::{RedemptionDetector, RedemptionMonitorError};
+    use super::{AlpacaManager, RedemptionDetector, RedemptionMonitorError};
+    use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
     use crate::redemption::Redemption;
@@ -232,23 +294,17 @@ mod tests {
     async fn setup_test_db_with_asset(vault_address: Address) -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
 
-        sqlx::query(
-            "CREATE TABLE tokenized_asset_view (
-                view_id TEXT PRIMARY KEY,
-                version BIGINT NOT NULL,
-                payload JSON NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
         let added_at = Utc::now();
 
-        let view_json = serde_json::json!({
+        let asset_view_json = serde_json::json!({
             "Asset": {
                 "underlying": underlying,
                 "token": token,
@@ -264,7 +320,29 @@ mod tests {
         )
         .bind(&underlying.0)
         .bind(1_i64)
-        .bind(view_json.to_string())
+        .bind(asset_view_json.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let account_view_json = serde_json::json!({
+            "Account": {
+                "client_id": "test-client-123",
+                "email": "test@example.com",
+                "alpaca_account": "ALPACA123",
+                "wallet": ap_wallet,
+                "status": "Active",
+                "linked_at": Utc::now()
+            }
+        });
+
+        sqlx::query(
+            "INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)",
+        )
+        .bind("test-client-123")
+        .bind(1_i64)
+        .bind(account_view_json.to_string())
         .execute(&pool)
         .await
         .unwrap();
@@ -315,12 +393,19 @@ mod tests {
         let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault_address).await;
 
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_manager =
+            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+
         let detector = RedemptionDetector::new(
             "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
             cqrs.clone(),
+            store.clone(),
             pool,
+            alpaca_manager,
         );
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
@@ -350,8 +435,8 @@ mod tests {
         let aggregate = context.aggregate();
 
         assert!(
-            matches!(aggregate, Redemption::Detected { .. }),
-            "Expected Detected state, got {aggregate:?}"
+            matches!(aggregate, Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled state, got {aggregate:?}"
         );
     }
 
@@ -362,15 +447,22 @@ mod tests {
         let redemption_wallet =
             address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
+        let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault_address).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_manager =
+            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
 
         let detector = RedemptionDetector::new(
             "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
             cqrs,
+            store,
             pool,
+            alpaca_manager,
         );
 
         let mut log = create_transfer_log(
@@ -400,15 +492,22 @@ mod tests {
         let redemption_wallet =
             address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
+        let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault_address).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_manager =
+            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
 
         let detector = RedemptionDetector::new(
             "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
             cqrs,
+            store,
             pool,
+            alpaca_manager,
         );
 
         let mut log = create_transfer_log(
@@ -440,15 +539,22 @@ mod tests {
         let redemption_wallet =
             address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
+        let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(wrong_vault_address).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_manager =
+            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
 
         let detector = RedemptionDetector::new(
             "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
             cqrs,
+            store,
             pool,
+            alpaca_manager,
         );
 
         let log = create_transfer_log(
@@ -479,15 +585,22 @@ mod tests {
         let redemption_wallet =
             address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
+        let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault_address).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let alpaca_manager =
+            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
 
         let detector = RedemptionDetector::new(
             "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
             cqrs,
+            store,
             pool,
+            alpaca_manager,
         );
 
         let tx_hash = b256!(

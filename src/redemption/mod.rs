@@ -2,6 +2,7 @@ mod cmd;
 mod event;
 mod view;
 
+pub(crate) mod alpaca_manager;
 pub(crate) mod detector;
 
 use alloy::primitives::{Address, B256};
