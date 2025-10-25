@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 
-use crate::mint::{IssuerRequestId, Quantity};
+use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
@@ -19,6 +19,23 @@ pub(crate) enum RedemptionView {
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
+    },
+    AlpacaCalled {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+    },
+    Failed {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
 }
 
@@ -50,6 +67,60 @@ impl View<Redemption> for RedemptionView {
                     tx_hash: *tx_hash,
                     block_number: *block_number,
                     detected_at: *detected_at,
+                };
+            }
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id,
+                tokenization_request_id,
+                called_at,
+            } => {
+                let Self::Detected {
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                    detected_at,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                *self = Self::AlpacaCalled {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    underlying: underlying.clone(),
+                    token: token.clone(),
+                    wallet: *wallet,
+                    quantity: quantity.clone(),
+                    tx_hash: *tx_hash,
+                    block_number: *block_number,
+                    detected_at: *detected_at,
+                    called_at: *called_at,
+                };
+            }
+            RedemptionEvent::AlpacaCallFailed {
+                issuer_request_id,
+                error,
+                failed_at,
+            } => {
+                *self = Self::Failed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: error.clone(),
+                    failed_at: *failed_at,
+                };
+            }
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id,
+                reason,
+                failed_at,
+            } => {
+                *self = Self::Failed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: reason.clone(),
+                    failed_at: *failed_at,
                 };
             }
         }

@@ -11,7 +11,7 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
 use crate::Quantity;
-use crate::mint::IssuerRequestId;
+use crate::mint::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
@@ -29,6 +29,23 @@ pub(crate) enum Redemption {
         detected_tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
+    },
+    AlpacaCalled {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        detected_tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+    },
+    Failed {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
 }
 
@@ -115,6 +132,56 @@ impl Aggregate for Redemption {
                     detected_at,
                 };
             }
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id,
+                tokenization_request_id,
+                called_at,
+            } => {
+                let Self::Detected {
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    detected_tx_hash,
+                    block_number,
+                    detected_at,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                *self = Self::AlpacaCalled {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    underlying: underlying.clone(),
+                    token: token.clone(),
+                    wallet: *wallet,
+                    quantity: quantity.clone(),
+                    detected_tx_hash: *detected_tx_hash,
+                    block_number: *block_number,
+                    detected_at: *detected_at,
+                    called_at,
+                };
+            }
+            RedemptionEvent::AlpacaCallFailed {
+                issuer_request_id,
+                error,
+                failed_at,
+            } => {
+                *self = Self::Failed {
+                    issuer_request_id,
+                    reason: error,
+                    failed_at,
+                };
+            }
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id,
+                reason,
+                failed_at,
+            } => {
+                *self = Self::Failed { issuer_request_id, reason, failed_at };
+            }
         }
     }
 }
@@ -158,36 +225,31 @@ mod tests {
                 block_number,
             });
 
-        let result = validator.inspect_result();
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
 
-        match result {
-            Ok(events) => {
-                assert_eq!(events.len(), 1);
+        let RedemptionEvent::Detected {
+            issuer_request_id: event_id,
+            underlying: event_underlying,
+            token: event_token,
+            wallet: event_wallet,
+            quantity: event_quantity,
+            tx_hash: event_tx_hash,
+            block_number: event_block_number,
+            detected_at,
+        } = &events[0]
+        else {
+            panic!("Expected Detected event, got {:?}", &events[0]);
+        };
 
-                match &events[0] {
-                    RedemptionEvent::Detected {
-                        issuer_request_id: event_id,
-                        underlying: event_underlying,
-                        token: event_token,
-                        wallet: event_wallet,
-                        quantity: event_quantity,
-                        tx_hash: event_tx_hash,
-                        block_number: event_block_number,
-                        detected_at,
-                    } => {
-                        assert_eq!(event_id, &issuer_request_id);
-                        assert_eq!(event_underlying, &underlying);
-                        assert_eq!(event_token, &token);
-                        assert_eq!(event_wallet, &wallet);
-                        assert_eq!(event_quantity, &quantity);
-                        assert_eq!(event_tx_hash, &tx_hash);
-                        assert_eq!(event_block_number, &block_number);
-                        assert!(detected_at.timestamp() > 0);
-                    }
-                }
-            }
-            Err(e) => panic!("Expected success, got error: {e}"),
-        }
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_underlying, &underlying);
+        assert_eq!(event_token, &token);
+        assert_eq!(event_wallet, &wallet);
+        assert_eq!(event_quantity, &quantity);
+        assert_eq!(event_tx_hash, &tx_hash);
+        assert_eq!(event_block_number, &block_number);
+        assert!(detected_at.timestamp() > 0);
     }
 
     #[test]

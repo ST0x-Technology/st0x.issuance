@@ -10,27 +10,27 @@ SPEC.md.
 
 ## Task 1. Add AlpacaCalled, AlpacaCallFailed, and RedemptionFailed events
 
-- [ ] Add `AlpacaCalled` event variant to `RedemptionEvent` enum in
+- [x] Add `AlpacaCalled` event variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
   - Fields: `issuer_request_id`, `tokenization_request_id`,
     `called_at: DateTime<Utc>`
-- [ ] Add `AlpacaCallFailed` event variant to `RedemptionEvent` enum
+- [x] Add `AlpacaCallFailed` event variant to `RedemptionEvent` enum
   - Fields: `issuer_request_id`, `error: String`, `failed_at: DateTime<Utc>`
-- [ ] Add `RedemptionFailed` event variant to `RedemptionEvent` enum
+- [x] Add `RedemptionFailed` event variant to `RedemptionEvent` enum
   - Fields: `issuer_request_id`, `reason: String`, `failed_at: DateTime<Utc>`
   - Note: This is a general failure event for any redemption failures beyond
     AlpacaCallFailed
-- [ ] Update `DomainEvent` impl to return correct event_type strings for all new
+- [x] Update `DomainEvent` impl to return correct event_type strings for all new
       events
-- [ ] Add new aggregate states to `Redemption` enum in `src/redemption/mod.rs`:
+- [x] Add new aggregate states to `Redemption` enum in `src/redemption/mod.rs`:
   - `AlpacaCalled { issuer_request_id, tokenization_request_id, underlying, token, wallet, quantity, detected_tx_hash, block_number, detected_at, called_at }`
   - `Failed { issuer_request_id, reason, failed_at }`
-- [ ] Update `Redemption::apply()` to handle `AlpacaCalled` event
+- [x] Update `Redemption::apply()` to handle `AlpacaCalled` event
   - Transition aggregate to `AlpacaCalled` state with tokenization_request_id
     and timestamp
-- [ ] Update `Redemption::apply()` to handle `AlpacaCallFailed` event
+- [x] Update `Redemption::apply()` to handle `AlpacaCallFailed` event
   - Transition aggregate to `Failed` state with error and timestamp
-- [ ] Update `Redemption::apply()` to handle `RedemptionFailed` event
+- [x] Update `Redemption::apply()` to handle `RedemptionFailed` event
   - Transition aggregate to `Failed` state with reason and timestamp
 
 ## Task 2. Add RecordAlpacaCall and RecordAlpacaFailure commands to Redemption aggregate
