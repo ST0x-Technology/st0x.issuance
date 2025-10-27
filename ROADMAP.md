@@ -143,8 +143,6 @@ callback.
 - [x] [#20](https://github.com/ST0x-Technology/st0x.issuance/issues/20) -
       End-to-end mint flow tests
   - **PR:** [#53](https://github.com/ST0x-Technology/st0x.issuance/pull/53)
-- [ ] [#52](https://github.com/ST0x-Technology/st0x.issuance/issues/52) - Create
-      Rust client library for issuance bot
 
 ---
 

@@ -91,9 +91,6 @@ pub(crate) struct Config {
     )]
     vault_address: Option<Address>,
 
-    #[arg(long, env = "CHAIN_ID", help = "Blockchain network chain ID")]
-    chain_id: Option<u64>,
-
     #[arg(
         long,
         env = "REDEMPTION_WALLET",
@@ -118,8 +115,6 @@ impl Config {
         let vault_address =
             self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
 
-        let _chain_id = self.chain_id.ok_or(ConfigError::MissingChainId)?;
-
         let signer = private_key.parse::<PrivateKeySigner>()?;
         let wallet = EthereumWallet::from(signer);
 
@@ -140,8 +135,6 @@ pub(crate) enum ConfigError {
     MissingPrivateKey,
     #[error("VAULT_ADDRESS is required")]
     MissingVaultAddress,
-    #[error("CHAIN_ID is required")]
-    MissingChainId,
     #[error("Invalid private key")]
     InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
     #[error("Failed to connect to RPC endpoint")]
