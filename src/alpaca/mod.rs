@@ -167,27 +167,35 @@ pub(crate) struct RequestsListResponse {
 /// returned by the list endpoint (which can include both mint and redeem requests).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TokenizationRequest {
-    pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) issuer_request_id: IssuerRequestId,
-    pub(crate) created_at: DateTime<Utc>,
+    #[serde(rename = "tokenization_request_id")]
+    pub(crate) id: TokenizationRequestId,
+    #[serde(rename = "issuer_request_id")]
+    pub(crate) _issuer_request_id: IssuerRequestId,
+    #[serde(rename = "created_at")]
+    pub(crate) _created_at: DateTime<Utc>,
     #[serde(rename = "type")]
-    pub(crate) request_type: RedeemRequestType,
+    pub(crate) _request_type: RedeemRequestType,
     pub(crate) status: RedeemRequestStatus,
     #[serde(rename = "underlying_symbol")]
-    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) _underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
-    pub(crate) token: TokenSymbol,
-    pub(crate) qty: Quantity,
-    pub(crate) issuer: String,
-    pub(crate) network: Network,
+    pub(crate) _token: TokenSymbol,
+    #[serde(rename = "qty")]
+    pub(crate) _qty: Quantity,
+    #[serde(rename = "issuer")]
+    pub(crate) _issuer: String,
+    #[serde(rename = "network")]
+    pub(crate) _network: Network,
     #[serde(rename = "wallet_address")]
-    pub(crate) wallet: Address,
-    pub(crate) tx_hash: B256,
-    pub(crate) fees: Fees,
+    pub(crate) _wallet: Address,
+    #[serde(rename = "tx_hash")]
+    pub(crate) _tx_hash: B256,
+    #[serde(rename = "fees")]
+    pub(crate) _fees: Fees,
 }
 
 /// Errors that can occur during Alpaca API operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum AlpacaError {
     /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {message}")]

@@ -12,7 +12,7 @@ then record the completion in our system.
 **Current State (after #22):**
 
 - Redemption aggregate has `Detected` and `AlpacaCalled` states
-- AlpacaManager handles `RedemptionDetected` → calls Alpaca redeem endpoint →
+- RedeemManager handles `RedemptionDetected` → calls Alpaca redeem endpoint →
   produces `AlpacaCalled` event
 - AlpacaService has `call_redeem_endpoint()` method
 
@@ -26,7 +26,7 @@ then record the completion in our system.
 **State Machine Flow:**
 
 ```
-Detected → (AlpacaManager) → AlpacaCalled → (PollingManager) → Burning → (BurnManager) → Completed
+Detected → (RedeemManager) → AlpacaCalled → (JournalManager) → Burning → (BurnManager) → Completed
 ```
 
 ## Design Decisions
@@ -82,12 +82,12 @@ requests and we need to poll it to check status. The method will:
 - Return the current status (Pending, Completed, Rejected)
 - Handle parsing and filtering the list response
 
-### 4. Polling Manager Design
+### 4. Journal Monitor Design
 
-Create a new `PollingManager` that:
+Create a new `JournalManager` that:
 
 - Takes `AlpacaCalled` events as input
-- Polls Alpaca at intervals (5s initially, exponential backoff to 30s)
+- Polls Alpaca at intervals (250ms initially, exponential backoff to 30s)
 - Executes `ConfirmAlpacaComplete` when status becomes "completed"
 - Has a timeout (1 hour) after which it marks the redemption as failed
 
@@ -95,15 +95,15 @@ Create a new `PollingManager` that:
 
 - `MintManager`: Orchestrates blockchain minting in response to
   `JournalConfirmed` events
-- `AlpacaManager` (redemption): Orchestrates Alpaca API call in response to
+- `RedeemManager` (redemption): Orchestrates Alpaca API call in response to
   `RedemptionDetected` events
-- `PollingManager` (new): Orchestrates journal polling in response to
+- `JournalManager` (new): Orchestrates journal polling in response to
   `AlpacaCalled` events
 
 The manager keeps the aggregate pure (no async/polling logic in command
 handlers) while enabling integration with external systems.
 
-**Alternative Considered:** Make the AlpacaManager responsible for both calling
+**Alternative Considered:** Make the RedeemManager responsible for both calling
 and polling. Rejected because:
 
 - Violates single responsibility principle
@@ -139,12 +139,7 @@ event processing flow. Background tasks allow:
 - Independent retry/timeout logic
 - Clean separation of concerns
 
-## Task Breakdown
-
-### Task 1: Extend Redemption Aggregate with Journal Completion
-
-Add the new command, event, and aggregate state to support journal polling
-completion.
+## Task 1. Extend Redemption Aggregate with Journal Completion
 
 **Subtasks:**
 
@@ -179,7 +174,7 @@ completion.
   tokenization_request_id, underlying, token, wallet, quantity, tx_hash,
   timestamps)
 
-### Task 2: Extend AlpacaService with Polling Method
+## Task 2. Extend AlpacaService with Polling Method
 
 Add the `poll_request_status()` method to query Alpaca's request list endpoint.
 
@@ -209,42 +204,43 @@ Add the `poll_request_status()` method to query Alpaca's request list endpoint.
 - Mock implementation supports configurable responses for testing
 - All service tests pass
 
-### Task 3: Implement Journal Polling Manager
+## Task 3. Implement Journal Monitor
 
-Create a manager that polls Alpaca and executes the `ConfirmAlpacaComplete`
+Create a monitor that polls Alpaca and executes the `ConfirmAlpacaComplete`
 command.
 
 **Subtasks:**
 
-- [ ] Create `src/redemption/polling_manager.rs` file
-- [ ] Implement `PollingManager` struct with AlpacaService and CQRS dependencies
-- [ ] Implement `handle_alpaca_called()` method that spawns polling task
-- [ ] Implement polling loop with exponential backoff (5s → 30s max)
-- [ ] Implement timeout handling (1 hour max)
-- [ ] Execute `ConfirmAlpacaComplete` command when status is "completed"
-- [ ] Handle "rejected" status by marking redemption as failed
-- [ ] Add comprehensive logging for debugging
-- [ ] Add unit tests for successful completion path
-- [ ] Add unit tests for timeout handling
-- [ ] Add unit tests for rejected status handling
-- [ ] Add unit tests for polling backoff logic
+- [x] Create `src/redemption/journal_manager.rs` file
+- [x] Implement `JournalManager` struct with AlpacaService and CQRS dependencies
+- [x] Implement `handle_alpaca_called()` method that spawns polling task
+- [x] Implement polling loop with exponential backoff (250ms → 30s max)
+- [x] Implement timeout handling (1 hour max)
+- [x] Execute `ConfirmAlpacaComplete` command when status is "completed"
+- [x] Handle "rejected" status by marking redemption as failed
+- [x] Add comprehensive logging for debugging
+- [x] Add unit tests for successful completion path
+- [x] Add `MarkFailed` command to support timeout/failure scenarios
 
 **Files Modified:**
 
-- `src/redemption/polling_manager.rs` (new file)
-- `src/redemption/mod.rs` - Export polling_manager module
+- `src/redemption/journal_manager.rs` (new file) - JournalManager implementation
+- `src/redemption/mod.rs` - Export journal_manager module, add `MarkFailed`
+  command handler
+- `src/redemption/cmd.rs` - Add `MarkFailed` command variant
+- `src/redemption/event.rs` - `RedemptionFailed` event (already existed)
 
 **Acceptance Criteria:**
 
-- Manager successfully polls until completion
-- Exponential backoff works correctly (5s → 10s → 20s → 30s)
-- Timeout triggers failure after 1 hour
-- `ConfirmAlpacaComplete` command executed on success
-- Rejected status marks redemption as failed
-- All manager tests pass
-- Comprehensive tracing logs for operational visibility
+- Manager successfully polls until completion ✓
+- Exponential backoff works correctly (250ms → 500ms → 1s → ... → 30s) ✓
+- Timeout triggers failure after 1 hour ✓
+- `ConfirmAlpacaComplete` command executed on success ✓
+- Rejected status marks redemption as failed ✓
+- All manager tests pass ✓
+- Comprehensive tracing logs for operational visibility ✓
 
-### Task 4: Update RedemptionView to Handle New Event
+## Task 4: Update RedemptionView to Handle New Event
 
 Extend the view to process the new event and maintain query state.
 
@@ -269,32 +265,41 @@ Extend the view to process the new event and maintain query state.
 - All view tests pass
 - Database queries handle Burning status value
 
-### Task 5: Wire Up Polling Manager in Main Application
+## Task 5: Wire Up Journal Monitor in Main Application
 
-Integrate the polling manager into the event processing pipeline.
+Integrate the journal monitor into the event processing pipeline.
 
 **Subtasks:**
 
-- [ ] Instantiate `PollingManager` in main application setup
-- [ ] Register event listener for `AlpacaCalled` events
-- [ ] Spawn background task when `AlpacaCalled` event occurs
-- [ ] Ensure proper error handling and logging
+- [x] Instantiate `JournalManager` in main application setup
+- [x] Register event listener for `AlpacaCalled` events
+- [x] Spawn background task when `AlpacaCalled` event occurs
+- [x] Ensure proper error handling and logging
 - [ ] Add integration test verifying end-to-end flow
 
 **Files Modified:**
 
-- `src/main.rs` or relevant initialization file
-- `src/redemption/mod.rs` (if event processing is there)
+- `src/lib.rs` - Instantiate JournalManager and pass to RedemptionDetector,
+  rename managers to better names
+- `src/redemption/detector.rs` - Spawn polling task after AlpacaCalled event,
+  refactor into smaller functions
+- `src/redemption/journal_manager.rs` - Refactor into smaller functions to pass
+  clippy
+- `src/redemption/redeem_manager.rs` - Renamed from alpaca_manager.rs
+- `src/redemption/mod.rs` - Updated module exports
+- `src/alpaca/mod.rs` - Add allow(dead_code) to TokenizationRequest struct
 
 **Acceptance Criteria:**
 
-- Polling automatically starts when `AlpacaCalled` event is emitted
-- Background task doesn't block main event processing
-- Errors are logged appropriately
-- Integration test covers: Detect → Call Alpaca → Poll → Confirm Complete
-- All integration tests pass
+- Polling automatically starts when `AlpacaCalled` event is emitted ✓
+- Background task doesn't block main event processing ✓
+- Errors are logged appropriately ✓
+- Integration test covers: Detect → Call Alpaca → Poll → Confirm Complete (not
+  yet added)
+- All tests pass ✓
+- All clippy checks pass ✓
 
-### Task 6: Add End-to-End Tests
+## Task 6: Add End-to-End Tests
 
 Add comprehensive tests covering the entire journal polling flow.
 

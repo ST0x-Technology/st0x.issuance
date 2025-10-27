@@ -20,8 +20,10 @@ use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use redemption::{
-    Redemption, RedemptionView, alpaca_manager::AlpacaManager,
-    detector::RedemptionDetector,
+    Redemption, RedemptionView,
+    detector::{RedemptionDetector, RedemptionDetectorConfig},
+    journal_manager::JournalManager,
+    redeem_call_manager::RedeemCallManager,
 };
 use tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -49,6 +51,28 @@ pub(crate) type TokenizedAssetCqrs =
 pub(crate) type MintCqrs = Arc<SqliteCqrs<mint::Mint>>;
 pub(crate) type MintEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, mint::Mint>>;
+
+type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
+type RedemptionEventStore =
+    Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
+
+struct AggregateCqrsSetup {
+    mint_cqrs: MintCqrs,
+    mint_event_store: MintEventStore,
+    redemption_cqrs: RedemptionCqrs,
+    redemption_event_store: RedemptionEventStore,
+}
+
+struct RedemptionManagers {
+    redeem_call_manager: Arc<
+        RedeemCallManager<
+            PersistedEventStore<SqliteEventRepository, Redemption>,
+        >,
+    >,
+    journal_manager: Arc<
+        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "st0x-issuance")]
@@ -222,103 +246,32 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 pub async fn initialize_rocket()
 -> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
     let config = Config::parse();
-
     let pool = create_pool(&config).await?;
-
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+    let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool).await?;
 
-    let account_query = GenericQuery::new(account_view_repo);
+    let AggregateCqrsSetup {
+        mint_cqrs,
+        mint_event_store,
+        redemption_cqrs,
+        redemption_event_store,
+    } = setup_aggregate_cqrs(&pool);
 
-    let account_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+    let (mint_manager, callback_manager) =
+        setup_mint_managers(&config, &mint_cqrs).await?;
 
-    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
+    let RedemptionManagers { redeem_call_manager, journal_manager } =
+        setup_redemption_managers(&config, &redemption_cqrs)?;
+
+    spawn_redemption_detector(
+        &config,
+        redemption_cqrs.clone(),
+        redemption_event_store,
         pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-
-    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
-
-    let tokenized_asset_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
-
-    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-        pool.clone(),
-        "mint_view".to_string(),
-    ));
-
-    let mint_query = GenericQuery::new(mint_view_repo);
-
-    let mint_cqrs_raw =
-        sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
-    let mint_cqrs = Arc::new(mint_cqrs_raw);
-
-    let mint_event_repo = SqliteEventRepository::new(pool.clone());
-    let mint_event_store: MintEventStore =
-        Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
-
-    let redemption_view_repo =
-        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-            pool.clone(),
-            "redemption_view".to_string(),
-        ));
-
-    let redemption_query = GenericQuery::new(redemption_view_repo);
-
-    let redemption_cqrs_raw =
-        sqlite_cqrs(pool.clone(), vec![Box::new(redemption_query)], ());
-    let redemption_cqrs = Arc::new(redemption_cqrs_raw);
-
-    let redemption_event_repo = SqliteEventRepository::new(pool.clone());
-    let redemption_event_store =
-        Arc::new(PersistedEventStore::new_event_store(redemption_event_repo));
-
-    seed_initial_assets(&tokenized_asset_cqrs).await?;
-
-    let blockchain_service = config.create_blockchain_service().await?;
-
-    let mint_manager =
-        Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
-
-    let alpaca_service = config.alpaca.service()?;
-    let callback_manager = Arc::new(CallbackManager::new(
-        alpaca_service.clone(),
-        mint_cqrs.clone(),
-    ));
-
-    let redemption_alpaca_manager =
-        Arc::new(AlpacaManager::new(alpaca_service, redemption_cqrs.clone()));
-
-    if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
-        (&config.rpc_url, config.redemption_wallet, config.vault_address)
-    {
-        info!(
-            "WebSocket monitoring task spawned for redemption wallet {redemption_wallet}"
-        );
-
-        let detector = RedemptionDetector::new(
-            rpc_url.clone(),
-            vault_address,
-            redemption_wallet,
-            redemption_cqrs.clone(),
-            redemption_event_store,
-            pool.clone(),
-            redemption_alpaca_manager,
-        );
-
-        tokio::spawn(async move {
-            detector.run().await;
-        });
-    }
+        redeem_call_manager,
+        journal_manager,
+    );
 
     Ok(rocket::build()
         .manage(account_cqrs)
@@ -338,6 +291,151 @@ pub async fn initialize_rocket()
                 mint::confirm_journal
             ],
         ))
+}
+
+async fn setup_basic_cqrs(
+    pool: &Pool<Sqlite>,
+) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), Box<dyn std::error::Error>>
+{
+    let account_view_repo =
+        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+    let account_query = GenericQuery::new(account_view_repo);
+    let account_cqrs =
+        sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
+        TokenizedAssetView,
+        TokenizedAsset,
+    >::new(
+        pool.clone(),
+        "tokenized_asset_view".to_string(),
+    ));
+    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
+    let tokenized_asset_cqrs =
+        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
+
+    seed_initial_assets(&tokenized_asset_cqrs).await?;
+
+    Ok((account_cqrs, tokenized_asset_cqrs))
+}
+
+fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
+    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+        pool.clone(),
+        "mint_view".to_string(),
+    ));
+    let mint_query = GenericQuery::new(mint_view_repo);
+    let mint_cqrs =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+    let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
+        SqliteEventRepository::new(pool.clone()),
+    ));
+
+    let redemption_view_repo =
+        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+            pool.clone(),
+            "redemption_view".to_string(),
+        ));
+    let redemption_query = GenericQuery::new(redemption_view_repo);
+    let redemption_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(redemption_query)],
+        (),
+    ));
+    let redemption_event_store =
+        Arc::new(PersistedEventStore::new_event_store(
+            SqliteEventRepository::new(pool.clone()),
+        ));
+
+    AggregateCqrsSetup {
+        mint_cqrs,
+        mint_event_store,
+        redemption_cqrs,
+        redemption_event_store,
+    }
+}
+
+async fn setup_mint_managers(
+    config: &Config,
+    mint_cqrs: &MintCqrs,
+) -> Result<
+    (
+        Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
+        Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let blockchain_service = config.create_blockchain_service().await?;
+    let mint_manager =
+        Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
+
+    let alpaca_service = config.alpaca.service()?;
+    let callback_manager =
+        Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
+
+    Ok((mint_manager, callback_manager))
+}
+
+fn setup_redemption_managers(
+    config: &Config,
+    redemption_cqrs: &RedemptionCqrs,
+) -> Result<RedemptionManagers, Box<dyn std::error::Error>> {
+    let alpaca_service = config.alpaca.service()?;
+    let redeem_call_manager = Arc::new(RedeemCallManager::new(
+        alpaca_service.clone(),
+        redemption_cqrs.clone(),
+    ));
+    let journal_manager =
+        Arc::new(JournalManager::new(alpaca_service, redemption_cqrs.clone()));
+
+    Ok(RedemptionManagers { redeem_call_manager, journal_manager })
+}
+
+fn spawn_redemption_detector(
+    config: &Config,
+    redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
+    redemption_event_store: Arc<
+        PersistedEventStore<SqliteEventRepository, Redemption>,
+    >,
+    pool: Pool<Sqlite>,
+    redeem_call_manager: Arc<
+        RedeemCallManager<
+            PersistedEventStore<SqliteEventRepository, Redemption>,
+        >,
+    >,
+    journal_manager: Arc<
+        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+) {
+    if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
+        (&config.rpc_url, config.redemption_wallet, config.vault_address)
+    {
+        info!(
+            "WebSocket monitoring task spawned for redemption wallet {redemption_wallet}"
+        );
+
+        let detector_config = RedemptionDetectorConfig {
+            rpc_url: rpc_url.clone(),
+            vault_address,
+            redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            detector_config,
+            redemption_cqrs,
+            redemption_event_store,
+            pool,
+            redeem_call_manager,
+            journal_manager,
+        );
+
+        tokio::spawn(async move {
+            detector.run().await;
+        });
+    }
 }
 
 async fn seed_initial_assets(

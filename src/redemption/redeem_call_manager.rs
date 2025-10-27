@@ -7,12 +7,12 @@ use crate::account::ClientId;
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
-pub(crate) struct AlpacaManager<ES: EventStore<Redemption>> {
+pub(crate) struct RedeemCallManager<ES: EventStore<Redemption>> {
     alpaca_service: Arc<dyn AlpacaService>,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
 }
 
-impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
+impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     pub(crate) const fn new(
         alpaca_service: Arc<dyn AlpacaService>,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
@@ -26,7 +26,7 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
         aggregate: &Redemption,
         client_id: ClientId,
         network: Network,
-    ) -> Result<(), AlpacaManagerError> {
+    ) -> Result<(), RedeemCallManagerError> {
         let Redemption::Detected {
             underlying,
             token,
@@ -36,7 +36,7 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
             ..
         } = aggregate
         else {
-            return Err(AlpacaManagerError::InvalidAggregateState {
+            return Err(RedeemCallManagerError::InvalidAggregateState {
                 current_state: aggregate.state_name().to_string(),
             });
         };
@@ -122,14 +122,14 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
                     "RecordAlpacaFailure command executed successfully"
                 );
 
-                Err(AlpacaManagerError::Alpaca(e))
+                Err(RedeemCallManagerError::Alpaca(e))
             }
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AlpacaManagerError {
+pub(crate) enum RedeemCallManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
     #[error("CQRS error: {0}")]
@@ -145,7 +145,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::sync::Arc;
 
-    use super::{AlpacaManager, AlpacaManagerError};
+    use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::ClientId;
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
@@ -208,7 +208,7 @@ mod tests {
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-success-123");
         let aggregate = create_test_redemption_in_detected_state(
@@ -250,7 +250,7 @@ mod tests {
             Arc::new(MockAlpacaService::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-failure-456");
         let aggregate = create_test_redemption_in_detected_state(
@@ -273,7 +273,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(AlpacaManagerError::Alpaca(_))),
+            matches!(result, Err(RedeemCallManagerError::Alpaca(_))),
             "Expected Alpaca error, got {result:?}"
         );
 
@@ -297,7 +297,7 @@ mod tests {
         let (cqrs, _store) = setup_test_cqrs();
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-wrong-state-789");
         let aggregate = Redemption::Uninitialized;
@@ -317,7 +317,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(AlpacaManagerError::InvalidAggregateState { .. })
+                Err(RedeemCallManagerError::InvalidAggregateState { .. })
             ),
             "Expected InvalidAggregateState error, got {result:?}"
         );

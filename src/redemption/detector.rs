@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol_types::SolEvent;
@@ -7,21 +5,34 @@ use alloy::transports::RpcError;
 use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 use tracing::{info, warn};
 use url::Url;
 
-use crate::account::view::{AccountViewError, find_by_wallet};
+use super::{
+    Redemption, RedemptionCommand, RedemptionError,
+    journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
+};
+use crate::account::{
+    ClientId,
+    view::{AccountViewError, find_by_wallet},
+};
 use crate::bindings;
-use crate::tokenized_asset::TokenizedAssetView;
+use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
+use crate::tokenized_asset::{
+    Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
+};
 use crate::{Quantity, QuantityConversionError};
 
-use super::{
-    Redemption, RedemptionCommand, RedemptionError,
-    alpaca_manager::AlpacaManager,
-};
+/// Configuration parameters for the redemption detector.
+pub(crate) struct RedemptionDetectorConfig {
+    pub(crate) rpc_url: Url,
+    pub(crate) vault_address: Address,
+    pub(crate) redemption_wallet: Address,
+}
 
 /// Orchestrates the WebSocket monitoring process for redemption detection.
 ///
@@ -35,38 +46,41 @@ pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
     event_store: Arc<ES>,
     pool: Pool<Sqlite>,
-    alpaca_manager: Arc<AlpacaManager<ES>>,
+    redeem_call_manager: Arc<RedeemCallManager<ES>>,
+    journal_manager: Arc<JournalManager<ES>>,
 }
 
-impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
+impl<ES: EventStore<Redemption> + 'static> RedemptionDetector<ES>
+where
+    ES::AC: Send,
+{
     /// Creates a new redemption detector.
     ///
     /// # Arguments
     ///
-    /// * `rpc_url` - WebSocket RPC endpoint URL
-    /// * `vault_address` - Address of the OffchainAssetReceiptVault contract
-    /// * `redemption_wallet` - Address where APs send tokens to initiate redemption
+    /// * `config` - Configuration parameters (RPC URL, addresses)
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
     /// * `event_store` - Event store for loading aggregates
     /// * `pool` - Database connection pool for querying tokenized assets
-    /// * `alpaca_manager` - Manager for handling Alpaca redeem calls
-    pub(crate) const fn new(
-        rpc_url: Url,
-        vault_address: Address,
-        redemption_wallet: Address,
+    /// * `redeem_call_manager` - Manager for handling Alpaca redeem API calls
+    /// * `journal_manager` - Manager for polling Alpaca journal status
+    pub(crate) fn new(
+        config: RedemptionDetectorConfig,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
         event_store: Arc<ES>,
         pool: Pool<Sqlite>,
-        alpaca_manager: Arc<AlpacaManager<ES>>,
+        redeem_call_manager: Arc<RedeemCallManager<ES>>,
+        journal_manager: Arc<JournalManager<ES>>,
     ) -> Self {
         Self {
-            rpc_url,
-            vault_address,
-            redemption_wallet,
+            rpc_url: config.rpc_url,
+            vault_address: config.vault_address,
+            redemption_wallet: config.redemption_wallet,
             cqrs,
             event_store,
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         }
     }
 
@@ -140,9 +154,33 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
             "Transfer event decoded"
         );
 
+        let (underlying, token, network) = self.find_matching_asset().await?;
+
+        let issuer_request_id = self
+            .create_redemption_detection(
+                &transfer_event,
+                log,
+                underlying,
+                token,
+            )
+            .await?;
+
+        let client_id =
+            self.get_account_client_id(&transfer_event.from).await?;
+
+        self.handle_alpaca_and_polling(issuer_request_id, client_id, network)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn find_matching_asset(
+        &self,
+    ) -> Result<(UnderlyingSymbol, TokenSymbol, Network), RedemptionMonitorError>
+    {
         let assets = list_enabled_assets(&self.pool).await?;
 
-        let (underlying, token, network) = assets
+        assets
             .into_iter()
             .find_map(|view| match view {
                 TokenizedAssetView::Asset {
@@ -158,8 +196,16 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
             })
             .ok_or(RedemptionMonitorError::NoMatchingAsset {
                 vault_address: self.vault_address,
-            })?;
+            })
+    }
 
+    async fn create_redemption_detection(
+        &self,
+        transfer_event: &bindings::OffchainAssetReceiptVault::Transfer,
+        log: &alloy::rpc::types::Log,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+    ) -> Result<IssuerRequestId, RedemptionMonitorError> {
         let tx_hash = log
             .transaction_hash
             .ok_or(RedemptionMonitorError::MissingTxHash)?;
@@ -186,34 +232,46 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
             block_number,
         };
 
-        let issuer_request_id_str = &issuer_request_id.0;
-
-        self.cqrs.execute(issuer_request_id_str, command).await?;
+        self.cqrs.execute(&issuer_request_id.0, command).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id.0,
             "Redemption detection recorded successfully"
         );
 
-        let account_view = find_by_wallet(&self.pool, &transfer_event.from)
-            .await?
-            .ok_or(RedemptionMonitorError::AccountNotFound {
-                wallet: transfer_event.from,
-            })?;
+        Ok(issuer_request_id)
+    }
+
+    async fn get_account_client_id(
+        &self,
+        wallet: &Address,
+    ) -> Result<ClientId, RedemptionMonitorError> {
+        let account_view = find_by_wallet(&self.pool, wallet).await?.ok_or(
+            RedemptionMonitorError::AccountNotFound { wallet: *wallet },
+        )?;
 
         let crate::account::AccountView::Account { client_id, .. } =
             account_view
         else {
             return Err(RedemptionMonitorError::AccountNotLinked {
-                wallet: transfer_event.from,
+                wallet: *wallet,
             });
         };
 
+        Ok(client_id)
+    }
+
+    async fn handle_alpaca_and_polling(
+        &self,
+        issuer_request_id: IssuerRequestId,
+        client_id: ClientId,
+        network: Network,
+    ) -> Result<(), RedemptionMonitorError> {
         let aggregate_ctx =
             self.event_store.load_aggregate(&issuer_request_id.0).await?;
 
         if let Err(e) = self
-            .alpaca_manager
+            .redeem_call_manager
             .handle_redemption_detected(
                 &issuer_request_id,
                 aggregate_ctx.aggregate(),
@@ -223,11 +281,40 @@ impl<ES: EventStore<Redemption>> RedemptionDetector<ES> {
             .await
         {
             warn!(
-                issuer_request_id = %issuer_request_id_str,
+                issuer_request_id = %issuer_request_id.0,
                 error = ?e,
                 "handle_redemption_detected failed"
             );
+            return Ok(());
         }
+
+        let aggregate_ctx =
+            self.event_store.load_aggregate(&issuer_request_id.0).await?;
+
+        let Redemption::AlpacaCalled { tokenization_request_id, .. } =
+            aggregate_ctx.aggregate()
+        else {
+            return Ok(());
+        };
+
+        let journal_manager = self.journal_manager.clone();
+        let issuer_request_id_cloned = issuer_request_id.clone();
+        let tokenization_request_id_cloned = tokenization_request_id.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = journal_manager
+                .handle_alpaca_called(
+                    issuer_request_id_cloned,
+                    tokenization_request_id_cloned,
+                )
+                .await
+            {
+                warn!(
+                    error = ?e,
+                    "handle_alpaca_called (journal polling) failed"
+                );
+            }
+        });
 
         Ok(())
     }
@@ -275,7 +362,10 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use super::{AlpacaManager, RedemptionDetector, RedemptionMonitorError};
+    use super::{
+        JournalManager, RedeemCallManager, RedemptionDetector,
+        RedemptionDetectorConfig, RedemptionMonitorError,
+    };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
@@ -395,17 +485,26 @@ mod tests {
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let alpaca_manager =
-            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+        ));
+        let journal_manager =
+            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
 
-        let detector = RedemptionDetector::new(
-            "wss://fake.url".parse().unwrap(),
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
             cqrs.clone(),
             store.clone(),
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         );
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
@@ -452,17 +551,26 @@ mod tests {
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let alpaca_manager =
-            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+        ));
+        let journal_manager =
+            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
 
-        let detector = RedemptionDetector::new(
-            "wss://fake.url".parse().unwrap(),
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
             cqrs,
             store,
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         );
 
         let mut log = create_transfer_log(
@@ -497,17 +605,26 @@ mod tests {
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let alpaca_manager =
-            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+        ));
+        let journal_manager =
+            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
 
-        let detector = RedemptionDetector::new(
-            "wss://fake.url".parse().unwrap(),
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
             cqrs,
             store,
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         );
 
         let mut log = create_transfer_log(
@@ -544,17 +661,26 @@ mod tests {
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let alpaca_manager =
-            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+        ));
+        let journal_manager =
+            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
 
-        let detector = RedemptionDetector::new(
-            "wss://fake.url".parse().unwrap(),
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
             cqrs,
             store,
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         );
 
         let log = create_transfer_log(
@@ -590,17 +716,26 @@ mod tests {
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let alpaca_manager =
-            Arc::new(AlpacaManager::new(alpaca_service, cqrs.clone()));
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+        ));
+        let journal_manager =
+            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
 
-        let detector = RedemptionDetector::new(
-            "wss://fake.url".parse().unwrap(),
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
             vault_address,
             redemption_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
             cqrs,
             store,
             pool,
-            alpaca_manager,
+            redeem_call_manager,
+            journal_manager,
         );
 
         let tx_hash = b256!(

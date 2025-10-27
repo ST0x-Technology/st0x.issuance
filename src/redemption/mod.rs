@@ -2,8 +2,9 @@ mod cmd;
 mod event;
 mod view;
 
-pub(crate) mod alpaca_manager;
 pub(crate) mod detector;
+pub(crate) mod journal_manager;
+pub(crate) mod redeem_call_manager;
 
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
@@ -256,6 +257,15 @@ impl Aggregate for Redemption {
                 Ok(vec![RedemptionEvent::AlpacaJournalCompleted {
                     issuer_request_id,
                     alpaca_completed_at: now,
+                }])
+            }
+            RedemptionCommand::MarkFailed { issuer_request_id, reason } => {
+                let now = Utc::now();
+
+                Ok(vec![RedemptionEvent::RedemptionFailed {
+                    issuer_request_id,
+                    reason,
+                    failed_at: now,
                 }])
             }
         }

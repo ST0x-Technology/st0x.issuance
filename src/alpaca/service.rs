@@ -285,7 +285,7 @@ impl AlpacaService for RealAlpacaService {
                     list_response
                         .requests
                         .into_iter()
-                        .find(|req| &req.tokenization_request_id == tokenization_request_id)
+                        .find(|req| &req.id == tokenization_request_id)
                         .map(|req| req.status)
                         .ok_or_else(|| AlpacaError::RequestNotFound {
                             tokenization_request_id: tokenization_request_id.0.clone(),
