@@ -185,15 +185,15 @@ Add the `poll_request_status()` method to query Alpaca's request list endpoint.
 
 **Subtasks:**
 
-- [ ] Add `RequestsListResponse` type to represent the list endpoint response
-- [ ] Add `poll_request_status()` method signature to `AlpacaService` trait
-- [ ] Implement method in `AlpacaHttpService` to call GET endpoint
-- [ ] Add filtering logic to find request by `tokenization_request_id`
-- [ ] Handle case where request is not found in list
-- [ ] Add mock implementation in `MockAlpacaService` for testing
-- [ ] Add unit tests for response parsing
-- [ ] Add unit tests for filtering logic
-- [ ] Add unit tests for not-found case
+- [x] Add `RequestsListResponse` type to represent the list endpoint response
+- [x] Add `poll_request_status()` method signature to `AlpacaService` trait
+- [x] Implement method in `AlpacaHttpService` to call GET endpoint
+- [x] Add filtering logic to find request by `tokenization_request_id`
+- [x] Handle case where request is not found in list
+- [x] Add mock implementation in `MockAlpacaService` for testing
+- [x] Add unit tests for response parsing
+- [x] Add unit tests for filtering logic
+- [x] Add unit tests for not-found case
 
 **Files Modified:**
 

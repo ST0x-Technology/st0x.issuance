@@ -41,6 +41,28 @@ pub(crate) trait AlpacaService: Send + Sync {
         &self,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
+
+    /// Polls Alpaca's request list endpoint to check the status of a tokenization request.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokenization_request_id` - ID of the tokenization request to poll
+    ///
+    /// # Returns
+    ///
+    /// Returns the current status of the request (Pending, Completed, or Rejected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] if:
+    /// - The HTTP request fails
+    /// - Authentication fails
+    /// - The request is not found in the list
+    /// - Alpaca returns an error response
+    async fn poll_request_status(
+        &self,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<RedeemRequestStatus, AlpacaError>;
 }
 
 /// Request payload for Alpaca's mint callback endpoint.
@@ -130,20 +152,55 @@ pub(crate) enum RedeemRequestStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Fees(pub(crate) Decimal);
 
+/// Response from Alpaca's tokenization requests list endpoint.
+///
+/// This struct deserializes the JSON response from:
+/// `GET /v1/accounts/{account_id}/tokenization/requests`
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RequestsListResponse {
+    pub(crate) requests: Vec<TokenizationRequest>,
+}
+
+/// Individual tokenization request from the list endpoint.
+///
+/// This is similar to `RedeemResponse` but represents the generic format
+/// returned by the list endpoint (which can include both mint and redeem requests).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TokenizationRequest {
+    pub(crate) tokenization_request_id: TokenizationRequestId,
+    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) created_at: DateTime<Utc>,
+    #[serde(rename = "type")]
+    pub(crate) request_type: RedeemRequestType,
+    pub(crate) status: RedeemRequestStatus,
+    #[serde(rename = "underlying_symbol")]
+    pub(crate) underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    pub(crate) token: TokenSymbol,
+    pub(crate) qty: Quantity,
+    pub(crate) issuer: String,
+    pub(crate) network: Network,
+    #[serde(rename = "wallet_address")]
+    pub(crate) wallet: Address,
+    pub(crate) tx_hash: B256,
+    pub(crate) fees: Fees,
+}
+
 /// Errors that can occur during Alpaca API operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaError {
     /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {message}")]
     Http { message: String },
-
     /// Authentication failed (401/403 response)
     #[error("Authentication failed: {reason}")]
     Auth { reason: String },
-
     /// Alpaca API returned an error response
     #[error("API error: {status_code} - {message}")]
     Api { status_code: u16, message: String },
+    /// Tokenization request not found when polling status
+    #[error("Tokenization request not found: {tokenization_request_id}")]
+    RequestNotFound { tokenization_request_id: String },
 }
 
 #[cfg(test)]
