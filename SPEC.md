@@ -785,7 +785,7 @@ sequenceDiagram
         Alpaca->>Us: {status: "pending" | "completed"}
     end
 
-    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted
+    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted<br/>Status: burning
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
     Blockchain->>Us: Transaction confirmed
@@ -947,11 +947,17 @@ tokenization account to the AP's account.
 
 **Polling Strategy:**
 
-- Start with 5-second intervals
+- Start with 250ms intervals
 - Exponential backoff up to 30-second max
 - Timeout after 1 hour
-- Update database status to `alpaca_completed` when status is "completed"
+- Execute `ConfirmAlpacaComplete` command when status is "completed"
 - Handle "rejected" status by marking redemption as failed
+
+**On Completion:** A polling manager listens for `AlpacaCalled` events, polls
+until the status is "completed", then executes the `ConfirmAlpacaComplete`
+command. This produces the `AlpacaJournalCompleted` event and transitions the
+aggregate to `Burning` state. A burn manager then orchestrates the on-chain
+token burning.
 
 #### Step 4: Burn Tokens On-Chain
 
@@ -1009,10 +1015,8 @@ stateDiagram-v2
     [*] --> Detected: DetectRedemption
     Detected --> AlpacaCalled: RecordAlpacaCall
     Detected --> Failed: Error
-    AlpacaCalled --> AlpacaCompleted: ConfirmAlpacaComplete
+    AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure
-    AlpacaCompleted --> Burning: BurningStarted
-    AlpacaCompleted --> Failed: Error
     Burning --> Completed: RecordBurnSuccess
     Burning --> Failed: RecordBurnFailure
     Failed --> [*]
@@ -1041,7 +1045,6 @@ struct StoredRedemption {
 enum RedemptionStatus {
     Detected,
     AlpacaCalled,
-    AlpacaCompleted,
     Burning,
     Completed,
     Failed(String),
