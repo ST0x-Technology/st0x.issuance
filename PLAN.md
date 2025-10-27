@@ -148,19 +148,19 @@ completion.
 
 **Subtasks:**
 
-- [ ] Add `Burning` state variant to `Redemption` enum with all necessary fields
-- [ ] Add `AlpacaJournalCompleted` event to `RedemptionEvent` enum
-- [ ] Add `ConfirmAlpacaComplete` command to `RedemptionCommand` enum
-- [ ] Implement command handler for `ConfirmAlpacaComplete` that produces
+- [x] Add `Burning` state variant to `Redemption` enum with all necessary fields
+- [x] Add `AlpacaJournalCompleted` event to `RedemptionEvent` enum
+- [x] Add `ConfirmAlpacaComplete` command to `RedemptionCommand` enum
+- [x] Implement command handler for `ConfirmAlpacaComplete` that produces
       `AlpacaJournalCompleted` event
-- [ ] Implement `apply()` logic for `AlpacaJournalCompleted` event (transition
+- [x] Implement `apply()` logic for `AlpacaJournalCompleted` event (transition
       to `Burning` state)
-- [ ] Update `state_name()` helper to include `Burning` state
-- [ ] Add unit tests for command handler (given AlpacaCalled, when
+- [x] Update `state_name()` helper to include `Burning` state
+- [x] Add unit tests for command handler (given AlpacaCalled, when
       ConfirmAlpacaComplete, then expect AlpacaJournalCompleted event)
-- [ ] Add unit tests for invalid state transitions (e.g., ConfirmAlpacaComplete
+- [x] Add unit tests for invalid state transitions (e.g., ConfirmAlpacaComplete
       from wrong state)
-- [ ] Add unit tests for event application (verify transition to Burning state)
+- [x] Add unit tests for event application (verify transition to Burning state)
 
 **Files Modified:**
 
@@ -250,13 +250,13 @@ Extend the view to process the new event and maintain query state.
 
 **Subtasks:**
 
-- [ ] Add `alpaca_completed_at` field to view payload (records when Alpaca
+- [x] Add `alpaca_completed_at` field to view payload (records when Alpaca
       journal completed)
-- [ ] Add `Burning` status variant to view's status enum
-- [ ] Implement `update()` logic for `AlpacaJournalCompleted` event (transition
+- [x] Add `Burning` status variant to view's status enum
+- [x] Implement `update()` logic for `AlpacaJournalCompleted` event (transition
       to Burning status)
-- [ ] Add unit tests for view updates with new event
-- [ ] Verify view queries work correctly with Burning status
+- [x] Add unit tests for view updates with new event
+- [x] Verify view queries work correctly with Burning status
 
 **Files Modified:**
 

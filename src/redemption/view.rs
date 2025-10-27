@@ -32,6 +32,19 @@ pub(crate) enum RedemptionView {
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
     },
+    Burning {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+        alpaca_completed_at: DateTime<Utc>,
+    },
     Failed {
         issuer_request_id: IssuerRequestId,
         reason: String,
@@ -42,6 +55,78 @@ pub(crate) enum RedemptionView {
 impl Default for RedemptionView {
     fn default() -> Self {
         Self::Unavailable
+    }
+}
+
+impl RedemptionView {
+    fn update_alpaca_called(
+        &mut self,
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        called_at: DateTime<Utc>,
+    ) {
+        let Self::Detected {
+            underlying,
+            token,
+            wallet,
+            quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        *self = Self::AlpacaCalled {
+            issuer_request_id,
+            tokenization_request_id,
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            tx_hash: *tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+            called_at,
+        };
+    }
+
+    fn update_alpaca_journal_completed(
+        &mut self,
+        issuer_request_id: IssuerRequestId,
+        alpaca_completed_at: DateTime<Utc>,
+    ) {
+        let Self::AlpacaCalled {
+            tokenization_request_id,
+            underlying,
+            token,
+            wallet,
+            quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        *self = Self::Burning {
+            issuer_request_id,
+            tokenization_request_id: tokenization_request_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            tx_hash: *tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+            called_at: *called_at,
+            alpaca_completed_at,
+        };
     }
 }
 
@@ -74,32 +159,11 @@ impl View<Redemption> for RedemptionView {
                 tokenization_request_id,
                 called_at,
             } => {
-                let Self::Detected {
-                    underlying,
-                    token,
-                    wallet,
-                    quantity,
-                    tx_hash,
-                    block_number,
-                    detected_at,
-                    ..
-                } = self
-                else {
-                    return;
-                };
-
-                *self = Self::AlpacaCalled {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    underlying: underlying.clone(),
-                    token: token.clone(),
-                    wallet: *wallet,
-                    quantity: quantity.clone(),
-                    tx_hash: *tx_hash,
-                    block_number: *block_number,
-                    detected_at: *detected_at,
-                    called_at: *called_at,
-                };
+                self.update_alpaca_called(
+                    issuer_request_id.clone(),
+                    tokenization_request_id.clone(),
+                    *called_at,
+                );
             }
             RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id,
@@ -111,6 +175,15 @@ impl View<Redemption> for RedemptionView {
                     reason: error.clone(),
                     failed_at: *failed_at,
                 };
+            }
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id,
+                alpaca_completed_at,
+            } => {
+                self.update_alpaca_journal_completed(
+                    issuer_request_id.clone(),
+                    *alpaca_completed_at,
+                );
             }
             RedemptionEvent::RedemptionFailed {
                 issuer_request_id,

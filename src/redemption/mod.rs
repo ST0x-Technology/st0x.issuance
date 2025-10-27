@@ -43,6 +43,19 @@ pub(crate) enum Redemption {
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
     },
+    Burning {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        detected_tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+        alpaca_completed_at: DateTime<Utc>,
+    },
     Failed {
         issuer_request_id: IssuerRequestId,
         reason: String,
@@ -62,8 +75,79 @@ impl Redemption {
             Self::Uninitialized => "Uninitialized",
             Self::Detected { .. } => "Detected",
             Self::AlpacaCalled { .. } => "AlpacaCalled",
+            Self::Burning { .. } => "Burning",
             Self::Failed { .. } => "Failed",
         }
+    }
+
+    fn apply_alpaca_called(
+        &mut self,
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        called_at: DateTime<Utc>,
+    ) {
+        let Self::Detected {
+            underlying,
+            token,
+            wallet,
+            quantity,
+            detected_tx_hash,
+            block_number,
+            detected_at,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        *self = Self::AlpacaCalled {
+            issuer_request_id,
+            tokenization_request_id,
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            detected_tx_hash: *detected_tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+            called_at,
+        };
+    }
+
+    fn apply_alpaca_journal_completed(
+        &mut self,
+        issuer_request_id: IssuerRequestId,
+        alpaca_completed_at: DateTime<Utc>,
+    ) {
+        let Self::AlpacaCalled {
+            tokenization_request_id,
+            underlying,
+            token,
+            wallet,
+            quantity,
+            detected_tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        *self = Self::Burning {
+            issuer_request_id,
+            tokenization_request_id: tokenization_request_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            detected_tx_hash: *detected_tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+            called_at: *called_at,
+            alpaca_completed_at,
+        };
     }
 }
 
@@ -159,6 +243,21 @@ impl Aggregate for Redemption {
                     failed_at: now,
                 }])
             }
+            RedemptionCommand::ConfirmAlpacaComplete { issuer_request_id } => {
+                if !matches!(self, Self::AlpacaCalled { .. }) {
+                    return Err(RedemptionError::InvalidState {
+                        expected: "AlpacaCalled".to_string(),
+                        found: self.state_name().to_string(),
+                    });
+                }
+
+                let now = Utc::now();
+
+                Ok(vec![RedemptionEvent::AlpacaJournalCompleted {
+                    issuer_request_id,
+                    alpaca_completed_at: now,
+                }])
+            }
         }
     }
 
@@ -190,32 +289,11 @@ impl Aggregate for Redemption {
                 tokenization_request_id,
                 called_at,
             } => {
-                let Self::Detected {
-                    underlying,
-                    token,
-                    wallet,
-                    quantity,
-                    detected_tx_hash,
-                    block_number,
-                    detected_at,
-                    ..
-                } = self
-                else {
-                    return;
-                };
-
-                *self = Self::AlpacaCalled {
+                self.apply_alpaca_called(
                     issuer_request_id,
                     tokenization_request_id,
-                    underlying: underlying.clone(),
-                    token: token.clone(),
-                    wallet: *wallet,
-                    quantity: quantity.clone(),
-                    detected_tx_hash: *detected_tx_hash,
-                    block_number: *block_number,
-                    detected_at: *detected_at,
                     called_at,
-                };
+                );
             }
             RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id,
@@ -227,6 +305,15 @@ impl Aggregate for Redemption {
                     reason: error,
                     failed_at,
                 };
+            }
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id,
+                alpaca_completed_at,
+            } => {
+                self.apply_alpaca_journal_completed(
+                    issuer_request_id,
+                    alpaca_completed_at,
+                );
             }
             RedemptionEvent::RedemptionFailed {
                 issuer_request_id,
@@ -513,5 +600,145 @@ mod tests {
                 expected: "Detected".to_string(),
                 found: "Uninitialized".to_string(),
             });
+    }
+
+    #[test]
+    fn test_confirm_alpaca_complete_from_alpaca_called_state() {
+        use crate::mint::TokenizationRequestId;
+
+        let issuer_request_id = IssuerRequestId::new("red-complete-123");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-complete-456");
+
+        let validator = RedemptionTestFramework::with(())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    tx_hash: b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                    block_number: 12345,
+                    detected_at: Utc::now(),
+                },
+                RedemptionEvent::AlpacaCalled {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    called_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::ConfirmAlpacaComplete {
+                issuer_request_id: issuer_request_id.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::AlpacaJournalCompleted {
+            issuer_request_id: event_id,
+            alpaca_completed_at,
+        } = &events[0]
+        else {
+            panic!(
+                "Expected AlpacaJournalCompleted event, got {:?}",
+                &events[0]
+            );
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert!(alpaca_completed_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_confirm_alpaca_complete_from_wrong_state_fails() {
+        let issuer_request_id = IssuerRequestId::new("red-complete-wrong-123");
+
+        RedemptionTestFramework::with(())
+            .given_no_previous_events()
+            .when(RedemptionCommand::ConfirmAlpacaComplete {
+                issuer_request_id,
+            })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "AlpacaCalled".to_string(),
+                found: "Uninitialized".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_apply_alpaca_journal_completed_transitions_to_burning() {
+        use crate::mint::TokenizationRequestId;
+
+        let mut redemption = Redemption::default();
+
+        let issuer_request_id = IssuerRequestId::new("red-burning-123");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-burning-456");
+        let underlying = UnderlyingSymbol::new("TSLA");
+        let token = TokenSymbol::new("tTSLA");
+        let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
+        let quantity = Quantity::new(Decimal::from(50));
+        let tx_hash = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let block_number = 54321;
+        let detected_at = Utc::now();
+        let called_at = Utc::now();
+        let alpaca_completed_at = Utc::now();
+
+        redemption.apply(RedemptionEvent::Detected {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet,
+            quantity: quantity.clone(),
+            tx_hash,
+            block_number,
+            detected_at,
+        });
+
+        redemption.apply(RedemptionEvent::AlpacaCalled {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            called_at,
+        });
+
+        redemption.apply(RedemptionEvent::AlpacaJournalCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            alpaca_completed_at,
+        });
+
+        let Redemption::Burning {
+            issuer_request_id: state_id,
+            tokenization_request_id: state_tok_id,
+            underlying: state_underlying,
+            token: state_token,
+            wallet: state_wallet,
+            quantity: state_quantity,
+            detected_tx_hash: state_tx_hash,
+            block_number: state_block_number,
+            detected_at: state_detected_at,
+            called_at: state_called_at,
+            alpaca_completed_at: state_alpaca_completed_at,
+        } = redemption
+        else {
+            panic!("Expected Burning state, got {redemption:?}");
+        };
+
+        assert_eq!(state_id, issuer_request_id);
+        assert_eq!(state_tok_id, tokenization_request_id);
+        assert_eq!(state_underlying, underlying);
+        assert_eq!(state_token, token);
+        assert_eq!(state_wallet, wallet);
+        assert_eq!(state_quantity, quantity);
+        assert_eq!(state_tx_hash, tx_hash);
+        assert_eq!(state_block_number, block_number);
+        assert_eq!(state_detected_at, detected_at);
+        assert_eq!(state_called_at, called_at);
+        assert_eq!(state_alpaca_completed_at, alpaca_completed_at);
     }
 }

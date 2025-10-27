@@ -28,6 +28,10 @@ pub(crate) enum RedemptionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    AlpacaJournalCompleted {
+        issuer_request_id: IssuerRequestId,
+        alpaca_completed_at: DateTime<Utc>,
+    },
     RedemptionFailed {
         issuer_request_id: IssuerRequestId,
         reason: String,
@@ -44,6 +48,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::AlpacaCallFailed { .. } => {
                 "RedemptionEvent::AlpacaCallFailed".to_string()
+            }
+            Self::AlpacaJournalCompleted { .. } => {
+                "RedemptionEvent::AlpacaJournalCompleted".to_string()
             }
             Self::RedemptionFailed { .. } => {
                 "RedemptionEvent::RedemptionFailed".to_string()

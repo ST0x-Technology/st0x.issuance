@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use std::sync::Arc;
 use tracing::{info, warn};
 
+use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::account::ClientId;
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
-
-use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 
 pub(crate) struct AlpacaManager<ES: EventStore<Redemption>> {
     alpaca_service: Arc<dyn AlpacaService>,
@@ -39,7 +37,7 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
         } = aggregate
         else {
             return Err(AlpacaManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(aggregate).to_string(),
+                current_state: aggregate.state_name().to_string(),
             });
         };
 
@@ -130,42 +128,29 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
     }
 }
 
-const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
-    match aggregate {
-        Redemption::Uninitialized => "Uninitialized",
-        Redemption::Detected { .. } => "Detected",
-        Redemption::AlpacaCalled { .. } => "AlpacaCalled",
-        Redemption::Failed { .. } => "Failed",
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
-
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use alloy::primitives::{address, b256};
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
+    use std::sync::Arc;
 
+    use super::{AlpacaManager, AlpacaManagerError};
     use crate::account::ClientId;
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
     use crate::redemption::{Redemption, RedemptionCommand, UnderlyingSymbol};
     use crate::tokenized_asset::{Network, TokenSymbol};
-
-    use super::{AlpacaManager, AlpacaManagerError};
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
