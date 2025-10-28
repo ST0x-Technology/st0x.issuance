@@ -41,62 +41,62 @@ Tests interact only through the public HTTP API.
 **Desired state**: Tests call LocalEvm::new() to get a configured Anvil
 environment with deployed vault contracts.
 
-- [ ] Add required imports to test_utils.rs
-- [ ] Define LocalEvmError enum
-- [ ] Define LocalEvm struct:
+- [x] Add required imports to test_utils.rs
+- [x] Define LocalEvmError enum
+- [x] Define LocalEvm struct:
   - `_anvil: AnvilInstance`
   - `pub vault_address: Address`
+  - `pub authorizer_address: Address`
   - `pub wallet_address: Address`
   - `pub private_key: B256`
   - `pub endpoint: String`
-- [ ] Implement LocalEvm::new() method
-- [ ] Implement LocalEvm::deploy_vault() private helper method
-- [ ] Implement LocalEvm::private_key_hex() method returning String
+- [x] Implement LocalEvm::new() method
+- [x] Implement LocalEvm::deploy_vault() private helper method
+- [x] Implement LocalEvm::private_key_hex() method returning String
+- [x] Implement LocalEvm::grant_deposit_role() method
 
 ### LocalEvm::new() Implementation
 
-- [ ] Spawn Anvil instance
-- [ ] Get WebSocket endpoint
-- [ ] Get first Anvil pre-funded key as B256
-- [ ] Create PrivateKeySigner from key
-- [ ] Get wallet address from signer
-- [ ] Create EthereumWallet from signer
-- [ ] Create provider with wallet attached
-- [ ] Call deploy_vault() with provider and wallet address
-- [ ] Return LocalEvm struct
+- [x] Spawn Anvil instance
+- [x] Get WebSocket endpoint
+- [x] Get first Anvil pre-funded key as B256
+- [x] Create PrivateKeySigner from key
+- [x] Get wallet address from signer
+- [x] Create EthereumWallet from signer
+- [x] Create provider with wallet attached
+- [x] Call deploy_vault() with provider and wallet address
+- [x] Return LocalEvm struct
 
 ### LocalEvm::deploy_vault() Implementation
 
 Follow lib/ethgild/script/Deploy.sol and
 lib/ethgild/test/lib/LibOffchainAssetVaultCreator.sol:
 
-- [ ] Deploy Receipt implementation
-- [ ] Deploy CloneFactory
-- [ ] Deploy OffchainAssetReceiptVault implementation with
+- [x] Deploy Receipt implementation
+- [x] Deploy CloneFactory
+- [x] Deploy OffchainAssetReceiptVault implementation with
       ReceiptVaultConstructionConfigV2
-- [ ] Deploy OffchainAssetReceiptVaultAuthorizerV1 implementation
-- [ ] Encode vault init data: (admin, (asset, name, symbol))
-- [ ] Call factory.clone(vault_impl, init_data).from(admin).send()
-- [ ] Parse NewClone event to get vault address
-- [ ] Encode authorizer init data: (admin)
-- [ ] Call factory.clone(authorizer_impl, init_data).from(admin).send()
-- [ ] Parse NewClone event to get authorizer address
-- [ ] Grant DEPOSIT role: authorizer.grantRole(keccak256("DEPOSIT"),
+- [x] Deploy OffchainAssetReceiptVaultAuthorizerV1 implementation
+- [x] Encode vault init data: (admin, (asset, name, symbol))
+- [x] Call factory.clone(vault_impl, init_data).from(admin).send()
+- [x] Parse NewClone event to get vault address
+- [x] Encode authorizer init data: (admin)
+- [x] Call factory.clone(authorizer_impl, init_data).from(admin).send()
+- [x] Parse NewClone event to get authorizer address
+- [x] Grant DEPOSIT role: authorizer.grantRole(keccak256("DEPOSIT"),
       admin).from(admin).send()
-- [ ] Grant WITHDRAW role: authorizer.grantRole(keccak256("WITHDRAW"),
-      admin).from(admin).send()
-- [ ] Set authorizer: vault.setAuthorizer(authorizer_address).from(admin).send()
-- [ ] Return vault address
+- [x] Set authorizer: vault.setAuthorizer(authorizer_address).from(admin).send()
+- [x] Return vault and authorizer addresses
 
 ## Task 3. Verify Deployment and Authorization
 
 **Desired state**: Vault deploys successfully with admin having DEPOSIT/WITHDRAW
 roles, enabling on-chain minting.
 
-- [ ] Run e2e mint test
-- [ ] Verify deployment completes without errors
-- [ ] Verify deposit transaction succeeds
-- [ ] Verify Deposit event is emitted with correct data
+- [x] Run e2e mint test
+- [x] Verify deployment completes without errors
+- [x] Verify deposit transaction succeeds
+- [x] Verify Deposit event is emitted with correct data
 
 ## Task 4. Verify E2E Mint Flow
 

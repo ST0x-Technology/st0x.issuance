@@ -198,7 +198,7 @@ impl LocalEvm {
     /// - Any contract deployment step fails
     pub async fn new() -> Result<Self, LocalEvmError> {
         let anvil = Anvil::new().spawn();
-        let endpoint = anvil.endpoint();
+        let endpoint = anvil.ws_endpoint();
 
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let signer = PrivateKeySigner::from_bytes(&private_key)
