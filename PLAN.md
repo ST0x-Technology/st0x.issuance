@@ -55,39 +55,39 @@ bot.
   - gRPC protocol for efficient trace export to HyperDX
 - Only service/crate name changes needed for issuance bot context
 
-## Task 3. Create env module with Env/Config types
+## Task 3. Create config module with Env/Config types
 
-Create `src/env.rs` module following the liquidity-b pattern where `Env` handles
-parsing and `Config` has properly typed fields.
+Create `src/config.rs` module following the liquidity-b pattern where `Env`
+handles parsing and `Config` has properly typed fields.
 
-- [ ] Create `src/env.rs` file
-- [ ] Create `LogLevel` enum with `Trace`, `Debug`, `Info`, `Warn`, `Error`
+- [x] Create `src/config.rs` file
+- [x] Create `LogLevel` enum with `Trace`, `Debug`, `Info`, `Warn`, `Error`
       variants and `#[derive(clap::ValueEnum, Debug, Clone)]`
-- [ ] Implement `From<LogLevel>` and `From<&LogLevel>` for `tracing::Level`
-- [ ] Create `HyperDxEnv` struct with `#[derive(Parser, Debug, Clone)]`:
+- [x] Implement `From<LogLevel>` and `From<&LogLevel>` for `tracing::Level`
+- [x] Create `HyperDxEnv` struct with `#[derive(Parser, Debug, Clone)]`:
   - `hyperdx_api_key: Option<String>` field
   - `hyperdx_service_name: String` field with default "st0x-issuance"
-- [ ] Implement
+- [x] Implement
       `HyperDxEnv::into_config(self, log_level: tracing::Level) -> Option<HyperDxConfig>`
       that returns Some if api_key is present
-- [ ] Create `Env` struct with `#[derive(Parser, Debug, Clone)]` containing:
+- [x] Create `Env` struct with `#[derive(Parser, Debug, Clone)]` containing:
   - All fields from current `Config` in lib.rs (database_url, rpc_url,
     private_key, vault_address, alpaca fields, etc.)
   - `log_level: LogLevel` field with default "debug"
   - `#[clap(flatten)] hyperdx: HyperDxEnv` field
-- [ ] Create `Config` struct without `#[derive(Parser)]` containing:
+- [x] Create `Config` struct without `#[derive(Parser)]` containing:
   - All fields from `Env` (database_url, rpc_url, etc.)
   - `log_level: LogLevel`
   - `hyperdx: Option<HyperDxConfig>` field
-- [ ] Implement `Env::into_config(self) -> Result<Config, ConfigError>` that
+- [x] Implement `Env::into_config(self) -> Result<Config, ConfigError>` that
       constructs Config from Env
-- [ ] In `into_config`, call
+- [x] In `into_config`, call
       `self.hyperdx.into_config((&self.log_level).into())` to get
       `Option<HyperDxConfig>`
-- [ ] Move `create_blockchain_service` method from lib.rs Config to env.rs
+- [x] Move `create_blockchain_service` method from lib.rs Config to config.rs
       Config
-- [ ] Move `ConfigError` enum from lib.rs to env.rs
-- [ ] Add `pub fn setup_tracing(log_level: &LogLevel)` function for console-only
+- [x] Move `ConfigError` enum from lib.rs to config.rs
+- [x] Add `pub fn setup_tracing(log_level: &LogLevel)` function for console-only
       tracing fallback
 
 **Design Rationale:**
@@ -106,13 +106,13 @@ parsing and `Config` has properly typed fields.
 - Uses `ConfigError` for any validation errors (existing variants for blockchain
   config, can add more if needed)
 
-## Task 4. Update lib.rs to export env types and remove old Config
+## Task 4. Update lib.rs to export config types and remove old Config
 
-Update `src/lib.rs` to use the new env module and remove the old Config
+Update `src/lib.rs` to use the new config module and remove the old Config
 definition.
 
-- [ ] Add `pub(crate) mod env;` declaration
-- [ ] Add `pub(crate) use env::{Env, Config, setup_tracing};` exports
+- [ ] Add `pub(crate) mod config;` declaration
+- [ ] Add `pub(crate) use config::{Env, Config, setup_tracing};` exports
 - [ ] Remove old `Config` struct definition from lib.rs
 - [ ] Remove old `ConfigError` enum from lib.rs
 - [ ] Keep all existing type aliases (AccountCqrs, MintCqrs, etc.)
@@ -120,9 +120,9 @@ definition.
 
 **Design Rationale:**
 
-- Centralizes configuration in env module
-- Clean separation of concerns: lib.rs handles application logic, env.rs handles
-  configuration
+- Centralizes configuration in config module
+- Clean separation of concerns: lib.rs handles application logic, config.rs
+  handles configuration
 - Public (crate-level) exports enable main.rs to use configuration types
 - Existing code using `Config` continues to work with no changes
 
