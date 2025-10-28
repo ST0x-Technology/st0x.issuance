@@ -38,6 +38,7 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod receipt_inventory;
 pub(crate) mod vault;
 
 mod bindings;
