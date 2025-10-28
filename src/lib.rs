@@ -18,6 +18,7 @@ pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
 pub(crate) mod config;
+pub(crate) mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 
