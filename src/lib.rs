@@ -17,7 +17,7 @@ use tracing::info;
 use url::Url;
 
 use account::{Account, AccountView};
-use alpaca::service::AlpacaConfig;
+use alpaca::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use redemption::{
     Redemption, RedemptionView,
@@ -77,14 +77,14 @@ struct RedemptionManagers {
 #[derive(Debug, Parser)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-pub(crate) struct Config {
+pub struct Config {
     #[arg(
         long,
         env = "DATABASE_URL",
         default_value = "sqlite:data.db",
         help = "SQLite database URL"
     )]
-    pub(crate) database_url: String,
+    pub database_url: String,
 
     #[arg(
         long,
@@ -92,38 +92,38 @@ pub(crate) struct Config {
         default_value = "5",
         help = "Maximum number of database connections in the pool"
     )]
-    pub(crate) database_max_connections: u32,
+    pub database_max_connections: u32,
 
     #[arg(
         long,
         env = "RPC_URL",
         help = "WebSocket RPC endpoint URL (wss://...)"
     )]
-    rpc_url: Option<Url>,
+    pub rpc_url: Option<Url>,
 
     #[arg(
         long,
         env = "PRIVATE_KEY",
         help = "Private key for signing blockchain transactions"
     )]
-    private_key: Option<String>,
+    pub private_key: Option<String>,
 
     #[arg(
         long,
         env = "VAULT_ADDRESS",
         help = "OffchainAssetReceiptVault contract address"
     )]
-    vault_address: Option<Address>,
+    pub vault_address: Option<Address>,
 
     #[arg(
         long,
         env = "REDEMPTION_WALLET",
         help = "Address where APs send tokens to initiate redemption"
     )]
-    redemption_wallet: Option<Address>,
+    pub redemption_wallet: Option<Address>,
 
     #[command(flatten)]
-    pub(crate) alpaca: AlpacaConfig,
+    pub alpaca: AlpacaConfig,
 }
 
 impl Config {

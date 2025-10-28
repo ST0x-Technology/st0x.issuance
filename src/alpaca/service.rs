@@ -11,35 +11,35 @@ use super::{
 use crate::mint::TokenizationRequestId;
 
 #[derive(Args)]
-pub(crate) struct AlpacaConfig {
+pub struct AlpacaConfig {
     #[arg(
         long = "alpaca-api-base-url",
         env = "ALPACA_API_BASE_URL",
         default_value = "https://broker-api.alpaca.markets",
         help = "Alpaca API base URL"
     )]
-    api_base_url: String,
+    pub api_base_url: String,
 
     #[arg(
         long = "alpaca-account-id",
         env = "ALPACA_ACCOUNT_ID",
         help = "Alpaca tokenization account ID"
     )]
-    account_id: String,
+    pub account_id: String,
 
     #[arg(
         long = "alpaca-api-key",
         env = "ALPACA_API_KEY",
         help = "Alpaca API key ID"
     )]
-    api_key: String,
+    pub api_key: String,
 
     #[arg(
         long = "alpaca-api-secret",
         env = "ALPACA_API_SECRET",
         help = "Alpaca API secret key"
     )]
-    api_secret: String,
+    pub api_secret: String,
 
     #[arg(
         long = "alpaca-connect-timeout-secs",
@@ -47,7 +47,7 @@ pub(crate) struct AlpacaConfig {
         default_value = "10",
         help = "Alpaca API connection timeout in seconds"
     )]
-    connect_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
 
     #[arg(
         long = "alpaca-request-timeout-secs",
@@ -55,7 +55,7 @@ pub(crate) struct AlpacaConfig {
         default_value = "30",
         help = "Alpaca API request timeout in seconds"
     )]
-    request_timeout_secs: u64,
+    pub request_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for AlpacaConfig {

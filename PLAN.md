@@ -28,13 +28,13 @@ Tests interact only through the public HTTP API.
 
 **Desired state**: E2E tests can construct Config and call initialize_rocket().
 
-- [ ] Make Config struct public
-- [ ] Make all Config fields public
-- [ ] Make alpaca module public and re-export AlpacaConfig
-- [ ] Make bindings module public
-- [ ] Change initialize_rocket() signature to accept Config parameter
-- [ ] Update src/main.rs to call Config::parse() and pass to initialize_rocket()
-- [ ] Verify compilation succeeds
+- [x] Make Config struct public
+- [x] Make all Config fields public
+- [x] Make alpaca module public and re-export AlpacaConfig
+- [x] Make bindings module public
+- [x] Change initialize_rocket() signature to accept Config parameter
+- [x] Update src/main.rs to call Config::parse() and pass to initialize_rocket()
+- [x] Verify compilation succeeds
 
 ## Task 2. Implement LocalEvm Deployment Infrastructure
 
