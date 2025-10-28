@@ -704,8 +704,8 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
-            underlying,
-            token,
+            underlying: underlying.clone(),
+            token: token.clone(),
             network,
             client_id,
             wallet,
@@ -724,6 +724,8 @@ mod tests {
 
         let event = MintEvent::TokensMinted {
             issuer_request_id: issuer_request_id.clone(),
+            underlying,
+            token,
             tx_hash,
             receipt_id,
             shares_minted,
