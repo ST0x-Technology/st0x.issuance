@@ -6,6 +6,7 @@ use alloy::transports::RpcError;
 use clap::Parser;
 use std::sync::Arc;
 use tracing::Level;
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
