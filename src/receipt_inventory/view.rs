@@ -47,26 +47,7 @@ impl Default for ReceiptInventoryView {
 }
 
 impl ReceiptInventoryView {
-    pub(crate) fn is_active(&self) -> bool {
-        matches!(self, Self::Active { .. })
-    }
-
-    pub(crate) fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending { .. })
-    }
-
-    pub(crate) fn is_depleted(&self) -> bool {
-        matches!(self, Self::Depleted { .. })
-    }
-
-    pub(crate) fn has_sufficient_balance(&self, amount: U256) -> bool {
-        match self {
-            Self::Active { current_balance, .. } => *current_balance >= amount,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn with_initiated_data(
+    fn with_initiated_data(
         self,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
@@ -77,7 +58,7 @@ impl ReceiptInventoryView {
         }
     }
 
-    pub(crate) fn with_tokens_minted(
+    fn with_tokens_minted(
         self,
         receipt_id: U256,
         shares_minted: U256,
@@ -91,25 +72,6 @@ impl ReceiptInventoryView {
                 initial_amount: shares_minted,
                 current_balance: shares_minted,
                 minted_at,
-            },
-            other => other,
-        }
-    }
-
-    pub(crate) fn mark_depleted(self, depleted_at: DateTime<Utc>) -> Self {
-        match self {
-            Self::Active {
-                receipt_id,
-                underlying,
-                token,
-                initial_amount,
-                ..
-            } => Self::Depleted {
-                receipt_id,
-                underlying,
-                token,
-                initial_amount,
-                depleted_at,
             },
             other => other,
         }
@@ -145,15 +107,11 @@ impl View<Mint> for ReceiptInventoryView {
 }
 
 impl View<Redemption> for ReceiptInventoryView {
-    fn update(&mut self, event: &EventEnvelope<Redemption>) {
-        match &event.payload {
-            _ => {
-                // TODO: This will be implemented when issue #25 adds burn events
-                // with receipt details. The implementation will:
-                // 1. Extract receipt_id and shares_burned from the burn event
-                // 2. Decrement current_balance by shares_burned
-                // 3. If balance reaches zero, transition to Depleted state
-            }
-        }
+    fn update(&mut self, _event: &EventEnvelope<Redemption>) {
+        // TODO: This will be implemented when issue #25 adds burn events
+        // with receipt details. The implementation will:
+        // 1. Extract receipt_id and shares_burned from the burn event
+        // 2. Decrement current_balance by shares_burned
+        // 3. If balance reaches zero, transition to Depleted state
     }
 }

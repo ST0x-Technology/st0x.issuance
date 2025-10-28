@@ -10,6 +10,20 @@ use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::info;
 
+use crate::account::{Account, AccountView};
+use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::receipt_inventory::ReceiptInventoryView;
+use crate::redemption::{
+    Redemption, RedemptionView,
+    detector::{RedemptionDetector, RedemptionDetectorConfig},
+    journal_manager::JournalManager,
+    redeem_call_manager::RedeemCallManager,
+};
+use crate::tokenized_asset::{
+    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    TokenizedAssetView, UnderlyingSymbol,
+};
+
 pub mod account;
 pub mod mint;
 pub mod redemption;
@@ -24,18 +38,6 @@ pub(crate) mod vault;
 
 mod bindings;
 
-use crate::account::{Account, AccountView};
-use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
-use crate::redemption::{
-    Redemption, RedemptionView,
-    detector::{RedemptionDetector, RedemptionDetectorConfig},
-    journal_manager::JournalManager,
-    redeem_call_manager::RedeemCallManager,
-};
-use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
-};
 pub use config::{Config, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
@@ -237,8 +239,20 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
         "mint_view".to_string(),
     ));
     let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+
+    let receipt_inventory_mint_repo =
+        Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+            pool.clone(),
+            "receipt_inventory_view".to_string(),
+        ));
+    let receipt_inventory_mint_query =
+        GenericQuery::new(receipt_inventory_mint_repo);
+
+    let mint_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
+        (),
+    ));
     let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
         SqliteEventRepository::new(pool.clone()),
     ));
@@ -249,9 +263,23 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
             "redemption_view".to_string(),
         ));
     let redemption_query = GenericQuery::new(redemption_view_repo);
+
+    let receipt_inventory_redemption_repo = Arc::new(SqliteViewRepository::<
+        ReceiptInventoryView,
+        Redemption,
+    >::new(
+        pool.clone(),
+        "receipt_inventory_view".to_string(),
+    ));
+    let receipt_inventory_redemption_query =
+        GenericQuery::new(receipt_inventory_redemption_repo);
+
     let redemption_cqrs = Arc::new(sqlite_cqrs(
         pool.clone(),
-        vec![Box::new(redemption_query)],
+        vec![
+            Box::new(redemption_query),
+            Box::new(receipt_inventory_redemption_query),
+        ],
         (),
     ));
     let redemption_event_store =
