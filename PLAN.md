@@ -171,15 +171,15 @@ cross-aggregate listening.
 
 Implement query methods for finding receipts during redemption.
 
-- [ ] Add `find_receipt_with_balance()` method to find a receipt with sufficient
+- [x] Add `find_receipt_with_balance()` method to find a receipt with sufficient
       balance for a given underlying symbol
-- [ ] Add `list_active_receipts()` method to list all active receipts for an
+- [x] Add `list_active_receipts()` method to list all active receipts for an
       underlying symbol
-- [ ] Add `get_total_balance()` method to sum balances across all receipts for
+- [x] Add `get_total_balance()` method to sum balances across all receipts for
       an underlying symbol
-- [ ] Add `get_receipt()` method to retrieve specific receipt by
+- [x] Add `get_receipt()` method to retrieve specific receipt by
       issuer_request_id
-- [ ] Add filtering options (by underlying, by token, by minimum balance)
+- [x] Add filtering options (by underlying, by token, by minimum balance)
 
 Query methods should be implemented as associated functions that take a
 `SqlitePool` parameter, following the pattern used in other views.
