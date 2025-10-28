@@ -152,19 +152,19 @@ Create the SQLite migration for the receipt_inventory_view table.
 Register the view with both Mint and Redemption CQRS frameworks for
 cross-aggregate listening.
 
-- [ ] Create shared `SqliteViewRepository` for `ReceiptInventoryView` in
+- [x] Create shared `SqliteViewRepository` for `ReceiptInventoryView` in
       `src/receipt_inventory/view.rs`
-- [ ] Implement repository following existing patterns from other views
-- [ ] Create `GenericQuery<Repo, ReceiptInventoryView, Mint>` for Mint events in
+- [x] Implement repository following existing patterns from other views
+- [x] Create `GenericQuery<Repo, ReceiptInventoryView, Mint>` for Mint events in
       `src/main.rs`
-- [ ] Create `GenericQuery<Repo, ReceiptInventoryView, Redemption>` for
+- [x] Create `GenericQuery<Repo, ReceiptInventoryView, Redemption>` for
       Redemption events
-- [ ] Both queries should use the SAME repository instance (same database table)
-- [ ] Register Mint query with Mint CQRS framework's queries vector
-- [ ] Register Redemption query with Redemption CQRS framework's queries vector
-- [ ] Verify view receives and processes `TokensMinted` events when running the
+- [x] Both queries should use the SAME repository instance (same database table)
+- [x] Register Mint query with Mint CQRS framework's queries vector
+- [x] Register Redemption query with Redemption CQRS framework's queries vector
+- [x] Verify view receives and processes `TokensMinted` events when running the
       application
-- [ ] Add comment noting Redemption query currently does nothing (waiting for
+- [x] Add comment noting Redemption query currently does nothing (waiting for
       #25)
 
 ## Task 6. Add Query Methods
