@@ -9,14 +9,14 @@ observability backend. The implementation follows the exact pattern from
 Add the required OpenTelemetry and tracing dependencies to enable distributed
 tracing with HyperDX.
 
-- [ ] Add `opentelemetry = "0.30.0"` to workspace dependencies
-- [ ] Add `opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }`
-      to workspace dependencies
-- [ ] Add `opentelemetry-otlp = "0.30.0"` to workspace dependencies
-- [ ] Add `tracing-opentelemetry = "0.31.0"` to workspace dependencies
-- [ ] Add `blocking` feature to existing `reqwest` dependency (required for OTLP
+- [x] Add `opentelemetry = "0.30.0"` to package dependencies
+- [x] Add `opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }`
+      to package dependencies
+- [x] Add `opentelemetry-otlp = "0.30.0"` to package dependencies
+- [x] Add `tracing-opentelemetry = "0.31.0"` to package dependencies
+- [x] Add `blocking` feature to existing `reqwest` dependency (required for OTLP
       exporter)
-- [ ] Update package dependencies to use workspace versions where applicable
+- [x] Add `tracing-subscriber` with `env-filter` feature to package dependencies
 
 **Design Rationale:**
 
