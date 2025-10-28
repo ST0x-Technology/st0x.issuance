@@ -136,16 +136,16 @@ listening.
 
 Create the SQLite migration for the receipt_inventory_view table.
 
-- [ ] Run `sqlx migrate add create_receipt_inventory_view`
-- [ ] Add `CREATE TABLE receipt_inventory_view` with view_id, version, payload
+- [x] Run `sqlx migrate add create_receipt_inventory_view`
+- [x] Add `CREATE TABLE receipt_inventory_view` with view_id, version, payload
       columns
-- [ ] Add indexes on `json_extract(payload, '$.underlying')` for filtering by
-      asset
-- [ ] Add indexes on `json_extract(payload, '$.token')` for filtering by token
-      symbol
-- [ ] Add index on `json_extract(payload, '$.current_balance')` for finding
+- [x] Add indexes on `json_extract(payload, '$.underlying')` for filtering by
+      asset (created indexes for both Pending and Active states)
+- [x] Add indexes on `json_extract(payload, '$.token')` for filtering by token
+      symbol (created indexes for both Pending and Active states)
+- [x] Add index on `json_extract(payload, '$.current_balance')` for finding
       available receipts
-- [ ] Test migration with `sqlx db reset -y`
+- [x] Test migration with `sqlx db reset -y`
 
 ## Task 5. Wire View into CQRS Framework
 
