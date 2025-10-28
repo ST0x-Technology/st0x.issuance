@@ -2,8 +2,9 @@ use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
 
-use crate::mint::{Mint, MintEvent};
+use crate::mint::{IssuerRequestId, Mint, MintEvent};
 use crate::redemption::Redemption;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
@@ -114,4 +115,106 @@ impl View<Redemption> for ReceiptInventoryView {
         // 2. Decrement current_balance by shares_burned
         // 3. If balance reaches zero, transition to Depleted state
     }
+}
+
+pub(crate) async fn get_receipt(
+    pool: &Pool<Sqlite>,
+    issuer_request_id: &IssuerRequestId,
+) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
+    let issuer_request_id_str = &issuer_request_id.0;
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM receipt_inventory_view
+        WHERE view_id = ?
+        "#,
+        issuer_request_id_str
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
+
+    Ok(Some(view))
+}
+
+pub(crate) async fn list_active_receipts(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<Vec<ReceiptInventoryView>, ReceiptInventoryViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM receipt_inventory_view
+        WHERE json_extract(payload, '$.Active.underlying') = ?
+        "#,
+        &underlying.0
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let views: Result<Vec<ReceiptInventoryView>, serde_json::Error> = rows
+        .into_iter()
+        .map(|row| serde_json::from_str(&row.payload))
+        .collect();
+
+    Ok(views?)
+}
+
+pub(crate) async fn find_receipt_with_balance(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+    minimum_balance: U256,
+) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM receipt_inventory_view
+        WHERE json_extract(payload, '$.Active.underlying') = ?
+          AND CAST(json_extract(payload, '$.Active.current_balance') AS TEXT) >= ?
+        ORDER BY CAST(json_extract(payload, '$.Active.current_balance') AS TEXT) DESC
+        LIMIT 1
+        "#,
+        &underlying.0,
+        minimum_balance.to_string()
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
+
+    Ok(Some(view))
+}
+
+pub(crate) async fn get_total_balance(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<U256, ReceiptInventoryViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM receipt_inventory_view
+        WHERE json_extract(payload, '$.Active.underlying') = ?
+        "#,
+        &underlying.0
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().try_fold(U256::ZERO, |acc, row| {
+        let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
+        Ok(if let ReceiptInventoryView::Active { current_balance, .. } = view {
+            acc + current_balance
+        } else {
+            acc
+        })
+    })
 }
