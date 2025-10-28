@@ -858,27 +858,52 @@ fn test_journal_confirmed_for_missing_mint() {
 
 ### End-to-End Tests
 
-**End-to-end tests** exercise the complete system from the perspective of an
-external consumer. These tests:
+**End-to-end tests** reproduce the complete production flow in a controlled
+environment. These tests simulate exactly what would happen in reality while
+mocking third-party external APIs.
+
+**Critical Requirements:**
 
 - Live in the project-root `tests/` directory (not nested in feature modules)
-- Start the full HTTP server (Rocket) with real wiring
+- Use **Anvil** (Foundry's local blockchain) for real on-chain transactions
+- Deploy actual smart contracts (OffchainAssetReceiptVault)
+- Send real blockchain transactions that trigger the system
+- Use **httpmock** to mock third-party HTTP APIs (Alpaca API)
+- Start the full HTTP server (Rocket) with real wiring - real CQRS framework,
+  real managers (MintManager, CallbackManager), real service implementations
+  (RealBlockchainService, RealAlpacaService)
 - Use in-memory SQLite database (real database operations, not MemStore)
-- Make HTTP requests like an external client would
-- Use mock external services (MockVaultService, MockAlpacaService) to avoid
-  external dependencies
-- Verify complete flows: HTTP request → CQRS → Managers → Database → Async
-  processing
-- Validate state transitions and event persistence across the full stack
+- Test the **complete happy path flow** from start to finish, not individual
+  steps
+
+**What to Mock:**
+
+- **Third-party APIs**: Mock Alpaca HTTP endpoints using httpmock
+- **Blockchain RPC**: Use Anvil (local blockchain) instead of real RPC providers
+
+**What NOT to Mock:**
+
+- Internal service traits (VaultService, AlpacaService) - use real
+  implementations
+- Managers (MintManager, CallbackManager, etc.) - use real implementations
+- CQRS framework - use real implementation with real event store
+
+**Example E2E Test Flows:**
+
+- **Mint**: Alpaca HTTP request → CQRS → Mint on-chain via `vault.deposit()` to
+  Anvil → Callback to httpmock Alpaca server
+- **Redemption**: Send tokens on-chain to redemption wallet on Anvil → Detector
+  triggers → Call httpmock Alpaca redeem endpoint → Poll httpmock for completion
+  → Burn tokens via `vault.withdraw()` on Anvil
 
 **Test Coverage Strategy:**
 
-End-to-end tests are slower and more complex than unit/integration tests, so
-focus them on:
+E2E tests are slower and more complex than unit/integration tests, so focus them
+exclusively on:
 
-- **Happy path flows** - Verify primary use cases work correctly end-to-end
-- **Critical error scenarios** - Test major failure modes that affect the whole
-  system (e.g., blockchain unavailable, external service down)
+- **Happy path flows only** - Verify primary use cases work correctly end-to-end
+- **Complete flows** - Test the entire path from trigger to completion, not
+  individual steps
 
 Leave exhaustive edge case testing to faster, more focused tests:
 
@@ -893,8 +918,8 @@ Leave exhaustive edge case testing to faster, more focused tests:
   MemStore (fast, exhaustive edge cases)
 - **Endpoint tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints with
   mocked dependencies (thorough error scenarios)
-- **End-to-end tests** (`tests/*.rs`): Test the complete system as an external
-  consumer would use it (happy paths + critical failures)
+- **End-to-end tests** (`tests/*.rs`): Test the complete production flow with
+  real blockchain + mock external services (happy paths only)
 
 **Public API Surface:**
 
