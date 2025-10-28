@@ -210,14 +210,14 @@ Export telemetry types from lib.rs for use in main.rs.
 Add HyperDX configuration variables to `.env.example` following the liquidity-b
 pattern.
 
-- [ ] Add comment block explaining HyperDX is optional
-- [ ] Add `HYPERDX_API_KEY=${HYPERDX_API_KEY}` variable
-- [ ] Add comment with link to https://www.hyperdx.io/ for obtaining API key
-- [ ] Add comment that bot runs with console-only logging if not set
-- [ ] Add `HYPERDX_SERVICE_NAME` as optional with note about default
+- [x] Add comment block explaining HyperDX is optional
+- [x] Add `HYPERDX_API_KEY=${HYPERDX_API_KEY}` variable
+- [x] Add comment with link to https://www.hyperdx.io/ for obtaining API key
+- [x] Add comment that bot runs with console-only logging if not set
+- [x] Add `HYPERDX_SERVICE_NAME` as optional with note about default
       "st0x-issuance"
-- [ ] Add `LOG_LEVEL` as optional with note about default "debug"
-- [ ] Add `RUST_LOG` variable with note that it overrides default filters
+- [x] Add `LOG_LEVEL` as optional with note about default "debug"
+- [x] Add `RUST_LOG` variable with note that it overrides default filters
 
 **Design Rationale:**
 
