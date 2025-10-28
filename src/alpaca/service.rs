@@ -10,7 +10,7 @@ use super::{
 };
 use crate::mint::TokenizationRequestId;
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct AlpacaConfig {
     #[arg(
         long = "alpaca-api-base-url",

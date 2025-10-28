@@ -6,7 +6,6 @@ use alloy::transports::RpcError;
 use clap::Parser;
 use std::sync::Arc;
 use tracing::Level;
-use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
@@ -67,7 +66,7 @@ impl HyperDxEnv {
 #[derive(Debug, Parser, Clone)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-pub(crate) struct Env {
+struct Env {
     #[arg(
         long,
         env = "DATABASE_URL",
@@ -123,11 +122,11 @@ pub(crate) struct Env {
 }
 
 impl Env {
-    pub(crate) fn into_config(self) -> Result<Config, ConfigError> {
+    fn into_config(self) -> Config {
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
 
-        Ok(Config {
+        Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
@@ -137,12 +136,12 @@ impl Env {
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
-        })
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Config {
+pub struct Config {
     pub(crate) database_url: String,
     pub(crate) database_max_connections: u32,
     pub(crate) rpc_url: Option<Url>,
@@ -155,6 +154,15 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    /// Parses configuration from environment variables and command-line arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if command-line arguments or environment variables are invalid.
+    pub fn parse() -> Result<Self, clap::Error> {
+        Env::try_parse().map(Env::into_config)
+    }
+
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
@@ -180,7 +188,7 @@ impl Config {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     #[error("RPC_URL is required")]
     MissingRpcUrl,
     #[error("PRIVATE_KEY is required")]

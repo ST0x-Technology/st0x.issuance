@@ -1,11 +1,8 @@
-use clap::Parser;
-
-use st0x_issuance::{Env, TelemetryGuard, initialize_rocket, setup_tracing};
+use st0x_issuance::{Config, initialize_rocket, setup_tracing};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let env = Env::parse();
-    let config = env.into_config()?;
+    let config = Config::parse()?;
 
     let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
         match hyperdx.setup_telemetry() {

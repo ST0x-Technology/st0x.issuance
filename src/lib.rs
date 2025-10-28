@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{U256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -24,7 +24,6 @@ pub(crate) mod vault;
 mod bindings;
 
 use crate::account::{Account, AccountView};
-use crate::alpaca::service::AlpacaConfig;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -36,9 +35,8 @@ use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
 };
-use crate::vault::{VaultService, service::RealBlockchainService};
-pub(crate) use config::{Config, Env, setup_tracing};
-pub(crate) use telemetry::TelemetryGuard;
+pub use config::{Config, setup_tracing};
+pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -152,7 +150,7 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 /// - Alpaca service configuration is invalid
 pub async fn initialize_rocket(
     config: Config,
-) -> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -206,8 +204,7 @@ pub async fn initialize_rocket(
 
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
-) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), Box<dyn std::error::Error>>
-{
+) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -277,7 +274,7 @@ async fn setup_mint_managers(
         Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
         Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
     ),
-    Box<dyn std::error::Error>,
+    anyhow::Error,
 > {
     let blockchain_service = config.create_blockchain_service().await?;
     let mint_manager =
@@ -294,7 +291,7 @@ fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-) -> Result<RedemptionManagers, Box<dyn std::error::Error>> {
+) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call_manager = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
@@ -355,7 +352,7 @@ fn spawn_redemption_detector(
 
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), anyhow::Error> {
     // dummy values
     let assets = vec![
         (
@@ -389,7 +386,7 @@ async fn seed_initial_assets(
         match cqrs.execute(underlying, command).await {
             Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
             Err(e) => {
-                return Err(Box::new(e));
+                return Err(e.into());
             }
         }
     }

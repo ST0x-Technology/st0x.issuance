@@ -26,6 +26,11 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
+#[tracing::instrument(skip(cqrs, event_store, mint_manager, callback_manager), fields(
+    tokenization_request_id = %request.tokenization_request_id.0,
+    issuer_request_id = %request.issuer_request_id.0,
+    status = ?request.status
+))]
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     cqrs: &State<crate::MintCqrs>,
@@ -123,6 +128,9 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
+#[tracing::instrument(skip(event_store, mint_manager, callback_manager), fields(
+    issuer_request_id = %issuer_request_id.0
+))]
 async fn process_journal_completion(
     event_store: MintEventStore,
     mint_manager: Arc<

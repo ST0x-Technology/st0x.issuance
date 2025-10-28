@@ -88,6 +88,7 @@ where
     ///
     /// This method never returns under normal operation. If a WebSocket error occurs,
     /// it logs the error and reconnects after 5 seconds.
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         loop {
             if let Err(e) = self.monitor_once().await {
@@ -138,6 +139,10 @@ where
     ///
     /// Decodes the event, looks up the corresponding tokenized asset, converts the quantity,
     /// and executes a RedemptionCommand::Detect.
+    #[tracing::instrument(skip(self, log), fields(
+        tx_hash = ?log.transaction_hash,
+        block_number = ?log.block_number
+    ))]
     async fn process_transfer_log(
         &self,
         log: &alloy::rpc::types::Log,

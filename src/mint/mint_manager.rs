@@ -65,6 +65,9 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     /// * `MintManagerError::QuantityConversion` - Quantity cannot be converted to U256
     /// * `MintManagerError::Blockchain` - Blockchain transaction failed
     /// * `MintManagerError::Cqrs` - Command execution failed
+    #[tracing::instrument(skip(self, aggregate), fields(
+        issuer_request_id = %issuer_request_id.0
+    ))]
     pub(crate) async fn handle_journal_confirmed(
         &self,
         issuer_request_id: &IssuerRequestId,

@@ -232,22 +232,22 @@ pattern.
 Add tracing instrumentation to mint and redemption flows following standard
 tracing patterns.
 
-- [ ] Add `#[tracing::instrument]` attribute to key mint functions:
+- [x] Add `#[tracing::instrument]` attribute to key mint functions:
   - `initiate_mint` endpoint handler
   - `confirm_journal` endpoint handler
-  - `MintManager::start_minting`
-  - `CallbackManager::send_callback`
-- [ ] Add `#[tracing::instrument]` attribute to key redemption functions:
+  - `MintManager::handle_journal_confirmed`
+  - `CallbackManager::handle_tokens_minted`
+- [x] Add `#[tracing::instrument]` attribute to key redemption functions:
   - `RedemptionDetector::run`
-  - `RedemptionDetector::handle_transfer`
-  - `RedeemCallManager::call_alpaca_redeem`
-  - `JournalManager::poll_for_completion`
-  - Burn token functions
-- [ ] Add manual spans for async contexts where `#[instrument]` doesn't work
-      well
-- [ ] Use `tracing::info!`, `tracing::warn!`, `tracing::error!` for contextual
+  - `RedemptionDetector::process_transfer_log`
+  - `RedeemCallManager::handle_redemption_detected`
+  - `JournalManager::handle_alpaca_called`
+  - Burn token functions (not yet implemented in codebase)
+- [x] Add manual spans for async contexts where `#[instrument]` doesn't work
+      well (not needed - `#[instrument]` works well with all async functions)
+- [x] Use `tracing::info!`, `tracing::warn!`, `tracing::error!` for contextual
       events within spans
-- [ ] Add span fields for key identifiers (issuer_request_id, client_id,
+- [x] Add span fields for key identifiers (issuer_request_id, client_id,
       underlying symbol)
 
 **Design Rationale:**
