@@ -19,6 +19,10 @@ pub(crate) enum ReceiptInventoryViewError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum ReceiptInventoryView {
     Unavailable,
+    Pending {
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+    },
     Active {
         receipt_id: U256,
         underlying: UnderlyingSymbol,
@@ -47,6 +51,10 @@ impl ReceiptInventoryView {
         matches!(self, Self::Active { .. })
     }
 
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
     pub(crate) fn is_depleted(&self) -> bool {
         matches!(self, Self::Depleted { .. })
     }
@@ -58,20 +66,33 @@ impl ReceiptInventoryView {
         }
     }
 
-    pub(crate) fn new_active(
-        receipt_id: U256,
+    pub(crate) fn with_initiated_data(
+        self,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
-        initial_amount: U256,
+    ) -> Self {
+        match self {
+            Self::Unavailable => Self::Pending { underlying, token },
+            other => other,
+        }
+    }
+
+    pub(crate) fn with_tokens_minted(
+        self,
+        receipt_id: U256,
+        shares_minted: U256,
         minted_at: DateTime<Utc>,
     ) -> Self {
-        Self::Active {
-            receipt_id,
-            underlying,
-            token,
-            initial_amount,
-            current_balance: initial_amount,
-            minted_at,
+        match self {
+            Self::Pending { underlying, token } => Self::Active {
+                receipt_id,
+                underlying,
+                token,
+                initial_amount: shares_minted,
+                current_balance: shares_minted,
+                minted_at,
+            },
+            other => other,
         }
     }
 
@@ -98,10 +119,27 @@ impl ReceiptInventoryView {
 impl View<Mint> for ReceiptInventoryView {
     fn update(&mut self, event: &EventEnvelope<Mint>) {
         match &event.payload {
-            MintEvent::TokensMinted { .. } => {
-                // TODO: Implement in Task 4
+            MintEvent::Initiated { underlying, token, .. } => {
+                *self = self
+                    .clone()
+                    .with_initiated_data(underlying.clone(), token.clone());
             }
-            _ => {}
+            MintEvent::TokensMinted {
+                receipt_id,
+                shares_minted,
+                minted_at,
+                ..
+            } => {
+                *self = self.clone().with_tokens_minted(
+                    *receipt_id,
+                    *shares_minted,
+                    *minted_at,
+                );
+            }
+            MintEvent::JournalConfirmed { .. }
+            | MintEvent::JournalRejected { .. }
+            | MintEvent::MintingFailed { .. }
+            | MintEvent::MintCompleted { .. } => {}
         }
     }
 }
