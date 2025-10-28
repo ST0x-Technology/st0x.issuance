@@ -4732,6 +4732,7 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "backon",
+ "base64",
  "chrono",
  "clap",
  "cqrs-es",

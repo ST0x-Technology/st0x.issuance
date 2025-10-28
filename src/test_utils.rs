@@ -6,6 +6,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use sqlite_es::{
@@ -27,6 +28,20 @@ use crate::tokenized_asset::{
     TokenizedAssetView, UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
+
+const TEST_API_KEY: &str = "test-key";
+const TEST_API_SECRET: &str = "test-secret";
+
+/// Returns a test Basic auth header value for mock Alpaca API requests.
+///
+/// Uses clearly fake test credentials: "test-key:test-secret"
+#[must_use]
+pub fn test_alpaca_auth_header() -> String {
+    format!(
+        "Basic {}",
+        BASE64.encode(format!("{TEST_API_KEY}:{TEST_API_SECRET}"))
+    )
+}
 
 /// Sets up a test Rocket instance with in-memory database and mock services.
 ///

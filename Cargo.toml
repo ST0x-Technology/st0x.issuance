@@ -63,6 +63,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 backon = "1.6.0"
 futures = "0.3.31"
 url = "2.5.7"
+base64 = "0.22.1"
 
 [lints]
 workspace = true

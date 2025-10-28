@@ -103,12 +103,29 @@ roles, enabling on-chain minting.
 **Desired state**: E2E mint test passes with on-chain deposit executing
 correctly.
 
-- [ ] Run cargo test --test e2e_mint_flow
-- [ ] Verify complete mint flow with non-zero shares balance
+- [x] Run cargo test --test e2e_mint_flow
+- [x] Verify complete mint flow with non-zero shares balance
+
+## Task 5. Verify E2E Redemption Flow
+
+**Desired state**: E2E redemption test infrastructure is in place with WebSocket
+monitoring working.
+
+- [x] Run cargo test --test e2e_redemption_flow
+- [x] Verify WebSocket connection and subscription work
+- [x] Verify Transfer events are detected and decoded
+- [ ] Fix vault address mismatch between LocalEvm and tokenized_asset seeds (out
+      of scope for initial infrastructure setup)
+
+**Known Issue**: Test currently fails because LocalEvm creates a vault with a
+dynamic address, but tokenized_asset seeds use hardcoded addresses. The
+RedemptionDetector correctly detects and decodes the Transfer event but can't
+find the corresponding asset. This needs to be addressed in a follow-up task.
 
 ## Success Criteria
 
 1. Config, initialize_rocket(), and bindings are publicly accessible
-2. LocalEvm deploys vault contracts with proper authorization
+2. LocalEvm deploys vault contracts with proper authorization using WebSocket
 3. E2E mint test passes with on-chain minting
 4. Shares balance increases after successful mint
+5. E2E redemption test demonstrates WebSocket monitoring works
