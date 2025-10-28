@@ -90,30 +90,32 @@ organization pattern.
 
 Define the types that model receipt inventory state.
 
-- [ ] Define `ReceiptInventoryView` enum with `Active` and `Depleted` variants
-- [ ] Add all required fields (receipt_id, underlying, token, initial_amount,
+- [x] Define `ReceiptInventoryView` enum with `Active` and `Depleted` variants
+- [x] Add all required fields (receipt_id, underlying, token, initial_amount,
       current_balance, timestamps)
-- [ ] Implement `Serialize` and `Deserialize` derives
-- [ ] Add helper methods: `is_active()`, `is_depleted()`,
+- [x] Implement `Serialize` and `Deserialize` derives
+- [x] Add helper methods: `is_active()`, `is_depleted()`,
       `has_sufficient_balance(amount)`
-- [ ] Add constructor methods: `new_active()`, `mark_depleted()`
+- [x] Add constructor methods: `new_active()`, `mark_depleted()`
 
 ## Task 3. Extend TokensMinted Event
 
 Add missing fields to `TokensMinted` event so the view has all required data.
 
-- [ ] Update `MintEvent::TokensMinted` variant in `src/mint/event.rs` to
+- [x] Update `MintEvent::TokensMinted` variant in `src/mint/event.rs` to
       include:
   - `underlying: UnderlyingSymbol`
   - `token: TokenSymbol`
-- [ ] Update `handle_record_mint_success()` in Mint aggregate to extract
+- [x] Update `handle_record_mint_success()` in Mint aggregate to extract
       underlying and token from the JournalConfirmed state and include them in
       the event
-- [ ] Update all existing tests that use `TokensMinted` to include new fields
-- [ ] Update `apply_tokens_minted()` method (no changes needed, just verify it
+- [x] Update all existing tests that use `TokensMinted` to include new fields
+- [x] Update `apply_tokens_minted()` method (no changes needed, just verify it
       ignores extra fields)
-- [ ] Update `MintView::update()` to handle new fields in `TokensMinted` event
-- [ ] Run `cargo test --workspace` to ensure no regressions
+- [x] Update `MintView::update()` to handle new fields in `TokensMinted` event
+- [x] Add test coverage verifying new fields are correctly extracted from state
+      and included in event
+- [x] Run `cargo test --workspace` to ensure no regressions
 
 **Rationale:** Adding fields to events is safe in event sourcing - the apply
 method already ignores fields it doesn't need via pattern matching. These fields
