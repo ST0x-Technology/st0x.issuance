@@ -132,12 +132,12 @@ Update `src/main.rs` to parse `Env`, convert to `Config`, and initialize
 telemetry following the exact pattern from
 `../st0x.liquidity-b/src/bin/server.rs`.
 
-- [ ] Add imports: `use st0x_issuance::{Env, setup_tracing, initialize_rocket};`
-- [ ] Add import for telemetry: `use st0x_issuance::telemetry::TelemetryGuard;`
-- [ ] Remove existing `tracing_subscriber::registry()` initialization code
-- [ ] Parse environment: `let env = Env::parse();`
-- [ ] Convert to Config: `let config = env.into_config()?;`
-- [ ] Set up telemetry with exact pattern from liquidity-b:
+- [x] Add imports: `use st0x_issuance::{Env, setup_tracing, initialize_rocket};`
+- [x] Add import for telemetry: `use st0x_issuance::telemetry::TelemetryGuard;`
+- [x] Remove existing `tracing_subscriber::registry()` initialization code
+- [x] Parse environment: `let env = Env::parse();`
+- [x] Convert to Config: `let config = env.into_config()?;`
+- [x] Set up telemetry with exact pattern from liquidity-b:
   ```rust
   let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
       match hyperdx.setup_telemetry() {
@@ -153,9 +153,9 @@ telemetry following the exact pattern from
       None
   };
   ```
-- [ ] Call `let result = initialize_rocket(config).await;`
-- [ ] Explicitly drop telemetry guard: `drop(telemetry_guard);`
-- [ ] Return result: `result?; Ok(())`
+- [x] Call `let result = initialize_rocket(config).await;`
+- [x] Explicitly drop telemetry guard: `drop(telemetry_guard);`
+- [x] Return result: `result?; Ok(())`
 
 **Design Rationale:**
 
@@ -174,11 +174,11 @@ telemetry following the exact pattern from
 Modify `initialize_rocket()` in `src/lib.rs` to accept `Config` as a parameter
 instead of parsing internally.
 
-- [ ] Change signature from `initialize_rocket()` to
+- [x] Change signature from `initialize_rocket()` to
       `initialize_rocket(config: Config)`
-- [ ] Remove `let config = Config::parse()` line inside function
-- [ ] Update all uses of config to use the parameter
-- [ ] Ensure all helper functions (`create_pool`, `setup_mint_managers`, etc.)
+- [x] Remove `let config = Config::parse()` line inside function
+- [x] Update all uses of config to use the parameter
+- [x] Ensure all helper functions (`create_pool`, `setup_mint_managers`, etc.)
       still receive `&Config`
 
 **Design Rationale:**
@@ -193,10 +193,9 @@ instead of parsing internally.
 
 Export telemetry types from lib.rs for use in main.rs.
 
-- [ ] Add `pub(crate) mod telemetry;` declaration
-- [ ] Export telemetry types:
-      `pub(crate) use telemetry::{TelemetryError, TelemetryGuard};`
-- [ ] Verify exports are visible in main.rs
+- [x] Add `pub(crate) mod telemetry;` declaration
+- [x] Export telemetry types: `pub(crate) use telemetry::TelemetryGuard;`
+- [x] Verify exports are visible in main.rs
 
 **Design Rationale:**
 

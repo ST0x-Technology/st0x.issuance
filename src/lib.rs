@@ -18,6 +18,7 @@ pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
 pub(crate) mod config;
+pub(crate) mod telemetry;
 pub(crate) mod vault;
 
 mod bindings;
@@ -37,6 +38,7 @@ use crate::tokenized_asset::{
 };
 use crate::vault::{VaultService, service::RealBlockchainService};
 pub(crate) use config::{Config, Env, setup_tracing};
+pub(crate) use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -148,9 +150,9 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 /// - Database connection or migration fails
 /// - Blockchain service configuration is invalid
 /// - Alpaca service configuration is invalid
-pub async fn initialize_rocket()
--> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
-    let config = Config::parse();
+pub async fn initialize_rocket(
+    config: Config,
+) -> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
