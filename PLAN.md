@@ -111,12 +111,12 @@ handles parsing and `Config` has properly typed fields.
 Update `src/lib.rs` to use the new config module and remove the old Config
 definition.
 
-- [ ] Add `pub(crate) mod config;` declaration
-- [ ] Add `pub(crate) use config::{Env, Config, setup_tracing};` exports
-- [ ] Remove old `Config` struct definition from lib.rs
-- [ ] Remove old `ConfigError` enum from lib.rs
-- [ ] Keep all existing type aliases (AccountCqrs, MintCqrs, etc.)
-- [ ] Keep all existing function signatures that use `&Config` parameter
+- [x] Add `pub(crate) mod config;` declaration
+- [x] Add `pub(crate) use config::{Env, Config, setup_tracing};` exports
+- [x] Remove old `Config` struct definition from lib.rs
+- [x] Remove old `ConfigError` enum from lib.rs
+- [x] Keep all existing type aliases (AccountCqrs, MintCqrs, etc.)
+- [x] Keep all existing function signatures that use `&Config` parameter
 
 **Design Rationale:**
 

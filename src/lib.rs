@@ -1,9 +1,4 @@
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, address};
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::transports::RpcError;
-use clap::Parser;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -14,7 +9,6 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::info;
-use url::Url;
 
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
@@ -38,9 +32,12 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod config;
 pub(crate) mod vault;
 
 mod bindings;
+
+pub(crate) use config::{Config, Env, setup_tracing};
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -72,97 +69,6 @@ struct RedemptionManagers {
     journal_manager: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "st0x-issuance")]
-#[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-pub(crate) struct Config {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite:data.db",
-        help = "SQLite database URL"
-    )]
-    pub(crate) database_url: String,
-
-    #[arg(
-        long,
-        env = "DATABASE_MAX_CONNECTIONS",
-        default_value = "5",
-        help = "Maximum number of database connections in the pool"
-    )]
-    pub(crate) database_max_connections: u32,
-
-    #[arg(
-        long,
-        env = "RPC_URL",
-        help = "WebSocket RPC endpoint URL (wss://...)"
-    )]
-    rpc_url: Option<Url>,
-
-    #[arg(
-        long,
-        env = "PRIVATE_KEY",
-        help = "Private key for signing blockchain transactions"
-    )]
-    private_key: Option<String>,
-
-    #[arg(
-        long,
-        env = "VAULT_ADDRESS",
-        help = "OffchainAssetReceiptVault contract address"
-    )]
-    vault_address: Option<Address>,
-
-    #[arg(
-        long,
-        env = "REDEMPTION_WALLET",
-        help = "Address where APs send tokens to initiate redemption"
-    )]
-    redemption_wallet: Option<Address>,
-
-    #[command(flatten)]
-    pub(crate) alpaca: AlpacaConfig,
-}
-
-impl Config {
-    pub(crate) async fn create_blockchain_service(
-        &self,
-    ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let rpc_url =
-            self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
-
-        let private_key =
-            self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
-
-        let vault_address =
-            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
-
-        let signer = private_key.parse::<PrivateKeySigner>()?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(rpc_url.as_str())
-            .await?;
-
-        Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
-    #[error("RPC_URL is required")]
-    MissingRpcUrl,
-    #[error("PRIVATE_KEY is required")]
-    MissingPrivateKey,
-    #[error("VAULT_ADDRESS is required")]
-    MissingVaultAddress,
-    #[error("Invalid private key")]
-    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
-    #[error("Failed to connect to RPC endpoint")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
