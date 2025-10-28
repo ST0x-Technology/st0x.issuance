@@ -19,6 +19,7 @@ use url::Url;
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use receipt_inventory::ReceiptInventoryView;
 use redemption::{
     Redemption, RedemptionView,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
@@ -333,8 +334,20 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
         "mint_view".to_string(),
     ));
     let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+
+    let receipt_inventory_mint_repo =
+        Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+            pool.clone(),
+            "receipt_inventory_view".to_string(),
+        ));
+    let receipt_inventory_mint_query =
+        GenericQuery::new(receipt_inventory_mint_repo);
+
+    let mint_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
+        (),
+    ));
     let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
         SqliteEventRepository::new(pool.clone()),
     ));
@@ -345,9 +358,23 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
             "redemption_view".to_string(),
         ));
     let redemption_query = GenericQuery::new(redemption_view_repo);
+
+    let receipt_inventory_redemption_repo = Arc::new(SqliteViewRepository::<
+        ReceiptInventoryView,
+        Redemption,
+    >::new(
+        pool.clone(),
+        "receipt_inventory_view".to_string(),
+    ));
+    let receipt_inventory_redemption_query =
+        GenericQuery::new(receipt_inventory_redemption_repo);
+
     let redemption_cqrs = Arc::new(sqlite_cqrs(
         pool.clone(),
-        vec![Box::new(redemption_query)],
+        vec![
+            Box::new(redemption_query),
+            Box::new(receipt_inventory_redemption_query),
+        ],
         (),
     ));
     let redemption_event_store =
