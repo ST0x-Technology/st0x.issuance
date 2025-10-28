@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+use clap::Parser;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -14,7 +15,9 @@ async fn rocket() -> _ {
         )
         .init();
 
-    match st0x_issuance::initialize_rocket().await {
+    let config = st0x_issuance::Config::parse();
+
+    match st0x_issuance::initialize_rocket(config).await {
         Ok(rocket) => rocket,
         Err(e) => {
             error!("Failed to initialize application: {e}");

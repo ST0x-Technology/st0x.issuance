@@ -17,7 +17,6 @@ use tracing::info;
 use url::Url;
 
 use account::{Account, AccountView};
-use alpaca::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use redemption::{
     Redemption, RedemptionView,
@@ -40,7 +39,9 @@ pub mod tokenized_asset;
 pub(crate) mod alpaca;
 pub(crate) mod vault;
 
-mod bindings;
+pub mod bindings;
+
+pub use alpaca::AlpacaConfig;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -243,9 +244,9 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 /// - Database connection or migration fails
 /// - Blockchain service configuration is invalid
 /// - Alpaca service configuration is invalid
-pub async fn initialize_rocket()
--> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
-    let config = Config::parse();
+pub async fn initialize_rocket(
+    config: Config,
+) -> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
