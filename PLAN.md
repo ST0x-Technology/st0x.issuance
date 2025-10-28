@@ -34,11 +34,11 @@ Create `src/telemetry.rs` by copying the exact implementation from
 `../st0x.liquidity-b/src/telemetry.rs` with minimal adaptations for the issuance
 bot.
 
-- [ ] Copy `src/telemetry.rs` from liquidity-b project
-- [ ] Update service name references from "st0x-hedge" to "st0x-issuance"
-- [ ] Update crate name references in default filters from
+- [x] Copy `src/telemetry.rs` from liquidity-b project
+- [x] Update service name references from "st0x-hedge" to "st0x-issuance"
+- [x] Update crate name references in default filters from
       "st0x_hedge,st0x_broker" to "st0x_issuance"
-- [ ] Keep all other implementation details identical (batch config, OTLP
+- [x] Keep all other implementation details identical (batch config, OTLP
       endpoint, error types, guard)
 
 **Design Rationale:**
