@@ -489,8 +489,11 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -555,8 +558,11 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -609,8 +615,11 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -665,8 +674,11 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -720,8 +732,11 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),

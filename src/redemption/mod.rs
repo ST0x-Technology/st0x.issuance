@@ -81,6 +81,46 @@ impl Redemption {
         }
     }
 
+    pub(crate) const fn validation_fields(
+        &self,
+    ) -> Option<(
+        &IssuerRequestId,
+        &UnderlyingSymbol,
+        &TokenSymbol,
+        &Quantity,
+        &Address,
+        &B256,
+    )> {
+        match self {
+            Self::AlpacaCalled {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                detected_tx_hash,
+                ..
+            }
+            | Self::Burning {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                detected_tx_hash,
+                ..
+            } => Some((
+                issuer_request_id,
+                underlying,
+                token,
+                quantity,
+                wallet,
+                detected_tx_hash,
+            )),
+            _ => None,
+        }
+    }
+
     fn apply_alpaca_called(
         &mut self,
         issuer_request_id: IssuerRequestId,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, RedeemResponse, RequestsListResponse,
+    RedeemResponse, RequestsListResponse,
 };
 use crate::mint::TokenizationRequestId;
 
@@ -255,7 +255,7 @@ impl AlpacaService for RealAlpacaService {
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<RedeemRequestStatus, AlpacaError> {
+    ) -> Result<super::TokenizationRequest, AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/requests",
             self.base_url.trim_end_matches('/'),
@@ -282,14 +282,22 @@ impl AlpacaService for RealAlpacaService {
                             message: format!("Failed to parse response: {e}"),
                         })?;
 
-                    list_response
+                    let request = list_response
                         .requests
                         .into_iter()
                         .find(|req| &req.id == tokenization_request_id)
-                        .map(|req| req.status)
                         .ok_or_else(|| AlpacaError::RequestNotFound {
                             tokenization_request_id: tokenization_request_id.0.clone(),
-                        })
+                        })?;
+
+                    if request.r#type != super::TokenizationRequestType::Redeem {
+                        return Err(AlpacaError::RequestTypeMismatch {
+                            expected: super::TokenizationRequestType::Redeem,
+                            actual: request.r#type,
+                        });
+                    }
+
+                    Ok(request)
                 }
                 reqwest::StatusCode::UNAUTHORIZED
                 | reqwest::StatusCode::FORBIDDEN => {
@@ -338,7 +346,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use crate::account::ClientId;
-    use crate::alpaca::{RedeemRequestStatus, RedeemRequestType};
+    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
@@ -576,7 +584,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId("client-456".to_string()),
-            qty: Quantity::new(rust_decimal::Decimal::from(100)),
+            quantity: Quantity::new(rust_decimal::Decimal::from(100)),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash: b256!(
@@ -627,7 +635,7 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.tokenization_request_id.0, "tok-456");
         assert_eq!(response.issuer_request_id.0, "red-123");
-        assert!(matches!(response.request_type, RedeemRequestType::Redeem));
+        assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
         mock.assert();
     }
@@ -899,8 +907,8 @@ mod tests {
             service.poll_request_status(&tokenization_request_id).await;
 
         assert!(result.is_ok());
-        let status = result.unwrap();
-        assert!(matches!(status, RedeemRequestStatus::Completed));
+        let request = result.unwrap();
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();
     }
 
@@ -977,7 +985,8 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), RedeemRequestStatus::Completed));
+        let request = result.unwrap();
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();
     }
 

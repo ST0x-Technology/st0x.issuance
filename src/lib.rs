@@ -262,7 +262,11 @@ pub async fn initialize_rocket()
         setup_mint_managers(&config, &mint_cqrs).await?;
 
     let RedemptionManagers { redeem_call_manager, journal_manager } =
-        setup_redemption_managers(&config, &redemption_cqrs)?;
+        setup_redemption_managers(
+            &config,
+            &redemption_cqrs,
+            &redemption_event_store,
+        )?;
 
     spawn_redemption_detector(
         &config,
@@ -382,14 +386,18 @@ async fn setup_mint_managers(
 fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
+    redemption_event_store: &RedemptionEventStore,
 ) -> Result<RedemptionManagers, Box<dyn std::error::Error>> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call_manager = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_cqrs.clone(),
     ));
-    let journal_manager =
-        Arc::new(JournalManager::new(alpaca_service, redemption_cqrs.clone()));
+    let journal_manager = Arc::new(JournalManager::new(
+        alpaca_service,
+        redemption_cqrs.clone(),
+        redemption_event_store.clone(),
+    ));
 
     Ok(RedemptionManagers { redeem_call_manager, journal_manager })
 }

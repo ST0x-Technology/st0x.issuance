@@ -62,3 +62,23 @@ impl DomainEvent for RedemptionEvent {
         "1.0".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    #[test]
+    fn test_alpaca_journal_completed_event_type() {
+        let event = RedemptionEvent::AlpacaJournalCompleted {
+            issuer_request_id: IssuerRequestId::new("red-test-123"),
+            alpaca_completed_at: Utc::now(),
+        };
+
+        assert_eq!(
+            event.event_type(),
+            "RedemptionEvent::AlpacaJournalCompleted"
+        );
+    }
+}

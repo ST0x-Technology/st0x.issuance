@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, RedeemRequestType, RedeemResponse,
+    RedeemRequestStatus, RedeemResponse, TokenizationRequestType,
 };
 use crate::mint::TokenizationRequestId;
 
@@ -102,11 +102,11 @@ impl AlpacaService for MockAlpacaService {
                     ),
                     issuer_request_id: request.issuer_request_id,
                     created_at: Utc::now(),
-                    request_type: RedeemRequestType::Redeem,
+                    r#type: TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Pending,
                     underlying: request.underlying,
                     token: request.token,
-                    qty: request.qty,
+                    quantity: request.quantity,
                     issuer: "mock-issuer".to_string(),
                     network: request.network,
                     wallet: request.wallet,
@@ -130,11 +130,11 @@ impl AlpacaService for MockAlpacaService {
                 ),
                 issuer_request_id: request.issuer_request_id,
                 created_at: Utc::now(),
-                request_type: RedeemRequestType::Redeem,
+                r#type: TokenizationRequestType::Redeem,
                 status: RedeemRequestStatus::Pending,
                 underlying: request.underlying,
                 token: request.token,
-                qty: request.qty,
+                quantity: request.quantity,
                 issuer: "mock-issuer".to_string(),
                 network: request.network,
                 wallet: request.wallet,
@@ -147,13 +147,33 @@ impl AlpacaService for MockAlpacaService {
     async fn poll_request_status(
         &self,
         _tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<RedeemRequestStatus, AlpacaError> {
+    ) -> Result<super::TokenizationRequest, AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
         {
             if self.should_succeed {
-                Ok(RedeemRequestStatus::Completed)
+                Ok(super::TokenizationRequest {
+                    id: _tokenization_request_id.clone(),
+                    issuer_request_id: crate::mint::IssuerRequestId::new(
+                        "mock-issuer-123",
+                    ),
+                    r#type: super::TokenizationRequestType::Redeem,
+                    status: super::RedeemRequestStatus::Completed,
+                    underlying: crate::tokenized_asset::UnderlyingSymbol::new(
+                        "AAPL",
+                    ),
+                    token: crate::tokenized_asset::TokenSymbol::new("tAAPL"),
+                    quantity: crate::mint::Quantity::new(
+                        rust_decimal::Decimal::from(100),
+                    ),
+                    wallet: alloy::primitives::address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    tx_hash: alloy::primitives::b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    ),
+                })
             } else {
                 Err(AlpacaError::RequestNotFound {
                     tokenization_request_id: _tokenization_request_id.0.clone(),
@@ -162,7 +182,25 @@ impl AlpacaService for MockAlpacaService {
         }
 
         #[cfg(not(test))]
-        Ok(RedeemRequestStatus::Completed)
+        Ok(super::TokenizationRequest {
+            id: _tokenization_request_id.clone(),
+            issuer_request_id: crate::mint::IssuerRequestId::new(
+                "mock-issuer-123",
+            ),
+            r#type: super::TokenizationRequestType::Redeem,
+            status: super::RedeemRequestStatus::Completed,
+            underlying: crate::tokenized_asset::UnderlyingSymbol::new("AAPL"),
+            token: crate::tokenized_asset::TokenSymbol::new("tAAPL"),
+            quantity: crate::mint::Quantity::new(rust_decimal::Decimal::from(
+                100,
+            )),
+            wallet: alloy::primitives::address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
+            tx_hash: alloy::primitives::b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+        })
     }
 }
 
@@ -258,7 +296,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId("client-456".to_string()),
-            qty: Quantity::new(Decimal::from(100)),
+            quantity: Quantity::new(Decimal::from(100)),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash: b256!(
@@ -344,7 +382,8 @@ mod tests {
         let result = mock.poll_request_status(&tokenization_request_id).await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
-        assert!(matches!(result.unwrap(), RedeemRequestStatus::Completed));
+        let request = result.unwrap();
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
         assert_eq!(mock.get_call_count(), 1);
     }
 
