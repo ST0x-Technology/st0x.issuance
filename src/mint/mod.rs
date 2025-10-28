@@ -224,12 +224,8 @@ impl Mint {
         gas_used: u64,
         block_number: u64,
     ) -> Result<Vec<MintEvent>, MintError> {
-        let Self::JournalConfirmed {
-            issuer_request_id: expected_id,
-            underlying,
-            token,
-            ..
-        } = self
+        let Self::JournalConfirmed { issuer_request_id: expected_id, .. } =
+            self
         else {
             return Err(MintError::NotInJournalConfirmedState {
                 current_state: self.state_name().to_string(),
@@ -242,8 +238,6 @@ impl Mint {
 
         Ok(vec![MintEvent::TokensMinted {
             issuer_request_id: provided_id,
-            underlying: underlying.clone(),
-            token: token.clone(),
             tx_hash,
             receipt_id,
             shares_minted,
@@ -616,8 +610,6 @@ impl Aggregate for Mint {
             } => self.apply_journal_rejected(reason, rejected_at),
             MintEvent::TokensMinted {
                 issuer_request_id: _,
-                underlying: _,
-                token: _,
                 tx_hash,
                 receipt_id,
                 shares_minted,
@@ -1225,70 +1217,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_success_includes_underlying_and_token() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
-        let tokenization_request_id = TokenizationRequestId::new("alp-456");
-        let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("TSLA");
-        let token = TokenSymbol::new("tTSLA");
-        let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let tx_hash = b256!(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-        );
-
-        let validator = MintTestFramework::with(())
-            .given(vec![
-                MintEvent::Initiated {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id,
-                    quantity,
-                    underlying: underlying.clone(),
-                    token: token.clone(),
-                    network,
-                    client_id,
-                    wallet,
-                    initiated_at: Utc::now(),
-                },
-                MintEvent::JournalConfirmed {
-                    issuer_request_id: issuer_request_id.clone(),
-                    confirmed_at: Utc::now(),
-                },
-            ])
-            .when(MintCommand::RecordMintSuccess {
-                issuer_request_id,
-                tx_hash,
-                receipt_id: uint!(1_U256),
-                shares_minted: uint!(100_000000000000000000_U256),
-                gas_used: 50000,
-                block_number: 1000,
-            });
-
-        let events = validator.inspect_result().unwrap();
-
-        assert_eq!(events.len(), 1);
-
-        let MintEvent::TokensMinted {
-            underlying: event_underlying,
-            token: event_token,
-            ..
-        } = &events[0]
-        else {
-            panic!("Expected TokensMinted event, got {:?}", &events[0]);
-        };
-
-        assert_eq!(
-            event_underlying, &underlying,
-            "TokensMinted event should include underlying from JournalConfirmed state"
-        );
-        assert_eq!(
-            event_token, &token,
-            "TokensMinted event should include token from JournalConfirmed state"
-        );
-    }
-
-    #[test]
     fn test_record_mint_success_from_wrong_state_fails() {
         let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
@@ -1444,8 +1372,6 @@ mod tests {
 
         mint.apply(MintEvent::TokensMinted {
             issuer_request_id: issuer_request_id.clone(),
-            underlying,
-            token,
             tx_hash,
             receipt_id,
             shares_minted,
@@ -1646,8 +1572,6 @@ mod tests {
                 },
                 MintEvent::TokensMinted {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying,
-                    token,
                     tx_hash,
                     receipt_id: uint!(1_U256),
                     shares_minted: uint!(100_000000000000000000_U256),
@@ -1739,8 +1663,6 @@ mod tests {
                 },
                 MintEvent::TokensMinted {
                     issuer_request_id: correct_issuer_request_id,
-                    underlying,
-                    token,
                     tx_hash,
                     receipt_id: uint!(1_U256),
                     shares_minted: uint!(100_000000000000000000_U256),
@@ -1884,8 +1806,6 @@ mod tests {
 
         mint.apply(MintEvent::TokensMinted {
             issuer_request_id: issuer_request_id.clone(),
-            underlying,
-            token,
             tx_hash,
             receipt_id,
             shares_minted,
