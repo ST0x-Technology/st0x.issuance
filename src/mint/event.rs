@@ -32,8 +32,6 @@ pub(crate) enum MintEvent {
     },
     TokensMinted {
         issuer_request_id: IssuerRequestId,
-        underlying: UnderlyingSymbol,
-        token: TokenSymbol,
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
