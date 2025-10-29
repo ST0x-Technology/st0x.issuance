@@ -250,7 +250,8 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool).await?;
+    let (account_cqrs, tokenized_asset_cqrs) =
+        setup_basic_cqrs(&pool, config.vault_address).await?;
 
     let AggregateCqrsSetup {
         mint_cqrs,
@@ -296,6 +297,7 @@ pub async fn initialize_rocket(
 
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
+    vault_address: Option<Address>,
 ) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), Box<dyn std::error::Error>>
 {
     let account_view_repo =
@@ -318,7 +320,7 @@ async fn setup_basic_cqrs(
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    seed_initial_assets(&tokenized_asset_cqrs).await?;
+    seed_initial_assets(&tokenized_asset_cqrs, vault_address).await?;
 
     Ok((account_cqrs, tokenized_asset_cqrs))
 }
@@ -441,28 +443,39 @@ fn spawn_redemption_detector(
 
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
+    vault_address: Option<Address>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // dummy values
-    let assets = vec![
-        (
-            "AAPL",
-            "tAAPL",
-            "base",
-            address!("0x1234567890abcdef1234567890abcdef12345678"),
-        ),
-        (
-            "TSLA",
-            "tTSLA",
-            "base",
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-        ),
-        (
-            "NVDA",
-            "tNVDA",
-            "base",
-            address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"),
-        ),
-    ];
+    let assets = vault_address.map_or_else(
+        || {
+            vec![
+                (
+                    "AAPL",
+                    "tAAPL",
+                    "base",
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                ),
+                (
+                    "TSLA",
+                    "tTSLA",
+                    "base",
+                    address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                ),
+                (
+                    "NVDA",
+                    "tNVDA",
+                    "base",
+                    address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"),
+                ),
+            ]
+        },
+        |addr| {
+            vec![
+                ("AAPL", "tAAPL", "base", addr),
+                ("TSLA", "tTSLA", "base", addr),
+                ("NVDA", "tNVDA", "base", addr),
+            ]
+        },
+    );
 
     for (underlying, token, network, vault_address) in assets {
         let command = TokenizedAssetCommand::Add {

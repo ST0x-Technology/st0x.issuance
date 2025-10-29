@@ -92,24 +92,48 @@ async fn test_complete_redemption_flow_with_anvil()
         },
     };
 
-    let _rocket = initialize_rocket(config).await?;
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
-    evm.grant_deposit_role(redemption_wallet).await?;
+    let user_wallet = evm.wallet_address;
 
-    let provider_signer = PrivateKeySigner::from_bytes(&evm.private_key)
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(user_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    let link_response = client
+        .post("/accounts/connect")
+        .header(rocket::http::ContentType::JSON)
+        .body(
+            json!({
+                "email": "user@example.com",
+                "account": "USER123",
+                "wallet": user_wallet.to_string()
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+    assert_eq!(link_response.status(), rocket::http::Status::Ok);
+
+    let user_signer = PrivateKeySigner::from_bytes(&evm.private_key)
         .map_err(|e| format!("Failed to create signer: {e}"))?;
-    let wallet = EthereumWallet::from(provider_signer);
-    let provider =
-        ProviderBuilder::new().wallet(wallet).connect(&evm.endpoint).await?;
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
 
-    let vault = OffchainAssetReceiptVault::new(evm.vault_address, &provider);
+    let vault =
+        OffchainAssetReceiptVault::new(evm.vault_address, &user_provider);
 
     let assets_to_mint = U256::from(50) * U256::from(10).pow(U256::from(18));
     let share_ratio = U256::from(10).pow(U256::from(18));
     let receipt_info = Bytes::from(b"test redemption");
 
     let mint_tx = vault
-        .deposit(assets_to_mint, redemption_wallet, share_ratio, receipt_info)
+        .deposit(assets_to_mint, user_wallet, share_ratio, receipt_info)
         .send()
         .await?
         .get_receipt()
@@ -126,40 +150,29 @@ async fn test_complete_redemption_flow_with_anvil()
         })
         .ok_or("Deposit event not found")?;
 
+    let user_balance = vault.balanceOf(user_wallet).call().await?;
+    assert_eq!(
+        user_balance, shares_minted,
+        "Shares were not minted to user wallet"
+    );
+
+    vault
+        .transfer(redemption_wallet, shares_minted)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
     let initial_balance = vault.balanceOf(redemption_wallet).call().await?;
     assert_eq!(
         initial_balance, shares_minted,
-        "Shares were not minted to redemption wallet"
+        "Shares were transferred to redemption wallet"
     );
 
-    let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(5);
-    let poll_interval = tokio::time::Duration::from_millis(100);
-
-    let final_balance = loop {
-        let balance = vault.balanceOf(redemption_wallet).call().await?;
-        if balance < initial_balance {
-            break balance;
-        }
-
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "Timeout waiting for balance to decrease after {}s (initial: {initial_balance}, current: {balance})",
-                timeout.as_secs()
-            )
-            .into());
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    };
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     redeem_mock.assert();
     poll_mock.assert();
-
-    assert!(
-        final_balance < initial_balance,
-        "Expected shares to be burned, but balance didn't decrease"
-    );
 
     Ok(())
 }

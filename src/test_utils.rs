@@ -1,7 +1,7 @@
 use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, address, keccak256};
+use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
@@ -492,6 +492,85 @@ impl LocalEvm {
         &self,
         to: Address,
     ) -> Result<(), LocalEvmError> {
+        self.grant_role("DEPOSIT", to).await
+    }
+
+    /// Grants the WITHDRAW role to an address via the authorizer contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Signer creation fails
+    /// - Provider connection fails
+    /// - Role granting transaction fails
+    pub async fn grant_withdraw_role(
+        &self,
+        to: Address,
+    ) -> Result<(), LocalEvmError> {
+        self.grant_role("WITHDRAW", to).await
+    }
+
+    /// Grants the CERTIFY role to an address via the authorizer contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Signer creation fails
+    /// - Provider connection fails
+    /// - Role granting transaction fails
+    pub async fn grant_certify_role(
+        &self,
+        to: Address,
+    ) -> Result<(), LocalEvmError> {
+        self.grant_role("CERTIFY", to).await
+    }
+
+    /// Certifies the vault until a specific timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Signer creation fails
+    /// - Provider connection fails
+    /// - Certification transaction fails
+    pub async fn certify_vault(
+        &self,
+        until: U256,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)
+            .map_err(|e| LocalEvmError::InvalidPrivateKey(e.to_string()))?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault =
+            OffchainAssetReceiptVault::new(self.vault_address, &provider);
+        vault
+            .certify(until, false, Bytes::new())
+            .send()
+            .await
+            .map_err(|e| {
+                LocalEvmError::DeploymentFailed(format!("Certify vault: {e}"))
+            })?
+            .get_receipt()
+            .await
+            .map_err(|e| {
+                LocalEvmError::DeploymentFailed(format!(
+                    "Certify vault receipt: {e}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    async fn grant_role(
+        &self,
+        role_name: &str,
+        to: Address,
+    ) -> Result<(), LocalEvmError> {
         let signer = PrivateKeySigner::from_bytes(&self.private_key)
             .map_err(|e| LocalEvmError::InvalidPrivateKey(e.to_string()))?;
         let wallet = EthereumWallet::from(signer);
@@ -505,21 +584,21 @@ impl LocalEvm {
             self.authorizer_address,
             &provider,
         );
-        let deposit_role = keccak256("DEPOSIT");
+        let role = keccak256(role_name);
         authorizer
-            .grantRole(deposit_role, to)
+            .grantRole(role, to)
             .send()
             .await
             .map_err(|e| {
                 LocalEvmError::DeploymentFailed(format!(
-                    "Grant DEPOSIT role: {e}"
+                    "Grant {role_name} role: {e}"
                 ))
             })?
             .get_receipt()
             .await
             .map_err(|e| {
                 LocalEvmError::DeploymentFailed(format!(
-                    "Grant DEPOSIT role receipt: {e}"
+                    "Grant {role_name} role receipt: {e}"
                 ))
             })?;
 
