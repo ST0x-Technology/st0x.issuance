@@ -64,6 +64,7 @@ backon = "1.6.0"
 futures = "0.3.31"
 url = "2.5.7"
 anyhow = "1.0.100"
+dotenvy = "0.15.7"
 
 [lints]
 workspace = true

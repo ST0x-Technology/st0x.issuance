@@ -3,7 +3,7 @@ use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
-use clap::Parser;
+use clap::{Args, Parser};
 use std::sync::Arc;
 use tracing::Level;
 use url::Url;
@@ -45,7 +45,7 @@ impl From<&LogLevel> for Level {
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Args, Debug, Clone)]
 struct HyperDxEnv {
     #[clap(long, env)]
     hyperdx_api_key: Option<String>,
@@ -117,7 +117,7 @@ struct Env {
     #[clap(flatten)]
     hyperdx: HyperDxEnv,
 
-    #[command(flatten)]
+    #[clap(flatten)]
     pub(crate) alpaca: AlpacaConfig,
 }
 

@@ -4863,6 +4863,7 @@ dependencies = [
  "chrono",
  "clap",
  "cqrs-es",
+ "dotenvy",
  "futures",
  "httpmock",
  "opentelemetry",
