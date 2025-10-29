@@ -205,10 +205,10 @@ pub fn setup_tracing(log_level: &LogLevel) {
     let level: Level = log_level.into();
     let default_filter = format!("st0x_issuance={level}");
 
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_filter.into()),
         )
-        .init();
+        .try_init();
 }
