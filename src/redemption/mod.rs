@@ -55,7 +55,7 @@ pub(crate) enum Redemption {
         block_number: u64,
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
-        alpaca_completed_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
     },
     Failed {
         issuer_request_id: IssuerRequestId,
@@ -98,6 +98,11 @@ impl Redemption {
             ..
         } = self
         else {
+            tracing::warn!(
+                issuer_request_id = %issuer_request_id.0,
+                current_state = %self.state_name(),
+                "AlpacaCalled event received in wrong state, expected Detected"
+            );
             return;
         };
 
@@ -118,7 +123,7 @@ impl Redemption {
     fn apply_alpaca_journal_completed(
         &mut self,
         issuer_request_id: IssuerRequestId,
-        alpaca_completed_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
     ) {
         let Self::AlpacaCalled {
             tokenization_request_id,
@@ -133,6 +138,11 @@ impl Redemption {
             ..
         } = self
         else {
+            tracing::warn!(
+                issuer_request_id = %issuer_request_id.0,
+                current_state = %self.state_name(),
+                "AlpacaJournalCompleted event received in wrong state, expected AlpacaCalled"
+            );
             return;
         };
 
@@ -147,7 +157,7 @@ impl Redemption {
             block_number: *block_number,
             detected_at: *detected_at,
             called_at: *called_at,
-            alpaca_completed_at,
+            alpaca_journal_completed_at,
         };
     }
 }
@@ -256,10 +266,23 @@ impl Aggregate for Redemption {
 
                 Ok(vec![RedemptionEvent::AlpacaJournalCompleted {
                     issuer_request_id,
-                    alpaca_completed_at: now,
+                    alpaca_journal_completed_at: now,
                 }])
             }
             RedemptionCommand::MarkFailed { issuer_request_id, reason } => {
+                if !matches!(
+                    self,
+                    Self::Detected { .. }
+                        | Self::AlpacaCalled { .. }
+                        | Self::Burning { .. }
+                ) {
+                    return Err(RedemptionError::InvalidState {
+                        expected: "Detected, AlpacaCalled, or Burning"
+                            .to_string(),
+                        found: self.state_name().to_string(),
+                    });
+                }
+
                 let now = Utc::now();
 
                 Ok(vec![RedemptionEvent::RedemptionFailed {
@@ -318,11 +341,11 @@ impl Aggregate for Redemption {
             }
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id,
-                alpaca_completed_at,
+                alpaca_journal_completed_at,
             } => {
                 self.apply_alpaca_journal_completed(
                     issuer_request_id,
-                    alpaca_completed_at,
+                    alpaca_journal_completed_at,
                 );
             }
             RedemptionEvent::RedemptionFailed {
@@ -651,7 +674,7 @@ mod tests {
 
         let RedemptionEvent::AlpacaJournalCompleted {
             issuer_request_id: event_id,
-            alpaca_completed_at,
+            alpaca_journal_completed_at,
         } = &events[0]
         else {
             panic!(
@@ -661,7 +684,7 @@ mod tests {
         };
 
         assert_eq!(event_id, &issuer_request_id);
-        assert!(alpaca_completed_at.timestamp() > 0);
+        assert!(alpaca_journal_completed_at.timestamp() > 0);
     }
 
     #[test]
@@ -698,7 +721,7 @@ mod tests {
         let block_number = 54321;
         let detected_at = Utc::now();
         let called_at = Utc::now();
-        let alpaca_completed_at = Utc::now();
+        let alpaca_journal_completed_at = Utc::now();
 
         redemption.apply(RedemptionEvent::Detected {
             issuer_request_id: issuer_request_id.clone(),
@@ -719,7 +742,7 @@ mod tests {
 
         redemption.apply(RedemptionEvent::AlpacaJournalCompleted {
             issuer_request_id: issuer_request_id.clone(),
-            alpaca_completed_at,
+            alpaca_journal_completed_at,
         });
 
         let Redemption::Burning {
@@ -733,7 +756,7 @@ mod tests {
             block_number: state_block_number,
             detected_at: state_detected_at,
             called_at: state_called_at,
-            alpaca_completed_at: state_alpaca_completed_at,
+            alpaca_journal_completed_at: state_alpaca_journal_completed_at,
         } = redemption
         else {
             panic!("Expected Burning state, got {redemption:?}");
@@ -749,6 +772,9 @@ mod tests {
         assert_eq!(state_block_number, block_number);
         assert_eq!(state_detected_at, detected_at);
         assert_eq!(state_called_at, called_at);
-        assert_eq!(state_alpaca_completed_at, alpaca_completed_at);
+        assert_eq!(
+            state_alpaca_journal_completed_at,
+            alpaca_journal_completed_at
+        );
     }
 }

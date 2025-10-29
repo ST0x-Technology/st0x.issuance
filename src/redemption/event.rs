@@ -30,7 +30,7 @@ pub(crate) enum RedemptionEvent {
     },
     AlpacaJournalCompleted {
         issuer_request_id: IssuerRequestId,
-        alpaca_completed_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
     },
     RedemptionFailed {
         issuer_request_id: IssuerRequestId,

@@ -166,7 +166,7 @@ async fn test_complete_redemption_flow_with_anvil()
     let initial_balance = vault.balanceOf(redemption_wallet).call().await?;
     assert_eq!(
         initial_balance, shares_minted,
-        "Shares were transferred to redemption wallet"
+        "Shares transfer to redemption wallet failed"
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

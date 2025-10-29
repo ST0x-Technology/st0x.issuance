@@ -864,7 +864,7 @@ mocking third-party external APIs.
 
 **Critical Requirements:**
 
-- Live in the project-root `tests/` directory (not nested in feature modules)
+- E2E tests in `./tests/` directory (not `src/`)
 - Use **Anvil** (Foundry's local blockchain) for real on-chain transactions
 - Deploy actual smart contracts (OffchainAssetReceiptVault)
 - Send real blockchain transactions that trigger the system
@@ -876,12 +876,12 @@ mocking third-party external APIs.
 - Test the **complete happy path flow** from start to finish, not individual
   steps
 
-**What to Mock:**
+**What to Mock (external systems only):**
 
-- **Third-party APIs**: Mock Alpaca HTTP endpoints using httpmock
+- **Third-party APIs**: Alpaca HTTP endpoints via httpmock
 - **Blockchain RPC**: Use Anvil (local blockchain) instead of real RPC providers
 
-**What NOT to Mock:**
+**What NOT to Mock (all internal code):**
 
 - Internal service traits (VaultService, AlpacaService) - use real
   implementations
@@ -898,8 +898,7 @@ mocking third-party external APIs.
 
 **Test Coverage Strategy:**
 
-E2E tests are slower and more complex than unit/integration tests, so focus them
-exclusively on:
+E2E tests are slower than unit/integration tests, so focus them exclusively on:
 
 - **Happy path flows only** - Verify primary use cases work correctly end-to-end
 - **Complete flows** - Test the entire path from trigger to completion, not
@@ -907,19 +906,20 @@ exclusively on:
 
 Leave exhaustive edge case testing to faster, more focused tests:
 
-- **Unit tests** (aggregate tests) - Exhaustive edge cases, validation rules,
-  business logic in isolation
-- **Integration tests** (endpoint tests) - Thorough error handling, database
-  operations, detailed scenarios
+- **Unit tests** (aggregate tests in `src/*/mod.rs`) - Exhaustive edge cases,
+  validation rules, business logic in isolation with MemStore
+- **Integration tests** (component tests in `src/*/api/*.rs`) - Individual HTTP
+  endpoints, database operations, error handling with mocked dependencies
 
-**Distinction from other test types:**
+**Test Type Distinctions:**
 
-- **Aggregate tests** (`src/mint/mod.rs`): Test CQRS logic in isolation with
-  MemStore (fast, exhaustive edge cases)
-- **Endpoint tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints with
-  mocked dependencies (thorough error scenarios)
-- **End-to-end tests** (`tests/*.rs`): Test the complete production flow with
-  real blockchain + mock external services (happy paths only)
+- **Unit tests** (`src/mint/mod.rs`): Test CQRS aggregate logic in isolation
+  with MemStore, no external dependencies (fast, exhaustive edge cases)
+- **Integration tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints or
+  components with mocked service dependencies (thorough error scenarios)
+- **End-to-end tests** (`tests/*.rs`): Test complete production flows from
+  external trigger to completion with real blockchain + mock external APIs only
+  (happy paths only)
 
 **Public API Surface:**
 

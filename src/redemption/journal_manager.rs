@@ -98,7 +98,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         warn!(
             issuer_request_id = %issuer_id_str,
             elapsed = ?elapsed,
-            "Polling timeout reached (1 hour), marking redemption as failed"
+            max_duration = ?self.max_duration,
+            "Polling timeout reached, marking redemption as failed"
         );
 
         self.cqrs
@@ -106,8 +107,10 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 issuer_id_str,
                 RedemptionCommand::MarkFailed {
                     issuer_request_id: issuer_request_id.clone(),
-                    reason: "Alpaca journal polling timeout (1 hour)"
-                        .to_string(),
+                    reason: format!(
+                        "Alpaca journal polling timeout after {:?}",
+                        self.max_duration
+                    ),
                 },
             )
             .await?;
