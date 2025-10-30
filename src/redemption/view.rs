@@ -196,11 +196,9 @@ impl View<Redemption> for RedemptionView {
                     failed_at: *failed_at,
                 };
             }
-            RedemptionEvent::BurningStarted { .. }
-            | RedemptionEvent::TokensBurned { .. }
+            RedemptionEvent::TokensBurned { .. }
             | RedemptionEvent::BurningFailed { .. } => {
-                // TODO(Task 2): Implement burn event handling in view
-                // - BurningStarted: possibly no-op
+                // TODO: Implement burn event handling (Task 4)
                 // - TokensBurned: transition to Completed state (final success state)
                 // - BurningFailed: transition to Failed state
             }

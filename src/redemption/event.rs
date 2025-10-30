@@ -37,10 +37,6 @@ pub(crate) enum RedemptionEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
-    BurningStarted {
-        issuer_request_id: IssuerRequestId,
-        burning_started_at: DateTime<Utc>,
-    },
     TokensBurned {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,
@@ -73,9 +69,6 @@ impl DomainEvent for RedemptionEvent {
             Self::RedemptionFailed { .. } => {
                 "RedemptionEvent::RedemptionFailed".to_string()
             }
-            Self::BurningStarted { .. } => {
-                "RedemptionEvent::BurningStarted".to_string()
-            }
             Self::TokensBurned { .. } => {
                 "RedemptionEvent::TokensBurned".to_string()
             }
@@ -92,6 +85,7 @@ impl DomainEvent for RedemptionEvent {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{b256, uint};
     use chrono::Utc;
 
     use super::*;
@@ -110,34 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_burning_started_event_type() {
-        let event = RedemptionEvent::BurningStarted {
-            issuer_request_id: IssuerRequestId::new("red-burn-123"),
-            burning_started_at: Utc::now(),
-        };
-
-        assert_eq!(event.event_type(), "RedemptionEvent::BurningStarted");
-        assert_eq!(event.event_version(), "1.0");
-    }
-
-    #[test]
-    fn test_burning_started_serialization() {
-        let event = RedemptionEvent::BurningStarted {
-            issuer_request_id: IssuerRequestId::new("red-ser-123"),
-            burning_started_at: Utc::now(),
-        };
-
-        let serialized = serde_json::to_string(&event).unwrap();
-        let deserialized: RedemptionEvent =
-            serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(event, deserialized);
-    }
-
-    #[test]
     fn test_tokens_burned_event_type() {
-        use alloy::primitives::{b256, uint};
-
         let event = RedemptionEvent::TokensBurned {
             issuer_request_id: IssuerRequestId::new("red-burned-456"),
             tx_hash: b256!(
@@ -156,8 +123,6 @@ mod tests {
 
     #[test]
     fn test_tokens_burned_serialization() {
-        use alloy::primitives::{b256, uint};
-
         let event = RedemptionEvent::TokensBurned {
             issuer_request_id: IssuerRequestId::new("red-ser-456"),
             tx_hash: b256!(

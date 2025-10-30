@@ -39,13 +39,16 @@ Following the existing pattern from `TokensMinted`, we'll add `receipt_id` and
 - **Depleted detection**: When `current_balance` reaches zero, transition
   receipt to `Depleted` state
 
-### BurningStarted Event
+### BurningStarted Event - Removed
 
-Following the Mint flow pattern where `ConfirmJournal` emits both
-`JournalConfirmed` and `MintingStarted` events, we need to ensure
-`ConfirmAlpacaComplete` emits both `AlpacaJournalCompleted` and `BurningStarted`
-events. This allows the `BurnManager` to react to the `BurningStarted` event to
-orchestrate burning.
+Initially, we considered following the Mint flow pattern where `ConfirmJournal`
+emits both `JournalConfirmed` and `MintingStarted` events. However, during
+implementation we discovered that `BurningStarted` would be a no-op in the
+aggregate's `apply()` method (the state transition to `Burning` is already
+handled by `AlpacaJournalCompleted`). This violates the ES/CQRS principle that
+events should represent meaningful state changes. Therefore, `BurningStarted`
+was removed, and the `BurnManager` will listen directly to
+`AlpacaJournalCompleted` events instead.
 
 ### Error Handling Philosophy
 
@@ -87,12 +90,9 @@ command handling and event application in one cohesive step.
       `src/redemption/cmd.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `error: String`
   - Similar structure to `RecordMintFailure`
-- [x] Add `BurningStarted` variant to `RedemptionEvent` enum in
-      `src/redemption/event.rs`
-  - Fields: `issuer_request_id: IssuerRequestId`,
-    `burning_started_at: DateTime<Utc>`
-  - Signals that burning should begin (emitted alongside
-    `AlpacaJournalCompleted`)
+- [x] ~~Add `BurningStarted` variant~~ - **Removed**: Event was unnecessary
+      (no-op in aggregate)
+  - `BurnManager` will listen to `AlpacaJournalCompleted` instead
 - [x] Add `TokensBurned` variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
@@ -106,8 +106,8 @@ command handling and event application in one cohesive step.
   - Records blockchain burning failure
 - [x] Implement `DomainEvent` trait for new event variants in
       `src/redemption/event.rs`
-  - Add event types: "RedemptionEvent::BurningStarted",
-    "RedemptionEvent::TokensBurned", "RedemptionEvent::BurningFailed"
+  - Add event types: "RedemptionEvent::TokensBurned",
+    "RedemptionEvent::BurningFailed"
   - All events use version "1.0"
   - Note: No separate RedemptionCompleted event needed - TokensBurned is the
     final success state
@@ -134,36 +134,35 @@ the task.
 
 **Implementation**:
 
-- [ ] Add `Completed` state to `Redemption` enum in `src/redemption/mod.rs`
-  - Fields: `issuer_request_id: IssuerRequestId`, `completed_at: DateTime<Utc>`,
-    and any other relevant fields from prior states that should be preserved
-- [ ] Update `Redemption::state_name()` to handle `Completed` state
-- [ ] Verify `ConfirmAlpacaComplete` command emits `BurningStarted` event
-  - Check if current implementation emits both `AlpacaJournalCompleted` and
-    `BurningStarted`
-  - If not, update to emit both events (following `ConfirmJournal` pattern from
-    Mint)
-- [ ] Update `Redemption::handle()` to process `RecordBurnSuccess` command
+- [x] Add `Completed` state to `Redemption` enum in `src/redemption/mod.rs`
+  - Fields: `issuer_request_id: IssuerRequestId`, `burn_tx_hash: B256`,
+    `completed_at: DateTime<Utc>`
+- [x] Update `Redemption::state_name()` to handle `Completed` state
+- [x] ~~Verify `ConfirmAlpacaComplete` emits `BurningStarted`~~ - **Changed**:
+      Only emits `AlpacaJournalCompleted`
+  - `BurningStarted` removed because it was a no-op event (violates ES/CQRS
+    principles)
+  - State transition to `Burning` handled by `AlpacaJournalCompleted`
+- [x] Update `Redemption::handle()` to process `RecordBurnSuccess` command
   - Validate current state is `Burning`
   - Return `InvalidState` error if in wrong state
   - Emit `TokensBurned` event (this is the final success state - no separate
     RedemptionCompleted event needed)
   - Capture `Utc::now()` for timestamp fields
-- [ ] Update `Redemption::handle()` to process `RecordBurnFailure` command
+- [x] Update `Redemption::handle()` to process `RecordBurnFailure` command
   - Validate current state is `Burning`
   - Return `InvalidState` error if in wrong state
   - Emit `BurningFailed` event
-- [ ] Update `Redemption::apply()` to handle `BurningStarted` event
-  - No state change needed (just a signal event)
-  - Or transition from `AlpacaCalled` to `Burning` if this isn't already handled
-    by `AlpacaJournalCompleted`
-- [ ] Update `Redemption::apply()` to handle `TokensBurned` event
+- [x] ~~Update `Redemption::apply()` to handle `BurningStarted`~~ - **Removed**:
+      Event no longer exists
+  - State transition to `Burning` already handled by `AlpacaJournalCompleted`
+- [x] Update `Redemption::apply()` to handle `TokensBurned` event
   - Transition from `Burning` to `Completed` state with burn transaction details
   - This is the final success state - redemption is complete once tokens are
     burned
-- [ ] Update `Redemption::apply()` to handle `BurningFailed` event
+- [x] Update `Redemption::apply()` to handle `BurningFailed` event
   - Transition to `Failed` state with error details
-- [ ] Add comprehensive unit tests in `src/redemption/mod.rs`
+- [x] Add comprehensive unit tests in `src/redemption/mod.rs`
   - Test `RecordBurnSuccess` from `Burning` state produces `TokensBurned` event
   - Test `RecordBurnSuccess` from wrong state returns `InvalidState` error
   - Test `RecordBurnFailure` from `Burning` state produces `BurningFailed` event
@@ -171,8 +170,7 @@ the task.
   - Test `apply(TokensBurned)` transitions to `Completed` state (final success)
   - Test `apply(BurningFailed)` transitions to `Failed` state
   - Test complete redemption flow: `Detected` → `AlpacaCalled` →
-    `AlpacaJournalCompleted` + `BurningStarted` → `TokensBurned` (final success
-    state)
+    `AlpacaJournalCompleted` → `TokensBurned` (final success state)
 
 **Files to modify**:
 
@@ -279,9 +277,9 @@ Create a manager to orchestrate the burning process, following the same pattern
 as `MintManager`, with comprehensive tests.
 
 **Reasoning**: Managers bridge ES/CQRS aggregates with external services. The
-`BurnManager` reacts to `BurningStarted` events by selecting a receipt, calling
-the blockchain service, and recording results. Tests are included to verify
-orchestration logic.
+`BurnManager` reacts to `AlpacaJournalCompleted` events by selecting a receipt,
+calling the blockchain service, and recording results. Tests are included to
+verify orchestration logic.
 
 **Implementation**:
 
@@ -343,8 +341,8 @@ orchestration logic.
 Integrate the `BurnManager` into the application's event processing pipeline to
 automatically burn tokens when redemptions enter the `Burning` state.
 
-**Reasoning**: The manager must react to `BurningStarted` events to execute
-burns. This requires wiring into the CQRS query/view infrastructure and
+**Reasoning**: The manager must react to `AlpacaJournalCompleted` events to
+execute burns. This requires wiring into the CQRS query/view infrastructure and
 potentially the event listener that processes redemption events.
 
 **Implementation**:
@@ -356,13 +354,15 @@ potentially the event listener that processes redemption events.
 - [ ] Create `BurnManager` instance during application startup
   - Pass `vault_service`, `sqlite_pool`, and `redemption_cqrs` as dependencies
   - Store in application state or service container
-- [ ] Wire manager to listen for `BurningStarted` events
+- [ ] Wire manager to listen for `AlpacaJournalCompleted` events
   - Option A: Add to existing redemption event processor if one exists
   - Option B: Create new event processor specifically for burning
-  - Option C: Implement as a query that triggers on `BurningStarted` event
+  - Option C: Implement as a query that triggers on `AlpacaJournalCompleted`
+    event
   - Follow the same pattern used for `MintManager` orchestration
 - [ ] Implement event processing logic
-  - When `BurningStarted` event is received
+  - When `AlpacaJournalCompleted` event is received and aggregate is in
+    `Burning` state
   - Load current `Redemption` aggregate from event store
   - Call `burn_manager.handle_burning_started()` with aggregate
   - Log success/failure appropriately
