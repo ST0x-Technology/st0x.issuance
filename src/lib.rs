@@ -15,6 +15,7 @@ use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
     Redemption, RedemptionView,
+    burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
@@ -63,13 +64,16 @@ struct AggregateCqrsSetup {
 }
 
 struct RedemptionManagers {
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 }
 
@@ -175,20 +179,23 @@ pub async fn initialize_rocket(
     let (mint_manager, callback_manager) =
         setup_mint_managers(&config, &mint_cqrs).await?;
 
-    let RedemptionManagers { redeem_call_manager, journal_manager } =
+    let RedemptionManagers { redeem_call, journal, burn } =
         setup_redemption_managers(
             &config,
             &redemption_cqrs,
             &redemption_event_store,
-        )?;
+            &pool,
+        )
+        .await?;
 
     spawn_redemption_detector(
         &config,
         redemption_cqrs.clone(),
         redemption_event_store,
         pool.clone(),
-        redeem_call_manager,
-        journal_manager,
+        redeem_call,
+        journal,
+        burn,
     );
 
     Ok(rocket::build()
@@ -322,23 +329,31 @@ async fn setup_mint_managers(
     Ok((mint_manager, callback_manager))
 }
 
-fn setup_redemption_managers(
+async fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
+    pool: &Pool<Sqlite>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
-    let redeem_call_manager = Arc::new(RedeemCallManager::new(
+    let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_cqrs.clone(),
     ));
-    let journal_manager = Arc::new(JournalManager::new(
+    let journal = Arc::new(JournalManager::new(
         alpaca_service,
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
     ));
 
-    Ok(RedemptionManagers { redeem_call_manager, journal_manager })
+    let blockchain_service = config.create_blockchain_service().await?;
+    let burn = Arc::new(BurnManager::new(
+        blockchain_service,
+        pool.clone(),
+        redemption_cqrs.clone(),
+    ));
+
+    Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
 fn spawn_redemption_detector(
@@ -348,13 +363,16 @@ fn spawn_redemption_detector(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
     if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
@@ -375,8 +393,9 @@ fn spawn_redemption_detector(
             redemption_cqrs,
             redemption_event_store,
             pool,
-            redeem_call_manager,
-            journal_manager,
+            redeem_call,
+            journal,
+            burn,
         );
 
         tokio::spawn(async move {

@@ -194,6 +194,8 @@ Operational concerns for production deployment.
       CD (GitHub Actions)
 - [ ] [#33](https://github.com/ST0x-Technology/st0x.issuance/issues/33) - Add
       staging environment (nice-to-have)
+- [ ] [#62](https://github.com/ST0x-Technology/st0x.issuance/issues/62) -
+      Abstract database view queries behind traits
 
 ---
 

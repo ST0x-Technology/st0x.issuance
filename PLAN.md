@@ -347,26 +347,26 @@ potentially the event listener that processes redemption events.
 
 **Implementation**:
 
-- [ ] Examine existing manager wiring
+- [x] Examine existing manager wiring
   - Locate where `MintManager` is instantiated (likely in `main.rs` or app
     setup)
   - Understand the event listening mechanism used for minting
-- [ ] Create `BurnManager` instance during application startup
+- [x] Create `BurnManager` instance during application startup
   - Pass `vault_service`, `sqlite_pool`, and `redemption_cqrs` as dependencies
   - Store in application state or service container
-- [ ] Wire manager to listen for `AlpacaJournalCompleted` events
+- [x] Wire manager to listen for `AlpacaJournalCompleted` events
   - Option A: Add to existing redemption event processor if one exists
   - Option B: Create new event processor specifically for burning
   - Option C: Implement as a query that triggers on `AlpacaJournalCompleted`
     event
   - Follow the same pattern used for `MintManager` orchestration
-- [ ] Implement event processing logic
+- [x] Implement event processing logic
   - When `AlpacaJournalCompleted` event is received and aggregate is in
     `Burning` state
   - Load current `Redemption` aggregate from event store
   - Call `burn_manager.handle_burning_started()` with aggregate
   - Log success/failure appropriately
-- [ ] Add error handling and logging
+- [x] Add error handling and logging
   - Log when burn orchestration starts
   - Log when burn succeeds (with tx hash, receipt ID, shares)
   - Log when burn fails (with error details)
@@ -392,26 +392,26 @@ miss.
 
 **Implementation**:
 
-- [ ] Add integration test for complete redemption with burn (happy path)
+- [x] Add integration test for complete redemption with burn (happy path)
   - Setup: Initialize in-memory SQLite, run migrations
   - Create redemption aggregate in `Burning` state
   - Seed `ReceiptInventoryView` with active receipt (sufficient balance)
   - Execute: Call `burn_manager.handle_burning_started()`
   - Verify: Burn succeeds, aggregate in `Completed` state, receipt balance
     decremented in database view
-- [ ] Add integration test for partial burn
+- [x] Add integration test for partial burn
   - Setup: Create receipt with balance larger than burn amount
   - Execute: Burn portion of shares
   - Verify: Receipt remains `Active` with correct updated balance
-- [ ] Add integration test for burn that depletes receipt
+- [x] Add integration test for burn that depletes receipt
   - Setup: Create receipt with exact balance needed for burn
   - Execute: Burn all shares
   - Verify: Receipt transitions to `Depleted` state
-- [ ] Add integration test for burn with multiple receipts
+- [x] Add integration test for burn with multiple receipts
   - Setup: Create multiple receipts with different balances
   - Execute: Burn amount requiring selection
   - Verify: Correct receipt selected (highest balance), others unchanged
-- [ ] Add integration test for insufficient balance scenario
+- [x] Add integration test for insufficient balance scenario
   - Setup: Create receipts with insufficient total balance
   - Execute: Attempt burn
   - Verify: Burn fails, aggregate in `Failed` state with appropriate error
