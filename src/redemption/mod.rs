@@ -308,6 +308,19 @@ impl Aggregate for Redemption {
                     failed_at: now,
                 }])
             }
+            RedemptionCommand::RecordBurnSuccess { .. } => {
+                // TODO(Task 2): Implement burn success handling
+                // Should emit TokensBurned event (no RedemptionCompleted needed)
+                unimplemented!(
+                    "RecordBurnSuccess will be implemented in Task 2"
+                )
+            }
+            RedemptionCommand::RecordBurnFailure { .. } => {
+                // TODO(Task 2): Implement burn failure handling
+                unimplemented!(
+                    "RecordBurnFailure will be implemented in Task 2"
+                )
+            }
         }
     }
 
@@ -371,6 +384,14 @@ impl Aggregate for Redemption {
                 failed_at,
             } => {
                 *self = Self::Failed { issuer_request_id, reason, failed_at };
+            }
+            RedemptionEvent::BurningStarted { .. }
+            | RedemptionEvent::TokensBurned { .. }
+            | RedemptionEvent::BurningFailed { .. } => {
+                // TODO(Task 2): Implement burn event handling in aggregate apply()
+                // - BurningStarted: no-op (just signals manager to start burning)
+                // - TokensBurned: transition to Completed state (final success state)
+                // - BurningFailed: transition to Failed state
             }
         }
     }

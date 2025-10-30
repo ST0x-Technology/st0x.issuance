@@ -77,44 +77,41 @@ command handling and event application in one cohesive step.
 
 **Implementation**:
 
-- [ ] Add `RecordBurnSuccess` variant to `RedemptionCommand` enum in
+- [x] Add `RecordBurnSuccess` variant to `RedemptionCommand` enum in
       `src/redemption/cmd.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
     `receipt_id: U256`, `shares_burned: U256`, `gas_used: u64`,
     `block_number: u64`
   - Similar structure to `RecordMintSuccess` for consistency
-- [ ] Add `RecordBurnFailure` variant to `RedemptionCommand` enum in
+- [x] Add `RecordBurnFailure` variant to `RedemptionCommand` enum in
       `src/redemption/cmd.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `error: String`
   - Similar structure to `RecordMintFailure`
-- [ ] Add `BurningStarted` variant to `RedemptionEvent` enum in
+- [x] Add `BurningStarted` variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
   - Fields: `issuer_request_id: IssuerRequestId`,
     `burning_started_at: DateTime<Utc>`
   - Signals that burning should begin (emitted alongside
     `AlpacaJournalCompleted`)
-- [ ] Add `TokensBurned` variant to `RedemptionEvent` enum in
+- [x] Add `TokensBurned` variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `tx_hash: B256`,
     `receipt_id: U256`, `shares_burned: U256`, `gas_used: u64`,
     `block_number: u64`, `burned_at: DateTime<Utc>`
   - Mirrors `MintEvent::TokensMinted` structure for consistency
-- [ ] Add `BurningFailed` variant to `RedemptionEvent` enum in
+- [x] Add `BurningFailed` variant to `RedemptionEvent` enum in
       `src/redemption/event.rs`
   - Fields: `issuer_request_id: IssuerRequestId`, `error: String`,
     `failed_at: DateTime<Utc>`
   - Records blockchain burning failure
-- [ ] Add `RedemptionCompleted` variant to `RedemptionEvent` enum in
-      `src/redemption/event.rs`
-  - Fields: `issuer_request_id: IssuerRequestId`, `completed_at: DateTime<Utc>`
-  - Marks successful end of redemption flow
-- [ ] Implement `DomainEvent` trait for new event variants in
+- [x] Implement `DomainEvent` trait for new event variants in
       `src/redemption/event.rs`
   - Add event types: "RedemptionEvent::BurningStarted",
-    "RedemptionEvent::TokensBurned", "RedemptionEvent::BurningFailed",
-    "RedemptionEvent::RedemptionCompleted"
+    "RedemptionEvent::TokensBurned", "RedemptionEvent::BurningFailed"
   - All events use version "1.0"
-- [ ] Add unit tests for event serialization in `src/redemption/event.rs`
+  - Note: No separate RedemptionCompleted event needed - TokensBurned is the
+    final success state
+- [x] Add unit tests for event serialization in `src/redemption/event.rs`
   - Test each new event can be serialized and deserialized
   - Test `event_type()` returns correct strings
   - Test `event_version()` returns "1.0"
@@ -149,8 +146,8 @@ the task.
 - [ ] Update `Redemption::handle()` to process `RecordBurnSuccess` command
   - Validate current state is `Burning`
   - Return `InvalidState` error if in wrong state
-  - Emit `TokensBurned` event followed by `RedemptionCompleted` event (two
-    events from one command)
+  - Emit `TokensBurned` event (this is the final success state - no separate
+    RedemptionCompleted event needed)
   - Capture `Utc::now()` for timestamp fields
 - [ ] Update `Redemption::handle()` to process `RecordBurnFailure` command
   - Validate current state is `Burning`
@@ -161,24 +158,21 @@ the task.
   - Or transition from `AlpacaCalled` to `Burning` if this isn't already handled
     by `AlpacaJournalCompleted`
 - [ ] Update `Redemption::apply()` to handle `TokensBurned` event
-  - Store burn transaction details if needed
-  - Remain in `Burning` state until `RedemptionCompleted` applies
-- [ ] Update `Redemption::apply()` to handle `RedemptionCompleted` event
-  - Transition from `Burning` to `Completed` with relevant fields
+  - Transition from `Burning` to `Completed` state with burn transaction details
+  - This is the final success state - redemption is complete once tokens are
+    burned
 - [ ] Update `Redemption::apply()` to handle `BurningFailed` event
   - Transition to `Failed` state with error details
 - [ ] Add comprehensive unit tests in `src/redemption/mod.rs`
-  - Test `RecordBurnSuccess` from `Burning` state produces `TokensBurned` +
-    `RedemptionCompleted` events
+  - Test `RecordBurnSuccess` from `Burning` state produces `TokensBurned` event
   - Test `RecordBurnSuccess` from wrong state returns `InvalidState` error
   - Test `RecordBurnFailure` from `Burning` state produces `BurningFailed` event
   - Test `RecordBurnFailure` from wrong state returns `InvalidState` error
-  - Test `apply(TokensBurned)` correctly updates state
-  - Test `apply(RedemptionCompleted)` transitions to `Completed` state
+  - Test `apply(TokensBurned)` transitions to `Completed` state (final success)
   - Test `apply(BurningFailed)` transitions to `Failed` state
   - Test complete redemption flow: `Detected` → `AlpacaCalled` →
-    `AlpacaJournalCompleted` + `BurningStarted` → `TokensBurned` →
-    `RedemptionCompleted`
+    `AlpacaJournalCompleted` + `BurningStarted` → `TokensBurned` (final success
+    state)
 
 **Files to modify**:
 

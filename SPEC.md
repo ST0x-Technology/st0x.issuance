@@ -253,7 +253,9 @@ on-chain transfer through calling Alpaca to burning tokens.
   (terminal failure state)
 - `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
   transfer
-- `RedemptionCompleted { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
+- `BurningStarted { issuer_request_id }` - Burning process started (signal event
+  for burn manager)
+- `TokensBurned { issuer_request_id, tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
   On-chain burn succeeded and entire redemption flow completed (terminal success
   state)
 - `BurningFailed { issuer_request_id, error }` - On-chain burn failed (terminal
@@ -261,14 +263,14 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command → Event Mappings:**
 
-| Command                 | Events Produced          | Notes                                                                      |
-| ----------------------- | ------------------------ | -------------------------------------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                      |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                                    |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                          |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - Alpaca journal transfer completed                           |
-| `RecordBurnSuccess`     | `RedemptionCompleted`    | Single event - burn succeeded and redemption fully done (terminal success) |
-| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                              |
+| Command                 | Events Produced                            | Notes                                                                 |
+| ----------------------- | ------------------------------------------ | --------------------------------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`                       | Single event - transfer to redemption wallet detected                 |
+| `RecordAlpacaCall`      | `AlpacaCalled`                             | Single event - Alpaca redeem API called                               |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`                         | Single event - API call failed (terminal failure)                     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`, `BurningStarted` | Two events - journal complete and signal burning should start         |
+| `RecordBurnSuccess`     | `TokensBurned`                             | Single event - burn succeeded, redemption complete (terminal success) |
+| `RecordBurnFailure`     | `BurningFailed`                            | Single event - burn failed (terminal failure)                         |
 
 ### Account Aggregate
 
@@ -789,11 +791,11 @@ sequenceDiagram
         Alpaca->>Us: {status: "pending" | "completed"}
     end
 
-    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted<br/>Status: burning
+    Note right of Us: ConfirmAlpacaComplete command<br/>Events: AlpacaJournalCompleted + BurningStarted<br/>Status: burning
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordBurnSuccess command<br/>Event: RedemptionCompleted
+    Note right of Us: RecordBurnSuccess command<br/>Event: TokensBurned (final success state)
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -1267,7 +1269,7 @@ events.
 **RedemptionView** - Maintains current state of redemptions:
 
 - Listens to: `RedemptionDetected`, `AlpacaCalled`, `AlpacaJournalCompleted`,
-  `RedemptionCompleted`, `AlpacaCallFailed`, `BurningFailed`
+  `BurningStarted`, `TokensBurned`, `AlpacaCallFailed`, `BurningFailed`
 - Updates: Status, timestamps, transaction details
 - Used for: Tracking redemption progress, status queries
 
@@ -1285,7 +1287,7 @@ events.
 
 **InventorySnapshotView** - Periodic inventory metrics:
 
-- Listens to: `TokensMinted`, `RedemptionCompleted`
+- Listens to: `TokensMinted`, `TokensBurned`
 - Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
 - Used for: Grafana dashboards, monitoring, alerting
 
