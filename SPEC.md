@@ -1274,14 +1274,13 @@ events.
 **ReceiptInventoryView** - Tracks receipt balances through state transitions:
 
 - Listens to: `MintEvent::Initiated` (captures underlying/token),
-  `MintEvent::TokensMinted` (creates active receipt)
-- Future: Will listen to burn events from Redemption aggregate when issue #25 is
-  implemented (decreases balance, transitions to Depleted)
-- State transitions: Unavailable → Pending → Active (→ Depleted when burning
-  implemented)
+  `MintEvent::TokensMinted` (creates active receipt),
+  `RedemptionEvent::TokensBurned` (decreases balance, transitions to Depleted)
+- State transitions: Unavailable → Pending → Active → Depleted
 - Updates: Accumulates data across event sequence to track each receipt's
-  lifecycle
-- Used for: Selecting which receipt to burn from, inventory management
+  lifecycle from creation through complete depletion
+- Used for: Selecting which receipt to burn from during redemptions, inventory
+  management
 
 **InventorySnapshotView** - Periodic inventory metrics:
 

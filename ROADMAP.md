@@ -165,7 +165,7 @@ Complete redemption flow - detect transfer through burn.
       Implement Alpaca journal polling feature
 - [ ] [#24](https://github.com/ST0x-Technology/st0x.issuance/issues/24) -
       Implement ReceiptInventoryView
-- [ ] [#25](https://github.com/ST0x-Technology/st0x.issuance/issues/25) -
+- [x] [#25](https://github.com/ST0x-Technology/st0x.issuance/issues/25) -
       Implement token burning feature
 - [ ] [#26](https://github.com/ST0x-Technology/st0x.issuance/issues/26) -
       End-to-end redemption flow tests

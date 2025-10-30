@@ -5,7 +5,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use crate::mint::{IssuerRequestId, Mint, MintEvent};
+use crate::mint::{Mint, MintEvent};
 use crate::redemption::{Redemption, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
@@ -185,38 +185,6 @@ impl View<Redemption> for ReceiptInventoryView {
     }
 }
 
-/// Retrieves a specific receipt by its issuer request ID.
-///
-/// Returns `None` if no receipt exists for the given ID.
-///
-/// # Use Case
-/// When burning tokens during redemption, use this to look up the receipt
-/// associated with a specific mint operation.
-pub(crate) async fn get_receipt(
-    pool: &Pool<Sqlite>,
-    issuer_request_id: &IssuerRequestId,
-) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
-    let issuer_request_id_str = &issuer_request_id.0;
-    let row = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM receipt_inventory_view
-        WHERE view_id = ?
-        "#,
-        issuer_request_id_str
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
-
-    Ok(Some(view))
-}
-
 /// Lists all Active receipts for a given underlying symbol.
 ///
 /// Returns only receipts in the Active state (has available balance > 0).
@@ -281,40 +249,6 @@ pub(crate) async fn find_receipt_with_balance(
         .next())
 }
 
-/// Calculates the total available balance across all Active receipts for an underlying symbol.
-///
-/// Sums the `current_balance` field from all Active receipts. Excludes Pending,
-/// Unavailable, and Depleted receipts.
-///
-/// # Use Case
-/// Verify total on-hand inventory before accepting redemption requests, or for
-/// operational metrics and monitoring dashboards.
-pub(crate) async fn get_total_balance(
-    pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
-) -> Result<U256, ReceiptInventoryViewError> {
-    let underlying_str = &underlying.0;
-    let rows = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM receipt_inventory_view
-        WHERE json_extract(payload, '$.Active.underlying') = ?
-        "#,
-        underlying_str
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter().try_fold(U256::ZERO, |acc, row| {
-        let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
-        Ok(if let ReceiptInventoryView::Active { current_balance, .. } = view {
-            acc + current_balance
-        } else {
-            acc
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256, uint};
@@ -326,7 +260,8 @@ mod tests {
 
     use super::*;
     use crate::mint::{
-        ClientId, MintEvent, Network, Quantity, TokenizationRequestId,
+        ClientId, IssuerRequestId, MintEvent, Network, Quantity,
+        TokenizationRequestId,
     };
     use crate::redemption::RedemptionEvent;
 
@@ -1123,65 +1058,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_receipt_returns_view() {
-        let pool = setup_test_db().await;
-
-        let issuer_request_id = IssuerRequestId::new("iss-retrieve");
-        let underlying = UnderlyingSymbol::new("MSFT");
-        let token = TokenSymbol::new("tMSFT");
-
-        let view = ReceiptInventoryView::Pending {
-            underlying: underlying.clone(),
-            token: token.clone(),
-        };
-
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO receipt_inventory_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            issuer_request_id.0,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let result = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_some());
-
-        let ReceiptInventoryView::Pending {
-            underlying: found_underlying,
-            token: found_token,
-        } = result.unwrap()
-        else {
-            panic!("Expected Pending variant");
-        };
-
-        assert_eq!(found_underlying, underlying);
-        assert_eq!(found_token, token);
-    }
-
-    #[tokio::test]
-    async fn test_get_receipt_returns_none_when_not_found() {
-        let pool = setup_test_db().await;
-
-        let issuer_request_id = IssuerRequestId::new("nonexistent");
-
-        let result = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
     async fn test_list_active_receipts_returns_only_active() {
         let pool = setup_test_db().await;
 
@@ -1360,182 +1236,5 @@ mod tests {
         .expect("Query should succeed");
 
         assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_total_balance_sums_all_active_receipts() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("NFLX");
-
-        let view1 = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-            initial_amount: uint!(100_000000000000000000_U256),
-            current_balance: uint!(75_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let view2 = ReceiptInventoryView::Active {
-            receipt_id: uint!(2_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-            initial_amount: uint!(50_000000000000000000_U256),
-            current_balance: uint!(50_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let pending_view = ReceiptInventoryView::Pending {
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-        };
-
-        let payload1 =
-            serde_json::to_string(&view1).expect("Failed to serialize");
-        let payload2 =
-            serde_json::to_string(&view2).expect("Failed to serialize");
-        let payload3 =
-            serde_json::to_string(&pending_view).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-1",
-            payload1
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-2",
-            payload2
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-3",
-            payload3
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        let total = get_total_balance(&pool, &underlying)
-            .await
-            .expect("Query should succeed");
-
-        assert_eq!(total, uint!(125_000000000000000000_U256));
-    }
-
-    #[tokio::test]
-    async fn test_get_total_balance_returns_zero_when_no_active() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("SHOP");
-
-        let total = get_total_balance(&pool, &underlying)
-            .await
-            .expect("Query should succeed");
-
-        assert_eq!(total, U256::ZERO);
-    }
-
-    #[tokio::test]
-    async fn test_burn_event_persists_balance_update_to_database() {
-        let pool = setup_test_db().await;
-
-        let issuer_request_id = IssuerRequestId::new("iss-burn-db");
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let receipt_id = uint!(42_U256);
-        let initial_balance = uint!(100_000000000000000000_U256);
-        let shares_to_burn = uint!(30_000000000000000000_U256);
-
-        let active_view = ReceiptInventoryView::Active {
-            receipt_id,
-            underlying: underlying.clone(),
-            token: token.clone(),
-            initial_amount: initial_balance,
-            current_balance: initial_balance,
-            minted_at: Utc::now(),
-        };
-
-        let payload = serde_json::to_string(&active_view)
-            .expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO receipt_inventory_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            issuer_request_id.0,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert initial view");
-
-        let mut view = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed")
-            .expect("View should exist");
-
-        let burned_at = Utc::now();
-        let burn_event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("red-db-test"),
-            tx_hash: b256!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            receipt_id,
-            shares_burned: shares_to_burn,
-            gas_used: 50000,
-            block_number: 2000,
-            burned_at,
-        };
-
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-db-test".to_string(),
-            sequence: 1,
-            payload: burn_event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let updated_payload = serde_json::to_string(&view)
-            .expect("Failed to serialize updated view");
-
-        sqlx::query!(
-            r"
-            UPDATE receipt_inventory_view
-            SET payload = ?, version = 2
-            WHERE view_id = ?
-            ",
-            updated_payload,
-            issuer_request_id.0
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to update view");
-
-        let persisted_view = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed")
-            .expect("View should exist");
-
-        let ReceiptInventoryView::Active { current_balance, .. } =
-            persisted_view
-        else {
-            panic!(
-                "Expected Active variant after partial burn, got {persisted_view:?}"
-            );
-        };
-
-        assert_eq!(current_balance, uint!(70_000000000000000000_U256));
     }
 }
