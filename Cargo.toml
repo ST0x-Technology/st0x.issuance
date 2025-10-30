@@ -65,6 +65,7 @@ futures = "0.3.31"
 url = "2.5.7"
 anyhow = "1.0.100"
 dotenvy = "0.15.7"
+itertools = "0.14.0"
 
 [lints]
 workspace = true
