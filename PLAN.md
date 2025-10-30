@@ -189,27 +189,27 @@ mock works correctly for downstream manager tests.
 
 **Implementation**:
 
-- [ ] Define `BurnResult` struct in `src/vault/mod.rs`
+- [x] Define `BurnResult` struct in `src/vault/mod.rs`
   - Fields: `tx_hash: B256`, `receipt_id: U256`, `shares_burned: U256`,
     `gas_used: u64`, `block_number: u64`
   - Place next to `MintResult` for consistency
   - Derive `Debug`, `Clone`, `PartialEq`, `Serialize`, `Deserialize`
-- [ ] Add `burn_tokens()` method to `VaultService` trait in `src/vault/mod.rs`
+- [x] Add `burn_tokens()` method to `VaultService` trait in `src/vault/mod.rs`
   - Parameters: `shares: U256`, `receipt_id: U256`, `receiver: Address`,
     `receipt_info: ReceiptInformation`
   - Returns: `Result<BurnResult, VaultError>`
-  - Document that this calls the vault's `withdraw()` function
-- [ ] Implement `burn_tokens()` in real vault service (`src/vault/service.rs`)
-  - Call vault contract's `withdraw()` function with correct parameters
+  - Document that this calls the vault's `redeem()` function
+- [x] Implement `burn_tokens()` in real vault service (`src/vault/service.rs`)
+  - Call vault contract's `redeem()` function with correct parameters
   - Parse `Withdraw` event from transaction receipt to extract shares burned
   - Handle transaction failures and missing events gracefully
   - Return `BurnResult` on success
-- [ ] Add success and failure modes to `MockVaultService` in `src/vault/mock.rs`
+- [x] Add success and failure modes to `MockVaultService` in `src/vault/mock.rs`
   - Implement `burn_tokens()` method that returns success or failure based on
     mock configuration
   - Track call count for test verification (add `burn_call_count` field)
   - Return deterministic test data (tx hash, receipt ID, shares, etc.)
-- [ ] Add unit tests for mock behavior in `src/vault/mock.rs`
+- [x] Add unit tests for mock behavior in `src/vault/mock.rs`
   - Test mock success mode returns expected `BurnResult`
   - Test mock failure mode returns `VaultError`
   - Test call count tracking works correctly
