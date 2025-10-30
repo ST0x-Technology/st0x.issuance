@@ -76,6 +76,12 @@ struct RedemptionManagers {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Quantity(pub(crate) Decimal);
 
+impl std::fmt::Display for Quantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
         Self(value)
@@ -428,4 +434,118 @@ async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{U256, uint};
+    use rust_decimal::Decimal;
+
+    use super::{Quantity, QuantityConversionError};
+
+    #[test]
+    fn test_quantity_display() {
+        let quantity = Quantity::new(Decimal::from(100));
+        assert_eq!(format!("{quantity}"), "100");
+
+        let quantity_with_decimals = Quantity::new(Decimal::new(12345, 2));
+        assert_eq!(format!("{quantity_with_decimals}"), "123.45");
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_whole_number() {
+        let quantity = Quantity::new(Decimal::from(100));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(100_000000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_with_decimals() {
+        let quantity = Quantity::new(Decimal::new(12345, 2));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123_450000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_zero() {
+        let quantity = Quantity::new(Decimal::ZERO);
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_negative_fails() {
+        let quantity = Quantity::new(Decimal::from(-10));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::NegativeValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_fractional_beyond_18_decimals_fails() {
+        let quantity = Quantity::new(Decimal::new(1, 19));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::FractionalValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_max_18_decimals() {
+        let quantity = Quantity::new(Decimal::new(123_456_789_012_345_678, 18));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123456789012345678_U256));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_whole_number() {
+        let u256_value = uint!(100_000000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::from(100));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_with_decimals() {
+        let u256_value = uint!(123_450000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(12345, 2));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_zero() {
+        let quantity =
+            Quantity::from_u256_with_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(quantity.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_preserves_precision() {
+        let u256_value = uint!(123456789012345678_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(123_456_789_012_345_678, 18));
+    }
+
+    #[test]
+    fn test_round_trip_conversion() {
+        let original = Quantity::new(Decimal::from(100));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
+
+    #[test]
+    fn test_round_trip_conversion_with_decimals() {
+        let original = Quantity::new(Decimal::new(12345, 2));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
 }

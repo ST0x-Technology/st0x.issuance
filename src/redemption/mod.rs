@@ -2,6 +2,7 @@ mod cmd;
 mod event;
 mod view;
 
+pub(crate) mod burn_manager;
 pub(crate) mod detector;
 pub(crate) mod journal_manager;
 pub(crate) mod redeem_call_manager;

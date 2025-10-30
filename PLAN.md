@@ -283,9 +283,9 @@ verify orchestration logic.
 
 **Implementation**:
 
-- [ ] Create `src/redemption/burn_manager.rs` module
+- [x] Create `src/redemption/burn_manager.rs` module
   - Add `pub(crate) mod burn_manager;` to `src/redemption/mod.rs`
-- [ ] Define `BurnManagerError` enum in `burn_manager.rs`
+- [x] Define `BurnManagerError` enum in `burn_manager.rs`
   - Variants: `Blockchain(VaultError)`, `Cqrs(AggregateError<RedemptionError>)`,
     `InvalidAggregateState { current_state: String }`,
     `QuantityConversion(QuantityConversionError)`,
@@ -293,16 +293,16 @@ verify orchestration logic.
     `Database(sqlx::Error)`
   - Derive `Debug`, `thiserror::Error`
   - Implement `From` traits for automatic error conversion where applicable
-- [ ] Define `BurnManager` struct in `burn_manager.rs`
+- [x] Define `BurnManager` struct in `burn_manager.rs`
   - Fields: `blockchain_service: Arc<dyn VaultService>`,
     `receipt_query_pool: Pool<Sqlite>`,
     `cqrs: Arc<CqrsFramework<Redemption, ES>>`
   - Generic over `ES: EventStore<Redemption>` for flexibility
-- [ ] Implement `BurnManager::new()` constructor
+- [x] Implement `BurnManager::new()` constructor
   - Accept blockchain service, database pool (for receipt queries), and CQRS
     framework
   - Return `Self`
-- [ ] Implement `BurnManager::handle_burning_started()` method
+- [x] Implement `BurnManager::handle_burning_started()` method
   - Accept `issuer_request_id: &IssuerRequestId` and `aggregate: &Redemption`
   - Validate aggregate is in `Burning` state, return `InvalidAggregateState`
     error if not
@@ -319,7 +319,7 @@ verify orchestration logic.
   - On success → execute `RecordBurnSuccess` command with transaction details
   - On failure → execute `RecordBurnFailure` command with error message
   - Add logging for start, success, and failure cases
-- [ ] Add unit tests in `burn_manager.rs`
+- [x] Add unit tests in `burn_manager.rs`
   - Test successful burn orchestration with mock vault service and in-memory
     CQRS
   - Test blockchain failure flow (error recorded in aggregate)

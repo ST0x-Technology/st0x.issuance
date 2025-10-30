@@ -17,6 +17,12 @@ pub(crate) use view::TokenizedAssetView;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnderlyingSymbol(pub(crate) String);
 
+impl std::fmt::Display for UnderlyingSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl UnderlyingSymbol {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -26,6 +32,12 @@ impl UnderlyingSymbol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(crate) String);
 
+impl std::fmt::Display for TokenSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl TokenSymbol {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -34,6 +46,12 @@ impl TokenSymbol {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Network(pub(crate) String);
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl Network {
     pub(crate) fn new(value: impl Into<String>) -> Self {
@@ -250,5 +268,23 @@ mod tests {
             }
             TokenizedAsset::NotAdded => panic!("Expected asset to be added"),
         }
+    }
+
+    #[test]
+    fn test_underlying_symbol_display() {
+        let symbol = UnderlyingSymbol::new("AAPL");
+        assert_eq!(format!("{symbol}"), "AAPL");
+    }
+
+    #[test]
+    fn test_token_symbol_display() {
+        let symbol = TokenSymbol::new("tAAPL");
+        assert_eq!(format!("{symbol}"), "tAAPL");
+    }
+
+    #[test]
+    fn test_network_display() {
+        let network = Network::new("base");
+        assert_eq!(format!("{network}"), "base");
     }
 }

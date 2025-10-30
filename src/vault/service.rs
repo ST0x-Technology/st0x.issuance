@@ -123,8 +123,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // The vault's redeem() function burns shares and returns underlying assets to receiver.
         // Parameters: shares to burn, receiver address, owner address, receipt ID, metadata.
-        // The owner is the address that owns the shares being burned. Since we're sending the
-        // transaction, the caller (wallet) is both the owner and will be validated on-chain.
+        // We pass `receiver` for both the receiver and owner parameters since our wallet
+        // (the transaction sender) owns the shares being burned.
         let receipt = vault
             .redeem(shares, receiver, receiver, receipt_id, receipt_info_bytes)
             .send()
