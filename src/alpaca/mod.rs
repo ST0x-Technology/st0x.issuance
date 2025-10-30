@@ -186,12 +186,6 @@ pub(crate) enum AlpacaError {
     /// Tokenization request not found when polling status
     #[error("Tokenization request not found: {tokenization_request_id}")]
     RequestNotFound { tokenization_request_id: String },
-    /// Tokenization request type mismatch
-    #[error("Request type mismatch: expected {expected:?}, got {actual:?}")]
-    RequestTypeMismatch {
-        expected: TokenizationRequestType,
-        actual: TokenizationRequestType,
-    },
 }
 
 #[cfg(test)]

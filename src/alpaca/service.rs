@@ -285,17 +285,13 @@ impl AlpacaService for RealAlpacaService {
                     let request = list_response
                         .requests
                         .into_iter()
-                        .find(|req| &req.id == tokenization_request_id)
+                        .find(|req| {
+                            &req.id == tokenization_request_id
+                                && req.r#type == super::TokenizationRequestType::Redeem
+                        })
                         .ok_or_else(|| AlpacaError::RequestNotFound {
                             tokenization_request_id: tokenization_request_id.0.clone(),
                         })?;
-
-                    if request.r#type != super::TokenizationRequestType::Redeem {
-                        return Err(AlpacaError::RequestTypeMismatch {
-                            expected: super::TokenizationRequestType::Redeem,
-                            actual: request.r#type,
-                        });
-                    }
 
                     Ok(request)
                 }
@@ -1209,6 +1205,77 @@ mod tests {
         let _ = service
             .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_request_status_skips_legacy_mint_entries() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests");
+            then.status(200).json_body(serde_json::json!({
+                "requests": [
+                    {
+                        "tokenization_request_id": "tok-mint-legacy",
+                        "issuer_request_id": "mint-123",
+                        "created_at": "2025-09-12T17:28:48.642437-04:00",
+                        "type": "mint",
+                        "status": "completed",
+                        "underlying_symbol": "AAPL",
+                        "token_symbol": "tAAPL",
+                        "qty": "100",
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                        "fees": "0.0"
+                    },
+                    {
+                        "tokenization_request_id": "tok-redeem-valid",
+                        "issuer_request_id": "red-456",
+                        "created_at": "2025-09-12T17:30:00.000000-04:00",
+                        "type": "redeem",
+                        "status": "pending",
+                        "underlying_symbol": "TSLA",
+                        "token_symbol": "tTSLA",
+                        "qty": "50",
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
+                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "fees": "0.0"
+                    }
+                ]
+            }));
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let result = service
+            .poll_request_status(&TokenizationRequestId::new("tok-mint-legacy"))
+            .await;
+
+        match result {
+            Err(AlpacaError::RequestNotFound {
+                tokenization_request_id: id,
+            }) => {
+                assert_eq!(id, "tok-mint-legacy");
+            }
+            _ => panic!(
+                "Expected RequestNotFound for legacy mint entry, got {result:?}"
+            ),
+        }
 
         mock.assert();
     }
