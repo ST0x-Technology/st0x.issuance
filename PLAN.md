@@ -232,7 +232,7 @@ burns.
 
 **Implementation**:
 
-- [ ] Add helper method `with_tokens_burned` to `ReceiptInventoryView` in
+- [x] Add helper method `with_tokens_burned` to `ReceiptInventoryView` in
       `src/receipt_inventory/view.rs`
   - Signature:
     `fn with_tokens_burned(self, receipt_id: U256, shares_burned: U256, burned_at: DateTime<Utc>) -> Self`
@@ -243,17 +243,17 @@ burns.
   - If still has balance, remain in `Active` state with updated
     `current_balance`
   - For all other states/mismatches, return `self` unchanged
-- [ ] Implement `View<Redemption>::update()` in `src/receipt_inventory/view.rs`
+- [x] Implement `View<Redemption>::update()` in `src/receipt_inventory/view.rs`
   - Handle `TokensBurned` event by calling `with_tokens_burned`
   - Extract `receipt_id`, `shares_burned`, and `burned_at` from event
   - All other redemption events leave view unchanged
-- [ ] Remove `#[allow(dead_code)]` annotations from query methods in
+- [x] Remove `#[allow(dead_code)]` annotations from query methods in
       `src/receipt_inventory/view.rs`
   - Remove from `get_receipt()`
   - Remove from `list_active_receipts()`
   - Remove from `find_receipt_with_balance()`
   - Remove from `get_total_balance()`
-- [ ] Add comprehensive unit tests in `src/receipt_inventory/view.rs`
+- [x] Add comprehensive unit tests in `src/receipt_inventory/view.rs`
   - Test `Active` receipt balance decrements correctly on `TokensBurned`
   - Test `Active` → `Depleted` transition when balance reaches zero
   - Test partial burns keep receipt `Active` with updated balance
@@ -261,7 +261,7 @@ burns.
   - Test burning when in `Pending` or `Unavailable` state leaves view unchanged
   - Test `View<Redemption>::update()` correctly processes `TokensBurned` events
   - Test other redemption events leave view unchanged
-- [ ] Add database integration test in `src/receipt_inventory/view.rs`
+- [x] Add database integration test in `src/receipt_inventory/view.rs`
   - Create in-memory database, seed with `Active` receipt
   - Apply `TokensBurned` event through view update
   - Verify persisted view has updated balance
