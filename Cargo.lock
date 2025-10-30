@@ -4686,6 +4686,7 @@ dependencies = [
  "cqrs-es",
  "futures",
  "httpmock",
+ "itertools 0.14.0",
  "reqwest",
  "rocket",
  "rust_decimal",
