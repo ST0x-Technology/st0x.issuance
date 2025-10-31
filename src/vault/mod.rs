@@ -7,17 +7,16 @@ use crate::mint::{
     IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
 
-#[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod service;
 
-/// Service abstraction for blockchain operations.
+/// Service abstraction for vault operations.
 ///
-/// This trait provides an interface for minting tokenized assets on-chain via the
+/// This trait provides an interface for minting and burning tokenized assets on-chain via the
 /// Rain OffchainAssetReceiptVault contract. Implementations can be real blockchain
 /// services or mocks for testing.
 #[async_trait]
-pub(crate) trait BlockchainService: Send + Sync {
+pub(crate) trait VaultService: Send + Sync {
     /// Mints tokens on-chain by calling the vault's deposit() function.
     ///
     /// # Arguments
@@ -33,14 +32,14 @@ pub(crate) trait BlockchainService: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`BlockchainError`] if the transaction fails, events are missing,
+    /// Returns [`VaultError`] if the transaction fails, events are missing,
     /// or RPC communication fails.
     async fn mint_tokens(
         &self,
         assets: U256,
         receiver: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, BlockchainError>;
+    ) -> Result<MintResult, VaultError>;
 }
 
 /// Result of a successful on-chain minting operation.
@@ -93,9 +92,9 @@ pub(crate) enum OperationType {
     Redeem,
 }
 
-/// Errors that can occur during blockchain operations.
+/// Errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BlockchainError {
+pub(crate) enum VaultError {
     /// Transaction was sent but failed on-chain
     #[error("Transaction failed: {reason}")]
     TransactionFailed { reason: String },

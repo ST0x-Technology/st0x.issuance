@@ -1,7 +1,6 @@
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use async_trait::async_trait;
 
 use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 
@@ -9,17 +8,28 @@ use super::{AlpacaError, AlpacaService, MintCallbackRequest};
 ///
 /// Can be configured to either succeed or fail, and tracks the number of times
 /// `send_mint_callback()` was called.
+///
+/// This mock is NOT behind `#[cfg(test)]` because `setup_test_rocket()` (used by E2E tests
+/// in `tests/`) needs to construct it. However, failure-related fields ARE behind
+/// `#[cfg(test)]` because E2E tests only exercise the happy path and compile the library
+/// without `#[cfg(test)]` enabled. Unit tests (inside the crate) can access `#[cfg(test)]`
+/// code, so they get full mock functionality including failure scenarios.
 pub(crate) struct MockAlpacaService {
+    #[cfg(test)]
     should_succeed: bool,
+    #[cfg(test)]
     error_message: Option<String>,
     call_count: Arc<AtomicUsize>,
 }
 
 impl MockAlpacaService {
     /// Creates a mock service that will succeed on all calls.
+    #[must_use]
     pub(crate) fn new_success() -> Self {
         Self {
+            #[cfg(test)]
             should_succeed: true,
+            #[cfg(test)]
             error_message: None,
             call_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -30,6 +40,7 @@ impl MockAlpacaService {
     /// # Arguments
     ///
     /// * `error_message` - Error message to return in the failure
+    #[cfg(test)]
     pub(crate) fn new_failure(error_message: impl Into<String>) -> Self {
         Self {
             should_succeed: false,
@@ -39,6 +50,7 @@ impl MockAlpacaService {
     }
 
     /// Returns the number of times `send_mint_callback()` was called.
+    #[cfg(test)]
     pub(crate) fn get_call_count(&self) -> usize {
         self.call_count.load(Ordering::Relaxed)
     }
@@ -52,15 +64,21 @@ impl AlpacaService for MockAlpacaService {
     ) -> Result<(), AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
-        if self.should_succeed {
-            Ok(())
-        } else {
-            let message = self
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "Mock error".to_string());
-            Err(AlpacaError::Http { message })
+        #[cfg(test)]
+        {
+            if self.should_succeed {
+                Ok(())
+            } else {
+                let message = self
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Mock error".to_string());
+                Err(AlpacaError::Http { message })
+            }
         }
+
+        #[cfg(not(test))]
+        Ok(())
     }
 }
 
@@ -68,12 +86,11 @@ impl AlpacaService for MockAlpacaService {
 mod tests {
     use alloy::primitives::{address, b256};
 
+    use super::MockAlpacaService;
     use crate::account::ClientId;
     use crate::alpaca::{AlpacaService, MintCallbackRequest};
     use crate::mint::TokenizationRequestId;
     use crate::tokenized_asset::Network;
-
-    use super::MockAlpacaService;
 
     #[tokio::test]
     async fn test_mock_success_service() {

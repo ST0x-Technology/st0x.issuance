@@ -1,3 +1,4 @@
+use rocket::post;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,8 @@ pub(crate) struct AccountLinkRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct AccountLinkResponse {
-    pub(crate) client_id: ClientId,
+pub struct AccountLinkResponse {
+    pub client_id: ClientId,
 }
 
 #[post("/accounts/connect", format = "json", data = "<request>")]
@@ -44,14 +45,15 @@ pub(crate) async fn connect_account(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Status};
+    use rocket::routes;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::super::{Account, Email};
+    use super::*;
 
     #[tokio::test]
     async fn test_connect_account_returns_client_id() {
@@ -102,10 +104,8 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: AccountLinkResponse = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: AccountLinkResponse =
+            response.into_json().await.expect("valid JSON response");
 
         assert!(!response_body.client_id.0.is_empty());
     }
@@ -340,10 +340,8 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: AccountLinkResponse = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: AccountLinkResponse =
+            response.into_json().await.expect("valid JSON response");
 
         let view = find_by_email(&pool, &Email(email.to_string()))
             .await

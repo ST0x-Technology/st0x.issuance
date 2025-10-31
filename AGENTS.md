@@ -43,6 +43,10 @@ Relevant docs:
   - All checks (tests, clippy, fmt) SHOULD pass at the end of each task whenever
     possible
   - Focused git diffs and passing checks make reviewing much easier
+- **CRITICAL: Keep PLAN.md in sync with implementation decisions**
+  - If you change approach during implementation, immediately update PLAN.md to reflect the new approach
+  - Plans are living documents during development - update them when you discover better solutions
+  - Implementation and plan must always match - out-of-sync plans are worse than no plan
 - Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
 - Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
   sections or verbose changelogs
@@ -848,6 +852,56 @@ fn test_journal_confirmed_for_missing_mint() {
 
 - In-memory SQLite databases for testing database-specific logic
 - Each test gets its own isolated database
+
+### End-to-End Tests
+
+**End-to-end tests** exercise the complete system from the perspective of an
+external consumer. These tests:
+
+- Live in the project-root `tests/` directory (not nested in feature modules)
+- Start the full HTTP server (Rocket) with real wiring
+- Use in-memory SQLite database (real database operations, not MemStore)
+- Make HTTP requests like an external client would
+- Use mock external services (MockVaultService, MockAlpacaService) to avoid
+  external dependencies
+- Verify complete flows: HTTP request → CQRS → Managers → Database → Async
+  processing
+- Validate state transitions and event persistence across the full stack
+
+**Test Coverage Strategy:**
+
+End-to-end tests are slower and more complex than unit/integration tests, so
+focus them on:
+
+- **Happy path flows** - Verify primary use cases work correctly end-to-end
+- **Critical error scenarios** - Test major failure modes that affect the whole
+  system (e.g., blockchain unavailable, external service down)
+
+Leave exhaustive edge case testing to faster, more focused tests:
+
+- **Unit tests** (aggregate tests) - Exhaustive edge cases, validation rules,
+  business logic in isolation
+- **Integration tests** (endpoint tests) - Thorough error handling, database
+  operations, detailed scenarios
+
+**Distinction from other test types:**
+
+- **Aggregate tests** (`src/mint/mod.rs`): Test CQRS logic in isolation with
+  MemStore (fast, exhaustive edge cases)
+- **Endpoint tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints with
+  mocked dependencies (thorough error scenarios)
+- **End-to-end tests** (`tests/*.rs`): Test the complete system as an external
+  consumer would use it (happy paths + critical failures)
+
+**Public API Surface:**
+
+End-to-end tests help shape what will become the public API for the Rust client
+library. When exposing types for end-to-end tests, be intentional about what
+will eventually be part of the client library interface. The progression is:
+
+1. Expose minimal public API for end-to-end tests (#20)
+2. Package exposed types into proper client library (#52)
+3. Refactor end-to-end tests to use the client library
 
 ### General Testing Guidelines
 

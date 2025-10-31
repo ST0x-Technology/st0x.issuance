@@ -1,5 +1,5 @@
 use cqrs_es::{AggregateContext, EventStore, persist::PersistedEventStore};
-use rocket::{State, serde::json::Json};
+use rocket::{State, post, serde::json::Json};
 use serde::Deserialize;
 use sqlite_es::SqliteEventRepository;
 use std::sync::Arc;
@@ -191,6 +191,7 @@ async fn process_journal_completion(
 mod tests {
     use alloy::primitives::address;
     use rocket::http::{ContentType, Status};
+    use rocket::routes;
     use rust_decimal::Decimal;
 
     use super::confirm_journal;

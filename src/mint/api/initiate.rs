@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use rocket::post;
 use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -90,6 +91,7 @@ pub(crate) async fn initiate_mint(
 mod tests {
     use alloy::primitives::address;
     use rocket::http::{ContentType, Status};
+    use rocket::routes;
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use tracing::debug;

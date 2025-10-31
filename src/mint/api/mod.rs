@@ -21,9 +21,9 @@ pub(crate) use confirm::confirm_journal;
 pub(crate) use initiate::initiate_mint;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct MintResponse {
-    pub(crate) issuer_request_id: IssuerRequestId,
-    pub(crate) status: String,
+pub struct MintResponse {
+    pub issuer_request_id: IssuerRequestId,
+    pub status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

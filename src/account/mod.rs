@@ -9,6 +9,7 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use api::AccountLinkResponse;
 pub(crate) use api::connect_account;
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
@@ -54,7 +55,7 @@ impl<'de> Deserialize<'de> for Email {
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ClientId(pub(crate) String);
+pub struct ClientId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LinkedAccountStatus {

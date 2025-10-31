@@ -132,6 +132,9 @@ cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warni
 ```
 st0x.issuance/
 ├── src/
+│   ├── lib.rs               # Library entry point with rocket setup
+│   ├── main.rs              # Binary entry point (minimal)
+│   ├── test_utils.rs        # Shared test utilities
 │   ├── account/             # Account aggregate and endpoints
 │   │   ├── mod.rs           # Aggregate, commands, events
 │   │   ├── api.rs           # HTTP endpoints
@@ -140,14 +143,20 @@ st0x.issuance/
 │   │   ├── mod.rs           # Aggregate, commands, events
 │   │   ├── cmd.rs           # Command definitions
 │   │   ├── event.rs         # Event definitions
-│   │   ├── api.rs           # HTTP endpoints
+│   │   ├── api/             # HTTP endpoints
 │   │   └── view.rs          # Read model projections
 │   ├── tokenized_asset/     # TokenizedAsset aggregate and endpoints
 │   │   └── ...              # Similar structure to above
-│   ├── blockchain/          # Blockchain service and types
+│   ├── alpaca/              # Alpaca API service
 │   │   ├── mod.rs           # Service trait and types
+│   │   ├── service.rs       # Real HTTP implementation
 │   │   └── mock.rs          # Mock implementation for testing
-│   └── main.rs              # Application entry point
+│   └── blockchain/          # Blockchain service and types
+│       ├── mod.rs           # Service trait and types
+│       ├── service.rs       # Real Alloy implementation
+│       └── mock.rs          # Mock implementation for testing
+├── tests/                   # End-to-end integration tests
+│   └── e2e_mint_flow.rs     # Complete mint flow tests
 ├── crates/
 │   └── sqlite-es/           # SQLite event store implementation
 ├── migrations/              # Database migrations
