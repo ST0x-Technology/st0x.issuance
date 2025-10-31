@@ -9,7 +9,6 @@ use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
-use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 pub use api::MintResponse;
@@ -24,6 +23,7 @@ pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{
     Network, TokenSymbol, UnderlyingSymbol,
 };
+pub(crate) use crate::{Quantity, QuantityConversionError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenizationRequestId(pub(crate) String);
@@ -42,50 +42,6 @@ impl IssuerRequestId {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Quantity(pub(crate) Decimal);
-
-impl Quantity {
-    pub(crate) const fn new(value: Decimal) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn to_u256_with_18_decimals(
-        &self,
-    ) -> Result<U256, QuantityConversionError> {
-        let Self(value) = self;
-
-        let multiplier = 10_u128.pow(18);
-        let scaled = value
-            .checked_mul(Decimal::from(multiplier))
-            .ok_or(QuantityConversionError::Overflow)?;
-
-        if scaled.fract() != Decimal::ZERO {
-            return Err(QuantityConversionError::FractionalValue {
-                value: scaled,
-            });
-        }
-
-        let integer_part = scaled.to_u128().ok_or(
-            QuantityConversionError::ConversionFailed { value: scaled },
-        )?;
-
-        Ok(U256::from(integer_part))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum QuantityConversionError {
-    #[error("Arithmetic overflow during conversion")]
-    Overflow,
-
-    #[error("Fractional value after scaling: {value}")]
-    FractionalValue { value: Decimal },
-
-    #[error("Cannot convert to u128: {value}")]
-    ConversionFailed { value: Decimal },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -724,7 +680,7 @@ mod tests {
         UnderlyingSymbol, mint_manager::MintManager,
     };
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
-    use crate::blockchain::{BlockchainService, mock::MockBlockchainService};
+    use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
 
@@ -1884,8 +1840,8 @@ mod tests {
     fn create_test_mint_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
     ) -> MintManager<MemStore<Mint>> {
-        let blockchain_service = Arc::new(MockBlockchainService::new_success())
-            as Arc<dyn BlockchainService>;
+        let blockchain_service =
+            Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
 
         MintManager::new(blockchain_service, cqrs)
     }

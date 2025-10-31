@@ -1,31 +1,39 @@
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, address};
+use alloy::primitives::{Address, U256, address};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::transports::RpcError;
 use clap::Parser;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use serde::{Deserialize, Serialize};
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
+use tracing::info;
+use url::Url;
 
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
-use blockchain::{BlockchainService, service::RealBlockchainService};
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use redemption::{Redemption, RedemptionView, detector::RedemptionDetector};
 use tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
 };
+use vault::{VaultService, service::RealBlockchainService};
 
 pub mod account;
-pub mod alpaca;
-pub mod blockchain;
 pub mod mint;
+pub mod redemption;
 pub mod test_utils;
 pub mod tokenized_asset;
+
+pub(crate) mod alpaca;
+pub(crate) mod vault;
 
 mod bindings;
 
@@ -59,8 +67,12 @@ pub(crate) struct Config {
     )]
     pub(crate) database_max_connections: u32,
 
-    #[arg(long, env = "RPC_URL", help = "Blockchain RPC endpoint URL")]
-    rpc_url: Option<String>,
+    #[arg(
+        long,
+        env = "RPC_URL",
+        help = "WebSocket RPC endpoint URL (wss://...)"
+    )]
+    rpc_url: Option<Url>,
 
     #[arg(
         long,
@@ -74,46 +86,39 @@ pub(crate) struct Config {
         env = "VAULT_ADDRESS",
         help = "OffchainAssetReceiptVault contract address"
     )]
-    vault_address: Option<String>,
+    vault_address: Option<Address>,
 
-    #[arg(long, env = "CHAIN_ID", help = "Blockchain network chain ID")]
-    chain_id: Option<u64>,
+    #[arg(
+        long,
+        env = "REDEMPTION_WALLET",
+        help = "Address where APs send tokens to initiate redemption"
+    )]
+    redemption_wallet: Option<Address>,
 
     #[command(flatten)]
     pub(crate) alpaca: AlpacaConfig,
 }
 
 impl Config {
-    pub(crate) fn create_blockchain_service(
+    pub(crate) async fn create_blockchain_service(
         &self,
-    ) -> Result<Arc<dyn BlockchainService>, ConfigError> {
+    ) -> Result<Arc<dyn VaultService>, ConfigError> {
         let rpc_url =
             self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
 
         let private_key =
             self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
 
-        let vault_address_str = self
-            .vault_address
-            .as_ref()
-            .ok_or(ConfigError::MissingVaultAddress)?;
+        let vault_address =
+            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
 
-        let _chain_id = self.chain_id.ok_or(ConfigError::MissingChainId)?;
-
-        let signer = private_key
-            .parse::<PrivateKeySigner>()
-            .map_err(|e| ConfigError::InvalidPrivateKey(e.to_string()))?;
+        let signer = private_key.parse::<PrivateKeySigner>()?;
         let wallet = EthereumWallet::from(signer);
 
-        let vault_address = vault_address_str
-            .parse::<Address>()
-            .map_err(|e| ConfigError::InvalidVaultAddress(e.to_string()))?;
-
-        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
-            rpc_url
-                .parse()
-                .map_err(|e| ConfigError::InvalidRpcUrl(format!("{e}")))?,
-        );
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(rpc_url.as_str())
+            .await?;
 
         Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
     }
@@ -123,24 +128,79 @@ impl Config {
 pub(crate) enum ConfigError {
     #[error("RPC_URL is required")]
     MissingRpcUrl,
-
     #[error("PRIVATE_KEY is required")]
     MissingPrivateKey,
-
     #[error("VAULT_ADDRESS is required")]
     MissingVaultAddress,
+    #[error("Invalid private key")]
+    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
+    #[error("Failed to connect to RPC endpoint")]
+    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+}
 
-    #[error("CHAIN_ID is required")]
-    MissingChainId,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Quantity(pub(crate) Decimal);
 
-    #[error("Invalid private key: {0}")]
-    InvalidPrivateKey(String),
+impl Quantity {
+    pub(crate) const fn new(value: Decimal) -> Self {
+        Self(value)
+    }
 
-    #[error("Invalid vault address: {0}")]
-    InvalidVaultAddress(String),
+    pub(crate) fn to_u256_with_18_decimals(
+        &self,
+    ) -> Result<U256, QuantityConversionError> {
+        let Self(value) = self;
 
-    #[error("Invalid RPC URL: {0}")]
-    InvalidRpcUrl(String),
+        if value.is_sign_negative() {
+            return Err(QuantityConversionError::NegativeValue {
+                value: *value,
+            });
+        }
+
+        let multiplier = 10_u128.pow(18);
+        let scaled = value
+            .checked_mul(Decimal::from(multiplier))
+            .ok_or(QuantityConversionError::Overflow)?;
+
+        if scaled.fract() != Decimal::ZERO {
+            return Err(QuantityConversionError::FractionalValue {
+                value: scaled,
+            });
+        }
+
+        let integer_part = scaled
+            .to_u128()
+            .ok_or(QuantityConversionError::U128OutOfRange { value: scaled })?;
+
+        Ok(U256::from(integer_part))
+    }
+
+    pub(crate) fn from_u256_with_18_decimals(
+        value: U256,
+    ) -> Result<Self, QuantityConversionError> {
+        let decimal: Decimal = value.to_string().parse()?;
+
+        let divisor = Decimal::from(10_u128.pow(18));
+        let quantity = decimal
+            .checked_div(divisor)
+            .ok_or(QuantityConversionError::Overflow)?;
+
+        Ok(Self(quantity))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuantityConversionError {
+    #[error("Arithmetic overflow during conversion")]
+    Overflow,
+    #[error("Fractional value after scaling: {value}")]
+    FractionalValue { value: Decimal },
+    #[error("Negative value: {value}")]
+    NegativeValue { value: Decimal },
+    #[error("Value out of range for u128: {value}")]
+    U128OutOfRange { value: Decimal },
+    #[error("Failed to parse decimal: {0}")]
+    ParseFailed(#[from] rust_decimal::Error),
 }
 
 type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
@@ -203,9 +263,21 @@ pub async fn initialize_rocket()
     let mint_event_store: MintEventStore =
         Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
 
+    let redemption_view_repo =
+        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+            pool.clone(),
+            "redemption_view".to_string(),
+        ));
+
+    let redemption_query = GenericQuery::new(redemption_view_repo);
+
+    let redemption_cqrs_raw =
+        sqlite_cqrs(pool.clone(), vec![Box::new(redemption_query)], ());
+    let redemption_cqrs = Arc::new(redemption_cqrs_raw);
+
     seed_initial_assets(&tokenized_asset_cqrs).await?;
 
-    let blockchain_service = config.create_blockchain_service()?;
+    let blockchain_service = config.create_blockchain_service().await?;
 
     let mint_manager =
         Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
@@ -214,6 +286,26 @@ pub async fn initialize_rocket()
     let callback_manager =
         Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
 
+    if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
+        (&config.rpc_url, config.redemption_wallet, config.vault_address)
+    {
+        info!(
+            "WebSocket monitoring task spawned for redemption wallet {redemption_wallet}"
+        );
+
+        let detector = RedemptionDetector::new(
+            rpc_url.clone(),
+            vault_address,
+            redemption_wallet,
+            redemption_cqrs.clone(),
+            pool.clone(),
+        );
+
+        tokio::spawn(async move {
+            detector.run().await;
+        });
+    }
+
     Ok(rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
@@ -221,6 +313,7 @@ pub async fn initialize_rocket()
         .manage(mint_event_store)
         .manage(mint_manager)
         .manage(callback_manager)
+        .manage(redemption_cqrs)
         .manage(pool)
         .mount(
             "/",

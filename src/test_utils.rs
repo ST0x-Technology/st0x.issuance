@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
-use crate::blockchain::mock::MockBlockchainService;
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
 };
+use crate::vault::mock::MockVaultService;
 
 /// Sets up a test Rocket instance with in-memory database and mock services.
 ///
@@ -86,7 +86,7 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
 
     // Create managers with mock services
     let mint_manager = Arc::new(MintManager::new(
-        Arc::new(MockBlockchainService::new_success()),
+        Arc::new(MockVaultService::new_success()),
         mint_cqrs.clone(),
     ));
 

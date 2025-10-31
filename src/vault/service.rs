@@ -2,9 +2,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 
-use super::{
-    BlockchainError, BlockchainService, MintResult, ReceiptInformation,
-};
+use super::{MintResult, ReceiptInformation, VaultError, VaultService};
 use crate::bindings::OffchainAssetReceiptVault;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
@@ -30,7 +28,7 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
 }
 
 #[async_trait]
-impl<P: Provider + Clone + Send + Sync + 'static> BlockchainService
+impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     for RealBlockchainService<P>
 {
     async fn mint_tokens(
@@ -38,10 +36,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> BlockchainService
         assets: U256,
         receiver: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, BlockchainError> {
+    ) -> Result<MintResult, VaultError> {
         let receipt_info_bytes =
             Bytes::from(serde_json::to_vec(&receipt_info).map_err(|e| {
-                BlockchainError::RpcError {
+                VaultError::RpcError {
                     message: format!(
                         "Failed to encode receipt information: {e}"
                     ),
@@ -64,12 +62,12 @@ impl<P: Provider + Clone + Send + Sync + 'static> BlockchainService
             .deposit(assets, receiver, share_ratio, receipt_info_bytes)
             .send()
             .await
-            .map_err(|e| BlockchainError::TransactionFailed {
+            .map_err(|e| VaultError::TransactionFailed {
                 reason: format!("Failed to send transaction: {e}"),
             })?
             .get_receipt()
             .await
-            .map_err(|e| BlockchainError::RpcError {
+            .map_err(|e| VaultError::RpcError {
                 message: format!("Failed to get transaction receipt: {e}"),
             })?;
 
@@ -85,13 +83,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> BlockchainService
                     },
                 )
             })
-            .ok_or_else(|| BlockchainError::EventNotFound {
+            .ok_or_else(|| VaultError::EventNotFound {
                 tx_hash: format!("{:?}", receipt.transaction_hash),
             })?;
 
         let gas_used = receipt.gas_used;
         let block_number =
-            receipt.block_number.ok_or(BlockchainError::InvalidReceipt)?;
+            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
         Ok(MintResult {
             tx_hash: receipt.transaction_hash,
@@ -119,15 +117,14 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
 
+    use super::RealBlockchainService;
     use crate::bindings::OffchainAssetReceiptVault;
-    use crate::blockchain::{
-        BlockchainService, OperationType, ReceiptInformation,
-    };
     use crate::mint::{
         IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
-
-    use super::RealBlockchainService;
+    use crate::vault::{
+        OperationType, ReceiptInformation, VaultError, VaultService,
+    };
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation {
@@ -362,10 +359,7 @@ mod tests {
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");
         let err = result.unwrap_err();
         assert!(
-            matches!(
-                err,
-                crate::blockchain::BlockchainError::EventNotFound { .. }
-            ),
+            matches!(err, VaultError::EventNotFound { .. }),
             "Expected EventNotFound but got: {err:?}"
         );
     }
