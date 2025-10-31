@@ -1192,10 +1192,18 @@ We call these Alpaca endpoints:
 
 ### Authentication
 
-- **OAuth 2.0** for calling Alpaca endpoints
-- **API Key** or **mTLS** for Alpaca calling our endpoints
-- Store tokens securely with encryption
+**For calling Alpaca endpoints:**
+
+- **OAuth 2.0** with API key and secret
+- Store credentials securely
 - Handle token refresh before expiration
+
+**For Alpaca calling our endpoints:**
+
+- **API Key** authentication via `Authorization: Bearer <key>` header
+- **IP Whitelisting** to restrict requests to Alpaca's known IP ranges
+- Rate limiting on failed authentication attempts
+- Comprehensive audit logging of all authentication attempts
 
 ### Error Handling
 
@@ -1548,7 +1556,10 @@ fn test_journal_confirmed_for_missing_mint() {
 # HTTP Server Configuration
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
-SERVER_API_KEY=<our_api_key_for_alpaca_to_call_us>
+
+# Authentication (for Alpaca calling our endpoints)
+ALPACA_API_KEY_FOR_US=<api_key_that_alpaca_uses_to_authenticate>
+ALPACA_IP_RANGES=<comma_separated_cidr_ranges>  # e.g., "1.2.3.0/24,5.6.7.8/32"
 
 # Alpaca Configuration
 ALPACA_API_KEY=<api_key>
