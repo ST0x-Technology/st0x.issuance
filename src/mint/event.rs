@@ -44,6 +44,10 @@ pub(crate) enum MintEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    MintCompleted {
+        issuer_request_id: IssuerRequestId,
+        completed_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
@@ -59,6 +63,9 @@ impl DomainEvent for MintEvent {
             Self::TokensMinted { .. } => "MintEvent::TokensMinted".to_string(),
             Self::MintingFailed { .. } => {
                 "MintEvent::MintingFailed".to_string()
+            }
+            Self::MintCompleted { .. } => {
+                "MintEvent::MintCompleted".to_string()
             }
         }
     }

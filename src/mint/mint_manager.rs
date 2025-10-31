@@ -13,19 +13,19 @@ use super::{IssuerRequestId, Mint, MintCommand, QuantityConversionError};
 
 /// Orchestrates the on-chain minting process in response to JournalConfirmed events.
 ///
-/// The conductor bridges ES/CQRS aggregates with external blockchain services. It reacts to
+/// The manager bridges ES/CQRS aggregates with external blockchain services. It reacts to
 /// JournalConfirmed events by calling the blockchain service to mint tokens, then records
 /// the result (success or failure) back into the Mint aggregate via commands.
 ///
 /// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
 /// integration with external systems.
-pub(crate) struct MintConductor<ES: EventStore<Mint>> {
+pub(crate) struct MintManager<ES: EventStore<Mint>> {
     blockchain_service: Arc<dyn BlockchainService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
 }
 
-impl<ES: EventStore<Mint>> MintConductor<ES> {
-    /// Creates a new mint conductor.
+impl<ES: EventStore<Mint>> MintManager<ES> {
+    /// Creates a new mint manager.
     ///
     /// # Arguments
     ///
@@ -54,20 +54,20 @@ impl<ES: EventStore<Mint>> MintConductor<ES> {
     /// # Returns
     ///
     /// Returns `Ok(())` if minting succeeded and RecordMintSuccess command was executed.
-    /// Returns `Err(ConductorError::Blockchain)` if minting failed (RecordMintFailure
+    /// Returns `Err(MintManagerError::Blockchain)` if minting failed (RecordMintFailure
     /// command is still executed to record the failure).
     ///
     /// # Errors
     ///
-    /// * `ConductorError::InvalidAggregateState` - Aggregate is not in JournalConfirmed state
-    /// * `ConductorError::QuantityConversion` - Quantity cannot be converted to U256
-    /// * `ConductorError::Blockchain` - Blockchain transaction failed
-    /// * `ConductorError::Cqrs` - Command execution failed
+    /// * `MintManagerError::InvalidAggregateState` - Aggregate is not in JournalConfirmed state
+    /// * `MintManagerError::QuantityConversion` - Quantity cannot be converted to U256
+    /// * `MintManagerError::Blockchain` - Blockchain transaction failed
+    /// * `MintManagerError::Cqrs` - Command execution failed
     pub(crate) async fn handle_journal_confirmed(
         &self,
         issuer_request_id: &IssuerRequestId,
         aggregate: &Mint,
-    ) -> Result<(), ConductorError> {
+    ) -> Result<(), MintManagerError> {
         let Mint::JournalConfirmed {
             tokenization_request_id,
             quantity,
@@ -76,7 +76,7 @@ impl<ES: EventStore<Mint>> MintConductor<ES> {
             ..
         } = aggregate
         else {
-            return Err(ConductorError::InvalidAggregateState {
+            return Err(MintManagerError::InvalidAggregateState {
                 current_state: aggregate_state_name(aggregate).to_string(),
             });
         };
@@ -133,7 +133,7 @@ impl<ES: EventStore<Mint>> MintConductor<ES> {
                         },
                     )
                     .await
-                    .map_err(|e| ConductorError::Cqrs(e.to_string()))?;
+                    .map_err(|e| MintManagerError::Cqrs(e.to_string()))?;
 
                 info!(
                     issuer_request_id = %issuer_request_id_str,
@@ -158,14 +158,14 @@ impl<ES: EventStore<Mint>> MintConductor<ES> {
                         },
                     )
                     .await
-                    .map_err(|err| ConductorError::Cqrs(err.to_string()))?;
+                    .map_err(|err| MintManagerError::Cqrs(err.to_string()))?;
 
                 info!(
                     issuer_request_id = %issuer_request_id_str,
                     "RecordMintFailure command executed successfully"
                 );
 
-                Err(ConductorError::Blockchain(e))
+                Err(MintManagerError::Blockchain(e))
             }
         }
     }
@@ -179,11 +179,12 @@ const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
         Mint::JournalRejected { .. } => "JournalRejected",
         Mint::CallbackPending { .. } => "CallbackPending",
         Mint::MintingFailed { .. } => "MintingFailed",
+        Mint::Completed { .. } => "Completed",
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConductorError {
+pub(crate) enum MintManagerError {
     #[error("Blockchain error: {0}")]
     Blockchain(#[from] BlockchainError),
 
@@ -213,7 +214,7 @@ mod tests {
         },
     };
 
-    use super::{ConductorError, MintConductor};
+    use super::{MintManager, MintManagerError};
 
     type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
     type TestStore = MemStore<Mint>;
@@ -281,7 +282,7 @@ mod tests {
             Arc::new(MockBlockchainService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::blockchain::BlockchainService>;
-        let conductor = MintConductor::new(blockchain_service, cqrs.clone());
+        let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-success-123");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -291,7 +292,7 @@ mod tests {
         )
         .await;
 
-        let result = conductor
+        let result = manager
             .handle_journal_confirmed(&issuer_request_id, &aggregate)
             .await;
 
@@ -316,7 +317,7 @@ mod tests {
         );
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::blockchain::BlockchainService>;
-        let conductor = MintConductor::new(blockchain_service, cqrs.clone());
+        let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-failure-456");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -326,12 +327,12 @@ mod tests {
         )
         .await;
 
-        let result = conductor
+        let result = manager
             .handle_journal_confirmed(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(ConductorError::Blockchain(_))),
+            matches!(result, Err(MintManagerError::Blockchain(_))),
             "Expected blockchain error, got {result:?}"
         );
 
@@ -355,7 +356,7 @@ mod tests {
         let (cqrs, store) = setup_test_cqrs();
         let blockchain_service = Arc::new(MockBlockchainService::new_success())
             as Arc<dyn crate::blockchain::BlockchainService>;
-        let conductor = MintConductor::new(blockchain_service, cqrs.clone());
+        let manager = MintManager::new(blockchain_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
@@ -384,12 +385,15 @@ mod tests {
 
         let aggregate = load_aggregate(&store, &issuer_request_id).await;
 
-        let result = conductor
+        let result = manager
             .handle_journal_confirmed(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(ConductorError::InvalidAggregateState { .. })),
+            matches!(
+                result,
+                Err(MintManagerError::InvalidAggregateState { .. })
+            ),
             "Expected InvalidAggregateState error, got {result:?}"
         );
     }

@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod account;
+mod alpaca;
 mod bindings;
 mod blockchain;
 mod config;
@@ -16,31 +17,45 @@ use sqlite_es::{
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
+use tracing::error;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use account::{Account, AccountView};
 use config::Config;
-use mint::{Mint, MintView, conductor::MintConductor};
+use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 type AccountCqrs = SqliteCqrs<Account>;
 type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
 type MintCqrs = Arc<SqliteCqrs<Mint>>;
-type MintConductorType =
-    Arc<MintConductor<PersistedEventStore<SqliteEventRepository, Mint>>>;
+type MintEventStore = Arc<PersistedEventStore<SqliteEventRepository, Mint>>;
 
 #[launch]
 async fn rocket() -> _ {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .init();
+
+    match initialize_rocket().await {
+        Ok(rocket) => rocket,
+        Err(e) => {
+            error!("Failed to initialize application: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn initialize_rocket()
+-> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
     let config = Config::parse();
 
-    let pool = create_pool(&config).await.unwrap_or_else(|e| {
-        eprintln!("Failed to create database pool: {e}");
-        std::process::exit(1);
-    });
+    let pool = create_pool(&config).await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap_or_else(|e| {
-        eprintln!("Failed to run database migrations: {e}");
-        std::process::exit(1);
-    });
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
@@ -77,25 +92,28 @@ async fn rocket() -> _ {
         sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
     let mint_cqrs = Arc::new(mint_cqrs_raw);
 
-    seed_initial_assets(&tokenized_asset_cqrs).await.unwrap_or_else(|e| {
-        eprintln!("Failed to seed initial assets: {e}");
-        std::process::exit(1);
-    });
+    let mint_event_repo = SqliteEventRepository::new(pool.clone());
+    let mint_event_store: MintEventStore =
+        Arc::new(PersistedEventStore::new_event_store(mint_event_repo));
 
-    let blockchain_service =
-        config.create_blockchain_service().unwrap_or_else(|e| {
-            eprintln!("Failed to create blockchain service: {e}");
-            std::process::exit(1);
-        });
+    seed_initial_assets(&tokenized_asset_cqrs).await?;
 
-    let mint_conductor =
-        Arc::new(MintConductor::new(blockchain_service, mint_cqrs.clone()));
+    let blockchain_service = config.create_blockchain_service()?;
 
-    rocket::build()
+    let mint_manager =
+        Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
+
+    let alpaca_service = config.alpaca.service()?;
+    let callback_manager =
+        Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
+
+    Ok(rocket::build()
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
-        .manage(mint_conductor)
+        .manage(mint_event_store)
+        .manage(mint_manager)
+        .manage(callback_manager)
         .manage(pool)
         .mount(
             "/",
@@ -105,7 +123,7 @@ async fn rocket() -> _ {
                 mint::initiate_mint,
                 mint::confirm_journal
             ],
-        )
+        ))
 }
 
 async fn seed_initial_assets(

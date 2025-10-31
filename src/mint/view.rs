@@ -89,6 +89,25 @@ pub(crate) enum MintView {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    Completed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for MintView {
@@ -273,6 +292,50 @@ impl MintView {
             failed_at,
         };
     }
+
+    fn handle_mint_completed(&mut self, completed_at: DateTime<Utc>) {
+        let Self::CallbackPending {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::Completed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+            completed_at,
+        };
+    }
 }
 
 impl View<Mint> for MintView {
@@ -307,6 +370,9 @@ impl View<Mint> for MintView {
             }
             MintEvent::MintingFailed { error, failed_at, .. } => {
                 self.handle_minting_failed(error.clone(), *failed_at);
+            }
+            MintEvent::MintCompleted { completed_at, .. } => {
+                self.handle_mint_completed(*completed_at);
             }
         }
     }
@@ -960,6 +1026,166 @@ mod tests {
         let original_view = view.clone();
 
         view.handle_minting_failed("error".to_string(), Utc::now());
+
+        assert_eq!(view, original_view);
+    }
+
+    #[test]
+    fn test_view_update_from_mint_completed_event() {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+        let receipt_id = uint!(1_U256);
+        let shares_minted = uint!(100_000000000000000000_U256);
+        let gas_used = 50000;
+        let block_number = 1000;
+        let minted_at = Utc::now();
+
+        let mut view = MintView::CallbackPending {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at,
+        };
+
+        let completed_at = Utc::now();
+
+        let event = MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 4,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let MintView::Completed {
+            issuer_request_id: view_issuer_id,
+            tx_hash: view_tx_hash,
+            receipt_id: view_receipt_id,
+            shares_minted: view_shares_minted,
+            gas_used: view_gas_used,
+            block_number: view_block_number,
+            minted_at: view_minted_at,
+            completed_at: view_completed_at,
+            ..
+        } = view
+        else {
+            panic!("Expected Completed variant, got {view:?}");
+        };
+
+        assert_eq!(view_issuer_id, issuer_request_id);
+        assert_eq!(view_tx_hash, tx_hash);
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_shares_minted, shares_minted);
+        assert_eq!(view_gas_used, gas_used);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_minted_at, minted_at);
+        assert_eq!(view_completed_at, completed_at);
+    }
+
+    #[test]
+    fn test_handle_mint_completed_from_wrong_state_does_not_change_state() {
+        let mut view = MintView::NotFound;
+        let original_view = view.clone();
+
+        view.handle_mint_completed(Utc::now());
+
+        assert_eq!(view, original_view);
+    }
+
+    #[test]
+    fn test_handle_mint_completed_from_journal_confirmed_state_does_not_change()
+    {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+
+        let mut view = MintView::JournalConfirmed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+        };
+        let original_view = view.clone();
+
+        view.handle_mint_completed(Utc::now());
+
+        assert_eq!(view, original_view);
+    }
+
+    #[test]
+    fn test_handle_mint_completed_from_minting_failed_state_does_not_change() {
+        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-456");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId("client-789".to_string());
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let error = "Transaction failed: insufficient gas".to_string();
+        let failed_at = Utc::now();
+
+        let mut view = MintView::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            error,
+            failed_at,
+        };
+        let original_view = view.clone();
+
+        view.handle_mint_completed(Utc::now());
 
         assert_eq!(view, original_view);
     }
