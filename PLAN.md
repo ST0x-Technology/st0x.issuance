@@ -377,42 +377,38 @@ deployment.
 
 **Subtasks:**
 
-- [ ] Add blockchain configuration (WS_RPC_URL, CHAIN_ID, vault addresses)
-- [ ] Add Alpaca API credentials
-- [ ] Add server configuration
-- [ ] Add database URL
-- [ ] Add logging configuration
-- [ ] Add comments explaining each variable
+- [x] Add blockchain configuration (WS_RPC_URL, CHAIN_ID, vault addresses)
+- [x] Add Alpaca API credentials
+- [x] Add server configuration
+- [x] Add database URL
+- [x] Add logging configuration
+- [x] Add comments explaining each variable
 
 **Template structure:**
 
 ```bash
-# Blockchain RPC endpoint
+# Blockchain RPC endpoint (WebSocket)
 # Format: wss://... or https://...
 # Recommended: dRPC (https://drpc.org) - Free tier available
 WS_RPC_URL=${WS_RPC_URL}
 
-# Blockchain configuration
-CHAIN_ID=${CHAIN_ID}
+# Rain OffchainAssetReceiptVault contract address
 VAULT_ADDRESS=${VAULT_ADDRESS}
+
+# Address where APs send tokens to redeem
 REDEMPTION_WALLET_ADDRESS=${REDEMPTION_WALLET_ADDRESS}
 
-# Alpaca API
+# Alpaca API credentials
 ALPACA_API_KEY=${ALPACA_API_KEY}
 ALPACA_API_SECRET=${ALPACA_API_SECRET}
-ALPACA_BASE_URL=${ALPACA_BASE_URL}
 
-# Server
-SERVER_HOST=${SERVER_HOST}
-SERVER_PORT=${SERVER_PORT}
-SERVER_API_KEY=${SERVER_API_KEY}
-
-# Database
+# Database URL (default: sqlite:issuance.db)
 DATABASE_URL=${DATABASE_URL}
-
-# Logging
-RUST_LOG=${RUST_LOG}
 ```
+
+**Note:** Variables like `CHAIN_ID`, `ALPACA_BASE_URL`, `SERVER_HOST`,
+`SERVER_PORT`, and `RUST_LOG` have sensible defaults in code and are not
+included.
 
 **Success criteria:**
 
@@ -433,10 +429,10 @@ droplet.
 
 **Subtasks:**
 
-- [ ] Add file encoding step for .env.example, docker-compose.template.yaml,
+- [x] Add file encoding step for .env.example, docker-compose.template.yaml,
       prep-docker-compose.sh
-- [ ] Add SSH deployment action with appleboy/ssh-action
-- [ ] Add deployment script with logging, backup, validation, and container
+- [x] Add SSH deployment action with appleboy/ssh-action
+- [x] Add deployment script with logging, backup, validation, and container
       checks
 - [ ] Test deployment to droplet via workflow_dispatch
 - [ ] Verify container starts and runs on droplet
@@ -479,13 +475,10 @@ Key sections to include:
 ```yaml
 env:
   WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
-  CHAIN_ID: ${{ secrets.CHAIN_ID }}
   VAULT_ADDRESS: ${{ secrets.VAULT_ADDRESS }}
   REDEMPTION_WALLET_ADDRESS: ${{ secrets.REDEMPTION_WALLET_ADDRESS }}
   ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
   ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-  ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
-  SERVER_API_KEY: ${{ secrets.SERVER_API_KEY }}
   ENV_TEMPLATE: ${{ env.ENV_TEMPLATE }}
   PREP_SCRIPT: ${{ env.PREP_SCRIPT }}
   DOCKER_COMPOSE_TEMPLATE: ${{ env.DOCKER_COMPOSE_TEMPLATE }}
@@ -740,17 +733,12 @@ Configure these secrets in the GitHub repository settings:
 
 **Blockchain:**
 - `WS_RPC_URL` - WebSocket RPC endpoint for blockchain monitoring
-- `CHAIN_ID` - Blockchain chain ID (e.g., 8453 for Base)
 - `VAULT_ADDRESS` - Rain OffchainAssetReceiptVault contract address
 - `REDEMPTION_WALLET_ADDRESS` - Address to monitor for redemption transfers
 
 **Alpaca:**
 - `ALPACA_API_KEY` - Alpaca API key
 - `ALPACA_API_SECRET` - Alpaca API secret
-- `ALPACA_BASE_URL` - Alpaca API base URL (e.g., https://api.alpaca.markets)
 
-**Server:**
-- `SERVER_API_KEY` - API key for authenticating requests to our endpoints
-- `SERVER_HOST` - Server host (e.g., 0.0.0.0)
-- `SERVER_PORT` - Server port (e.g., 8000)
+**Note:** Variables like `CHAIN_ID`, `ALPACA_BASE_URL`, `SERVER_HOST`, `SERVER_PORT`, and `RUST_LOG` have sensible defaults in the application code and don't need to be configured as secrets.
 ```

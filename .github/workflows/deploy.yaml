@@ -46,3 +46,187 @@ jobs:
         run: |
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest
+
+      - name: Encode file contents
+        run: |
+          echo "ENV_TEMPLATE=$(base64 -w 0 .env.example)" >> $GITHUB_ENV
+          echo "DOCKER_COMPOSE_TEMPLATE=$(base64 -w 0 docker-compose.template.yaml)" >> $GITHUB_ENV
+          echo "PREP_SCRIPT=$(base64 -w 0 prep-docker-compose.sh)" >> $GITHUB_ENV
+
+      - name: Deploy to Droplet
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,WS_RPC_URL,VAULT_ADDRESS,REDEMPTION_WALLET_ADDRESS,ALPACA_API_KEY,ALPACA_API_SECRET,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,PREP_SCRIPT
+          script: |
+            set -euo pipefail
+
+            mkdir -p /var/log/issuance-bot
+            TIMESTAMP=$(date +%Y-%m-%d-%H%M%S)
+            DEPLOY_LOG="/var/log/issuance-bot/deploy-${TIMESTAMP}.log"
+
+            log_exec() {
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" | tee -a "${DEPLOY_LOG}"
+              "$@" 2>&1 | tee -a "${DEPLOY_LOG}"
+              return ${PIPEFAIL[0]}
+            }
+
+            perform_rollback() {
+              trap - ERR
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - DEPLOYMENT FAILED - Attempting automatic rollback" | tee -a "${DEPLOY_LOG}" >&2
+
+              cd /mnt/volume_nyc3_01
+
+              if [ ! -f "docker-compose.yaml.backup" ] || [ ! -f ".env.backup" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - No backup files found, cannot rollback (possibly first deployment)" | tee -a "${DEPLOY_LOG}" >&2
+                exit 1
+              fi
+
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Backup files found, performing rollback..." | tee -a "${DEPLOY_LOG}" >&2
+
+              docker compose down 2>&1 | tee -a "${DEPLOY_LOG}" || true
+
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Restoring backed-up configuration..." | tee -a "${DEPLOY_LOG}"
+              cp -p docker-compose.yaml.backup docker-compose.yaml
+              cp -p .env.backup .env
+
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting containers with restored configuration..." | tee -a "${DEPLOY_LOG}"
+              docker compose up -d 2>&1 | tee -a "${DEPLOY_LOG}"
+
+              sleep 10
+
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Verifying rollback..." | tee -a "${DEPLOY_LOG}"
+              docker compose ps 2>&1 | tee -a "${DEPLOY_LOG}"
+
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Rollback completed - production restored to previous version" | tee -a "${DEPLOY_LOG}" >&2
+              exit 1
+            }
+
+            validate_required_env() {
+              local missing_vars=()
+
+              for var in REGISTRY_NAME SHORT_SHA DATA_VOLUME_PATH \
+                         WS_RPC_URL VAULT_ADDRESS REDEMPTION_WALLET_ADDRESS \
+                         ALPACA_API_KEY ALPACA_API_SECRET; do
+                local value="${!var:-}"
+                if [ -z "$value" ]; then
+                  missing_vars+=("$var")
+                fi
+              done
+
+              if [ ${#missing_vars[@]} -gt 0 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: Required environment variables are missing:" | tee -a "${DEPLOY_LOG}" >&2
+                for var in "${missing_vars[@]}"; do
+                  echo "  - $var" | tee -a "${DEPLOY_LOG}" >&2
+                done
+                exit 1
+              fi
+            }
+
+            check_container_running() {
+              local container_name="$1"
+              local container_label="$2"
+
+              if ! docker ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - ${container_label} container not found in docker ps" | tee -a "${DEPLOY_LOG}" >&2
+                docker compose logs "$container_name" 2>&1 | tee -a "${DEPLOY_LOG}"
+                perform_rollback
+              fi
+            }
+
+            check_container_logs() {
+              local container_name="$1"
+              local container_label="$2"
+
+              if docker compose logs "$container_name" 2>&1 | grep -qiE 'error|panic|failed'; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - ${container_label} errors detected in logs" | tee -a "${DEPLOY_LOG}" >&2
+                docker compose logs --tail 20 "$container_name" 2>&1 | tee -a "${DEPLOY_LOG}"
+                perform_rollback
+              fi
+            }
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting deployment of issuance-bot:${SHORT_SHA}" | tee "${DEPLOY_LOG}"
+            echo "Deployment logs: ${DEPLOY_LOG}" | tee -a "${DEPLOY_LOG}"
+
+            export DATA_VOLUME_PATH="/mnt/volume_nyc3_01"
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Validating required environment variables..." | tee -a "${DEPLOY_LOG}"
+            validate_required_env
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - All required environment variables present" | tee -a "${DEPLOY_LOG}"
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Logging into Docker registry" | tee -a "${DEPLOY_LOG}"
+            echo "${DIGITALOCEAN_ACCESS_TOKEN}" | \
+              docker login registry.digitalocean.com -u unused --password-stdin 2>&1 | tee -a "${DEPLOY_LOG}"
+
+            cd /mnt/volume_nyc3_01
+            if [ -f "docker-compose.yaml" ] && [ -f ".env" ]; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Backing up current configuration for rollback" | tee -a "${DEPLOY_LOG}"
+              cp -p docker-compose.yaml docker-compose.yaml.backup
+              cp -p .env .env.backup
+            else
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - No existing configuration to backup (first deployment)" | tee -a "${DEPLOY_LOG}"
+            fi
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating configuration files from templates" | tee -a "${DEPLOY_LOG}"
+
+            echo "$PREP_SCRIPT" | base64 -d > /mnt/volume_nyc3_01/prep-docker-compose.sh
+            chmod +x /mnt/volume_nyc3_01/prep-docker-compose.sh
+
+            echo "$DOCKER_COMPOSE_TEMPLATE" | base64 -d > /mnt/volume_nyc3_01/docker-compose.template.yaml
+
+            cd /mnt/volume_nyc3_01
+            ./prep-docker-compose.sh --prod 2>&1 | tee -a "${DEPLOY_LOG}"
+
+            log_exec docker compose pull
+
+            trap 'perform_rollback' ERR
+
+            log_exec docker compose down || true
+
+            log_exec chmod 755 /mnt/volume_nyc3_01
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating .env file from template" | tee -a "${DEPLOY_LOG}"
+
+            echo "$ENV_TEMPLATE" | base64 -d | envsubst > /mnt/volume_nyc3_01/.env
+            chmod 600 /mnt/volume_nyc3_01/.env
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting services with docker-compose" | tee -a "${DEPLOY_LOG}"
+            if ! docker compose up -d 2>&1 | tee -a "${DEPLOY_LOG}"; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Failed to start containers" | tee -a "${DEPLOY_LOG}" >&2
+              perform_rollback
+            fi
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Waiting for containers to start..." | tee -a "${DEPLOY_LOG}"
+            sleep 15
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Checking container status..." | tee -a "${DEPLOY_LOG}"
+
+            docker ps --format "table {{.Names}}\t{{.Status}}" | tee -a "${DEPLOY_LOG}"
+
+            check_container_running "issuance-bot" "Issuance-bot"
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - All containers confirmed running" | tee -a "${DEPLOY_LOG}"
+
+            trap - ERR
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Services started successfully, capturing logs..." | tee -a "${DEPLOY_LOG}"
+            docker compose logs issuance-bot 2>&1 | tee -a "${DEPLOY_LOG}"
+
+            check_container_logs "issuance-bot" "Issuance-bot"
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Cleaning up old images..." | tee -a "${DEPLOY_LOG}"
+            log_exec docker image prune -f
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Deployment completed successfully!" | tee -a "${DEPLOY_LOG}"
+            echo "Deployment logs: ${DEPLOY_LOG}"
+        env:
+          WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
+          VAULT_ADDRESS: ${{ secrets.VAULT_ADDRESS }}
+          REDEMPTION_WALLET_ADDRESS: ${{ secrets.REDEMPTION_WALLET_ADDRESS }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ENV_TEMPLATE: ${{ env.ENV_TEMPLATE }}
+          PREP_SCRIPT: ${{ env.PREP_SCRIPT }}
+          DOCKER_COMPOSE_TEMPLATE: ${{ env.DOCKER_COMPOSE_TEMPLATE }}
