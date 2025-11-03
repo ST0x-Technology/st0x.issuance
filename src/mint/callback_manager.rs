@@ -54,6 +54,9 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     /// * `CallbackManagerError::InvalidAggregateState` - Aggregate is not in CallbackPending state
     /// * `CallbackManagerError::Alpaca` - Alpaca API call failed
     /// * `CallbackManagerError::Cqrs` - Command execution failed
+    #[tracing::instrument(skip(self, aggregate), fields(
+        issuer_request_id = %issuer_request_id.0
+    ))]
     pub(crate) async fn handle_tokens_minted(
         &self,
         issuer_request_id: &IssuerRequestId,

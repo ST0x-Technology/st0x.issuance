@@ -1,9 +1,4 @@
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, U256, address};
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::transports::RpcError;
-use clap::Parser;
+use alloy::primitives::{U256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -14,22 +9,6 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::info;
-use url::Url;
-
-use account::{Account, AccountView};
-use alpaca::service::AlpacaConfig;
-use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
-use redemption::{
-    Redemption, RedemptionView,
-    detector::{RedemptionDetector, RedemptionDetectorConfig},
-    journal_manager::JournalManager,
-    redeem_call_manager::RedeemCallManager,
-};
-use tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
-};
-use vault::{VaultService, service::RealBlockchainService};
 
 pub mod account;
 pub mod mint;
@@ -38,9 +17,26 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod config;
+pub(crate) mod telemetry;
 pub(crate) mod vault;
 
 mod bindings;
+
+use crate::account::{Account, AccountView};
+use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::redemption::{
+    Redemption, RedemptionView,
+    detector::{RedemptionDetector, RedemptionDetectorConfig},
+    journal_manager::JournalManager,
+    redeem_call_manager::RedeemCallManager,
+};
+use crate::tokenized_asset::{
+    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    TokenizedAssetView, UnderlyingSymbol,
+};
+pub use config::{Config, setup_tracing};
+pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -72,97 +68,6 @@ struct RedemptionManagers {
     journal_manager: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "st0x-issuance")]
-#[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-pub(crate) struct Config {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite:data.db",
-        help = "SQLite database URL"
-    )]
-    pub(crate) database_url: String,
-
-    #[arg(
-        long,
-        env = "DATABASE_MAX_CONNECTIONS",
-        default_value = "5",
-        help = "Maximum number of database connections in the pool"
-    )]
-    pub(crate) database_max_connections: u32,
-
-    #[arg(
-        long,
-        env = "RPC_URL",
-        help = "WebSocket RPC endpoint URL (wss://...)"
-    )]
-    rpc_url: Option<Url>,
-
-    #[arg(
-        long,
-        env = "PRIVATE_KEY",
-        help = "Private key for signing blockchain transactions"
-    )]
-    private_key: Option<String>,
-
-    #[arg(
-        long,
-        env = "VAULT_ADDRESS",
-        help = "OffchainAssetReceiptVault contract address"
-    )]
-    vault_address: Option<Address>,
-
-    #[arg(
-        long,
-        env = "REDEMPTION_WALLET",
-        help = "Address where APs send tokens to initiate redemption"
-    )]
-    redemption_wallet: Option<Address>,
-
-    #[command(flatten)]
-    pub(crate) alpaca: AlpacaConfig,
-}
-
-impl Config {
-    pub(crate) async fn create_blockchain_service(
-        &self,
-    ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let rpc_url =
-            self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
-
-        let private_key =
-            self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
-
-        let vault_address =
-            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
-
-        let signer = private_key.parse::<PrivateKeySigner>()?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(rpc_url.as_str())
-            .await?;
-
-        Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
-    #[error("RPC_URL is required")]
-    MissingRpcUrl,
-    #[error("PRIVATE_KEY is required")]
-    MissingPrivateKey,
-    #[error("VAULT_ADDRESS is required")]
-    MissingVaultAddress,
-    #[error("Invalid private key")]
-    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
-    #[error("Failed to connect to RPC endpoint")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,9 +148,9 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 /// - Database connection or migration fails
 /// - Blockchain service configuration is invalid
 /// - Alpaca service configuration is invalid
-pub async fn initialize_rocket()
--> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
-    let config = Config::parse();
+pub async fn initialize_rocket(
+    config: Config,
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -299,8 +204,7 @@ pub async fn initialize_rocket()
 
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
-) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), Box<dyn std::error::Error>>
-{
+) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -370,7 +274,7 @@ async fn setup_mint_managers(
         Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
         Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
     ),
-    Box<dyn std::error::Error>,
+    anyhow::Error,
 > {
     let blockchain_service = config.create_blockchain_service().await?;
     let mint_manager =
@@ -387,7 +291,7 @@ fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-) -> Result<RedemptionManagers, Box<dyn std::error::Error>> {
+) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call_manager = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
@@ -448,7 +352,7 @@ fn spawn_redemption_detector(
 
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), anyhow::Error> {
     // dummy values
     let assets = vec![
         (
@@ -482,7 +386,7 @@ async fn seed_initial_assets(
         match cqrs.execute(underlying, command).await {
             Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
             Err(e) => {
-                return Err(Box::new(e));
+                return Err(e.into());
             }
         }
     }

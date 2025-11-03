@@ -33,6 +33,10 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(
+        issuer_request_id = %issuer_request_id.0,
+        tokenization_request_id = %tokenization_request_id.0
+    ))]
     pub(crate) async fn handle_alpaca_called(
         &self,
         issuer_request_id: IssuerRequestId,

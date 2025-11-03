@@ -1,0 +1,214 @@
+use alloy::network::EthereumWallet;
+use alloy::primitives::Address;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::transports::RpcError;
+use clap::{Args, Parser};
+use std::sync::Arc;
+use tracing::Level;
+use url::Url;
+
+use crate::alpaca::service::AlpacaConfig;
+use crate::telemetry::HyperDxConfig;
+use crate::vault::{VaultService, service::RealBlockchainService};
+
+#[derive(clap::ValueEnum, Debug, Clone)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for Level {
+    fn from(log_level: LogLevel) -> Self {
+        match log_level {
+            LogLevel::Trace => Self::TRACE,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Error => Self::ERROR,
+        }
+    }
+}
+
+impl From<&LogLevel> for Level {
+    fn from(log_level: &LogLevel) -> Self {
+        match log_level {
+            LogLevel::Trace => Self::TRACE,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Error => Self::ERROR,
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+struct HyperDxEnv {
+    #[clap(long, env)]
+    hyperdx_api_key: Option<String>,
+    #[clap(long, env, default_value = "st0x-issuance")]
+    hyperdx_service_name: String,
+}
+
+impl HyperDxEnv {
+    fn into_config(self, log_level: Level) -> Option<HyperDxConfig> {
+        self.hyperdx_api_key.map(|api_key| HyperDxConfig {
+            api_key,
+            service_name: self.hyperdx_service_name,
+            log_level,
+        })
+    }
+}
+
+#[derive(Debug, Parser, Clone)]
+#[command(name = "st0x-issuance")]
+#[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
+struct Env {
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "sqlite:data.db",
+        help = "SQLite database URL"
+    )]
+    database_url: String,
+
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value = "5",
+        help = "Maximum number of database connections in the pool"
+    )]
+    database_max_connections: u32,
+
+    #[arg(
+        long,
+        env = "RPC_URL",
+        help = "WebSocket RPC endpoint URL (wss://...)"
+    )]
+    rpc_url: Option<Url>,
+
+    #[arg(
+        long,
+        env = "PRIVATE_KEY",
+        help = "Private key for signing blockchain transactions"
+    )]
+    private_key: Option<String>,
+
+    #[arg(
+        long,
+        env = "VAULT_ADDRESS",
+        help = "OffchainAssetReceiptVault contract address"
+    )]
+    vault_address: Option<Address>,
+
+    #[arg(
+        long,
+        env = "REDEMPTION_WALLET",
+        help = "Address where APs send tokens to initiate redemption"
+    )]
+    redemption_wallet: Option<Address>,
+
+    #[clap(long, env, default_value = "debug")]
+    log_level: LogLevel,
+
+    #[clap(flatten)]
+    hyperdx: HyperDxEnv,
+
+    #[clap(flatten)]
+    pub(crate) alpaca: AlpacaConfig,
+}
+
+impl Env {
+    fn into_config(self) -> Config {
+        let log_level_tracing = (&self.log_level).into();
+        let hyperdx = self.hyperdx.into_config(log_level_tracing);
+
+        Config {
+            database_url: self.database_url,
+            database_max_connections: self.database_max_connections,
+            rpc_url: self.rpc_url,
+            private_key: self.private_key,
+            vault_address: self.vault_address,
+            redemption_wallet: self.redemption_wallet,
+            log_level: self.log_level,
+            hyperdx,
+            alpaca: self.alpaca,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub(crate) database_url: String,
+    pub(crate) database_max_connections: u32,
+    pub(crate) rpc_url: Option<Url>,
+    pub(crate) private_key: Option<String>,
+    pub(crate) vault_address: Option<Address>,
+    pub(crate) redemption_wallet: Option<Address>,
+    pub log_level: LogLevel,
+    pub hyperdx: Option<HyperDxConfig>,
+    pub(crate) alpaca: AlpacaConfig,
+}
+
+impl Config {
+    /// Parses configuration from environment variables and command-line arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if command-line arguments or environment variables are invalid.
+    pub fn parse() -> Result<Self, clap::Error> {
+        Env::try_parse().map(Env::into_config)
+    }
+
+    pub(crate) async fn create_blockchain_service(
+        &self,
+    ) -> Result<Arc<dyn VaultService>, ConfigError> {
+        let rpc_url =
+            self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
+
+        let private_key =
+            self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
+
+        let vault_address =
+            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
+
+        let signer = private_key.parse::<PrivateKeySigner>()?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(rpc_url.as_str())
+            .await?;
+
+        Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("RPC_URL is required")]
+    MissingRpcUrl,
+    #[error("PRIVATE_KEY is required")]
+    MissingPrivateKey,
+    #[error("VAULT_ADDRESS is required")]
+    MissingVaultAddress,
+    #[error("Invalid private key")]
+    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
+    #[error("Failed to connect to RPC endpoint")]
+    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+}
+
+pub fn setup_tracing(log_level: &LogLevel) {
+    let level: Level = log_level.into();
+    let default_filter = format!("st0x_issuance={level}");
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
+        .try_init();
+}

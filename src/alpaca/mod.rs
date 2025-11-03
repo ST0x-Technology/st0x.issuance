@@ -42,7 +42,7 @@ pub(crate) trait AlpacaService: Send + Sync {
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
 
-    /// Polls Alpaca's request list endpoint to check the status of a tokenization request.
+    /// Polls Alpaca's request list endpoint to retrieve a tokenization request.
     ///
     /// # Arguments
     ///
@@ -50,15 +50,20 @@ pub(crate) trait AlpacaService: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns the current status of the request (Pending, Completed, or Rejected).
+    /// Returns the full [`TokenizationRequest`] containing:
+    /// - Request ID and issuer request ID
+    /// - Request type (mint or redeem) and status (pending, completed, or rejected)
+    /// - Asset details (underlying symbol, token symbol, quantity)
+    /// - Transaction details (wallet address, transaction hash)
     ///
     /// # Errors
     ///
     /// Returns [`AlpacaError`] if:
-    /// - The HTTP request fails
-    /// - Authentication fails
-    /// - The request is not found in the list
+    /// - HTTP request fails (network error, timeout, etc.)
+    /// - Authentication fails (401/403 response)
+    /// - Request is not found in Alpaca's list
     /// - Alpaca returns an error response
+    /// - Response deserialization or parsing fails
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,

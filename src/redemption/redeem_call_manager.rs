@@ -20,6 +20,10 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         Self { alpaca_service, cqrs }
     }
 
+    #[tracing::instrument(skip(self, aggregate), fields(
+        issuer_request_id = %issuer_request_id.0,
+        client_id = %client_id.0
+    ))]
     pub(crate) async fn handle_redemption_detected(
         &self,
         issuer_request_id: &IssuerRequestId,

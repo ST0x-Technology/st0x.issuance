@@ -29,6 +29,12 @@ pub(crate) struct MintRequest {
     pub(crate) wallet: Address,
 }
 
+#[tracing::instrument(skip(cqrs, pool), fields(
+    tokenization_request_id = %request.tokenization_request_id.0,
+    underlying = %request.underlying.0,
+    client_id = %request.client_id,
+    quantity = %request.quantity
+))]
 #[post("/inkind/issuance", format = "json", data = "<request>")]
 pub(crate) async fn initiate_mint(
     cqrs: &rocket::State<crate::MintCqrs>,
