@@ -1,0 +1,13 @@
+services:
+  issuance-bot:
+    image: ${DOCKER_IMAGE}
+    pull_policy: ${PULL_POLICY}
+    container_name: issuance-bot
+    command: ["./server"]
+    environment:
+      - DATABASE_URL=sqlite:///data/issuance.db
+    env_file:
+      - .env
+    volumes:
+      - ${DATA_VOLUME_PATH}:/data
+    restart: unless-stopped

@@ -137,7 +137,7 @@ build-and-push pipeline works.
 - [x] Add registry login step
 - [x] Add image tagging with SHORT_SHA
 - [x] Add registry push steps
-- [ ] Verify images appear in DigitalOcean Container Registry
+- [x] Verify images appear in DigitalOcean Container Registry
 
 **Workflow additions:**
 
@@ -196,14 +196,14 @@ lines)
 
 **Subtasks:**
 
-- [ ] Replace Dockerfile with full Nix-based builder stage
-- [ ] Add cargo chef for dependency caching
-- [ ] Add SQLite database creation and migration steps
-- [ ] Add test execution during build
-- [ ] Add binary compilation with release profile
-- [ ] Fix binary interpreter paths with patchelf
-- [ ] Create minimal runtime stage
-- [ ] Test full build in GitHub Actions
+- [x] Replace Dockerfile with full Nix-based builder stage
+- [x] Add cargo chef for dependency caching
+- [x] Add SQLite database creation and migration steps
+- [x] Add test execution during build
+- [x] Add binary compilation with release profile
+- [x] Fix binary interpreter paths with patchelf
+- [x] Create minimal runtime stage
+- [x] Test full build in GitHub Actions
 
 **Key sections from reference to adapt:**
 
@@ -323,9 +323,9 @@ local and production deployment.
 
 **Subtasks:**
 
-- [ ] Create `docker-compose.template.yaml` with single issuance-bot service
-- [ ] Create `prep-docker-compose.sh` script based on reference
-- [ ] Test locally with `./prep-docker-compose.sh` (uses local build or
+- [x] Create `docker-compose.template.yaml` with single issuance-bot service
+- [x] Create `prep-docker-compose.sh` script based on reference
+- [x] Test locally with `./prep-docker-compose.sh` (uses local build or
       skip-build)
 - [ ] Commit both files
 

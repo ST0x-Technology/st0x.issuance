@@ -4,3 +4,4 @@ target/
 .env
 .pre-commit-config.yaml
 *.db
+docker-compose.yaml
