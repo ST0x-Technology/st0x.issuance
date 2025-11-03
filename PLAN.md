@@ -132,11 +132,11 @@ build-and-push pipeline works.
 
 **Subtasks:**
 
-- [ ] Add `DIGITALOCEAN_ACCESS_TOKEN` and `REGISTRY_NAME` to workflow env
-- [ ] Install doctl action
-- [ ] Add registry login step
-- [ ] Add image tagging with SHORT_SHA
-- [ ] Add registry push steps
+- [x] Add `DIGITALOCEAN_ACCESS_TOKEN` and `REGISTRY_NAME` to workflow env
+- [x] Install doctl action
+- [x] Add registry login step
+- [x] Add image tagging with SHORT_SHA
+- [x] Add registry push steps
 - [ ] Verify images appear in DigitalOcean Container Registry
 
 **Workflow additions:**
