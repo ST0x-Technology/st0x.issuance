@@ -41,6 +41,28 @@ pub(crate) trait AlpacaService: Send + Sync {
         &self,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
+
+    /// Polls Alpaca's request list endpoint to check the status of a tokenization request.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokenization_request_id` - ID of the tokenization request to poll
+    ///
+    /// # Returns
+    ///
+    /// Returns the current status of the request (Pending, Completed, or Rejected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] if:
+    /// - The HTTP request fails
+    /// - Authentication fails
+    /// - The request is not found in the list
+    /// - Alpaca returns an error response
+    async fn poll_request_status(
+        &self,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaError>;
 }
 
 /// Request payload for Alpaca's mint callback endpoint.
@@ -53,27 +75,9 @@ pub(crate) trait AlpacaService: Send + Sync {
 pub(crate) struct MintCallbackRequest {
     pub(crate) tokenization_request_id: TokenizationRequestId,
     pub(crate) client_id: ClientId,
-    #[serde(serialize_with = "serialize_address")]
     pub(crate) wallet_address: Address,
-    #[serde(serialize_with = "serialize_b256")]
     pub(crate) tx_hash: B256,
     pub(crate) network: Network,
-}
-
-/// Serializes an Alloy `Address` as a hex string with `0x` prefix.
-fn serialize_address<S>(addr: &Address, s: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    s.serialize_str(&format!("{addr:#x}"))
-}
-
-/// Serializes an Alloy `B256` hash as a hex string with `0x` prefix.
-fn serialize_b256<S>(hash: &B256, s: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    s.serialize_str(&format!("{hash:#x}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,11 +88,11 @@ pub(crate) struct RedeemRequest {
     #[serde(rename = "token_symbol")]
     pub(crate) token: TokenSymbol,
     pub(crate) client_id: ClientId,
-    pub(crate) qty: Quantity,
+    #[serde(rename = "qty")]
+    pub(crate) quantity: Quantity,
     pub(crate) network: Network,
-    #[serde(rename = "wallet_address", serialize_with = "serialize_address")]
+    #[serde(rename = "wallet_address")]
     pub(crate) wallet: Address,
-    #[serde(serialize_with = "serialize_b256")]
     pub(crate) tx_hash: B256,
 }
 
@@ -98,13 +102,14 @@ pub(crate) struct RedeemResponse {
     pub(crate) issuer_request_id: IssuerRequestId,
     pub(crate) created_at: DateTime<Utc>,
     #[serde(rename = "type")]
-    pub(crate) request_type: RedeemRequestType,
+    pub(crate) r#type: TokenizationRequestType,
     pub(crate) status: RedeemRequestStatus,
     #[serde(rename = "underlying_symbol")]
     pub(crate) underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
     pub(crate) token: TokenSymbol,
-    pub(crate) qty: Quantity,
+    #[serde(rename = "qty")]
+    pub(crate) quantity: Quantity,
     pub(crate) issuer: String,
     pub(crate) network: Network,
     #[serde(rename = "wallet_address")]
@@ -113,9 +118,10 @@ pub(crate) struct RedeemResponse {
     pub(crate) fees: Fees,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum RedeemRequestType {
+pub(crate) enum TokenizationRequestType {
+    Mint,
     Redeem,
 }
 
@@ -130,20 +136,62 @@ pub(crate) enum RedeemRequestStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Fees(pub(crate) Decimal);
 
+/// Response from Alpaca's tokenization requests list endpoint.
+///
+/// This struct deserializes the JSON response from:
+/// `GET /v1/accounts/{account_id}/tokenization/requests`
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RequestsListResponse {
+    pub(crate) requests: Vec<TokenizationRequest>,
+}
+
+/// Individual tokenization request from the list endpoint.
+///
+/// This struct represents both mint and redeem requests returned by Alpaca's
+/// request list endpoint. We validate all fields match to ensure we're processing
+/// the correct request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenizationRequest {
+    #[serde(rename = "tokenization_request_id")]
+    pub id: TokenizationRequestId,
+    #[serde(rename = "issuer_request_id")]
+    pub issuer_request_id: IssuerRequestId,
+    #[serde(rename = "type")]
+    pub r#type: TokenizationRequestType,
+    pub status: RedeemRequestStatus,
+    #[serde(rename = "underlying_symbol")]
+    pub underlying: UnderlyingSymbol,
+    #[serde(rename = "token_symbol")]
+    pub token: TokenSymbol,
+    #[serde(rename = "qty")]
+    pub quantity: Quantity,
+    #[serde(rename = "wallet_address")]
+    pub wallet: Address,
+    #[serde(rename = "tx_hash")]
+    pub tx_hash: B256,
+}
+
 /// Errors that can occur during Alpaca API operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum AlpacaError {
     /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {message}")]
     Http { message: String },
-
     /// Authentication failed (401/403 response)
     #[error("Authentication failed: {reason}")]
     Auth { reason: String },
-
     /// Alpaca API returned an error response
     #[error("API error: {status_code} - {message}")]
     Api { status_code: u16, message: String },
+    /// Tokenization request not found when polling status
+    #[error("Tokenization request not found: {tokenization_request_id}")]
+    RequestNotFound { tokenization_request_id: String },
+    /// Tokenization request type mismatch
+    #[error("Request type mismatch: expected {expected:?}, got {actual:?}")]
+    RequestTypeMismatch {
+        expected: TokenizationRequestType,
+        actual: TokenizationRequestType,
+    },
 }
 
 #[cfg(test)]
@@ -201,7 +249,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId("5505-1234-ABC-4G45".to_string()),
-            qty: Quantity::new(Decimal::new(10050, 2)),
+            quantity: Quantity::new(Decimal::new(10050, 2)),
             network: Network::new("base"),
             wallet: address!("0x9999999999999999999999999999999999999999"),
             tx_hash: b256!(

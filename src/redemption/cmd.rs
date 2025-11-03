@@ -23,4 +23,11 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRequestId,
         error: String,
     },
+    ConfirmAlpacaComplete {
+        issuer_request_id: IssuerRequestId,
+    },
+    MarkFailed {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+    },
 }

@@ -1,20 +1,18 @@
-use std::sync::Arc;
-
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use std::sync::Arc;
 use tracing::{info, warn};
 
+use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::account::ClientId;
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
-use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
-
-pub(crate) struct AlpacaManager<ES: EventStore<Redemption>> {
+pub(crate) struct RedeemCallManager<ES: EventStore<Redemption>> {
     alpaca_service: Arc<dyn AlpacaService>,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
 }
 
-impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
+impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     pub(crate) const fn new(
         alpaca_service: Arc<dyn AlpacaService>,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
@@ -28,7 +26,7 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
         aggregate: &Redemption,
         client_id: ClientId,
         network: Network,
-    ) -> Result<(), AlpacaManagerError> {
+    ) -> Result<(), RedeemCallManagerError> {
         let Redemption::Detected {
             underlying,
             token,
@@ -38,8 +36,8 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
             ..
         } = aggregate
         else {
-            return Err(AlpacaManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(aggregate).to_string(),
+            return Err(RedeemCallManagerError::InvalidAggregateState {
+                current_state: aggregate.state_name().to_string(),
             });
         };
 
@@ -59,7 +57,7 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
             underlying: underlying.clone(),
             token: token.clone(),
             client_id,
-            qty: quantity.clone(),
+            quantity: quantity.clone(),
             network,
             wallet: *wallet,
             tx_hash: *detected_tx_hash,
@@ -70,13 +68,13 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
                 info!(
                     issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
-                    request_type = ?response.request_type,
+                    r#type = ?response.r#type,
                     status = ?response.status,
                     created_at = %response.created_at,
                     issuer = %response.issuer,
                     underlying = %response.underlying.0,
                     token = %response.token.0,
-                    qty = %response.qty.0,
+                    quantity = %response.quantity.0,
                     network = %response.network.0,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
@@ -124,48 +122,35 @@ impl<ES: EventStore<Redemption>> AlpacaManager<ES> {
                     "RecordAlpacaFailure command executed successfully"
                 );
 
-                Err(AlpacaManagerError::Alpaca(e))
+                Err(RedeemCallManagerError::Alpaca(e))
             }
         }
     }
 }
 
-const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
-    match aggregate {
-        Redemption::Uninitialized => "Uninitialized",
-        Redemption::Detected { .. } => "Detected",
-        Redemption::AlpacaCalled { .. } => "AlpacaCalled",
-        Redemption::Failed { .. } => "Failed",
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AlpacaManagerError {
+pub(crate) enum RedeemCallManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
-
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use alloy::primitives::{address, b256};
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
+    use std::sync::Arc;
 
+    use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::ClientId;
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
     use crate::redemption::{Redemption, RedemptionCommand, UnderlyingSymbol};
     use crate::tokenized_asset::{Network, TokenSymbol};
-
-    use super::{AlpacaManager, AlpacaManagerError};
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -223,7 +208,7 @@ mod tests {
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-success-123");
         let aggregate = create_test_redemption_in_detected_state(
@@ -265,7 +250,7 @@ mod tests {
             Arc::new(MockAlpacaService::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-failure-456");
         let aggregate = create_test_redemption_in_detected_state(
@@ -288,7 +273,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(AlpacaManagerError::Alpaca(_))),
+            matches!(result, Err(RedeemCallManagerError::Alpaca(_))),
             "Expected Alpaca error, got {result:?}"
         );
 
@@ -312,7 +297,7 @@ mod tests {
         let (cqrs, _store) = setup_test_cqrs();
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = AlpacaManager::new(alpaca_service, cqrs.clone());
+        let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-wrong-state-789");
         let aggregate = Redemption::Uninitialized;
@@ -332,7 +317,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(AlpacaManagerError::InvalidAggregateState { .. })
+                Err(RedeemCallManagerError::InvalidAggregateState { .. })
             ),
             "Expected InvalidAggregateState error, got {result:?}"
         );
