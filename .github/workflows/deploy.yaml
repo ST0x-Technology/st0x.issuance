@@ -1,0 +1,25 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [feat/cd]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Docker image
+        run: |
+          docker build -t issuance-bot:test .
+
+      - name: Test image runs
+        run: |
+          docker run --rm -d --name test-container issuance-bot:test
+          sleep 5
+          docker logs test-container
+          docker stop test-container
