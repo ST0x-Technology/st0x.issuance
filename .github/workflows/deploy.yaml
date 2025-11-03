@@ -19,7 +19,8 @@ jobs:
 
       - name: Test image runs
         run: |
-          docker run --rm -d --name test-container issuance-bot:test
+          docker run -d --name test-container issuance-bot:test
           sleep 5
+          docker ps -a
           docker logs test-container
-          docker stop test-container
+          docker rm -f test-container
