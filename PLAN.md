@@ -50,13 +50,13 @@ structure)
 
 **Subtasks:**
 
-- [ ] Create a minimal Dockerfile that builds successfully but doesn't do full
+- [x] Create a minimal Dockerfile that builds successfully but doesn't do full
       Nix build yet
-- [ ] Create `.github/workflows/deploy.yaml` with just the build steps (no
+- [x] Create `.github/workflows/deploy.yaml` with just the build steps (no
       deployment yet)
-- [ ] Configure workflow to trigger on push to current branch (for testing)
-- [ ] Add Docker build step with proper tagging
-- [ ] Verify workflow runs successfully in GitHub Actions
+- [x] Configure workflow to trigger on push to current branch (for testing)
+- [x] Add Docker build step with proper tagging
+- [x] Verify workflow runs successfully in GitHub Actions
 
 **Minimal Dockerfile approach:**
 
