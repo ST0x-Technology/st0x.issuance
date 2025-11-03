@@ -5,22 +5,44 @@ on:
     branches: [feat/cd]
   workflow_dispatch:
 
+env:
+  DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+  REGISTRY_NAME: stox
+
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+
       - name: Build Docker image
         run: |
-          docker build -t issuance-bot:test .
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+
+          docker build \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:$SHORT_SHA \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest .
 
       - name: Test image runs
         run: |
-          docker run -d --name test-container issuance-bot:test
+          docker run -d --name test-container registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
           sleep 5
           docker ps -a
           docker logs test-container
           docker rm -f test-container
+
+      - name: Log in to DO Container Registry
+        run: doctl registry login --expiry-seconds 1200
+
+      - name: Push image to DO Registry
+        run: |
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest
