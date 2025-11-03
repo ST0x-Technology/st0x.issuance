@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
-use crate::mint::{IssuerRequestId, Quantity};
+use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,5 +14,13 @@ pub(crate) enum RedemptionCommand {
         quantity: Quantity,
         tx_hash: B256,
         block_number: u64,
+    },
+    RecordAlpacaCall {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+    },
+    RecordAlpacaFailure {
+        issuer_request_id: IssuerRequestId,
+        error: String,
     },
 }

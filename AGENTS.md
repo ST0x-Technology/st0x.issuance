@@ -44,9 +44,12 @@ Relevant docs:
     possible
   - Focused git diffs and passing checks make reviewing much easier
 - **CRITICAL: Keep PLAN.md in sync with implementation decisions**
-  - If you change approach during implementation, immediately update PLAN.md to reflect the new approach
-  - Plans are living documents during development - update them when you discover better solutions
-  - Implementation and plan must always match - out-of-sync plans are worse than no plan
+  - If you change approach during implementation, immediately update PLAN.md to
+    reflect the new approach
+  - Plans are living documents during development - update them when you
+    discover better solutions
+  - Implementation and plan must always match - out-of-sync plans are worse than
+    no plan
 - Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
 - Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
   sections or verbose changelogs

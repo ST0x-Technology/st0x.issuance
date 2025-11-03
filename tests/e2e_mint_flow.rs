@@ -18,7 +18,8 @@ async fn test_complete_mint_flow_happy_path()
         .body(
             json!({
                 "email": "test@example.com",
-                "account": "ALPACA123"
+                "account": "ALPACA123",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678"
             })
             .to_string(),
         )

@@ -19,7 +19,10 @@ use url::Url;
 use account::{Account, AccountView};
 use alpaca::service::AlpacaConfig;
 use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
-use redemption::{Redemption, RedemptionView, detector::RedemptionDetector};
+use redemption::{
+    Redemption, RedemptionView, alpaca_manager::AlpacaManager,
+    detector::RedemptionDetector,
+};
 use tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
@@ -275,6 +278,10 @@ pub async fn initialize_rocket()
         sqlite_cqrs(pool.clone(), vec![Box::new(redemption_query)], ());
     let redemption_cqrs = Arc::new(redemption_cqrs_raw);
 
+    let redemption_event_repo = SqliteEventRepository::new(pool.clone());
+    let redemption_event_store =
+        Arc::new(PersistedEventStore::new_event_store(redemption_event_repo));
+
     seed_initial_assets(&tokenized_asset_cqrs).await?;
 
     let blockchain_service = config.create_blockchain_service().await?;
@@ -283,8 +290,13 @@ pub async fn initialize_rocket()
         Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
 
     let alpaca_service = config.alpaca.service()?;
-    let callback_manager =
-        Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
+    let callback_manager = Arc::new(CallbackManager::new(
+        alpaca_service.clone(),
+        mint_cqrs.clone(),
+    ));
+
+    let redemption_alpaca_manager =
+        Arc::new(AlpacaManager::new(alpaca_service, redemption_cqrs.clone()));
 
     if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
         (&config.rpc_url, config.redemption_wallet, config.vault_address)
@@ -298,7 +310,9 @@ pub async fn initialize_rocket()
             vault_address,
             redemption_wallet,
             redemption_cqrs.clone(),
+            redemption_event_store,
             pool.clone(),
+            redemption_alpaca_manager,
         );
 
         tokio::spawn(async move {

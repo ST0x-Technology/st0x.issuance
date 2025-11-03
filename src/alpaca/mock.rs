@@ -1,8 +1,13 @@
 use async_trait::async_trait;
+use chrono::Utc;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{AlpacaError, AlpacaService, MintCallbackRequest};
+use super::{
+    AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
+    RedeemRequestStatus, RedeemRequestType, RedeemResponse,
+};
 
 /// Mock Alpaca service for testing.
 ///
@@ -80,17 +85,75 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(not(test))]
         Ok(())
     }
+
+    async fn call_redeem_endpoint(
+        &self,
+        request: RedeemRequest,
+    ) -> Result<RedeemResponse, AlpacaError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(test)]
+        {
+            if self.should_succeed {
+                Ok(RedeemResponse {
+                    tokenization_request_id: crate::mint::TokenizationRequestId(
+                        "mock-tok-123".to_string(),
+                    ),
+                    issuer_request_id: request.issuer_request_id,
+                    created_at: Utc::now(),
+                    request_type: RedeemRequestType::Redeem,
+                    status: RedeemRequestStatus::Pending,
+                    underlying: request.underlying,
+                    token: request.token,
+                    qty: request.qty,
+                    issuer: "mock-issuer".to_string(),
+                    network: request.network,
+                    wallet: request.wallet,
+                    tx_hash: request.tx_hash,
+                    fees: Fees(Decimal::ZERO),
+                })
+            } else {
+                let message = self
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Mock error".to_string());
+                Err(AlpacaError::Http { message })
+            }
+        }
+
+        #[cfg(not(test))]
+        {
+            Ok(RedeemResponse {
+                tokenization_request_id: crate::mint::TokenizationRequestId(
+                    "mock-tok-123".to_string(),
+                ),
+                issuer_request_id: request.issuer_request_id,
+                created_at: Utc::now(),
+                request_type: RedeemRequestType::Redeem,
+                status: RedeemRequestStatus::Pending,
+                underlying: request.underlying,
+                token: request.token,
+                qty: request.qty,
+                issuer: "mock-issuer".to_string(),
+                network: request.network,
+                wallet: request.wallet,
+                tx_hash: request.tx_hash,
+                fees: Fees(Decimal::ZERO),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
+    use rust_decimal::Decimal;
 
     use super::MockAlpacaService;
     use crate::account::ClientId;
-    use crate::alpaca::{AlpacaService, MintCallbackRequest};
-    use crate::mint::TokenizationRequestId;
-    use crate::tokenized_asset::Network;
+    use crate::alpaca::{AlpacaService, MintCallbackRequest, RedeemRequest};
+    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     #[tokio::test]
     async fn test_mock_success_service() {
@@ -163,5 +226,89 @@ mod tests {
         mock.send_mint_callback(request).await.unwrap();
 
         assert_eq!(mock.get_call_count(), 3);
+    }
+
+    fn create_redeem_request() -> RedeemRequest {
+        RedeemRequest {
+            issuer_request_id: IssuerRequestId::new("red-123"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            client_id: ClientId("client-456".to_string()),
+            qty: Quantity::new(Decimal::from(100)),
+            network: Network::new("base"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_redeem_success() {
+        let mock = MockAlpacaService::new_success();
+
+        let request = create_redeem_request();
+        let result = mock.call_redeem_endpoint(request).await;
+
+        assert!(result.is_ok(), "Expected Ok, got {result:?}");
+        assert_eq!(mock.get_call_count(), 1);
+
+        let response = result.unwrap();
+        assert_eq!(response.tokenization_request_id.0, "mock-tok-123");
+        assert_eq!(response.issuer_request_id.0, "red-123");
+    }
+
+    #[tokio::test]
+    async fn test_mock_redeem_failure() {
+        let mock = MockAlpacaService::new_failure("API timeout");
+
+        let request = create_redeem_request();
+        let result = mock.call_redeem_endpoint(request).await;
+
+        assert!(result.is_err(), "Expected Err, got Ok");
+        assert_eq!(mock.get_call_count(), 1);
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("API timeout"),
+            "Expected error message to contain 'API timeout', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_redeem_tracks_multiple_calls() {
+        let mock = MockAlpacaService::new_success();
+
+        let request = create_redeem_request();
+
+        mock.call_redeem_endpoint(request.clone()).await.unwrap();
+        mock.call_redeem_endpoint(request.clone()).await.unwrap();
+        mock.call_redeem_endpoint(request).await.unwrap();
+
+        assert_eq!(mock.get_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_mock_shares_call_count_between_endpoints() {
+        let mock = MockAlpacaService::new_success();
+
+        let mint_request = MintCallbackRequest {
+            tokenization_request_id: TokenizationRequestId::new("test"),
+            client_id: ClientId("client".to_string()),
+            wallet_address: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            network: Network::new("base"),
+        };
+
+        let redeem_request = create_redeem_request();
+
+        mock.send_mint_callback(mint_request).await.unwrap();
+        mock.call_redeem_endpoint(redeem_request).await.unwrap();
+
+        assert_eq!(mock.get_call_count(), 2);
     }
 }

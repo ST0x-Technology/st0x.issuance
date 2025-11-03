@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::mint::{IssuerRequestId, Quantity};
+use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -18,12 +18,36 @@ pub(crate) enum RedemptionEvent {
         block_number: u64,
         detected_at: DateTime<Utc>,
     },
+    AlpacaCalled {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        called_at: DateTime<Utc>,
+    },
+    AlpacaCallFailed {
+        issuer_request_id: IssuerRequestId,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+    RedemptionFailed {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for RedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Detected { .. } => "RedemptionEvent::Detected".to_string(),
+            Self::AlpacaCalled { .. } => {
+                "RedemptionEvent::AlpacaCalled".to_string()
+            }
+            Self::AlpacaCallFailed { .. } => {
+                "RedemptionEvent::AlpacaCallFailed".to_string()
+            }
+            Self::RedemptionFailed { .. } => {
+                "RedemptionEvent::RedemptionFailed".to_string()
+            }
         }
     }
 

@@ -2,6 +2,7 @@ mod cmd;
 mod event;
 mod view;
 
+pub(crate) mod alpaca_manager;
 pub(crate) mod detector;
 
 use alloy::primitives::{Address, B256};
@@ -11,7 +12,7 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
 use crate::Quantity;
-use crate::mint::IssuerRequestId;
+use crate::mint::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
@@ -30,6 +31,23 @@ pub(crate) enum Redemption {
         block_number: u64,
         detected_at: DateTime<Utc>,
     },
+    AlpacaCalled {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        detected_tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+    },
+    Failed {
+        issuer_request_id: IssuerRequestId,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Redemption {
@@ -38,10 +56,24 @@ impl Default for Redemption {
     }
 }
 
+impl Redemption {
+    const fn state_name(&self) -> &'static str {
+        match self {
+            Self::Uninitialized => "Uninitialized",
+            Self::Detected { .. } => "Detected",
+            Self::AlpacaCalled { .. } => "AlpacaCalled",
+            Self::Failed { .. } => "Failed",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub(crate) enum RedemptionError {
     #[error("Redemption already detected for request: {issuer_request_id}")]
     AlreadyDetected { issuer_request_id: String },
+
+    #[error("Invalid state for operation: expected {expected}, found {found}")]
+    InvalidState { expected: String, found: String },
 }
 
 #[async_trait]
@@ -89,6 +121,44 @@ impl Aggregate for Redemption {
                     detected_at: now,
                 }])
             }
+            RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id,
+                tokenization_request_id,
+            } => {
+                if !matches!(self, Self::Detected { .. }) {
+                    return Err(RedemptionError::InvalidState {
+                        expected: "Detected".to_string(),
+                        found: self.state_name().to_string(),
+                    });
+                }
+
+                let now = Utc::now();
+
+                Ok(vec![RedemptionEvent::AlpacaCalled {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    called_at: now,
+                }])
+            }
+            RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id,
+                error,
+            } => {
+                if !matches!(self, Self::Detected { .. }) {
+                    return Err(RedemptionError::InvalidState {
+                        expected: "Detected".to_string(),
+                        found: self.state_name().to_string(),
+                    });
+                }
+
+                let now = Utc::now();
+
+                Ok(vec![RedemptionEvent::AlpacaCallFailed {
+                    issuer_request_id,
+                    error,
+                    failed_at: now,
+                }])
+            }
         }
     }
 
@@ -114,6 +184,56 @@ impl Aggregate for Redemption {
                     block_number,
                     detected_at,
                 };
+            }
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id,
+                tokenization_request_id,
+                called_at,
+            } => {
+                let Self::Detected {
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    detected_tx_hash,
+                    block_number,
+                    detected_at,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                *self = Self::AlpacaCalled {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    underlying: underlying.clone(),
+                    token: token.clone(),
+                    wallet: *wallet,
+                    quantity: quantity.clone(),
+                    detected_tx_hash: *detected_tx_hash,
+                    block_number: *block_number,
+                    detected_at: *detected_at,
+                    called_at,
+                };
+            }
+            RedemptionEvent::AlpacaCallFailed {
+                issuer_request_id,
+                error,
+                failed_at,
+            } => {
+                *self = Self::Failed {
+                    issuer_request_id,
+                    reason: error,
+                    failed_at,
+                };
+            }
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id,
+                reason,
+                failed_at,
+            } => {
+                *self = Self::Failed { issuer_request_id, reason, failed_at };
             }
         }
     }
@@ -158,36 +278,31 @@ mod tests {
                 block_number,
             });
 
-        let result = validator.inspect_result();
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
 
-        match result {
-            Ok(events) => {
-                assert_eq!(events.len(), 1);
+        let RedemptionEvent::Detected {
+            issuer_request_id: event_id,
+            underlying: event_underlying,
+            token: event_token,
+            wallet: event_wallet,
+            quantity: event_quantity,
+            tx_hash: event_tx_hash,
+            block_number: event_block_number,
+            detected_at,
+        } = &events[0]
+        else {
+            panic!("Expected Detected event, got {:?}", &events[0]);
+        };
 
-                match &events[0] {
-                    RedemptionEvent::Detected {
-                        issuer_request_id: event_id,
-                        underlying: event_underlying,
-                        token: event_token,
-                        wallet: event_wallet,
-                        quantity: event_quantity,
-                        tx_hash: event_tx_hash,
-                        block_number: event_block_number,
-                        detected_at,
-                    } => {
-                        assert_eq!(event_id, &issuer_request_id);
-                        assert_eq!(event_underlying, &underlying);
-                        assert_eq!(event_token, &token);
-                        assert_eq!(event_wallet, &wallet);
-                        assert_eq!(event_quantity, &quantity);
-                        assert_eq!(event_tx_hash, &tx_hash);
-                        assert_eq!(event_block_number, &block_number);
-                        assert!(detected_at.timestamp() > 0);
-                    }
-                }
-            }
-            Err(e) => panic!("Expected success, got error: {e}"),
-        }
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_underlying, &underlying);
+        assert_eq!(event_token, &token);
+        assert_eq!(event_wallet, &wallet);
+        assert_eq!(event_quantity, &quantity);
+        assert_eq!(event_tx_hash, &tx_hash);
+        assert_eq!(event_block_number, &block_number);
+        assert!(detected_at.timestamp() > 0);
     }
 
     #[test]
@@ -277,5 +392,126 @@ mod tests {
         assert_eq!(state_tx_hash, tx_hash);
         assert_eq!(state_block_number, block_number);
         assert_eq!(state_detected_at, detected_at);
+    }
+
+    #[test]
+    fn test_record_alpaca_call_from_detected_state() {
+        use crate::mint::TokenizationRequestId;
+
+        let issuer_request_id = IssuerRequestId::new("red-call-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
+
+        let validator = RedemptionTestFramework::with(())
+            .given(vec![RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!(
+                    "0x1234567890abcdef1234567890abcdef12345678"
+                ),
+                quantity: Quantity::new(Decimal::from(100)),
+                tx_hash: b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                block_number: 12345,
+                detected_at: Utc::now(),
+            }])
+            .when(RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::AlpacaCalled {
+            issuer_request_id: event_id,
+            tokenization_request_id: event_tok_id,
+            called_at,
+        } = &events[0]
+        else {
+            panic!("Expected AlpacaCalled event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_tok_id, &tokenization_request_id);
+        assert!(called_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_record_alpaca_call_from_wrong_state_fails() {
+        use crate::mint::TokenizationRequestId;
+
+        let issuer_request_id = IssuerRequestId::new("red-call-fail-123");
+        let tokenization_request_id = TokenizationRequestId::new("alp-tok-789");
+
+        RedemptionTestFramework::with(())
+            .given_no_previous_events()
+            .when(RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id,
+                tokenization_request_id,
+            })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Detected".to_string(),
+                found: "Uninitialized".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_record_alpaca_failure_from_detected_state() {
+        let issuer_request_id = IssuerRequestId::new("red-fail-123");
+        let error = "API timeout".to_string();
+
+        let validator = RedemptionTestFramework::with(())
+            .given(vec![RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("TSLA"),
+                token: TokenSymbol::new("tTSLA"),
+                wallet: address!(
+                    "0x9876543210fedcba9876543210fedcba98765432"
+                ),
+                quantity: Quantity::new(Decimal::from(50)),
+                tx_hash: b256!(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                ),
+                block_number: 54321,
+                detected_at: Utc::now(),
+            }])
+            .when(RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: error.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::AlpacaCallFailed {
+            issuer_request_id: event_id,
+            error: event_error,
+            failed_at,
+        } = &events[0]
+        else {
+            panic!("Expected AlpacaCallFailed event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_error, &error);
+        assert!(failed_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_record_alpaca_failure_from_wrong_state_fails() {
+        let issuer_request_id = IssuerRequestId::new("red-fail-wrong-123");
+
+        RedemptionTestFramework::with(())
+            .given_no_previous_events()
+            .when(RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id,
+                error: "Some error".to_string(),
+            })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Detected".to_string(),
+                found: "Uninitialized".to_string(),
+            });
     }
 }
