@@ -4867,12 +4867,9 @@ dependencies = [
  "futures",
  "httpmock",
  "itertools 0.14.0",
-<<<<<<< HEAD
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
-=======
->>>>>>> d7200de (address feedback)
  "reqwest",
  "rocket",
  "rust_decimal",
