@@ -45,6 +45,12 @@ pub(crate) enum RedemptionView {
         called_at: DateTime<Utc>,
         alpaca_completed_at: DateTime<Utc>,
     },
+    Completed {
+        issuer_request_id: IssuerRequestId,
+        burn_tx_hash: B256,
+        block_number: u64,
+        completed_at: DateTime<Utc>,
+    },
     Failed {
         issuer_request_id: IssuerRequestId,
         reason: String,
@@ -169,6 +175,16 @@ impl View<Redemption> for RedemptionView {
                 issuer_request_id,
                 error,
                 failed_at,
+            }
+            | RedemptionEvent::RedemptionFailed {
+                issuer_request_id,
+                reason: error,
+                failed_at,
+            }
+            | RedemptionEvent::BurningFailed {
+                issuer_request_id,
+                error,
+                failed_at,
             } => {
                 *self = Self::Failed {
                     issuer_request_id: issuer_request_id.clone(),
@@ -185,15 +201,18 @@ impl View<Redemption> for RedemptionView {
                     *alpaca_completed_at,
                 );
             }
-            RedemptionEvent::RedemptionFailed {
+            RedemptionEvent::TokensBurned {
                 issuer_request_id,
-                reason,
-                failed_at,
+                tx_hash,
+                block_number,
+                burned_at,
+                ..
             } => {
-                *self = Self::Failed {
+                *self = Self::Completed {
                     issuer_request_id: issuer_request_id.clone(),
-                    reason: reason.clone(),
-                    failed_at: *failed_at,
+                    burn_tx_hash: *tx_hash,
+                    block_number: *block_number,
+                    completed_at: *burned_at,
                 };
             }
         }

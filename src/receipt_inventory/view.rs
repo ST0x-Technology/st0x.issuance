@@ -5,8 +5,8 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use crate::mint::{IssuerRequestId, Mint, MintEvent};
-use crate::redemption::Redemption;
+use crate::mint::{Mint, MintEvent};
+use crate::redemption::{Redemption, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +92,44 @@ impl ReceiptInventoryView {
             other => other,
         }
     }
+
+    fn with_tokens_burned(
+        self,
+        burn_receipt_id: U256,
+        shares_burned: U256,
+        burned_at: DateTime<Utc>,
+    ) -> Self {
+        match self {
+            Self::Active {
+                receipt_id,
+                underlying,
+                token,
+                initial_amount,
+                current_balance,
+                minted_at,
+            } if receipt_id == burn_receipt_id => {
+                if current_balance > shares_burned {
+                    Self::Active {
+                        receipt_id,
+                        underlying,
+                        token,
+                        initial_amount,
+                        current_balance: current_balance - shares_burned,
+                        minted_at,
+                    }
+                } else {
+                    Self::Depleted {
+                        receipt_id,
+                        underlying,
+                        token,
+                        initial_amount,
+                        depleted_at: burned_at,
+                    }
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl View<Mint> for ReceiptInventoryView {
@@ -123,47 +161,28 @@ impl View<Mint> for ReceiptInventoryView {
 }
 
 impl View<Redemption> for ReceiptInventoryView {
-    fn update(&mut self, _event: &EventEnvelope<Redemption>) {
-        // TODO: This will be implemented when issue #25 adds burn events
-        // with receipt details. The implementation will:
-        // 1. Extract receipt_id and shares_burned from the burn event
-        // 2. Decrement current_balance by shares_burned
-        // 3. If balance reaches zero, transition to Depleted state
+    fn update(&mut self, event: &EventEnvelope<Redemption>) {
+        match &event.payload {
+            RedemptionEvent::TokensBurned {
+                receipt_id,
+                shares_burned,
+                burned_at,
+                ..
+            } => {
+                *self = self.clone().with_tokens_burned(
+                    *receipt_id,
+                    *shares_burned,
+                    *burned_at,
+                );
+            }
+            RedemptionEvent::Detected { .. }
+            | RedemptionEvent::AlpacaCalled { .. }
+            | RedemptionEvent::AlpacaCallFailed { .. }
+            | RedemptionEvent::AlpacaJournalCompleted { .. }
+            | RedemptionEvent::RedemptionFailed { .. }
+            | RedemptionEvent::BurningFailed { .. } => {}
+        }
     }
-}
-
-/// Retrieves a specific receipt by its issuer request ID.
-///
-/// Returns `None` if no receipt exists for the given ID.
-///
-/// # Use Case
-/// When burning tokens during redemption, use this to look up the receipt
-/// associated with a specific mint operation.
-// TODO(#25): Remove #[allow(dead_code)] when burn functionality uses this query method
-#[allow(dead_code)]
-pub(crate) async fn get_receipt(
-    pool: &Pool<Sqlite>,
-    issuer_request_id: &IssuerRequestId,
-) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
-    let issuer_request_id_str = &issuer_request_id.0;
-    let row = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM receipt_inventory_view
-        WHERE view_id = ?
-        "#,
-        issuer_request_id_str
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
-
-    Ok(Some(view))
 }
 
 /// Lists all Active receipts for a given underlying symbol.
@@ -174,8 +193,6 @@ pub(crate) async fn get_receipt(
 /// # Use Case
 /// View all available receipt inventory for a specific asset, useful for
 /// operational dashboards and manual receipt selection.
-// TODO(#25): Remove #[allow(dead_code)] when burn functionality uses this query method
-#[allow(dead_code)]
 pub(crate) async fn list_active_receipts(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
@@ -210,8 +227,6 @@ pub(crate) async fn list_active_receipts(
 /// Primary method for selecting which receipt to burn from during redemption.
 /// The burn logic will call this to find a suitable receipt, then use that
 /// receipt's ID in the vault.withdraw() call.
-// TODO(#25): Remove #[allow(dead_code)] when burn functionality uses this query method
-#[allow(dead_code)]
 pub(crate) async fn find_receipt_with_balance(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
@@ -234,56 +249,62 @@ pub(crate) async fn find_receipt_with_balance(
         .next())
 }
 
-/// Calculates the total available balance across all Active receipts for an underlying symbol.
+/// Retrieves a single receipt by issuer_request_id (view_id).
 ///
-/// Sums the `current_balance` field from all Active receipts. Excludes Pending,
-/// Unavailable, and Depleted receipts.
+/// Returns the receipt inventory view for the given issuer_request_id, which
+/// serves as the view_id in the receipt_inventory_view table.
 ///
 /// # Use Case
-/// Verify total on-hand inventory before accepting redemption requests, or for
-/// operational metrics and monitoring dashboards.
-// TODO(#25): Remove #[allow(dead_code)] when burn functionality uses this query method
-#[allow(dead_code)]
-pub(crate) async fn get_total_balance(
+/// Used for querying the current state of a specific receipt in tests and
+/// operational queries where the issuer_request_id is known.
+#[cfg(test)]
+pub(crate) async fn get_receipt(
     pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
-) -> Result<U256, ReceiptInventoryViewError> {
-    let underlying_str = &underlying.0;
-    let rows = sqlx::query!(
+    issuer_request_id: &crate::mint::IssuerRequestId,
+) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
+    let view_id = &issuer_request_id.0;
+    let row = sqlx::query!(
         r#"
         SELECT payload as "payload: String"
         FROM receipt_inventory_view
-        WHERE json_extract(payload, '$.Active.underlying') = ?
+        WHERE view_id = ?
         "#,
-        underlying_str
+        view_id
     )
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await?;
 
-    rows.into_iter().try_fold(U256::ZERO, |acc, row| {
-        let view: ReceiptInventoryView = serde_json::from_str(&row.payload)?;
-        Ok(if let ReceiptInventoryView::Active { current_balance, .. } = view {
-            acc + current_balance
-        } else {
-            acc
-        })
-    })
+    match row {
+        Some(row) => {
+            let view: ReceiptInventoryView =
+                serde_json::from_str(&row.payload)?;
+            Ok(Some(view))
+        }
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::{GenericQuery, ViewContext, ViewRepository};
+    use cqrs_es::{CqrsFramework, EventEnvelope, EventStore, Query};
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tracing::error;
 
     use super::*;
     use crate::mint::{
-        ClientId, MintEvent, Network, Quantity, TokenizationRequestId,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintEvent, MintView,
+        Network, Quantity, TokenizationRequestId,
     };
-    use crate::redemption::RedemptionEvent;
+    use crate::redemption::{
+        Redemption, RedemptionCommand, RedemptionEvent, RedemptionView,
+    };
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -298,6 +319,134 @@ mod tests {
             .expect("Failed to run migrations");
 
         pool
+    }
+
+    /// Custom query for receipt inventory updates from Mint events.
+    ///
+    /// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
+    /// the issuer_request_id from event payloads to use as the view_id. This allows
+    /// both Mint and Redemption aggregates to update the same receipt inventory view.
+    struct ReceiptInventoryMintQuery {
+        view_repository: Arc<SqliteViewRepository<ReceiptInventoryView, Mint>>,
+    }
+
+    impl ReceiptInventoryMintQuery {
+        const fn new(
+            view_repository: Arc<
+                SqliteViewRepository<ReceiptInventoryView, Mint>,
+            >,
+        ) -> Self {
+            Self { view_repository }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Query<Mint> for ReceiptInventoryMintQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            events: &[EventEnvelope<Mint>],
+        ) {
+            for event in events {
+                let view_id = match &event.payload {
+                    MintEvent::Initiated { issuer_request_id, .. }
+                    | MintEvent::TokensMinted { issuer_request_id, .. } => {
+                        &issuer_request_id.0
+                    }
+                    _ => continue,
+                };
+
+                let result = async {
+                    let (mut view, view_context) = self
+                        .view_repository
+                        .load_with_context(view_id)
+                        .await?
+                        .map_or_else(
+                            || {
+                                (
+                                    ReceiptInventoryView::default(),
+                                    ViewContext::new(view_id.to_string(), 0),
+                                )
+                            },
+                            |pair| pair,
+                        );
+
+                    view.update(event);
+                    self.view_repository.update_view(view, view_context).await
+                }
+                .await;
+
+                if let Err(err) = result {
+                    error!(
+                        "Failed to update receipt inventory view for {view_id}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Custom query for receipt inventory updates from Redemption events.
+    ///
+    /// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
+    /// the issuer_request_id from event payloads to use as the view_id. This allows
+    /// both Mint and Redemption aggregates to update the same receipt inventory view.
+    struct ReceiptInventoryRedemptionQuery {
+        view_repository:
+            Arc<SqliteViewRepository<ReceiptInventoryView, Redemption>>,
+    }
+
+    impl ReceiptInventoryRedemptionQuery {
+        const fn new(
+            view_repository: Arc<
+                SqliteViewRepository<ReceiptInventoryView, Redemption>,
+            >,
+        ) -> Self {
+            Self { view_repository }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Query<Redemption> for ReceiptInventoryRedemptionQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            events: &[EventEnvelope<Redemption>],
+        ) {
+            for event in events {
+                let view_id = match &event.payload {
+                    RedemptionEvent::TokensBurned {
+                        issuer_request_id, ..
+                    } => &issuer_request_id.0,
+                    _ => continue,
+                };
+
+                let result = async {
+                    let (mut view, view_context) = self
+                        .view_repository
+                        .load_with_context(view_id)
+                        .await?
+                        .map_or_else(
+                            || {
+                                (
+                                    ReceiptInventoryView::default(),
+                                    ViewContext::new(view_id.to_string(), 0),
+                                )
+                            },
+                            |pair| pair,
+                        );
+
+                    view.update(event);
+                    self.view_repository.update_view(view, view_context).await
+                }
+                .await;
+
+                if let Err(err) = result {
+                    error!(
+                        "Failed to update receipt inventory view for {view_id}: {err}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -552,28 +701,206 @@ mod tests {
     }
 
     #[test]
-    fn test_redemption_view_update_is_noop() {
-        let mut view = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
+    fn test_with_tokens_burned_decrements_balance_on_partial_burn() {
+        let view = ReceiptInventoryView::Active {
+            receipt_id: uint!(42_U256),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             initial_amount: uint!(100_000000000000000000_U256),
             current_balance: uint!(100_000000000000000000_U256),
             minted_at: Utc::now(),
         };
+
+        let burned_at = Utc::now();
+        let result = view.with_tokens_burned(
+            uint!(42_U256),
+            uint!(30_000000000000000000_U256),
+            burned_at,
+        );
+
+        let ReceiptInventoryView::Active {
+            receipt_id,
+            current_balance,
+            initial_amount,
+            ..
+        } = result
+        else {
+            panic!(
+                "Expected Active variant after partial burn, got {result:?}"
+            );
+        };
+
+        assert_eq!(receipt_id, uint!(42_U256));
+        assert_eq!(current_balance, uint!(70_000000000000000000_U256));
+        assert_eq!(initial_amount, uint!(100_000000000000000000_U256));
+    }
+
+    #[test]
+    fn test_with_tokens_burned_transitions_to_depleted_on_exact_burn() {
+        let view = ReceiptInventoryView::Active {
+            receipt_id: uint!(7_U256),
+            underlying: UnderlyingSymbol::new("TSLA"),
+            token: TokenSymbol::new("tTSLA"),
+            initial_amount: uint!(50_000000000000000000_U256),
+            current_balance: uint!(50_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+
+        let burned_at = Utc::now();
+        let result = view.with_tokens_burned(
+            uint!(7_U256),
+            uint!(50_000000000000000000_U256),
+            burned_at,
+        );
+
+        let ReceiptInventoryView::Depleted {
+            receipt_id,
+            underlying,
+            token,
+            initial_amount,
+            depleted_at,
+        } = result
+        else {
+            panic!("Expected Depleted variant after full burn, got {result:?}");
+        };
+
+        assert_eq!(receipt_id, uint!(7_U256));
+        assert_eq!(underlying, UnderlyingSymbol::new("TSLA"));
+        assert_eq!(token, TokenSymbol::new("tTSLA"));
+        assert_eq!(initial_amount, uint!(50_000000000000000000_U256));
+        assert_eq!(depleted_at, burned_at);
+    }
+
+    #[test]
+    fn test_with_tokens_burned_transitions_to_depleted_on_over_burn() {
+        let view = ReceiptInventoryView::Active {
+            receipt_id: uint!(10_U256),
+            underlying: UnderlyingSymbol::new("NVDA"),
+            token: TokenSymbol::new("tNVDA"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(30_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+
+        let burned_at = Utc::now();
+        let result = view.with_tokens_burned(
+            uint!(10_U256),
+            uint!(50_000000000000000000_U256),
+            burned_at,
+        );
+
+        assert!(
+            matches!(result, ReceiptInventoryView::Depleted { .. }),
+            "Expected Depleted variant when burning more than balance, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_with_tokens_burned_leaves_active_unchanged_on_wrong_receipt_id() {
+        let view = ReceiptInventoryView::Active {
+            receipt_id: uint!(1_U256),
+            underlying: UnderlyingSymbol::new("GOOG"),
+            token: TokenSymbol::new("tGOOG"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(100_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
         let original_view = view.clone();
 
-        let event = RedemptionEvent::Detected {
-            issuer_request_id: IssuerRequestId::new("red-123"),
+        let result = view.with_tokens_burned(
+            uint!(99_U256),
+            uint!(50_000000000000000000_U256),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            result, original_view,
+            "Burn with mismatched receipt ID should not change view"
+        );
+    }
+
+    #[test]
+    fn test_with_tokens_burned_leaves_pending_unchanged() {
+        let view = ReceiptInventoryView::Pending {
+            underlying: UnderlyingSymbol::new("AMD"),
+            token: TokenSymbol::new("tAMD"),
+        };
+        let original_view = view.clone();
+
+        let result = view.with_tokens_burned(
+            uint!(1_U256),
+            uint!(50_000000000000000000_U256),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            result, original_view,
+            "Burn in Pending state should not change view"
+        );
+    }
+
+    #[test]
+    fn test_with_tokens_burned_leaves_unavailable_unchanged() {
+        let view = ReceiptInventoryView::Unavailable;
+        let original_view = view.clone();
+
+        let result = view.with_tokens_burned(
+            uint!(1_U256),
+            uint!(50_000000000000000000_U256),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            result, original_view,
+            "Burn in Unavailable state should not change view"
+        );
+    }
+
+    #[test]
+    fn test_with_tokens_burned_leaves_depleted_unchanged() {
+        let view = ReceiptInventoryView::Depleted {
+            receipt_id: uint!(5_U256),
+            underlying: UnderlyingSymbol::new("META"),
+            token: TokenSymbol::new("tMETA"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            depleted_at: Utc::now(),
+        };
+        let original_view = view.clone();
+
+        let result = view.with_tokens_burned(
+            uint!(5_U256),
+            uint!(50_000000000000000000_U256),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            result, original_view,
+            "Burn in Depleted state should not change view"
+        );
+    }
+
+    #[test]
+    fn test_active_receipt_balance_decrements_on_burn() {
+        let mut view = ReceiptInventoryView::Active {
+            receipt_id: uint!(42_U256),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            wallet: address!("0x3333333333333333333333333333333333333333"),
-            quantity: Quantity::new(Decimal::from(10)),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(100_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+
+        let burned_at = Utc::now();
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-123"),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            block_number: 5000,
-            detected_at: Utc::now(),
+            receipt_id: uint!(42_U256),
+            shares_burned: uint!(30_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 2000,
+            burned_at,
         };
 
         let envelope: EventEnvelope<Redemption> = EventEnvelope {
@@ -585,10 +912,275 @@ mod tests {
 
         view.update(&envelope);
 
+        let ReceiptInventoryView::Active { current_balance, .. } = view else {
+            panic!("Expected Active variant after partial burn, got {view:?}");
+        };
+
+        assert_eq!(current_balance, uint!(70_000000000000000000_U256));
+    }
+
+    #[test]
+    fn test_active_to_depleted_when_balance_reaches_zero() {
+        let mut view = ReceiptInventoryView::Active {
+            receipt_id: uint!(7_U256),
+            underlying: UnderlyingSymbol::new("TSLA"),
+            token: TokenSymbol::new("tTSLA"),
+            initial_amount: uint!(50_000000000000000000_U256),
+            current_balance: uint!(50_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+
+        let burned_at = Utc::now();
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-456"),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            receipt_id: uint!(7_U256),
+            shares_burned: uint!(50_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 3000,
+            burned_at,
+        };
+
+        let envelope: EventEnvelope<Redemption> = EventEnvelope {
+            aggregate_id: "red-456".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let ReceiptInventoryView::Depleted {
+            receipt_id,
+            underlying,
+            token,
+            initial_amount,
+            depleted_at,
+        } = view
+        else {
+            panic!("Expected Depleted variant after full burn, got {view:?}");
+        };
+
+        assert_eq!(receipt_id, uint!(7_U256));
+        assert_eq!(underlying, UnderlyingSymbol::new("TSLA"));
+        assert_eq!(token, TokenSymbol::new("tTSLA"));
+        assert_eq!(initial_amount, uint!(50_000000000000000000_U256));
+        assert_eq!(depleted_at, burned_at);
+    }
+
+    #[test]
+    fn test_active_to_depleted_when_burning_more_than_balance() {
+        let mut view = ReceiptInventoryView::Active {
+            receipt_id: uint!(10_U256),
+            underlying: UnderlyingSymbol::new("NVDA"),
+            token: TokenSymbol::new("tNVDA"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(30_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+
+        let burned_at = Utc::now();
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-789"),
+            tx_hash: b256!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ),
+            receipt_id: uint!(10_U256),
+            shares_burned: uint!(50_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 4000,
+            burned_at,
+        };
+
+        let envelope: EventEnvelope<Redemption> = EventEnvelope {
+            aggregate_id: "red-789".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        assert!(
+            matches!(view, ReceiptInventoryView::Depleted { .. }),
+            "Expected Depleted variant when burning more than balance, got {view:?}"
+        );
+    }
+
+    #[test]
+    fn test_burn_from_wrong_receipt_id_leaves_unchanged() {
+        let mut view = ReceiptInventoryView::Active {
+            receipt_id: uint!(1_U256),
+            underlying: UnderlyingSymbol::new("GOOG"),
+            token: TokenSymbol::new("tGOOG"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(100_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+        let original_view = view.clone();
+
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-wrong"),
+            tx_hash: b256!(
+                "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            receipt_id: uint!(99_U256),
+            shares_burned: uint!(50_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 5000,
+            burned_at: Utc::now(),
+        };
+
+        let envelope: EventEnvelope<Redemption> = EventEnvelope {
+            aggregate_id: "red-wrong".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
         assert_eq!(
             view, original_view,
-            "Redemption event should not change view state (waiting for issue #25)"
+            "Burn with mismatched receipt ID should not change view"
         );
+    }
+
+    #[test]
+    fn test_burn_in_pending_state_leaves_unchanged() {
+        let mut view = ReceiptInventoryView::Pending {
+            underlying: UnderlyingSymbol::new("AMD"),
+            token: TokenSymbol::new("tAMD"),
+        };
+        let original_view = view.clone();
+
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-pending"),
+            tx_hash: b256!(
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            ),
+            receipt_id: uint!(1_U256),
+            shares_burned: uint!(50_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 6000,
+            burned_at: Utc::now(),
+        };
+
+        let envelope: EventEnvelope<Redemption> = EventEnvelope {
+            aggregate_id: "red-pending".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        assert_eq!(
+            view, original_view,
+            "Burn in Pending state should not change view"
+        );
+    }
+
+    #[test]
+    fn test_burn_in_unavailable_state_leaves_unchanged() {
+        let mut view = ReceiptInventoryView::Unavailable;
+        let original_view = view.clone();
+
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("red-unavail"),
+            tx_hash: b256!(
+                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            ),
+            receipt_id: uint!(1_U256),
+            shares_burned: uint!(50_000000000000000000_U256),
+            gas_used: 50000,
+            block_number: 7000,
+            burned_at: Utc::now(),
+        };
+
+        let envelope: EventEnvelope<Redemption> = EventEnvelope {
+            aggregate_id: "red-unavail".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        assert_eq!(
+            view, original_view,
+            "Burn in Unavailable state should not change view"
+        );
+    }
+
+    #[test]
+    fn test_other_redemption_events_leave_view_unchanged() {
+        let mut view = ReceiptInventoryView::Active {
+            receipt_id: uint!(1_U256),
+            underlying: UnderlyingSymbol::new("META"),
+            token: TokenSymbol::new("tMETA"),
+            initial_amount: uint!(100_000000000000000000_U256),
+            current_balance: uint!(100_000000000000000000_U256),
+            minted_at: Utc::now(),
+        };
+        let original_view = view.clone();
+
+        let events = vec![
+            RedemptionEvent::Detected {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                underlying: UnderlyingSymbol::new("META"),
+                token: TokenSymbol::new("tMETA"),
+                wallet: address!("0x3333333333333333333333333333333333333333"),
+                quantity: Quantity::new(Decimal::from(10)),
+                tx_hash: b256!(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                block_number: 5000,
+                detected_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                tokenization_request_id: TokenizationRequestId::new("alp-456"),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaCallFailed {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                error: "test error".to_string(),
+                failed_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                alpaca_completed_at: Utc::now(),
+            },
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                reason: "test reason".to_string(),
+                failed_at: Utc::now(),
+            },
+            RedemptionEvent::BurningFailed {
+                issuer_request_id: IssuerRequestId::new("red-123"),
+                error: "blockchain error".to_string(),
+                failed_at: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            let envelope: EventEnvelope<Redemption> = EventEnvelope {
+                aggregate_id: "red-123".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
+
+            view.update(&envelope);
+
+            assert_eq!(
+                view, original_view,
+                "Non-burn redemption events should not change view state"
+            );
+        }
     }
 
     #[test]
@@ -632,65 +1224,6 @@ mod tests {
 
             assert_eq!(view, original_view);
         }
-    }
-
-    #[tokio::test]
-    async fn test_get_receipt_returns_view() {
-        let pool = setup_test_db().await;
-
-        let issuer_request_id = IssuerRequestId::new("iss-retrieve");
-        let underlying = UnderlyingSymbol::new("MSFT");
-        let token = TokenSymbol::new("tMSFT");
-
-        let view = ReceiptInventoryView::Pending {
-            underlying: underlying.clone(),
-            token: token.clone(),
-        };
-
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO receipt_inventory_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            issuer_request_id.0,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let result = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_some());
-
-        let ReceiptInventoryView::Pending {
-            underlying: found_underlying,
-            token: found_token,
-        } = result.unwrap()
-        else {
-            panic!("Expected Pending variant");
-        };
-
-        assert_eq!(found_underlying, underlying);
-        assert_eq!(found_token, token);
-    }
-
-    #[tokio::test]
-    async fn test_get_receipt_returns_none_when_not_found() {
-        let pool = setup_test_db().await;
-
-        let issuer_request_id = IssuerRequestId::new("nonexistent");
-
-        let result = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -875,85 +1408,233 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_total_balance_sums_all_active_receipts() {
+    async fn test_cross_aggregate_burn_updates_mint_receipt() {
         let pool = setup_test_db().await;
 
-        let underlying = UnderlyingSymbol::new("NFLX");
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
 
-        let view1 = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-            initial_amount: uint!(100_000000000000000000_U256),
-            current_balance: uint!(75_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
+        let receipt_inventory_mint_repo =
+            Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+                pool.clone(),
+                "receipt_inventory_view".to_string(),
+            ));
+        let receipt_inventory_mint_query =
+            ReceiptInventoryMintQuery::new(receipt_inventory_mint_repo);
 
-        let view2 = ReceiptInventoryView::Active {
-            receipt_id: uint!(2_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-            initial_amount: uint!(50_000000000000000000_U256),
-            current_balance: uint!(50_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
+        let mint_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
+            (),
+        ));
 
-        let pending_view = ReceiptInventoryView::Pending {
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tNFLX"),
-        };
+        let redemption_view_repo =
+            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
+        let redemption_query = GenericQuery::new(redemption_view_repo);
 
-        let payload1 =
-            serde_json::to_string(&view1).expect("Failed to serialize");
-        let payload2 =
-            serde_json::to_string(&view2).expect("Failed to serialize");
-        let payload3 =
-            serde_json::to_string(&pending_view).expect("Failed to serialize");
+        let receipt_inventory_redemption_repo = Arc::new(
+            SqliteViewRepository::<ReceiptInventoryView, Redemption>::new(
+                pool.clone(),
+                "receipt_inventory_view".to_string(),
+            ),
+        );
+        let receipt_inventory_redemption_query =
+            ReceiptInventoryRedemptionQuery::new(
+                receipt_inventory_redemption_repo,
+            );
 
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-1",
-            payload1
+        let redemption_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(redemption_query),
+                Box::new(receipt_inventory_redemption_query),
+            ],
+            (),
+        ));
+
+        let issuer_request_id = IssuerRequestId::new("iss-mint-123");
+        let receipt_id = uint!(42_U256);
+        let initial_shares = uint!(100_000000000000000000_U256);
+
+        execute_mint_flow(
+            &mint_cqrs,
+            &issuer_request_id,
+            receipt_id,
+            initial_shares,
         )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
+        .await;
 
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-2",
-            payload2
+        let balance_after_mint =
+            verify_active_receipt(&pool, &issuer_request_id).await;
+        assert_eq!(balance_after_mint, initial_shares);
+
+        let shares_to_burn = uint!(30_000000000000000000_U256);
+
+        execute_redemption_flow(
+            &redemption_cqrs,
+            &issuer_request_id,
+            receipt_id,
+            shares_to_burn,
         )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
+        .await;
 
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-3",
-            payload3
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
+        let balance_after_burn =
+            verify_active_receipt(&pool, &issuer_request_id).await;
 
-        let total = get_total_balance(&pool, &underlying)
-            .await
-            .expect("Query should succeed");
-
-        assert_eq!(total, uint!(125_000000000000000000_U256));
+        let expected_balance = initial_shares - shares_to_burn;
+        assert_eq!(
+            balance_after_burn, expected_balance,
+            "Receipt inventory at issuer_request_id should be updated by redemption burn. \
+             Expected {expected_balance}, got {balance_after_burn}"
+        );
     }
 
-    #[tokio::test]
-    async fn test_get_total_balance_returns_zero_when_no_active() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("SHOP");
-
-        let total = get_total_balance(&pool, &underlying)
+    async fn execute_mint_flow<ES>(
+        mint_cqrs: &Arc<CqrsFramework<Mint, ES>>,
+        issuer_request_id: &IssuerRequestId,
+        receipt_id: U256,
+        initial_shares: U256,
+    ) where
+        ES: EventStore<Mint>,
+    {
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-456",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id: ClientId("client-123".to_string()),
+                    wallet: address!(
+                        "0x1111111111111111111111111111111111111111"
+                    ),
+                },
+            )
             .await
-            .expect("Query should succeed");
+            .expect("Initiate should succeed");
 
-        assert_eq!(total, U256::ZERO);
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmJournal should succeed");
+
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::RecordMintSuccess {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    receipt_id,
+                    shares_minted: initial_shares,
+                    gas_used: 50000,
+                    block_number: 1000,
+                },
+            )
+            .await
+            .expect("RecordMintSuccess should succeed");
+    }
+
+    async fn execute_redemption_flow<ES>(
+        redemption_cqrs: &Arc<CqrsFramework<Redemption, ES>>,
+        issuer_request_id: &IssuerRequestId,
+        receipt_id: U256,
+        shares_to_burn: U256,
+    ) where
+        ES: EventStore<Redemption>,
+    {
+        let redemption_aggregate_id = "red-redemption-456";
+
+        redemption_cqrs
+            .execute(
+                redemption_aggregate_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    wallet: address!("0x2222222222222222222222222222222222222222"),
+                    quantity: Quantity::new(Decimal::from(30)),
+                    tx_hash: b256!(
+                        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    block_number: 1500,
+                },
+            )
+            .await
+            .expect("Detect should succeed");
+
+        redemption_cqrs
+            .execute(
+                redemption_aggregate_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-redeem-789",
+                    ),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall should succeed");
+
+        redemption_cqrs
+            .execute(
+                redemption_aggregate_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete should succeed");
+
+        redemption_cqrs
+            .execute(
+                redemption_aggregate_id,
+                RedemptionCommand::RecordBurnSuccess {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: b256!(
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    ),
+                    receipt_id,
+                    shares_burned: shares_to_burn,
+                    gas_used: 45000,
+                    block_number: 2000,
+                },
+            )
+            .await
+            .expect("RecordBurnSuccess should succeed");
+    }
+
+    async fn verify_active_receipt(
+        pool: &Pool<Sqlite>,
+        issuer_request_id: &IssuerRequestId,
+    ) -> U256 {
+        let view = get_receipt(pool, issuer_request_id)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let ReceiptInventoryView::Active { current_balance, .. } = view else {
+            panic!("Expected Active view, got {view:?}");
+        };
+
+        current_balance
     }
 }

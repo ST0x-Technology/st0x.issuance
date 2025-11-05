@@ -352,10 +352,10 @@ instead.
    `DetectRedemption`, Event: `RedemptionDetected`)
 2. We call Alpaca's redeem endpoint (Command: `RecordAlpacaCall`, Event:
    `AlpacaCalled`)
-3. We poll for journal completion (Command: `ConfirmAlpacaComplete`, Events:
-   `AlpacaJournalCompleted`, `BurningStarted`)
+3. We poll for journal completion (Command: `ConfirmAlpacaComplete`, Event:
+   `AlpacaJournalCompleted`)
 4. We burn tokens on-chain via `vault.withdraw()` (Command: `RecordBurnSuccess`,
-   Events: `TokensBurned`, `RedemptionCompleted`)
+   Event: `TokensBurned` - final success state)
 
 ### Configuration
 

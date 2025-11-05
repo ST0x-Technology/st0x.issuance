@@ -253,7 +253,7 @@ on-chain transfer through calling Alpaca to burning tokens.
   (terminal failure state)
 - `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
   transfer
-- `RedemptionCompleted { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
+- `TokensBurned { issuer_request_id, tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
   On-chain burn succeeded and entire redemption flow completed (terminal success
   state)
 - `BurningFailed { issuer_request_id, error }` - On-chain burn failed (terminal
@@ -261,14 +261,14 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command → Event Mappings:**
 
-| Command                 | Events Produced          | Notes                                                                      |
-| ----------------------- | ------------------------ | -------------------------------------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                      |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                                    |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                          |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - Alpaca journal transfer completed                           |
-| `RecordBurnSuccess`     | `RedemptionCompleted`    | Single event - burn succeeded and redemption fully done (terminal success) |
-| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                              |
+| Command                 | Events Produced          | Notes                                                                 |
+| ----------------------- | ------------------------ | --------------------------------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                 |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                               |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - journal complete, transitions aggregate to Burning     |
+| `RecordBurnSuccess`     | `TokensBurned`           | Single event - burn succeeded, redemption complete (terminal success) |
+| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                         |
 
 ### Account Aggregate
 
@@ -793,7 +793,7 @@ sequenceDiagram
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordBurnSuccess command<br/>Event: RedemptionCompleted
+    Note right of Us: RecordBurnSuccess command<br/>Event: TokensBurned (final success state)
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -1267,25 +1267,24 @@ events.
 **RedemptionView** - Maintains current state of redemptions:
 
 - Listens to: `RedemptionDetected`, `AlpacaCalled`, `AlpacaJournalCompleted`,
-  `RedemptionCompleted`, `AlpacaCallFailed`, `BurningFailed`
+  `TokensBurned`, `AlpacaCallFailed`, `BurningFailed`
 - Updates: Status, timestamps, transaction details
 - Used for: Tracking redemption progress, status queries
 
 **ReceiptInventoryView** - Tracks receipt balances through state transitions:
 
 - Listens to: `MintEvent::Initiated` (captures underlying/token),
-  `MintEvent::TokensMinted` (creates active receipt)
-- Future: Will listen to burn events from Redemption aggregate when issue #25 is
-  implemented (decreases balance, transitions to Depleted)
-- State transitions: Unavailable → Pending → Active (→ Depleted when burning
-  implemented)
+  `MintEvent::TokensMinted` (creates active receipt),
+  `RedemptionEvent::TokensBurned` (decreases balance, transitions to Depleted)
+- State transitions: Unavailable → Pending → Active → Depleted
 - Updates: Accumulates data across event sequence to track each receipt's
-  lifecycle
-- Used for: Selecting which receipt to burn from, inventory management
+  lifecycle from creation through complete depletion
+- Used for: Selecting which receipt to burn from during redemptions, inventory
+  management
 
 **InventorySnapshotView** - Periodic inventory metrics:
 
-- Listens to: `TokensMinted`, `RedemptionCompleted`
+- Listens to: `TokensMinted`, `TokensBurned`
 - Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
 - Used for: Grafana dashboards, monitoring, alerting
 

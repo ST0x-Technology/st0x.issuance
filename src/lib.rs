@@ -15,6 +15,7 @@ use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
     Redemption, RedemptionView,
+    burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
@@ -63,18 +64,27 @@ struct AggregateCqrsSetup {
 }
 
 struct RedemptionManagers {
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Quantity(pub(crate) Decimal);
+
+impl std::fmt::Display for Quantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
@@ -169,20 +179,23 @@ pub async fn initialize_rocket(
     let (mint_manager, callback_manager) =
         setup_mint_managers(&config, &mint_cqrs).await?;
 
-    let RedemptionManagers { redeem_call_manager, journal_manager } =
+    let RedemptionManagers { redeem_call, journal, burn } =
         setup_redemption_managers(
             &config,
             &redemption_cqrs,
             &redemption_event_store,
-        )?;
+            &pool,
+        )
+        .await?;
 
     spawn_redemption_detector(
         &config,
         redemption_cqrs.clone(),
         redemption_event_store,
         pool.clone(),
-        redeem_call_manager,
-        journal_manager,
+        redeem_call,
+        journal,
+        burn,
     );
 
     Ok(rocket::build()
@@ -316,23 +329,31 @@ async fn setup_mint_managers(
     Ok((mint_manager, callback_manager))
 }
 
-fn setup_redemption_managers(
+async fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
+    pool: &Pool<Sqlite>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
-    let redeem_call_manager = Arc::new(RedeemCallManager::new(
+    let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_cqrs.clone(),
     ));
-    let journal_manager = Arc::new(JournalManager::new(
+    let journal = Arc::new(JournalManager::new(
         alpaca_service,
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
     ));
 
-    Ok(RedemptionManagers { redeem_call_manager, journal_manager })
+    let blockchain_service = config.create_blockchain_service().await?;
+    let burn = Arc::new(BurnManager::new(
+        blockchain_service,
+        pool.clone(),
+        redemption_cqrs.clone(),
+    ));
+
+    Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
 fn spawn_redemption_detector(
@@ -342,13 +363,16 @@ fn spawn_redemption_detector(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
     if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
@@ -369,8 +393,9 @@ fn spawn_redemption_detector(
             redemption_cqrs,
             redemption_event_store,
             pool,
-            redeem_call_manager,
-            journal_manager,
+            redeem_call,
+            journal,
+            burn,
         );
 
         tokio::spawn(async move {
@@ -428,4 +453,118 @@ async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{U256, uint};
+    use rust_decimal::Decimal;
+
+    use super::{Quantity, QuantityConversionError};
+
+    #[test]
+    fn test_quantity_display() {
+        let quantity = Quantity::new(Decimal::from(100));
+        assert_eq!(format!("{quantity}"), "100");
+
+        let quantity_with_decimals = Quantity::new(Decimal::new(12345, 2));
+        assert_eq!(format!("{quantity_with_decimals}"), "123.45");
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_whole_number() {
+        let quantity = Quantity::new(Decimal::from(100));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(100_000000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_with_decimals() {
+        let quantity = Quantity::new(Decimal::new(12345, 2));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123_450000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_zero() {
+        let quantity = Quantity::new(Decimal::ZERO);
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_negative_fails() {
+        let quantity = Quantity::new(Decimal::from(-10));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::NegativeValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_fractional_beyond_18_decimals_fails() {
+        let quantity = Quantity::new(Decimal::new(1, 19));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::FractionalValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_max_18_decimals() {
+        let quantity = Quantity::new(Decimal::new(123_456_789_012_345_678, 18));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123456789012345678_U256));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_whole_number() {
+        let u256_value = uint!(100_000000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::from(100));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_with_decimals() {
+        let u256_value = uint!(123_450000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(12345, 2));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_zero() {
+        let quantity =
+            Quantity::from_u256_with_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(quantity.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_preserves_precision() {
+        let u256_value = uint!(123456789012345678_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(123_456_789_012_345_678, 18));
+    }
+
+    #[test]
+    fn test_round_trip_conversion() {
+        let original = Quantity::new(Decimal::from(100));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
+
+    #[test]
+    fn test_round_trip_conversion_with_decimals() {
+        let original = Quantity::new(Decimal::new(12345, 2));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
 }
