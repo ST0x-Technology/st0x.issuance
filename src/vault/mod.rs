@@ -47,6 +47,7 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// * `shares` - Number of shares to burn (18-decimal fixed-point)
     /// * `receipt_id` - ERC-1155 receipt ID to burn from
+    /// * `owner` - Address of the account whose shares are being burned
     /// * `receiver` - Address that will receive the underlying assets
     /// * `receipt_info` - Metadata about the burn operation for on-chain audit trail
     ///
@@ -63,6 +64,7 @@ pub(crate) trait VaultService: Send + Sync {
         &self,
         shares: U256,
         receipt_id: U256,
+        owner: Address,
         receiver: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<BurnResult, VaultError>;

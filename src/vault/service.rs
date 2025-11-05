@@ -106,6 +106,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         &self,
         shares: U256,
         receipt_id: U256,
+        owner: Address,
         receiver: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<BurnResult, VaultError> {
@@ -123,10 +124,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // The vault's redeem() function burns shares and returns underlying assets to receiver.
         // Parameters: shares to burn, receiver address, owner address, receipt ID, metadata.
-        // We pass `receiver` for both the receiver and owner parameters since our wallet
-        // (the transaction sender) owns the shares being burned.
+        // The owner parameter specifies whose shares are being burned, while receiver gets the assets.
         let receipt = vault
-            .redeem(shares, receiver, receiver, receipt_id, receipt_info_bytes)
+            .redeem(shares, receiver, owner, receipt_id, receipt_info_bytes)
             .send()
             .await
             .map_err(|e| VaultError::TransactionFailed {
@@ -546,7 +546,7 @@ mod tests {
         let service = RealBlockchainService::new(provider, vault_address);
 
         let result = service
-            .burn_tokens(shares, receipt_id, receiver, receipt_info)
+            .burn_tokens(shares, receipt_id, receiver, receiver, receipt_info)
             .await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
@@ -562,6 +562,7 @@ mod tests {
     async fn test_burn_tokens_missing_withdraw_event() {
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
         let mut receipt_info = test_receipt_info();
         receipt_info.operation_type = OperationType::Redeem;
@@ -645,7 +646,7 @@ mod tests {
         let service = RealBlockchainService::new(provider, vault_address);
 
         let result = service
-            .burn_tokens(shares, receipt_id, receiver, receipt_info)
+            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
             .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");

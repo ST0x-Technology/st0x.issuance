@@ -22,6 +22,7 @@ pub(crate) struct MintTokensCall {
 pub(crate) struct BurnTokensCall {
     pub(crate) shares: U256,
     pub(crate) receipt_id: U256,
+    pub(crate) owner: Address,
     pub(crate) receiver: Address,
     pub(crate) receipt_info: ReceiptInformation,
 }
@@ -170,6 +171,7 @@ impl VaultService for MockVaultService {
         &self,
         shares: U256,
         receipt_id: U256,
+        owner: Address,
         receiver: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<BurnResult, VaultError> {
@@ -187,6 +189,7 @@ impl VaultService for MockVaultService {
             *self.last_burn_call.lock().unwrap() = Some(BurnTokensCall {
                 shares,
                 receipt_id,
+                owner,
                 receiver,
                 receipt_info: receipt_info.clone(),
             });
@@ -348,11 +351,13 @@ mod tests {
         let mock = MockVaultService::new_success();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
 
-        let result =
-            mock.burn_tokens(shares, receipt_id, receiver, receipt_info).await;
+        let result = mock
+            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .await;
 
         assert!(result.is_ok());
         let burn_result = result.unwrap();
@@ -367,11 +372,13 @@ mod tests {
         let mock = MockVaultService::new_failure("blockchain error");
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
 
-        let result =
-            mock.burn_tokens(shares, receipt_id, receiver, receipt_info).await;
+        let result = mock
+            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -385,18 +392,31 @@ mod tests {
         let mock = MockVaultService::new_success();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
 
         assert_eq!(mock.get_burn_call_count(), 0);
 
-        mock.burn_tokens(shares, receipt_id, receiver, test_receipt_info())
-            .await
-            .unwrap();
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
         assert_eq!(mock.get_burn_call_count(), 1);
 
-        mock.burn_tokens(shares, receipt_id, receiver, test_receipt_info())
-            .await
-            .unwrap();
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
         assert_eq!(mock.get_burn_call_count(), 2);
     }
 
@@ -405,14 +425,21 @@ mod tests {
         let mock = MockVaultService::new_success();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
 
         assert!(mock.get_last_burn_call().is_none());
 
-        mock.burn_tokens(shares, receipt_id, receiver, receipt_info.clone())
-            .await
-            .unwrap();
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
 
         let last_call = mock.get_last_burn_call();
         assert!(last_call.is_some());
@@ -420,6 +447,7 @@ mod tests {
         let call = last_call.unwrap();
         assert_eq!(call.shares, shares);
         assert_eq!(call.receipt_id, receipt_id);
+        assert_eq!(call.owner, owner);
         assert_eq!(call.receiver, receiver);
         assert_eq!(
             call.receipt_info.tokenization_request_id.0,
@@ -432,13 +460,20 @@ mod tests {
         let mock = MockVaultService::new_success();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
+        let owner = test_receiver();
         let receiver = test_receiver();
         let receipt_info = test_receipt_info();
 
-        mock.burn_tokens(shares, receipt_id, receiver, receipt_info.clone())
-            .await
-            .unwrap();
-        mock.burn_tokens(shares, receipt_id, receiver, receipt_info)
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
+        mock.burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
             .await
             .unwrap();
 

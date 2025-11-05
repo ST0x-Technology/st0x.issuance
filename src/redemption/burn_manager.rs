@@ -247,7 +247,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     ) -> Result<(), BurnManagerError> {
         match self
             .blockchain_service
-            .burn_tokens(shares, receipt_id, wallet, receipt_info)
+            .burn_tokens(shares, receipt_id, wallet, wallet, receipt_info)
             .await
         {
             Ok(result) => {

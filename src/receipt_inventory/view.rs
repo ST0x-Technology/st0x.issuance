@@ -1,12 +1,9 @@
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::ViewRepository;
 use cqrs_es::{EventEnvelope, View};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tracing::error;
 
 use crate::mint::{Mint, MintEvent};
 use crate::redemption::{Redemption, RedemptionEvent};
@@ -260,6 +257,7 @@ pub(crate) async fn find_receipt_with_balance(
 /// # Use Case
 /// Used for querying the current state of a specific receipt in tests and
 /// operational queries where the issuer_request_id is known.
+#[cfg(test)]
 pub(crate) async fn get_receipt(
     pool: &Pool<Sqlite>,
     issuer_request_id: &crate::mint::IssuerRequestId,
@@ -286,154 +284,27 @@ pub(crate) async fn get_receipt(
     }
 }
 
-/// Custom query for receipt inventory updates from Mint events.
-///
-/// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
-/// the issuer_request_id from event payloads to use as the view_id. This allows
-/// both Mint and Redemption aggregates to update the same receipt inventory view.
-pub(crate) struct ReceiptInventoryMintQuery {
-    view_repository:
-        Arc<sqlite_es::SqliteViewRepository<ReceiptInventoryView, Mint>>,
-}
-
-impl ReceiptInventoryMintQuery {
-    pub(crate) fn new(
-        view_repository: Arc<
-            sqlite_es::SqliteViewRepository<ReceiptInventoryView, Mint>,
-        >,
-    ) -> Self {
-        Self { view_repository }
-    }
-}
-
-#[async_trait::async_trait]
-impl cqrs_es::Query<Mint> for ReceiptInventoryMintQuery {
-    async fn dispatch(
-        &self,
-        _aggregate_id: &str,
-        events: &[EventEnvelope<Mint>],
-    ) {
-        for event in events {
-            let view_id = match &event.payload {
-                MintEvent::Initiated { issuer_request_id, .. } => {
-                    &issuer_request_id.0
-                }
-                MintEvent::TokensMinted { issuer_request_id, .. } => {
-                    &issuer_request_id.0
-                }
-                _ => continue,
-            };
-
-            let result = async {
-                let (mut view, view_context) = match self
-                    .view_repository
-                    .load_with_context(view_id)
-                    .await?
-                {
-                    Some(pair) => pair,
-                    None => (
-                        ReceiptInventoryView::default(),
-                        cqrs_es::persist::ViewContext::new(
-                            view_id.to_string(),
-                            0,
-                        ),
-                    ),
-                };
-
-                view.update(event);
-                self.view_repository.update_view(view, view_context).await
-            }
-            .await;
-
-            if let Err(err) = result {
-                error!(
-                    "Failed to update receipt inventory view for {view_id}: {err}"
-                );
-            }
-        }
-    }
-}
-
-/// Custom query for receipt inventory updates from Redemption events.
-///
-/// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
-/// the issuer_request_id from event payloads to use as the view_id. This allows
-/// both Mint and Redemption aggregates to update the same receipt inventory view.
-pub(crate) struct ReceiptInventoryRedemptionQuery {
-    view_repository:
-        Arc<sqlite_es::SqliteViewRepository<ReceiptInventoryView, Redemption>>,
-}
-
-impl ReceiptInventoryRedemptionQuery {
-    pub(crate) fn new(
-        view_repository: Arc<
-            sqlite_es::SqliteViewRepository<ReceiptInventoryView, Redemption>,
-        >,
-    ) -> Self {
-        Self { view_repository }
-    }
-}
-
-#[async_trait::async_trait]
-impl cqrs_es::Query<Redemption> for ReceiptInventoryRedemptionQuery {
-    async fn dispatch(
-        &self,
-        _aggregate_id: &str,
-        events: &[EventEnvelope<Redemption>],
-    ) {
-        for event in events {
-            let view_id = match &event.payload {
-                RedemptionEvent::TokensBurned { issuer_request_id, .. } => {
-                    &issuer_request_id.0
-                }
-                _ => continue,
-            };
-
-            let result = async {
-                let (mut view, view_context) = match self
-                    .view_repository
-                    .load_with_context(view_id)
-                    .await?
-                {
-                    Some(pair) => pair,
-                    None => (
-                        ReceiptInventoryView::default(),
-                        cqrs_es::persist::ViewContext::new(
-                            view_id.to_string(),
-                            0,
-                        ),
-                    ),
-                };
-
-                view.update(event);
-                self.view_repository.update_view(view, view_context).await
-            }
-            .await;
-
-            if let Err(err) = result {
-                error!(
-                    "Failed to update receipt inventory view for {view_id}: {err}"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::{GenericQuery, ViewContext, ViewRepository};
+    use cqrs_es::{CqrsFramework, EventEnvelope, EventStore, Query};
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tracing::error;
 
     use super::*;
     use crate::mint::{
-        ClientId, IssuerRequestId, MintEvent, Network, Quantity,
-        TokenizationRequestId,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintEvent, MintView,
+        Network, Quantity, TokenizationRequestId,
     };
-    use crate::redemption::RedemptionEvent;
+    use crate::redemption::{
+        Redemption, RedemptionCommand, RedemptionEvent, RedemptionView,
+    };
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -448,6 +319,134 @@ mod tests {
             .expect("Failed to run migrations");
 
         pool
+    }
+
+    /// Custom query for receipt inventory updates from Mint events.
+    ///
+    /// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
+    /// the issuer_request_id from event payloads to use as the view_id. This allows
+    /// both Mint and Redemption aggregates to update the same receipt inventory view.
+    struct ReceiptInventoryMintQuery {
+        view_repository: Arc<SqliteViewRepository<ReceiptInventoryView, Mint>>,
+    }
+
+    impl ReceiptInventoryMintQuery {
+        const fn new(
+            view_repository: Arc<
+                SqliteViewRepository<ReceiptInventoryView, Mint>,
+            >,
+        ) -> Self {
+            Self { view_repository }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Query<Mint> for ReceiptInventoryMintQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            events: &[EventEnvelope<Mint>],
+        ) {
+            for event in events {
+                let view_id = match &event.payload {
+                    MintEvent::Initiated { issuer_request_id, .. }
+                    | MintEvent::TokensMinted { issuer_request_id, .. } => {
+                        &issuer_request_id.0
+                    }
+                    _ => continue,
+                };
+
+                let result = async {
+                    let (mut view, view_context) = self
+                        .view_repository
+                        .load_with_context(view_id)
+                        .await?
+                        .map_or_else(
+                            || {
+                                (
+                                    ReceiptInventoryView::default(),
+                                    ViewContext::new(view_id.to_string(), 0),
+                                )
+                            },
+                            |pair| pair,
+                        );
+
+                    view.update(event);
+                    self.view_repository.update_view(view, view_context).await
+                }
+                .await;
+
+                if let Err(err) = result {
+                    error!(
+                        "Failed to update receipt inventory view for {view_id}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Custom query for receipt inventory updates from Redemption events.
+    ///
+    /// Unlike GenericQuery which uses aggregate_id as view_id, this query extracts
+    /// the issuer_request_id from event payloads to use as the view_id. This allows
+    /// both Mint and Redemption aggregates to update the same receipt inventory view.
+    struct ReceiptInventoryRedemptionQuery {
+        view_repository:
+            Arc<SqliteViewRepository<ReceiptInventoryView, Redemption>>,
+    }
+
+    impl ReceiptInventoryRedemptionQuery {
+        const fn new(
+            view_repository: Arc<
+                SqliteViewRepository<ReceiptInventoryView, Redemption>,
+            >,
+        ) -> Self {
+            Self { view_repository }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Query<Redemption> for ReceiptInventoryRedemptionQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            events: &[EventEnvelope<Redemption>],
+        ) {
+            for event in events {
+                let view_id = match &event.payload {
+                    RedemptionEvent::TokensBurned {
+                        issuer_request_id, ..
+                    } => &issuer_request_id.0,
+                    _ => continue,
+                };
+
+                let result = async {
+                    let (mut view, view_context) = self
+                        .view_repository
+                        .load_with_context(view_id)
+                        .await?
+                        .map_or_else(
+                            || {
+                                (
+                                    ReceiptInventoryView::default(),
+                                    ViewContext::new(view_id.to_string(), 0),
+                                )
+                            },
+                            |pair| pair,
+                        );
+
+                    view.update(event);
+                    self.view_repository.update_view(view, view_context).await
+                }
+                .await;
+
+                if let Err(err) = result {
+                    error!(
+                        "Failed to update receipt inventory view for {view_id}: {err}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1410,14 +1409,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_aggregate_burn_updates_mint_receipt() {
-        use cqrs_es::persist::GenericQuery;
-        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-
-        use crate::mint::{Mint, MintCommand, MintView};
-        use crate::redemption::{
-            Redemption, RedemptionCommand, RedemptionView,
-        };
-
         let pool = setup_test_db().await;
 
         let mint_view_repo =
@@ -1472,6 +1463,47 @@ mod tests {
         let receipt_id = uint!(42_U256);
         let initial_shares = uint!(100_000000000000000000_U256);
 
+        execute_mint_flow(
+            &mint_cqrs,
+            &issuer_request_id,
+            receipt_id,
+            initial_shares,
+        )
+        .await;
+
+        let balance_after_mint =
+            verify_active_receipt(&pool, &issuer_request_id).await;
+        assert_eq!(balance_after_mint, initial_shares);
+
+        let shares_to_burn = uint!(30_000000000000000000_U256);
+
+        execute_redemption_flow(
+            &redemption_cqrs,
+            &issuer_request_id,
+            receipt_id,
+            shares_to_burn,
+        )
+        .await;
+
+        let balance_after_burn =
+            verify_active_receipt(&pool, &issuer_request_id).await;
+
+        let expected_balance = initial_shares - shares_to_burn;
+        assert_eq!(
+            balance_after_burn, expected_balance,
+            "Receipt inventory at issuer_request_id should be updated by redemption burn. \
+             Expected {expected_balance}, got {balance_after_burn}"
+        );
+    }
+
+    async fn execute_mint_flow<ES>(
+        mint_cqrs: &Arc<CqrsFramework<Mint, ES>>,
+        issuer_request_id: &IssuerRequestId,
+        receipt_id: U256,
+        initial_shares: U256,
+    ) where
+        ES: EventStore<Mint>,
+    {
         mint_cqrs
             .execute(
                 &issuer_request_id.0,
@@ -1519,24 +1551,17 @@ mod tests {
             )
             .await
             .expect("RecordMintSuccess should succeed");
+    }
 
-        let view_after_mint = get_receipt(&pool, &issuer_request_id)
-            .await
-            .expect("Query should succeed")
-            .expect("View should exist after mint");
-
-        let ReceiptInventoryView::Active {
-            current_balance: balance_after_mint,
-            ..
-        } = view_after_mint
-        else {
-            panic!("Expected Active view after mint, got {view_after_mint:?}");
-        };
-
-        assert_eq!(balance_after_mint, initial_shares);
-
+    async fn execute_redemption_flow<ES>(
+        redemption_cqrs: &Arc<CqrsFramework<Redemption, ES>>,
+        issuer_request_id: &IssuerRequestId,
+        receipt_id: U256,
+        shares_to_burn: U256,
+    ) where
+        ES: EventStore<Redemption>,
+    {
         let redemption_aggregate_id = "red-redemption-456";
-        let shares_to_burn = uint!(30_000000000000000000_U256);
 
         redemption_cqrs
             .execute(
@@ -1595,27 +1620,21 @@ mod tests {
             )
             .await
             .expect("RecordBurnSuccess should succeed");
+    }
 
-        let view_after_burn = get_receipt(&pool, &issuer_request_id)
+    async fn verify_active_receipt(
+        pool: &Pool<Sqlite>,
+        issuer_request_id: &IssuerRequestId,
+    ) -> U256 {
+        let view = get_receipt(pool, issuer_request_id)
             .await
             .expect("Query should succeed")
-            .expect("View should still exist after burn");
+            .expect("View should exist");
 
-        let ReceiptInventoryView::Active {
-            current_balance: balance_after_burn,
-            ..
-        } = view_after_burn
-        else {
-            panic!(
-                "Expected Active view after partial burn, got {view_after_burn:?}"
-            );
+        let ReceiptInventoryView::Active { current_balance, .. } = view else {
+            panic!("Expected Active view, got {view:?}");
         };
 
-        let expected_balance = initial_shares - shares_to_burn;
-        assert_eq!(
-            balance_after_burn, expected_balance,
-            "Receipt inventory at issuer_request_id should be updated by redemption burn. \
-             Expected {expected_balance}, got {balance_after_burn}"
-        );
+        current_balance
     }
 }
