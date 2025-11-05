@@ -1206,15 +1206,19 @@ CREATE TABLE tokenized_asset_view (
 
 CREATE INDEX idx_asset_view_enabled ON tokenized_asset_view(json_extract(payload, '$.enabled'));
 
--- Receipt inventory view: built from TokensMinted and TokensBurned events
+-- Receipt inventory view: tracks receipt state transitions (cross-aggregate listening to Mint and Redemption)
 CREATE TABLE receipt_inventory_view (
-    view_id TEXT PRIMARY KEY,         -- receipt_id:vault_address
+    view_id TEXT PRIMARY KEY,         -- issuer_request_id
     version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {receipt_id, vault_address, symbol, initial_amount, current_balance, timestamps}
+    payload JSON NOT NULL             -- State enum: Unavailable | Pending{underlying,token} | Active{receipt_id,underlying,token,initial_amount,current_balance,minted_at} | Depleted{receipt_id,underlying,token,initial_amount,depleted_at}
 );
 
-CREATE INDEX idx_receipt_vault ON receipt_inventory_view(json_extract(payload, '$.vault_address'));
-CREATE INDEX idx_receipt_symbol ON receipt_inventory_view(json_extract(payload, '$.symbol'));
+-- Indexes for both Pending and Active states
+CREATE INDEX idx_receipt_pending_underlying ON receipt_inventory_view(json_extract(payload, '$.Pending.underlying'));
+CREATE INDEX idx_receipt_pending_token ON receipt_inventory_view(json_extract(payload, '$.Pending.token'));
+CREATE INDEX idx_receipt_active_underlying ON receipt_inventory_view(json_extract(payload, '$.Active.underlying'));
+CREATE INDEX idx_receipt_active_token ON receipt_inventory_view(json_extract(payload, '$.Active.token'));
+CREATE INDEX idx_receipt_current_balance ON receipt_inventory_view(json_extract(payload, '$.Active.current_balance'));
 
 -- Inventory snapshot view: periodic inventory metrics for Grafana
 CREATE TABLE inventory_snapshot_view (
@@ -1267,11 +1271,16 @@ events.
 - Updates: Status, timestamps, transaction details
 - Used for: Tracking redemption progress, status queries
 
-**ReceiptInventoryView** - Tracks receipt balances:
+**ReceiptInventoryView** - Tracks receipt balances through state transitions:
 
-- Listens to: `TokensMinted` (increases balance), `RedemptionCompleted`
-  (decreases balance)
-- Updates: Current balance for each receipt ID
+- Listens to: `MintEvent::Initiated` (captures underlying/token),
+  `MintEvent::TokensMinted` (creates active receipt)
+- Future: Will listen to burn events from Redemption aggregate when issue #25 is
+  implemented (decreases balance, transitions to Depleted)
+- State transitions: Unavailable → Pending → Active (→ Depleted when burning
+  implemented)
+- Updates: Accumulates data across event sequence to track each receipt's
+  lifecycle
 - Used for: Selecting which receipt to burn from, inventory management
 
 **InventorySnapshotView** - Periodic inventory metrics:
