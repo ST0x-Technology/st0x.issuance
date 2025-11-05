@@ -327,7 +327,7 @@ local and production deployment.
 - [x] Create `prep-docker-compose.sh` script based on reference
 - [x] Test locally with `./prep-docker-compose.sh` (uses local build or
       skip-build)
-- [ ] Commit both files
+- [x] Commit both files
 
 **docker-compose.template.yaml:**
 
@@ -434,8 +434,6 @@ droplet.
 - [x] Add SSH deployment action with appleboy/ssh-action
 - [x] Add deployment script with logging, backup, validation, and container
       checks
-- [ ] Test deployment to droplet via workflow_dispatch
-- [ ] Verify container starts and runs on droplet
 
 **File encoding (lines 54-62 adapted):**
 
@@ -505,11 +503,11 @@ automatically restore the previous version.
 
 **Subtasks:**
 
-- [ ] Add `perform_rollback` function to deployment script
-- [ ] Set up ERR trap to trigger rollback on failures
-- [ ] Test rollback by intentionally failing deployment (e.g., bad image tag)
-- [ ] Verify system restores to previous version
-- [ ] Remove test failure and verify normal deployment works
+- [x] Add `perform_rollback` function to deployment script
+- [x] Set up ERR trap to trigger rollback on failures
+
+**Note:** Automatic rollback was implemented in Task 6 as part of the deployment
+script.
 
 **Rollback function (lines 92-144):**
 
@@ -578,10 +576,8 @@ deployment.
 
 **Subtasks:**
 
-- [ ] Create `rollback.sh` script based on reference
-- [ ] Create `.github/workflows/rollback.yaml` based on reference
-- [ ] Test manual rollback via workflow_dispatch
-- [ ] Verify container is restored to previous version
+- [x] Create `rollback.sh` script based on reference
+- [x] Create `.github/workflows/rollback.yaml` based on reference
 
 **rollback.sh structure (213 lines from reference):**
 
@@ -647,22 +643,6 @@ concurrency:
 
 ---
 
-## Task 10. Update documentation
-
-Update README.md with deployment information and instructions.
-
-**Subtasks:**
-
-- [ ] Add "Deployment" section to README.md
-- [ ] Document local Docker development workflow
-- [ ] Document production deployment process
-- [ ] Document rollback process
-- [ ] List required GitHub secrets
-- [ ] Add troubleshooting section
-
-**Documentation structure:**
-
-````markdown
 ## Deployment
 
 ### Local Development with Docker
@@ -673,8 +653,8 @@ Build and run with Docker:
 ./prep-docker-compose.sh
 docker compose up -d
 ```
-````
 
+````
 View logs:
 
 ```bash
@@ -741,4 +721,32 @@ Configure these secrets in the GitHub repository settings:
 - `ALPACA_API_SECRET` - Alpaca API secret
 
 **Note:** Variables like `CHAIN_ID`, `ALPACA_BASE_URL`, `SERVER_HOST`, `SERVER_PORT`, and `RUST_LOG` have sensible defaults in the application code and don't need to be configured as secrets.
-```
+
+---
+
+## Task 11. Testing and Verification
+
+Test all deployment workflows and verify they work correctly in production.
+
+**Subtasks:**
+
+- [ ] Configure all required GitHub secrets in repository settings
+- [ ] Test deployment to droplet via workflow_dispatch
+- [ ] Verify container starts and runs on droplet
+- [ ] Test automatic rollback by intentionally failing a deployment
+- [ ] Verify system automatically restores to previous version
+- [ ] Remove test failure and verify normal deployment works
+- [ ] Test manual rollback via workflow_dispatch
+- [ ] Verify container is restored to previous version after manual rollback
+- [ ] Update workflow trigger from `feat/cd` to `main` (Task 9)
+- [ ] Test deployment triggers automatically on push to `main`
+
+**Success criteria:**
+
+- All GitHub secrets configured
+- Deployment workflow successfully deploys to droplet
+- Container runs without errors
+- Automatic rollback works when deployment fails
+- Manual rollback restores previous version
+- Workflow triggers correctly on `main` branch
+````
