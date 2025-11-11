@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  DATA_VOLUME_PATH: /mnt/volume_nyc3_01
+  DATA_VOLUME_PATH: /mnt/volume_nyc3_02
 
 jobs:
   rollback:

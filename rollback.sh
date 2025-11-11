@@ -12,7 +12,7 @@
 #
 # Environment variables:
 #   DATA_VOLUME_PATH (optional): Data directory path
-#                                Defaults to /mnt/volume_nyc3_01 (production)
+#                                Defaults to /mnt/volume_nyc3_02 (production)
 #                                Set to ./data for local testing
 #
 # Examples:
@@ -29,7 +29,7 @@ set -euo pipefail
 
 DRY_RUN=false
 
-export DATA_VOLUME_PATH="${DATA_VOLUME_PATH:-/mnt/volume_nyc3_01}"
+export DATA_VOLUME_PATH="${DATA_VOLUME_PATH:-/mnt/volume_nyc3_02}"
 DOCKER_COMPOSE_BACKUP="${DATA_VOLUME_PATH}/docker-compose.yaml.backup"
 ENV_BACKUP="${DATA_VOLUME_PATH}/.env.backup"
 DOCKER_COMPOSE="${DATA_VOLUME_PATH}/docker-compose.yaml"
