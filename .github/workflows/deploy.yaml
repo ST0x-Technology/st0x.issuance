@@ -77,7 +77,7 @@ jobs:
               trap - ERR
               echo "$(date '+%Y-%m-%d %H:%M:%S') - DEPLOYMENT FAILED - Attempting automatic rollback" | tee -a "${DEPLOY_LOG}" >&2
 
-              cd /mnt/volume_nyc3_01
+              cd /mnt/volume_nyc3_02
 
               if [ ! -f "docker-compose.yaml.backup" ] || [ ! -f ".env.backup" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - No backup files found, cannot rollback (possibly first deployment)" | tee -a "${DEPLOY_LOG}" >&2
@@ -150,7 +150,7 @@ jobs:
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting deployment of issuance-bot:${SHORT_SHA}" | tee "${DEPLOY_LOG}"
             echo "Deployment logs: ${DEPLOY_LOG}" | tee -a "${DEPLOY_LOG}"
 
-            export DATA_VOLUME_PATH="/mnt/volume_nyc3_01"
+            export DATA_VOLUME_PATH="/mnt/volume_nyc3_02"
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Validating required environment variables..." | tee -a "${DEPLOY_LOG}"
             validate_required_env
@@ -160,7 +160,7 @@ jobs:
             echo "${DIGITALOCEAN_ACCESS_TOKEN}" | \
               docker login registry.digitalocean.com -u unused --password-stdin 2>&1 | tee -a "${DEPLOY_LOG}"
 
-            cd /mnt/volume_nyc3_01
+            cd /mnt/volume_nyc3_02
             if [ -f "docker-compose.yaml" ] && [ -f ".env" ]; then
               echo "$(date '+%Y-%m-%d %H:%M:%S') - Backing up current configuration for rollback" | tee -a "${DEPLOY_LOG}"
               cp -p docker-compose.yaml docker-compose.yaml.backup
@@ -171,12 +171,12 @@ jobs:
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating configuration files from templates" | tee -a "${DEPLOY_LOG}"
 
-            echo "$PREP_SCRIPT" | base64 -d > /mnt/volume_nyc3_01/prep-docker-compose.sh
-            chmod +x /mnt/volume_nyc3_01/prep-docker-compose.sh
+            echo "$PREP_SCRIPT" | base64 -d > /mnt/volume_nyc3_02/prep-docker-compose.sh
+            chmod +x /mnt/volume_nyc3_02/prep-docker-compose.sh
 
-            echo "$DOCKER_COMPOSE_TEMPLATE" | base64 -d > /mnt/volume_nyc3_01/docker-compose.template.yaml
+            echo "$DOCKER_COMPOSE_TEMPLATE" | base64 -d > /mnt/volume_nyc3_02/docker-compose.template.yaml
 
-            cd /mnt/volume_nyc3_01
+            cd /mnt/volume_nyc3_02
             ./prep-docker-compose.sh --prod 2>&1 | tee -a "${DEPLOY_LOG}"
 
             log_exec docker compose pull
@@ -185,12 +185,12 @@ jobs:
 
             log_exec docker compose down || true
 
-            log_exec chmod 755 /mnt/volume_nyc3_01
+            log_exec chmod 755 /mnt/volume_nyc3_02
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating .env file from template" | tee -a "${DEPLOY_LOG}"
 
-            echo "$ENV_TEMPLATE" | base64 -d | envsubst > /mnt/volume_nyc3_01/.env
-            chmod 600 /mnt/volume_nyc3_01/.env
+            echo "$ENV_TEMPLATE" | base64 -d | envsubst > /mnt/volume_nyc3_02/.env
+            chmod 600 /mnt/volume_nyc3_02/.env
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting services with docker-compose" | tee -a "${DEPLOY_LOG}"
             if ! docker compose up -d 2>&1 | tee -a "${DEPLOY_LOG}"; then
