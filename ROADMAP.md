@@ -158,15 +158,19 @@ Complete redemption flow - detect transfer through burn.
 
 - [ ] [#21](https://github.com/ST0x-Technology/st0x.issuance/issues/21) -
       Implement DetectRedemption feature and MonitorService
+  - **PR:** [#54](https://github.com/ST0x-Technology/st0x.issuance/pull/54)
 - [x] [#22](https://github.com/ST0x-Technology/st0x.issuance/issues/22) -
       Implement Alpaca redeem call feature
   - **PR:** [#55](https://github.com/ST0x-Technology/st0x.issuance/pull/55)
-- [ ] [#23](https://github.com/ST0x-Technology/st0x.issuance/issues/23) -
+- [x] [#23](https://github.com/ST0x-Technology/st0x.issuance/issues/23) -
       Implement Alpaca journal polling feature
-- [ ] [#24](https://github.com/ST0x-Technology/st0x.issuance/issues/24) -
+  - **PR:** [#56](https://github.com/ST0x-Technology/st0x.issuance/pull/56)
+- [x] [#24](https://github.com/ST0x-Technology/st0x.issuance/issues/24) -
       Implement ReceiptInventoryView
+  - **PR:** [#59](https://github.com/ST0x-Technology/st0x.issuance/pull/59)
 - [x] [#25](https://github.com/ST0x-Technology/st0x.issuance/issues/25) -
       Implement token burning feature
+  - **PR:** [#61](https://github.com/ST0x-Technology/st0x.issuance/pull/61)
 - [ ] [#26](https://github.com/ST0x-Technology/st0x.issuance/issues/26) -
       End-to-end redemption flow tests
 
@@ -186,8 +190,9 @@ Operational concerns for production deployment.
       Implement API authentication for our endpoints
 - [ ] [#29](https://github.com/ST0x-Technology/st0x.issuance/issues/29) - Setup
       configuration and secrets management
-- [ ] [#30](https://github.com/ST0x-Technology/st0x.issuance/issues/30) -
+- [x] [#30](https://github.com/ST0x-Technology/st0x.issuance/issues/30) -
       Integrate OpenTelemetry tracing with HyperDX
+  - **PR:** [#60](https://github.com/ST0x-Technology/st0x.issuance/pull/60)
 - [ ] [#31](https://github.com/ST0x-Technology/st0x.issuance/issues/31) -
       Integrate Grafana for metrics
 - [ ] [#32](https://github.com/ST0x-Technology/st0x.issuance/issues/32) - Setup
