@@ -94,7 +94,7 @@ mod tests {
     fn test_alpaca_journal_completed_event_type() {
         let event = RedemptionEvent::AlpacaJournalCompleted {
             issuer_request_id: IssuerRequestId::new("red-test-123"),
-            alpaca_completed_at: Utc::now(),
+            alpaca_journal_completed_at: Utc::now(),
         };
 
         assert_eq!(

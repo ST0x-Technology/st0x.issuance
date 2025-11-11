@@ -79,13 +79,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         issuer_request_id: &IssuerRequestId,
         aggregate: &Redemption,
     ) -> Result<(), BurnManagerError> {
-        let Redemption::Burning {
-            tokenization_request_id,
-            underlying,
-            quantity,
-            wallet,
-            ..
-        } = aggregate
+        let Redemption::Burning { metadata, tokenization_request_id, .. } =
+            aggregate
         else {
             return Err(BurnManagerError::InvalidAggregateState {
                 current_state: aggregate_state_name(aggregate).to_string(),
@@ -94,23 +89,27 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         info!(
             issuer_request_id = %issuer_request_id,
-            underlying = %underlying,
-            quantity = %quantity,
-            wallet = %wallet,
+            underlying = %metadata.underlying,
+            quantity = %metadata.quantity,
+            wallet = %metadata.wallet,
             "Starting on-chain burning process"
         );
 
-        let shares = quantity.to_u256_with_18_decimals()?;
+        let shares = metadata.quantity.to_u256_with_18_decimals()?;
 
         let receipt_id = self
-            .select_receipt_for_burning(issuer_request_id, underlying, shares)
+            .select_receipt_for_burning(
+                issuer_request_id,
+                &metadata.underlying,
+                shares,
+            )
             .await?;
 
         let receipt_info = ReceiptInformation {
             tokenization_request_id: tokenization_request_id.clone(),
             issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            quantity: quantity.clone(),
+            underlying: metadata.underlying.clone(),
+            quantity: metadata.quantity.clone(),
             operation_type: OperationType::Redeem,
             timestamp: Utc::now(),
             notes: None,
@@ -120,7 +119,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             issuer_request_id,
             shares,
             receipt_id,
-            *wallet,
+            metadata.wallet,
             receipt_info,
         )
         .await

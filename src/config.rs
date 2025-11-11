@@ -1,5 +1,5 @@
 use alloy::network::EthereumWallet;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
@@ -95,7 +95,7 @@ struct Env {
         env = "PRIVATE_KEY",
         help = "Private key for signing blockchain transactions"
     )]
-    private_key: Option<String>,
+    private_key: Option<B256>,
 
     #[arg(
         long,
@@ -142,15 +142,15 @@ impl Env {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub(crate) database_url: String,
-    pub(crate) database_max_connections: u32,
-    pub(crate) rpc_url: Option<Url>,
-    pub(crate) private_key: Option<String>,
-    pub(crate) vault_address: Option<Address>,
-    pub(crate) redemption_wallet: Option<Address>,
+    pub database_url: String,
+    pub database_max_connections: u32,
+    pub rpc_url: Option<Url>,
+    pub private_key: Option<B256>,
+    pub vault_address: Option<Address>,
+    pub redemption_wallet: Option<Address>,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
-    pub(crate) alpaca: AlpacaConfig,
+    pub alpaca: AlpacaConfig,
 }
 
 impl Config {
@@ -170,12 +170,12 @@ impl Config {
             self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
 
         let private_key =
-            self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
+            self.private_key.ok_or(ConfigError::MissingPrivateKey)?;
 
         let vault_address =
             self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
 
-        let signer = private_key.parse::<PrivateKeySigner>()?;
+        let signer = PrivateKeySigner::from_bytes(&private_key)?;
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
@@ -197,6 +197,8 @@ pub enum ConfigError {
     MissingVaultAddress,
     #[error("Invalid private key")]
     InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
+    #[error("Invalid private key format")]
+    InvalidPrivateKeyFormat(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("Failed to connect to RPC endpoint")]
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
 }

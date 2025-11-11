@@ -1,4 +1,4 @@
-use alloy::primitives::{U256, address};
+use alloy::primitives::{Address, U256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -41,7 +41,7 @@ pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
 
-pub use config::{Config, setup_tracing};
+pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;

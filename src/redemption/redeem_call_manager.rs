@@ -31,40 +31,32 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         client_id: ClientId,
         network: Network,
     ) -> Result<(), RedeemCallManagerError> {
-        let Redemption::Detected {
-            underlying,
-            token,
-            wallet,
-            quantity,
-            detected_tx_hash,
-            ..
-        } = aggregate
-        else {
+        let Redemption::Detected { metadata } = aggregate else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
                 current_state: aggregate.state_name().to_string(),
             });
         };
 
         let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-        let UnderlyingSymbol(underlying_str) = underlying;
+        let UnderlyingSymbol(underlying_str) = &metadata.underlying;
 
         info!(
             issuer_request_id = %issuer_request_id_str,
             underlying = %underlying_str,
-            quantity = %quantity.0,
-            wallet = %wallet,
+            quantity = %metadata.quantity.0,
+            wallet = %metadata.wallet,
             "Calling Alpaca redeem endpoint"
         );
 
         let request = RedeemRequest {
             issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            token: token.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
             client_id,
-            quantity: quantity.clone(),
+            quantity: metadata.quantity.clone(),
             network,
-            wallet: *wallet,
-            tx_hash: *detected_tx_hash,
+            wallet: metadata.wallet,
+            tx_hash: metadata.detected_tx_hash,
         };
 
         match self.alpaca_service.call_redeem_endpoint(request).await {

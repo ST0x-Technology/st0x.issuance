@@ -1152,7 +1152,7 @@ mod tests {
             },
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: IssuerRequestId::new("red-123"),
-                alpaca_completed_at: Utc::now(),
+                alpaca_journal_completed_at: Utc::now(),
             },
             RedemptionEvent::RedemptionFailed {
                 issuer_request_id: IssuerRequestId::new("red-123"),
