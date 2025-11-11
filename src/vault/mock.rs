@@ -5,12 +5,24 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{MintResult, ReceiptInformation, VaultError, VaultService};
+use super::{
+    BurnResult, MintResult, ReceiptInformation, VaultError, VaultService,
+};
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct MintTokensCall {
     pub(crate) assets: U256,
+    pub(crate) receiver: Address,
+    pub(crate) receipt_info: ReceiptInformation,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BurnTokensCall {
+    pub(crate) shares: U256,
+    pub(crate) receipt_id: U256,
+    pub(crate) owner: Address,
     pub(crate) receiver: Address,
     pub(crate) receipt_info: ReceiptInformation,
 }
@@ -38,9 +50,13 @@ enum MockBehavior {
 pub(crate) struct MockVaultService {
     behavior: MockBehavior,
     mint_delay_ms: u64,
+    burn_delay_ms: u64,
     call_count: Arc<AtomicUsize>,
+    burn_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
+    #[cfg(test)]
+    last_burn_call: Arc<Mutex<Option<BurnTokensCall>>>,
 }
 
 impl MockVaultService {
@@ -49,9 +65,13 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Success,
             mint_delay_ms: 0,
+            burn_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
+            burn_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             last_call: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            last_burn_call: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -60,8 +80,11 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Failure { reason: reason.into() },
             mint_delay_ms: 0,
+            burn_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
+            burn_call_count: Arc::new(AtomicUsize::new(0)),
             last_call: Arc::new(Mutex::new(None)),
+            last_burn_call: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -83,9 +106,21 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn get_burn_call_count(&self) -> usize {
+        self.burn_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_last_burn_call(&self) -> Option<BurnTokensCall> {
+        self.last_burn_call.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.call_count.store(0, Ordering::Relaxed);
+        self.burn_call_count.store(0, Ordering::Relaxed);
         *self.last_call.lock().unwrap() = None;
+        *self.last_burn_call.lock().unwrap() = None;
     }
 }
 
@@ -123,6 +158,50 @@ impl VaultService for MockVaultService {
                 shares_minted: assets,
                 gas_used: 21000,
                 block_number: 1000,
+            }),
+            #[cfg(test)]
+            MockBehavior::Failure { reason } => {
+                Err(VaultError::TransactionFailed { reason: reason.clone() })
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    async fn burn_tokens(
+        &self,
+        shares: U256,
+        receipt_id: U256,
+        owner: Address,
+        receiver: Address,
+        receipt_info: ReceiptInformation,
+    ) -> Result<BurnResult, VaultError> {
+        if self.burn_delay_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                self.burn_delay_ms,
+            ))
+            .await;
+        }
+
+        self.burn_call_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(test)]
+        {
+            *self.last_burn_call.lock().unwrap() = Some(BurnTokensCall {
+                shares,
+                receipt_id,
+                owner,
+                receiver,
+                receipt_info: receipt_info.clone(),
+            });
+        }
+
+        match &self.behavior {
+            MockBehavior::Success => Ok(BurnResult {
+                tx_hash: B256::from([0x43; 32]),
+                receipt_id,
+                shares_burned: shares,
+                gas_used: 25000,
+                block_number: 2000,
             }),
             #[cfg(test)]
             MockBehavior::Failure { reason } => {
@@ -265,5 +344,145 @@ mod tests {
 
         assert_eq!(mock.get_call_count(), 0);
         assert!(mock.get_last_call().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_burn_new_success_returns_burn_result() {
+        let mock = MockVaultService::new_success();
+        let shares = U256::from(500);
+        let receipt_id = U256::from(42);
+        let owner = test_receiver();
+        let receiver = test_receiver();
+        let receipt_info = test_receipt_info();
+
+        let result = mock
+            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .await;
+
+        assert!(result.is_ok());
+        let burn_result = result.unwrap();
+        assert_eq!(burn_result.receipt_id, receipt_id);
+        assert_eq!(burn_result.shares_burned, shares);
+        assert_eq!(burn_result.gas_used, 25000);
+        assert_eq!(burn_result.block_number, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_burn_new_failure_returns_error() {
+        let mock = MockVaultService::new_failure("blockchain error");
+        let shares = U256::from(500);
+        let receipt_id = U256::from(42);
+        let owner = test_receiver();
+        let receiver = test_receiver();
+        let receipt_info = test_receipt_info();
+
+        let result = mock
+            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            VaultError::TransactionFailed { reason } if reason == "blockchain error"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_burn_get_call_count_increments() {
+        let mock = MockVaultService::new_success();
+        let shares = U256::from(500);
+        let receipt_id = U256::from(42);
+        let owner = test_receiver();
+        let receiver = test_receiver();
+
+        assert_eq!(mock.get_burn_call_count(), 0);
+
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.get_burn_call_count(), 1);
+
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.get_burn_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_burn_get_last_call_captures_arguments() {
+        let mock = MockVaultService::new_success();
+        let shares = U256::from(500);
+        let receipt_id = U256::from(42);
+        let owner = test_receiver();
+        let receiver = test_receiver();
+        let receipt_info = test_receipt_info();
+
+        assert!(mock.get_last_burn_call().is_none());
+
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
+
+        let last_call = mock.get_last_burn_call();
+        assert!(last_call.is_some());
+
+        let call = last_call.unwrap();
+        assert_eq!(call.shares, shares);
+        assert_eq!(call.receipt_id, receipt_id);
+        assert_eq!(call.owner, owner);
+        assert_eq!(call.receiver, receiver);
+        assert_eq!(
+            call.receipt_info.tokenization_request_id.0,
+            receipt_info.tokenization_request_id.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_clears_burn_state() {
+        let mock = MockVaultService::new_success();
+        let shares = U256::from(500);
+        let receipt_id = U256::from(42);
+        let owner = test_receiver();
+        let receiver = test_receiver();
+        let receipt_info = test_receipt_info();
+
+        mock.burn_tokens(
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
+        mock.burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.get_burn_call_count(), 2);
+        assert!(mock.get_last_burn_call().is_some());
+
+        mock.reset();
+
+        assert_eq!(mock.get_burn_call_count(), 0);
+        assert!(mock.get_last_burn_call().is_none());
     }
 }

@@ -17,6 +17,11 @@ pub struct AccountLinkResponse {
     pub client_id: ClientId,
 }
 
+#[tracing::instrument(skip(cqrs, pool), fields(
+    email = %request.email.0,
+    account = %request.account.0,
+    wallet = ?request.wallet
+))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
 pub(crate) async fn connect_account(
     cqrs: &rocket::State<crate::AccountCqrs>,

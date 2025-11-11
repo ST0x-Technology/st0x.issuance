@@ -28,6 +28,12 @@ pub(crate) use crate::{Quantity, QuantityConversionError};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenizationRequestId(pub(crate) String);
 
+impl std::fmt::Display for TokenizationRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl TokenizationRequestId {
     #[cfg(test)]
     pub(crate) fn new(value: impl Into<String>) -> Self {
@@ -37,6 +43,12 @@ impl TokenizationRequestId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuerRequestId(pub String);
+
+impl std::fmt::Display for IssuerRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl IssuerRequestId {
     pub(crate) fn new(value: impl Into<String>) -> Self {
@@ -1995,5 +2007,17 @@ mod tests {
         assert!(view_completed_at >= view_minted_at);
         assert!(view_minted_at >= view_journal_confirmed_at);
         assert!(view_journal_confirmed_at >= view_initiated_at);
+    }
+
+    #[test]
+    fn test_issuer_request_id_display() {
+        let id = super::IssuerRequestId::new("iss-123");
+        assert_eq!(format!("{id}"), "iss-123");
+    }
+
+    #[test]
+    fn test_tokenization_request_id_display() {
+        let id = TokenizationRequestId::new("alp-456");
+        assert_eq!(format!("{id}"), "alp-456");
     }
 }

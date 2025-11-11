@@ -20,6 +20,10 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         Self { alpaca_service, cqrs }
     }
 
+    #[tracing::instrument(skip(self, aggregate), fields(
+        issuer_request_id = %issuer_request_id.0,
+        client_id = %client_id.0
+    ))]
     pub(crate) async fn handle_redemption_detected(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -57,7 +61,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             underlying: underlying.clone(),
             token: token.clone(),
             client_id,
-            qty: quantity.clone(),
+            quantity: quantity.clone(),
             network,
             wallet: *wallet,
             tx_hash: *detected_tx_hash,
@@ -68,13 +72,13 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                 info!(
                     issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
-                    request_type = ?response.request_type,
+                    r#type = ?response.r#type,
                     status = ?response.status,
                     created_at = %response.created_at,
                     issuer = %response.issuer,
                     underlying = %response.underlying.0,
                     token = %response.token.0,
-                    qty = %response.qty.0,
+                    quantity = %response.quantity.0,
                     network = %response.network.0,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,

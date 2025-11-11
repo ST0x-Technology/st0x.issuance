@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use super::{
-    Redemption, RedemptionCommand, RedemptionError,
+    Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
 use crate::account::{
@@ -48,6 +48,7 @@ pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
     pool: Pool<Sqlite>,
     redeem_call_manager: Arc<RedeemCallManager<ES>>,
     journal_manager: Arc<JournalManager<ES>>,
+    burn_manager: Arc<BurnManager<ES>>,
 }
 
 impl<ES: EventStore<Redemption> + 'static> RedemptionDetector<ES>
@@ -64,6 +65,7 @@ where
     /// * `pool` - Database connection pool for querying tokenized assets
     /// * `redeem_call_manager` - Manager for handling Alpaca redeem API calls
     /// * `journal_manager` - Manager for polling Alpaca journal status
+    /// * `burn_manager` - Manager for handling token burning after Alpaca journal completes
     pub(crate) fn new(
         config: RedemptionDetectorConfig,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
@@ -71,6 +73,7 @@ where
         pool: Pool<Sqlite>,
         redeem_call_manager: Arc<RedeemCallManager<ES>>,
         journal_manager: Arc<JournalManager<ES>>,
+        burn_manager: Arc<BurnManager<ES>>,
     ) -> Self {
         Self {
             rpc_url: config.rpc_url,
@@ -81,6 +84,7 @@ where
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         }
     }
 
@@ -88,6 +92,7 @@ where
     ///
     /// This method never returns under normal operation. If a WebSocket error occurs,
     /// it logs the error and reconnects after 5 seconds.
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         loop {
             if let Err(e) = self.monitor_once().await {
@@ -138,6 +143,10 @@ where
     ///
     /// Decodes the event, looks up the corresponding tokenized asset, converts the quantity,
     /// and executes a RedemptionCommand::Detect.
+    #[tracing::instrument(skip(self, log), fields(
+        tx_hash = ?log.transaction_hash,
+        block_number = ?log.block_number
+    ))]
     async fn process_transfer_log(
         &self,
         log: &alloy::rpc::types::Log,
@@ -298,13 +307,15 @@ where
         };
 
         let journal_manager = self.journal_manager.clone();
+        let burn_manager = self.burn_manager.clone();
+        let event_store = self.event_store.clone();
         let issuer_request_id_cloned = issuer_request_id.clone();
         let tokenization_request_id_cloned = tokenization_request_id.clone();
 
         tokio::spawn(async move {
             if let Err(e) = journal_manager
                 .handle_alpaca_called(
-                    issuer_request_id_cloned,
+                    issuer_request_id_cloned.clone(),
                     tokenization_request_id_cloned,
                 )
                 .await
@@ -313,6 +324,38 @@ where
                     error = ?e,
                     "handle_alpaca_called (journal polling) failed"
                 );
+                return;
+            }
+
+            let aggregate_ctx = match event_store
+                .load_aggregate(&issuer_request_id_cloned.0)
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    warn!(
+                        issuer_request_id = %issuer_request_id_cloned.0,
+                        error = ?e,
+                        "Failed to load aggregate after journal completion"
+                    );
+                    return;
+                }
+            };
+
+            if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
+                if let Err(e) = burn_manager
+                    .handle_burning_started(
+                        &issuer_request_id_cloned,
+                        aggregate_ctx.aggregate(),
+                    )
+                    .await
+                {
+                    warn!(
+                        issuer_request_id = %issuer_request_id_cloned.0,
+                        error = ?e,
+                        "handle_burning_started failed"
+                    );
+                }
             }
         });
 
@@ -363,7 +406,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        JournalManager, RedeemCallManager, RedemptionDetector,
+        BurnManager, JournalManager, RedeemCallManager, RedemptionDetector,
         RedemptionDetectorConfig, RedemptionMonitorError,
     };
     use crate::alpaca::mock::MockAlpacaService;
@@ -371,6 +414,7 @@ mod tests {
     use crate::mint::IssuerRequestId;
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+    use crate::vault::mock::MockVaultService;
 
     type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -489,8 +533,19 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -505,6 +560,7 @@ mod tests {
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         );
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
@@ -555,8 +611,19 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -571,6 +638,7 @@ mod tests {
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         );
 
         let mut log = create_transfer_log(
@@ -609,8 +677,19 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -625,6 +704,7 @@ mod tests {
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         );
 
         let mut log = create_transfer_log(
@@ -665,8 +745,19 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -681,6 +772,7 @@ mod tests {
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         );
 
         let log = create_transfer_log(
@@ -720,8 +812,19 @@ mod tests {
             alpaca_service.clone(),
             cqrs.clone(),
         ));
-        let journal_manager =
-            Arc::new(JournalManager::new(alpaca_service, cqrs.clone()));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+        ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
@@ -736,6 +839,7 @@ mod tests {
             pool,
             redeem_call_manager,
             journal_manager,
+            burn_manager,
         );
 
         let tx_hash = b256!(

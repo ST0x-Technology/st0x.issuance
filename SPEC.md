@@ -162,7 +162,7 @@ initial request through journal confirmation to on-chain minting and callback.
 
 - `issuer_request_id`: Our unique identifier for this mint
 - `tokenization_request_id`: Alpaca's identifier
-- `qty`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
+- `quantity`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
   details
 - `status`: Current state in the mint lifecycle
 - `tx_hash`, `receipt_id`, `shares_minted`: On-chain transaction details
@@ -170,7 +170,7 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Commands:**
 
-- `InitiateMint { tokenization_request_id, qty, underlying, token, network, client_id, wallet }` -
+- `InitiateMint { tokenization_request_id, quantity, underlying, token, network, client_id, wallet }` -
   Create a new mint request from Alpaca
 - `ConfirmJournal { issuer_request_id }` - Alpaca confirmed shares journal
   transfer
@@ -186,7 +186,7 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Events:**
 
-- `MintInitiated { issuer_request_id, tokenization_request_id, qty, underlying, token, network, client_id, wallet }` -
+- `MintInitiated { issuer_request_id, tokenization_request_id, quantity, underlying, token, network, client_id, wallet }` -
   Mint request created
 - `JournalConfirmed { issuer_request_id }` - Alpaca journal transfer confirmed
 - `JournalRejected { issuer_request_id, reason }` - Alpaca journal transfer
@@ -222,7 +222,7 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `issuer_request_id`: Our unique identifier for this redemption
 - `tokenization_request_id`: Alpaca's identifier (received after calling their
   API)
-- `underlying`, `token`, `wallet`, `qty`: Redemption details
+- `underlying`, `token`, `wallet`, `quantity`: Redemption details
 - `detected_tx_hash`: On-chain transfer that triggered redemption
 - `status`: Current state in the redemption lifecycle
 - `burn_tx_hash`, `receipt_id`, `shares_burned`: Burn transaction details
@@ -230,7 +230,7 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Commands:**
 
-- `DetectRedemption { underlying, token, wallet, qty, tx_hash, block_number }` -
+- `DetectRedemption { underlying, token, wallet, quantity, tx_hash, block_number }` -
   Transfer to redemption wallet detected
 - `RecordAlpacaCall { issuer_request_id, tokenization_request_id }` - Alpaca
   redeem API called successfully
@@ -245,7 +245,7 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Events:**
 
-- `RedemptionDetected { issuer_request_id, underlying, token, wallet, qty, tx_hash, block_number }` -
+- `RedemptionDetected { issuer_request_id, underlying, token, wallet, quantity, tx_hash, block_number }` -
   Transfer to redemption wallet detected
 - `AlpacaCalled { issuer_request_id, tokenization_request_id }` - Alpaca redeem
   endpoint called
@@ -253,7 +253,7 @@ on-chain transfer through calling Alpaca to burning tokens.
   (terminal failure state)
 - `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
   transfer
-- `RedemptionCompleted { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
+- `TokensBurned { issuer_request_id, tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
   On-chain burn succeeded and entire redemption flow completed (terminal success
   state)
 - `BurningFailed { issuer_request_id, error }` - On-chain burn failed (terminal
@@ -261,14 +261,14 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command → Event Mappings:**
 
-| Command                 | Events Produced          | Notes                                                                      |
-| ----------------------- | ------------------------ | -------------------------------------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                      |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                                    |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                          |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - Alpaca journal transfer completed                           |
-| `RecordBurnSuccess`     | `RedemptionCompleted`    | Single event - burn succeeded and redemption fully done (terminal success) |
-| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                              |
+| Command                 | Events Produced          | Notes                                                                 |
+| ----------------------- | ------------------------ | --------------------------------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                 |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                               |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - journal complete, transitions aggregate to Burning     |
+| `RecordBurnSuccess`     | `TokensBurned`           | Single event - burn succeeded, redemption complete (terminal success) |
+| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                         |
 
 ### Account Aggregate
 
@@ -498,6 +498,9 @@ sequenceDiagram
 }
 ```
 
+**Note:** The JSON uses `qty` but our internal code uses `quantity` with
+`#[serde(rename = "qty")]` to maintain API compatibility.
+
 **Our Validation:**
 
 1. Verify `underlying_symbol` is supported
@@ -537,7 +540,8 @@ in Step 2, we'll find out in Step 3.
 ```rust
 struct AlpacaMintRequest {
     tokenization_request_id: TokenizationRequestId,
-    qty: Quantity,
+    #[serde(rename = "qty")]
+    quantity: Quantity,
     #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
@@ -738,7 +742,7 @@ struct StoredMintRequest {
     id: i64,
     tokenization_request_id: TokenizationRequestId,
     issuer_request_id: IssuerRequestId,
-    qty: Quantity,
+    quantity: Quantity,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
     network: Network,
@@ -789,7 +793,7 @@ sequenceDiagram
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordBurnSuccess command<br/>Event: RedemptionCompleted
+    Note right of Us: RecordBurnSuccess command<br/>Event: TokensBurned (final success state)
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -897,14 +901,16 @@ struct AlpacaRedeemRequest {
     #[serde(rename = "token_symbol")]
     token: TokenSymbol,
     client_id: ClientId,
-    qty: Quantity,
+    #[serde(rename = "qty")]
+    quantity: Quantity,
     network: Network,
     #[serde(rename = "wallet_address")]
     wallet: Address,
     tx_hash: B256,
 }
 
-enum RedeemRequestType {
+enum TokenizationRequestType {
+    Mint,
     Redeem,
 }
 
@@ -920,13 +926,15 @@ struct AlpacaRedeemResponse {
     tokenization_request_id: TokenizationRequestId,
     issuer_request_id: IssuerRequestId,
     created_at: DateTime<Utc>,
-    request_type: RedeemRequestType,
+    #[serde(rename = "type")]
+    r#type: TokenizationRequestType,
     status: RedeemRequestStatus,
     #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
     token: TokenSymbol,
-    qty: Quantity,
+    #[serde(rename = "qty")]
+    quantity: Quantity,
     issuer: String,
     network: Network,
     #[serde(rename = "wallet_address")]
@@ -1034,7 +1042,7 @@ struct StoredRedemption {
     token: TokenSymbol,
     wallet: Address,
     tx_hash: B256,
-    qty: Quantity,
+    quantity: Quantity,
     status: RedemptionStatus,
     detected_at: DateTime<Utc>,
     alpaca_called_at: Option<DateTime<Utc>>,
@@ -1198,15 +1206,19 @@ CREATE TABLE tokenized_asset_view (
 
 CREATE INDEX idx_asset_view_enabled ON tokenized_asset_view(json_extract(payload, '$.enabled'));
 
--- Receipt inventory view: built from TokensMinted and TokensBurned events
+-- Receipt inventory view: tracks receipt state transitions (cross-aggregate listening to Mint and Redemption)
 CREATE TABLE receipt_inventory_view (
-    view_id TEXT PRIMARY KEY,         -- receipt_id:vault_address
+    view_id TEXT PRIMARY KEY,         -- issuer_request_id
     version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {receipt_id, vault_address, symbol, initial_amount, current_balance, timestamps}
+    payload JSON NOT NULL             -- State enum: Unavailable | Pending{underlying,token} | Active{receipt_id,underlying,token,initial_amount,current_balance,minted_at} | Depleted{receipt_id,underlying,token,initial_amount,depleted_at}
 );
 
-CREATE INDEX idx_receipt_vault ON receipt_inventory_view(json_extract(payload, '$.vault_address'));
-CREATE INDEX idx_receipt_symbol ON receipt_inventory_view(json_extract(payload, '$.symbol'));
+-- Indexes for both Pending and Active states
+CREATE INDEX idx_receipt_pending_underlying ON receipt_inventory_view(json_extract(payload, '$.Pending.underlying'));
+CREATE INDEX idx_receipt_pending_token ON receipt_inventory_view(json_extract(payload, '$.Pending.token'));
+CREATE INDEX idx_receipt_active_underlying ON receipt_inventory_view(json_extract(payload, '$.Active.underlying'));
+CREATE INDEX idx_receipt_active_token ON receipt_inventory_view(json_extract(payload, '$.Active.token'));
+CREATE INDEX idx_receipt_current_balance ON receipt_inventory_view(json_extract(payload, '$.Active.current_balance'));
 
 -- Inventory snapshot view: periodic inventory metrics for Grafana
 CREATE TABLE inventory_snapshot_view (
@@ -1255,20 +1267,24 @@ events.
 **RedemptionView** - Maintains current state of redemptions:
 
 - Listens to: `RedemptionDetected`, `AlpacaCalled`, `AlpacaJournalCompleted`,
-  `RedemptionCompleted`, `AlpacaCallFailed`, `BurningFailed`
+  `TokensBurned`, `AlpacaCallFailed`, `BurningFailed`
 - Updates: Status, timestamps, transaction details
 - Used for: Tracking redemption progress, status queries
 
-**ReceiptInventoryView** - Tracks receipt balances:
+**ReceiptInventoryView** - Tracks receipt balances through state transitions:
 
-- Listens to: `TokensMinted` (increases balance), `RedemptionCompleted`
-  (decreases balance)
-- Updates: Current balance for each receipt ID
-- Used for: Selecting which receipt to burn from, inventory management
+- Listens to: `MintEvent::Initiated` (captures underlying/token),
+  `MintEvent::TokensMinted` (creates active receipt),
+  `RedemptionEvent::TokensBurned` (decreases balance, transitions to Depleted)
+- State transitions: Unavailable → Pending → Active → Depleted
+- Updates: Accumulates data across event sequence to track each receipt's
+  lifecycle from creation through complete depletion
+- Used for: Selecting which receipt to burn from during redemptions, inventory
+  management
 
 **InventorySnapshotView** - Periodic inventory metrics:
 
-- Listens to: `TokensMinted`, `RedemptionCompleted`
+- Listens to: `TokensMinted`, `TokensBurned`
 - Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
 - Used for: Grafana dashboards, monitoring, alerting
 
@@ -1368,7 +1384,7 @@ fn test_initiate_mint() {
         .given_no_previous_events()
         .when(InitiateMint {
             tokenization_request_id: "alp-123",
-            qty: Decimal::from(100),
+            quantity: Decimal::from(100),
             // ...
         })
         .then_expect_events(vec![

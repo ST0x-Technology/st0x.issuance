@@ -40,6 +40,34 @@ pub(crate) trait VaultService: Send + Sync {
         receiver: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError>;
+
+    /// Burns tokens on-chain by calling the vault's withdraw() function.
+    ///
+    /// # Arguments
+    ///
+    /// * `shares` - Number of shares to burn (18-decimal fixed-point)
+    /// * `receipt_id` - ERC-1155 receipt ID to burn from
+    /// * `owner` - Address of the account whose shares are being burned
+    /// * `receiver` - Address that will receive the underlying assets
+    /// * `receipt_info` - Metadata about the burn operation for on-chain audit trail
+    ///
+    /// # Returns
+    ///
+    /// On success, returns [`BurnResult`] containing transaction hash, receipt ID,
+    /// shares burned, gas used, and block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] if the transaction fails, events are missing,
+    /// or RPC communication fails.
+    async fn burn_tokens(
+        &self,
+        shares: U256,
+        receipt_id: U256,
+        owner: Address,
+        receiver: Address,
+        receipt_info: ReceiptInformation,
+    ) -> Result<BurnResult, VaultError>;
 }
 
 /// Result of a successful on-chain minting operation.
@@ -54,6 +82,24 @@ pub(crate) struct MintResult {
     pub(crate) receipt_id: U256,
     /// Number of ERC-20 shares minted (with 18 decimals)
     pub(crate) shares_minted: U256,
+    /// Gas consumed by the transaction
+    pub(crate) gas_used: u64,
+    /// Block number where the transaction was included
+    pub(crate) block_number: u64,
+}
+
+/// Result of a successful on-chain burning operation.
+///
+/// Contains all transaction details needed to track the burn in the Redemption aggregate
+/// and for audit trails.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BurnResult {
+    /// Transaction hash of the withdraw transaction
+    pub(crate) tx_hash: B256,
+    /// ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of ERC-20 shares burned (with 18 decimals)
+    pub(crate) shares_burned: U256,
     /// Gas consumed by the transaction
     pub(crate) gas_used: u64,
     /// Block number where the transaction was included

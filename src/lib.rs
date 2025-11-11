@@ -1,9 +1,4 @@
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, U256, address};
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::transports::RpcError;
-use clap::Parser;
+use alloy::primitives::{U256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -14,21 +9,21 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::info;
-use url::Url;
 
-use account::{Account, AccountView};
-use mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
-use redemption::{
+use crate::account::{Account, AccountView};
+use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::receipt_inventory::ReceiptInventoryView;
+use crate::redemption::{
     Redemption, RedemptionView,
+    burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
 };
-use tokenized_asset::{
+use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
 };
-use vault::{VaultService, service::RealBlockchainService};
 
 pub mod account;
 pub mod mint;
@@ -37,11 +32,17 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod config;
+pub(crate) mod receipt_inventory;
+pub(crate) mod telemetry;
 pub(crate) mod vault;
 
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
+
+pub use config::{Config, setup_tracing};
+pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
@@ -65,109 +66,27 @@ struct AggregateCqrsSetup {
 }
 
 struct RedemptionManagers {
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "st0x-issuance")]
-#[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
-pub struct Config {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite:data.db",
-        help = "SQLite database URL"
-    )]
-    pub database_url: String,
-
-    #[arg(
-        long,
-        env = "DATABASE_MAX_CONNECTIONS",
-        default_value = "5",
-        help = "Maximum number of database connections in the pool"
-    )]
-    pub database_max_connections: u32,
-
-    #[arg(
-        long,
-        env = "RPC_URL",
-        help = "WebSocket RPC endpoint URL (wss://...)"
-    )]
-    pub rpc_url: Option<Url>,
-
-    #[arg(
-        long,
-        env = "PRIVATE_KEY",
-        help = "Private key for signing blockchain transactions"
-    )]
-    pub private_key: Option<String>,
-
-    #[arg(
-        long,
-        env = "VAULT_ADDRESS",
-        help = "OffchainAssetReceiptVault contract address"
-    )]
-    pub vault_address: Option<Address>,
-
-    #[arg(
-        long,
-        env = "REDEMPTION_WALLET",
-        help = "Address where APs send tokens to initiate redemption"
-    )]
-    pub redemption_wallet: Option<Address>,
-
-    #[command(flatten)]
-    pub alpaca: AlpacaConfig,
-}
-
-impl Config {
-    pub(crate) async fn create_blockchain_service(
-        &self,
-    ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let rpc_url =
-            self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
-
-        let private_key =
-            self.private_key.as_ref().ok_or(ConfigError::MissingPrivateKey)?;
-
-        let vault_address =
-            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
-
-        let signer = private_key.parse::<PrivateKeySigner>()?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(rpc_url.as_str())
-            .await?;
-
-        Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
-    #[error("RPC_URL is required")]
-    MissingRpcUrl,
-    #[error("PRIVATE_KEY is required")]
-    MissingPrivateKey,
-    #[error("VAULT_ADDRESS is required")]
-    MissingVaultAddress,
-    #[error("Invalid private key")]
-    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
-    #[error("Failed to connect to RPC endpoint")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Quantity(pub(crate) Decimal);
+
+impl std::fmt::Display for Quantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
@@ -246,7 +165,7 @@ type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
 /// - Alpaca service configuration is invalid
 pub async fn initialize_rocket(
     config: Config,
-) -> Result<rocket::Rocket<rocket::Build>, Box<dyn std::error::Error>> {
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -263,16 +182,23 @@ pub async fn initialize_rocket(
     let (mint_manager, callback_manager) =
         setup_mint_managers(&config, &mint_cqrs).await?;
 
-    let RedemptionManagers { redeem_call_manager, journal_manager } =
-        setup_redemption_managers(&config, &redemption_cqrs)?;
+    let RedemptionManagers { redeem_call, journal, burn } =
+        setup_redemption_managers(
+            &config,
+            &redemption_cqrs,
+            &redemption_event_store,
+            &pool,
+        )
+        .await?;
 
     spawn_redemption_detector(
         &config,
         redemption_cqrs.clone(),
         redemption_event_store,
         pool.clone(),
-        redeem_call_manager,
-        journal_manager,
+        redeem_call,
+        journal,
+        burn,
     );
 
     Ok(rocket::build()
@@ -298,8 +224,7 @@ pub async fn initialize_rocket(
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
     vault_address: Option<Address>,
-) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), Box<dyn std::error::Error>>
-{
+) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -331,8 +256,20 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
         "mint_view".to_string(),
     ));
     let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+
+    let receipt_inventory_mint_repo =
+        Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+            pool.clone(),
+            "receipt_inventory_view".to_string(),
+        ));
+    let receipt_inventory_mint_query =
+        GenericQuery::new(receipt_inventory_mint_repo);
+
+    let mint_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
+        (),
+    ));
     let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
         SqliteEventRepository::new(pool.clone()),
     ));
@@ -343,9 +280,23 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
             "redemption_view".to_string(),
         ));
     let redemption_query = GenericQuery::new(redemption_view_repo);
+
+    let receipt_inventory_redemption_repo = Arc::new(SqliteViewRepository::<
+        ReceiptInventoryView,
+        Redemption,
+    >::new(
+        pool.clone(),
+        "receipt_inventory_view".to_string(),
+    ));
+    let receipt_inventory_redemption_query =
+        GenericQuery::new(receipt_inventory_redemption_repo);
+
     let redemption_cqrs = Arc::new(sqlite_cqrs(
         pool.clone(),
-        vec![Box::new(redemption_query)],
+        vec![
+            Box::new(redemption_query),
+            Box::new(receipt_inventory_redemption_query),
+        ],
         (),
     ));
     let redemption_event_store =
@@ -369,7 +320,7 @@ async fn setup_mint_managers(
         Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
         Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
     ),
-    Box<dyn std::error::Error>,
+    anyhow::Error,
 > {
     let blockchain_service = config.create_blockchain_service().await?;
     let mint_manager =
@@ -382,19 +333,31 @@ async fn setup_mint_managers(
     Ok((mint_manager, callback_manager))
 }
 
-fn setup_redemption_managers(
+async fn setup_redemption_managers(
     config: &Config,
     redemption_cqrs: &RedemptionCqrs,
-) -> Result<RedemptionManagers, Box<dyn std::error::Error>> {
+    redemption_event_store: &RedemptionEventStore,
+    pool: &Pool<Sqlite>,
+) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
-    let redeem_call_manager = Arc::new(RedeemCallManager::new(
+    let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_cqrs.clone(),
     ));
-    let journal_manager =
-        Arc::new(JournalManager::new(alpaca_service, redemption_cqrs.clone()));
+    let journal = Arc::new(JournalManager::new(
+        alpaca_service,
+        redemption_cqrs.clone(),
+        redemption_event_store.clone(),
+    ));
 
-    Ok(RedemptionManagers { redeem_call_manager, journal_manager })
+    let blockchain_service = config.create_blockchain_service().await?;
+    let burn = Arc::new(BurnManager::new(
+        blockchain_service,
+        pool.clone(),
+        redemption_cqrs.clone(),
+    ));
+
+    Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
 fn spawn_redemption_detector(
@@ -404,13 +367,16 @@ fn spawn_redemption_detector(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<
+    redeem_call: Arc<
         RedeemCallManager<
             PersistedEventStore<SqliteEventRepository, Redemption>,
         >,
     >,
-    journal_manager: Arc<
+    journal: Arc<
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
     if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
@@ -431,8 +397,9 @@ fn spawn_redemption_detector(
             redemption_cqrs,
             redemption_event_store,
             pool,
-            redeem_call_manager,
-            journal_manager,
+            redeem_call,
+            journal,
+            burn,
         );
 
         tokio::spawn(async move {
@@ -444,7 +411,7 @@ fn spawn_redemption_detector(
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
     vault_address: Option<Address>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), anyhow::Error> {
     let assets = vault_address.map_or_else(
         || {
             vec![
@@ -488,7 +455,7 @@ async fn seed_initial_assets(
         match cqrs.execute(underlying, command).await {
             Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
             Err(e) => {
-                return Err(Box::new(e));
+                return Err(e.into());
             }
         }
     }
@@ -501,4 +468,118 @@ async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{U256, uint};
+    use rust_decimal::Decimal;
+
+    use super::{Quantity, QuantityConversionError};
+
+    #[test]
+    fn test_quantity_display() {
+        let quantity = Quantity::new(Decimal::from(100));
+        assert_eq!(format!("{quantity}"), "100");
+
+        let quantity_with_decimals = Quantity::new(Decimal::new(12345, 2));
+        assert_eq!(format!("{quantity_with_decimals}"), "123.45");
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_whole_number() {
+        let quantity = Quantity::new(Decimal::from(100));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(100_000000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_with_decimals() {
+        let quantity = Quantity::new(Decimal::new(12345, 2));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123_450000000000000000_U256));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_zero() {
+        let quantity = Quantity::new(Decimal::ZERO);
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_negative_fails() {
+        let quantity = Quantity::new(Decimal::from(-10));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::NegativeValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_fractional_beyond_18_decimals_fails() {
+        let quantity = Quantity::new(Decimal::new(1, 19));
+        let result = quantity.to_u256_with_18_decimals();
+        assert!(matches!(
+            result,
+            Err(QuantityConversionError::FractionalValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_to_u256_with_18_decimals_max_18_decimals() {
+        let quantity = Quantity::new(Decimal::new(123_456_789_012_345_678, 18));
+        let result = quantity.to_u256_with_18_decimals().unwrap();
+        assert_eq!(result, uint!(123456789012345678_U256));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_whole_number() {
+        let u256_value = uint!(100_000000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::from(100));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_with_decimals() {
+        let u256_value = uint!(123_450000000000000000_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(12345, 2));
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_zero() {
+        let quantity =
+            Quantity::from_u256_with_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(quantity.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_from_u256_with_18_decimals_preserves_precision() {
+        let u256_value = uint!(123456789012345678_U256);
+        let quantity =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(quantity.0, Decimal::new(123_456_789_012_345_678, 18));
+    }
+
+    #[test]
+    fn test_round_trip_conversion() {
+        let original = Quantity::new(Decimal::from(100));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
+
+    #[test]
+    fn test_round_trip_conversion_with_decimals() {
+        let original = Quantity::new(Decimal::new(12345, 2));
+        let u256_value = original.to_u256_with_18_decimals().unwrap();
+        let round_trip =
+            Quantity::from_u256_with_18_decimals(u256_value).unwrap();
+        assert_eq!(original, round_trip);
+    }
 }

@@ -17,6 +17,12 @@ pub(crate) use view::TokenizedAssetView;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnderlyingSymbol(pub(crate) String);
 
+impl std::fmt::Display for UnderlyingSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl UnderlyingSymbol {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -26,6 +32,12 @@ impl UnderlyingSymbol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(crate) String);
 
+impl std::fmt::Display for TokenSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl TokenSymbol {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -34,6 +46,12 @@ impl TokenSymbol {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Network(pub(crate) String);
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl Network {
     pub(crate) fn new(value: impl Into<String>) -> Self {
@@ -84,9 +102,11 @@ impl Aggregate for TokenizedAsset {
                 vault_address,
             } => {
                 if matches!(self, Self::Added { .. }) {
-                    return Err(TokenizedAssetError::AssetAlreadyExists {
-                        underlying: underlying.0,
-                    });
+                    tracing::debug!(
+                        underlying = %underlying.0,
+                        "Asset already added, skipping"
+                    );
+                    return Ok(vec![]);
                 }
 
                 let now = Utc::now();
@@ -125,10 +145,7 @@ impl Aggregate for TokenizedAsset {
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
-pub(crate) enum TokenizedAssetError {
-    #[error("Asset already exists for underlying symbol: {underlying}")]
-    AssetAlreadyExists { underlying: String },
-}
+pub(crate) enum TokenizedAssetError {}
 
 #[cfg(test)]
 mod tests {
@@ -137,7 +154,7 @@ mod tests {
 
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetError, TokenizedAssetEvent, UnderlyingSymbol,
+        TokenizedAssetEvent, UnderlyingSymbol,
     };
 
     type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
@@ -186,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_asset_when_already_added_returns_error() {
+    fn test_add_asset_when_already_added_is_idempotent() {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
@@ -209,9 +226,7 @@ mod tests {
                 network,
                 vault_address,
             })
-            .then_expect_error(TokenizedAssetError::AssetAlreadyExists {
-                underlying: "AAPL".to_string(),
-            });
+            .then_expect_events(vec![]);
     }
 
     #[test]
@@ -253,5 +268,23 @@ mod tests {
             }
             TokenizedAsset::NotAdded => panic!("Expected asset to be added"),
         }
+    }
+
+    #[test]
+    fn test_underlying_symbol_display() {
+        let symbol = UnderlyingSymbol::new("AAPL");
+        assert_eq!(format!("{symbol}"), "AAPL");
+    }
+
+    #[test]
+    fn test_token_symbol_display() {
+        let symbol = TokenSymbol::new("tAAPL");
+        assert_eq!(format!("{symbol}"), "tAAPL");
+    }
+
+    #[test]
+    fn test_network_display() {
+        let network = Network::new("base");
+        assert_eq!(format!("{network}"), "base");
     }
 }

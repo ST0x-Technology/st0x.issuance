@@ -57,6 +57,12 @@ pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientId(pub String);
 
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LinkedAccountStatus {
     Active,
@@ -296,5 +302,11 @@ mod tests {
             }
             Account::NotLinked => panic!("Expected account to be linked"),
         }
+    }
+
+    #[test]
+    fn test_client_id_display() {
+        let id = super::ClientId("client-123".to_string());
+        assert_eq!(format!("{id}"), "client-123");
     }
 }

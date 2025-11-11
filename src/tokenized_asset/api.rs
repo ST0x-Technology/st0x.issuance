@@ -13,6 +13,7 @@ pub(crate) struct TokenizedAssetResponse {
     pub(crate) network: Network,
 }
 
+#[tracing::instrument(skip(pool))]
 #[get("/tokenized-assets")]
 pub(crate) async fn list_tokenized_assets(
     pool: &rocket::State<Pool<Sqlite>>,

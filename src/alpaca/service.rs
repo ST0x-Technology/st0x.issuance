@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, RedeemResponse, RequestsListResponse,
+    RedeemResponse, RequestsListResponse,
 };
 use crate::mint::TokenizationRequestId;
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct AlpacaConfig {
     #[arg(
         long = "alpaca-api-base-url",
@@ -255,7 +255,7 @@ impl AlpacaService for RealAlpacaService {
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<RedeemRequestStatus, AlpacaError> {
+    ) -> Result<super::TokenizationRequest, AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/requests",
             self.base_url.trim_end_matches('/'),
@@ -282,14 +282,18 @@ impl AlpacaService for RealAlpacaService {
                             message: format!("Failed to parse response: {e}"),
                         })?;
 
-                    list_response
+                    let request = list_response
                         .requests
                         .into_iter()
-                        .find(|req| &req.id == tokenization_request_id)
-                        .map(|req| req.status)
+                        .find(|req| {
+                            &req.id == tokenization_request_id
+                                && req.r#type == super::TokenizationRequestType::Redeem
+                        })
                         .ok_or_else(|| AlpacaError::RequestNotFound {
                             tokenization_request_id: tokenization_request_id.0.clone(),
-                        })
+                        })?;
+
+                    Ok(request)
                 }
                 reqwest::StatusCode::UNAUTHORIZED
                 | reqwest::StatusCode::FORBIDDEN => {
@@ -338,7 +342,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use crate::account::ClientId;
-    use crate::alpaca::{RedeemRequestStatus, RedeemRequestType};
+    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
@@ -576,7 +580,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId("client-456".to_string()),
-            qty: Quantity::new(rust_decimal::Decimal::from(100)),
+            quantity: Quantity::new(rust_decimal::Decimal::from(100)),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash: b256!(
@@ -627,7 +631,7 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.tokenization_request_id.0, "tok-456");
         assert_eq!(response.issuer_request_id.0, "red-123");
-        assert!(matches!(response.request_type, RedeemRequestType::Redeem));
+        assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
         mock.assert();
     }
@@ -899,8 +903,8 @@ mod tests {
             service.poll_request_status(&tokenization_request_id).await;
 
         assert!(result.is_ok());
-        let status = result.unwrap();
-        assert!(matches!(status, RedeemRequestStatus::Completed));
+        let request = result.unwrap();
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();
     }
 
@@ -977,7 +981,8 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), RedeemRequestStatus::Completed));
+        let request = result.unwrap();
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();
     }
 
@@ -1200,6 +1205,77 @@ mod tests {
         let _ = service
             .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_request_status_skips_legacy_mint_entries() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests");
+            then.status(200).json_body(serde_json::json!({
+                "requests": [
+                    {
+                        "tokenization_request_id": "tok-mint-legacy",
+                        "issuer_request_id": "mint-123",
+                        "created_at": "2025-09-12T17:28:48.642437-04:00",
+                        "type": "mint",
+                        "status": "completed",
+                        "underlying_symbol": "AAPL",
+                        "token_symbol": "tAAPL",
+                        "qty": "100",
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                        "fees": "0.0"
+                    },
+                    {
+                        "tokenization_request_id": "tok-redeem-valid",
+                        "issuer_request_id": "red-456",
+                        "created_at": "2025-09-12T17:30:00.000000-04:00",
+                        "type": "redeem",
+                        "status": "pending",
+                        "underlying_symbol": "TSLA",
+                        "token_symbol": "tTSLA",
+                        "qty": "50",
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
+                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "fees": "0.0"
+                    }
+                ]
+            }));
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let result = service
+            .poll_request_status(&TokenizationRequestId::new("tok-mint-legacy"))
+            .await;
+
+        match result {
+            Err(AlpacaError::RequestNotFound {
+                tokenization_request_id: id,
+            }) => {
+                assert_eq!(id, "tok-mint-legacy");
+            }
+            _ => panic!(
+                "Expected RequestNotFound for legacy mint entry, got {result:?}"
+            ),
+        }
 
         mock.assert();
     }
