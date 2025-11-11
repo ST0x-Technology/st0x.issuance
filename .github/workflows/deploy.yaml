@@ -70,7 +70,7 @@ jobs:
             log_exec() {
               echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" | tee -a "${DEPLOY_LOG}"
               "$@" 2>&1 | tee -a "${DEPLOY_LOG}"
-              return ${PIPEFAIL[0]}
+              return ${PIPESTATUS[0]}
             }
 
             perform_rollback() {
