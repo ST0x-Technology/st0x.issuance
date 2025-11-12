@@ -88,28 +88,28 @@ struct Env {
         env = "RPC_URL",
         help = "WebSocket RPC endpoint URL (wss://...)"
     )]
-    rpc_url: Option<Url>,
+    rpc_url: Url,
 
     #[arg(
         long,
         env = "PRIVATE_KEY",
         help = "Private key for signing blockchain transactions"
     )]
-    private_key: Option<B256>,
+    private_key: B256,
 
     #[arg(
         long,
         env = "VAULT_ADDRESS",
         help = "OffchainAssetReceiptVault contract address"
     )]
-    vault_address: Option<Address>,
+    vault: Address,
 
     #[arg(
         long,
-        env = "REDEMPTION_WALLET",
-        help = "Address where APs send tokens to initiate redemption"
+        env = "BOT_WALLET",
+        help = "Bot's wallet address that controls minting and redemption"
     )]
-    redemption_wallet: Option<Address>,
+    bot_wallet: Address,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -131,8 +131,8 @@ impl Env {
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
             private_key: self.private_key,
-            vault_address: self.vault_address,
-            redemption_wallet: self.redemption_wallet,
+            vault: self.vault,
+            bot_wallet: self.bot_wallet,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
@@ -144,10 +144,10 @@ impl Env {
 pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
-    pub rpc_url: Option<Url>,
-    pub private_key: Option<B256>,
-    pub vault_address: Option<Address>,
-    pub redemption_wallet: Option<Address>,
+    pub rpc_url: Url,
+    pub private_key: B256,
+    pub vault: Address,
+    pub bot_wallet: Address,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
@@ -166,35 +166,20 @@ impl Config {
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let rpc_url =
-            self.rpc_url.as_ref().ok_or(ConfigError::MissingRpcUrl)?;
-
-        let private_key =
-            self.private_key.ok_or(ConfigError::MissingPrivateKey)?;
-
-        let vault_address =
-            self.vault_address.ok_or(ConfigError::MissingVaultAddress)?;
-
-        let signer = PrivateKeySigner::from_bytes(&private_key)?;
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
             .wallet(wallet)
-            .connect(rpc_url.as_str())
+            .connect(self.rpc_url.as_str())
             .await?;
 
-        Ok(Arc::new(RealBlockchainService::new(provider, vault_address)))
+        Ok(Arc::new(RealBlockchainService::new(provider, self.vault)))
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("RPC_URL is required")]
-    MissingRpcUrl,
-    #[error("PRIVATE_KEY is required")]
-    MissingPrivateKey,
-    #[error("VAULT_ADDRESS is required")]
-    MissingVaultAddress,
     #[error("Invalid private key")]
     InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
     #[error("Invalid private key format")]

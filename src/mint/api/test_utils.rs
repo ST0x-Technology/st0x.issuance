@@ -125,13 +125,13 @@ pub(super) async fn setup_with_account_and_asset(
     let underlying = UnderlyingSymbol::new("AAPL");
     let token = TokenSymbol::new("tAAPL");
     let network = Network::new("base");
-    let vault_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+    let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
     let asset_cmd = TokenizedAssetCommand::Add {
         underlying: underlying.clone(),
         token: token.clone(),
         network: network.clone(),
-        vault_address,
+        vault,
     };
 
     tokenized_asset_cqrs

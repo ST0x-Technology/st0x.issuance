@@ -262,7 +262,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
-    let redemption_wallet = evm.wallet_address;
+    let bot_wallet = evm.wallet_address;
     let user_private_key = b256!(
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
     );
@@ -276,10 +276,10 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
-        rpc_url: Some(Url::parse(&evm.endpoint)?),
-        private_key: Some(evm.private_key),
-        vault_address: Some(evm.vault_address),
-        redemption_wallet: Some(redemption_wallet),
+        rpc_url: Url::parse(&evm.endpoint)?,
+        private_key: evm.private_key,
+        vault: evm.vault_address,
+        bot_wallet,
         log_level: st0x_issuance::LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {
@@ -296,7 +296,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
     evm.grant_deposit_role(user_wallet).await?;
-    evm.grant_withdraw_role(redemption_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
     evm.grant_certify_role(evm.wallet_address).await?;
     evm.certify_vault(U256::MAX).await?;
 
@@ -315,19 +315,19 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     vault
-        .transfer(redemption_wallet, shares_minted)
+        .transfer(bot_wallet, shares_minted)
         .send()
         .await?
         .get_receipt()
         .await?;
 
     assert_eq!(
-        vault.balanceOf(redemption_wallet).call().await?,
+        vault.balanceOf(bot_wallet).call().await?,
         shares_minted,
-        "Shares transfer to redemption wallet failed"
+        "Shares transfer to bot wallet failed"
     );
 
-    wait_for_burn(&vault, redemption_wallet).await?;
+    wait_for_burn(&vault, bot_wallet).await?;
 
     redeem_mock.assert();
     poll_mock.assert();

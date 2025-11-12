@@ -157,12 +157,12 @@ async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {
         ),
     ];
 
-    for (underlying, token, network, vault_address) in assets {
+    for (underlying, token, network, vault) in assets {
         let command = TokenizedAssetCommand::Add {
             underlying: UnderlyingSymbol::new(underlying),
             token: TokenSymbol::new(token),
             network: Network::new(network),
-            vault_address,
+            vault,
         };
 
         cqrs.execute(underlying, command)

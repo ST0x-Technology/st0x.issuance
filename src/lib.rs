@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{Address, U256};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -170,7 +170,7 @@ pub async fn initialize_rocket(
     sqlx::migrate!("./migrations").run(&pool).await?;
 
     let (account_cqrs, tokenized_asset_cqrs) =
-        setup_basic_cqrs(&pool, config.vault_address).await?;
+        setup_basic_cqrs(&pool, config.vault).await?;
 
     let AggregateCqrsSetup {
         mint_cqrs,
@@ -223,7 +223,7 @@ pub async fn initialize_rocket(
 
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
-    vault_address: Option<Address>,
+    vault: Address,
 ) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
@@ -245,7 +245,7 @@ async fn setup_basic_cqrs(
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    seed_initial_assets(&tokenized_asset_cqrs, vault_address).await?;
+    seed_initial_assets(&tokenized_asset_cqrs, vault).await?;
 
     Ok((account_cqrs, tokenized_asset_cqrs))
 }
@@ -355,6 +355,7 @@ async fn setup_redemption_managers(
         blockchain_service,
         pool.clone(),
         redemption_cqrs.clone(),
+        config.bot_wallet,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -379,77 +380,48 @@ fn spawn_redemption_detector(
         BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
-    if let (Some(rpc_url), Some(redemption_wallet), Some(vault_address)) =
-        (&config.rpc_url, config.redemption_wallet, config.vault_address)
-    {
-        info!(
-            "WebSocket monitoring task spawned for redemption wallet {redemption_wallet}"
-        );
+    info!(
+        "WebSocket monitoring task spawned for bot wallet {}",
+        config.bot_wallet
+    );
 
-        let detector_config = RedemptionDetectorConfig {
-            rpc_url: rpc_url.clone(),
-            vault_address,
-            redemption_wallet,
-        };
+    let detector_config = RedemptionDetectorConfig {
+        rpc_url: config.rpc_url.clone(),
+        vault: config.vault,
+        bot_wallet: config.bot_wallet,
+    };
 
-        let detector = RedemptionDetector::new(
-            detector_config,
-            redemption_cqrs,
-            redemption_event_store,
-            pool,
-            redeem_call,
-            journal,
-            burn,
-        );
+    let detector = RedemptionDetector::new(
+        detector_config,
+        redemption_cqrs,
+        redemption_event_store,
+        pool,
+        redeem_call,
+        journal,
+        burn,
+    );
 
-        tokio::spawn(async move {
-            detector.run().await;
-        });
-    }
+    tokio::spawn(async move {
+        detector.run().await;
+    });
 }
 
 async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
-    vault_address: Option<Address>,
+    vault: Address,
 ) -> Result<(), anyhow::Error> {
-    let assets = vault_address.map_or_else(
-        || {
-            vec![
-                (
-                    "AAPL",
-                    "tAAPL",
-                    "base",
-                    address!("0x1234567890abcdef1234567890abcdef12345678"),
-                ),
-                (
-                    "TSLA",
-                    "tTSLA",
-                    "base",
-                    address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-                ),
-                (
-                    "NVDA",
-                    "tNVDA",
-                    "base",
-                    address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"),
-                ),
-            ]
-        },
-        |addr| {
-            vec![
-                ("AAPL", "tAAPL", "base", addr),
-                ("TSLA", "tTSLA", "base", addr),
-                ("NVDA", "tNVDA", "base", addr),
-            ]
-        },
-    );
+    let assets = vec![
+        ("AAPL", "tAAPL", "base", vault),
+        ("TSLA", "tTSLA", "base", vault),
+        ("NVDA", "tNVDA", "base", vault),
+    ];
 
-    for (underlying, token, network, vault_address) in assets {
+    for (underlying, token, network, vault) in assets {
         let command = TokenizedAssetCommand::Add {
             underlying: UnderlyingSymbol::new(underlying),
             token: TokenSymbol::new(token),
             network: Network::new(network),
-            vault_address,
+            vault,
         };
 
         match cqrs.execute(underlying, command).await {
