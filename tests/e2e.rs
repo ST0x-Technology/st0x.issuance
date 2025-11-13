@@ -133,7 +133,7 @@ async fn perform_mint_flow(
     assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
 
     let user_private_key = b256!(
-        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
     );
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet_instance = EthereumWallet::from(user_signer);
@@ -263,8 +263,9 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let mock_alpaca = MockServer::start();
 
     let bot_wallet = evm.wallet_address;
+    // Use second Anvil test account for user (first account is bot)
     let user_private_key = b256!(
-        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
     );
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet = user_signer.address();
