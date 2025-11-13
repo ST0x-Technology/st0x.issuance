@@ -341,8 +341,10 @@ instead.
 3. Alpaca journals shares from AP to our custodian account
 4. Alpaca confirms journal → we receive `/inkind/issuance/confirm` (Command:
    `ConfirmJournal`, Events: `JournalConfirmed`, `MintingStarted`)
-5. We mint tokens on-chain via `vault.deposit()` (Command: `RecordMintSuccess`,
-   Event: `TokensMinted`)
+5. We mint tokens on-chain via `vault.multicall()` which atomically executes:
+   - `deposit()` - Mints receipts + shares to bot's wallet
+   - `transfer()` - Transfers only shares to user's wallet (Command:
+     `RecordMintSuccess`, Event: `TokensMinted`)
 6. We call Alpaca's callback endpoint (Command: `RecordCallback`, Events:
    `CallbackSent`, `MintCompleted`)
 
