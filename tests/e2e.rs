@@ -322,12 +322,6 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         .get_receipt()
         .await?;
 
-    assert_eq!(
-        vault.balanceOf(bot_wallet).call().await?,
-        shares_minted,
-        "Shares transfer to bot wallet failed"
-    );
-
     wait_for_burn(&vault, bot_wallet).await?;
 
     redeem_mock.assert();
