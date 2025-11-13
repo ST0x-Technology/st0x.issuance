@@ -411,11 +411,7 @@ async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
     vault: Address,
 ) -> Result<(), anyhow::Error> {
-    let assets = vec![
-        ("AAPL", "tAAPL", "base", vault),
-        ("TSLA", "tTSLA", "base", vault),
-        ("NVDA", "tNVDA", "base", vault),
-    ];
+    let assets = vec![("AAPL", "tAAPL", "base", vault)];
 
     for (underlying, token, network, vault) in assets {
         let command = TokenizedAssetCommand::Add {
