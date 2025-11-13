@@ -50,14 +50,14 @@ mint-and-transfer.
 async fn mint_and_transfer_shares(
     &self,
     assets: U256,
-    bot_wallet: Address,
-    user_wallet: Address,
+    bot: Address,
+    user: Address,
     receipt_info: ReceiptInformation,
 ) -> Result<MintResult, VaultError>;
 
 // RealBlockchainService implementation
-let deposit_call = vault.deposit(assets, bot_wallet, share_ratio, receipt_info_bytes).calldata();
-let transfer_call = vault.transfer(user_wallet, assets).calldata();
+let deposit_call = vault.deposit(assets, bot, share_ratio, receipt_info_bytes).calldata();
+let transfer_call = vault.transfer(user, assets).calldata();
 let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.get_receipt().await?;
 // Parse Deposit event to get receipt_id and shares_minted
 ```
@@ -75,13 +75,13 @@ let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.g
 
 **Subtasks:**
 
-- [x] Add `bot_wallet: Address` field to `MintManager` struct
-- [x] Update `MintManager::new()` constructor to accept `bot_wallet` parameter
+- [x] Add `bot: Address` field to `MintManager` struct
+- [x] Update `MintManager::new()` constructor to accept `bot` parameter
 - [x] Update `handle_journal_confirmed()` to call `mint_and_transfer_shares()`
   - [x] Change from `mint_tokens(assets, *wallet, receipt_info)`
   - [x] Change to
-        `mint_and_transfer_shares(assets, self.bot_wallet, *wallet, receipt_info)`
-- [x] Update `src/lib.rs` to pass `config.bot_wallet` when creating MintManager
+        `mint_and_transfer_shares(assets, self.bot, *wallet, receipt_info)`
+- [x] Update `src/lib.rs` to pass `config.bot` when creating MintManager
 
 **Error handling:**
 
@@ -93,7 +93,7 @@ let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.g
 
 ## Task 3. Update Configuration Documentation
 
-**Goal:** Document that `bot_wallet` is the bot's wallet that holds receipts.
+**Goal:** Document that `bot` is the bot's wallet that holds receipts.
 
 **Files to modify:**
 
@@ -102,7 +102,7 @@ let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.g
 
 **Subtasks:**
 
-- [x] Add doc comment to `bot_wallet` field in Config explaining:
+- [x] Add doc comment to `bot` field in Config explaining:
   - [x] Holds all ERC1155 receipts from minting operations
   - [x] Receives ERC20 shares from users initiating redemptions
   - [x] Performs burns (requires both shares + receipts)
@@ -127,11 +127,12 @@ changes needed).
 
 **Subtasks:**
 
-- [ ] Verify BurnManager has `bot_wallet: Address` field
-- [ ] Verify it uses `self.bot_wallet` as owner when burning
-- [ ] Verify owner will have both shares (from user transfer) + receipts (from
+- [x] Verify BurnManager has `bot_wallet: Address` field (uses `bot_wallet`
+      naming for clarity)
+- [x] Verify it uses `self.bot_wallet` as owner when burning
+- [x] Verify owner will have both shares (from user transfer) + receipts (from
       mint)
-- [ ] Confirm no code changes are needed
+- [x] Confirm no code changes are needed
 
 ---
 
@@ -145,13 +146,14 @@ changes needed).
 
 **Subtasks:**
 
-- [ ] Run `cargo test -q test_tokenization_flow`
-- [ ] Verify user receives shares after mint (from multicall transfer)
-- [ ] Verify bot holds receipts (from multicall deposit)
-- [ ] Verify user can transfer shares back to bot for redemption
-- [ ] Verify bot successfully burns (has both shares + receipts)
-- [ ] Consider adding unit tests for `mint_and_transfer_shares()` encoding
-- [ ] Consider adding test to verify multicall calldata is correct
+- [x] Run `cargo test -q test_tokenization_flow`
+- [x] Verify user receives shares after mint (from multicall transfer)
+- [x] Verify bot holds receipts (from multicall deposit)
+- [x] Verify user can transfer shares back to bot for redemption
+- [x] Verify bot successfully burns (has both shares + receipts)
+- [x] Add unit test verifying exact transfer calldata encoding
+- [x] Add unit test verifying exact deposit calldata encoding
+- [x] Add unit test verifying exact multicall calldata encoding
 
 ---
 
@@ -167,13 +169,13 @@ Follow this sequence to minimize risk:
 
 ## Success Criteria
 
-- [ ] E2E test passes
-- [ ] User receives shares after mint (via multicall)
-- [ ] Bot holds receipts after mint (via multicall)
-- [ ] Single transaction for mint-and-transfer (truly atomic)
-- [ ] Redemption burn succeeds (bot has shares + receipts)
-- [ ] All existing tests pass
-- [ ] Clippy and fmt checks pass
+- [x] E2E test passes
+- [x] User receives shares after mint (via multicall)
+- [x] Bot holds receipts after mint (via multicall)
+- [x] Single transaction for mint-and-transfer (truly atomic)
+- [x] Redemption burn succeeds (bot has shares + receipts)
+- [x] All existing tests pass
+- [x] Clippy and fmt checks pass
 
 ## Key Assumptions
 

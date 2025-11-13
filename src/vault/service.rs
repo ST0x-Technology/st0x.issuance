@@ -180,7 +180,7 @@ mod tests {
     };
     use alloy::network::EthereumWallet;
     use alloy::primitives::{
-        Address, Bloom, Bytes, IntoLogData, U256, address, fixed_bytes,
+        Address, Bloom, Bytes, IntoLogData, U256, address, bytes, fixed_bytes,
     };
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
@@ -677,6 +677,85 @@ mod tests {
         assert!(
             matches!(err, VaultError::EventNotFound { .. }),
             "Expected EventNotFound but got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mint_and_transfer_shares_produces_exact_calldata() {
+        let vault_address = test_vault_address();
+        let assets = U256::from(1000);
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let user = address!("0x2222222222222222222222222222222222222222");
+
+        use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+        use crate::tokenized_asset::UnderlyingSymbol;
+        use crate::vault::OperationType;
+        use chrono::Utc;
+        use rust_decimal::Decimal;
+
+        let fixed_timestamp =
+            chrono::DateTime::parse_from_rfc3339("2025-01-15T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            issuer_request_id: IssuerRequestId::new("iss-456"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity::new(Decimal::from(100)),
+            operation_type: OperationType::Mint,
+            timestamp: fixed_timestamp,
+            notes: None,
+        };
+
+        let signer = PrivateKeySigner::random();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect_anvil();
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+
+        let receipt_info_bytes =
+            Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
+        let share_ratio = U256::from(10).pow(U256::from(18));
+
+        let deposit_call = vault
+            .deposit(assets, bot, share_ratio, receipt_info_bytes)
+            .calldata()
+            .clone();
+
+        let transfer_call = vault.transfer(user, assets).calldata().clone();
+
+        let multicall_calldata = vault
+            .multicall(vec![deposit_call.clone(), transfer_call.clone()])
+            .calldata()
+            .clone();
+
+        let expected_transfer = bytes!(
+            "0xa9059cbb000000000000000000000000222222222222222222222222222222222222222200000000000000000000000000000000000000000000000000000000000003e8"
+        );
+
+        assert_eq!(
+            transfer_call.as_ref(),
+            expected_transfer.as_ref(),
+            "Transfer calldata mismatch"
+        );
+
+        assert!(
+            !deposit_call.is_empty()
+                && deposit_call[0..4] == [0x14, 0x23, 0xfe, 0xba],
+            "Deposit should start with correct function selector"
+        );
+
+        assert!(
+            !multicall_calldata.is_empty()
+                && multicall_calldata[0..4] == [0xac, 0x96, 0x50, 0xd8],
+            "Multicall should start with correct function selector"
+        );
+
+        assert!(
+            multicall_calldata.len() > deposit_call.len() + transfer_call.len(),
+            "Multicall should contain both calls"
         );
     }
 }
