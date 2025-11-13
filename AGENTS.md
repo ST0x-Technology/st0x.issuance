@@ -621,15 +621,22 @@ regulatory violations, and complete system failure.**
 
 ### CRITICAL: Security and Secrets Management
 
-**NEVER read files containing secrets, credentials, or sensitive configuration
-without explicit user permission.**
+**⚠️ ABSOLUTE PROHIBITION: NEVER, UNDER ANY CIRCUMSTANCES, READ FILES CONTAINING
+CREDENTIALS OR SECRETS WITHOUT EXPLICIT USER PERMISSION ⚠️**
+
+**This is a ZERO-TOLERANCE policy. Violations are deployment-blocking.**
 
 This project handles financial transactions and sensitive API credentials.
 Unauthorized access to secrets can lead to:
 
-- Account compromise
-- Financial losses
+- Account compromise and theft
+- Financial losses (potentially millions of dollars)
 - Security breaches
+- Regulatory violations
+- Complete system compromise
+
+**DO NOT attempt to "help" by reading credential files. DO NOT make exceptions.
+DO NOT read these files even if you think it would solve the user's problem.**
 
 #### Files That Require Explicit Permission
 
