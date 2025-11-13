@@ -326,7 +326,7 @@ async fn setup_mint_managers(
     let mint_manager = Arc::new(MintManager::new(
         blockchain_service,
         mint_cqrs.clone(),
-        config.bot_wallet,
+        config.bot,
     ));
 
     let alpaca_service = config.alpaca.service()?;
@@ -358,7 +358,7 @@ async fn setup_redemption_managers(
         blockchain_service,
         pool.clone(),
         redemption_cqrs.clone(),
-        config.bot_wallet,
+        config.bot,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -383,15 +383,12 @@ fn spawn_redemption_detector(
         BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
-    info!(
-        "WebSocket monitoring task spawned for bot wallet {}",
-        config.bot_wallet
-    );
+    info!("WebSocket monitoring task spawned for bot wallet {}", config.bot);
 
     let detector_config = RedemptionDetectorConfig {
         rpc_url: config.rpc_url.clone(),
         vault: config.vault,
-        bot_wallet: config.bot_wallet,
+        bot_wallet: config.bot,
     };
 
     let detector = RedemptionDetector::new(

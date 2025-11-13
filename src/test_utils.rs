@@ -111,11 +111,11 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
     seed_test_assets(&tokenized_asset_cqrs).await;
 
     // Create managers with mock services
-    let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let mint_manager = Arc::new(MintManager::new(
         Arc::new(MockVaultService::new_success()),
         mint_cqrs.clone(),
-        bot_wallet,
+        bot,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(

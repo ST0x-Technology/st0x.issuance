@@ -130,8 +130,8 @@ impl VaultService for MockVaultService {
     async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        bot_wallet: Address,
-        _user_wallet: Address,
+        bot: Address,
+        _user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         if self.mint_delay_ms > 0 {
@@ -147,7 +147,7 @@ impl VaultService for MockVaultService {
         {
             *self.last_call.lock().unwrap() = Some(MintTokensCall {
                 assets,
-                receiver: bot_wallet,
+                receiver: bot,
                 receipt_info: receipt_info.clone(),
             });
         }

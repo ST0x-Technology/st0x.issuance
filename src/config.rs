@@ -109,7 +109,7 @@ struct Env {
         env = "BOT_WALLET",
         help = "Bot's wallet address that controls minting and redemption"
     )]
-    bot_wallet: Address,
+    bot: Address,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -132,7 +132,7 @@ impl Env {
             rpc_url: self.rpc_url,
             private_key: self.private_key,
             vault: self.vault,
-            bot_wallet: self.bot_wallet,
+            bot: self.bot,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
@@ -147,7 +147,7 @@ pub struct Config {
     pub rpc_url: Url,
     pub private_key: B256,
     pub vault: Address,
-    pub bot_wallet: Address,
+    pub bot: Address,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,

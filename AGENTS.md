@@ -365,6 +365,8 @@ Environment variables (can be set via `.env` file):
 - `WS_RPC_URL`: WebSocket RPC endpoint for blockchain monitoring
 - `CHAIN_ID`: Chain ID (e.g., 8453 for Base)
 - `VAULT_ADDRESS`: OffchainAssetReceiptVault contract address
+- `PRIVATE_KEY`: Bot's private key for signing blockchain transactions
+- `BOT_WALLET_ADDRESS`: Bot's wallet address (derived from private key)
 - `REDEMPTION_WALLET_ADDRESS`: Address where APs send tokens to redeem
 - Alpaca API credentials and endpoints
 - Server configuration (host, port, API key)

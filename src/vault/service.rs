@@ -36,8 +36,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        bot_wallet: Address,
-        user_wallet: Address,
+        bot: Address,
+        user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         let receipt_info_bytes =
@@ -54,16 +54,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         let share_ratio = U256::from(10).pow(U256::from(18));
 
-        // Encode deposit call - mints shares + receipts to bot_wallet
+        // Encode deposit call - mints shares + receipts to bot
         let deposit_call = vault
-            .deposit(assets, bot_wallet, share_ratio, receipt_info_bytes)
+            .deposit(assets, bot, share_ratio, receipt_info_bytes)
             .calldata()
             .clone();
 
         // Encode transfer call - transfers shares from bot to user
         // Due to 1:1 ratio (1e18), shares_minted == assets, so we can pre-calculate
-        let transfer_call =
-            vault.transfer(user_wallet, assets).calldata().clone();
+        let transfer_call = vault.transfer(user, assets).calldata().clone();
 
         // Execute both operations atomically via multicall
         let receipt = vault

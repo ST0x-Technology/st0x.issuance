@@ -279,7 +279,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
-        bot_wallet,
+        bot: bot_wallet,
         log_level: st0x_issuance::LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {

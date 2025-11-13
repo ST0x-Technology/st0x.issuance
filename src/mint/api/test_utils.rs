@@ -24,9 +24,9 @@ pub(super) fn create_test_mint_manager(
 ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
     let blockchain_service =
         Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
-    let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-    Arc::new(MintManager::new(blockchain_service, mint_cqrs, bot_wallet))
+    Arc::new(MintManager::new(blockchain_service, mint_cqrs, bot))
 }
 
 pub(super) fn create_test_callback_manager(

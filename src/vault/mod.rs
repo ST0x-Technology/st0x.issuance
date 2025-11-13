@@ -28,8 +28,8 @@ pub(crate) trait VaultService: Send + Sync {
     /// # Arguments
     ///
     /// * `assets` - Amount of assets to deposit (18-decimal fixed-point)
-    /// * `bot_wallet` - Bot's wallet that will hold the receipts
-    /// * `user_wallet` - User's wallet that will receive the shares
+    /// * `bot` - Bot's address that will hold the receipts
+    /// * `user` - User's address that will receive the shares
     /// * `receipt_info` - Metadata about the mint operation for on-chain audit trail
     ///
     /// # Returns
@@ -50,8 +50,8 @@ pub(crate) trait VaultService: Send + Sync {
     async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        bot_wallet: Address,
-        user_wallet: Address,
+        bot: Address,
+        user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError>;
 

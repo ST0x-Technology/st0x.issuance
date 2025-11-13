@@ -102,17 +102,17 @@ let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.g
 
 **Subtasks:**
 
-- [ ] Add doc comment to `bot_wallet` field in Config explaining:
-  - [ ] Holds all ERC1155 receipts from minting operations
-  - [ ] Receives ERC20 shares from users initiating redemptions
-  - [ ] Performs burns (requires both shares + receipts)
-  - [ ] Same wallet controlled by `private_key`
-  - [ ] Multicall atomically mints receipts to bot while transferring shares to
+- [x] Add doc comment to `bot_wallet` field in Config explaining:
+  - [x] Holds all ERC1155 receipts from minting operations
+  - [x] Receives ERC20 shares from users initiating redemptions
+  - [x] Performs burns (requires both shares + receipts)
+  - [x] Same wallet controlled by `private_key`
+  - [x] Multicall atomically mints receipts to bot while transferring shares to
         users
-- [ ] Update AGENTS.md configuration section to explain:
-  - [ ] Receipt custody model
-  - [ ] Why bot holds receipts
-  - [ ] How multicall ensures atomicity
+- [x] Update AGENTS.md configuration section to explain:
+  - [x] Receipt custody model
+  - [x] Why bot holds receipts
+  - [x] How multicall ensures atomicity
 
 ---
 
