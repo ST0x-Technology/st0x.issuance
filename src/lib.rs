@@ -201,7 +201,11 @@ pub async fn initialize_rocket(
         burn,
     );
 
-    Ok(rocket::build()
+    let figment = rocket::Config::figment()
+        .merge(("address", "0.0.0.0"))
+        .merge(("port", 8000));
+
+    Ok(rocket::custom(figment)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
