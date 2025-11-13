@@ -167,4 +167,7 @@ pub(crate) enum VaultError {
     /// Expected event (e.g., Deposit) not found in transaction logs
     #[error("Event not found in transaction: {tx_hash}")]
     EventNotFound { tx_hash: String },
+    /// Contract call error
+    #[error(transparent)]
+    Contract(#[from] alloy::contract::Error),
 }
