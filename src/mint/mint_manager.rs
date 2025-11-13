@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy::primitives::Address;
 use chrono::Utc;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use tracing::{info, warn};
@@ -24,6 +25,7 @@ use super::{
 pub(crate) struct MintManager<ES: EventStore<Mint>> {
     blockchain_service: Arc<dyn VaultService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
+    bot_wallet: Address,
 }
 
 impl<ES: EventStore<Mint>> MintManager<ES> {
@@ -33,11 +35,13 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     ///
     /// * `blockchain_service` - Service for on-chain minting operations
     /// * `cqrs` - CQRS framework for executing commands on the Mint aggregate
+    /// * `bot_wallet` - Bot's wallet address that receives ERC1155 receipts
     pub(crate) const fn new(
         blockchain_service: Arc<dyn VaultService>,
         cqrs: Arc<CqrsFramework<Mint, ES>>,
+        bot_wallet: Address,
     ) -> Self {
-        Self { blockchain_service, cqrs }
+        Self { blockchain_service, cqrs, bot_wallet }
     }
 
     /// Handles a JournalConfirmed event by minting tokens on-chain.
@@ -111,7 +115,12 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
 
         match self
             .blockchain_service
-            .mint_tokens(assets, *wallet, receipt_info)
+            .mint_and_transfer_shares(
+                assets,
+                self.bot_wallet,
+                *wallet,
+                receipt_info,
+            )
             .await
         {
             Ok(result) => {
@@ -282,7 +291,9 @@ mod tests {
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = MintManager::new(blockchain_service, cqrs.clone());
+        let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let manager =
+            MintManager::new(blockchain_service, cqrs.clone(), bot_wallet);
 
         let issuer_request_id = IssuerRequestId::new("iss-success-123");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -316,7 +327,9 @@ mod tests {
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = MintManager::new(blockchain_service, cqrs.clone());
+        let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let manager =
+            MintManager::new(blockchain_service, cqrs.clone(), bot_wallet);
 
         let issuer_request_id = IssuerRequestId::new("iss-failure-456");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -355,7 +368,9 @@ mod tests {
         let (cqrs, store) = setup_test_cqrs();
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = MintManager::new(blockchain_service, cqrs.clone());
+        let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let manager =
+            MintManager::new(blockchain_service, cqrs.clone(), bot_wallet);
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");

@@ -323,8 +323,11 @@ async fn setup_mint_managers(
     anyhow::Error,
 > {
     let blockchain_service = config.create_blockchain_service().await?;
-    let mint_manager =
-        Arc::new(MintManager::new(blockchain_service, mint_cqrs.clone()));
+    let mint_manager = Arc::new(MintManager::new(
+        blockchain_service,
+        mint_cqrs.clone(),
+        config.bot_wallet,
+    ));
 
     let alpaca_service = config.alpaca.service()?;
     let callback_manager =

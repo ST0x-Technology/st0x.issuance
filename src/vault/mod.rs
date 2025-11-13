@@ -17,12 +17,19 @@ pub(crate) mod service;
 /// services or mocks for testing.
 #[async_trait]
 pub(crate) trait VaultService: Send + Sync {
-    /// Mints tokens on-chain by calling the vault's deposit() function.
+    /// Atomically mints tokens and transfers shares using the vault's multicall() function.
+    ///
+    /// This method implements the receipt custody model by:
+    /// 1. Minting both ERC1155 receipts and ERC20 shares to the bot's wallet
+    /// 2. Immediately transferring the ERC20 shares to the user's wallet
+    ///
+    /// Both operations succeed or fail atomically in a single transaction.
     ///
     /// # Arguments
     ///
     /// * `assets` - Amount of assets to deposit (18-decimal fixed-point)
-    /// * `receiver` - Address that will receive the minted shares
+    /// * `bot_wallet` - Bot's wallet that will hold the receipts
+    /// * `user_wallet` - User's wallet that will receive the shares
     /// * `receipt_info` - Metadata about the mint operation for on-chain audit trail
     ///
     /// # Returns
@@ -32,12 +39,19 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultError`] if the transaction fails, events are missing,
+    /// Returns [`VaultError`] if the multicall fails, events are missing,
     /// or RPC communication fails.
-    async fn mint_tokens(
+    ///
+    /// # Implementation Note
+    ///
+    /// This relies on the 1:1 share ratio (1 asset = 1 share with 18 decimals).
+    /// The transfer amount can be pre-calculated as equal to assets, allowing
+    /// the multicall to be encoded before execution.
+    async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        receiver: Address,
+        bot_wallet: Address,
+        user_wallet: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError>;
 

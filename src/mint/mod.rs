@@ -1854,8 +1854,9 @@ mod tests {
     ) -> MintManager<MemStore<Mint>> {
         let blockchain_service =
             Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
+        let bot_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-        MintManager::new(blockchain_service, cqrs)
+        MintManager::new(blockchain_service, cqrs, bot_wallet)
     }
 
     fn create_test_callback_manager(

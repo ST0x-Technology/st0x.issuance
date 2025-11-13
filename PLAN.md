@@ -31,17 +31,17 @@ mint-and-transfer.
 
 **Subtasks:**
 
-- [ ] Add `mint_and_transfer_shares()` to VaultService trait
-- [ ] Implement `mint_and_transfer_shares()` for RealBlockchainService
-  - [ ] Encode `deposit()` call with `receiver = bot_wallet`
-  - [ ] Encode `transfer()` call with `to = user_wallet, amount = assets`
-  - [ ] Call `vault.multicall([deposit_call, transfer_call])`
-  - [ ] Parse results to extract receipt_id, shares_minted from deposit event
-  - [ ] Return MintResult
-- [ ] Implement `mint_and_transfer_shares()` for MockVaultService
-  - [ ] Simulate both operations
-  - [ ] Store that bot has receipts and user has shares
-  - [ ] Return MintResult
+- [x] Add `mint_and_transfer_shares()` to VaultService trait
+- [x] Implement `mint_and_transfer_shares()` for RealBlockchainService
+  - [x] Encode `deposit()` call with `receiver = bot_wallet`
+  - [x] Encode `transfer()` call with `to = user_wallet, amount = assets`
+  - [x] Call `vault.multicall([deposit_call, transfer_call])`
+  - [x] Parse results to extract receipt_id, shares_minted from deposit event
+  - [x] Return MintResult
+- [x] Implement `mint_and_transfer_shares()` for MockVaultService
+  - [x] Simulate both operations
+  - [x] Store that bot has receipts and user has shares
+  - [x] Return MintResult
 
 **Implementation pseudocode:**
 
@@ -75,13 +75,13 @@ let receipt = vault.multicall(vec![deposit_call, transfer_call]).send().await?.g
 
 **Subtasks:**
 
-- [ ] Add `bot_wallet: Address` field to `MintManager` struct
-- [ ] Update `MintManager::new()` constructor to accept `bot_wallet` parameter
-- [ ] Update `handle_journal_confirmed()` to call `mint_and_transfer_shares()`
-  - [ ] Change from `mint_tokens(assets, *wallet, receipt_info)`
-  - [ ] Change to
+- [x] Add `bot_wallet: Address` field to `MintManager` struct
+- [x] Update `MintManager::new()` constructor to accept `bot_wallet` parameter
+- [x] Update `handle_journal_confirmed()` to call `mint_and_transfer_shares()`
+  - [x] Change from `mint_tokens(assets, *wallet, receipt_info)`
+  - [x] Change to
         `mint_and_transfer_shares(assets, self.bot_wallet, *wallet, receipt_info)`
-- [ ] Update `src/lib.rs` to pass `config.bot_wallet` when creating MintManager
+- [x] Update `src/lib.rs` to pass `config.bot_wallet` when creating MintManager
 
 **Error handling:**
 
