@@ -156,7 +156,7 @@ Complete redemption flow - detect transfer through burn.
 
 ### Issues
 
-- [ ] [#21](https://github.com/ST0x-Technology/st0x.issuance/issues/21) -
+- [x] [#21](https://github.com/ST0x-Technology/st0x.issuance/issues/21) -
       Implement DetectRedemption feature and MonitorService
   - **PR:** [#54](https://github.com/ST0x-Technology/st0x.issuance/pull/54)
 - [x] [#22](https://github.com/ST0x-Technology/st0x.issuance/issues/22) -
@@ -171,8 +171,9 @@ Complete redemption flow - detect transfer through burn.
 - [x] [#25](https://github.com/ST0x-Technology/st0x.issuance/issues/25) -
       Implement token burning feature
   - **PR:** [#61](https://github.com/ST0x-Technology/st0x.issuance/pull/61)
-- [ ] [#26](https://github.com/ST0x-Technology/st0x.issuance/issues/26) -
+- [x] [#26](https://github.com/ST0x-Technology/st0x.issuance/issues/26) -
       End-to-end redemption flow tests
+  - **PR:** [#58](https://github.com/ST0x-Technology/st0x.issuance/pull/58)
 
 ---
 
@@ -195,8 +196,9 @@ Operational concerns for production deployment.
   - **PR:** [#60](https://github.com/ST0x-Technology/st0x.issuance/pull/60)
 - [ ] [#31](https://github.com/ST0x-Technology/st0x.issuance/issues/31) -
       Integrate Grafana for metrics
-- [ ] [#32](https://github.com/ST0x-Technology/st0x.issuance/issues/32) - Setup
+- [x] [#32](https://github.com/ST0x-Technology/st0x.issuance/issues/32) - Setup
       CD (GitHub Actions)
+  - **PR:** [#66](https://github.com/ST0x-Technology/st0x.issuance/pull/66)
 - [ ] [#33](https://github.com/ST0x-Technology/st0x.issuance/issues/33) - Add
       staging environment (nice-to-have)
 - [ ] [#62](https://github.com/ST0x-Technology/st0x.issuance/issues/62) -
