@@ -1,4 +1,4 @@
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use chrono::Utc;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
@@ -28,6 +28,7 @@ pub(crate) struct BurnManager<ES: EventStore<Redemption>> {
     blockchain_service: Arc<dyn VaultService>,
     receipt_query_pool: Pool<Sqlite>,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    bot_wallet: Address,
 }
 
 impl<ES: EventStore<Redemption>> BurnManager<ES> {
@@ -38,12 +39,14 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     /// * `blockchain_service` - Service for on-chain burning operations
     /// * `receipt_query_pool` - Database pool for querying receipt inventory
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
+    /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
         blockchain_service: Arc<dyn VaultService>,
         receipt_query_pool: Pool<Sqlite>,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        bot_wallet: Address,
     ) -> Self {
-        Self { blockchain_service, receipt_query_pool, cqrs }
+        Self { blockchain_service, receipt_query_pool, cqrs, bot_wallet }
     }
 
     /// Handles a `Burning` state by burning tokens on-chain.
@@ -79,13 +82,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         issuer_request_id: &IssuerRequestId,
         aggregate: &Redemption,
     ) -> Result<(), BurnManagerError> {
-        let Redemption::Burning {
-            tokenization_request_id,
-            underlying,
-            quantity,
-            wallet,
-            ..
-        } = aggregate
+        let Redemption::Burning { metadata, tokenization_request_id, .. } =
+            aggregate
         else {
             return Err(BurnManagerError::InvalidAggregateState {
                 current_state: aggregate_state_name(aggregate).to_string(),
@@ -94,23 +92,27 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         info!(
             issuer_request_id = %issuer_request_id,
-            underlying = %underlying,
-            quantity = %quantity,
-            wallet = %wallet,
+            underlying = %metadata.underlying,
+            quantity = %metadata.quantity,
+            wallet = %metadata.wallet,
             "Starting on-chain burning process"
         );
 
-        let shares = quantity.to_u256_with_18_decimals()?;
+        let shares = metadata.quantity.to_u256_with_18_decimals()?;
 
         let receipt_id = self
-            .select_receipt_for_burning(issuer_request_id, underlying, shares)
+            .select_receipt_for_burning(
+                issuer_request_id,
+                &metadata.underlying,
+                shares,
+            )
             .await?;
 
         let receipt_info = ReceiptInformation {
             tokenization_request_id: tokenization_request_id.clone(),
             issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            quantity: quantity.clone(),
+            underlying: metadata.underlying.clone(),
+            quantity: metadata.quantity.clone(),
             operation_type: OperationType::Redeem,
             timestamp: Utc::now(),
             notes: None,
@@ -120,7 +122,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             issuer_request_id,
             shares,
             receipt_id,
-            *wallet,
+            metadata.wallet,
             receipt_info,
         )
         .await
@@ -247,7 +249,13 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     ) -> Result<(), BurnManagerError> {
         match self
             .blockchain_service
-            .burn_tokens(shares, receipt_id, wallet, wallet, receipt_info)
+            .burn_tokens(
+                shares,
+                receipt_id,
+                self.bot_wallet,
+                wallet,
+                receipt_info,
+            )
             .await
         {
             Ok(result) => {
@@ -344,7 +352,7 @@ pub(crate) enum BurnManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{Address, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
@@ -356,6 +364,9 @@ mod tests {
     use crate::receipt_inventory::view::ReceiptInventoryView;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
+
+    const TEST_WALLET: Address =
+        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -483,8 +494,12 @@ mod tests {
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-burn-success-123");
 
@@ -530,8 +545,12 @@ mod tests {
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-burn-failure-456");
 
@@ -582,8 +601,12 @@ mod tests {
         let pool = setup_test_db().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-insufficient-789");
 
@@ -622,7 +645,12 @@ mod tests {
         let pool = setup_test_db().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(blockchain_service, pool, cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool,
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-wrong-state-999");
         let underlying = UnderlyingSymbol::new("TSLA");
@@ -667,7 +695,7 @@ mod tests {
 
 #[cfg(test)]
 mod integration_tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{Address, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{
         AggregateContext, EventStore,
@@ -684,6 +712,9 @@ mod integration_tests {
     use crate::redemption::view::RedemptionView;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
+
+    const TEST_WALLET: Address =
+        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
     type TestCqrs = SqliteCqrs<Redemption>;
     type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
@@ -821,8 +852,12 @@ mod integration_tests {
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-integration-001");
         let mint_issuer_request_id = "mint-integration-001";
@@ -866,8 +901,12 @@ mod integration_tests {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-integration-002");
         let mint_issuer_request_id = "mint-integration-002";
@@ -949,8 +988,12 @@ mod integration_tests {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-integration-003");
         let mint_issuer_request_id = "mint-integration-003";
@@ -992,8 +1035,12 @@ mod integration_tests {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-integration-004");
 
@@ -1044,8 +1091,12 @@ mod integration_tests {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager =
-            BurnManager::new(blockchain_service, pool.clone(), cqrs.clone());
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            TEST_WALLET,
+        );
 
         let issuer_request_id = IssuerRequestId::new("red-integration-005");
 

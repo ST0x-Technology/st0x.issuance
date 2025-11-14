@@ -127,10 +127,11 @@ impl MockVaultService {
 #[async_trait]
 impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
-    async fn mint_tokens(
+    async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        receiver: Address,
+        bot: Address,
+        _user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         if self.mint_delay_ms > 0 {
@@ -146,7 +147,7 @@ impl VaultService for MockVaultService {
         {
             *self.last_call.lock().unwrap() = Some(MintTokensCall {
                 assets,
-                receiver,
+                receiver: bot,
                 receipt_info: receipt_info.clone(),
             });
         }
@@ -245,10 +246,19 @@ mod tests {
     async fn test_new_success_returns_mint_result() {
         let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        let result = mock.mint_tokens(assets, receiver, receipt_info).await;
+        let result = mock
+            .mint_and_transfer_shares(
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+            )
+            .await;
 
         assert!(result.is_ok());
         let mint_result = result.unwrap();
@@ -262,10 +272,19 @@ mod tests {
     async fn test_new_failure_returns_error() {
         let mock = MockVaultService::new_failure("network error");
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        let result = mock.mint_tokens(assets, receiver, receipt_info).await;
+        let result = mock
+            .mint_and_transfer_shares(
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+            )
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -278,14 +297,30 @@ mod tests {
     async fn test_get_call_count_increments() {
         let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
 
         assert_eq!(mock.get_call_count(), 0);
 
-        mock.mint_tokens(assets, receiver, test_receipt_info()).await.unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
         assert_eq!(mock.get_call_count(), 1);
 
-        mock.mint_tokens(assets, receiver, test_receipt_info()).await.unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            test_receipt_info(),
+        )
+        .await
+        .unwrap();
         assert_eq!(mock.get_call_count(), 2);
     }
 
@@ -293,19 +328,28 @@ mod tests {
     async fn test_get_last_call_captures_arguments() {
         let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
         assert!(mock.get_last_call().is_none());
 
-        mock.mint_tokens(assets, receiver, receipt_info.clone()).await.unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
 
         let last_call = mock.get_last_call();
         assert!(last_call.is_some());
 
         let call = last_call.unwrap();
         assert_eq!(call.assets, assets);
-        assert_eq!(call.receiver, receiver);
+        assert_eq!(call.receiver, bot_wallet);
         assert_eq!(
             call.receipt_info.tokenization_request_id.0,
             receipt_info.tokenization_request_id.0
@@ -317,11 +361,20 @@ mod tests {
         let delay_ms = 50;
         let mock = MockVaultService::new_success().with_delay(delay_ms);
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
         let start = tokio::time::Instant::now();
-        mock.mint_tokens(assets, receiver, receipt_info).await.unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            receipt_info,
+        )
+        .await
+        .unwrap();
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() >= u128::from(delay_ms));
@@ -331,11 +384,27 @@ mod tests {
     async fn test_reset_clears_state() {
         let mock = MockVaultService::new_success();
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        mock.mint_tokens(assets, receiver, receipt_info.clone()).await.unwrap();
-        mock.mint_tokens(assets, receiver, receipt_info).await.unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            receipt_info.clone(),
+        )
+        .await
+        .unwrap();
+        mock.mint_and_transfer_shares(
+            assets,
+            bot_wallet,
+            user_wallet,
+            receipt_info,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(mock.get_call_count(), 2);
         assert!(mock.get_last_call().is_some());

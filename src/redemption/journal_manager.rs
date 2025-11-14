@@ -115,15 +115,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             aggregate.apply(event.payload);
         }
 
-        let Some((
-            expected_issuer_request_id,
-            expected_underlying,
-            expected_token,
-            expected_quantity,
-            expected_wallet,
-            expected_tx_hash,
-        )) = aggregate.validation_fields()
-        else {
+        let Some(metadata) = aggregate.metadata() else {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
@@ -132,62 +124,62 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         };
 
-        if &request.issuer_request_id != expected_issuer_request_id {
+        if request.issuer_request_id != metadata.issuer_request_id {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Issuer request ID mismatch: expected {}, got {}",
-                    expected_issuer_request_id.0, request.issuer_request_id.0
+                    metadata.issuer_request_id.0, request.issuer_request_id.0
                 ),
             });
         }
 
-        if &request.underlying != expected_underlying {
+        if request.underlying != metadata.underlying {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Underlying symbol mismatch: expected {}, got {}",
-                    expected_underlying.0, request.underlying.0
+                    metadata.underlying.0, request.underlying.0
                 ),
             });
         }
 
-        if &request.token != expected_token {
+        if request.token != metadata.token {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Token symbol mismatch: expected {}, got {}",
-                    expected_token.0, request.token.0
+                    metadata.token.0, request.token.0
                 ),
             });
         }
 
-        if &request.quantity != expected_quantity {
+        if request.quantity != metadata.quantity {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Quantity mismatch: expected {}, got {}",
-                    expected_quantity.0, request.quantity.0
+                    metadata.quantity.0, request.quantity.0
                 ),
             });
         }
 
-        if &request.wallet != expected_wallet {
+        if request.wallet != metadata.wallet {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Wallet mismatch: expected {}, got {}",
-                    expected_wallet, request.wallet
+                    metadata.wallet, request.wallet
                 ),
             });
         }
 
-        if &request.tx_hash != expected_tx_hash {
+        if request.tx_hash != metadata.detected_tx_hash {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Transaction hash mismatch: expected {}, got {}",
-                    expected_tx_hash, request.tx_hash
+                    metadata.detected_tx_hash, request.tx_hash
                 ),
             });
         }
@@ -205,7 +197,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         warn!(
             issuer_request_id = %issuer_id_str,
             elapsed = ?elapsed,
-            "Polling timeout reached (1 hour), marking redemption as failed"
+            max_duration = ?self.max_duration,
+            "Polling timeout reached, marking redemption as failed"
         );
 
         self.cqrs
@@ -213,8 +206,10 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 issuer_id_str,
                 RedemptionCommand::MarkFailed {
                     issuer_request_id: issuer_request_id.clone(),
-                    reason: "Alpaca journal polling timeout (1 hour)"
-                        .to_string(),
+                    reason: format!(
+                        "Alpaca journal polling timeout after {:?}",
+                        self.max_duration
+                    ),
                 },
             )
             .await?;

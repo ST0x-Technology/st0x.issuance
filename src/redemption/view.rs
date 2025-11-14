@@ -43,7 +43,7 @@ pub(crate) enum RedemptionView {
         block_number: u64,
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
-        alpaca_completed_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
     },
     Completed {
         issuer_request_id: IssuerRequestId,
@@ -102,7 +102,7 @@ impl RedemptionView {
     fn update_alpaca_journal_completed(
         &mut self,
         issuer_request_id: IssuerRequestId,
-        alpaca_completed_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
     ) {
         let Self::AlpacaCalled {
             tokenization_request_id,
@@ -131,7 +131,7 @@ impl RedemptionView {
             block_number: *block_number,
             detected_at: *detected_at,
             called_at: *called_at,
-            alpaca_completed_at,
+            alpaca_journal_completed_at,
         };
     }
 }
@@ -194,11 +194,11 @@ impl View<Redemption> for RedemptionView {
             }
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id,
-                alpaca_completed_at,
+                alpaca_journal_completed_at,
             } => {
                 self.update_alpaca_journal_completed(
                     issuer_request_id.clone(),
-                    *alpaca_completed_at,
+                    *alpaca_journal_completed_at,
                 );
             }
             RedemptionEvent::TokensBurned {
@@ -388,7 +388,7 @@ mod tests {
         let block_number = 99999;
         let detected_at = Utc::now();
         let called_at = Utc::now();
-        let alpaca_completed_at = Utc::now();
+        let alpaca_journal_completed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
             aggregate_id: issuer_request_id.0.clone(),
@@ -422,7 +422,7 @@ mod tests {
             sequence: 3,
             payload: RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: issuer_request_id.clone(),
-                alpaca_completed_at,
+                alpaca_journal_completed_at,
             },
             metadata: HashMap::default(),
         });
@@ -438,7 +438,7 @@ mod tests {
             block_number: view_block_number,
             detected_at: view_detected_at,
             called_at: view_called_at,
-            alpaca_completed_at: view_alpaca_completed_at,
+            alpaca_journal_completed_at: view_alpaca_journal_completed_at,
         } = view
         else {
             panic!("Expected Burning view, got {view:?}");
@@ -454,7 +454,10 @@ mod tests {
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_detected_at, detected_at);
         assert_eq!(view_called_at, called_at);
-        assert_eq!(view_alpaca_completed_at, alpaca_completed_at);
+        assert_eq!(
+            view_alpaca_journal_completed_at,
+            alpaca_journal_completed_at
+        );
     }
 
     #[test]

@@ -24,8 +24,9 @@ pub(super) fn create_test_mint_manager(
 ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
     let blockchain_service =
         Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
+    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-    Arc::new(MintManager::new(blockchain_service, mint_cqrs))
+    Arc::new(MintManager::new(blockchain_service, mint_cqrs, bot))
 }
 
 pub(super) fn create_test_callback_manager(
@@ -125,13 +126,13 @@ pub(super) async fn setup_with_account_and_asset(
     let underlying = UnderlyingSymbol::new("AAPL");
     let token = TokenSymbol::new("tAAPL");
     let network = Network::new("base");
-    let vault_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+    let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
     let asset_cmd = TokenizedAssetCommand::Add {
         underlying: underlying.clone(),
         token: token.clone(),
         network: network.clone(),
-        vault_address,
+        vault,
     };
 
     tokenized_asset_cqrs

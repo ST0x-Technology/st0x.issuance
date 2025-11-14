@@ -450,6 +450,19 @@ struct TokenizedAsset {
 
 ### 3. Token Minting (Alpaca ITN Flow)
 
+#### Receipt Custody Model
+
+**IMPORTANT:** The bot's wallet retains custody of all ERC1155 receipts while
+users hold ERC20 shares. This design:
+
+- Allows the bot to manage burns while only receiving a share transfer (it holds
+  both shares and receipts during redemption)
+- Maintains a clear audit trail (all receipts remain with the issuer)
+
+**Mint Flow:** Bot receives shares + receipts -> Bot transfers shares to user ->
+Bot keeps receipts **Redemption Flow:** User sends shares to bot -> Bot has both
+shares + receipts -> Bot burns
+
 #### Complete Mint Flow
 
 ```mermaid
@@ -465,19 +478,25 @@ sequenceDiagram
     Note right of Us: InitiateMint command<br/>Event: MintInitiated<br/>Status: pending_journal
     Us->>Alpaca: {issuer_request_id, status: "created"}
 
-    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP → To: Issuer account
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP -> To: Issuer account
     Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
     Note right of Us: ConfirmJournal command<br/>Event: JournalConfirmed
 
-    Us->>Blockchain: vault.deposit(10 AAPL, ap_wallet)
-    Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted
+    rect rgb(200, 220, 250)
+        Note over Us,Blockchain: Single Atomic Transaction (multicall)
+        Us->>Blockchain: 1. deposit(10 AAPL, bot_wallet)
+        Note right of Blockchain: Bot receives shares + receipts
+        Us->>Blockchain: 2. transfer(ap_wallet, 10 AAPL)
+        Note right of Blockchain: Bot transfers shares to AP<br/>(keeps receipts)
+    end
+    Blockchain->>Us: Transaction confirmed (both steps succeeded)
+    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted<br/>(AP has shares, bot has receipts)
 
     Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
     Note right of Us: RecordCallback command<br/>Event: MintCompleted<br/>Status: completed
 
     Alpaca->>AP: Mint completed ✓
-    Note left of AP: AP now has 10 AAPL0x<br/>tokens in their wallet
+    Note left of AP: AP now has 10 AAPL0x<br/>share tokens in their wallet<br/>(Bot holds receipts)
 ```
 
 #### Step 1: Receive Mint Request from Alpaca
@@ -612,13 +631,35 @@ struct AlpacaJournalConfirmation {
 
 Once journal is confirmed, we mint tokens using the Rain vault.
 
-**On-Chain Call:** `OffchainAssetReceiptVault.deposit()`
+**On-Chain Call:** `OffchainAssetReceiptVault.multicall()`
+
+To ensure atomicity, we use the vault's `multicall()` function to execute both
+deposit and transfer in a single transaction:
 
 **Parameters:**
 
-- `assets`: Quantity to mint (convert from string to U256, handling decimals)
-- `receiver`: AP's wallet address from original request
-- `receiptInformation`: Metadata bytes (see structure below)
+- `data`: Array of two encoded calls:
+  1. `deposit(assets, bot_wallet, minShareRatio, receiptInformation)`
+  2. `transfer(user_wallet, assets)`
+
+**Key Design Points:**
+
+- **Atomicity:** Both operations succeed or both fail - no intermediate state
+- **1:1 Share Ratio:** We always use `minShareRatio = 1e18`, giving 1 share per
+  asset. This allows us to know the transfer amount (`assets`) when encoding the
+  multicall.
+- **Result:** Bot's wallet receives ERC1155 receipts, user's wallet receives
+  ERC20 shares
+
+**Multicall Execution:**
+
+1. `deposit(assets, bot_wallet, ...)` - Bot receives both shares and receipts
+2. `transfer(user_wallet, assets)` - Bot transfers shares (keeping receipts)
+3. Both succeed in same transaction, or entire transaction reverts
+
+**Result:** AP receives shares, bot retains receipts. This separation enables
+the redemption flow where the bot can atomically burn (it will have both shares
+and receipts once the AP sends shares back).
 
 **Receipt Information Structure:**
 
@@ -774,7 +815,8 @@ sequenceDiagram
     participant Us as Issuance Bot
     participant Alpaca as Alpaca ITN
 
-    AP->>Blockchain: Transfer 10 AAPL0x to redemption wallet
+    AP->>Blockchain: Transfer 10 AAPL0x shares to bot wallet
+    Note right of Us: Bot now has BOTH<br/>shares + receipts
     Blockchain->>Us: Transfer event detected
     Note right of Us: DetectRedemption command<br/>Event: RedemptionDetected<br/>Status: detected
 
@@ -791,7 +833,8 @@ sequenceDiagram
 
     Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted<br/>Status: burning
 
-    Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)
+    Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)<br/>owner=bot_wallet
+    Note right of Us: Bot burns using<br/>shares + receipts<br/>it now holds
     Blockchain->>Us: Transaction confirmed
     Note right of Us: RecordBurnSuccess command<br/>Event: TokensBurned (final success state)
 
@@ -799,16 +842,21 @@ sequenceDiagram
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
 ```
 
-#### Step 1: Monitor Redemption Wallet
+#### Step 1: Monitor Bot Wallet for Redemptions
 
-We continuously monitor our designated redemption wallet for incoming token
-transfers.
+We continuously monitor the bot's wallet for incoming share transfers (which
+signal redemption requests).
 
 **Monitoring Approach:**
 
 - Subscribe to `Transfer` events for the vault's ERC-20 shares
-- Filter for transfers where `to` address is our redemption wallet
+- Filter for transfers where `to` address is the bot's wallet
 - Can use WebSocket subscription or polling depending on infrastructure
+
+**Note:** The bot's wallet serves as the redemption destination. When users send
+shares to this wallet, they're initiating a redemption. Since the bot already
+holds the corresponding ERC1155 receipts (from the original mint), it can
+atomically burn both shares and receipts once Alpaca confirms the journal.
 
 **On Detection:**
 
@@ -977,15 +1025,26 @@ Once Alpaca confirms the journal is completed, we burn the tokens on-chain.
 
 - `assets`: Quantity to burn (convert from string to U256)
 - `receiver`: Can be zero address (tokens going off-chain)
-- `owner`: Our redemption wallet (owns the shares)
+- `owner`: Bot's wallet (owns both the shares AND receipts - received during
+  mint, shares returned during redemption)
 - `id`: Receipt ID to burn from (need to track which receipt to use)
 - `receiptInformation`: Metadata bytes (similar structure to mint)
+
+**Key Design Point:** The burn succeeds because the bot's wallet holds both:
+
+1. **ERC20 shares** - Received from the AP during the transfer that initiated
+   redemption
+2. **ERC1155 receipts** - Retained from the original mint operation
+
+The `OffchainAssetReceiptVault.withdraw()` function requires the `owner` to hold
+both shares and receipts. Our receipt custody model ensures this invariant is
+satisfied.
 
 **Receipt Tracking:** We need to determine which receipt ID has sufficient
 balance to burn from. This requires:
 
 - Maintaining an inventory of active receipt IDs
-- Querying on-chain balances for the redemption wallet
+- Querying on-chain balances for the bot's wallet
 - Selecting an appropriate receipt with sufficient balance
 
 **Authorization Check:** Verify our operator address is authorized for the

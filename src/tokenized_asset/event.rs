@@ -11,7 +11,7 @@ pub(crate) enum TokenizedAssetEvent {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: Address,
+        vault: Address,
         added_at: DateTime<Utc>,
     },
 }

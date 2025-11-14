@@ -33,10 +33,11 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
 impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     for RealBlockchainService<P>
 {
-    async fn mint_tokens(
+    async fn mint_and_transfer_shares(
         &self,
         assets: U256,
-        receiver: Address,
+        bot: Address,
+        user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         let receipt_info_bytes =
@@ -51,21 +52,25 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let vault =
             OffchainAssetReceiptVault::new(self.vault_address, &self.provider);
 
-        // The third parameter to deposit() is depositMinShareRatio (an 18-decimal fixed-point number).
-        // OffchainAssetReceiptVault inherits from ReceiptVault (OffchainAssetReceiptVault.sol:243).
-        // The deposit() method is implemented in ReceiptVault.sol (lines 224-238).
-        // It calls _calculateDeposit() (line 233) which uses the formula (line 440):
-        //   shares = assets.fixedPointMul(shareRatio, Math.Rounding.Down)
-        //   where shareRatio comes from _shareRatio() which defaults to 1e18 (line 305).
-        // For 1:1 (one share per asset): depositMinShareRatio = 1e18.
         let share_ratio = U256::from(10).pow(U256::from(18));
 
+        // Encode deposit call - mints shares + receipts to bot
+        let deposit_call = vault
+            .deposit(assets, bot, share_ratio, receipt_info_bytes)
+            .calldata()
+            .clone();
+
+        // Encode transfer call - transfers shares from bot to user
+        // Due to 1:1 ratio (1e18), shares_minted == assets, so we can pre-calculate
+        let transfer_call = vault.transfer(user, assets).calldata().clone();
+
+        // Execute both operations atomically via multicall
         let receipt = vault
-            .deposit(assets, receiver, share_ratio, receipt_info_bytes)
+            .multicall(vec![deposit_call, transfer_call])
             .send()
             .await
             .map_err(|e| VaultError::TransactionFailed {
-                reason: format!("Failed to send transaction: {e}"),
+                reason: format!("Failed to send multicall transaction: {e}"),
             })?
             .get_receipt()
             .await
@@ -175,7 +180,7 @@ mod tests {
     };
     use alloy::network::EthereumWallet;
     use alloy::primitives::{
-        Address, Bloom, Bytes, IntoLogData, U256, address, fixed_bytes,
+        Address, Bloom, Bytes, IntoLogData, U256, address, bytes, fixed_bytes,
     };
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
@@ -214,9 +219,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mint_tokens_success() {
+    async fn test_mint_and_transfer_shares_success() {
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x2222222222222222222222222222222222222222");
         let receipt_info = test_receipt_info();
         let vault_address = test_vault_address();
 
@@ -227,8 +234,8 @@ mod tests {
         let shares = U256::from(1000);
 
         let deposit_event = OffchainAssetReceiptVault::Deposit {
-            sender: receiver,
-            owner: receiver,
+            sender: bot_wallet,
+            owner: bot_wallet,
             assets,
             shares,
             id: receipt_id,
@@ -326,7 +333,14 @@ mod tests {
             .connect_mocked_client(asserter);
         let service = RealBlockchainService::new(provider, vault_address);
 
-        let result = service.mint_tokens(assets, receiver, receipt_info).await;
+        let result = service
+            .mint_and_transfer_shares(
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+            )
+            .await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
         let mint_result = result.unwrap();
@@ -338,9 +352,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mint_tokens_missing_deposit_event() {
+    async fn test_mint_and_transfer_shares_missing_deposit_event() {
         let assets = U256::from(1000);
-        let receiver = test_receiver();
+        let bot_wallet = test_receiver();
+        let user_wallet =
+            address!("0x2222222222222222222222222222222222222222");
         let receipt_info = test_receipt_info();
         let vault_address = test_vault_address();
 
@@ -421,7 +437,14 @@ mod tests {
             .connect_mocked_client(asserter);
         let service = RealBlockchainService::new(provider, vault_address);
 
-        let result = service.mint_tokens(assets, receiver, receipt_info).await;
+        let result = service
+            .mint_and_transfer_shares(
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+            )
+            .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");
         let err = result.unwrap_err();
@@ -654,6 +677,85 @@ mod tests {
         assert!(
             matches!(err, VaultError::EventNotFound { .. }),
             "Expected EventNotFound but got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mint_and_transfer_shares_produces_exact_calldata() {
+        let vault_address = test_vault_address();
+        let assets = U256::from(1000);
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let user = address!("0x2222222222222222222222222222222222222222");
+
+        use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+        use crate::tokenized_asset::UnderlyingSymbol;
+        use crate::vault::OperationType;
+        use chrono::Utc;
+        use rust_decimal::Decimal;
+
+        let fixed_timestamp =
+            chrono::DateTime::parse_from_rfc3339("2025-01-15T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            issuer_request_id: IssuerRequestId::new("iss-456"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity::new(Decimal::from(100)),
+            operation_type: OperationType::Mint,
+            timestamp: fixed_timestamp,
+            notes: None,
+        };
+
+        let signer = PrivateKeySigner::random();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect_anvil();
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+
+        let receipt_info_bytes =
+            Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
+        let share_ratio = U256::from(10).pow(U256::from(18));
+
+        let deposit_call = vault
+            .deposit(assets, bot, share_ratio, receipt_info_bytes)
+            .calldata()
+            .clone();
+
+        let transfer_call = vault.transfer(user, assets).calldata().clone();
+
+        let multicall_calldata = vault
+            .multicall(vec![deposit_call.clone(), transfer_call.clone()])
+            .calldata()
+            .clone();
+
+        let expected_transfer = bytes!(
+            "0xa9059cbb000000000000000000000000222222222222222222222222222222222222222200000000000000000000000000000000000000000000000000000000000003e8"
+        );
+
+        assert_eq!(
+            transfer_call.as_ref(),
+            expected_transfer.as_ref(),
+            "Transfer calldata mismatch"
+        );
+
+        assert!(
+            !deposit_call.is_empty()
+                && deposit_call[0..4] == [0x14, 0x23, 0xfe, 0xba],
+            "Deposit should start with correct function selector"
+        );
+
+        assert!(
+            !multicall_calldata.is_empty()
+                && multicall_calldata[0..4] == [0xac, 0x96, 0x50, 0xd8],
+            "Multicall should start with correct function selector"
+        );
+
+        assert!(
+            multicall_calldata.len() > deposit_call.len() + transfer_call.len(),
+            "Multicall should contain both calls"
         );
     }
 }

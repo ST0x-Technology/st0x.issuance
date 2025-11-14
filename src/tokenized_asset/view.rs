@@ -24,7 +24,7 @@ pub(crate) enum TokenizedAssetView {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: Address,
+        vault: Address,
         enabled: bool,
         added_at: DateTime<Utc>,
     },
@@ -43,14 +43,14 @@ impl View<TokenizedAsset> for TokenizedAssetView {
                 underlying,
                 token,
                 network,
-                vault_address,
+                vault,
                 added_at,
             } => {
                 *self = Self::Asset {
                     underlying: underlying.clone(),
                     token: token.clone(),
                     network: network.clone(),
-                    vault_address: *vault_address,
+                    vault: *vault,
                     enabled: true,
                     added_at: *added_at,
                 };
@@ -109,15 +109,14 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let added_at = Utc::now();
 
         let event = TokenizedAssetEvent::Added {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),
-            vault_address,
+            vault,
             added_at,
         };
 
@@ -138,7 +137,7 @@ mod tests {
             underlying: view_underlying,
             token: view_token,
             network: view_network,
-            vault_address: view_vault_address,
+            vault: view_vault,
             enabled,
             added_at: view_added_at,
         } = view
@@ -149,7 +148,7 @@ mod tests {
         assert_eq!(view_underlying, underlying);
         assert_eq!(view_token, token);
         assert_eq!(view_network, network);
-        assert_eq!(view_vault_address, vault_address);
+        assert_eq!(view_vault, vault);
         assert!(enabled);
         assert_eq!(view_added_at, added_at);
     }
@@ -163,9 +162,7 @@ mod tests {
             underlying: enabled_underlying.clone(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::new("base"),
-            vault_address: address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
+            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             enabled: true,
             added_at: Utc::now(),
         };
@@ -175,9 +172,7 @@ mod tests {
             underlying: disabled_underlying.clone(),
             token: TokenSymbol::new("tTSLA"),
             network: Network::new("base"),
-            vault_address: address!(
-                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ),
+            vault: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             enabled: false,
             added_at: Utc::now(),
         };

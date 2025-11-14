@@ -156,7 +156,8 @@ st0x.issuance/
 │       ├── service.rs       # Real Alloy implementation
 │       └── mock.rs          # Mock implementation for testing
 ├── tests/                   # End-to-end integration tests
-│   └── e2e_mint_flow.rs     # Complete mint flow tests
+│   ├── e2e_mint_flow.rs     # Complete mint flow with Anvil
+│   └── e2e_redemption_flow.rs  # Redemption flow with Anvil
 ├── crates/
 │   └── sqlite-es/           # SQLite event store implementation
 ├── migrations/              # Database migrations
@@ -237,6 +238,24 @@ This approach enables:
 - Clear test intent and readability
 - Complete coverage of state transitions
 - Easy mocking of external services
+
+### End-to-End Testing with Anvil
+
+E2E tests in `tests/` use Anvil (local Ethereum blockchain) for realistic
+on-chain testing:
+
+- **LocalEvm**: Test infrastructure that deploys vault contracts to Anvil
+- **Real blockchain interactions**: Tests execute actual on-chain deposits and
+  transfers
+- **WebSocket monitoring**: Tests verify event subscriptions and real-time
+  detection
+- **In-memory database**: Tests use SQLite in-memory for fast, isolated
+  execution
+- **Mock external APIs**: Alpaca API calls use httpmock for deterministic
+  testing
+
+E2E tests validate complete flows from HTTP request through CQRS to on-chain
+execution.
 
 ## Documentation
 

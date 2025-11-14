@@ -51,7 +51,11 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 cqrs-es.workspace = true
 async-trait.workspace = true
 clap = { version = "4.5.49", features = ["derive", "env"] }
-alloy = { version = "1.0.41", features = ["provider-ws", "pubsub"] }
+alloy = { version = "1.0.41", features = [
+  "provider-ws",
+  "pubsub",
+  "node-bindings",
+] }
 rust_decimal = { version = "1.39.0", features = ["serde"] }
 tokio = { version = "1.48.0", features = ["time"] }
 reqwest = { version = "0.12.24", features = ["json", "blocking", "gzip"] }
@@ -66,10 +70,13 @@ url = "2.5.7"
 anyhow = "1.0.100"
 dotenvy = "0.15.7"
 itertools = "0.14.0"
+base64 = "0.22.1"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+alloy-node-bindings = "1.0.41"
+alloy-sol-types = "1.4.1"
 httpmock = "0.8.2"
 tokio = { version = "1.48.0", features = ["macros"] }

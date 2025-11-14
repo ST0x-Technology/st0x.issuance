@@ -9,6 +9,6 @@ pub(crate) enum TokenizedAssetCommand {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
-        vault_address: Address,
+        vault: Address,
     },
 }

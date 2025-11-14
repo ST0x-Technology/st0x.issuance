@@ -64,9 +64,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             network: Network::new("base"),
-            vault_address: address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
+            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             enabled: true,
             added_at: Utc::now(),
         };
@@ -75,9 +73,7 @@ mod tests {
             underlying: UnderlyingSymbol::new("TSLA"),
             token: TokenSymbol::new("tTSLA"),
             network: Network::new("base"),
-            vault_address: address!(
-                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ),
+            vault: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             enabled: false,
             added_at: Utc::now(),
         };

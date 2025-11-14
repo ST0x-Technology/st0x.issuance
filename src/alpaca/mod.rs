@@ -11,6 +11,8 @@ use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 pub(crate) mod mock;
 pub(crate) mod service;
 
+pub use service::AlpacaConfig;
+
 /// Service abstraction for Alpaca API operations.
 ///
 /// This trait provides an interface for calling Alpaca's tokenization endpoints,

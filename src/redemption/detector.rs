@@ -30,8 +30,8 @@ use crate::{Quantity, QuantityConversionError};
 /// Configuration parameters for the redemption detector.
 pub(crate) struct RedemptionDetectorConfig {
     pub(crate) rpc_url: Url,
-    pub(crate) vault_address: Address,
-    pub(crate) redemption_wallet: Address,
+    pub(crate) vault: Address,
+    pub(crate) bot_wallet: Address,
 }
 
 /// Orchestrates the WebSocket monitoring process for redemption detection.
@@ -41,8 +41,8 @@ pub(crate) struct RedemptionDetectorConfig {
 /// RedemptionCommand::Detect to record the redemption in the aggregate.
 pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
     rpc_url: Url,
-    vault_address: Address,
-    redemption_wallet: Address,
+    vault: Address,
+    bot_wallet: Address,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
     event_store: Arc<ES>,
     pool: Pool<Sqlite>,
@@ -77,8 +77,8 @@ where
     ) -> Self {
         Self {
             rpc_url: config.rpc_url,
-            vault_address: config.vault_address,
-            redemption_wallet: config.redemption_wallet,
+            vault: config.vault,
+            bot_wallet: config.bot_wallet,
             cqrs,
             event_store,
             pool,
@@ -111,17 +111,14 @@ where
         let provider =
             ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
 
-        let vault = bindings::OffchainAssetReceiptVault::new(
-            self.vault_address,
-            &provider,
-        );
+        let vault =
+            bindings::OffchainAssetReceiptVault::new(self.vault, &provider);
 
-        let filter =
-            vault.Transfer_filter().topic2(self.redemption_wallet).filter;
+        let filter = vault.Transfer_filter().topic2(self.bot_wallet).filter;
 
         info!(
-            "Subscribing to Transfer events for redemption wallet {}",
-            self.redemption_wallet
+            "Subscribing to Transfer events for bot wallet {}",
+            self.bot_wallet
         );
 
         let sub = provider.subscribe_logs(&filter).await?;
@@ -196,15 +193,13 @@ where
                     underlying,
                     token,
                     network,
-                    vault_address: addr,
+                    vault: addr,
                     ..
-                } if addr == self.vault_address => {
-                    Some((underlying, token, network))
-                }
+                } if addr == self.vault => Some((underlying, token, network)),
                 _ => None,
             })
             .ok_or(RedemptionMonitorError::NoMatchingAsset {
-                vault_address: self.vault_address,
+                vault: self.vault,
             })
     }
 
@@ -371,8 +366,8 @@ pub(crate) enum RedemptionMonitorError {
     EventDecode(#[from] alloy::sol_types::Error),
     #[error("Failed to list assets: {0}")]
     ListAssets(#[from] TokenizedAssetViewError),
-    #[error("No asset found for vault address {vault_address}")]
-    NoMatchingAsset { vault_address: Address },
+    #[error("No asset found for vault {vault}")]
+    NoMatchingAsset { vault: Address },
     #[error("Missing transaction hash in log")]
     MissingTxHash,
     #[error("Missing block number in log")]
@@ -425,7 +420,7 @@ mod tests {
         (cqrs, store)
     }
 
-    async fn setup_test_db_with_asset(vault_address: Address) -> SqlitePool {
+    async fn setup_test_db_with_asset(vault: Address) -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
 
         sqlx::migrate!("./migrations")
@@ -443,7 +438,7 @@ mod tests {
                 "underlying": underlying,
                 "token": token,
                 "network": network,
-                "vault_address": vault_address,
+                "vault": vault,
                 "enabled": true,
                 "added_at": added_at
             }
@@ -518,14 +513,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_transfer_log_success() {
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
-        let redemption_wallet =
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault_address).await;
+        let pool = setup_test_db_with_asset(vault).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -545,12 +538,13 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            bot_wallet,
         ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault_address,
-            redemption_wallet,
+            vault,
+            bot_wallet,
         };
 
         let detector = RedemptionDetector::new(
@@ -571,7 +565,7 @@ mod tests {
 
         let log = create_transfer_log(
             ap_wallet,
-            redemption_wallet,
+            bot_wallet,
             value,
             tx_hash,
             block_number,
@@ -597,13 +591,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_transfer_log_missing_tx_hash() {
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
-        let redemption_wallet =
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault_address).await;
+        let pool = setup_test_db_with_asset(vault).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -623,12 +615,13 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            bot_wallet,
         ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault_address,
-            redemption_wallet,
+            vault,
+            bot_wallet,
         };
 
         let detector = RedemptionDetector::new(
@@ -643,7 +636,7 @@ mod tests {
 
         let mut log = create_transfer_log(
             address!("0x9999999999999999999999999999999999999999"),
-            redemption_wallet,
+            bot_wallet,
             U256::from(100),
             b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -663,13 +656,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_transfer_log_missing_block_number() {
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
-        let redemption_wallet =
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault_address).await;
+        let pool = setup_test_db_with_asset(vault).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -689,12 +680,13 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            bot_wallet,
         ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault_address,
-            redemption_wallet,
+            vault,
+            bot_wallet,
         };
 
         let detector = RedemptionDetector::new(
@@ -709,7 +701,7 @@ mod tests {
 
         let mut log = create_transfer_log(
             address!("0x9999999999999999999999999999999999999999"),
-            redemption_wallet,
+            bot_wallet,
             U256::from(100),
             b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -729,15 +721,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_transfer_log_no_matching_asset() {
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
-        let wrong_vault_address =
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let wrong_vault =
             address!("0x9876543210fedcba9876543210fedcba98765432");
-        let redemption_wallet =
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(wrong_vault_address).await;
+        let pool = setup_test_db_with_asset(wrong_vault).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -757,12 +747,13 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            bot_wallet,
         ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault_address,
-            redemption_wallet,
+            vault,
+            bot_wallet,
         };
 
         let detector = RedemptionDetector::new(
@@ -777,7 +768,7 @@ mod tests {
 
         let log = create_transfer_log(
             address!("0x9999999999999999999999999999999999999999"),
-            redemption_wallet,
+            bot_wallet,
             U256::from(100),
             b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -798,13 +789,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_transfer_log_duplicate_detection_fails() {
-        let vault_address =
-            address!("0x1234567890abcdef1234567890abcdef12345678");
-        let redemption_wallet =
-            address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault_address).await;
+        let pool = setup_test_db_with_asset(vault).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -824,12 +813,13 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            bot_wallet,
         ));
 
         let config = RedemptionDetectorConfig {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault_address,
-            redemption_wallet,
+            vault,
+            bot_wallet,
         };
 
         let detector = RedemptionDetector::new(
@@ -848,7 +838,7 @@ mod tests {
 
         let log = create_transfer_log(
             address!("0x9999999999999999999999999999999999999999"),
-            redemption_wallet,
+            bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),
             tx_hash,
             12345,
