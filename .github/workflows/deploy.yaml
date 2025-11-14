@@ -1,9 +1,9 @@
 name: Build and deploy
 
 on:
-  push:
-    branches: [feat/cd]
   workflow_dispatch:
+  push:
+    branches: [main]
 
 env:
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
