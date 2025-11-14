@@ -201,7 +201,11 @@ pub async fn initialize_rocket(
         burn,
     );
 
-    Ok(rocket::build()
+    let figment = rocket::Config::figment()
+        .merge(("address", "0.0.0.0"))
+        .merge(("port", 8000));
+
+    Ok(rocket::custom(figment)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
@@ -410,11 +414,7 @@ async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
     vault: Address,
 ) -> Result<(), anyhow::Error> {
-    let assets = vec![
-        ("AAPL", "tAAPL", "base", vault),
-        ("TSLA", "tTSLA", "base", vault),
-        ("NVDA", "tNVDA", "base", vault),
-    ];
+    let assets = vec![("AAPL", "tAAPL", "base", vault)];
 
     for (underlying, token, network, vault) in assets {
         let command = TokenizedAssetCommand::Add {
