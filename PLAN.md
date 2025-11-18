@@ -141,15 +141,14 @@ This task adds the ability to whitelist wallets on an already-linked account.
       new variant
 - [ ] Add `AccountCommand::WhitelistWallet` variant in `src/account/cmd.rs` with
       `wallet: Address` field
-- [ ] Add error variants in `src/account/mod.rs`:
+- [ ] Add error variant in `src/account/mod.rs`:
   - [ ] `AccountError::AccountNotLinked`
-  - [ ] `AccountError::WalletAlreadyWhitelisted { wallet: Address }`
 - [ ] Add handle() logic for WhitelistWallet command:
   - [ ] Match on aggregate state, return AccountNotLinked if NotLinked
-  - [ ] Check if wallet already in whitelisted_wallets vec, return
-        WalletAlreadyWhitelisted if duplicate
+  - [ ] Check if wallet already in whitelisted_wallets vec, return empty vec if
+        already whitelisted (idempotent)
   - [ ] Return vec containing WalletWhitelisted event with wallet and current
-        timestamp
+        timestamp if not already whitelisted
 - [ ] Add apply() logic for WalletWhitelisted event:
   - [ ] Match on event variant
   - [ ] If aggregate is Linked, push wallet to whitelisted_wallets vec
@@ -158,8 +157,8 @@ This task adds the ability to whitelist wallets on an already-linked account.
         event
   - [ ] Test whitelisting wallet on NotLinked account returns AccountNotLinked
         error
-  - [ ] Test whitelisting duplicate wallet returns WalletAlreadyWhitelisted
-        error
+  - [ ] Test whitelisting already-whitelisted wallet returns empty vec
+        (idempotent)
   - [ ] Test apply() correctly adds wallet to whitelisted_wallets vec
   - [ ] Test apply() can add multiple different wallets
 - [ ] Run tests: `cargo test -q --lib account`
@@ -201,18 +200,19 @@ This task creates the HTTP endpoint for whitelisting wallets.
   - [ ] Execute WhitelistWallet command on aggregate
   - [ ] Map AccountNotLinked error to 500 InternalServerError (defensive,
         shouldn't happen)
-  - [ ] Map WalletAlreadyWhitelisted error to 409 Conflict
-  - [ ] Return 200 OK with `{ success: true }`
+  - [ ] Return 200 OK with `{ success: true }` (idempotent - returns success
+        even if wallet was already whitelisted)
 - [ ] Add tracing instrument with client_id and wallet
 - [ ] Export in `src/account/api.rs`: add `mod whitelist_wallet;` and
       `pub use whitelist_wallet::whitelist_wallet;`
 - [ ] Write integration tests:
   - [ ] Test whitelisting wallet for existing client_id returns 200
   - [ ] Test whitelisting wallet for non-existent client_id returns 404
-  - [ ] Test whitelisting duplicate wallet returns 409
-  - [ ] Test events are persisted (query events table)
+  - [ ] Test whitelisting same wallet twice returns 200 both times (idempotent)
+  - [ ] Test whitelisting same wallet twice produces only one event (check
+        events table)
   - [ ] Test view is updated (query account_view via find_by_wallet)
-  - [ ] Test multiple wallets can be whitelisted for same account
+  - [ ] Test multiple different wallets can be whitelisted for same account
 - [ ] Add route to Rocket in `src/main.rs` (mount at
       `/accounts/<client_id>/wallets`)
 - [ ] Run tests: `cargo test -q --lib account::api::whitelist_wallet`
@@ -240,22 +240,16 @@ whitelisting flow.
 - [ ] Verify redemption flow still works with whitelisted wallet lookup
 - [ ] Run E2E tests: `cargo test --test e2e -q`
 
-## Task 9. Update Documentation
+## Task 9. Update README Documentation
 
-This task updates all documentation to reflect the new two-step account setup
-flow.
+This task updates README.md to reflect the new two-step account setup flow.
+(SPEC.md was already updated in Tasks 3 and 6)
 
-- [ ] Update SPEC.md:
-  - [ ] Update Account aggregate section to show
-        `whitelisted_wallets: Vec<Address>`
-  - [ ] Add WalletWhitelisted to Account Events list
-  - [ ] Add WhitelistWallet to Account Commands list
-  - [ ] Update account linking flow to remove wallet
-  - [ ] Add wallet whitelisting as separate step before redemption
 - [ ] Update README.md:
   - [ ] Add `POST /accounts/{client_id}/wallets` to endpoints list
+  - [ ] Update account linking section to show it no longer requires wallet
   - [ ] Update redemption flow description to mention wallet must be whitelisted
-        first
+        before redemption
   - [ ] Add note about multiple wallets per account support
 
 ## Task 10. Final Validation
