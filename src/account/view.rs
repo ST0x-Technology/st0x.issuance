@@ -25,7 +25,7 @@ pub(crate) enum AccountView {
         client_id: ClientId,
         email: Email,
         alpaca_account: AlpacaAccountNumber,
-        wallet: Address,
+        whitelisted_wallets: Vec<Address>,
         status: LinkedAccountStatus,
         linked_at: DateTime<Utc>,
     },
@@ -44,14 +44,13 @@ impl View<Account> for AccountView {
                 client_id,
                 email,
                 alpaca_account,
-                wallet,
                 linked_at,
             } => {
                 *self = Self::Account {
                     client_id: client_id.clone(),
                     email: email.clone(),
                     alpaca_account: alpaca_account.clone(),
-                    wallet: *wallet,
+                    whitelisted_wallets: Vec::new(),
                     status: LinkedAccountStatus::Active,
                     linked_at: *linked_at,
                 };
@@ -119,7 +118,11 @@ pub(crate) async fn find_by_wallet(
         r#"
         SELECT payload as "payload: String"
         FROM account_view
-        WHERE wallet_indexed = ?
+        WHERE EXISTS(
+            SELECT 1
+            FROM json_each(payload, '$.Account.whitelisted_wallets')
+            WHERE value = ?
+        )
         "#,
         wallet_str
     )
@@ -137,12 +140,11 @@ pub(crate) async fn find_by_wallet(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
-
-    use super::*;
     use cqrs_es::EventEnvelope;
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+
+    use super::*;
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -164,14 +166,12 @@ mod tests {
         let client_id = ClientId("test-client-123".to_string());
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let wallet = address!("0x1111111111111111111111111111111111111111");
         let linked_at = Utc::now();
 
         let event = AccountEvent::Linked {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
-            wallet,
             linked_at,
         };
 
@@ -192,7 +192,7 @@ mod tests {
             client_id: view_client_id,
             email: view_email,
             alpaca_account: view_alpaca,
-            wallet: view_wallet,
+            whitelisted_wallets,
             status,
             linked_at: view_linked_at,
         } = view
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(view_client_id, client_id);
         assert_eq!(view_email, email);
         assert_eq!(view_alpaca, alpaca_account);
-        assert_eq!(view_wallet, wallet);
+        assert!(whitelisted_wallets.is_empty());
         assert_eq!(status, LinkedAccountStatus::Active);
         assert_eq!(view_linked_at, linked_at);
     }
@@ -215,14 +215,13 @@ mod tests {
         let client_id = ClientId("test-client-456".to_string());
         let email = Email("test@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA456".to_string());
-        let wallet = address!("0x2222222222222222222222222222222222222222");
         let linked_at = Utc::now();
 
         let view = AccountView::Account {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
-            wallet,
+            whitelisted_wallets: Vec::new(),
             status: LinkedAccountStatus::Active,
             linked_at,
         };
@@ -283,14 +282,13 @@ mod tests {
         let client_id = ClientId("test-client-789".to_string());
         let email = Email("client@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
-        let wallet = address!("0x3333333333333333333333333333333333333333");
         let linked_at = Utc::now();
 
         let view = AccountView::Account {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
-            wallet,
+            whitelisted_wallets: Vec::new(),
             status: LinkedAccountStatus::Active,
             linked_at,
         };

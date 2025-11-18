@@ -1,4 +1,3 @@
-use alloy::primitives::Address;
 use rocket::post;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,6 @@ use super::{AlpacaAccountNumber, ClientId, Email, view::find_by_email};
 pub(crate) struct AccountLinkRequest {
     pub(crate) email: Email,
     pub(crate) account: AlpacaAccountNumber,
-    pub(crate) wallet: Address,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,8 +17,7 @@ pub struct AccountLinkResponse {
 
 #[tracing::instrument(skip(cqrs, pool), fields(
     email = %request.email.0,
-    account = %request.account.0,
-    wallet = ?request.wallet
+    account = %request.account.0
 ))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
 pub(crate) async fn connect_account(
@@ -32,7 +29,6 @@ pub(crate) async fn connect_account(
     let command = super::AccountCommand::Link {
         email: request.email.clone(),
         alpaca_account: request.account.clone(),
-        wallet: request.wallet,
     };
 
     cqrs.execute(aggregate_id, command)
@@ -100,8 +96,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "customer@firm.com",
-            "account": "alpaca-account-123",
-            "wallet": "0x1111111111111111111111111111111111111111"
+            "account": "alpaca-account-123"
         });
 
         let response = client
@@ -156,8 +151,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "duplicate@example.com",
-            "account": "ALPACA789",
-            "wallet": "0x2222222222222222222222222222222222222222"
+            "account": "ALPACA789"
         });
 
         let response1 = client
@@ -216,8 +210,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "not-an-email",
-            "account": "ALPACA999",
-            "wallet": "0x3333333333333333333333333333333333333333"
+            "account": "ALPACA999"
         });
 
         let response = client
@@ -268,8 +261,7 @@ mod tests {
         let email = "events@example.com";
         let request_body = serde_json::json!({
             "email": email,
-            "account": "ALPACA001",
-            "wallet": "0x4444444444444444444444444444444444444444"
+            "account": "ALPACA001"
         });
 
         let response = client
@@ -340,8 +332,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": email,
-            "account": alpaca_account,
-            "wallet": "0x5555555555555555555555555555555555555555"
+            "account": alpaca_account
         });
 
         let response = client
@@ -365,6 +356,7 @@ mod tests {
             client_id,
             email: view_email,
             alpaca_account: view_alpaca_account,
+            whitelisted_wallets,
             status,
             ..
         } = view
@@ -375,6 +367,7 @@ mod tests {
         assert_eq!(client_id, response_body.client_id);
         assert_eq!(view_email.as_str(), email);
         assert_eq!(view_alpaca_account.0, alpaca_account);
+        assert!(whitelisted_wallets.is_empty());
         assert_eq!(status, super::super::LinkedAccountStatus::Active);
     }
 }

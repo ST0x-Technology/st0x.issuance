@@ -125,11 +125,9 @@ mod tests {
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
-        let wallet = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
         let account_cmd = AccountCommand::Link {
             email: email.clone(),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            wallet,
         };
         account_cqrs
             .execute(email.as_str(), account_cmd)
@@ -207,11 +205,9 @@ mod tests {
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
-        let wallet = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
         let account_cmd = AccountCommand::Link {
             email: email.clone(),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            wallet,
         };
         account_cqrs
             .execute(email.as_str(), account_cmd)

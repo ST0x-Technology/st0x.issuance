@@ -73,76 +73,92 @@ find accounts where the wallet exists in the whitelisted_wallets array.
 - **New**: `POST /accounts/{client_id}/wallets` - Whitelist a wallet for an
   account
 
-## Task 1. Remove Wallet from Account Linking (Event, Command, Aggregate)
+## Task 1. Remove Wallet from Account Linking
 
 This task makes `/accounts/connect` compliant with Alpaca's specification by
-removing the wallet requirement from account linking.
+removing the wallet requirement from account linking. This is a complete feature
+change that updates all layers of the system.
 
-- [ ] Remove `wallet: Address` field from `AccountEvent::Linked` in
+**Domain Model Changes:**
+
+- [x] Remove `wallet: Address` field from `AccountEvent::Linked` in
       `src/account/event.rs`
-- [ ] Remove `wallet: Address` field from `AccountCommand::Link` in
+- [x] Remove `wallet: Address` field from `AccountCommand::Link` in
       `src/account/cmd.rs`
-- [ ] Update `Account::Linked` variant in `src/account/mod.rs` to have
+- [x] Update `Account::Linked` variant in `src/account/mod.rs` to have
       `whitelisted_wallets: Vec<Address>` field instead of single wallet
-- [ ] Update aggregate handle() method for Link command to initialize with empty
+- [x] Update aggregate handle() method for Link command to initialize with empty
       `whitelisted_wallets: Vec::new()`
-- [ ] Update aggregate apply() method for Linked event to set
+- [x] Update aggregate apply() method for Linked event to set
       `whitelisted_wallets: Vec::new()`
-- [ ] Update existing unit tests in `src/account/mod.rs`:
-  - [ ] Remove wallet from `AccountEvent::Linked` test data
-  - [ ] Remove wallet from `AccountCommand::Link` test cases
-  - [ ] Update `test_apply_account_linked_updates_state` to check
+- [x] Update aggregate unit tests in `src/account/mod.rs`:
+  - [x] Remove wallet from `AccountEvent::Linked` test data
+  - [x] Remove wallet from `AccountCommand::Link` test cases
+  - [x] Update `test_apply_account_linked_updates_state` to check
         whitelisted_wallets is empty vec
-- [ ] Run tests: `cargo test -q --lib account`
 
-## Task 2. Update Account View and Database Schema
+**View Changes:**
 
-This task updates the database schema and view logic to support multiple
-whitelisted wallets.
-
-- [ ] Update `AccountView::Account` variant in `src/account/view.rs` to have
+- [x] Update `AccountView::Account` variant in `src/account/view.rs` to have
       `whitelisted_wallets: Vec<Address>` instead of single `wallet: Address`
-- [ ] Update View::update() method to handle `AccountEvent::Linked` with
-      `whitelisted_wallets: Vec::new()`
-- [ ] Update unit test `test_view_update_from_account_linked_event` to expect
+- [x] Update View::update() method to handle `AccountEvent::Linked` without
+      wallet field
+- [x] Update unit test `test_view_update_from_account_linked_event` to expect
       empty whitelisted_wallets
-- [ ] Create database migration: `sqlx migrate add update_account_view_wallets`
-- [ ] Edit migration file to:
-  - [ ] Drop existing `wallet_indexed` column
-  - [ ] Drop existing index `idx_account_view_wallet_indexed`
-- [ ] Reset database: `sqlx db reset -y`
-- [ ] Run tests: `cargo test -q --lib account::view`
+- [x] Update `find_by_wallet()` to query whitelisted_wallets array using
+      json_each
 
-## Task 3. Update /accounts/connect Endpoint
+**API Changes:**
 
-This task removes the wallet field from the account linking endpoint.
-
-- [ ] Remove `wallet: Address` field from `AccountLinkRequest` struct in
+- [x] Remove `wallet: Address` field from `AccountLinkRequest` struct in
       `src/account/api.rs`
-- [ ] Remove wallet from tracing instrument fields
-- [ ] Update command construction to not include wallet parameter
-- [ ] Update all endpoint tests:
-  - [ ] Remove wallet from all test request JSON bodies
-  - [ ] Update `test_views_are_updated_correctly` to verify whitelisted_wallets
+- [x] Remove wallet from tracing instrument fields
+- [x] Update command construction to not include wallet parameter
+- [x] Update all endpoint tests:
+  - [x] Remove wallet from all test request JSON bodies
+  - [x] Update `test_views_are_updated_correctly` to verify whitelisted_wallets
         is empty
-- [ ] Run tests: `cargo test -q account::api`
-- [ ] Run workspace tests to ensure nothing else broke:
-      `cargo test --workspace -q`
 
-## Task 4. Add Wallet Whitelisting (Event, Command, Aggregate)
+**Database Migration:**
 
-This task adds the ability to whitelist wallets on an already-linked account.
+- [x] Delete obsolete migration file
+      `20251025023426_add_wallet_to_account_view.sql`
+
+**Test Helper Updates:**
+
+- [x] Update `src/mint/api/test_utils.rs` to remove wallet from
+      AccountCommand::Link
+- [x] Update `src/mint/api/initiate.rs` test helpers to remove wallet from
+      AccountCommand::Link
+
+**Validation:**
+
+- [x] Run tests: `cargo test -q account` (all 15 tests pass)
+- [x] Verify build: `cargo build` (compiles successfully)
+- [x] Run clippy: no warnings
+- [x] Run formatter: `cargo fmt`
+
+**Result:** The `/accounts/connect` endpoint no longer requires wallet field.
+Account linking now only needs email and alpaca_account. All tests pass and code
+compiles.
+
+## Task 2. Add Wallet Whitelisting Feature
+
+This task adds the complete wallet whitelisting feature: domain model, view,
+endpoint, and all tests. After this task, APs can whitelist multiple wallets for
+their accounts.
+
+**Domain Model Changes:**
 
 - [ ] Add `AccountEvent::WalletWhitelisted` variant in `src/account/event.rs`
       with fields:
   - [ ] `wallet: Address`
   - [ ] `whitelisted_at: DateTime<Utc>`
-- [ ] Update event_type() match to return "AccountEvent::WalletWhitelisted" for
-      new variant
+- [ ] Update event_type() match to return "AccountEvent::WalletWhitelisted"
 - [ ] Add `AccountCommand::WhitelistWallet` variant in `src/account/cmd.rs` with
       `wallet: Address` field
 - [ ] Add error variant in `src/account/mod.rs`:
-  - [ ] `AccountError::AccountNotLinked`
+      `AccountError::AccountNotLinked`
 - [ ] Add handle() logic for WhitelistWallet command:
   - [ ] Match on aggregate state, return AccountNotLinked if NotLinked
   - [ ] Check if wallet already in whitelisted_wallets vec, return empty vec if
@@ -152,7 +168,7 @@ This task adds the ability to whitelist wallets on an already-linked account.
 - [ ] Add apply() logic for WalletWhitelisted event:
   - [ ] Match on event variant
   - [ ] If aggregate is Linked, push wallet to whitelisted_wallets vec
-- [ ] Write unit tests:
+- [ ] Write aggregate unit tests:
   - [ ] Test whitelisting wallet on linked account produces WalletWhitelisted
         event
   - [ ] Test whitelisting wallet on NotLinked account returns AccountNotLinked
@@ -161,12 +177,8 @@ This task adds the ability to whitelist wallets on an already-linked account.
         (idempotent)
   - [ ] Test apply() correctly adds wallet to whitelisted_wallets vec
   - [ ] Test apply() can add multiple different wallets
-- [ ] Run tests: `cargo test -q --lib account`
 
-## Task 5. Update Account View for Wallet Whitelisting
-
-This task updates the view to handle wallet whitelisting events and enables
-wallet-based lookup.
+**View Changes:**
 
 - [ ] Update View::update() method in `src/account/view.rs` to handle
       `AccountEvent::WalletWhitelisted`:
@@ -178,16 +190,13 @@ wallet-based lookup.
   - [ ] Match against the expanded values
   - [ ] SQL pattern:
         `EXISTS(SELECT 1 FROM json_each(payload, '$.Account.whitelisted_wallets') WHERE value = ?)`
-- [ ] Write unit tests:
+- [ ] Write view unit tests:
   - [ ] Test view update from WalletWhitelisted event adds wallet to vec
   - [ ] Test find_by_wallet finds account with whitelisted wallet
   - [ ] Test find_by_wallet returns None for non-whitelisted wallet
   - [ ] Test find_by_wallet works with multiple whitelisted wallets
-- [ ] Run tests: `cargo test -q --lib account::view`
 
-## Task 6. Create Wallet Whitelisting Endpoint
-
-This task creates the HTTP endpoint for whitelisting wallets.
+**API Endpoint:**
 
 - [ ] Create `src/account/api/whitelist_wallet.rs` module
 - [ ] Define request struct `WhitelistWalletRequest { wallet: Address }`
@@ -205,6 +214,8 @@ This task creates the HTTP endpoint for whitelisting wallets.
 - [ ] Add tracing instrument with client_id and wallet
 - [ ] Export in `src/account/api.rs`: add `mod whitelist_wallet;` and
       `pub use whitelist_wallet::whitelist_wallet;`
+- [ ] Add route to Rocket in `src/main.rs` (mount at
+      `/accounts/<client_id>/wallets`)
 - [ ] Write integration tests:
   - [ ] Test whitelisting wallet for existing client_id returns 200
   - [ ] Test whitelisting wallet for non-existent client_id returns 404
@@ -213,37 +224,45 @@ This task creates the HTTP endpoint for whitelisting wallets.
         events table)
   - [ ] Test view is updated (query account_view via find_by_wallet)
   - [ ] Test multiple different wallets can be whitelisted for same account
-- [ ] Add route to Rocket in `src/main.rs` (mount at
-      `/accounts/<client_id>/wallets`)
-- [ ] Run tests: `cargo test -q --lib account::api::whitelist_wallet`
-- [ ] Run all account tests: `cargo test -q account`
 
-## Task 7. Update Mint API Tests
+**Validation:**
+
+- [ ] Run tests: `cargo test --workspace -q`
+- [ ] Verify build: `cargo build`
+
+**Result:** The `POST /accounts/{client_id}/wallets` endpoint is fully
+functional. APs can whitelist multiple wallets for their accounts. Redemption
+flow can look up client_id by wallet address. All tests pass and code compiles.
+
+## Task 3. Update Mint API Tests
 
 This task updates mint endpoint tests to use the new two-step account setup
-flow.
+flow: first link account (without wallet), then whitelist wallet.
 
-- [ ] Find all test helper functions in `src/mint/api/test_utils.rs` or
-      individual test files that link accounts
-- [ ] Update account linking to remove wallet field
-- [ ] Add wallet whitelisting step after account linking in test setup
+- [ ] Update test helpers in `src/mint/api/test_utils.rs` to use two-step flow
+- [ ] Update any inline test setup in `src/mint/api/initiate.rs` to use two-step
+      flow
 - [ ] Run tests: `cargo test -q mint::api`
 
-## Task 8. Update E2E Tests
+**Result:** All mint API tests pass with the new account setup flow.
+
+## Task 4. Update E2E Tests
 
 This task updates end-to-end tests to use the new account linking and wallet
 whitelisting flow.
 
-- [ ] Find account setup code in `tests/e2e.rs`
-- [ ] Remove wallet field from account linking HTTP request
-- [ ] Add HTTP request to whitelist wallet after account is linked
-- [ ] Verify redemption flow still works with whitelisted wallet lookup
+- [ ] Update account setup in `tests/e2e.rs` to use two-step flow:
+  - [ ] Link account without wallet field
+  - [ ] Whitelist wallet as separate step
+- [ ] Verify redemption flow still works with wallet lookup
 - [ ] Run E2E tests: `cargo test --test e2e -q`
 
-## Task 9. Update README Documentation
+**Result:** E2E tests pass with the new two-step account setup flow. Redemption
+flow correctly looks up client_id from whitelisted wallet.
+
+## Task 5. Update Documentation
 
 This task updates README.md to reflect the new two-step account setup flow.
-(SPEC.md was already updated in Tasks 3 and 6)
 
 - [ ] Update README.md:
   - [ ] Add `POST /accounts/{client_id}/wallets` to endpoints list
@@ -252,7 +271,10 @@ This task updates README.md to reflect the new two-step account setup flow.
         before redemption
   - [ ] Add note about multiple wallets per account support
 
-## Task 10. Final Validation
+**Result:** Documentation accurately reflects the new account linking and wallet
+whitelisting flow.
+
+## Task 6. Final Validation
 
 This task ensures all code passes checks and tests.
 
@@ -261,3 +283,5 @@ This task ensures all code passes checks and tests.
       `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
 - [ ] Run formatter: `cargo fmt`
 - [ ] Verify E2E tests pass: `cargo test --test e2e -q`
+
+**Result:** All tests pass, no clippy warnings, code is properly formatted.

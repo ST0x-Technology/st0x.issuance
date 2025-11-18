@@ -3,6 +3,7 @@ mod cmd;
 mod event;
 pub(crate) mod view;
 
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -76,7 +77,7 @@ pub(crate) enum Account {
         client_id: ClientId,
         email: Email,
         alpaca_account: AlpacaAccountNumber,
-        wallet: alloy::primitives::Address,
+        whitelisted_wallets: Vec<Address>,
         status: LinkedAccountStatus,
         linked_at: DateTime<Utc>,
     },
@@ -105,7 +106,7 @@ impl Aggregate for Account {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            AccountCommand::Link { email, alpaca_account, wallet } => {
+            AccountCommand::Link { email, alpaca_account } => {
                 if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
                         email: email.as_str().to_string(),
@@ -119,7 +120,6 @@ impl Aggregate for Account {
                     client_id,
                     email,
                     alpaca_account,
-                    wallet,
                     linked_at: now,
                 }])
             }
@@ -132,14 +132,13 @@ impl Aggregate for Account {
                 client_id,
                 email,
                 alpaca_account,
-                wallet,
                 linked_at,
             } => {
                 *self = Self::Linked {
                     client_id,
                     email,
                     alpaca_account,
-                    wallet,
+                    whitelisted_wallets: Vec::new(),
                     status: LinkedAccountStatus::Active,
                     linked_at,
                 };
@@ -159,7 +158,6 @@ pub(crate) enum AccountError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
 
     use super::{
@@ -173,14 +171,12 @@ mod tests {
     fn test_link_account_creates_new_account() {
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let wallet = address!("0x1111111111111111111111111111111111111111");
 
         let validator = AccountTestFramework::with(())
             .given_no_previous_events()
             .when(AccountCommand::Link {
                 email: email.clone(),
                 alpaca_account: alpaca_account.clone(),
-                wallet,
             });
 
         let result = validator.inspect_result();
@@ -194,13 +190,11 @@ mod tests {
                         client_id,
                         email: event_email,
                         alpaca_account: event_alpaca,
-                        wallet: event_wallet,
                         linked_at,
                     } => {
                         assert!(!client_id.0.is_empty());
                         assert_eq!(event_email, &email);
                         assert_eq!(event_alpaca, &alpaca_account);
-                        assert_eq!(event_wallet, &wallet);
                         assert!(linked_at.timestamp() > 0);
                     }
                 }
@@ -248,17 +242,15 @@ mod tests {
     fn test_link_account_when_already_linked_returns_error() {
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let wallet = address!("0x2222222222222222222222222222222222222222");
 
         AccountTestFramework::with(())
             .given(vec![AccountEvent::Linked {
                 client_id: super::ClientId("existing-client-id".to_string()),
                 email: email.clone(),
                 alpaca_account: AlpacaAccountNumber("ALPACA456".to_string()),
-                wallet: address!("0x3333333333333333333333333333333333333333"),
                 linked_at: chrono::Utc::now(),
             }])
-            .when(AccountCommand::Link { email, alpaca_account, wallet })
+            .when(AccountCommand::Link { email, alpaca_account })
             .then_expect_error(AccountError::AccountAlreadyExists {
                 email: "user@example.com".to_string(),
             });
@@ -273,14 +265,12 @@ mod tests {
         let client_id = super::ClientId("test-client-123".to_string());
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let wallet = address!("0x4444444444444444444444444444444444444444");
         let linked_at = chrono::Utc::now();
 
         account.apply(AccountEvent::Linked {
             client_id: client_id.clone(),
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
-            wallet,
             linked_at,
         });
 
@@ -289,14 +279,14 @@ mod tests {
                 client_id: linked_client_id,
                 email: linked_email,
                 alpaca_account: linked_alpaca,
-                wallet: linked_wallet,
+                whitelisted_wallets,
                 status,
                 linked_at: linked_at_timestamp,
             } => {
                 assert_eq!(linked_client_id, client_id);
                 assert_eq!(linked_email, email);
                 assert_eq!(linked_alpaca, alpaca_account);
-                assert_eq!(linked_wallet, wallet);
+                assert!(whitelisted_wallets.is_empty());
                 assert_eq!(status, LinkedAccountStatus::Active);
                 assert_eq!(linked_at_timestamp, linked_at);
             }

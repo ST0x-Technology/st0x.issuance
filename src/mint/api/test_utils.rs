@@ -102,11 +102,9 @@ pub(super) async fn setup_with_account_and_asset(
     let email =
         Email::new("test@placeholder.com".to_string()).expect("Valid email");
 
-    let wallet = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     let account_cmd = AccountCommand::Link {
         email: email.clone(),
         alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-        wallet,
     };
 
     account_cqrs
