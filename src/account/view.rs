@@ -173,7 +173,7 @@ mod tests {
         let linked_at = Utc::now();
 
         let event = AccountEvent::Linked {
-            client_id: client_id.clone(),
+            client_id,
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
             linked_at,
@@ -222,7 +222,7 @@ mod tests {
         let linked_at = Utc::now();
 
         let view = AccountView::Account {
-            client_id: client_id.clone(),
+            client_id,
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
             whitelisted_wallets: Vec::new(),

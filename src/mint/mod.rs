@@ -716,7 +716,7 @@ mod tests {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
-                client_id: client_id.clone(),
+                client_id,
                 wallet,
             });
 
@@ -786,7 +786,7 @@ mod tests {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
-                client_id: client_id.clone(),
+                client_id,
                 wallet,
                 initiated_at: chrono::Utc::now(),
             }])
@@ -828,7 +828,7 @@ mod tests {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),
-            client_id: client_id.clone(),
+            client_id,
             wallet,
             initiated_at,
         });
@@ -1917,7 +1917,7 @@ mod tests {
                 underlying: data.underlying.clone(),
                 token: data.token.clone(),
                 network: data.network.clone(),
-                client_id: data.client_id.clone(),
+                client_id: data.client_id,
                 wallet: data.wallet,
             },
         )

@@ -256,6 +256,8 @@ mod tests {
         let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
+        let client_id = ClientId::new();
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
             .manage(account_cqrs)
@@ -273,7 +275,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "network": "base",
-            "client_id": "test",
+            "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
@@ -318,6 +320,8 @@ mod tests {
             .await
             .expect("Failed to add asset");
 
+        let nonexistent_client_id = ClientId::new();
+
         let rocket = rocket::build()
             .manage(mint_cqrs)
             .manage(account_cqrs)
@@ -335,7 +339,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "network": "base",
-            "client_id": "nonexistent-client-id",
+            "client_id": nonexistent_client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 

@@ -393,7 +393,6 @@ mod tests {
     };
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolEvent;
-    use chrono::Utc;
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
         persist::GenericQuery,

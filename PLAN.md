@@ -239,23 +239,25 @@ flaw. Redemption flow can look up client_id by wallet address.
 This task updates mint endpoint tests to use the new two-step account setup
 flow: first link account (without wallet), then whitelist wallet.
 
-- [ ] Update test helpers in `src/mint/api/test_utils.rs` to use two-step flow
-- [ ] Update any inline test setup in `src/mint/api/initiate.rs` to use two-step
+- [x] Update test helpers in `src/mint/api/test_utils.rs` to use two-step flow
+- [x] Update any inline test setup in `src/mint/api/initiate.rs` to use two-step
       flow
-- [ ] Run tests: `cargo test -q mint::api`
+- [x] Run tests: `cargo test -q mint::api`
+- [x] Fix 3 failing tests that used invalid client_id values
 
-**Result:** All mint API tests pass with the new account setup flow.
+**Result:** All mint API tests pass with the new account setup flow. Updated
+tests to use valid UUIDs for ClientId instead of test strings.
 
 ## Task 4. Update E2E Tests
 
 This task updates end-to-end tests to use the new account linking and wallet
 whitelisting flow.
 
-- [ ] Update account setup in `tests/e2e.rs` to use two-step flow:
-  - [ ] Link account without wallet field
-  - [ ] Whitelist wallet as separate step
-- [ ] Verify redemption flow still works with wallet lookup
-- [ ] Run E2E tests: `cargo test --test e2e -q`
+- [x] Update account setup in `tests/e2e.rs` to use two-step flow:
+  - [x] Link account without wallet field
+  - [x] Whitelist wallet as separate step
+- [x] Verify redemption flow still works with wallet lookup
+- [x] Run E2E tests: `cargo test --test e2e -q`
 
 **Result:** E2E tests pass with the new two-step account setup flow. Redemption
 flow correctly looks up client_id from whitelisted wallet.
@@ -264,24 +266,30 @@ flow correctly looks up client_id from whitelisted wallet.
 
 This task updates README.md to reflect the new two-step account setup flow.
 
-- [ ] Update README.md:
-  - [ ] Add `POST /accounts/{client_id}/wallets` to endpoints list
-  - [ ] Update account linking section to show it no longer requires wallet
-  - [ ] Update redemption flow description to mention wallet must be whitelisted
-        before redemption
-  - [ ] Add note about multiple wallets per account support
+- [x] Update README.md:
+  - [x] Add `POST /accounts/{client_id}/wallets` to endpoints list
+  - [x] Add new "Account Setup Flow" section explaining the two-step process
+  - [x] Update Mint Flow to mention wallet validation
+  - [x] Update Redemption Flow to mention wallet lookup by address
+  - [x] Document support for multiple wallets per account
 
 **Result:** Documentation accurately reflects the new account linking and wallet
-whitelisting flow.
+whitelisting flow. Added comprehensive Account Setup Flow section before Mint
+and Redemption flows.
 
 ## Task 6. Final Validation
 
 This task ensures all code passes checks and tests.
 
-- [ ] Run all workspace tests: `cargo test --workspace -q`
-- [ ] Run clippy:
+- [x] Run all workspace tests: `cargo test --workspace -q`
+- [x] Run clippy:
       `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run formatter: `cargo fmt`
-- [ ] Verify E2E tests pass: `cargo test --test e2e -q`
+- [x] Run formatter: `cargo fmt`
+- [x] Verify E2E tests pass: `cargo test --test e2e -q`
+- [x] Fixed all clippy warnings:
+  - [x] Removed unnecessary `Self` references in ApiError
+  - [x] Removed all `.clone()` calls on `ClientId` (implements Copy)
+  - [x] Used `clone_from()` for efficient cloning in E2E tests
+  - [x] Removed unused `chrono::Utc` import in redemption detector tests
 
-**Result:** All tests pass, no clippy warnings, code is properly formatted.
+**Result:** All 278 tests pass, no clippy warnings, code is properly formatted.

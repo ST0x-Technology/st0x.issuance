@@ -253,7 +253,7 @@ mod tests {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
-                client_id: client_id.clone(),
+                client_id,
                 wallet,
             },
         )

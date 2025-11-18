@@ -40,8 +40,8 @@ impl<'r> Responder<'r, 'static> for ApiError {
         _: &'r Request<'_>,
     ) -> rocket::response::Result<'static> {
         let status = match self {
-            ApiError::AccountNotFound => Status::NotFound,
-            ApiError::Database(_) | ApiError::CommandFailed(_) => {
+            Self::AccountNotFound => Status::NotFound,
+            Self::Database(_) | Self::CommandFailed(_) => {
                 Status::InternalServerError
             }
         };
@@ -374,6 +374,11 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
+        let response_body: AccountLinkResponse =
+            response.into_json().await.expect("valid JSON response");
+
+        let client_id_str = response_body.client_id.to_string();
+
         let events = sqlx::query!(
             r"
             SELECT aggregate_id, event_type, sequence
@@ -381,14 +386,14 @@ mod tests {
             WHERE aggregate_id = ? AND aggregate_type = 'Account'
             ORDER BY sequence
             ",
-            email
+            client_id_str
         )
         .fetch_all(&pool)
         .await
         .expect("Failed to query events");
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].aggregate_id, email);
+        assert_eq!(events[0].aggregate_id, client_id_str);
         assert_eq!(events[0].event_type, "AccountEvent::Linked");
         assert_eq!(events[0].sequence, 1);
     }

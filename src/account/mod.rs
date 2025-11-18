@@ -231,7 +231,7 @@ mod tests {
         let events = AccountTestFramework::with(())
             .given_no_previous_events()
             .when(AccountCommand::Link {
-                client_id: client_id.clone(),
+                client_id,
                 email: email.clone(),
                 alpaca_account: alpaca_account.clone(),
             })
