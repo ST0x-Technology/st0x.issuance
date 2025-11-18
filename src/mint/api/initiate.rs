@@ -24,7 +24,7 @@ pub(crate) struct MintRequest {
     #[serde(rename = "token_symbol")]
     pub(crate) token: TokenSymbol,
     pub(crate) network: Network,
-    pub(crate) client_id: String,
+    pub(crate) client_id: ClientId,
     #[serde(rename = "wallet_address")]
     pub(crate) wallet: Address,
 }
@@ -55,9 +55,7 @@ pub(crate) async fn initiate_mint(
     )
     .await?;
 
-    let client_id = ClientId(request.client_id.clone());
-
-    validate_client_eligible(pool.inner(), &client_id).await?;
+    validate_client_eligible(pool.inner(), &request.client_id).await?;
 
     let issuer_request_id =
         IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
@@ -69,7 +67,7 @@ pub(crate) async fn initiate_mint(
         underlying: request.underlying,
         token: request.token,
         network: request.network,
-        client_id,
+        client_id: request.client_id,
         wallet: request.wallet,
     };
 
@@ -103,10 +101,7 @@ mod tests {
     use tracing::debug;
 
     use super::initiate_mint;
-    use crate::account::{
-        AccountCommand, AccountView, AlpacaAccountNumber, Email,
-        view::find_by_email,
-    };
+    use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
     use crate::mint::api::test_utils::{
         setup_test_environment, setup_with_account_and_asset,
     };
@@ -125,23 +120,19 @@ mod tests {
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
+        let client_id = ClientId::new();
+
         let account_cmd = AccountCommand::Link {
+            client_id,
             email: email.clone(),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
         };
+
+        let aggregate_id = client_id.to_string();
         account_cqrs
-            .execute(email.as_str(), account_cmd)
+            .execute(&aggregate_id, account_cmd)
             .await
             .expect("Failed to link account");
-
-        let account_view = find_by_email(&pool, &email)
-            .await
-            .expect("Failed to query account")
-            .expect("Account should exist");
-
-        let AccountView::Account { client_id, .. } = account_view else {
-            panic!("Expected Account variant");
-        };
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -176,7 +167,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "network": "base",
-            "client_id": client_id.0,
+            "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
@@ -205,23 +196,19 @@ mod tests {
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
+        let client_id = ClientId::new();
+
         let account_cmd = AccountCommand::Link {
+            client_id,
             email: email.clone(),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
         };
+
+        let aggregate_id = client_id.to_string();
         account_cqrs
-            .execute(email.as_str(), account_cmd)
+            .execute(&aggregate_id, account_cmd)
             .await
             .expect("Failed to link account");
-
-        let account_view = find_by_email(&pool, &email)
-            .await
-            .expect("Failed to query account")
-            .expect("Account should exist");
-
-        let AccountView::Account { client_id, .. } = account_view else {
-            panic!("Expected Account variant");
-        };
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -240,7 +227,7 @@ mod tests {
             "underlying_symbol": "UNKNOWN",
             "token_symbol": "tUNKNOWN",
             "network": "base",
-            "client_id": client_id.0,
+            "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
@@ -378,12 +365,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -457,13 +440,9 @@ mod tests {
         let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
-        let (client_id_str, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+        let (client_id, underlying, token, network) =
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -484,7 +463,7 @@ mod tests {
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
             "network": network.0,
-            "client_id": client_id_str,
+            "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
 
@@ -529,7 +508,7 @@ mod tests {
         assert_eq!(view_underlying, underlying);
         assert_eq!(view_token, token);
         assert_eq!(view_network, network);
-        assert_eq!(view_client_id.0, client_id_str);
+        assert_eq!(view_client_id, client_id);
         assert_eq!(
             view_wallet,
             address!("0x1234567890abcdef1234567890abcdef12345678")
@@ -542,12 +521,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -586,12 +561,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, _network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let rocket = rocket::build()
             .manage(mint_cqrs)
@@ -636,16 +607,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_with_duplicate_issuer_request_id() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
+        let (_pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = "test-issuer-request-id";
 
@@ -656,7 +623,7 @@ mod tests {
             underlying: underlying.clone(),
             token: token.clone(),
             network: network.clone(),
-            client_id: ClientId(client_id.clone()),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 

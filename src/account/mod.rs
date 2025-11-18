@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
+use sqlx::{Sqlite, encode::IsNull, sqlite::SqliteArgumentValue};
+use std::str::FromStr;
 use uuid::Uuid;
 
-pub use api::AccountLinkResponse;
-pub(crate) use api::connect_account;
+pub use api::{AccountLinkResponse, WhitelistWalletResponse};
+pub(crate) use api::{connect_account, whitelist_wallet};
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
 pub(crate) use view::AccountView;
@@ -55,12 +57,42 @@ impl<'de> Deserialize<'de> for Email {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientId(Uuid);
+
+impl ClientId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
 
 impl std::fmt::Display for ClientId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for ClientId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(ClientId)
+    }
+}
+
+impl sqlx::Type<Sqlite> for ClientId {
+    fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<Sqlite>>::type_info()
+    }
+}
+
+impl<'q> sqlx::Encode<'q, Sqlite> for ClientId {
+    fn encode_by_ref(
+        &self,
+        args: &mut Vec<SqliteArgumentValue<'q>>,
+    ) -> Result<IsNull, sqlx::error::BoxDynError> {
+        args.push(SqliteArgumentValue::Text(self.0.to_string().into()));
+        Ok(IsNull::No)
     }
 }
 
@@ -106,14 +138,13 @@ impl Aggregate for Account {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            AccountCommand::Link { email, alpaca_account } => {
+            AccountCommand::Link { client_id, email, alpaca_account } => {
                 if matches!(self, Self::Linked { .. }) {
                     return Err(AccountError::AccountAlreadyExists {
                         email: email.as_str().to_string(),
                     });
                 }
 
-                let client_id = ClientId(Uuid::new_v4().to_string());
                 let now = Utc::now();
 
                 Ok(vec![AccountEvent::Linked {
@@ -123,6 +154,20 @@ impl Aggregate for Account {
                     linked_at: now,
                 }])
             }
+            AccountCommand::WhitelistWallet { wallet } => match self {
+                Self::NotLinked => Err(AccountError::AccountNotLinked),
+                Self::Linked { whitelisted_wallets, .. } => {
+                    if whitelisted_wallets.contains(&wallet) {
+                        Ok(vec![])
+                    } else {
+                        let now = Utc::now();
+                        Ok(vec![AccountEvent::WalletWhitelisted {
+                            wallet,
+                            whitelisted_at: now,
+                        }])
+                    }
+                }
+            },
         }
     }
 
@@ -143,6 +188,11 @@ impl Aggregate for Account {
                     linked_at,
                 };
             }
+            AccountEvent::WalletWhitelisted { wallet, .. } => {
+                if let Self::Linked { whitelisted_wallets, .. } = self {
+                    whitelisted_wallets.push(wallet);
+                }
+            }
         }
     }
 }
@@ -154,53 +204,56 @@ pub(crate) enum AccountError {
 
     #[error("Account already exists for email: {email}")]
     AccountAlreadyExists { email: String },
+
+    #[error("Account is not linked")]
+    AccountNotLinked,
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use uuid::Uuid;
 
     use super::{
         Account, AccountCommand, AccountError, AccountEvent,
-        AlpacaAccountNumber, Email, LinkedAccountStatus,
+        AlpacaAccountNumber, ClientId, Email, LinkedAccountStatus,
     };
 
     type AccountTestFramework = TestFramework<Account>;
 
     #[test]
     fn test_link_account_creates_new_account() {
+        let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
 
-        let validator = AccountTestFramework::with(())
+        let events = AccountTestFramework::with(())
             .given_no_previous_events()
             .when(AccountCommand::Link {
+                client_id: client_id.clone(),
                 email: email.clone(),
                 alpaca_account: alpaca_account.clone(),
-            });
+            })
+            .inspect_result()
+            .unwrap();
 
-        let result = validator.inspect_result();
+        assert_eq!(events.len(), 1);
 
-        match result {
-            Ok(events) => {
-                assert_eq!(events.len(), 1);
+        let AccountEvent::Linked {
+            client_id: event_client_id,
+            email: event_email,
+            alpaca_account: event_alpaca,
+            linked_at,
+        } = &events[0]
+        else {
+            panic!("Expected Linked event, got {:?}", &events[0])
+        };
 
-                match &events[0] {
-                    AccountEvent::Linked {
-                        client_id,
-                        email: event_email,
-                        alpaca_account: event_alpaca,
-                        linked_at,
-                    } => {
-                        assert!(!client_id.0.is_empty());
-                        assert_eq!(event_email, &email);
-                        assert_eq!(event_alpaca, &alpaca_account);
-                        assert!(linked_at.timestamp() > 0);
-                    }
-                }
-            }
-            Err(e) => panic!("Expected success, got error: {e}"),
-        }
+        assert_eq!(event_client_id, &client_id);
+        assert_eq!(event_email, &email);
+        assert_eq!(event_alpaca, &alpaca_account);
+        assert!(linked_at.timestamp() > 0);
     }
 
     #[test]
@@ -240,17 +293,18 @@ mod tests {
 
     #[test]
     fn test_link_account_when_already_linked_returns_error() {
+        let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
 
         AccountTestFramework::with(())
             .given(vec![AccountEvent::Linked {
-                client_id: super::ClientId("existing-client-id".to_string()),
+                client_id: ClientId::new(),
                 email: email.clone(),
                 alpaca_account: AlpacaAccountNumber("ALPACA456".to_string()),
                 linked_at: chrono::Utc::now(),
             }])
-            .when(AccountCommand::Link { email, alpaca_account })
+            .when(AccountCommand::Link { client_id, email, alpaca_account })
             .then_expect_error(AccountError::AccountAlreadyExists {
                 email: "user@example.com".to_string(),
             });
@@ -262,13 +316,13 @@ mod tests {
 
         assert!(matches!(account, Account::NotLinked));
 
-        let client_id = super::ClientId("test-client-123".to_string());
+        let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
         let linked_at = chrono::Utc::now();
 
         account.apply(AccountEvent::Linked {
-            client_id: client_id.clone(),
+            client_id,
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
             linked_at,
@@ -296,7 +350,134 @@ mod tests {
 
     #[test]
     fn test_client_id_display() {
-        let id = super::ClientId("client-123".to_string());
-        assert_eq!(format!("{id}"), "client-123");
+        let uuid = Uuid::new_v4();
+        let id = ClientId(uuid);
+        assert_eq!(format!("{id}"), uuid.to_string());
+    }
+
+    #[test]
+    fn test_whitelist_wallet_on_linked_account() {
+        let email = Email("user@example.com".to_string());
+        let client_id = ClientId::new();
+        let linked_at = chrono::Utc::now();
+
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let events = AccountTestFramework::with(())
+            .given(vec![AccountEvent::Linked {
+                client_id,
+                email,
+                alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+                linked_at,
+            }])
+            .when(AccountCommand::WhitelistWallet { wallet })
+            .inspect_result()
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+
+        let AccountEvent::WalletWhitelisted {
+            wallet: event_wallet,
+            whitelisted_at,
+        } = &events[0]
+        else {
+            panic!("Expected WalletWhitelisted event, got {:?}", &events[0])
+        };
+
+        assert_eq!(event_wallet, &wallet);
+        assert!(whitelisted_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_whitelist_wallet_on_not_linked_account() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        AccountTestFramework::with(())
+            .given_no_previous_events()
+            .when(AccountCommand::WhitelistWallet { wallet })
+            .then_expect_error(AccountError::AccountNotLinked);
+    }
+
+    #[test]
+    fn test_whitelist_already_whitelisted_wallet_is_idempotent() {
+        let email = Email("user@example.com".to_string());
+        let client_id = ClientId::new();
+        let linked_at = chrono::Utc::now();
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+        let whitelisted_at = chrono::Utc::now();
+
+        AccountTestFramework::with(())
+            .given(vec![
+                AccountEvent::Linked {
+                    client_id,
+                    email,
+                    alpaca_account: AlpacaAccountNumber(
+                        "ALPACA123".to_string(),
+                    ),
+                    linked_at,
+                },
+                AccountEvent::WalletWhitelisted { wallet, whitelisted_at },
+            ])
+            .when(AccountCommand::WhitelistWallet { wallet })
+            .then_expect_events(vec![]);
+    }
+
+    #[test]
+    fn test_apply_wallet_whitelisted_adds_wallet() {
+        let mut account = Account::Linked {
+            client_id: ClientId::new(),
+            email: Email("user@example.com".to_string()),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+            whitelisted_wallets: Vec::new(),
+            status: LinkedAccountStatus::Active,
+            linked_at: chrono::Utc::now(),
+        };
+
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        account.apply(AccountEvent::WalletWhitelisted {
+            wallet,
+            whitelisted_at: chrono::Utc::now(),
+        });
+
+        let Account::Linked { whitelisted_wallets, .. } = account else {
+            panic!("Expected account to be linked")
+        };
+
+        assert_eq!(whitelisted_wallets.len(), 1);
+        assert_eq!(whitelisted_wallets[0], wallet);
+    }
+
+    #[test]
+    fn test_apply_wallet_whitelisted_adds_multiple_wallets() {
+        let mut account = Account::Linked {
+            client_id: ClientId::new(),
+            email: Email("user@example.com".to_string()),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+            whitelisted_wallets: Vec::new(),
+            status: LinkedAccountStatus::Active,
+            linked_at: chrono::Utc::now(),
+        };
+
+        let wallet1 = address!("0x1111111111111111111111111111111111111111");
+        let wallet2 = address!("0x2222222222222222222222222222222222222222");
+
+        account.apply(AccountEvent::WalletWhitelisted {
+            wallet: wallet1,
+            whitelisted_at: chrono::Utc::now(),
+        });
+
+        account.apply(AccountEvent::WalletWhitelisted {
+            wallet: wallet2,
+            whitelisted_at: chrono::Utc::now(),
+        });
+
+        let Account::Linked { whitelisted_wallets, .. } = account else {
+            panic!("Expected account to be linked")
+        };
+
+        assert_eq!(whitelisted_wallets.len(), 2);
+        assert_eq!(whitelisted_wallets[0], wallet1);
+        assert_eq!(whitelisted_wallets[1], wallet2);
     }
 }

@@ -209,7 +209,7 @@ mod tests {
         setup_with_account_and_asset,
     };
     use crate::mint::{
-        ClientId, IssuerRequestId, MintCommand, MintView, Quantity,
+        IssuerRequestId, MintCommand, MintView, Quantity,
         TokenizationRequestId, view::find_by_issuer_request_id,
     };
 
@@ -219,12 +219,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-ok-test");
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -236,7 +232,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -283,12 +279,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
         let tokenization_request_id =
@@ -301,7 +293,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -349,12 +341,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-complete-123");
         let tokenization_request_id =
@@ -367,7 +355,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -431,12 +419,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-view-123");
         let tokenization_request_id =
@@ -449,7 +433,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -516,12 +500,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-123");
         let tokenization_request_id =
@@ -534,7 +514,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -598,12 +578,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
         let tokenization_request_id =
@@ -616,7 +592,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
@@ -685,12 +661,8 @@ mod tests {
             setup_test_environment().await;
 
         let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(
-                &pool,
-                &account_cqrs,
-                &tokenized_asset_cqrs,
-            )
-            .await;
+            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
+                .await;
 
         let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
         let correct_tokenization_request_id =
@@ -705,7 +677,7 @@ mod tests {
             underlying,
             token,
             network,
-            client_id: ClientId(client_id),
+            client_id,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 

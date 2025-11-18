@@ -704,7 +704,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-456".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let validator = MintTestFramework::with(())
@@ -775,7 +775,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-456".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -817,7 +817,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let initiated_at = chrono::Utc::now();
 
@@ -867,7 +867,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
 
@@ -911,7 +911,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
 
@@ -959,7 +959,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let validator = MintTestFramework::with(())
@@ -1003,7 +1003,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let validator = MintTestFramework::with(())
@@ -1039,7 +1039,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let reason = "Insufficient funds";
 
@@ -1099,7 +1099,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1133,7 +1133,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1166,7 +1166,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let tx_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -1236,7 +1236,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let tx_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -1275,7 +1275,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let error_message = "Transaction failed: insufficient gas";
 
@@ -1323,7 +1323,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1355,7 +1355,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let journal_confirmed_at = Utc::now();
@@ -1423,7 +1423,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let journal_confirmed_at = Utc::now();
@@ -1475,7 +1475,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1520,7 +1520,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1559,7 +1559,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let tx_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -1613,7 +1613,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         MintTestFramework::with(())
@@ -1650,7 +1650,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let tx_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -1700,7 +1700,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let journal_confirmed_at = Utc::now();
@@ -1773,7 +1773,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-flow-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
@@ -1892,7 +1892,7 @@ mod tests {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::new("base"),
-                client_id: ClientId("client-integration-789".to_string()),
+                client_id: ClientId::new(),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             }
         }

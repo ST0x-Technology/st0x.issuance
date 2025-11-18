@@ -461,7 +461,7 @@ mod tests {
             underlying: underlying.clone(),
             token: token.clone(),
             network: Network::new("base"),
-            client_id: ClientId("client-789".to_string()),
+            client_id: ClientId::new(),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             initiated_at: Utc::now(),
         };
@@ -557,7 +557,7 @@ mod tests {
             underlying: underlying.clone(),
             token: token.clone(),
             network: Network::new("base"),
-            client_id: ClientId("client-abc".to_string()),
+            client_id: ClientId::new(),
             wallet: address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"),
             initiated_at: Utc::now(),
         };
@@ -657,7 +657,7 @@ mod tests {
             underlying: aapl_underlying.clone(),
             token: aapl_token,
             network: Network::new("base"),
-            client_id: ClientId("client-1".to_string()),
+            client_id: ClientId::new(),
             wallet: address!("0x1111111111111111111111111111111111111111"),
             initiated_at: Utc::now(),
         };
@@ -669,7 +669,7 @@ mod tests {
             underlying: tsla_underlying.clone(),
             token: tsla_token,
             network: Network::new("base"),
-            client_id: ClientId("client-2".to_string()),
+            client_id: ClientId::new(),
             wallet: address!("0x2222222222222222222222222222222222222222"),
             initiated_at: Utc::now(),
         };
@@ -1516,7 +1516,7 @@ mod tests {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::new("base"),
-                    client_id: ClientId("client-123".to_string()),
+                    client_id: ClientId::new(),
                     wallet: address!(
                         "0x1111111111111111111111111111111111111111"
                     ),

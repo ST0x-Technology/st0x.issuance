@@ -22,7 +22,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
     #[tracing::instrument(skip(self, aggregate), fields(
         issuer_request_id = %issuer_request_id.0,
-        client_id = %client_id.0
+        client_id = %client_id
     ))]
     pub(crate) async fn handle_redemption_detected(
         &self,
@@ -214,7 +214,7 @@ mod tests {
         )
         .await;
 
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let network = Network::new("base");
 
         let result = manager
@@ -256,7 +256,7 @@ mod tests {
         )
         .await;
 
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let network = Network::new("base");
 
         let result = manager
@@ -298,7 +298,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-wrong-state-789");
         let aggregate = Redemption::Uninitialized;
 
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let network = Network::new("base");
 
         let result = manager

@@ -214,6 +214,7 @@ pub async fn initialize_rocket(
             "/",
             routes![
                 account::connect_account,
+                account::whitelist_wallet,
                 tokenized_asset::list_tokenized_assets,
                 mint::initiate_mint,
                 mint::confirm_journal

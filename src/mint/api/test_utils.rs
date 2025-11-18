@@ -5,8 +5,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 
 use crate::account::{
-    Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
-    view::find_by_email,
+    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::AlpacaService;
 use crate::mint::{
@@ -95,31 +94,24 @@ pub(super) async fn setup_test_environment() -> (
 }
 
 pub(super) async fn setup_with_account_and_asset(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
     account_cqrs: &crate::AccountCqrs,
     tokenized_asset_cqrs: &crate::TokenizedAssetCqrs,
-) -> (String, UnderlyingSymbol, TokenSymbol, Network) {
+) -> (ClientId, UnderlyingSymbol, TokenSymbol, Network) {
     let email =
         Email::new("test@placeholder.com".to_string()).expect("Valid email");
+    let client_id = ClientId::new();
 
     let account_cmd = AccountCommand::Link {
+        client_id,
         email: email.clone(),
         alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
     };
 
+    let aggregate_id = client_id.to_string();
     account_cqrs
-        .execute(email.as_str(), account_cmd)
+        .execute(&aggregate_id, account_cmd)
         .await
         .expect("Failed to link account");
-
-    let account_view = find_by_email(pool, &email)
-        .await
-        .expect("Failed to query account")
-        .expect("Account should exist");
-
-    let AccountView::Account { client_id, .. } = account_view else {
-        panic!("Expected Account variant");
-    };
 
     let underlying = UnderlyingSymbol::new("AAPL");
     let token = TokenSymbol::new("tAAPL");
@@ -138,5 +130,5 @@ pub(super) async fn setup_with_account_and_asset(
         .await
         .expect("Failed to add asset");
 
-    (client_id.0, underlying, token, network)
+    (client_id, underlying, token, network)
 }

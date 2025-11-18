@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
@@ -12,12 +13,19 @@ pub(crate) enum AccountEvent {
         alpaca_account: AlpacaAccountNumber,
         linked_at: DateTime<Utc>,
     },
+    WalletWhitelisted {
+        wallet: Address,
+        whitelisted_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for AccountEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Linked { .. } => "AccountEvent::Linked".to_string(),
+            Self::WalletWhitelisted { .. } => {
+                "AccountEvent::WalletWhitelisted".to_string()
+            }
         }
     }
 

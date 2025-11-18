@@ -241,7 +241,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
@@ -370,7 +370,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(

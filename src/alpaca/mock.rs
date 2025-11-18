@@ -223,7 +223,7 @@ mod tests {
 
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test-123"),
-            client_id: ClientId("client-456".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),
@@ -245,7 +245,7 @@ mod tests {
 
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test-789"),
-            client_id: ClientId("client-xyz".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -273,7 +273,7 @@ mod tests {
 
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test"),
-            client_id: ClientId("client".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),
@@ -295,7 +295,7 @@ mod tests {
             issuer_request_id: IssuerRequestId::new("red-123"),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            client_id: ClientId("client-456".to_string()),
+            client_id: ClientId::new(),
             quantity: Quantity::new(Decimal::from(100)),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -356,7 +356,7 @@ mod tests {
 
         let mint_request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test"),
-            client_id: ClientId("client".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),
@@ -424,7 +424,7 @@ mod tests {
 
         let mint_request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("mint-tok"),
-            client_id: ClientId("client".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),

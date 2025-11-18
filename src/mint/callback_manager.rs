@@ -86,7 +86,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
 
         let callback_request = MintCallbackRequest {
             tokenization_request_id: tokenization_request_id.clone(),
-            client_id: client_id.clone(),
+            client_id: *client_id,
             wallet_address: *wallet,
             tx_hash: *tx_hash,
             network: network.clone(),
@@ -173,7 +173,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
@@ -185,7 +185,7 @@ mod tests {
                 underlying: underlying.clone(),
                 token: token.clone(),
                 network: network.clone(),
-                client_id: client_id.clone(),
+                client_id,
                 wallet,
             },
         )
@@ -319,7 +319,7 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let client_id = ClientId("client-789".to_string());
+        let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(

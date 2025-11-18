@@ -85,16 +85,17 @@ async fn perform_mint_flow(
             json!({
                 "email": "user@example.com",
                 "account": "USER123",
-                "wallet": user_wallet.to_string()
+                "wallet": user_wallet
             })
             .to_string(),
         )
         .dispatch()
         .await;
+
     assert_eq!(link_response.status(), rocket::http::Status::Ok);
+
     let link_body: AccountLinkResponse =
         link_response.into_json().await.unwrap();
-    let client_id = link_body.client_id.0;
 
     let mint_response = client
         .post("/inkind/issuance")
@@ -106,16 +107,16 @@ async fn perform_mint_flow(
                 "underlying_symbol": "AAPL",
                 "token_symbol": "tAAPL",
                 "network": "base",
-                "client_id": client_id,
-                "wallet_address": user_wallet.to_string()
+                "client_id": link_body.client_id,
+                "wallet_address": user_wallet
             })
             .to_string(),
         )
         .dispatch()
         .await;
+
     assert_eq!(mint_response.status(), rocket::http::Status::Ok);
     let mint_body: MintResponse = mint_response.into_json().await.unwrap();
-    let issuer_request_id = mint_body.issuer_request_id.0;
 
     let confirm_response = client
         .post("/inkind/issuance/confirm")
@@ -123,13 +124,14 @@ async fn perform_mint_flow(
         .body(
             json!({
                 "tokenization_request_id": "alp-mint-789",
-                "issuer_request_id": issuer_request_id,
+                "issuer_request_id": mint_body.issuer_request_id,
                 "status": "completed"
             })
             .to_string(),
         )
         .dispatch()
         .await;
+
     assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
 
     let user_private_key = b256!(
@@ -161,19 +163,17 @@ fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
     })
 }
 
-#[allow(clippy::unwrap_used, clippy::assigning_clones)]
 fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
     user_wallet: Address,
 ) -> (Mock, Mock) {
     let test_auth = test_alpaca_auth_header();
-    let wallet_str = user_wallet.to_string();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));
 
     let shared_issuer_id_clone = Arc::clone(&shared_issuer_id);
     let shared_tx_hash_clone = Arc::clone(&shared_tx_hash);
-    let wallet_str_clone = wallet_str.clone();
+
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/test-account/tokenization/redeem")
@@ -201,7 +201,7 @@ fn setup_redemption_mocks(
                     "qty": "50",
                     "issuer": "test-issuer",
                     "network": "base",
-                    "wallet_address": wallet_str_clone.clone(),
+                    "wallet_address": user_wallet,
                     "tx_hash": tx_hash,
                     "fees": "0.5"
                 }))
@@ -238,7 +238,7 @@ fn setup_redemption_mocks(
                         "qty": "50",
                         "issuer": "test-issuer",
                         "network": "base",
-                        "wallet_address": wallet_str.clone(),
+                        "wallet_address": user_wallet,
                         "tx_hash": tx_hash,
                         "fees": "0.5"
                     }]
