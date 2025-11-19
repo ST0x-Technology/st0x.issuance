@@ -178,6 +178,7 @@ endpoints.
 ### Endpoints We Implement (for Alpaca)
 
 - `POST /accounts/connect` - Link AP account to our system
+- `POST /accounts/{client_id}/wallets` - Whitelist a wallet for an AP account
 - `GET /tokenized-assets` - List supported tokenized assets
 - `POST /inkind/issuance` - Receive mint request from Alpaca
 - `POST /inkind/issuance/confirm` - Receive journal confirmation from Alpaca

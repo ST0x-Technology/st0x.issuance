@@ -341,7 +341,6 @@ mod tests {
     use alloy::primitives::{address, b256};
     use httpmock::prelude::*;
 
-    use crate::account::ClientId;
     use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
@@ -352,11 +351,13 @@ mod tests {
     };
 
     fn create_test_request() -> MintCallbackRequest {
+        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+
         MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new(
                 "12345-678-90AB",
             ),
-            client_id: ClientId("5505-1234-ABC-4G45".to_string()),
+            client_id,
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),
@@ -493,7 +494,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
                     "tokenization_request_id": "12345-678-90AB",
-                    "client_id": "5505-1234-ABC-4G45",
+                    "client_id": "55051234-0000-4abc-9000-4aabcdef0045",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                     "network": "base"
@@ -575,11 +576,13 @@ mod tests {
     }
 
     fn create_redeem_request() -> RedeemRequest {
+        let client_id = "00000000-0000-0000-0000-000000000456".parse().unwrap();
+
         RedeemRequest {
             issuer_request_id: IssuerRequestId::new("red-123"),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            client_id: ClientId("client-456".to_string()),
+            client_id,
             quantity: Quantity::new(rust_decimal::Decimal::from(100)),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -819,7 +822,7 @@ mod tests {
                     "issuer_request_id": "red-123",
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
-                    "client_id": "client-456",
+                    "client_id": "00000000-0000-0000-0000-000000000456",
                     "qty": "100",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",

@@ -280,24 +280,29 @@ system.
 - `client_id`: Our identifier for the linked account
 - `email`: AP's email address
 - `alpaca_account`: Alpaca account number
-- `wallet`: On-chain wallet address for redemption lookups
+- `whitelisted_wallets`: List of on-chain wallet addresses authorized for
+  redemptions
 - `status`: Active or inactive
 - Timestamps
 
 **Commands:**
 
-- `LinkAccount { email, alpaca_account, wallet }` - Create new account link
+- `LinkAccount { email, alpaca_account }` - Create new account link
+- `WhitelistWallet { wallet }` - Authorize a wallet address for redemptions
 
 **Events:**
 
-- `AccountLinked { client_id, email, alpaca_account, wallet, linked_at }` -
-  Account successfully linked
+- `AccountLinked { client_id, email, alpaca_account, linked_at }` - Account
+  successfully linked
+- `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
+  redemptions
 
 **Command → Event Mappings:**
 
-| Command       | Events Produced | Notes                    |
-| ------------- | --------------- | ------------------------ |
-| `LinkAccount` | `AccountLinked` | New account link created |
+| Command           | Events Produced     | Notes                                |
+| ----------------- | ------------------- | ------------------------------------ |
+| `LinkAccount`     | `AccountLinked`     | New account link created             |
+| `WhitelistWallet` | `WalletWhitelisted` | Wallet authorized (multiple allowed) |
 
 ### TokenizedAsset Aggregate
 
@@ -380,8 +385,7 @@ account with their account on our platform.
 ```json
 {
   "email": "customer@firm.com",
-  "account": "alpaca_account_number",
-  "wallet": "0x1234567890abcdef1234567890abcdef12345678"
+  "account": "alpaca_account_number"
 }
 ```
 
@@ -405,7 +409,6 @@ account with their account on our platform.
 struct AccountLinkRequest {
     email: Email,
     account: AlpacaAccountNumber,
-    wallet: Address,
 }
 
 struct AccountLinkResponse {
@@ -413,7 +416,54 @@ struct AccountLinkResponse {
 }
 ```
 
-### 2. Tokenized Assets Data Endpoint
+### 2. Wallet Whitelisting
+
+After account linking, APs must whitelist their wallet addresses before they can
+redeem tokens. Multiple wallets can be whitelisted per account.
+
+**Endpoint:** `POST /accounts/{client_id}/wallets`
+
+**Request Body:**
+
+```json
+{
+  "wallet": "0x1234567890abcdef1234567890abcdef12345678"
+}
+```
+
+**Our Response:**
+
+```json
+{
+  "success": true
+}
+```
+
+**Status Codes:**
+
+- `200`: Wallet successfully whitelisted (or already whitelisted - idempotent)
+- `404`: Client ID not found
+
+**Data Structure:**
+
+```rust
+struct WhitelistWalletRequest {
+    wallet: Address,
+}
+
+struct WhitelistWalletResponse {
+    success: bool,
+}
+```
+
+**Notes:**
+
+- An account can have multiple whitelisted wallets
+- Wallet addresses must be whitelisted before initiating redemptions
+- During redemption, we look up which `client_id` owns the wallet that sent the
+  tokens
+
+### 3. Tokenized Assets Data Endpoint
 
 Alpaca needs to query which assets we support:
 
@@ -448,7 +498,7 @@ struct TokenizedAsset {
 }
 ```
 
-### 3. Token Minting (Alpaca ITN Flow)
+### 4. Token Minting (Alpaca ITN Flow)
 
 #### Receipt Custody Model
 
@@ -804,7 +854,7 @@ enum MintStatus {
 }
 ```
 
-### 4. Token Redemption (Alpaca ITN Flow)
+### 5. Token Redemption (Alpaca ITN Flow)
 
 #### Complete Redemption Flow
 

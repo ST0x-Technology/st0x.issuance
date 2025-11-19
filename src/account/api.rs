@@ -1,15 +1,65 @@
 use alloy::primitives::Address;
+use rocket::Request;
+use rocket::http::Status;
 use rocket::post;
+use rocket::request::FromParam;
+use rocket::response::Responder;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
+use tracing::error;
+use uuid::Uuid;
 
-use super::{AlpacaAccountNumber, ClientId, Email, view::find_by_email};
+use super::{
+    AlpacaAccountNumber, ClientId, Email, view::find_by_client_id,
+    view::find_by_email,
+};
+
+impl<'a> FromParam<'a> for ClientId {
+    type Error = uuid::Error;
+
+    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
+        Uuid::parse_str(param).map(ClientId)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApiError {
+    #[error("Account not found")]
+    AccountNotFound,
+
+    #[error("Database error: {0}")]
+    Database(#[from] super::view::AccountViewError),
+
+    #[error("Command execution failed: {0}")]
+    CommandFailed(#[from] cqrs_es::AggregateError<super::AccountError>),
+}
+
+impl<'r> Responder<'r, 'static> for ApiError {
+    fn respond_to(
+        self,
+        _: &'r Request<'_>,
+    ) -> rocket::response::Result<'static> {
+        let status = match self {
+            Self::AccountNotFound => Status::NotFound,
+            Self::Database(_) | Self::CommandFailed(_) => {
+                Status::InternalServerError
+            }
+        };
+
+        let message = self.to_string();
+        error!("{message}");
+
+        rocket::Response::build()
+            .status(status)
+            .sized_body(message.len(), std::io::Cursor::new(message))
+            .ok()
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccountLinkRequest {
     pub(crate) email: Email,
     pub(crate) account: AlpacaAccountNumber,
-    pub(crate) wallet: Address,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,8 +69,7 @@ pub struct AccountLinkResponse {
 
 #[tracing::instrument(skip(cqrs, pool), fields(
     email = %request.email.0,
-    account = %request.account.0,
-    wallet = ?request.wallet
+    account = %request.account.0
 ))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
 pub(crate) async fn connect_account(
@@ -28,18 +77,28 @@ pub(crate) async fn connect_account(
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<AccountLinkRequest>,
 ) -> Result<Json<AccountLinkResponse>, rocket::http::Status> {
-    let aggregate_id = request.email.as_str();
+    if find_by_email(pool.inner(), &request.email)
+        .await
+        .map_err(|_| rocket::http::Status::InternalServerError)?
+        .is_some()
+    {
+        return Err(rocket::http::Status::Conflict);
+    }
+
+    let client_id = ClientId::new();
+
     let command = super::AccountCommand::Link {
+        client_id,
         email: request.email.clone(),
         alpaca_account: request.account.clone(),
-        wallet: request.wallet,
     };
 
-    cqrs.execute(aggregate_id, command)
+    let aggregate_id = client_id.to_string();
+    cqrs.execute(&aggregate_id, command)
         .await
         .map_err(|_| rocket::http::Status::Conflict)?;
 
-    let account_view = find_by_email(pool.inner(), &request.email)
+    let account_view = find_by_client_id(pool.inner(), &client_id)
         .await
         .map_err(|_| rocket::http::Status::InternalServerError)?
         .ok_or(rocket::http::Status::InternalServerError)?;
@@ -51,6 +110,44 @@ pub(crate) async fn connect_account(
     Ok(Json(AccountLinkResponse { client_id }))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct WhitelistWalletRequest {
+    pub(crate) wallet: Address,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WhitelistWalletResponse {
+    pub success: bool,
+}
+
+#[tracing::instrument(skip(cqrs, pool), fields(
+    client_id = %client_id,
+    wallet = ?request.wallet
+))]
+#[post("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
+pub(crate) async fn whitelist_wallet(
+    cqrs: &rocket::State<crate::AccountCqrs>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    request: Json<WhitelistWalletRequest>,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    let account_view = find_by_client_id(pool.inner(), &client_id)
+        .await?
+        .ok_or(ApiError::AccountNotFound)?;
+
+    let super::AccountView::Account { .. } = account_view else {
+        return Err(ApiError::AccountNotFound);
+    };
+
+    let command =
+        super::AccountCommand::WhitelistWallet { wallet: request.wallet };
+
+    let aggregate_id = client_id.0.to_string();
+    cqrs.execute(&aggregate_id, command).await?;
+
+    Ok(Json(WhitelistWalletResponse { success: true }))
+}
+
 #[cfg(test)]
 mod tests {
     use cqrs_es::persist::GenericQuery;
@@ -60,7 +157,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
-    use super::super::{Account, Email};
+    use super::super::Account;
     use super::*;
 
     #[tokio::test]
@@ -100,8 +197,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "customer@firm.com",
-            "account": "alpaca-account-123",
-            "wallet": "0x1111111111111111111111111111111111111111"
+            "account": "alpaca-account-123"
         });
 
         let response = client
@@ -116,7 +212,7 @@ mod tests {
         let response_body: AccountLinkResponse =
             response.into_json().await.expect("valid JSON response");
 
-        assert!(!response_body.client_id.0.is_empty());
+        assert_ne!(response_body.client_id.0, Uuid::nil());
     }
 
     #[tokio::test]
@@ -156,8 +252,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "duplicate@example.com",
-            "account": "ALPACA789",
-            "wallet": "0x2222222222222222222222222222222222222222"
+            "account": "ALPACA789"
         });
 
         let response1 = client
@@ -216,8 +311,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": "not-an-email",
-            "account": "ALPACA999",
-            "wallet": "0x3333333333333333333333333333333333333333"
+            "account": "ALPACA999"
         });
 
         let response = client
@@ -268,8 +362,7 @@ mod tests {
         let email = "events@example.com";
         let request_body = serde_json::json!({
             "email": email,
-            "account": "ALPACA001",
-            "wallet": "0x4444444444444444444444444444444444444444"
+            "account": "ALPACA001"
         });
 
         let response = client
@@ -281,6 +374,11 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
+        let response_body: AccountLinkResponse =
+            response.into_json().await.expect("valid JSON response");
+
+        let client_id_str = response_body.client_id.to_string();
+
         let events = sqlx::query!(
             r"
             SELECT aggregate_id, event_type, sequence
@@ -288,14 +386,14 @@ mod tests {
             WHERE aggregate_id = ? AND aggregate_type = 'Account'
             ORDER BY sequence
             ",
-            email
+            client_id_str
         )
         .fetch_all(&pool)
         .await
         .expect("Failed to query events");
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].aggregate_id, email);
+        assert_eq!(events[0].aggregate_id, client_id_str);
         assert_eq!(events[0].event_type, "AccountEvent::Linked");
         assert_eq!(events[0].sequence, 1);
     }
@@ -340,8 +438,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "email": email,
-            "account": alpaca_account,
-            "wallet": "0x5555555555555555555555555555555555555555"
+            "account": alpaca_account
         });
 
         let response = client
@@ -356,7 +453,7 @@ mod tests {
         let response_body: AccountLinkResponse =
             response.into_json().await.expect("valid JSON response");
 
-        let view = find_by_email(&pool, &Email(email.to_string()))
+        let view = find_by_client_id(&pool, &response_body.client_id)
             .await
             .expect("Failed to query view")
             .expect("View should exist");
@@ -365,6 +462,7 @@ mod tests {
             client_id,
             email: view_email,
             alpaca_account: view_alpaca_account,
+            whitelisted_wallets,
             status,
             ..
         } = view
@@ -375,6 +473,7 @@ mod tests {
         assert_eq!(client_id, response_body.client_id);
         assert_eq!(view_email.as_str(), email);
         assert_eq!(view_alpaca_account.0, alpaca_account);
+        assert!(whitelisted_wallets.is_empty());
         assert_eq!(status, super::super::LinkedAccountStatus::Active);
     }
 }

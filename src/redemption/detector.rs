@@ -393,10 +393,11 @@ mod tests {
     };
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolEvent;
-    use chrono::Utc;
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
+        persist::GenericQuery,
     };
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
@@ -404,11 +405,18 @@ mod tests {
         BurnManager, JournalManager, RedeemCallManager, RedemptionDetector,
         RedemptionDetectorConfig, RedemptionMonitorError,
     };
+    use crate::account::{
+        Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
+        view::AccountView,
+    };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
     use crate::redemption::Redemption;
-    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol, view::TokenizedAssetView,
+    };
     use crate::vault::mock::MockVaultService;
 
     type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
@@ -420,7 +428,10 @@ mod tests {
         (cqrs, store)
     }
 
-    async fn setup_test_db_with_asset(vault: Address) -> SqlitePool {
+    async fn setup_test_db_with_asset(
+        vault: Address,
+        ap_wallet: Option<Address>,
+    ) -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
 
         sqlx::migrate!("./migrations")
@@ -428,53 +439,70 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
+        let asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let asset_query = GenericQuery::new(asset_view_repo);
+        let asset_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
-        let added_at = Utc::now();
 
-        let asset_view_json = serde_json::json!({
-            "Asset": {
-                "underlying": underlying,
-                "token": token,
-                "network": network,
-                "vault": vault,
-                "enabled": true,
-                "added_at": added_at
-            }
-        });
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token,
+                    network,
+                    vault,
+                },
+            )
+            .await
+            .unwrap();
 
-        sqlx::query(
-            "INSERT INTO tokenized_asset_view (view_id, version, payload) VALUES (?, ?, ?)",
-        )
-        .bind(&underlying.0)
-        .bind(1_i64)
-        .bind(asset_view_json.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
+        if let Some(wallet) = ap_wallet {
+            let account_view_repo =
+                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                    pool.clone(),
+                    "account_view".to_string(),
+                ));
 
-        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
-        let account_view_json = serde_json::json!({
-            "Account": {
-                "client_id": "test-client-123",
-                "email": "test@example.com",
-                "alpaca_account": "ALPACA123",
-                "wallet": ap_wallet,
-                "status": "Active",
-                "linked_at": Utc::now()
-            }
-        });
+            let account_query = GenericQuery::new(account_view_repo);
+            let account_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-        sqlx::query(
-            "INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)",
-        )
-        .bind("test-client-123")
-        .bind(1_i64)
-        .bind(account_view_json.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
+            let client_id = ClientId::new();
+            let email = Email::new("test@example.com".to_string()).unwrap();
+
+            account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::Link {
+                        client_id,
+                        email,
+                        alpaca_account: AlpacaAccountNumber(
+                            "ALPACA123".to_string(),
+                        ),
+                    },
+                )
+                .await
+                .unwrap();
+
+            account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::WhitelistWallet { wallet },
+                )
+                .await
+                .unwrap();
+        }
 
         pool
     }
@@ -518,7 +546,7 @@ mod tests {
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault).await;
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -595,7 +623,7 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault).await;
+        let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -660,7 +688,7 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault).await;
+        let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -727,7 +755,7 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(wrong_vault).await;
+        let pool = setup_test_db_with_asset(wrong_vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -791,9 +819,10 @@ mod tests {
     async fn test_process_transfer_log_duplicate_detection_fails() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
         let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault).await;
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;

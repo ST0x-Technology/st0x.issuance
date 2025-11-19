@@ -209,11 +209,13 @@ mod tests {
 
     #[test]
     fn test_mint_callback_request_serialization() {
+        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new(
                 "12345-678-90AB",
             ),
-            client_id: ClientId("5505-1234-ABC-4G45".to_string()),
+            client_id,
             wallet_address: address!(
                 "0x1234567890abcdef1234567890abcdef12345678"
             ),
@@ -229,7 +231,10 @@ mod tests {
             serialized["tokenization_request_id"],
             json!("12345-678-90AB")
         );
-        assert_eq!(serialized["client_id"], json!("5505-1234-ABC-4G45"));
+        assert_eq!(
+            serialized["client_id"],
+            json!("55051234-0000-4abc-9000-4aabcdef0045")
+        );
         assert_eq!(
             serialized["wallet_address"],
             json!("0x1234567890abcdef1234567890abcdef12345678")
@@ -245,11 +250,13 @@ mod tests {
 
     #[test]
     fn test_redeem_request_serialization() {
+        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+
         let request = RedeemRequest {
             issuer_request_id: IssuerRequestId::new("red-abc123"),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            client_id: ClientId("5505-1234-ABC-4G45".to_string()),
+            client_id,
             quantity: Quantity::new(Decimal::new(10050, 2)),
             network: Network::new("base"),
             wallet: address!("0x9999999999999999999999999999999999999999"),
@@ -263,7 +270,10 @@ mod tests {
         assert_eq!(serialized["issuer_request_id"], json!("red-abc123"));
         assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
         assert_eq!(serialized["token_symbol"], json!("tAAPL"));
-        assert_eq!(serialized["client_id"], json!("5505-1234-ABC-4G45"));
+        assert_eq!(
+            serialized["client_id"],
+            json!("55051234-0000-4abc-9000-4aabcdef0045")
+        );
         assert_eq!(serialized["qty"], json!("100.50"));
         assert_eq!(serialized["network"], json!("base"));
         assert_eq!(
@@ -282,7 +292,7 @@ mod tests {
     fn test_address_serialization_includes_0x_prefix() {
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test"),
-            client_id: ClientId("test".to_string()),
+            client_id: ClientId::new(),
             wallet_address: address!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
