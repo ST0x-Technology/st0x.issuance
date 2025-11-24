@@ -63,118 +63,64 @@ and manageable
 
 ## Task Breakdown
 
-### Task 1. Add Configuration Types and Managed State
+### Task 1. Implement Complete Authentication Guard
 
-Add configuration fields for API key and IP whitelist, and make config available
-to request guards.
+Implement complete authentication system with config, request guard, and unit
+tests.
 
 **Subtasks**:
 
-- [ ] Add `ipnetwork` crate: `cargo add ipnetwork`
-- [ ] Add `issuer_api_key: String` field to `Config` struct
-- [ ] Add `alpaca_ip_ranges: Vec<IpNetwork>` field to `Config` struct
+- [ ] Add dependencies: `cargo add ipnetwork subtle`
+- [ ] Add `issuer_api_key: String` and `alpaca_ip_ranges: Vec<IpNetwork>` fields
+      to `Config` struct
 - [ ] Update `.env.example` with `ISSUER_API_KEY` and `ALPACA_IP_RANGES` with
       explanatory comments
-- [ ] Update `Config::parse()` to read both environment variables
-- [ ] Add validation that API key is at least 32 characters
-- [ ] Add parsing for CIDR notation IP ranges (comma-separated format)
+- [ ] Update `Config::parse()` to read and validate both environment variables
+      (min 32 chars for API key)
 - [ ] Add `Config` to Rocket managed state in `initialize_rocket()`
-
-**Files to modify**:
-
-- `src/config.rs`
-- `.env.example`
-- `src/lib.rs` (add Config to managed state)
-
-**Acceptance criteria**:
-
-- Config successfully parses IP ranges like `"1.2.3.0/24,5.6.7.8/32"`
-- Config validates API key meets minimum length (32 chars)
-- Missing/invalid config returns clear error message
-- Config accessible via `rocket.state::<Config>()`
-- `cargo test --workspace` passes
-- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-  passes
-- `cargo fmt` applied
-
----
-
-### Task 2. Implement Authentication Request Guard
-
-Create Rocket request guard that validates API key and IP address using config
-from managed state.
-
-**Subtasks**:
-
-- [ ] Add `subtle` crate: `cargo add subtle`
-- [ ] Create `src/auth.rs` module
-- [ ] Define `AlpacaAuth` guard struct
-- [ ] Implement `FromRequest` trait for `AlpacaAuth`
-- [ ] Access `Config` from managed state via
-      `request.rocket().state::<Config>()`
+- [ ] Create `src/auth.rs` module with `AlpacaAuth` request guard
+- [ ] Implement `FromRequest` trait that accesses `Config` from managed state
 - [ ] Extract `Authorization` header and validate Bearer format
 - [ ] Use constant-time comparison for API key validation (prevent timing
       attacks)
-- [ ] Extract client IP from request
-- [ ] Validate IP is in allowed ranges from config
-- [ ] Define `AuthError` enum with variants: `MissingApiKey`, `InvalidApiKey`,
-      `UnauthorizedIp`, `NoClientIp`, `ConfigMissing`
-- [ ] Implement `Responder` for `AuthError` to return appropriate HTTP status
-      codes
+- [ ] Extract client IP from request and validate against IP ranges
+- [ ] Define `AuthError` enum with appropriate variants and HTTP status codes
+- [ ] Implement `Responder` for `AuthError`
 - [ ] Add structured logging for auth attempts (success and failure)
-- [ ] Add `mod auth;` to `src/lib.rs`
-- [ ] Export `AlpacaAuth` from `src/lib.rs` as `pub use auth::AlpacaAuth;`
+- [ ] Add `mod auth;` and export `AlpacaAuth` from `src/lib.rs`
+- [ ] Add unit tests for auth guard (valid key, invalid key, wrong IP, missing
+      header, etc.)
 
 **Files to create/modify**:
 
-- Create `src/auth.rs`
-- Modify `src/lib.rs`
+- `src/config.rs`
+- `.env.example`
+- `src/lib.rs`
+- Create `src/auth.rs` (with `#[cfg(test)] mod tests`)
 
 **Implementation notes**:
 
-```rust
-// Constant-time comparison to prevent timing attacks
-use subtle::ConstantTimeEq;
-
-fn validate_api_key(provided: &str, expected: &str) -> bool {
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
-}
-```
-
-**Error responses**:
-
-- Missing API key → 401 Unauthorized
-- Invalid API key → 401 Unauthorized
-- IP not whitelisted → 403 Forbidden
-- Can't determine client IP → 400 Bad Request
-
-**Logging**:
-
-```rust
-// Success
-info!(
-    ip = %client_ip,
-    endpoint = %request.uri(),
-    "Alpaca authentication success"
-);
-
-// Failure
-warn!(
-    ip = ?maybe_ip,
-    reason = ?error,
-    endpoint = %request.uri(),
-    "Alpaca authentication failed"
-);
-```
+- Constant-time comparison to prevent timing attacks:
+  ```rust
+  use subtle::ConstantTimeEq;
+  provided.as_bytes().ct_eq(expected.as_bytes()).into()
+  ```
+- Error responses: Missing/invalid key → 401, IP not whitelisted → 403, no
+  client IP → 400
+- Log all auth attempts (success and failure) with IP and endpoint
 
 **Acceptance criteria**:
 
+- Config parses IP ranges like `"1.2.3.0/24,5.6.7.8/32"`
+- Config validates API key meets minimum length (32 chars)
 - Request with valid key from whitelisted IP succeeds
 - Request with invalid key returns 401
 - Request from non-whitelisted IP returns 403
 - Request without Authorization header returns 401
 - All auth attempts are logged with IP and outcome
-- Timing attack resistance verified (constant-time comparison)
+- Unit tests cover all auth scenarios (valid, invalid key, wrong IP, missing
+  header)
+- Constant-time comparison used for API key validation
 - `cargo test --workspace` passes
 - `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
   passes
@@ -182,7 +128,7 @@ warn!(
 
 ---
 
-### Task 3. Add Auth Guard to Endpoints
+### Task 2. Add Auth Guard to Endpoints
 
 Add `AlpacaAuth` guard to all issuer endpoints.
 
@@ -227,65 +173,7 @@ pub(crate) async fn initiate_mint(
 
 ---
 
-### Task 4. Add Unit Tests for Auth Guard
-
-Test authentication logic in isolation.
-
-**Subtasks**:
-
-- [ ] Add `#[cfg(test)] mod tests` to `src/auth.rs`
-- [ ] Test: Valid API key + whitelisted IP → Success
-- [ ] Test: Invalid API key → 401 Unauthorized
-- [ ] Test: Missing Authorization header → 401 Unauthorized
-- [ ] Test: Malformed Authorization header → 401 Unauthorized
-- [ ] Test: Valid key but non-whitelisted IP → 403 Forbidden
-- [ ] Test: Request from 127.0.0.1 when whitelisted → Success
-- [ ] Test: Request from 0.0.0.0/0 whitelist (allow all) → Success for any IP
-
-**Files to modify**:
-
-- `src/auth.rs`
-
-**Testing approach**:
-
-```rust
-#[tokio::test]
-async fn test_valid_auth_succeeds() {
-    let rocket = rocket::build()
-        .manage(Config {
-            issuer_api_key: "test-key-12345".to_string(),
-            alpaca_ip_ranges: vec!["127.0.0.1/32".parse().unwrap()],
-            // ... other config
-        })
-        .mount("/", routes![test_endpoint]);
-
-    let client = rocket::local::asynchronous::Client::tracked(rocket)
-        .await
-        .expect("valid rocket instance");
-
-    let response = client
-        .get("/test")
-        .header(Header::new("Authorization", "Bearer test-key-12345"))
-        .dispatch()
-        .await;
-
-    assert_eq!(response.status(), Status::Ok);
-}
-```
-
-**Acceptance criteria**:
-
-- All test scenarios pass
-- Tests verify both API key and IP validation independently
-- Edge cases covered (missing headers, malformed data)
-- `cargo test --workspace` passes
-- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-  passes
-- `cargo fmt` applied
-
----
-
-### Task 5. Add Integration Tests
+### Task 3. Add Integration Tests
 
 Test authentication with actual endpoints.
 
@@ -331,7 +219,7 @@ let response = client
 
 ---
 
-### Task 6. Add Rate Limiting
+### Task 4. Add Rate Limiting
 
 Prevent brute force attacks on API key.
 
@@ -379,7 +267,7 @@ if auth_failed {
 
 ---
 
-### Task 7. Documentation and Configuration Guide
+### Task 5. Documentation and Configuration Guide
 
 Document the authentication system for deployment and Alpaca integration.
 
@@ -417,7 +305,7 @@ Document the authentication system for deployment and Alpaca integration.
 
 ---
 
-### Task 8. End-to-End Authentication Testing
+### Task 6. End-to-End Authentication Testing
 
 Test complete authentication flow in realistic scenario.
 
