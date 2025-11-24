@@ -49,7 +49,7 @@ and manageable
 
 ### Configuration
 
-**API Key Storage**: Environment variable `ALPACA_API_KEY_FOR_US`
+**API Key Storage**: Environment variable `ISSUER_API_KEY`
 
 - Different from `ALPACA_API_KEY` (which is our key to call Alpaca)
 - Long random key (256-bit minimum)
@@ -63,65 +63,72 @@ and manageable
 
 ## Task Breakdown
 
-### Task 1. Add Configuration Types
+### Task 1. Add Configuration Types and Managed State
 
-Add configuration fields for API key and IP whitelist.
+Add configuration fields for API key and IP whitelist, and make config available
+to request guards.
 
 **Subtasks**:
 
-- [ ] Add `alpaca_api_key_for_us: String` field to `Config` struct
+- [ ] Add `ipnetwork` crate: `cargo add ipnetwork`
+- [ ] Add `issuer_api_key: String` field to `Config` struct
 - [ ] Add `alpaca_ip_ranges: Vec<IpNetwork>` field to `Config` struct
-- [ ] Update `.env.example` with new environment variables
-- [ ] Update `Config::parse()` to read `ALPACA_API_KEY_FOR_US` and
-      `ALPACA_IP_RANGES`
+- [ ] Update `.env.example` with `ISSUER_API_KEY` and `ALPACA_IP_RANGES` with
+      explanatory comments
+- [ ] Update `Config::parse()` to read both environment variables
 - [ ] Add validation that API key is at least 32 characters
-- [ ] Add parsing for CIDR notation IP ranges using `ipnetwork` crate
+- [ ] Add parsing for CIDR notation IP ranges (comma-separated format)
+- [ ] Add `Config` to Rocket managed state in `initialize_rocket()`
 
 **Files to modify**:
 
-- `src/config.rs` or wherever `Config` lives
+- `src/config.rs`
 - `.env.example`
-
-**Dependencies**:
-
-- Add `ipnetwork` crate for IP range parsing: `cargo add ipnetwork`
+- `src/lib.rs` (add Config to managed state)
 
 **Acceptance criteria**:
 
 - Config successfully parses IP ranges like `"1.2.3.0/24,5.6.7.8/32"`
-- Config validates API key meets minimum length
+- Config validates API key meets minimum length (32 chars)
 - Missing/invalid config returns clear error message
+- Config accessible via `rocket.state::<Config>()`
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
 ### Task 2. Implement Authentication Request Guard
 
-Create Rocket request guard that validates API key and IP address.
+Create Rocket request guard that validates API key and IP address using config
+from managed state.
 
 **Subtasks**:
 
+- [ ] Add `subtle` crate: `cargo add subtle`
 - [ ] Create `src/auth.rs` module
 - [ ] Define `AlpacaAuth` guard struct
 - [ ] Implement `FromRequest` trait for `AlpacaAuth`
-- [ ] Extract `Authorization` header and validate format
+- [ ] Access `Config` from managed state via
+      `request.rocket().state::<Config>()`
+- [ ] Extract `Authorization` header and validate Bearer format
 - [ ] Use constant-time comparison for API key validation (prevent timing
       attacks)
 - [ ] Extract client IP from request
-- [ ] Validate IP is in allowed ranges
+- [ ] Validate IP is in allowed ranges from config
 - [ ] Define `AuthError` enum with variants: `MissingApiKey`, `InvalidApiKey`,
-      `UnauthorizedIp`, `NoClientIp`
+      `UnauthorizedIp`, `NoClientIp`, `ConfigMissing`
 - [ ] Implement `Responder` for `AuthError` to return appropriate HTTP status
       codes
 - [ ] Add structured logging for auth attempts (success and failure)
+- [ ] Add `mod auth;` to `src/lib.rs`
+- [ ] Export `AlpacaAuth` from `src/lib.rs` as `pub use auth::AlpacaAuth;`
 
 **Files to create/modify**:
 
 - Create `src/auth.rs`
-- Modify `src/lib.rs` to add `mod auth;` and `pub use auth::AlpacaAuth;`
-
-**Dependencies**:
-
-- `subtle` crate for constant-time comparison: `cargo add subtle`
+- Modify `src/lib.rs`
 
 **Implementation notes**:
 
@@ -168,6 +175,10 @@ warn!(
 - Request without Authorization header returns 401
 - All auth attempts are logged with IP and outcome
 - Timing attack resistance verified (constant-time comparison)
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
@@ -209,45 +220,14 @@ pub(crate) async fn initiate_mint(
 - Requests without valid auth return 401/403 before reaching handler logic
 - Requests with valid auth reach handler as before
 - All protected endpoints require authentication
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
-### Task 4. Provide Config to Request Guards
-
-Make configuration available to request guards via Rocket managed state.
-
-**Subtasks**:
-
-- [ ] Add `Config` to Rocket managed state in `initialize_rocket()`
-- [ ] Update `AlpacaAuth::from_request()` to access config via
-      `request.rocket().state::<Config>()`
-- [ ] Use config's `alpaca_api_key_for_us` and `alpaca_ip_ranges` for validation
-
-**Files to modify**:
-
-- `src/lib.rs` (or wherever `initialize_rocket` is)
-- `src/auth.rs`
-
-**Implementation notes**:
-
-```rust
-// In from_request
-let config = request.rocket()
-    .state::<Config>()
-    .ok_or(AuthError::ConfigMissing)?;
-
-let expected_key = &config.alpaca_api_key_for_us;
-let allowed_ips = &config.alpaca_ip_ranges;
-```
-
-**Acceptance criteria**:
-
-- Request guard successfully accesses configuration
-- Authentication uses config values for validation
-
----
-
-### Task 5. Add Unit Tests for Auth Guard
+### Task 4. Add Unit Tests for Auth Guard
 
 Test authentication logic in isolation.
 
@@ -273,7 +253,7 @@ Test authentication logic in isolation.
 async fn test_valid_auth_succeeds() {
     let rocket = rocket::build()
         .manage(Config {
-            alpaca_api_key_for_us: "test-key-12345".to_string(),
+            issuer_api_key: "test-key-12345".to_string(),
             alpaca_ip_ranges: vec!["127.0.0.1/32".parse().unwrap()],
             // ... other config
         })
@@ -298,10 +278,14 @@ async fn test_valid_auth_succeeds() {
 - All test scenarios pass
 - Tests verify both API key and IP validation independently
 - Edge cases covered (missing headers, malformed data)
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
-### Task 6. Add Integration Tests
+### Task 5. Add Integration Tests
 
 Test authentication with actual endpoints.
 
@@ -340,10 +324,14 @@ let response = client
 - All existing tests pass with authentication added
 - New negative tests verify auth is required
 - IP whitelisting is tested in integration tests
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
-### Task 7. Add Rate Limiting
+### Task 6. Add Rate Limiting
 
 Prevent brute force attacks on API key.
 
@@ -384,10 +372,14 @@ if auth_failed {
 - 11th failed auth attempt from same IP within a minute returns 429
 - Rate limit resets after 1 minute
 - Successful authentications don't count against rate limit
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
 
 ---
 
-### Task 8. Documentation and Configuration Guide
+### Task 7. Documentation and Configuration Guide
 
 Document the authentication system for deployment and Alpaca integration.
 
@@ -416,13 +408,16 @@ Document the authentication system for deployment and Alpaca integration.
 
 **Acceptance criteria**:
 
-- Clear instructions for configuring authentication
-- Example curl commands showing correct header format
-- Rotation procedure documented
+- Clear instructions for configuring authentication in README.md
+- SPEC.md updated with authentication implementation details
+- Example curl commands showing correct `Authorization: Bearer <key>` format
+- API key rotation procedure documented
+- IP whitelist update procedure documented
+- Security best practices documented (HTTPS, key strength, rotation schedule)
 
 ---
 
-### Task 9. End-to-End Authentication Testing
+### Task 8. End-to-End Authentication Testing
 
 Test complete authentication flow in realistic scenario.
 
@@ -440,63 +435,12 @@ Test complete authentication flow in realistic scenario.
 
 **Acceptance criteria**:
 
-- Complete mint flow works with authentication
-- Auth failures at any step are handled correctly
-
----
-
-## Testing Strategy
-
-### Unit Tests
-
-- `src/auth.rs`: Request guard logic in isolation
-- Cover all auth failure scenarios
-- Verify constant-time comparison
-
-### Integration Tests
-
-- Each endpoint module: Verify auth is required
-- Test both success and failure cases
-- Verify error responses are correct
-
-### End-to-End Tests
-
-- Complete flows work with authentication
-- Auth integrates properly with CQRS framework
-
-### Manual Testing
-
-- Test with curl/Postman before Alpaca integration
-- Verify error messages are clear
-- Test from different IPs (local, VPN, etc.)
-
-## Security Checklist
-
-Before marking this complete:
-
-- [ ] API key uses cryptographically secure random generation (at least 256
-      bits)
-- [ ] Constant-time comparison prevents timing attacks
-- [ ] All auth attempts logged (success and failure)
-- [ ] IP address logged for audit trail
-- [ ] Rate limiting prevents brute force
-- [ ] Error messages don't leak information (same response for invalid key vs.
-      wrong IP)
-- [ ] HTTPS required (enforce in production configuration)
-- [ ] API key not logged in plaintext
-- [ ] Configuration validation ensures strong keys
-- [ ] Documentation includes rotation procedure
-
-## Deployment Checklist
-
-Before production:
-
-- [ ] Generate strong API key (use: `openssl rand -hex 32`)
-- [ ] Obtain Alpaca's IP ranges from their documentation/support
-- [ ] Configure `ALPACA_API_KEY_FOR_US` in production environment
-- [ ] Configure `ALPACA_IP_RANGES` in production environment
-- [ ] Test authentication from Alpaca's staging environment
-- [ ] Set up monitoring/alerts for auth failures
-- [ ] Document API key in secure location (password manager, Vault)
-- [ ] Schedule 90-day key rotation reminder
-- [ ] Verify HTTPS enforced in production
+- Complete mint flow (initiate → confirm → callback) works with authentication
+- Account linking flow works with authentication
+- Asset listing flow works with authentication
+- Auth failures at any step return appropriate errors (401/403)
+- End-to-end tests pass with authentication integrated
+- `cargo test --workspace` passes
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+  passes
+- `cargo fmt` applied
