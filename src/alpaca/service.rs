@@ -85,6 +85,18 @@ impl AlpacaConfig {
         )?;
         Ok(Arc::new(service))
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Self {
+            api_base_url: "https://example.com".to_string(),
+            account_id: "test".to_string(),
+            api_key: "test".to_string(),
+            api_secret: "test".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+        }
+    }
 }
 
 pub(crate) struct RealAlpacaService {

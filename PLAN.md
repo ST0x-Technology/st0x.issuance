@@ -70,25 +70,25 @@ tests.
 
 **Subtasks**:
 
-- [ ] Add dependencies: `cargo add ipnetwork subtle`
-- [ ] Add `issuer_api_key: String` and `alpaca_ip_ranges: Vec<IpNetwork>` fields
+- [x] Add dependencies: `cargo add ipnetwork subtle`
+- [x] Add `issuer_api_key: String` and `alpaca_ip_ranges: Vec<IpNetwork>` fields
       to `Config` struct
-- [ ] Update `.env.example` with `ISSUER_API_KEY` and `ALPACA_IP_RANGES` with
+- [x] Update `.env.example` with `ISSUER_API_KEY` and `ALPACA_IP_RANGES` with
       explanatory comments
-- [ ] Update `Config::parse()` to read and validate both environment variables
+- [x] Update `Config::parse()` to read and validate both environment variables
       (min 32 chars for API key)
-- [ ] Add `Config` to Rocket managed state in `initialize_rocket()`
-- [ ] Create `src/auth.rs` module with `AlpacaAuth` request guard
-- [ ] Implement `FromRequest` trait that accesses `Config` from managed state
-- [ ] Extract `Authorization` header and validate Bearer format
-- [ ] Use constant-time comparison for API key validation (prevent timing
+- [x] Add `Config` to Rocket managed state in `initialize_rocket()`
+- [x] Create `src/auth.rs` module with `IssuerAuth` request guard
+- [x] Implement `FromRequest` trait that accesses `Config` from managed state
+- [x] Extract `Authorization` header and validate Bearer format
+- [x] Use constant-time comparison for API key validation (prevent timing
       attacks)
-- [ ] Extract client IP from request and validate against IP ranges
-- [ ] Define `AuthError` enum with appropriate variants and HTTP status codes
-- [ ] Implement `Responder` for `AuthError`
-- [ ] Add structured logging for auth attempts (success and failure)
-- [ ] Add `mod auth;` and export `AlpacaAuth` from `src/lib.rs`
-- [ ] Add unit tests for auth guard (valid key, invalid key, wrong IP, missing
+- [x] Extract client IP from request and validate against IP ranges
+- [x] Define `AuthError` enum with appropriate variants and HTTP status codes
+- [x] Implement `Responder` for `AuthError`
+- [x] Add structured logging for auth attempts (success and failure)
+- [x] Add `mod auth;` to `src/lib.rs`
+- [x] Add unit tests for auth guard (valid key, invalid key, wrong IP, missing
       header, etc.)
 
 **Files to create/modify**:
@@ -130,14 +130,14 @@ tests.
 
 ### Task 2. Add Auth Guard to Endpoints
 
-Add `AlpacaAuth` guard to all issuer endpoints.
+Add `IssuerAuth` guard to all issuer endpoints.
 
 **Subtasks**:
 
-- [ ] Add `_auth: AlpacaAuth` parameter to `connect_account` endpoint
-- [ ] Add `_auth: AlpacaAuth` parameter to `list_tokenized_assets` endpoint
-- [ ] Add `_auth: AlpacaAuth` parameter to `initiate_mint` endpoint
-- [ ] Add `_auth: AlpacaAuth` parameter to `confirm_journal` endpoint
+- [ ] Add `_auth: IssuerAuth` parameter to `connect_account` endpoint
+- [ ] Add `_auth: IssuerAuth` parameter to `list_tokenized_assets` endpoint
+- [ ] Add `_auth: IssuerAuth` parameter to `initiate_mint` endpoint
+- [ ] Add `_auth: IssuerAuth` parameter to `confirm_journal` endpoint
 - [ ] Verify parameter is named with underscore prefix (unused in handler body)
 
 **Files to modify**:
@@ -152,7 +152,7 @@ Add `AlpacaAuth` guard to all issuer endpoints.
 ```rust
 #[post("/inkind/issuance", format = "json", data = "<request>")]
 pub(crate) async fn initiate_mint(
-    _auth: AlpacaAuth,  // Authentication happens before handler is called
+    _auth: IssuerAuth,  // Authentication happens before handler is called
     cqrs: &rocket::State<crate::MintCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<MintRequest>,

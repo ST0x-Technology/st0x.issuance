@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::account::{Account, AccountView};
+use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
@@ -32,6 +33,7 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod auth;
 pub(crate) mod config;
 pub(crate) mod receipt_inventory;
 pub(crate) mod telemetry;
@@ -202,6 +204,7 @@ pub async fn initialize_rocket(
     );
 
     Ok(rocket::build()
+        .manage(config)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)

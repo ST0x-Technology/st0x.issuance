@@ -71,6 +71,9 @@ anyhow = "1.0.100"
 dotenvy = "0.15.7"
 itertools = "0.14.0"
 base64 = "0.22.1"
+ipnetwork = "0.21.1"
+subtle = "2.6.1"
+governor = "0.10.2"
 
 [lints]
 workspace = true
