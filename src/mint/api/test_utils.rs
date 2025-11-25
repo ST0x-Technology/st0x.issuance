@@ -8,6 +8,8 @@ use crate::account::{
     Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::AlpacaService;
+use crate::alpaca::service::AlpacaConfig;
+use crate::config::{Config, LogLevel};
 use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
@@ -17,6 +19,22 @@ use crate::tokenized_asset::{
 };
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
+
+pub(super) fn test_config() -> Config {
+    Config {
+        database_url: "sqlite::memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: None,
+        private_key: None,
+        vault_address: None,
+        redemption_wallet: None,
+        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+        alpaca_ip_ranges: vec![*crate::test_utils::test_localhost_ip_range()],
+        log_level: LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig::test_default(),
+    }
+}
 
 pub(super) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,

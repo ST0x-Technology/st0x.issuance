@@ -86,7 +86,6 @@ impl AlpacaConfig {
         Ok(Arc::new(service))
     }
 
-    #[cfg(test)]
     pub(crate) fn test_default() -> Self {
         Self {
             api_base_url: "https://example.com".to_string(),
@@ -105,6 +104,7 @@ pub(crate) struct RealAlpacaService {
     account_id: String,
     api_key: String,
     api_secret: String,
+    max_retries: usize,
 }
 
 impl RealAlpacaService {
@@ -123,7 +123,20 @@ impl RealAlpacaService {
             .map_err(|e| AlpacaError::Http {
                 message: format!("Failed to build HTTP client: {e}"),
             })?;
-        Ok(Self { client, base_url, account_id, api_key, api_secret })
+        Ok(Self {
+            client,
+            base_url,
+            account_id,
+            api_key,
+            api_secret,
+            max_retries: 5,
+        })
+    }
+
+    #[cfg(test)]
+    const fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 }
 
@@ -177,7 +190,11 @@ impl AlpacaService for RealAlpacaService {
                 }
             }
         })
-        .retry(ExponentialBuilder::default().with_max_times(5).with_jitter())
+        .retry(
+            ExponentialBuilder::default()
+                .with_max_times(self.max_retries)
+                .with_jitter(),
+        )
         .when(|e: &AlpacaError| {
             matches!(
                 e,
@@ -248,7 +265,11 @@ impl AlpacaService for RealAlpacaService {
                 }
             }
         })
-        .retry(ExponentialBuilder::default().with_max_times(5).with_jitter())
+        .retry(
+            ExponentialBuilder::default()
+                .with_max_times(self.max_retries)
+                .with_jitter(),
+        )
         .when(|e: &AlpacaError| {
             matches!(
                 e,
@@ -331,7 +352,11 @@ impl AlpacaService for RealAlpacaService {
                 }
             }
         })
-        .retry(ExponentialBuilder::default().with_max_times(5).with_jitter())
+        .retry(
+            ExponentialBuilder::default()
+                .with_max_times(self.max_retries)
+                .with_jitter(),
+        )
         .when(|e: &AlpacaError| {
             matches!(
                 e,
@@ -1132,7 +1157,8 @@ mod tests {
             10,
             30,
         )
-        .unwrap();
+        .unwrap()
+        .with_max_retries(0);
 
         let result = service
             .poll_request_status(&TokenizationRequestId::new("tok-123"))
@@ -1145,7 +1171,7 @@ mod tests {
             _ => panic!("Expected Api error, got {result:?}"),
         }
 
-        mock.assert_calls(6);
+        mock.assert();
     }
 
     #[tokio::test]

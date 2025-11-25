@@ -8,19 +8,23 @@ use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use ipnetwork::IpNetwork;
 use rocket::routes;
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::sqlite::SqlitePoolOptions;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
+use crate::alpaca::service::AlpacaConfig;
+use crate::auth::FailedAuthRateLimiter;
 use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
+use crate::config::{Config, LogLevel};
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
@@ -41,6 +45,27 @@ pub fn test_alpaca_auth_header() -> String {
         "Basic {}",
         BASE64.encode(format!("{test_api_key}:{test_api_secret}"))
     )
+}
+
+pub(crate) fn test_localhost_ip_range() -> &'static IpNetwork {
+    static IP_RANGE: OnceLock<IpNetwork> = OnceLock::new();
+    IP_RANGE.get_or_init(|| "127.0.0.1/32".parse().expect("Valid IP range"))
+}
+
+fn test_config() -> Config {
+    Config {
+        database_url: "sqlite::memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: None,
+        private_key: None,
+        vault: None,
+        bot: None,
+        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+        alpaca_ip_ranges: vec![*test_localhost_ip_range()],
+        log_level: LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig::test_default(),
+    }
 }
 
 /// Sets up a test Rocket instance with in-memory database and mock services.
@@ -123,14 +148,19 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
         mint_cqrs.clone(),
     ));
 
+    let rate_limiter = FailedAuthRateLimiter::new()
+        .expect("Failed to create rate limiter for tests");
+
     // Build rocket
     rocket::build()
+        .manage(test_config())
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
         .manage(mint_event_store)
         .manage(mint_manager)
         .manage(callback_manager)
+        .manage(rate_limiter)
         .manage(pool)
         .mount(
             "/",

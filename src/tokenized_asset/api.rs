@@ -5,6 +5,7 @@ use sqlx::{Pool, Sqlite};
 use tracing::error;
 
 use super::{Network, TokenSymbol, UnderlyingSymbol, view::TokenizedAssetView};
+use crate::auth::IssuerAuth;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TokenizedAssetResponse {
@@ -13,9 +14,10 @@ pub(crate) struct TokenizedAssetResponse {
     pub(crate) network: Network,
 }
 
-#[tracing::instrument(skip(pool))]
+#[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets")]
 pub(crate) async fn list_tokenized_assets(
+    _auth: IssuerAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<Vec<TokenizedAssetResponse>>, rocket::http::Status> {
     let views =
@@ -41,11 +43,31 @@ pub(crate) async fn list_tokenized_assets(
 mod tests {
     use alloy::primitives::address;
     use chrono::Utc;
-    use rocket::http::Status;
+    use rocket::http::{Header, Status};
     use rocket::routes;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::alpaca::service::AlpacaConfig;
+    use crate::config::{Config, LogLevel};
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            rpc_url: None,
+            private_key: None,
+            vault_address: None,
+            redemption_wallet: None,
+            issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+            alpaca_ip_ranges: vec![
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ],
+            log_level: LogLevel::Debug,
+            hyperdx: None,
+            alpaca: AlpacaConfig::test_default(),
+        }
+    }
 
     #[tokio::test]
     async fn test_list_tokenized_assets_returns_enabled_assets() {
@@ -108,6 +130,7 @@ mod tests {
         .expect("Failed to insert disabled view");
 
         let rocket = rocket::build()
+            .manage(test_config())
             .manage(pool)
             .mount("/", routes![list_tokenized_assets]);
 
@@ -115,7 +138,15 @@ mod tests {
             .await
             .expect("valid rocket instance");
 
-        let response = client.get("/tokenized-assets").dispatch().await;
+        let response = client
+            .get("/tokenized-assets")
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .dispatch()
+            .await;
 
         assert_eq!(response.status(), Status::Ok);
 
@@ -144,6 +175,7 @@ mod tests {
             .expect("Failed to run migrations");
 
         let rocket = rocket::build()
+            .manage(test_config())
             .manage(pool)
             .mount("/", routes![list_tokenized_assets]);
 
@@ -151,7 +183,15 @@ mod tests {
             .await
             .expect("valid rocket instance");
 
-        let response = client.get("/tokenized-assets").dispatch().await;
+        let response = client
+            .get("/tokenized-assets")
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .dispatch()
+            .await;
 
         assert_eq!(response.status(), Status::Ok);
 

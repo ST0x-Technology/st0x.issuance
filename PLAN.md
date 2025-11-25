@@ -134,11 +134,11 @@ Add `IssuerAuth` guard to all issuer endpoints.
 
 **Subtasks**:
 
-- [ ] Add `_auth: IssuerAuth` parameter to `connect_account` endpoint
-- [ ] Add `_auth: IssuerAuth` parameter to `list_tokenized_assets` endpoint
-- [ ] Add `_auth: IssuerAuth` parameter to `initiate_mint` endpoint
-- [ ] Add `_auth: IssuerAuth` parameter to `confirm_journal` endpoint
-- [ ] Verify parameter is named with underscore prefix (unused in handler body)
+- [x] Add `_auth: IssuerAuth` parameter to `connect_account` endpoint
+- [x] Add `_auth: IssuerAuth` parameter to `list_tokenized_assets` endpoint
+- [x] Add `_auth: IssuerAuth` parameter to `initiate_mint` endpoint
+- [x] Add `_auth: IssuerAuth` parameter to `confirm_journal` endpoint
+- [x] Verify parameter is named with underscore prefix (unused in handler body)
 
 **Files to modify**:
 
