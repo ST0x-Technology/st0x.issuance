@@ -179,13 +179,13 @@ Test authentication with actual endpoints.
 
 **Subtasks**:
 
-- [ ] Update existing endpoint tests to include valid auth
-- [ ] Add test: `POST /accounts/connect` without auth → 401
-- [ ] Add test: `GET /tokenized-assets` without auth → 401
-- [ ] Add test: `POST /inkind/issuance` without auth → 401
-- [ ] Add test: `POST /inkind/issuance/confirm` without auth → 401
-- [ ] Add test: Valid auth allows request to succeed (existing happy path tests)
-- [ ] Add test: Wrong IP returns 403 even with valid key
+- [x] Update existing endpoint tests to include valid auth
+- [x] Add test: `POST /accounts/connect` without auth → 401
+- [x] Add test: `GET /tokenized-assets` without auth → 401
+- [x] Add test: `POST /inkind/issuance` without auth → 401
+- [x] Add test: `POST /inkind/issuance/confirm` without auth → 401
+- [x] Add test: Valid auth allows request to succeed (existing happy path tests)
+- [x] Add test: Wrong IP returns 403 even with valid key
 
 **Files to modify**:
 

@@ -554,4 +554,113 @@ mod tests {
         assert!(whitelisted_wallets.is_empty());
         assert_eq!(status, super::super::LinkedAccountStatus::Active);
     }
+
+    #[tokio::test]
+    async fn test_connect_account_without_auth_returns_401() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            super::super::AccountView,
+            Account,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "customer@firm.com",
+            "account": "alpaca-account-123",
+            "wallet": "0x1111111111111111111111111111111111111111"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn test_connect_account_with_wrong_ip_returns_403() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            super::super::AccountView,
+            Account,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "customer@firm.com",
+            "account": "alpaca-account-123",
+            "wallet": "0x1111111111111111111111111111111111111111"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+    }
 }

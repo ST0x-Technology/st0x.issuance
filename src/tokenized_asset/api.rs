@@ -202,4 +202,31 @@ mod tests {
 
         assert!(assets.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_list_tokenized_assets_without_auth_returns_401() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(pool)
+            .mount("/", routes![list_tokenized_assets]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/tokenized-assets").dispatch().await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
 }

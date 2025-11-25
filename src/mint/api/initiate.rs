@@ -690,4 +690,39 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_initiate_mint_without_auth_returns_401() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(mint_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.0",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "network": "base",
+            "client_id": "client-456",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
 }

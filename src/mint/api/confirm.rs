@@ -805,4 +805,42 @@ mod tests {
 
         assert_eq!(response.status(), Status::InternalServerError);
     }
+
+    #[tokio::test]
+    async fn test_confirm_journal_without_auth_returns_401() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let event_store = create_test_event_store(&pool);
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(mint_cqrs)
+            .manage(event_store)
+            .manage(mint_manager)
+            .manage(callback_manager)
+            .manage(pool)
+            .mount("/", routes![confirm_journal]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "issuer_request_id": "iss-456",
+            "status": "completed"
+        });
+
+        let response = client
+            .post("/inkind/issuance/confirm")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
 }
