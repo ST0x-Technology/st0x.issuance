@@ -1558,7 +1558,7 @@ SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
 
 # Authentication (for Alpaca calling our endpoints)
-ALPACA_API_KEY_FOR_US=<api_key_that_alpaca_uses_to_authenticate>
+ISSUER_API_KEY=<api_key_that_alpaca_uses_to_authenticate>
 ALPACA_IP_RANGES=<comma_separated_cidr_ranges>  # e.g., "1.2.3.0/24,5.6.7.8/32"
 
 # Alpaca Configuration
