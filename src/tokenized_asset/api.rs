@@ -124,10 +124,8 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: TokenizedAssetsListResponse = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: TokenizedAssetsListResponse =
+            response.into_json().await.expect("valid JSON response");
 
         assert_eq!(response_body.tokens.len(), 1);
         assert_eq!(
@@ -163,10 +161,8 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: TokenizedAssetsListResponse = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: TokenizedAssetsListResponse =
+            response.into_json().await.expect("valid JSON response");
 
         assert!(response_body.tokens.is_empty());
     }
