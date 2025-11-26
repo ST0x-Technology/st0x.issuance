@@ -14,19 +14,24 @@ pub(crate) struct TokenizedAssetResponse {
     pub(crate) network: Network,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TokenizedAssetsListResponse {
+    pub(crate) tokens: Vec<TokenizedAssetResponse>,
+}
+
 #[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets")]
 pub(crate) async fn list_tokenized_assets(
     _auth: IssuerAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-) -> Result<Json<Vec<TokenizedAssetResponse>>, rocket::http::Status> {
+) -> Result<Json<TokenizedAssetsListResponse>, rocket::http::Status> {
     let views =
         super::view::list_enabled_assets(pool.inner()).await.map_err(|e| {
             error!("Failed to list enabled assets: {e}");
             rocket::http::Status::InternalServerError
         })?;
 
-    let assets = views
+    let tokens = views
         .into_iter()
         .filter_map(|view| match view {
             TokenizedAssetView::Asset {
@@ -36,7 +41,7 @@ pub(crate) async fn list_tokenized_assets(
         })
         .collect();
 
-    Ok(Json(assets))
+    Ok(Json(TokenizedAssetsListResponse { tokens }))
 }
 
 #[cfg(test)]
@@ -155,15 +160,16 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let assets: Vec<TokenizedAssetResponse> = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: TokenizedAssetsListResponse =
+            response.into_json().await.expect("valid JSON response");
 
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].underlying, UnderlyingSymbol::new("AAPL"));
-        assert_eq!(assets[0].token, TokenSymbol::new("tAAPL"));
-        assert_eq!(assets[0].network, Network::new("base"));
+        assert_eq!(response_body.tokens.len(), 1);
+        assert_eq!(
+            response_body.tokens[0].underlying,
+            UnderlyingSymbol::new("AAPL")
+        );
+        assert_eq!(response_body.tokens[0].token, TokenSymbol::new("tAAPL"));
+        assert_eq!(response_body.tokens[0].network, Network::new("base"));
     }
 
     #[tokio::test]
@@ -201,12 +207,10 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let assets: Vec<TokenizedAssetResponse> = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
+        let response_body: TokenizedAssetsListResponse =
+            response.into_json().await.expect("valid JSON response");
 
-        assert!(assets.is_empty());
+        assert!(response_body.tokens.is_empty());
     }
 
     #[tokio::test]
