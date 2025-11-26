@@ -92,6 +92,31 @@ Segregation (CQRS)** patterns:
    cargo run
    ```
 
+## Authentication
+
+Endpoints require API key authentication with IP whitelisting and rate limiting.
+
+**Configuration:**
+
+```bash
+# Generate API key (min 32 chars)
+ISSUER_API_KEY=$(openssl rand -hex 32)
+
+# Configure IP whitelist (CIDR notation)
+ALPACA_IP_RANGES="1.2.3.0/24,5.6.7.8/32"
+```
+
+**Request format:**
+
+```bash
+curl -X POST https://issuer.example.com/inkind/issuance \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json"
+```
+
+**Security:** API key constant-time comparison, 10 failed auth attempts/IP/min
+rate limit
+
 ## Development Commands
 
 ### Building & Running
