@@ -42,7 +42,6 @@ pub(crate) mod vault;
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
-
 pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
@@ -203,8 +202,12 @@ pub async fn initialize_rocket(
         burn,
     );
 
+    let rate_limiter = FailedAuthRateLimiter::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create rate limiter: {e}"))?;
+
     Ok(rocket::build()
         .manage(config)
+        .manage(rate_limiter)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)

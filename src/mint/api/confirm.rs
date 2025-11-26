@@ -205,6 +205,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::confirm_journal;
+    use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
         create_test_callback_manager, create_test_event_store,
         create_test_mint_manager, setup_test_environment,
@@ -249,6 +250,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -316,6 +318,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -384,6 +387,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -468,6 +472,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -555,6 +560,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -639,6 +645,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -730,6 +737,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -774,6 +782,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -817,6 +826,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)

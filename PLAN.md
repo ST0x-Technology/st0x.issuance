@@ -225,11 +225,11 @@ Prevent brute force attacks on API key.
 
 **Subtasks**:
 
-- [ ] Add `governor` crate for rate limiting: `cargo add governor`
-- [ ] Create rate limiter fairings/guards
-- [ ] Limit failed auth attempts: 10 per IP per minute
-- [ ] Log when rate limit is triggered
-- [ ] Return 429 Too Many Requests when rate limited
+- [x] Add `governor` crate for rate limiting: `cargo add governor`
+- [x] Create rate limiter fairings/guards
+- [x] Limit failed auth attempts: 10 per IP per minute
+- [x] Log when rate limit is triggered
+- [x] Return 429 Too Many Requests when rate limited
 
 **Files to create/modify**:
 

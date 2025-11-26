@@ -1,13 +1,37 @@
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use ipnetwork::IpNetwork;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::{Responder, Response};
 use std::io::Cursor;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 use crate::config::Config;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RateLimiterError {
+    #[error("Rate limit value must be non-zero")]
+    InvalidRateLimit,
+}
+
+pub(crate) struct FailedAuthRateLimiter(Arc<DefaultKeyedRateLimiter<IpAddr>>);
+
+impl FailedAuthRateLimiter {
+    pub(crate) fn new() -> Result<Self, RateLimiterError> {
+        let rate_limit =
+            NonZeroU32::new(10).ok_or(RateLimiterError::InvalidRateLimit)?;
+        let quota = Quota::per_minute(rate_limit);
+        Ok(Self(Arc::new(RateLimiter::keyed(quota))))
+    }
+
+    fn check(&self, ip: &IpAddr) -> bool {
+        self.0.check_key(ip).is_ok()
+    }
+}
 
 pub(crate) struct IssuerAuth;
 
@@ -20,6 +44,16 @@ impl<'r> FromRequest<'r> for IssuerAuth {
     ) -> Outcome<Self, Self::Error> {
         let Some(config) = request.rocket().state::<Config>() else {
             warn!("Config not found in Rocket state");
+            return Outcome::Error((
+                Status::InternalServerError,
+                AuthError::ConfigMissing,
+            ));
+        };
+
+        let Some(rate_limiter) =
+            request.rocket().state::<FailedAuthRateLimiter>()
+        else {
+            warn!("Rate limiter not found in Rocket state");
             return Outcome::Error((
                 Status::InternalServerError,
                 AuthError::ConfigMissing,
@@ -51,6 +85,20 @@ impl<'r> FromRequest<'r> for IssuerAuth {
 
         let expected_key = &config.issuer_api_key;
         if !validate_api_key(api_key, expected_key) {
+            if let Some(client_ip) = extract_client_ip(request) {
+                if !rate_limiter.check(&client_ip) {
+                    warn!(
+                        ip = %client_ip,
+                        endpoint = %request.uri(),
+                        "Rate limit exceeded for failed authentication"
+                    );
+                    return Outcome::Error((
+                        Status::TooManyRequests,
+                        AuthError::RateLimited,
+                    ));
+                }
+            }
+
             warn!(
                 endpoint = %request.uri(),
                 "Invalid API key"
@@ -70,6 +118,18 @@ impl<'r> FromRequest<'r> for IssuerAuth {
         };
 
         if !is_ip_whitelisted(&client_ip, &config.alpaca_ip_ranges) {
+            if !rate_limiter.check(&client_ip) {
+                warn!(
+                    ip = %client_ip,
+                    endpoint = %request.uri(),
+                    "Rate limit exceeded for failed authentication"
+                );
+                return Outcome::Error((
+                    Status::TooManyRequests,
+                    AuthError::RateLimited,
+                ));
+            }
+
             warn!(
                 ip = %client_ip,
                 endpoint = %request.uri(),
@@ -110,6 +170,7 @@ pub enum AuthError {
     UnauthorizedIp,
     NoClientIp,
     ConfigMissing,
+    RateLimited,
 }
 
 impl<'r> Responder<'r, 'static> for AuthError {
@@ -129,6 +190,10 @@ impl<'r> Responder<'r, 'static> for AuthError {
             Self::ConfigMissing => {
                 (Status::InternalServerError, "Server configuration error")
             }
+            Self::RateLimited => (
+                Status::TooManyRequests,
+                "Too many failed authentication attempts",
+            ),
         };
 
         Response::build()
@@ -172,6 +237,7 @@ mod tests {
     async fn test_missing_authorization_header_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .mount("/", rocket::routes![test_endpoint]);
 
         let client =
@@ -186,6 +252,7 @@ mod tests {
     async fn test_malformed_authorization_header_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .mount("/", rocket::routes![test_endpoint]);
 
         let client =
@@ -204,6 +271,7 @@ mod tests {
     async fn test_invalid_api_key_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .mount("/", rocket::routes![test_endpoint]);
 
         let client =
@@ -242,5 +310,66 @@ mod tests {
         assert!(is_ip_whitelisted(&ip1, &ranges));
         assert!(is_ip_whitelisted(&ip2, &ranges));
         assert!(!is_ip_whitelisted(&ip3, &ranges));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_11th_failed_attempt_returns_429() {
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .mount("/", rocket::routes![test_endpoint]);
+
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
+
+        for i in 0..10 {
+            let response = client
+                .get("/test")
+                .header(Header::new("Authorization", "Bearer wrong-key"))
+                .header(Header::new("X-Real-IP", "127.0.0.1"))
+                .dispatch()
+                .await;
+
+            assert_eq!(
+                response.status(),
+                Status::Unauthorized,
+                "Request {} should return 401",
+                i + 1
+            );
+        }
+
+        let response = client
+            .get("/test")
+            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::TooManyRequests);
+    }
+
+    #[tokio::test]
+    async fn test_successful_auth_does_not_count_against_limit() {
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .mount("/", rocket::routes![test_endpoint]);
+
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
+
+        for _ in 0..15 {
+            let response = client
+                .get("/test")
+                .header(Header::new(
+                    "Authorization",
+                    "Bearer test-key-12345678901234567890123456",
+                ))
+                .header(Header::new("X-Real-IP", "127.0.0.1"))
+                .dispatch()
+                .await;
+
+            assert_eq!(response.status(), Status::Ok);
+        }
     }
 }

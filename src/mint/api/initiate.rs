@@ -103,7 +103,11 @@ mod tests {
     use tracing::debug;
 
     use super::initiate_mint;
-    use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
+    use crate::account::{
+        AccountCommand, AccountView, AlpacaAccountNumber, Email,
+        view::find_by_email,
+    };
+    use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
         setup_test_environment, setup_with_account_and_asset, test_config,
     };
@@ -154,6 +158,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -220,6 +225,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -274,6 +280,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -344,6 +351,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -400,6 +408,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -482,6 +491,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -568,6 +578,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -614,6 +625,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -698,6 +710,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);

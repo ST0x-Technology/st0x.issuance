@@ -75,21 +75,21 @@ fn test_config() -> Config {
 /// the same reason. However, all mock services are internal implementation details - E2E
 /// tests should only interact with the returned Rocket instance through its public HTTP API.
 ///
-/// # Panics
-/// Panics if database creation, migrations, or asset seeding fails.
-pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
+/// # Errors
+///
+/// Returns an error if:
+/// - Database creation fails
+/// - Database migrations fail
+/// - Asset seeding fails
+/// - Rate limiter initialization fails
+pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>>
+{
     // Create in-memory database
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(":memory:")
-        .await
-        .expect("Failed to create in-memory database");
+    let pool =
+        SqlitePoolOptions::new().max_connections(5).connect(":memory:").await?;
 
     // Run migrations
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     // Setup Account CQRS
     let account_view_repo =
@@ -133,7 +133,7 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
     >::new_event_store(mint_event_repo));
 
     // Seed initial assets
-    seed_test_assets(&tokenized_asset_cqrs).await;
+    seed_test_assets(&tokenized_asset_cqrs).await?;
 
     // Create managers with mock services
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -148,11 +148,10 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
         mint_cqrs.clone(),
     ));
 
-    let rate_limiter = FailedAuthRateLimiter::new()
-        .expect("Failed to create rate limiter for tests");
+    let rate_limiter = FailedAuthRateLimiter::new()?;
 
     // Build rocket
-    rocket::build()
+    Ok(rocket::build()
         .manage(test_config())
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
@@ -170,10 +169,12 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
                 crate::mint::initiate_mint,
                 crate::mint::confirm_journal
             ],
-        )
+        ))
 }
 
-async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {
+async fn seed_test_assets(
+    cqrs: &SqliteCqrs<TokenizedAsset>,
+) -> Result<(), anyhow::Error> {
     let assets = vec![
         (
             "AAPL",
@@ -197,10 +198,15 @@ async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {
             vault,
         };
 
-        cqrs.execute(underlying, command)
-            .await
-            .expect("Failed to seed test asset");
+        match cqrs.execute(underlying, command).await {
+            Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

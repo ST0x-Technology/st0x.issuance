@@ -49,6 +49,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
+    use crate::auth::FailedAuthRateLimiter;
     use crate::config::{Config, LogLevel};
 
     fn test_config() -> Config {
@@ -131,6 +132,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool)
             .mount("/", routes![list_tokenized_assets]);
 
@@ -176,6 +178,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool)
             .mount("/", routes![list_tokenized_assets]);
 
@@ -218,6 +221,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool)
             .mount("/", routes![list_tokenized_assets]);
 

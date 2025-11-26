@@ -214,6 +214,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(rate_limiter)
             .manage(pool)
@@ -279,6 +280,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(rate_limiter)
             .manage(pool)
@@ -353,6 +355,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(rate_limiter)
             .manage(pool)
@@ -413,6 +416,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(rate_limiter)
             .manage(pool.clone())
@@ -497,6 +501,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(rate_limiter)
             .manage(pool.clone())
@@ -583,6 +588,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
@@ -635,6 +641,7 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
