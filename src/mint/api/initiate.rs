@@ -103,10 +103,7 @@ mod tests {
     use tracing::debug;
 
     use super::initiate_mint;
-    use crate::account::{
-        AccountCommand, AccountView, AlpacaAccountNumber, Email,
-        view::find_by_email,
-    };
+    use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
         setup_test_environment, setup_with_account_and_asset, test_config,

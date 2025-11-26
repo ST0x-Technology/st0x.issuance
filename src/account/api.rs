@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, address};
+use alloy::primitives::Address;
 use rocket::Request;
 use rocket::http::Status;
 use rocket::post;
@@ -7,7 +7,6 @@ use rocket::response::Responder;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 use tracing::error;
-use url::Url;
 use uuid::Uuid;
 
 use super::{
@@ -153,12 +152,14 @@ pub(crate) async fn whitelist_wallet(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, address};
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use url::Url;
 
     use super::super::Account;
     use super::*;
