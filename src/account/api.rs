@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, address};
 use rocket::Request;
 use rocket::http::Status;
 use rocket::post;
@@ -7,6 +7,7 @@ use rocket::response::Responder;
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
 use tracing::error;
+use url::Url;
 use uuid::Uuid;
 
 use super::{
@@ -169,10 +170,10 @@ mod tests {
         Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
-            rpc_url: None,
-            private_key: None,
-            vault: None,
-            bot: None,
+            rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+            private_key: B256::ZERO,
+            vault: address!("0x1111111111111111111111111111111111111111"),
+            bot: address!("0x2222222222222222222222222222222222222222"),
             issuer_api_key: "test-key-12345678901234567890123456".to_string(),
             alpaca_ip_ranges: vec![
                 "127.0.0.1/32".parse().expect("Valid IP range"),
@@ -214,9 +215,8 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
             .manage(rate_limiter)
+            .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -280,9 +280,8 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
             .manage(rate_limiter)
+            .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -355,9 +354,8 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
             .manage(rate_limiter)
+            .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -416,9 +414,8 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
             .manage(rate_limiter)
+            .manage(account_cqrs)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
 
@@ -501,9 +498,8 @@ mod tests {
 
         let rocket = rocket::build()
             .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
             .manage(rate_limiter)
+            .manage(account_cqrs)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
 

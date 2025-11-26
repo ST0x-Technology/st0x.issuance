@@ -81,6 +81,11 @@ async fn perform_mint_flow(
     let link_response = client
         .post("/accounts/connect")
         .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "Authorization",
+            "Bearer test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
             json!({
                 "email": "user@example.com",
@@ -113,6 +118,11 @@ async fn perform_mint_flow(
     let mint_response = client
         .post("/inkind/issuance")
         .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "Authorization",
+            "Bearer test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
             json!({
                 "tokenization_request_id": "alp-mint-789",
@@ -134,6 +144,11 @@ async fn perform_mint_flow(
     let confirm_response = client
         .post("/inkind/issuance/confirm")
         .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "Authorization",
+            "Bearer test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
             json!({
                 "tokenization_request_id": "alp-mint-789",
@@ -298,6 +313,8 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         private_key: evm.private_key,
         vault: evm.vault_address,
         bot: bot_wallet,
+        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+        alpaca_ip_ranges: vec!["127.0.0.1/32".parse().expect("Valid IP range")],
         log_level: st0x_issuance::LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {

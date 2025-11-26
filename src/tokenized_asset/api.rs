@@ -53,13 +53,16 @@ mod tests {
     use crate::config::{Config, LogLevel};
 
     fn test_config() -> Config {
+        use alloy::primitives::{B256, address};
+        use url::Url;
+
         Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
-            rpc_url: None,
-            private_key: None,
-            vault_address: None,
-            redemption_wallet: None,
+            rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+            private_key: B256::ZERO,
+            vault: address!("0x1111111111111111111111111111111111111111"),
+            bot: address!("0x2222222222222222222222222222222222222222"),
             issuer_api_key: "test-key-12345678901234567890123456".to_string(),
             alpaca_ip_ranges: vec![
                 "127.0.0.1/32".parse().expect("Valid IP range"),
