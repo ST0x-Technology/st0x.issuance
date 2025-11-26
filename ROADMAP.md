@@ -182,8 +182,9 @@ Operational concerns for production deployment.
 
 - [ ] [#27](https://github.com/ST0x-Technology/st0x.issuance/issues/27) - Design
       and implement private key management
-- [ ] [#28](https://github.com/ST0x-Technology/st0x.issuance/issues/28) -
+- [x] [#28](https://github.com/ST0x-Technology/st0x.issuance/issues/28) -
       Implement API authentication for our endpoints
+  - **PR:** [#63](https://github.com/ST0x-Technology/st0x.issuance/pull/63)
 - [ ] [#29](https://github.com/ST0x-Technology/st0x.issuance/issues/29) - Setup
       configuration and secrets management
 - [ ] [#30](https://github.com/ST0x-Technology/st0x.issuance/issues/30) -
