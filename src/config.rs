@@ -4,6 +4,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
+use ipnetwork::IpNetwork;
 use std::sync::Arc;
 use tracing::Level;
 use url::Url;
@@ -111,6 +112,21 @@ struct Env {
     )]
     bot: Address,
 
+    #[arg(
+        long,
+        env = "ISSUER_API_KEY",
+        help = "API key for authenticating inbound requests from Alpaca"
+    )]
+    issuer_api_key: String,
+
+    #[arg(
+        long,
+        env = "ALPACA_IP_RANGES",
+        value_delimiter = ',',
+        help = "Comma-separated list of IP ranges (CIDR notation) allowed to call issuer endpoints"
+    )]
+    alpaca_ip_ranges: Vec<IpNetwork>,
+
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
 
@@ -122,21 +138,30 @@ struct Env {
 }
 
 impl Env {
-    fn into_config(self) -> Config {
+    fn into_config(self) -> Result<Config, ConfigError> {
+        if self.issuer_api_key.len() < 32 {
+            return Err(ConfigError::InvalidIssuerApiKey(format!(
+                "API key must be at least 32 characters, got {}",
+                self.issuer_api_key.len()
+            )));
+        }
+
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
 
-        Config {
+        Ok(Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
             private_key: self.private_key,
             vault: self.vault,
             bot: self.bot,
+            issuer_api_key: self.issuer_api_key,
+            alpaca_ip_ranges: self.alpaca_ip_ranges,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
-        }
+        })
     }
 }
 
@@ -148,6 +173,8 @@ pub struct Config {
     pub private_key: B256,
     pub vault: Address,
     pub bot: Address,
+    pub issuer_api_key: String,
+    pub alpaca_ip_ranges: Vec<IpNetwork>,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
@@ -159,8 +186,9 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if command-line arguments or environment variables are invalid.
-    pub fn parse() -> Result<Self, clap::Error> {
-        Env::try_parse().map(Env::into_config)
+    pub fn parse() -> Result<Self, ConfigError> {
+        let env = Env::try_parse()?;
+        env.into_config()
     }
 
     pub(crate) async fn create_blockchain_service(
@@ -186,6 +214,10 @@ pub enum ConfigError {
     InvalidPrivateKeyFormat(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("Failed to connect to RPC endpoint")]
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("Invalid issuer API key: {0}")]
+    InvalidIssuerApiKey(String),
+    #[error("Failed to parse configuration: {0}")]
+    ParseError(#[from] clap::Error),
 }
 
 pub fn setup_tracing(log_level: &LogLevel) {

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::account::{Account, AccountView};
+use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
@@ -32,6 +33,7 @@ pub mod test_utils;
 pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
+pub(crate) mod auth;
 pub(crate) mod config;
 pub(crate) mod receipt_inventory;
 pub(crate) mod telemetry;
@@ -40,7 +42,6 @@ pub(crate) mod vault;
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
-
 pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
@@ -201,11 +202,16 @@ pub async fn initialize_rocket(
         burn,
     );
 
+    let rate_limiter = FailedAuthRateLimiter::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create rate limiter: {e}"))?;
+
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))
         .merge(("port", 8000));
 
     Ok(rocket::custom(figment)
+        .manage(config)
+        .manage(rate_limiter)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)

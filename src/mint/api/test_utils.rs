@@ -1,13 +1,16 @@
-use alloy::primitives::address;
+use alloy::primitives::{B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
+use url::Url;
 
 use crate::account::{
     Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::AlpacaService;
+use crate::alpaca::service::AlpacaConfig;
+use crate::config::{Config, LogLevel};
 use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
@@ -17,6 +20,22 @@ use crate::tokenized_asset::{
 };
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
+
+pub(super) fn test_config() -> Config {
+    Config {
+        database_url: "sqlite::memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+        private_key: B256::ZERO,
+        vault: address!("0x1111111111111111111111111111111111111111"),
+        bot: address!("0x2222222222222222222222222222222222222222"),
+        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+        alpaca_ip_ranges: vec![*crate::test_utils::test_localhost_ip_range()],
+        log_level: LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig::test_default(),
+    }
+}
 
 pub(super) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,

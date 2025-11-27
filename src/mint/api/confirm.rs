@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::MintEventStore;
+use crate::auth::IssuerAuth;
 use crate::mint::{
     CallbackManager, IssuerRequestId, Mint, MintCommand, TokenizationRequestId,
     mint_manager::MintManager,
@@ -26,13 +27,14 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(cqrs, event_store, mint_manager, callback_manager), fields(
+#[tracing::instrument(skip(_auth, cqrs, event_store, mint_manager, callback_manager), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id.0,
     status = ?request.status
 ))]
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
+    _auth: IssuerAuth,
     cqrs: &State<crate::MintCqrs>,
     event_store: &State<MintEventStore>,
     mint_manager: &State<
@@ -198,15 +200,16 @@ async fn process_journal_completion(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use rocket::http::{ContentType, Status};
+    use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
 
     use super::confirm_journal;
+    use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
         create_test_callback_manager, create_test_event_store,
         create_test_mint_manager, setup_test_environment,
-        setup_with_account_and_asset,
+        setup_with_account_and_asset, test_config,
     };
     use crate::mint::{
         IssuerRequestId, MintCommand, MintView, Quantity,
@@ -246,6 +249,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -266,6 +271,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -307,6 +317,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -327,6 +339,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -369,6 +386,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -389,6 +408,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -447,6 +471,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -467,6 +493,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -528,6 +559,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -548,6 +581,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -606,6 +644,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -626,6 +666,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -691,6 +736,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -711,6 +758,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -729,6 +781,8 @@ mod tests {
         let callback_manager = create_test_callback_manager(mint_cqrs.clone());
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
             .manage(mint_manager)
@@ -749,10 +803,54 @@ mod tests {
         let response = client
             .post("/inkind/issuance/confirm")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
 
         assert_eq!(response.status(), Status::InternalServerError);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_journal_without_auth_returns_401() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let event_store = create_test_event_store(&pool);
+        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
+        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_cqrs)
+            .manage(event_store)
+            .manage(mint_manager)
+            .manage(callback_manager)
+            .manage(pool)
+            .mount("/", routes![confirm_journal]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "issuer_request_id": "iss-456",
+            "status": "completed"
+        });
+
+        let response = client
+            .post("/inkind/issuance/confirm")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
     }
 }
