@@ -6,7 +6,7 @@ use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use ipnetwork::IpNetwork;
 use std::sync::Arc;
-use tracing::Level;
+use tracing::{Level, warn};
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
@@ -125,7 +125,7 @@ struct Env {
         value_delimiter = ',',
         help = "Comma-separated list of IP ranges (CIDR notation) allowed to call issuer endpoints"
     )]
-    alpaca_ip_ranges: Vec<IpNetwork>,
+    alpaca_ip_ranges: Option<Vec<IpNetwork>>,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -146,6 +146,16 @@ impl Env {
             )));
         }
 
+        let alpaca_ip_ranges = self.alpaca_ip_ranges.unwrap_or_default();
+
+        if alpaca_ip_ranges.is_empty() {
+            warn!(
+                "ALPACA_IP_RANGES not set - IP whitelisting is DISABLED. \
+                 This is NOT RECOMMENDED for production. Any IP can access issuer endpoints \
+                 if they have the API key."
+            );
+        }
+
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
 
@@ -157,7 +167,7 @@ impl Env {
             vault: self.vault,
             bot: self.bot,
             issuer_api_key: self.issuer_api_key,
-            alpaca_ip_ranges: self.alpaca_ip_ranges,
+            alpaca_ip_ranges,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,

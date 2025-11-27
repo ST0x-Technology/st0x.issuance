@@ -59,7 +59,7 @@ jobs:
           host: ${{ secrets.DROPLET_HOST }}
           username: root
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,RPC_URL,PRIVATE_KEY,VAULT_ADDRESS,BOT_WALLET,ALPACA_API_BASE_URL,ALPACA_ACCOUNT_ID,ALPACA_API_KEY,ALPACA_API_SECRET,HYPERDX_API_KEY,HYPERDX_SERVICE_NAME,LOG_LEVEL,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,PREP_SCRIPT
+          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,RPC_URL,PRIVATE_KEY,VAULT_ADDRESS,BOT_WALLET,ISSUER_API_KEY,ALPACA_API_BASE_URL,ALPACA_ACCOUNT_ID,ALPACA_API_KEY,ALPACA_API_SECRET,HYPERDX_API_KEY,HYPERDX_SERVICE_NAME,LOG_LEVEL,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,PREP_SCRIPT
           script: |
             set -euo pipefail
 
@@ -109,6 +109,7 @@ jobs:
 
               for var in REGISTRY_NAME SHORT_SHA DATA_VOLUME_PATH \
                          RPC_URL PRIVATE_KEY VAULT_ADDRESS BOT_WALLET \
+                         ISSUER_API_KEY \
                          ALPACA_ACCOUNT_ID ALPACA_API_KEY ALPACA_API_SECRET; do
                 local value="${!var:-}"
                 if [ -z "$value" ]; then
@@ -226,6 +227,7 @@ jobs:
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           VAULT_ADDRESS: ${{ secrets.VAULT_ADDRESS }}
           BOT_WALLET: ${{ secrets.BOT_WALLET }}
+          ISSUER_API_KEY: ${{ secrets.ISSUER_API_KEY }}
           ALPACA_API_BASE_URL: "https://broker-api.alpaca.markets"
           ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
