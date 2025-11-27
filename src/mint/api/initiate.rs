@@ -8,6 +8,7 @@ use tracing::error;
 use super::{
     MintApiError, MintResponse, validate_asset_exists, validate_client_eligible,
 };
+use crate::auth::IssuerAuth;
 use crate::mint::{
     ClientId, IssuerRequestId, MintCommand, MintView, Network, Quantity,
     TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
@@ -29,7 +30,7 @@ pub(crate) struct MintRequest {
     pub(crate) wallet: Address,
 }
 
-#[tracing::instrument(skip(cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     underlying = %request.underlying.0,
     client_id = %request.client_id,
@@ -37,6 +38,7 @@ pub(crate) struct MintRequest {
 ))]
 #[post("/inkind/issuance", format = "json", data = "<request>")]
 pub(crate) async fn initiate_mint(
+    _auth: IssuerAuth,
     cqrs: &rocket::State<crate::MintCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<MintRequest>,
@@ -94,7 +96,7 @@ pub(crate) async fn initiate_mint(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use rocket::http::{ContentType, Status};
+    use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
     use std::str::FromStr;
@@ -102,8 +104,9 @@ mod tests {
 
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
+    use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        setup_test_environment, setup_with_account_and_asset,
+        setup_test_environment, setup_with_account_and_asset, test_config,
     };
     use crate::mint::api::{ErrorResponse, MintResponse};
     use crate::mint::{
@@ -151,6 +154,8 @@ mod tests {
             .expect("Failed to add asset");
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -174,6 +179,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -211,6 +221,8 @@ mod tests {
             .expect("Failed to link account");
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -234,6 +246,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -259,6 +276,8 @@ mod tests {
         let client_id = ClientId::new();
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -282,6 +301,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -323,6 +347,8 @@ mod tests {
         let nonexistent_client_id = ClientId::new();
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -346,6 +372,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -373,6 +404,8 @@ mod tests {
                 .await;
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -396,6 +429,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -449,6 +487,8 @@ mod tests {
                 .await;
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -474,6 +514,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -529,6 +574,8 @@ mod tests {
                 .await;
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -552,6 +599,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -569,6 +621,8 @@ mod tests {
                 .await;
 
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(account_cqrs)
             .manage(tokenized_asset_cqrs)
@@ -592,6 +646,11 @@ mod tests {
         let response = client
             .post("/inkind/issuance")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -639,5 +698,41 @@ mod tests {
         let result = mint_cqrs.execute(issuer_request_id, command).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_initiate_mint_without_auth_returns_401() {
+        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
+            setup_test_environment().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.0",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "network": "base",
+            "client_id": "client-456",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
     }
 }

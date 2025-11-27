@@ -8,19 +8,24 @@ use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use ipnetwork::IpNetwork;
 use rocket::routes;
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::sqlite::SqlitePoolOptions;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
+use crate::alpaca::service::AlpacaConfig;
+use crate::auth::FailedAuthRateLimiter;
 use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
+use crate::config::{Config, LogLevel};
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
@@ -43,6 +48,27 @@ pub fn test_alpaca_auth_header() -> String {
     )
 }
 
+pub(crate) fn test_localhost_ip_range() -> &'static IpNetwork {
+    static IP_RANGE: OnceLock<IpNetwork> = OnceLock::new();
+    IP_RANGE.get_or_init(|| "127.0.0.1/32".parse().expect("Valid IP range"))
+}
+
+fn test_config() -> Config {
+    Config {
+        database_url: "sqlite::memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+        private_key: B256::ZERO,
+        vault: address!("0x1111111111111111111111111111111111111111"),
+        bot: address!("0x2222222222222222222222222222222222222222"),
+        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+        alpaca_ip_ranges: vec![*test_localhost_ip_range()],
+        log_level: LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig::test_default(),
+    }
+}
+
 /// Sets up a test Rocket instance with in-memory database and mock services.
 ///
 /// This function is NOT behind `#[cfg(test)]` because E2E tests in the `tests/` directory
@@ -50,21 +76,21 @@ pub fn test_alpaca_auth_header() -> String {
 /// the same reason. However, all mock services are internal implementation details - E2E
 /// tests should only interact with the returned Rocket instance through its public HTTP API.
 ///
-/// # Panics
-/// Panics if database creation, migrations, or asset seeding fails.
-pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
+/// # Errors
+///
+/// Returns an error if:
+/// - Database creation fails
+/// - Database migrations fail
+/// - Asset seeding fails
+/// - Rate limiter initialization fails
+pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>>
+{
     // Create in-memory database
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(":memory:")
-        .await
-        .expect("Failed to create in-memory database");
+    let pool =
+        SqlitePoolOptions::new().max_connections(5).connect(":memory:").await?;
 
     // Run migrations
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     // Setup Account CQRS
     let account_view_repo =
@@ -108,7 +134,7 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
     >::new_event_store(mint_event_repo));
 
     // Seed initial assets
-    seed_test_assets(&tokenized_asset_cqrs).await;
+    seed_test_assets(&tokenized_asset_cqrs).await?;
 
     // Create managers with mock services
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -123,14 +149,18 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
         mint_cqrs.clone(),
     ));
 
+    let rate_limiter = FailedAuthRateLimiter::new()?;
+
     // Build rocket
-    rocket::build()
+    Ok(rocket::build()
+        .manage(test_config())
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
         .manage(mint_event_store)
         .manage(mint_manager)
         .manage(callback_manager)
+        .manage(rate_limiter)
         .manage(pool)
         .mount(
             "/",
@@ -140,10 +170,12 @@ pub async fn setup_test_rocket() -> rocket::Rocket<rocket::Build> {
                 crate::mint::initiate_mint,
                 crate::mint::confirm_journal
             ],
-        )
+        ))
 }
 
-async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {
+async fn seed_test_assets(
+    cqrs: &SqliteCqrs<TokenizedAsset>,
+) -> Result<(), anyhow::Error> {
     let assets = vec![
         (
             "AAPL",
@@ -167,10 +199,15 @@ async fn seed_test_assets(cqrs: &SqliteCqrs<TokenizedAsset>) {
             vault,
         };
 
-        cqrs.execute(underlying, command)
-            .await
-            .expect("Failed to seed test asset");
+        match cqrs.execute(underlying, command).await {
+            Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

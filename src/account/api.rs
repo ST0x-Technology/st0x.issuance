@@ -13,6 +13,7 @@ use super::{
     AlpacaAccountNumber, ClientId, Email, view::find_by_client_id,
     view::find_by_email,
 };
+use crate::auth::IssuerAuth;
 
 impl<'a> FromParam<'a> for ClientId {
     type Error = uuid::Error;
@@ -67,12 +68,13 @@ pub struct AccountLinkResponse {
     pub client_id: ClientId,
 }
 
-#[tracing::instrument(skip(cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(
     email = %request.email.0,
     account = %request.account.0
 ))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
 pub(crate) async fn connect_account(
+    _auth: IssuerAuth,
     cqrs: &rocket::State<crate::AccountCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<AccountLinkRequest>,
@@ -150,15 +152,38 @@ pub(crate) async fn whitelist_wallet(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{B256, address};
     use cqrs_es::persist::GenericQuery;
-    use rocket::http::{ContentType, Status};
+    use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use url::Url;
 
     use super::super::Account;
     use super::*;
+    use crate::alpaca::service::AlpacaConfig;
+    use crate::auth::FailedAuthRateLimiter;
+    use crate::config::{Config, LogLevel};
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+            private_key: B256::ZERO,
+            vault: address!("0x1111111111111111111111111111111111111111"),
+            bot: address!("0x2222222222222222222222222222222222222222"),
+            issuer_api_key: "test-key-12345678901234567890123456".to_string(),
+            alpaca_ip_ranges: vec![
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ],
+            log_level: LogLevel::Debug,
+            hyperdx: None,
+            alpaca: AlpacaConfig::test_default(),
+        }
+    }
 
     #[tokio::test]
     async fn test_connect_account_returns_client_id() {
@@ -186,7 +211,12 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
+        let rate_limiter = FailedAuthRateLimiter::new()
+            .expect("Failed to create rate limiter for tests");
+
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
             .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
@@ -203,6 +233,11 @@ mod tests {
         let response = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -241,7 +276,12 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
+        let rate_limiter = FailedAuthRateLimiter::new()
+            .expect("Failed to create rate limiter for tests");
+
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
             .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
@@ -255,9 +295,17 @@ mod tests {
             "account": "ALPACA789"
         });
 
+        let auth_header = Header::new(
+            "Authorization",
+            "Bearer test-key-12345678901234567890123456",
+        );
+        let ip_header = Header::new("X-Real-IP", "127.0.0.1");
+
         let response1 = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(auth_header.clone())
+            .header(ip_header.clone())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -267,6 +315,8 @@ mod tests {
         let response2 = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(auth_header)
+            .header(ip_header)
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -300,7 +350,12 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
+        let rate_limiter = FailedAuthRateLimiter::new()
+            .expect("Failed to create rate limiter for tests");
+
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
             .manage(account_cqrs)
             .manage(pool)
             .mount("/", routes![connect_account]);
@@ -317,6 +372,11 @@ mod tests {
         let response = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -350,7 +410,12 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
+        let rate_limiter = FailedAuthRateLimiter::new()
+            .expect("Failed to create rate limiter for tests");
+
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
             .manage(account_cqrs)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
@@ -368,6 +433,11 @@ mod tests {
         let response = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -424,7 +494,12 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
+        let rate_limiter = FailedAuthRateLimiter::new()
+            .expect("Failed to create rate limiter for tests");
+
         let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
             .manage(account_cqrs)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
@@ -444,6 +519,11 @@ mod tests {
         let response = client
             .post("/accounts/connect")
             .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -475,5 +555,116 @@ mod tests {
         assert_eq!(view_alpaca_account.0, alpaca_account);
         assert!(whitelisted_wallets.is_empty());
         assert_eq!(status, super::super::LinkedAccountStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn test_connect_account_without_auth_returns_401() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            super::super::AccountView,
+            Account,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "customer@firm.com",
+            "account": "alpaca-account-123",
+            "wallet": "0x1111111111111111111111111111111111111111"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn test_connect_account_with_wrong_ip_returns_403() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            super::super::AccountView,
+            Account,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "customer@firm.com",
+            "account": "alpaca-account-123",
+            "wallet": "0x1111111111111111111111111111111111111111"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                "Bearer test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
     }
 }
