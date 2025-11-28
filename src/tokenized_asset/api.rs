@@ -151,8 +151,8 @@ mod tests {
         let response = client
             .get("/tokenized-assets")
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .dispatch()
@@ -198,8 +198,8 @@ mod tests {
         let response = client
             .get("/tokenized-assets")
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .dispatch()

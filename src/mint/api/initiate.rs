@@ -180,8 +180,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -247,8 +247,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -302,8 +302,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -373,8 +373,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -430,8 +430,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -515,8 +515,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -600,8 +600,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -647,8 +647,8 @@ mod tests {
             .post("/inkind/issuance")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())

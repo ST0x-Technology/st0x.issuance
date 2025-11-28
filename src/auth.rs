@@ -60,32 +60,20 @@ impl<'r> FromRequest<'r> for IssuerAuth {
             ));
         };
 
-        if let Err(e) = validate_api_key_from_request(
-            request,
-            &config.issuer_api_key,
-            rate_limiter,
-        ) {
-            return Outcome::Error(e);
-        }
-
-        if config.alpaca_ip_ranges.is_empty() {
-            info!(
+        let Some(api_key) = request.headers().get_one("X-API-KEY") else {
+            warn!(
                 endpoint = %request.uri(),
-                "Issuer authentication success (IP whitelisting disabled)"
+                "Missing X-API-KEY header"
             );
-        } else {
-            let Some(client_ip) = extract_client_ip(request) else {
-                warn!(
-                    endpoint = %request.uri(),
-                    "Could not determine client IP"
-                );
-                return Outcome::Error((
-                    Status::BadRequest,
-                    AuthError::NoClientIp,
-                ));
-            };
+            return Outcome::Error((
+                Status::Unauthorized,
+                AuthError::MissingApiKey,
+            ));
+        };
 
-            if !is_ip_whitelisted(&client_ip, &config.alpaca_ip_ranges) {
+        let expected_key = &config.issuer_api_key;
+        if !validate_api_key(api_key, expected_key) {
+            if let Some(client_ip) = extract_client_ip(request) {
                 if !rate_limiter.check(&client_ip) {
                     warn!(
                         ip = %client_ip,
@@ -97,83 +85,58 @@ impl<'r> FromRequest<'r> for IssuerAuth {
                         AuthError::RateLimited,
                     ));
                 }
+            }
 
+            warn!(
+                endpoint = %request.uri(),
+                "Invalid API key"
+            );
+            return Outcome::Error((
+                Status::Unauthorized,
+                AuthError::InvalidApiKey,
+            ));
+        }
+
+        let Some(client_ip) = extract_client_ip(request) else {
+            warn!(
+                endpoint = %request.uri(),
+                "Could not determine client IP"
+            );
+            return Outcome::Error((Status::BadRequest, AuthError::NoClientIp));
+        };
+
+        if !is_ip_whitelisted(&client_ip, &config.alpaca_ip_ranges) {
+            if !rate_limiter.check(&client_ip) {
                 warn!(
                     ip = %client_ip,
                     endpoint = %request.uri(),
-                    "IP not whitelisted"
+                    "Rate limit exceeded for failed authentication"
                 );
                 return Outcome::Error((
-                    Status::Forbidden,
-                    AuthError::UnauthorizedIp,
+                    Status::TooManyRequests,
+                    AuthError::RateLimited,
                 ));
             }
 
-            info!(
-                ip = %client_ip,
-                endpoint = %request.uri(),
-                "Issuer authentication success"
-            );
-        }
-
-        Outcome::Success(Self)
-    }
-}
-
-fn validate_api_key_from_request(
-    request: &Request<'_>,
-    expected_key: &str,
-    rate_limiter: &FailedAuthRateLimiter,
-) -> Result<(), (Status, AuthError)> {
-    let auth_header = extract_auth_header(request)?;
-    let api_key = parse_bearer_token(request, auth_header)?;
-
-    if !validate_api_key(api_key, expected_key) {
-        check_rate_limit_on_auth_failure(request, rate_limiter)?;
-        warn!(endpoint = %request.uri(), "Invalid API key");
-        return Err((Status::Unauthorized, AuthError::InvalidApiKey));
-    }
-
-    Ok(())
-}
-
-fn extract_auth_header<'a>(
-    request: &'a Request<'_>,
-) -> Result<&'a str, (Status, AuthError)> {
-    request.headers().get_one("Authorization").ok_or_else(|| {
-        warn!(endpoint = %request.uri(), "Missing Authorization header");
-        (Status::Unauthorized, AuthError::MissingApiKey)
-    })
-}
-
-fn parse_bearer_token<'a>(
-    request: &Request<'_>,
-    auth_header: &'a str,
-) -> Result<&'a str, (Status, AuthError)> {
-    auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-        warn!(
-            endpoint = %request.uri(),
-            "Malformed Authorization header (expected 'Bearer <key>')"
-        );
-        (Status::Unauthorized, AuthError::InvalidApiKey)
-    })
-}
-
-fn check_rate_limit_on_auth_failure(
-    request: &Request<'_>,
-    rate_limiter: &FailedAuthRateLimiter,
-) -> Result<(), (Status, AuthError)> {
-    if let Some(client_ip) = extract_client_ip(request) {
-        if !rate_limiter.check(&client_ip) {
             warn!(
                 ip = %client_ip,
                 endpoint = %request.uri(),
-                "Rate limit exceeded for failed authentication"
+                "IP not whitelisted"
             );
-            return Err((Status::TooManyRequests, AuthError::RateLimited));
+            return Outcome::Error((
+                Status::Forbidden,
+                AuthError::UnauthorizedIp,
+            ));
         }
+
+        info!(
+            ip = %client_ip,
+            endpoint = %request.uri(),
+            "Issuer authentication success"
+        );
+
+        Outcome::Success(Self)
     }
-    Ok(())
 }
 
 fn validate_api_key(provided: &str, expected: &str) -> bool {
@@ -262,7 +225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_authorization_header_returns_401() {
+    async fn test_missing_api_key_header_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
@@ -272,25 +235,6 @@ mod tests {
             Client::tracked(rocket).await.expect("valid rocket instance");
 
         let response = client.get("/test").dispatch().await;
-
-        assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[tokio::test]
-    async fn test_malformed_authorization_header_returns_401() {
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .mount("/", rocket::routes![test_endpoint]);
-
-        let client =
-            Client::tracked(rocket).await.expect("valid rocket instance");
-
-        let response = client
-            .get("/test")
-            .header(Header::new("Authorization", "InvalidFormat"))
-            .dispatch()
-            .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
     }
@@ -307,7 +251,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .dispatch()
             .await;
 
@@ -353,7 +297,7 @@ mod tests {
         for i in 0..10 {
             let response = client
                 .get("/test")
-                .header(Header::new("Authorization", "Bearer wrong-key"))
+                .header(Header::new("X-API-KEY", "wrong-key"))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()
                 .await;
@@ -368,7 +312,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .dispatch()
             .await;
@@ -390,8 +334,8 @@ mod tests {
             let response = client
                 .get("/test")
                 .header(Header::new(
-                    "Authorization",
-                    "Bearer test-key-12345678901234567890123456",
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
                 ))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()

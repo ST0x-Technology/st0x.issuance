@@ -1200,7 +1200,7 @@ We call these Alpaca endpoints:
 
 **For Alpaca calling our endpoints:**
 
-- **API Key** authentication via `Authorization: Bearer <key>` header
+- **API Key** authentication via `X-API-KEY: <key>` header
 - **IP Whitelisting** to restrict requests to Alpaca's known IP ranges
 - Rate limiting on failed authentication attempts
 - Comprehensive audit logging of all authentication attempts

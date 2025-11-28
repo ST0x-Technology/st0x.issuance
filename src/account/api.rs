@@ -234,8 +234,8 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -295,10 +295,8 @@ mod tests {
             "account": "ALPACA789"
         });
 
-        let auth_header = Header::new(
-            "Authorization",
-            "Bearer test-key-12345678901234567890123456",
-        );
+        let auth_header =
+            Header::new("X-API-KEY", "test-key-12345678901234567890123456");
         let ip_header = Header::new("X-Real-IP", "127.0.0.1");
 
         let response1 = client
@@ -373,8 +371,8 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -434,8 +432,8 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -520,8 +518,8 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .body(request_body.to_string())
@@ -657,8 +655,8 @@ mod tests {
             .post("/accounts/connect")
             .header(ContentType::JSON)
             .header(Header::new(
-                "Authorization",
-                "Bearer test-key-12345678901234567890123456",
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
             ))
             .header(Header::new("X-Real-IP", "8.8.8.8"))
             .body(request_body.to_string())
