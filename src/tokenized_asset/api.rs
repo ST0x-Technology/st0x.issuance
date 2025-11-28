@@ -11,7 +11,7 @@ use crate::auth::IssuerAuth;
 pub(crate) struct TokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
-    pub(crate) network: Network,
+    pub(crate) networks: Vec<Network>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,7 +36,11 @@ pub(crate) async fn list_tokenized_assets(
         .filter_map(|view| match view {
             TokenizedAssetView::Asset {
                 underlying, token, network, ..
-            } => Some(TokenizedAssetResponse { underlying, token, network }),
+            } => Some(TokenizedAssetResponse {
+                underlying,
+                token,
+                networks: vec![network],
+            }),
             TokenizedAssetView::Unavailable => None,
         })
         .collect();
@@ -169,7 +173,10 @@ mod tests {
             UnderlyingSymbol::new("AAPL")
         );
         assert_eq!(response_body.tokens[0].token, TokenSymbol::new("tAAPL"));
-        assert_eq!(response_body.tokens[0].network, Network::new("base"));
+        assert_eq!(
+            response_body.tokens[0].networks,
+            vec![Network::new("base")]
+        );
     }
 
     #[tokio::test]
