@@ -82,8 +82,8 @@ async fn perform_mint_flow(
         .post("/accounts/connect")
         .header(rocket::http::ContentType::JSON)
         .header(rocket::http::Header::new(
-            "Authorization",
-            "Bearer test-key-12345678901234567890123456",
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
         ))
         .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
@@ -119,8 +119,8 @@ async fn perform_mint_flow(
         .post("/inkind/issuance")
         .header(rocket::http::ContentType::JSON)
         .header(rocket::http::Header::new(
-            "Authorization",
-            "Bearer test-key-12345678901234567890123456",
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
         ))
         .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
@@ -145,8 +145,8 @@ async fn perform_mint_flow(
         .post("/inkind/issuance/confirm")
         .header(rocket::http::ContentType::JSON)
         .header(rocket::http::Header::new(
-            "Authorization",
-            "Bearer test-key-12345678901234567890123456",
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
         ))
         .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(

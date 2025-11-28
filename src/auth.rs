@@ -130,6 +130,48 @@ impl<'r> FromRequest<'r> for IssuerAuth {
                 ));
             }
 
+            info!(
+                ip = %client_ip,
+                endpoint = %request.uri(),
+                "Issuer authentication success"
+            );
+        }
+
+        Outcome::Success(Self)
+    }
+}
+
+fn validate_api_key_from_request(
+    request: &Request<'_>,
+    expected_key: &str,
+    rate_limiter: &FailedAuthRateLimiter,
+) -> Result<(), (Status, AuthError)> {
+    let api_key = extract_api_key(request)?;
+
+    if !validate_api_key(api_key, expected_key) {
+        check_rate_limit_on_auth_failure(request, rate_limiter)?;
+        warn!(endpoint = %request.uri(), "Invalid API key");
+        return Err((Status::Unauthorized, AuthError::InvalidApiKey));
+    }
+
+    Ok(())
+}
+
+fn extract_api_key<'a>(
+    request: &'a Request<'_>,
+) -> Result<&'a str, (Status, AuthError)> {
+    request.headers().get_one("X-API-KEY").ok_or_else(|| {
+        warn!(endpoint = %request.uri(), "Missing X-API-KEY header");
+        (Status::Unauthorized, AuthError::MissingApiKey)
+    })
+}
+
+fn check_rate_limit_on_auth_failure(
+    request: &Request<'_>,
+    rate_limiter: &FailedAuthRateLimiter,
+) -> Result<(), (Status, AuthError)> {
+    if let Some(client_ip) = extract_client_ip(request) {
+        if !rate_limiter.check(&client_ip) {
             warn!(
                 ip = %client_ip,
                 endpoint = %request.uri(),
@@ -237,7 +279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_authorization_header_returns_401() {
+    async fn test_missing_api_key_header_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
@@ -247,25 +289,6 @@ mod tests {
             Client::tracked(rocket).await.expect("valid rocket instance");
 
         let response = client.get("/test").dispatch().await;
-
-        assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[tokio::test]
-    async fn test_malformed_authorization_header_returns_401() {
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .mount("/", rocket::routes![test_endpoint]);
-
-        let client =
-            Client::tracked(rocket).await.expect("valid rocket instance");
-
-        let response = client
-            .get("/test")
-            .header(Header::new("Authorization", "InvalidFormat"))
-            .dispatch()
-            .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
     }
@@ -282,7 +305,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .dispatch()
             .await;
 
@@ -328,7 +351,7 @@ mod tests {
         for i in 0..10 {
             let response = client
                 .get("/test")
-                .header(Header::new("Authorization", "Bearer wrong-key"))
+                .header(Header::new("X-API-KEY", "wrong-key"))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()
                 .await;
@@ -343,7 +366,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .dispatch()
             .await;
@@ -365,8 +388,8 @@ mod tests {
             let response = client
                 .get("/test")
                 .header(Header::new(
-                    "Authorization",
-                    "Bearer test-key-12345678901234567890123456",
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
                 ))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()
