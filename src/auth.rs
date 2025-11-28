@@ -60,26 +60,14 @@ impl<'r> FromRequest<'r> for IssuerAuth {
             ));
         };
 
-        let Some(auth_header) = request.headers().get_one("Authorization")
-        else {
+        let Some(api_key) = request.headers().get_one("X-API-KEY") else {
             warn!(
                 endpoint = %request.uri(),
-                "Missing Authorization header"
+                "Missing X-API-KEY header"
             );
             return Outcome::Error((
                 Status::Unauthorized,
                 AuthError::MissingApiKey,
-            ));
-        };
-
-        let Some(api_key) = auth_header.strip_prefix("Bearer ") else {
-            warn!(
-                endpoint = %request.uri(),
-                "Malformed Authorization header (expected 'Bearer <key>')"
-            );
-            return Outcome::Error((
-                Status::Unauthorized,
-                AuthError::InvalidApiKey,
             ));
         };
 
@@ -130,48 +118,6 @@ impl<'r> FromRequest<'r> for IssuerAuth {
                 ));
             }
 
-            info!(
-                ip = %client_ip,
-                endpoint = %request.uri(),
-                "Issuer authentication success"
-            );
-        }
-
-        Outcome::Success(Self)
-    }
-}
-
-fn validate_api_key_from_request(
-    request: &Request<'_>,
-    expected_key: &str,
-    rate_limiter: &FailedAuthRateLimiter,
-) -> Result<(), (Status, AuthError)> {
-    let api_key = extract_api_key(request)?;
-
-    if !validate_api_key(api_key, expected_key) {
-        check_rate_limit_on_auth_failure(request, rate_limiter)?;
-        warn!(endpoint = %request.uri(), "Invalid API key");
-        return Err((Status::Unauthorized, AuthError::InvalidApiKey));
-    }
-
-    Ok(())
-}
-
-fn extract_api_key<'a>(
-    request: &'a Request<'_>,
-) -> Result<&'a str, (Status, AuthError)> {
-    request.headers().get_one("X-API-KEY").ok_or_else(|| {
-        warn!(endpoint = %request.uri(), "Missing X-API-KEY header");
-        (Status::Unauthorized, AuthError::MissingApiKey)
-    })
-}
-
-fn check_rate_limit_on_auth_failure(
-    request: &Request<'_>,
-    rate_limiter: &FailedAuthRateLimiter,
-) -> Result<(), (Status, AuthError)> {
-    if let Some(client_ip) = extract_client_ip(request) {
-        if !rate_limiter.check(&client_ip) {
             warn!(
                 ip = %client_ip,
                 endpoint = %request.uri(),
