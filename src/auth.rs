@@ -60,26 +60,14 @@ impl<'r> FromRequest<'r> for IssuerAuth {
             ));
         };
 
-        let Some(auth_header) = request.headers().get_one("Authorization")
-        else {
+        let Some(api_key) = request.headers().get_one("X-API-KEY") else {
             warn!(
                 endpoint = %request.uri(),
-                "Missing Authorization header"
+                "Missing X-API-KEY header"
             );
             return Outcome::Error((
                 Status::Unauthorized,
                 AuthError::MissingApiKey,
-            ));
-        };
-
-        let Some(api_key) = auth_header.strip_prefix("Bearer ") else {
-            warn!(
-                endpoint = %request.uri(),
-                "Malformed Authorization header (expected 'Bearer <key>')"
-            );
-            return Outcome::Error((
-                Status::Unauthorized,
-                AuthError::InvalidApiKey,
             ));
         };
 
@@ -237,7 +225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_authorization_header_returns_401() {
+    async fn test_missing_api_key_header_returns_401() {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
@@ -247,25 +235,6 @@ mod tests {
             Client::tracked(rocket).await.expect("valid rocket instance");
 
         let response = client.get("/test").dispatch().await;
-
-        assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[tokio::test]
-    async fn test_malformed_authorization_header_returns_401() {
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .mount("/", rocket::routes![test_endpoint]);
-
-        let client =
-            Client::tracked(rocket).await.expect("valid rocket instance");
-
-        let response = client
-            .get("/test")
-            .header(Header::new("Authorization", "InvalidFormat"))
-            .dispatch()
-            .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
     }
@@ -282,7 +251,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .dispatch()
             .await;
 
@@ -328,7 +297,7 @@ mod tests {
         for i in 0..10 {
             let response = client
                 .get("/test")
-                .header(Header::new("Authorization", "Bearer wrong-key"))
+                .header(Header::new("X-API-KEY", "wrong-key"))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()
                 .await;
@@ -343,7 +312,7 @@ mod tests {
 
         let response = client
             .get("/test")
-            .header(Header::new("Authorization", "Bearer wrong-key"))
+            .header(Header::new("X-API-KEY", "wrong-key"))
             .header(Header::new("X-Real-IP", "127.0.0.1"))
             .dispatch()
             .await;
@@ -365,8 +334,8 @@ mod tests {
             let response = client
                 .get("/test")
                 .header(Header::new(
-                    "Authorization",
-                    "Bearer test-key-12345678901234567890123456",
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
                 ))
                 .header(Header::new("X-Real-IP", "127.0.0.1"))
                 .dispatch()

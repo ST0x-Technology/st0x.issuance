@@ -110,7 +110,7 @@ ALPACA_IP_RANGES="1.2.3.0/24,5.6.7.8/32"
 
 ```bash
 curl -X POST https://issuer.example.com/inkind/issuance \
-  -H "Authorization: Bearer <api-key>" \
+  -H "X-API-KEY: <api-key>" \
   -H "Content-Type: application/json"
 ```
 
