@@ -12,6 +12,16 @@ jobs:
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -44,6 +54,16 @@ jobs:
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
