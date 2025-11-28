@@ -42,6 +42,7 @@ pub(crate) mod vault;
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
+pub use auth::IpWhitelist;
 pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 

@@ -14,7 +14,7 @@ use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_auth_header};
-use st0x_issuance::{AlpacaConfig, Config, initialize_rocket};
+use st0x_issuance::{AlpacaConfig, Config, IpWhitelist, initialize_rocket};
 
 async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
@@ -314,7 +314,9 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         vault: evm.vault_address,
         bot: bot_wallet,
         issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-        alpaca_ip_ranges: vec!["127.0.0.1/32".parse().expect("Valid IP range")],
+        alpaca_ip_ranges: IpWhitelist::single(
+            "127.0.0.1/32".parse().expect("Valid IP range"),
+        ),
         log_level: st0x_issuance::LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {

@@ -6,11 +6,77 @@ use rocket::response::{Responder, Response};
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 use crate::config::Config;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpWhitelist {
+    AllowAll,
+    Whitelist { first: IpNetwork, rest: Vec<IpNetwork> },
+}
+
+impl IpWhitelist {
+    pub(crate) fn is_allowed(&self, ip: &IpAddr) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::Whitelist { first, rest } => {
+                first.contains(*ip)
+                    || rest.iter().any(|range| range.contains(*ip))
+            }
+        }
+    }
+
+    /// Creates a whitelist with a single IP range.
+    #[must_use]
+    pub const fn single(range: IpNetwork) -> Self {
+        Self::Whitelist { first: range, rest: Vec::new() }
+    }
+
+    /// Creates a whitelist from a slice of IP ranges.
+    ///
+    /// Returns `AllowAll` if the slice is empty.
+    #[must_use]
+    pub fn from_ranges(ranges: &[IpNetwork]) -> Self {
+        match ranges.split_first() {
+            None => Self::AllowAll,
+            Some((first, rest)) => {
+                Self::Whitelist { first: *first, rest: rest.to_vec() }
+            }
+        }
+    }
+}
+
+impl FromStr for IpWhitelist {
+    type Err = IpWhitelistParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.trim().is_empty() {
+            return Ok(Self::AllowAll);
+        }
+
+        let ranges: Vec<IpNetwork> = s
+            .split(',')
+            .map(|range| IpNetwork::from_str(range.trim()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let (first, rest) =
+            ranges.split_first().ok_or(IpWhitelistParseError::Empty)?;
+
+        Ok(Self::Whitelist { first: *first, rest: rest.to_vec() })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IpWhitelistParseError {
+    #[error("Failed to parse IP range: {0}")]
+    InvalidRange(#[from] ipnetwork::IpNetworkError),
+    #[error("Whitelist cannot be empty")]
+    Empty,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RateLimiterError {
@@ -105,7 +171,7 @@ impl<'r> FromRequest<'r> for IssuerAuth {
             return Outcome::Error((Status::BadRequest, AuthError::NoClientIp));
         };
 
-        if !is_ip_whitelisted(&client_ip, &config.alpaca_ip_ranges) {
+        if !config.alpaca_ip_ranges.is_allowed(&client_ip) {
             if !rate_limiter.check(&client_ip) {
                 warn!(
                     ip = %client_ip,
@@ -145,10 +211,6 @@ fn validate_api_key(provided: &str, expected: &str) -> bool {
 
 fn extract_client_ip(request: &Request<'_>) -> Option<IpAddr> {
     request.client_ip()
-}
-
-fn is_ip_whitelisted(ip: &IpAddr, allowed_ranges: &[IpNetwork]) -> bool {
-    allowed_ranges.iter().any(|range| range.contains(*ip))
 }
 
 #[derive(Debug)]
@@ -217,7 +279,9 @@ mod tests {
             vault: address!("0x1111111111111111111111111111111111111111"),
             bot: address!("0x2222222222222222222222222222222222222222"),
             issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-            alpaca_ip_ranges: vec!["127.0.0.1/32".parse().unwrap()],
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().unwrap(),
+            ),
             log_level: LogLevel::Debug,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
@@ -269,19 +333,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ip_whitelist_validation() {
-        let ranges: Vec<IpNetwork> = vec![
-            "10.0.0.0/24".parse().unwrap(),
-            "192.168.1.100/32".parse().unwrap(),
-        ];
+    async fn test_empty_ip_ranges_allows_authenticated_requests() {
+        let mut config = test_config();
+        config.alpaca_ip_ranges = IpWhitelist::AllowAll;
 
-        let ip1: IpAddr = "10.0.0.50".parse().unwrap();
-        let ip2: IpAddr = "192.168.1.100".parse().unwrap();
-        let ip3: IpAddr = "8.8.8.8".parse().unwrap();
+        let rocket = rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .mount("/", rocket::routes![test_endpoint]);
 
-        assert!(is_ip_whitelisted(&ip1, &ranges));
-        assert!(is_ip_whitelisted(&ip2, &ranges));
-        assert!(!is_ip_whitelisted(&ip3, &ranges));
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
+
+        let response = client
+            .get("/test")
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_configured_ip_ranges_block_unauthorized_ips() {
+        let mut config = test_config();
+        config.alpaca_ip_ranges =
+            IpWhitelist::single("10.0.0.0/24".parse().unwrap());
+
+        let rocket = rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .mount("/", rocket::routes![test_endpoint]);
+
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
+
+        let response = client
+            .get("/test")
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
     }
 
     #[tokio::test]
