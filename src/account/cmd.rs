@@ -5,12 +5,7 @@ use super::{AlpacaAccountNumber, ClientId, Email};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum AccountCommand {
-    Link {
-        client_id: ClientId,
-        email: Email,
-        alpaca_account: AlpacaAccountNumber,
-    },
-    WhitelistWallet {
-        wallet: Address,
-    },
+    Register { client_id: ClientId, email: Email },
+    LinkToAlpaca { alpaca_account: AlpacaAccountNumber },
+    WhitelistWallet { wallet: Address },
 }

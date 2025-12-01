@@ -22,47 +22,47 @@ single unit (these are tightly coupled and must change together).
 
 **`src/account/event.rs`:**
 
-- [ ] Rename `Linked` to `Registered`, remove `alpaca_account`, rename
+- [x] Rename `Linked` to `Registered`, remove `alpaca_account`, rename
       `linked_at` to `registered_at`
-- [ ] Add `LinkedToAlpaca { alpaca_account, linked_at }`
-- [ ] Update `DomainEvent` impl for new event type strings
+- [x] Add `LinkedToAlpaca { alpaca_account, linked_at }`
+- [x] Update `DomainEvent` impl for new event type strings
 
 **`src/account/cmd.rs`:**
 
-- [ ] Rename `Link` to `Register`, remove `alpaca_account`
-- [ ] Add `LinkToAlpaca { alpaca_account }`
+- [x] Rename `Link` to `Register`, remove `alpaca_account`
+- [x] Add `LinkToAlpaca { alpaca_account }`
 
 **`src/account/mod.rs` (aggregate):**
 
-- [ ] Rename `NotLinked` to `NotRegistered`
-- [ ] Add `Registered { client_id, email, registered_at }` state
-- [ ] Rename `Linked` to `LinkedToAlpaca`, remove `status` field
-- [ ] Remove `LinkedAccountStatus` enum
-- [ ] Update `handle` for `Register`: `NotRegistered` → produces `Registered`
+- [x] Rename `NotLinked` to `NotRegistered`
+- [x] Add `Registered { client_id, email, registered_at }` state
+- [x] Rename `Linked` to `LinkedToAlpaca`, remove `status` field
+- [x] Remove `LinkedAccountStatus` enum
+- [x] Update `handle` for `Register`: `NotRegistered` → produces `Registered`
       event
-- [ ] Add `handle` for `LinkToAlpaca`: `Registered` → produces `LinkedToAlpaca`
+- [x] Add `handle` for `LinkToAlpaca`: `Registered` → produces `LinkedToAlpaca`
       event
-- [ ] Update `handle` for `WhitelistWallet`: only allowed in `LinkedToAlpaca`
+- [x] Update `handle` for `WhitelistWallet`: only allowed in `LinkedToAlpaca`
       state
-- [ ] Update `apply` for all three events
-- [ ] Update errors: rename `AccountAlreadyExists` to
+- [x] Update `apply` for all three events
+- [x] Update errors: rename `AccountAlreadyExists` to
       `AccountAlreadyRegistered`, add `NotRegistered`, add
       `AlreadyLinkedToAlpaca`
 
 **`src/account/mod.rs` (tests):**
 
-- [ ] Update `test_link_account_creates_new_account` →
+- [x] Update `test_link_account_creates_new_account` →
       `test_register_creates_new_account`
-- [ ] Update `test_link_account_when_already_linked_returns_error` →
+- [x] Update `test_link_account_when_already_linked_returns_error` →
       `test_register_when_already_registered_returns_error`
-- [ ] Add `test_link_to_alpaca_on_registered_account`
-- [ ] Add `test_link_to_alpaca_on_not_registered_returns_error`
-- [ ] Add `test_link_to_alpaca_when_already_linked_returns_error`
-- [ ] Update `test_apply_account_linked_updates_state` →
+- [x] Add `test_link_to_alpaca_on_registered_account`
+- [x] Add `test_link_to_alpaca_on_not_registered_returns_error`
+- [x] Add `test_link_to_alpaca_when_already_linked_returns_error`
+- [x] Update `test_apply_account_linked_updates_state` →
       `test_apply_registered_updates_state`
-- [ ] Add `test_apply_linked_to_alpaca_updates_state`
-- [ ] Update wallet whitelisting tests for new state names
-- [ ] Run `cargo test -p issuance -- account` and `cargo clippy` and `cargo fmt`
+- [x] Add `test_apply_linked_to_alpaca_updates_state`
+- [x] Update wallet whitelisting tests for new state names
+- [x] Run `cargo test -p issuance -- account` and `cargo clippy` and `cargo fmt`
 
 ## Task 2. Update View
 
@@ -70,25 +70,25 @@ Update `AccountView` to handle new events and states.
 
 **`src/account/view.rs`:**
 
-- [ ] Add `Registered { client_id, email, registered_at }` variant
-- [ ] Rename `Account` to `LinkedToAlpaca`
-- [ ] Update `View::update` for `Registered` event
-- [ ] Update `View::update` for `LinkedToAlpaca` event (must handle transition
+- [x] Add `Registered { client_id, email, registered_at }` variant
+- [x] Rename `Account` to `LinkedToAlpaca`
+- [x] Update `View::update` for `Registered` event
+- [x] Update `View::update` for `LinkedToAlpaca` event (must handle transition
       from `Registered` state, carrying over `client_id` and `email`)
-- [ ] Update `WalletWhitelisted` handling for `LinkedToAlpaca` variant
-- [ ] Update `find_by_email` to query both `$.Registered.email` and
+- [x] Update `WalletWhitelisted` handling for `LinkedToAlpaca` variant
+- [x] Update `find_by_email` to query both `$.Registered.email` and
       `$.LinkedToAlpaca.email`
-- [ ] Update `find_by_client_id` to query both states
+- [x] Update `find_by_client_id` to query both states
 
 **`src/account/view.rs` (tests):**
 
-- [ ] Update `test_view_update_from_account_linked_event` →
+- [x] Update `test_view_update_from_account_linked_event` →
       `test_view_update_from_registered_event`
-- [ ] Add `test_view_update_from_linked_to_alpaca_event`
-- [ ] Update `test_find_by_client_id_returns_view` for new state name
-- [ ] Update `test_find_by_email_returns_view` for new state name
-- [ ] Update wallet whitelisting view tests
-- [ ] Run `cargo test -p issuance -- account::view` and `cargo clippy` and
+- [x] Add `test_view_update_from_linked_to_alpaca_event`
+- [x] Update `test_find_by_client_id_returns_view` for new state name
+- [x] Update `test_find_by_email_returns_view` for new state name
+- [x] Update wallet whitelisting view tests
+- [x] Run `cargo test -p issuance -- account::view` and `cargo clippy` and
       `cargo fmt`
 
 ## Task 3. Add Internal Auth Guard
@@ -173,7 +173,7 @@ creating a new one.
 
 **`src/account/api.rs`:**
 
-- [ ] Update `connect_account`:
+- [x] Update `connect_account`:
   - Look up account by email via `find_by_email`
   - Return 404 if not found
   - Return 409 if already linked to Alpaca
@@ -183,17 +183,18 @@ creating a new one.
 - [ ] Update `whitelist_wallet`:
   - Change from `IssuerAuth` to `InternalAuth` (internal endpoint)
   - Check for `LinkedToAlpaca` view state (not `Account`)
+  - **Note:** Blocked on Task 3 (InternalAuth guard)
 
 **`src/account/api.rs` (tests):**
 
-- [ ] Update `test_connect_account_returns_client_id` to first register, then
+- [x] Update `test_connect_account_returns_client_id` to first register, then
       connect
 - [ ] Add `test_connect_account_when_not_registered_returns_404`
-- [ ] Update `test_duplicate_account_link_returns_409` for new flow (register →
+- [x] Update `test_duplicate_account_link_returns_409` for new flow (register →
       connect → connect again)
-- [ ] Update `test_events_are_persisted_correctly` for new event names
-- [ ] Update `test_views_are_updated_correctly` for new state names
-- [ ] Run `cargo test -p issuance -- account::api` and `cargo clippy` and
+- [x] Update `test_events_are_persisted_correctly` for new event names
+- [x] Update `test_views_are_updated_correctly` for new state names
+- [x] Run `cargo test -p issuance -- account::api` and `cargo clippy` and
       `cargo fmt`
 
 ## Task 6. Final Validation

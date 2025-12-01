@@ -125,17 +125,23 @@ mod tests {
             .expect("Valid email");
         let client_id = ClientId::new();
 
-        let account_cmd = AccountCommand::Link {
-            client_id,
-            email: email.clone(),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-        };
+        let register_cmd =
+            AccountCommand::Register { client_id, email: email.clone() };
 
         let aggregate_id = client_id.to_string();
         account_cqrs
-            .execute(&aggregate_id, account_cmd)
+            .execute(&aggregate_id, register_cmd)
             .await
-            .expect("Failed to link account");
+            .expect("Failed to register account");
+
+        let link_cmd = AccountCommand::LinkToAlpaca {
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+        };
+
+        account_cqrs
+            .execute(&aggregate_id, link_cmd)
+            .await
+            .expect("Failed to link account to Alpaca");
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -208,17 +214,23 @@ mod tests {
             .expect("Valid email");
         let client_id = ClientId::new();
 
-        let account_cmd = AccountCommand::Link {
-            client_id,
-            email: email.clone(),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-        };
+        let register_cmd =
+            AccountCommand::Register { client_id, email: email.clone() };
 
         let aggregate_id = client_id.to_string();
         account_cqrs
-            .execute(&aggregate_id, account_cmd)
+            .execute(&aggregate_id, register_cmd)
             .await
-            .expect("Failed to link account");
+            .expect("Failed to register account");
+
+        let link_cmd = AccountCommand::LinkToAlpaca {
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+        };
+
+        account_cqrs
+            .execute(&aggregate_id, link_cmd)
+            .await
+            .expect("Failed to link account to Alpaca");
 
         let rocket = rocket::build()
             .manage(test_config())

@@ -7,9 +7,12 @@ use super::{AlpacaAccountNumber, ClientId, Email};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum AccountEvent {
-    Linked {
+    Registered {
         client_id: ClientId,
         email: Email,
+        registered_at: DateTime<Utc>,
+    },
+    LinkedToAlpaca {
         alpaca_account: AlpacaAccountNumber,
         linked_at: DateTime<Utc>,
     },
@@ -22,7 +25,10 @@ pub(crate) enum AccountEvent {
 impl DomainEvent for AccountEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::Linked { .. } => "AccountEvent::Linked".to_string(),
+            Self::Registered { .. } => "AccountEvent::Registered".to_string(),
+            Self::LinkedToAlpaca { .. } => {
+                "AccountEvent::LinkedToAlpaca".to_string()
+            }
             Self::WalletWhitelisted { .. } => {
                 "AccountEvent::WalletWhitelisted".to_string()
             }
