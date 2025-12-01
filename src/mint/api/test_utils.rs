@@ -10,11 +10,13 @@ use crate::account::{
 };
 use crate::alpaca::AlpacaService;
 use crate::alpaca::service::AlpacaConfig;
+use crate::auth::IpWhitelist;
 use crate::config::{Config, LogLevel};
 use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
 };
+use crate::test_utils::test_localhost_ip_range;
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
@@ -30,7 +32,7 @@ pub(super) fn test_config() -> Config {
         vault: address!("0x1111111111111111111111111111111111111111"),
         bot: address!("0x2222222222222222222222222222222222222222"),
         issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-        alpaca_ip_ranges: vec![*crate::test_utils::test_localhost_ip_range()],
+        alpaca_ip_ranges: IpWhitelist::single(*test_localhost_ip_range()),
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),

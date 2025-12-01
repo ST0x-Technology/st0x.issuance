@@ -11,7 +11,7 @@ use crate::auth::IssuerAuth;
 pub(crate) struct TokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
-    pub(crate) network: Network,
+    pub(crate) networks: Vec<Network>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,7 +36,11 @@ pub(crate) async fn list_tokenized_assets(
         .filter_map(|view| match view {
             TokenizedAssetView::Asset {
                 underlying, token, network, ..
-            } => Some(TokenizedAssetResponse { underlying, token, network }),
+            } => Some(TokenizedAssetResponse {
+                underlying,
+                token,
+                networks: vec![network],
+            }),
             TokenizedAssetView::Unavailable => None,
         })
         .collect();
@@ -54,7 +58,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
-    use crate::auth::FailedAuthRateLimiter;
+    use crate::auth::{FailedAuthRateLimiter, IpWhitelist};
     use crate::config::{Config, LogLevel};
 
     fn test_config() -> Config {
@@ -69,9 +73,9 @@ mod tests {
             vault: address!("0x1111111111111111111111111111111111111111"),
             bot: address!("0x2222222222222222222222222222222222222222"),
             issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-            alpaca_ip_ranges: vec![
+            alpaca_ip_ranges: IpWhitelist::single(
                 "127.0.0.1/32".parse().expect("Valid IP range"),
-            ],
+            ),
             log_level: LogLevel::Debug,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
@@ -169,7 +173,10 @@ mod tests {
             UnderlyingSymbol::new("AAPL")
         );
         assert_eq!(response_body.tokens[0].token, TokenSymbol::new("tAAPL"));
-        assert_eq!(response_body.tokens[0].network, Network::new("base"));
+        assert_eq!(
+            response_body.tokens[0].networks,
+            vec![Network::new("base")]
+        );
     }
 
     #[tokio::test]

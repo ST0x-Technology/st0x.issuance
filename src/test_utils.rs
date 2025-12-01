@@ -20,7 +20,7 @@ use url::Url;
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
-use crate::auth::FailedAuthRateLimiter;
+use crate::auth::{FailedAuthRateLimiter, IpWhitelist};
 use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
@@ -62,7 +62,7 @@ fn test_config() -> Config {
         vault: address!("0x1111111111111111111111111111111111111111"),
         bot: address!("0x2222222222222222222222222222222222222222"),
         issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-        alpaca_ip_ranges: vec![*test_localhost_ip_range()],
+        alpaca_ip_ranges: IpWhitelist::single(*test_localhost_ip_range()),
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
