@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use cqrs_es::AggregateError;
 use rocket::Request;
 use rocket::http::Status;
 use rocket::post;
@@ -93,11 +94,29 @@ pub(crate) async fn register_account(
         AccountCommand::Register { client_id, email: request.email.clone() };
 
     let aggregate_id = client_id.to_string();
-    cqrs.execute(&aggregate_id, register_command)
-        .await
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    if let Err(e) = cqrs.execute(&aggregate_id, register_command).await {
+        return Err(map_cqrs_error_to_status(&e));
+    }
 
     Ok(Json(RegisterAccountResponse { client_id }))
+}
+
+fn map_cqrs_error_to_status(
+    err: &AggregateError<super::AccountError>,
+) -> Status {
+    match err {
+        AggregateError::DatabaseConnectionError(inner)
+            if inner.to_string().contains("UNIQUE constraint failed") =>
+        {
+            Status::Conflict
+        }
+        AggregateError::UserError(_) => Status::BadRequest,
+        AggregateError::AggregateConflict => Status::Conflict,
+        _ => {
+            error!("CQRS execute error: {err}");
+            Status::InternalServerError
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -946,5 +965,56 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[tokio::test]
+    async fn test_email_unique_constraint_enforced_at_db_level() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let email = "race@example.com";
+        let payload1 = serde_json::json!({
+            "Registered": {
+                "client_id": "11111111-1111-1111-1111-111111111111",
+                "email": email,
+                "registered_at": "2024-01-01T00:00:00Z"
+            }
+        });
+
+        sqlx::query("INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)")
+            .bind("11111111-1111-1111-1111-111111111111")
+            .bind(1i64)
+            .bind(payload1.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let payload2 = serde_json::json!({
+            "Registered": {
+                "client_id": "22222222-2222-2222-2222-222222222222",
+                "email": email,
+                "registered_at": "2024-01-01T00:00:00Z"
+            }
+        });
+
+        let result = sqlx::query(
+            "INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)",
+        )
+        .bind("22222222-2222-2222-2222-222222222222")
+        .bind(1i64)
+        .bind(payload2.to_string())
+        .execute(&pool)
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "DB should enforce email uniqueness via migration, got: {err}"
+        );
     }
 }
