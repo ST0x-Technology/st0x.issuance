@@ -68,6 +68,10 @@ Relevant docs:
 - Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
   sections or verbose changelogs
 - The code diffs themselves should be self-explanatory and easy to review
+- **CRITICAL: TODO comments are for redundancy only** - PLAN.md is the source of
+  truth for tracking work. TODO comments in code serve as backup reminders, not
+  primary tracking. When completing a task, always `grep -r "TODO.*Task N"` (or
+  similar) to find and address any related TODOs in the codebase.
 
 ### Before creating a PR
 
