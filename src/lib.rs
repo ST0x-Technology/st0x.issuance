@@ -206,7 +206,11 @@ pub async fn initialize_rocket(
     let rate_limiter = FailedAuthRateLimiter::new()
         .map_err(|e| anyhow::anyhow!("Failed to create rate limiter: {e}"))?;
 
-    Ok(rocket::build()
+    let figment = rocket::Config::figment()
+        .merge(("address", "0.0.0.0"))
+        .merge(("port", 8000));
+
+    Ok(rocket::custom(figment)
         .manage(config)
         .manage(rate_limiter)
         .manage(account_cqrs)
@@ -418,11 +422,7 @@ async fn seed_initial_assets(
     cqrs: &TokenizedAssetCqrsInternal,
     vault: Address,
 ) -> Result<(), anyhow::Error> {
-    let assets = vec![
-        ("AAPL", "tAAPL", "base", vault),
-        ("TSLA", "tTSLA", "base", vault),
-        ("NVDA", "tNVDA", "base", vault),
-    ];
+    let assets = vec![("AAPL", "tAAPL", "base", vault)];
 
     for (underlying, token, network, vault) in assets {
         let command = TokenizedAssetCommand::Add {

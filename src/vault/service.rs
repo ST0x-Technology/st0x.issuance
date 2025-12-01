@@ -54,15 +54,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         let share_ratio = U256::from(10).pow(U256::from(18));
 
+        // Preview deposit to get the exact number shares that will be minted
+        let shares = vault.previewDeposit(assets, share_ratio).call().await?;
+
         // Encode deposit call - mints shares + receipts to bot
         let deposit_call = vault
             .deposit(assets, bot, share_ratio, receipt_info_bytes)
             .calldata()
             .clone();
 
-        // Encode transfer call - transfers shares from bot to user
-        // Due to 1:1 ratio (1e18), shares_minted == assets, so we can pre-calculate
-        let transfer_call = vault.transfer(user, assets).calldata().clone();
+        // Encode transfer call - transfers exact shares from bot to user
+        let transfer_call = vault.transfer(user, shares).calldata().clone();
 
         // Execute both operations atomically via multicall
         let receipt = vault
@@ -299,6 +301,9 @@ mod tests {
 
         let asserter = Asserter::new();
 
+        // Mock previewDeposit call (eth_call returns shares as 32-byte hex string)
+        asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
+
         // Mock eth_getTransactionCount (get nonce)
         asserter.push_success(&0u64);
 
@@ -402,6 +407,9 @@ mod tests {
         let block: Block = Block::default();
 
         let asserter = Asserter::new();
+
+        // Mock previewDeposit call (eth_call returns shares as 32-byte hex string)
+        asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
 
         // Mock eth_getTransactionCount (get nonce)
         asserter.push_success(&0u64);
