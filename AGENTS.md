@@ -2,6 +2,10 @@
 
 This file provides guidance to AI agents working with code in this repository.
 
+**CRITICAL: File Size Limit** - AGENTS.md must not exceed 40,000 characters.
+When editing this file, check the character count (`wc -c AGENTS.md`). If over
+the limit, condense explanations without removing any rules.
+
 Relevant docs:
 
 - README.md
@@ -422,6 +426,47 @@ Environment variables (can be set via `.env` file):
     `enum Account { NotLinked, Linked { client_id, email, ... } }`, NOT
     `struct Account { client_id: Option<ClientId>, email: Option<Email>, ... }`
   - Leverage the type system to enforce invariants at compile time
+- **CRITICAL: Parse, Don't Validate**: If a value exists, it must be valid.
+  Validation must happen at construction time through smart constructors, not as
+  a separate step that callers might forget to call.
+  - **FORBIDDEN**: Separate `validate()` methods that must be called after
+    construction
+  - **FORBIDDEN**: Raw primitive types (String, i64, etc.) for domain values
+    that have constraints
+  - **FORBIDDEN**: Public struct fields or constructors that bypass validation
+  - **CORRECT**: Newtypes with private inner values and fallible smart
+    constructors
+  - **CORRECT**: The only way to create a value is through a function that
+    validates
+  - Example of **FORBIDDEN** pattern:
+    ```rust
+    // ❌ WRONG - validate() can be forgotten, value can exist invalid
+    pub struct ApiKey(pub String);
+    impl ApiKey {
+        pub fn validate(&self) -> Result<(), Error> {
+            if self.0.len() < 32 { return Err(Error::TooShort); }
+            Ok(())
+        }
+    }
+    ```
+  - Example of **CORRECT** pattern:
+    ```rust
+    // ✅ CORRECT - if ApiKey exists, it's guaranteed valid
+    pub struct ApiKey(String);  // Private inner value
+    impl ApiKey {
+        pub fn new(value: String) -> Result<Self, ApiKeyError> {
+            if value.len() < 32 {
+                return Err(ApiKeyError::TooShort { len: value.len() });
+            }
+            Ok(Self(value))
+        }
+        pub fn as_str(&self) -> &str { &self.0 }
+    }
+    ```
+  - This principle applies to ALL domain types with constraints: API keys,
+    emails, quantities, addresses, IDs, etc.
+  - The smart constructor is the ONLY way to create the type - this guarantees
+    that if you have a value, it passed validation
 - **Schema Design**: Avoid database columns that can contradict each other. Use
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
@@ -502,132 +547,38 @@ Environment variables (can be set via `.env` file):
 
 ### CRITICAL: Financial Data Integrity
 
-**This is a mission-critical financial application. The following patterns are
-STRICTLY FORBIDDEN and can result in catastrophic financial losses:**
+**NEVER** silently provide wrong values, hide conversion errors, or mask
+failures. FORBIDDEN patterns:
 
-**NEVER** write code that silently provides wrong values, hides conversion
-errors, or masks failures in any way. This includes but is not limited to:
+- Defensive value capping hiding overflow/underflow
+- Fallback to defaults on conversion failure (`unwrap_or`, `unwrap_or_default`)
+- Silent precision truncation
+- "Graceful degradation" in conversion functions
 
-- Defensive value capping that hides overflow/underflow
-- Fallback to default values on conversion failure
-- Silent truncation of precision
-- Using `unwrap_or(default_value)` on financial calculations
-- Using `unwrap_or_default()` on monetary values
-- Conversion functions that "gracefully degrade" instead of failing
-
-**ALL financial operations must use explicit error handling with proper error
-propagation. Here are examples of forbidden patterns and their correct
-alternatives:**
-
-#### Numeric Conversions
+**All financial operations must use explicit error handling:**
 
 ```rust
-// ❌ CATASTROPHICALLY DANGEROUS - Silent data corruption
-const fn shares_to_db_i64(value: u64) -> i64 {
-    if value > i64::MAX as u64 {
-        i64::MAX  // WRONG: Silently caps at wrong value
-    } else {
-        value as i64
-    }
-}
+// ❌ WRONG - Silent cap          | ✅ CORRECT - Explicit error
+fn to_i64(v: u64) -> i64 {        | fn to_i64(v: u64) -> Result<i64, Error> {
+    if v > i64::MAX as u64 {      |     v.try_into().map_err(|_| Error::TooLarge { v })
+        i64::MAX // silent cap    | }
+    } else { v as i64 }           |
+}                                 |
 
-// ✅ CORRECT - Explicit conversion with proper error handling
-fn shares_to_db_i64(value: u64) -> Result<i64, ConversionError> {
-    value.try_into()
-        .map_err(|_| ConversionError::ValueTooLarge {
-            value,
-            max_allowed: i64::MAX as u64
-        })
-}
+// ❌ WRONG - Hides parse error   | ✅ CORRECT - Propagates error
+fn parse(s: &str) -> f64 {        | fn parse(s: &str) -> Result<Decimal, ParseError> {
+    s.parse().unwrap_or(0.0)      |     Decimal::from_str(s).map_err(Into::into)
+}                                 | }
+
+// ❌ WRONG - Masks DB violation  | ✅ CORRECT - Let constraint fail
+let safe = amt.clamp(0, MAX);     | sqlx::query!("INSERT ...", amt).execute(pool)?;
+sqlx::query!("...", safe)...      |
 ```
 
-#### String Parsing
+**Must fail fast:** numeric conversions (`try_into`), precision loss, range
+violations, parse failures, arithmetic (use checked ops), DB constraints.
 
-```rust
-// ❌ DANGEROUS - Hides conversion errors
-fn parse_price(input: &str) -> f64 {
-    input.parse().unwrap_or(0.0)  // WRONG
-}
-
-// ✅ CORRECT - Parse with explicit error
-fn parse_price(input: &str) -> Result<Decimal, ParseError> {
-    Decimal::from_str(input).map_err(|e| ParseError::InvalidPrice { input: input.to_string(), source: e })
-}
-```
-
-#### Precision-Critical Arithmetic
-
-```rust
-// ❌ DANGEROUS - Silent precision loss
-fn convert_to_cents(dollars: f64) -> i64 {
-    (dollars * 100.0) as i64  // WRONG: Truncates
-}
-
-// ✅ CORRECT - Checked arithmetic
-fn convert_to_cents(dollars: Decimal) -> Result<i64, ArithmeticError> {
-    let cents = dollars.checked_mul(Decimal::from(100)).ok_or(ArithmeticError::Overflow)?;
-    if cents.fract() != Decimal::ZERO {
-        return Err(ArithmeticError::FractionalCents { value: cents });
-    }
-    cents.to_i64().ok_or(ArithmeticError::ConversionFailed { value: cents })
-}
-```
-
-#### Database Constraints
-
-```rust
-// ❌ DANGEROUS - Masks constraint violations
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    let safe = amount.min(Decimal::MAX).max(Decimal::ZERO);  // WRONG
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", safe).execute(pool).await?;
-    Ok(())
-}
-
-// ✅ CORRECT - Let constraints fail naturally
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", amount).execute(pool).await?;
-    Ok(())
-}
-```
-
-#### Error Categories That Must Fail Fast
-
-1. **Numeric Conversions**: Any conversion between numeric types must use
-   `try_into()` or equivalent
-2. **Precision Loss**: Operations that could lose precision must be explicit
-   about it
-3. **Range Violations**: Values outside expected ranges must error, not clamp
-4. **Parse Failures**: String-to-number parsing must propagate parse errors
-5. **Arithmetic Operations**: Use checked arithmetic for all financial
-   calculations
-6. **Database Constraints**: Let database constraints fail rather than masking
-   violations
-
-#### Required Error Types
-
-Every financial operation must have proper error types that preserve context:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum FinancialError {
-    #[error("Value {value} exceeds maximum allowed {max_allowed}")]
-    ValueTooLarge { value: u64, max_allowed: u64 },
-
-    #[error("Arithmetic overflow in operation: {operation}")]
-    ArithmeticOverflow { operation: String },
-
-    #[error("Precision loss detected: {original} -> {converted}")]
-    PrecisionLoss { original: String, converted: String },
-
-    #[error("Invalid price format: '{input}'")]
-    InvalidPrice { input: String, #[source] source: DecimalError },
-}
-```
-
-**Remember: In financial applications, it is ALWAYS better for the system to
-fail fast with a clear error than to continue with potentially corrupted data.
-Silent data corruption in financial systems can lead to massive losses,
-regulatory violations, and complete system failure.**
+**Fail fast > corrupted data.** Silent corruption leads to massive losses.
 
 ### CRITICAL: Security and Secrets Management
 
@@ -695,315 +646,113 @@ explicit permission.**
 
 ## Database Schema
 
-The database uses **SQLite** with an event sourcing architecture. The event
-store is the single source of truth, and all other tables are read-optimized
-views derived from events.
+SQLite with event sourcing. The event store is the single source of truth; views
+are derived projections. See `migrations/` for complete schemas.
 
-### Event Store Tables
-
-These tables store the immutable event log that serves as the authoritative
-source of truth.
+### Event Store
 
 ```sql
--- Events table: stores all domain events
 CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'Mint', 'Redemption', 'Account', 'TokenizedAsset'
-    aggregate_id TEXT NOT NULL,        -- Unique identifier for the aggregate instance
-    sequence BIGINT NOT NULL,          -- Sequence number for this aggregate (starts at 1)
-    event_type TEXT NOT NULL,          -- Event name (e.g., 'MintInitiated', 'TokensMinted')
-    event_version TEXT NOT NULL,       -- Event schema version (e.g., '1.0')
-    payload JSON NOT NULL,             -- Event data as JSON
-    metadata JSON NOT NULL,            -- Correlation IDs, timestamps, user context, etc.
+    aggregate_type TEXT NOT NULL,  -- 'Mint', 'Redemption', 'Account', 'TokenizedAsset'
+    aggregate_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,      -- Sequence number (starts at 1)
+    event_type TEXT NOT NULL,
+    event_version TEXT NOT NULL,
+    payload JSON NOT NULL,
+    metadata JSON NOT NULL,
     PRIMARY KEY (aggregate_type, aggregate_id, sequence)
 );
 
-CREATE INDEX idx_events_type ON events(aggregate_type);
-CREATE INDEX idx_events_aggregate ON events(aggregate_id);
-
--- Snapshots table: aggregate state cache for performance
+-- Snapshots: performance optimization caching aggregate state
 CREATE TABLE snapshots (
     aggregate_type TEXT NOT NULL,
     aggregate_id TEXT NOT NULL,
-    last_sequence BIGINT NOT NULL,    -- Last event sequence included in this snapshot
-    payload JSON NOT NULL,             -- Serialized aggregate state
+    last_sequence BIGINT NOT NULL,
+    payload JSON NOT NULL,
     timestamp TEXT NOT NULL,
     PRIMARY KEY (aggregate_type, aggregate_id)
 );
 ```
 
-**Note on Snapshots**: The snapshots table is a performance optimization that
-caches aggregate state at specific sequence numbers. When loading an aggregate,
-the framework loads the latest snapshot (if any) and replays only events since
-that snapshot, rather than replaying all events from the beginning. Snapshots
-can be deleted at any time - aggregates can always be rebuilt from the event
-store alone.
+Snapshots can be deleted anytime - aggregates rebuild from events alone.
 
-### View Tables
+### Views
 
-These tables are read-optimized projections built from events. They can be
-rebuilt at any time by replaying events.
+All views follow the same pattern (`view_id`, `version`, `payload` as JSON).
+Views implement `View` trait and are updated by `GenericQuery` on event commit.
 
 ```sql
--- Mint view: current state of mint operations
 CREATE TABLE mint_view (
-    view_id TEXT PRIMARY KEY,         -- issuer_request_id
-    version BIGINT NOT NULL,          -- Last event sequence applied to this view
-    payload JSON NOT NULL             -- Current mint state as JSON
-);
-
-CREATE INDEX idx_mint_view_payload ON mint_view(json_extract(payload, '$.status'));
-CREATE INDEX idx_mint_view_client ON mint_view(json_extract(payload, '$.client_id'));
-CREATE INDEX idx_mint_view_symbol ON mint_view(json_extract(payload, '$.underlying'));
-
--- Redemption view: current state of redemption operations
-CREATE TABLE redemption_view (
-    view_id TEXT PRIMARY KEY,         -- issuer_request_id
+    view_id TEXT PRIMARY KEY,
     version BIGINT NOT NULL,
     payload JSON NOT NULL
 );
-
-CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
-CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
-
--- Account view: current account state
-CREATE TABLE account_view (
-    view_id TEXT PRIMARY KEY,         -- client_id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
-);
-
-CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
-CREATE INDEX idx_account_view_alpaca ON account_view(json_extract(payload, '$.alpaca_account'));
-CREATE INDEX idx_account_view_status ON account_view(json_extract(payload, '$.status'));
-
--- Tokenized asset view: current supported assets
-CREATE TABLE tokenized_asset_view (
-    view_id TEXT PRIMARY KEY,         -- underlying symbol
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {token, network, vault_address, enabled, timestamps}
-);
-
-CREATE INDEX idx_asset_view_enabled ON tokenized_asset_view(json_extract(payload, '$.enabled'));
-
--- Receipt inventory view: built from TokensMinted and TokensBurned events
-CREATE TABLE receipt_inventory_view (
-    view_id TEXT PRIMARY KEY,         -- receipt_id:vault_address
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {receipt_id, vault_address, symbol, initial_amount, current_balance, timestamps}
-);
-
-CREATE INDEX idx_receipt_vault ON receipt_inventory_view(json_extract(payload, '$.vault_address'));
-CREATE INDEX idx_receipt_symbol ON receipt_inventory_view(json_extract(payload, '$.symbol'));
 ```
 
-**Note on Views**: All view tables follow the same pattern - `view_id` (primary
-key), `version` (last event sequence applied), and `payload` (JSON containing
-the view state). Views implement the `View` trait and are automatically updated
-by `GenericQuery` processors when events are committed. If a view becomes
-corrupted or a new projection is needed, simply drop the table and replay all
-events to rebuild it.
+See `migrations/` for all view table definitions and indexes.
 
 ## Testing Strategy
 
 ### Given-When-Then Aggregate Testing
 
-ES/CQRS enables highly testable business logic through the Given-When-Then
-pattern.
-
-**Testing Approach:**
-
-- **Given**: Set up initial aggregate state by providing previous events
-- **When**: Execute a command
-- **Then**: Assert expected events are produced (or expected error)
-
-**Example Tests:**
+ES/CQRS enables testable business logic: **Given** previous events → **When**
+command → **Then** expect events (or error).
 
 ```rust
-// Happy path: mint initiated successfully
-#[test]
-fn test_initiate_mint() {
-    MintTestFramework::with(mock_services)
-        .given_no_previous_events()
-        .when(InitiateMint {
-            tokenization_request_id: "alp-123",
-            qty: Decimal::from(100),
-            // ...
-        })
-        .then_expect_events(vec![
-            MintInitiated { /* ... */ }
-        ]);
-}
-
-// Journal confirmed triggers minting
 #[test]
 fn test_journal_confirmed() {
     MintTestFramework::with(mock_services)
-        .given(vec![
-            MintInitiated { issuer_request_id: "iss-456", /* ... */ }
-        ])
+        .given(vec![MintInitiated { issuer_request_id: "iss-456", /* ... */ }])
         .when(ConfirmJournal { issuer_request_id: "iss-456" })
-        .then_expect_events(vec![
-            JournalConfirmed { /* ... */ },
-            MintingStarted { /* ... */ }
-        ]);
-}
-
-// Error case: can't confirm journal for non-existent mint
-#[test]
-fn test_journal_confirmed_for_missing_mint() {
-    MintTestFramework::with(mock_services)
-        .given_no_previous_events()
-        .when(ConfirmJournal { issuer_request_id: "unknown" })
-        .then_expect_error("Mint not found or already completed");
+        .then_expect_events(vec![JournalConfirmed { /* ... */ }, MintingStarted { /* ... */ }]);
 }
 ```
 
 ### Testing Infrastructure
 
-**In-Memory Event Store:**
-
-- The `cqrs-es` crate provides an in-memory event store for testing aggregates
-- Use this for testing aggregate logic when not testing database-specific
-  behavior
-- Fast and isolated tests without database overhead
-
-**Mock External Systems:**
-
-- `httpmock` crate for Alpaca API testing
-- Mock blockchain interactions for deterministic testing
-
-**Database Isolation:**
-
-- In-memory SQLite databases for testing database-specific logic
-- Each test gets its own isolated database
+- **In-memory event store**: `cqrs-es` provides MemStore for fast aggregate
+  tests
+- **Mock external systems**: `httpmock` for Alpaca API, mock blockchain for
+  determinism
+- **Database isolation**: In-memory SQLite per test
 
 ### End-to-End Tests
 
-**End-to-end tests** reproduce the complete production flow in a controlled
-environment. These tests simulate exactly what would happen in reality while
-mocking third-party external APIs.
+E2E tests in `./tests/` reproduce complete production flows with real wiring.
 
-**Critical Requirements:**
+**Mock only external systems:**
 
-- E2E tests in `./tests/` directory (not `src/`)
-- Use **Anvil** (Foundry's local blockchain) for real on-chain transactions
-- Deploy actual smart contracts (OffchainAssetReceiptVault)
-- Send real blockchain transactions that trigger the system
-- Use **httpmock** to mock third-party HTTP APIs (Alpaca API)
-- Start the full HTTP server (Rocket) with real wiring - real CQRS framework,
-  real managers (MintManager, CallbackManager), real service implementations
-  (RealBlockchainService, RealAlpacaService)
-- Use in-memory SQLite database (real database operations, not MemStore)
-- Test the **complete happy path flow** from start to finish, not individual
-  steps
+- Alpaca API via httpmock
+- Blockchain via Anvil (local chain)
 
-**What to Mock (external systems only):**
+**Use real implementations for:** CQRS framework, managers, service traits,
+SQLite
 
-- **Third-party APIs**: Alpaca HTTP endpoints via httpmock
-- **Blockchain RPC**: Use Anvil (local blockchain) instead of real RPC providers
+**Test types:**
 
-**What NOT to Mock (all internal code):**
+- **Unit** (`src/*/mod.rs`): Aggregate logic with MemStore, exhaustive edge
+  cases
+- **Integration** (`src/*/api/*.rs`): HTTP endpoints with mocked dependencies
+- **E2E** (`tests/*.rs`): Complete flows, happy paths only, real blockchain
 
-- Internal service traits (VaultService, AlpacaService) - use real
-  implementations
-- Managers (MintManager, CallbackManager, etc.) - use real implementations
-- CQRS framework - use real implementation with real event store
+### Testing Guidelines
 
-**Example E2E Test Flows:**
-
-- **Mint**: Alpaca HTTP request → CQRS → Mint on-chain via `vault.deposit()` to
-  Anvil → Callback to httpmock Alpaca server
-- **Redemption**: Send tokens on-chain to redemption wallet on Anvil → Detector
-  triggers → Call httpmock Alpaca redeem endpoint → Poll httpmock for completion
-  → Burn tokens via `vault.withdraw()` on Anvil
-
-**Test Coverage Strategy:**
-
-E2E tests are slower than unit/integration tests, so focus them exclusively on:
-
-- **Happy path flows only** - Verify primary use cases work correctly end-to-end
-- **Complete flows** - Test the entire path from trigger to completion, not
-  individual steps
-
-Leave exhaustive edge case testing to faster, more focused tests:
-
-- **Unit tests** (aggregate tests in `src/*/mod.rs`) - Exhaustive edge cases,
-  validation rules, business logic in isolation with MemStore
-- **Integration tests** (component tests in `src/*/api/*.rs`) - Individual HTTP
-  endpoints, database operations, error handling with mocked dependencies
-
-**Test Type Distinctions:**
-
-- **Unit tests** (`src/mint/mod.rs`): Test CQRS aggregate logic in isolation
-  with MemStore, no external dependencies (fast, exhaustive edge cases)
-- **Integration tests** (`src/mint/api/*.rs`): Test individual HTTP endpoints or
-  components with mocked service dependencies (thorough error scenarios)
-- **End-to-end tests** (`tests/*.rs`): Test complete production flows from
-  external trigger to completion with real blockchain + mock external APIs only
-  (happy paths only)
-
-**Public API Surface:**
-
-End-to-end tests help shape what will become the public API for the Rust client
-library. When exposing types for end-to-end tests, be intentional about what
-will eventually be part of the client library interface. The progression is:
-
-1. Expose minimal public API for end-to-end tests (#20)
-2. Package exposed types into proper client library (#52)
-3. Refactor end-to-end tests to use the client library
-
-### General Testing Guidelines
-
-- **Edge Case Coverage**: Comprehensive error scenario testing for all workflows
-- **Debugging failing tests**: When debugging tests with failing assert! macros,
-  add additional context to the assert! macro instead of adding temporary
-  println! statements
-- **Test Quality**: Never write tests that only exercise language features
-  without testing our application logic. Tests should verify actual business
-  logic, not just struct field assignments or basic language operations
-
-#### Writing Meaningful Tests
-
-Tests should verify our application logic, not just language features. Avoid
-tests that only exercise struct construction or field access without testing any
-business logic.
-
-##### ❌ Bad: Testing language features instead of our code
+- Add context to failing `assert!` macros instead of temporary `println!`
+- Never test language features - test business logic
 
 ```rust
-#[test]
-fn test_mint_request_fields() {
-    let request = MintRequest {
-        qty: Decimal::from(100),
-        underlying: "AAPL".to_string(),
-    };
-
-    assert_eq!(request.qty, Decimal::from(100));
-    assert_eq!(request.underlying, "AAPL");
+// ❌ Bad: Tests struct assignment, not our code
+fn test_fields() {
+    let r = MintRequest { qty: 100.into(), underlying: "AAPL".into() };
+    assert_eq!(r.qty, 100.into());
 }
-```
 
-This test creates a struct and verifies field assignments, but doesn't test any
-of our code logic - it only tests Rust's struct field assignment mechanism.
-
-##### ✅ Good: Testing actual business logic
-
-```rust
-#[test]
-fn test_mint_validates_positive_quantity() {
-    let command = InitiateMint {
-        qty: Decimal::from(-10),
-        // ...
-    };
-
-    let result = Mint::default().handle(command);
-
+// ✅ Good: Tests our validation logic
+fn test_validates_quantity() {
+    let result = Mint::default().handle(InitiateMint { qty: (-10).into(), .. });
     assert!(matches!(result, Err(MintError::InvalidQuantity)));
 }
 ```
-
-This test verifies that our validation logic correctly rejects negative
-quantities.
 
 ## Workflow Best Practices
 
@@ -1096,393 +845,108 @@ accumulation through lint suppression.
 
 ## Commenting Guidelines
 
-Code should be primarily self-documenting through clear naming, structure, and
-type modeling. Comments should only be used when they add meaningful context
-that cannot be expressed through code structure alone.
+Code should be self-documenting. Comment only when adding context that code
+structure cannot express.
 
-### When to Use Comments
+**✅ DO comment:** Complex business logic, algorithm rationale, external system
+behavior, non-obvious constraints, test data context, workarounds.
 
-#### ✅ DO comment when:
-
-- **Complex business logic**: Explaining non-obvious domain-specific rules or
-  calculations
-- **Algorithm rationale**: Why a particular approach was chosen over
-  alternatives
-- **External system interactions**: Behavior that depends on external APIs or
-  protocols
-- **Non-obvious technical constraints**: Performance considerations, platform
-  limitations
-- **Test data context**: Explaining what mock values represent or test scenarios
-- **Workarounds**: Temporary solutions with context about why they exist
-
-#### ❌ DON'T comment when:
-
-- The code is self-explanatory through naming and structure
-- Restating what the code obviously does
-- Describing function signatures (use doc comments instead)
-- Adding obvious test setup descriptions
-- Marking code sections that are clear from structure
-
-### Good Comment Examples
+**❌ DON'T comment:** Self-explanatory code, restating what code does, obvious
+assignments, test section markers.
 
 ```rust
-// Alpaca requires the journal to be confirmed before we can mint on-chain.
-// If we mint before confirmation, we risk minting without the backing shares.
-let journal_confirmed = wait_for_journal_confirmation(&mint_id).await?;
+// ✅ Good: Explains WHY (business rule)
+// Alpaca requires journal confirmation before minting - otherwise we risk
+// minting without backing shares.
+let confirmed = wait_for_journal_confirmation(&mint_id).await?;
 
-// We need to get the corresponding AfterClear event as ClearV2 doesn't
-// contain the amounts. So we query the same block number, filter out
-// logs with index lower than the ClearV2 log index and with tx hashes
-// that don't match the ClearV2 tx hash.
-let after_clear_logs = provider.get_logs(/* ... */).await?;
-
-// Test data representing 9 shares with 18 decimal places
-alice_output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 dps)
-
-/// Helper that converts a fixed-decimal `U256` amount into an `f64` using
-/// the provided number of decimals.
-///
-/// NOTE: Parsing should never fail but precision may be lost.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
-```
-
-### Bad Comment Examples
-
-```rust
-// ❌ Redundant - the function name says this
+// ❌ Bad: Restates WHAT (obvious from code)
 // Execute mint command
 execute_mint_command(mint);
-
-// ❌ Obvious from context
-// Store mint request
-let mint = MintRequest { /* ... */ };
-mint.save(&pool).await?;
-
-// ❌ Just restating the code
-// Call Alpaca callback endpoint
-call_alpaca_callback(&mint_id).await?;
-
-// ❌ Test section markers that add no value
-// 1. Test mint initiation
-let result = initiate_mint(request).await;
-
-// ❌ Explaining what the code obviously does
-// Create a mint command
-let command = InitiateMint { /* ... */ };
-
-// ❌ Obvious variable assignments
-// Create an aggregate
-let aggregate = Mint::default();
 ```
 
-### Function Documentation
-
-Use Rust doc comments (`///`) for public APIs:
-
-```rust
-/// Executes a command against the aggregate and persists resulting events.
-///
-/// Returns `CommandError::AggregateNotFound` if the aggregate doesn't exist
-/// and the command requires an existing aggregate.
-pub async fn execute_command<C: Command>(
-    aggregate_id: &str,
-    command: C,
-) -> Result<Vec<Event>, CommandError> {
-```
-
-### Comment Maintenance
-
-- Remove comments when refactoring makes them obsolete
-- Update comments when changing the logic they describe
-- If a comment is needed to explain what code does, consider refactoring for
-  clarity
-- Keep comments concise and focused on the "why" rather than the "what"
+Use `///` doc comments for public APIs. Keep comments focused on "why" not
+"what".
 
 ## Code Style
 
 ### Module Organization
 
-Organize code within modules by importance and visibility:
-
-- **Public API first**: Place public functions, types, and traits at the top of
-  the module where they are immediately visible to consumers
-- **Private helpers below public code**: Place private helper functions, types,
-  and traits immediately after the public code that uses them
-- **Implementation blocks next to type definitions**: Place `impl` blocks after
-  the type definition
-
-This organization pattern makes the module's public interface clear at a glance
-and keeps implementation details appropriately subordinate.
-
-**Example of good module organization (note that comments are just for
-illustration, in real code we wouldn't leave those):**
+Order by visibility: **public API first** → **impl blocks after types** →
+**private helpers last**. This makes public interface immediately visible.
 
 ```rust
-// Public struct definition
-pub(crate) struct MintRequest {
-    pub(crate) id: Option<i64>,
-    pub(crate) issuer_request_id: String,
-    pub(crate) qty: Decimal,
-}
+pub(crate) struct MintRequest { /* fields */ }  // Public type first
+impl MintRequest { pub(crate) async fn save(&self, ..) -> Result<..> { } }
 
-// Implementation block right after type definition
-impl MintRequest {
-    pub(crate) async fn save(&self, pool: &SqlitePool) -> Result<i64, Error> {
-        // Implementation
-    }
-}
-
-// Public function that uses helper functions
-pub(crate) async fn find_mints_by_status(
-    pool: &SqlitePool,
-    status: MintStatus,
-) -> Result<Vec<MintRequest>, Error> {
-    let rows = query_by_status(pool, status.as_str()).await?;
+pub(crate) async fn find_mints(..) -> Result<Vec<MintRequest>, Error> {
+    let rows = query_by_status(..)?;  // Uses private helper below
     rows.into_iter().map(row_to_mint).collect()
 }
 
-// Private helper functions used by find_mints_by_status
-async fn query_by_status(
-    pool: &SqlitePool,
-    status: &str,
-) -> Result<Vec<MintRow>, sqlx::Error> {
-    // SQL query implementation
-}
-
-fn row_to_mint(row: MintRow) -> Result<MintRequest, Error> {
-    // Conversion logic
-}
+async fn query_by_status(..) -> Result<Vec<MintRow>, Error> { }  // Private helper
+fn row_to_mint(row: MintRow) -> Result<MintRequest, Error> { }   // Private helper
 ```
 
-### Use `.unwrap` over boolean result assertions in tests
+### Test assertions
 
-Instead of
+Use `.unwrap()` directly - if unexpected, you see the value immediately:
 
 ```rust
-assert!(result.is_err());
-assert!(matches!(result.unwrap_err(), MintError::InvalidQuantity));
+// ❌ Verbose                           | ✅ Concise
+assert!(result.is_err());               | assert!(matches!(result.unwrap_err(),
+assert!(matches!(result.unwrap_err(),   |     MintError::InvalidQuantity));
+    MintError::InvalidQuantity));       |
 ```
 
-or
+### Type modeling
+
+**Make invalid states unrepresentable** - use enums, not nullable fields:
 
 ```rust
-assert!(result.is_ok());
-assert_eq!(result.unwrap(), expected_events);
+// ❌ Bad: Options can contradict         | ✅ Good: Each state has its data
+pub struct Mint {                         | pub enum MintStatus {
+    pub status: String,                   |     Pending,
+    pub tx_hash: Option<String>,          |     Completed { tx_hash: String, shares: u64 },
+    pub error: Option<String>,            |     Failed { reason: String },
+}                                         | }
 ```
 
-Write
+**Use newtypes** to prevent mixing incompatible values:
 
 ```rust
-assert!(matches!(result.unwrap_err(), MintError::InvalidQuantity));
-```
-
-and
-
-```rust
-assert_eq!(result.unwrap(), expected_events);
-```
-
-so that if we get an unexpected result value, we immediately see the value.
-
-### Type modeling examples
-
-#### Make invalid states unrepresentable:
-
-Instead of using multiple fields that can contradict each other:
-
-```rust
-// ❌ Bad: Multiple fields can be in invalid combinations
-pub struct MintRequest {
-    pub status: String,  // "pending", "completed", "failed"
-    pub tx_hash: Option<String>,  // Some when completed, None when pending
-    pub minted_at: Option<DateTime<Utc>>,  // Some when completed
-    pub shares: Option<u64>,  // Some when completed
-    pub error: Option<String>,  // Some when failed
-}
-```
-
-Use enum variants to encode valid states:
-
-```rust
-// ✅ Good: Each state has exactly the data it needs
-pub enum MintStatus {
-    PendingJournal,
-    JournalCompleted,
-    Minting,
-    CallbackPending,
-    Completed {
-        tx_hash: String,
-        minted_at: DateTime<Utc>,
-        shares: u64,
-    },
-    Failed {
-        failed_at: DateTime<Utc>,
-        reason: String,
-    },
-}
-```
-
-#### Use newtypes for domain concepts:
-
-```rust
-// ❌ Bad: Easy to mix up parameters of the same type
-fn initiate_mint(
-    tokenization_id: String,
-    issuer_id: String,
-    symbol: String,
-    qty: String,
-) { }
-
-// ✅ Good: Type system prevents mixing incompatible values
-#[derive(Debug, Clone)]
-struct TokenizationRequestId(String);
-
-#[derive(Debug, Clone)]
-struct IssuerRequestId(String);
-
-#[derive(Debug, Clone)]
-struct Symbol(String);
-
-#[derive(Debug)]
-struct Quantity(Decimal);
-
-fn initiate_mint(
-    tokenization_id: TokenizationRequestId,
-    issuer_id: IssuerRequestId,
-    symbol: Symbol,
-    qty: Quantity,
-) { }
+// ❌ fn mint(tok_id: String, iss_id: String, sym: String) - easy to mix up
+// ✅ fn mint(tok_id: TokenizationId, iss_id: IssuerId, sym: Symbol) - type-safe
 ```
 
 ### Avoid deep nesting
 
-Prefer flat code over deeply nested blocks to improve readability and
-maintainability.
-
-#### Use early returns:
-
-Instead of
+Use early returns and `let-else` for flat code:
 
 ```rust
-fn validate_mint(data: Option<&MintData>) -> Result<(), Error> {
-    if let Some(data) = data {
-        if data.qty > Decimal::ZERO {
-            if data.symbol.is_supported() {
-                Ok(())
-            } else {
-                Err(Error::UnsupportedSymbol)
-            }
-        } else {
-            Err(Error::InvalidQuantity)
-        }
-    } else {
-        Err(Error::NoData)
-    }
-}
-```
-
-Write
-
-```rust
-fn validate_mint(data: Option<&MintData>) -> Result<(), Error> {
-    let data = data.ok_or(Error::NoData)?;
-
-    if data.qty <= Decimal::ZERO {
-        return Err(Error::InvalidQuantity);
-    }
-
-    if !data.symbol.is_supported() {
-        return Err(Error::UnsupportedSymbol);
-    }
-
-    Ok(())
-}
-```
-
-#### Use let-else pattern for guard clauses:
-
-The let-else pattern (available since Rust 1.65) is excellent for reducing
-nesting when you need to extract a value or return early:
-
-Instead of
-
-```rust
-fn process_mint(mint: &Mint) -> Result<Receipt, Error> {
-    if let Some(tx_hash) = mint.get_tx_hash() {
-        if tx_hash.is_valid() {
-            if let Some(receipt_id) = mint.extract_receipt_id() {
-                Ok(Receipt::new(tx_hash, receipt_id))
-            } else {
-                Err(Error::NoReceiptId)
-            }
-        } else {
-            Err(Error::InvalidTxHash)
-        }
-    } else {
-        Err(Error::NoTxHash)
-    }
-}
-```
-
-Write
-
-```rust
-fn process_mint(mint: &Mint) -> Result<Receipt, Error> {
-    let Some(tx_hash) = mint.get_tx_hash() else {
-        return Err(Error::NoTxHash);
-    };
-
-    if !tx_hash.is_valid() {
-        return Err(Error::InvalidTxHash);
-    }
-
-    let Some(receipt_id) = mint.extract_receipt_id() else {
-        return Err(Error::NoReceiptId);
-    };
-
-    Ok(Receipt::new(tx_hash, receipt_id))
-}
+// ❌ Nested                              | ✅ Flat with early returns
+fn validate(d: Option<&Data>) -> Res<()> | fn validate(d: Option<&Data>) -> Res<()> {
+{                                         |     let d = d.ok_or(Error::NoData)?;
+    if let Some(d) = d {                  |     if d.qty <= 0 { return Err(Error::Qty); }
+        if d.qty > 0 {                    |     if !d.sym.ok() { return Err(Error::Sym); }
+            if d.sym.ok() { Ok(()) }      |     Ok(())
+            else { Err(Error::Sym) }      | }
+        } else { Err(Error::Qty) }        |
+    } else { Err(Error::NoData) }         |
+}                                         |
 ```
 
 ### Struct field access
 
-Avoid creating unnecessary constructors or getters when they don't add logic
-beyond setting/getting field values. Use public fields directly instead.
-
-#### Prefer direct field access:
+Prefer direct field access over unnecessary constructors/getters:
 
 ```rust
-pub struct MintRequest {
-    pub tokenization_request_id: String,
-    pub issuer_request_id: String,
-    pub qty: Decimal,
-    pub underlying: String,
-}
+// ✅ Use struct literals directly
+let req = MintRequest { qty: 100.into(), underlying: "AAPL".into(), .. };
+println!("{}", req.qty);  // Direct access
 
-// Create with struct literal syntax
-let request = MintRequest {
-    tokenization_request_id: "alp-123".to_string(),
-    issuer_request_id: "iss-456".to_string(),
-    qty: Decimal::from(100),
-    underlying: "AAPL".to_string(),
-};
-
-// Access fields directly
-println!("Quantity: {}", request.qty);
-```
-
-#### Avoid unnecessary constructors and getters:
-
-```rust
-// Don't create these unless they add meaningful logic
+// ❌ Don't add getters/constructors that just forward to fields
 impl MintRequest {
-    // Unnecessary - just sets fields without additional logic
-    pub fn new(tokenization_id: String, /* ... */) -> Self { /* ... */ }
-
-    // Unnecessary - just returns field value
-    pub fn qty(&self) -> Decimal { self.qty }
+    pub fn qty(&self) -> Decimal { self.qty }  // Unnecessary
 }
 ```
-
-This preserves argument clarity and avoids losing information about what each
-field represents.
