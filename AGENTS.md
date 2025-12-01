@@ -73,37 +73,35 @@ Relevant docs:
   primary tracking. When completing a task, always `grep -r "TODO.*Task N"` (or
   similar) to find and address any related TODOs in the codebase.
 
-### Before creating a PR
+### After completing a plan
 
-- **CRITICAL**: Delete PLAN.md before submitting changes for review
-- PLAN.md is a transient development file that should ONLY exist on development
-  branches
-- PLAN.md should NEVER appear in pull requests or be merged to main/master
-- The plan is for development tracking only - final documentation goes in commit
-  messages, docstrings, and permanent markdown documents
-- **CRITICAL**: Update all documentation to reflect your changes
-  - **ROADMAP.md**: Mark completed tasks as done with the PR link
-    - When you complete a task that corresponds to an issue in ROADMAP.md,
-      update the roadmap to mark it as complete `[x]` and add the PR link
-    - Format: `- [x] [#N](issue-url) - Task description`
-    - Add PR reference: `- **PR:** [#N](pr-url)`
-    - This ensures the roadmap accurately reflects progress when the PR is
-      merged
-  - **README.md**: Review and update if your changes affect:
-    - Project structure (new directories, modules)
-    - Key features or capabilities
-    - Development commands or workflows
-    - API endpoints
-    - Architecture overview
-  - **SPEC.md**: Review and update if your changes affect:
-    - Aggregates, commands, or events
-    - State machines or flows
-    - Data structures or APIs
-    - Integration points with external systems
-  - **AGENTS.md**: Update if you introduce new patterns, practices, or
-    conventions that other developers should follow
-  - Out-of-date documentation has negative value - it confuses more than it
-    clarifies
+When all tasks in PLAN.md are complete, perform this checklist **before**
+creating or updating a PR:
+
+1. **Delete PLAN.md** - It's a transient development file that should ONLY exist
+   on development branches, never in PRs or merged to main
+2. **Update ROADMAP.md**:
+   - Mark completed issues as `[x]` with PR link
+   - Format: `- [x] [#N](issue-url) - Task description`
+   - Add: `- **PR:** [#N](pr-url)`
+   - If work doesn't fit an existing phase, add it to "Fixes & Improvements"
+     section
+   - Use `gh issue list` and `gh pr list` to verify all related issues/PRs are
+     linked
+3. **Update other documentation** as needed:
+   - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
+     changed
+   - **README.md**: If project structure, features, commands, or architecture
+     changed
+   - **AGENTS.md**: If new patterns or conventions were introduced
+4. **Verify GitHub state**:
+   - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
+     description)
+   - Check that no issues are marked complete in ROADMAP.md but still open on
+     GitHub
+
+Out-of-date documentation has negative value - it confuses more than it
+clarifies.
 
 ## Project Overview
 
