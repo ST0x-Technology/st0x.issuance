@@ -99,45 +99,47 @@ organized by domain concept (not by technical layer).
 
 **`src/auth/mod.rs`:**
 
-- [ ] Convert `src/auth.rs` to `src/auth/mod.rs`
-- [ ] Keep guards here: `IssuerAuth`, `InternalAuth` (new)
-- [ ] Keep `AuthError` here (tightly coupled to guards)
-- [ ] Add `AuthConfig` struct with:
-  - `issuer_api_key: String`
+- [x] Convert `src/auth.rs` to `src/auth/mod.rs`
+- [x] Keep guards here: `IssuerAuth`, `InternalAuth` (new)
+- [x] Keep `AuthError` here (tightly coupled to guards)
+- [x] Add `AuthConfig` struct with:
+  - `issuer_api_key: IssuerApiKey`
   - `alpaca_ip_ranges: IpWhitelist`
   - `internal_ip_ranges: IpWhitelist` (default: `127.0.0.1/8,::1/128`)
-- [ ] Derive `clap::Args` for `AuthConfig`
-- [ ] Create `InternalAuth` guard (IP-only check against `internal_ip_ranges`)
-- [ ] Extract shared guard logic into helper functions
-- [ ] Re-export public types from submodules
+- [x] Derive `clap::Args` for `AuthConfig`
+- [x] Create `InternalAuth` guard (requires API key + checks
+      `internal_ip_ranges`)
+- [x] Extract shared guard logic into `authenticate_request()` helper function
+- [x] Re-export public types from submodules
 
 **`src/auth/ip_whitelist.rs`:**
 
-- [ ] Move `IpWhitelist` and `IpWhitelistParseError` here
-- [ ] Add tests for `IpWhitelist` parsing and `is_allowed` logic
+- [x] Move `IpWhitelist` and `IpWhitelistParseError` here
+- [x] Add tests for `IpWhitelist` parsing and `is_allowed` logic
 
 **`src/auth/rate_limit.rs`:**
 
-- [ ] Move `FailedAuthRateLimiter` and `RateLimiterError` here
-- [ ] Move `test_rate_limit_11th_failed_attempt_returns_429` here
-- [ ] Move `test_successful_auth_does_not_count_against_limit` here
+- [x] Move `FailedAuthRateLimiter` and `RateLimitConfigError` here
+- [x] Move `test_rate_limit_11th_failed_attempt_returns_429` here
+- [x] Move `test_successful_auth_does_not_count_against_limit` here
 
 **`src/config.rs`:**
 
-- [ ] Remove `issuer_api_key` and `alpaca_ip_ranges` fields
-- [ ] Add `#[clap(flatten)] pub auth: AuthConfig`
-- [ ] Update any code that accesses `config.issuer_api_key` to use
+- [x] Remove `issuer_api_key` and `alpaca_ip_ranges` fields
+- [x] Add `#[clap(flatten)] pub auth: AuthConfig`
+- [x] Update any code that accesses `config.issuer_api_key` to use
       `config.auth.issuer_api_key`
 
 **`src/auth/mod.rs` (tests):**
 
-- [ ] Keep guard-related tests: `test_missing_api_key_header_returns_401`,
+- [x] Keep guard-related tests: `test_missing_api_key_header_returns_401`,
       `test_invalid_api_key_returns_401`, `test_empty_ip_ranges_allows_*`,
       `test_configured_ip_ranges_block_*`
-- [ ] Add `test_internal_auth_allows_localhost`
-- [ ] Add `test_internal_auth_blocks_external_ip`
-- [ ] Update existing guard tests to use `AuthConfig`
-- [ ] Run `cargo test -p issuance -- auth` and `cargo clippy` and `cargo fmt`
+- [x] Add `test_internal_auth_allows_localhost`
+- [x] Add `test_internal_auth_allows_ipv6_localhost`
+- [x] Add `test_internal_auth_blocks_external_ip`
+- [x] Update existing guard tests to use `AuthConfig`
+- [x] Run `cargo test -p issuance -- auth` and `cargo clippy` and `cargo fmt`
 
 ## Task 4. Add Registration Endpoint
 

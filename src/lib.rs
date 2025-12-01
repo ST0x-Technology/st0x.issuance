@@ -42,7 +42,7 @@ pub(crate) mod vault;
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
-pub use auth::IpWhitelist;
+pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
@@ -203,8 +203,7 @@ pub async fn initialize_rocket(
         burn,
     );
 
-    let rate_limiter = FailedAuthRateLimiter::new()
-        .map_err(|e| anyhow::anyhow!("Failed to create rate limiter: {e}"))?;
+    let rate_limiter = FailedAuthRateLimiter::new()?;
 
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))

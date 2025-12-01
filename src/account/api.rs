@@ -157,7 +157,7 @@ mod tests {
     use super::*;
     use crate::account::Account;
     use crate::alpaca::service::AlpacaConfig;
-    use crate::auth::{FailedAuthRateLimiter, IpWhitelist};
+    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
 
     fn test_config() -> Config {
@@ -168,10 +168,7 @@ mod tests {
             private_key: B256::ZERO,
             vault: address!("0x1111111111111111111111111111111111111111"),
             bot: address!("0x2222222222222222222222222222222222222222"),
-            issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-            alpaca_ip_ranges: IpWhitelist::single(
-                "127.0.0.1/32".parse().expect("Valid IP range"),
-            ),
+            auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
@@ -223,8 +220,7 @@ mod tests {
         let email = "customer@firm.com";
         let client_id = register_account(&account_cqrs, email).await;
 
-        let rate_limiter = FailedAuthRateLimiter::new()
-            .expect("Failed to create rate limiter for tests");
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -289,8 +285,7 @@ mod tests {
         let email = "duplicate@example.com";
         register_account(&account_cqrs, email).await;
 
-        let rate_limiter = FailedAuthRateLimiter::new()
-            .expect("Failed to create rate limiter for tests");
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -359,8 +354,7 @@ mod tests {
         let account_cqrs =
             sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-        let rate_limiter = FailedAuthRateLimiter::new()
-            .expect("Failed to create rate limiter for tests");
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -420,8 +414,7 @@ mod tests {
         let email = "events@example.com";
         let client_id = register_account(&account_cqrs, email).await;
 
-        let rate_limiter = FailedAuthRateLimiter::new()
-            .expect("Failed to create rate limiter for tests");
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -503,8 +496,7 @@ mod tests {
         let email = "view@example.com";
         let client_id = register_account(&account_cqrs, email).await;
 
-        let rate_limiter = FailedAuthRateLimiter::new()
-            .expect("Failed to create rate limiter for tests");
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
