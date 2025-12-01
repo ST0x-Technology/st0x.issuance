@@ -182,16 +182,15 @@ creating a new one.
   - Get `client_id` from existing `Registered` account
   - Execute `LinkToAlpaca` command using existing `client_id` as aggregate ID
   - Return `AccountLinkResponse { client_id }`
-- [ ] Update `whitelist_wallet`:
+- [x] Update `whitelist_wallet`:
   - Change from `IssuerAuth` to `InternalAuth` (internal endpoint)
   - Check for `LinkedToAlpaca` view state (not `Account`)
-  - **Note:** Blocked on Task 3 (InternalAuth guard)
 
 **`src/account/api.rs` (tests):**
 
 - [x] Update `test_connect_account_returns_client_id` to first register, then
       connect
-- [ ] Add `test_connect_account_when_not_registered_returns_404`
+- [x] Add `test_connect_account_when_not_registered_returns_404`
 - [x] Update `test_duplicate_account_link_returns_409` for new flow (register →
       connect → connect again)
 - [x] Update `test_events_are_persisted_correctly` for new event names
@@ -201,7 +200,7 @@ creating a new one.
 
 ## Task 6. Final Validation
 
-- [ ] Run `cargo test --workspace`
-- [ ] Run
+- [x] Run `cargo test --workspace`
+- [x] Run
       `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-- [ ] Run `cargo fmt --all -- --check`
+- [x] Run `cargo fmt --all -- --check`

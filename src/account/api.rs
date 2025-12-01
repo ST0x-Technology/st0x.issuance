@@ -159,12 +159,13 @@ pub struct WhitelistWalletResponse {
     pub success: bool,
 }
 
-#[tracing::instrument(skip(cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(
     client_id = %client_id,
     wallet = ?request.wallet
 ))]
 #[post("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
 pub(crate) async fn whitelist_wallet(
+    _auth: InternalAuth,
     cqrs: &rocket::State<crate::AccountCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
@@ -371,6 +372,63 @@ mod tests {
             .await;
 
         assert_eq!(response2.status(), Status::Conflict);
+    }
+
+    #[tokio::test]
+    async fn test_connect_account_when_not_registered_returns_404() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "nonexistent@example.com",
+            "account": "ALPACA999"
+        });
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NotFound);
     }
 
     #[tokio::test]

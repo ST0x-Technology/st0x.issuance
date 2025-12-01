@@ -117,6 +117,11 @@ async fn setup_account(
     let whitelist_response = client
         .post(format!("/accounts/{}/wallets", link_body.client_id))
         .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
