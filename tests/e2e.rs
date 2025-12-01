@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-use st0x_issuance::account::AccountLinkResponse;
+use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_auth_header};
@@ -75,11 +75,26 @@ where
     }
 }
 
-async fn perform_mint_flow(
+async fn setup_account(
     client: &Client,
-    evm: &LocalEvm,
     user_wallet: Address,
-) -> Result<U256, Box<dyn std::error::Error>> {
+) -> AccountLinkResponse {
+    let register_response = client
+        .post("/accounts")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .body(json!({"email": "user@example.com"}).to_string())
+        .dispatch()
+        .await;
+
+    assert_eq!(register_response.status(), rocket::http::Status::Ok);
+    let _: RegisterAccountResponse =
+        register_response.into_json().await.unwrap();
+
     let link_response = client
         .post("/accounts/connect")
         .header(rocket::http::ContentType::JSON)
@@ -89,33 +104,34 @@ async fn perform_mint_flow(
         ))
         .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
-            json!({
-                "email": "user@example.com",
-                "account": "USER123"
-            })
-            .to_string(),
+            json!({"email": "user@example.com", "account": "USER123"})
+                .to_string(),
         )
         .dispatch()
         .await;
 
     assert_eq!(link_response.status(), rocket::http::Status::Ok);
-
     let link_body: AccountLinkResponse =
         link_response.into_json().await.unwrap();
 
     let whitelist_response = client
         .post(format!("/accounts/{}/wallets", link_body.client_id))
         .header(rocket::http::ContentType::JSON)
-        .body(
-            json!({
-                "wallet": user_wallet
-            })
-            .to_string(),
-        )
+        .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
 
     assert_eq!(whitelist_response.status(), rocket::http::Status::Ok);
+
+    link_body
+}
+
+async fn perform_mint_flow(
+    client: &Client,
+    evm: &LocalEvm,
+    user_wallet: Address,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    let link_body = setup_account(client, user_wallet).await;
 
     let mint_response = client
         .post("/inkind/issuance")

@@ -13,7 +13,7 @@ use super::{
     AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
     view::find_by_client_id, view::find_by_email,
 };
-use crate::auth::IssuerAuth;
+use crate::auth::{InternalAuth, IssuerAuth};
 
 impl<'a> FromParam<'a> for ClientId {
     type Error = uuid::Error;
@@ -55,6 +55,49 @@ impl<'r> Responder<'r, 'static> for ApiError {
             .sized_body(message.len(), std::io::Cursor::new(message))
             .ok()
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RegisterAccountRequest {
+    pub(crate) email: Email,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterAccountResponse {
+    pub client_id: ClientId,
+}
+
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(email = %request.email.0))]
+#[post("/accounts", format = "json", data = "<request>")]
+pub(crate) async fn register_account(
+    _auth: InternalAuth,
+    cqrs: &rocket::State<crate::AccountCqrs>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    request: Json<RegisterAccountRequest>,
+) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
+    if let Some(view) = find_by_email(pool.inner(), &request.email)
+        .await
+        .map_err(|_| rocket::http::Status::InternalServerError)?
+    {
+        match view {
+            AccountView::Registered { .. }
+            | AccountView::LinkedToAlpaca { .. } => {
+                return Err(rocket::http::Status::Conflict);
+            }
+            AccountView::Unavailable => {}
+        }
+    }
+
+    let client_id = ClientId::new();
+    let register_command =
+        AccountCommand::Register { client_id, email: request.email.clone() };
+
+    let aggregate_id = client_id.to_string();
+    cqrs.execute(&aggregate_id, register_command)
+        .await
+        .map_err(|_| rocket::http::Status::InternalServerError)?;
+
+    Ok(Json(RegisterAccountResponse { client_id }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -657,5 +700,193 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn test_register_account_returns_client_id() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool.clone())
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let email = "newuser@example.com";
+        let request_body = serde_json::json!({
+            "email": email
+        });
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let response_body: RegisterAccountResponse =
+            response.into_json().await.expect("valid JSON response");
+
+        let view = find_by_client_id(&pool, &response_body.client_id)
+            .await
+            .expect("Failed to query view")
+            .expect("View should exist");
+
+        let AccountView::Registered { client_id, email: view_email, .. } = view
+        else {
+            panic!("Expected Registered, got {view:?}");
+        };
+
+        assert_eq!(client_id, response_body.client_id);
+        assert_eq!(view_email.as_str(), email);
+    }
+
+    #[tokio::test]
+    async fn test_register_duplicate_email_returns_409() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let email = "duplicate@example.com";
+        register_account(&account_cqrs, email).await;
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": email
+        });
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Conflict);
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_email_returns_422() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "email": "not-an-email"
+        });
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 }

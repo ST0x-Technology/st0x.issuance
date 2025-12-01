@@ -13,8 +13,10 @@ use std::str::FromStr;
 use tracing::error;
 use uuid::Uuid;
 
-pub use api::{AccountLinkResponse, WhitelistWalletResponse};
-pub(crate) use api::{connect_account, whitelist_wallet};
+pub use api::{
+    AccountLinkResponse, RegisterAccountResponse, WhitelistWalletResponse,
+};
+pub(crate) use api::{connect_account, register_account, whitelist_wallet};
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
 pub(crate) use view::AccountView;
@@ -62,8 +64,6 @@ pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 pub struct ClientId(Uuid);
 
 impl ClientId {
-    // TODO: Remove #[cfg(test)] when Task 4 adds registration endpoint
-    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }

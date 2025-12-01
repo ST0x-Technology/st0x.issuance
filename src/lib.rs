@@ -223,6 +223,7 @@ pub async fn initialize_rocket(
         .mount(
             "/",
             routes![
+                account::register_account,
                 account::connect_account,
                 account::whitelist_wallet,
                 tokenized_asset::list_tokenized_assets,

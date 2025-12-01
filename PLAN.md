@@ -147,25 +147,25 @@ Add internal `POST /accounts` endpoint for manual AP registration.
 
 **`src/account/api.rs`:**
 
-- [ ] Add `RegisterAccountRequest { email }` struct
-- [ ] Add `POST /accounts` endpoint (`register_account` function):
+- [x] Add `RegisterAccountRequest { email }` struct
+- [x] Add `POST /accounts` endpoint (`register_account` function):
   - Use `InternalAuth` guard (not `IssuerAuth`)
   - Check email not already registered via `find_by_email`
   - Generate `client_id`
   - Execute `Register` command
   - Return `RegisterAccountResponse { client_id }`
-- [ ] Export `register_account` from `src/account/mod.rs`
+- [x] Export `register_account` from `src/account/mod.rs`
 
-**`src/main.rs`:**
+**`src/lib.rs`:**
 
-- [ ] Mount `register_account` route
+- [x] Mount `register_account` route
 
 **`src/account/api.rs` (tests):**
 
-- [ ] Add `test_register_account_returns_client_id`
-- [ ] Add `test_register_duplicate_email_returns_409`
-- [ ] Add `test_register_invalid_email_returns_422`
-- [ ] Run `cargo test -p issuance -- account::api` and `cargo clippy` and
+- [x] Add `test_register_account_returns_client_id`
+- [x] Add `test_register_duplicate_email_returns_409`
+- [x] Add `test_register_invalid_email_returns_422`
+- [x] Run `cargo test -p st0x-issuance -- account::api` and `cargo clippy` and
       `cargo fmt`
 
 ## Task 5. Update Connect Endpoint
