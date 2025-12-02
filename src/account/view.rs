@@ -4,10 +4,7 @@ use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use super::{
-    Account, AccountEvent, AlpacaAccountNumber, ClientId, Email,
-    LinkedAccountStatus,
-};
+use super::{Account, AccountEvent, AlpacaAccountNumber, ClientId, Email};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccountViewError {
@@ -21,12 +18,17 @@ pub(crate) enum AccountViewError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum AccountView {
     Unavailable,
-    Account {
+    Registered {
+        client_id: ClientId,
+        email: Email,
+        registered_at: DateTime<Utc>,
+    },
+    LinkedToAlpaca {
         client_id: ClientId,
         email: Email,
         alpaca_account: AlpacaAccountNumber,
         whitelisted_wallets: Vec<Address>,
-        status: LinkedAccountStatus,
+        registered_at: DateTime<Utc>,
         linked_at: DateTime<Utc>,
     },
 }
@@ -40,23 +42,31 @@ impl Default for AccountView {
 impl View<Account> for AccountView {
     fn update(&mut self, event: &EventEnvelope<Account>) {
         match &event.payload {
-            AccountEvent::Linked {
-                client_id,
-                email,
-                alpaca_account,
-                linked_at,
-            } => {
-                *self = Self::Account {
+            AccountEvent::Registered { client_id, email, registered_at } => {
+                *self = Self::Registered {
                     client_id: *client_id,
                     email: email.clone(),
-                    alpaca_account: alpaca_account.clone(),
-                    whitelisted_wallets: Vec::new(),
-                    status: LinkedAccountStatus::Active,
-                    linked_at: *linked_at,
+                    registered_at: *registered_at,
                 };
             }
+
+            AccountEvent::LinkedToAlpaca { alpaca_account, linked_at } => {
+                if let Self::Registered { client_id, email, registered_at } =
+                    self.clone()
+                {
+                    *self = Self::LinkedToAlpaca {
+                        client_id,
+                        email,
+                        alpaca_account: alpaca_account.clone(),
+                        whitelisted_wallets: Vec::new(),
+                        registered_at,
+                        linked_at: *linked_at,
+                    };
+                }
+            }
+
             AccountEvent::WalletWhitelisted { wallet, .. } => {
-                if let Self::Account { whitelisted_wallets, .. } = self {
+                if let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self {
                     whitelisted_wallets.push(*wallet);
                 }
             }
@@ -68,13 +78,16 @@ pub(crate) async fn find_by_client_id(
     pool: &Pool<Sqlite>,
     client_id: &ClientId,
 ) -> Result<Option<AccountView>, AccountViewError> {
+    let client_id_str = client_id.to_string();
     let row = sqlx::query!(
         r#"
         SELECT payload as "payload: String"
         FROM account_view
-        WHERE client_id_indexed = ?
+        WHERE json_extract(payload, '$.Registered.client_id') = ?
+           OR json_extract(payload, '$.LinkedToAlpaca.client_id') = ?
         "#,
-        client_id
+        client_id_str,
+        client_id_str
     )
     .fetch_optional(pool)
     .await?;
@@ -96,8 +109,10 @@ pub(crate) async fn find_by_email(
         r#"
         SELECT payload as "payload: String"
         FROM account_view
-        WHERE json_extract(payload, '$.Account.email') = ?
+        WHERE json_extract(payload, '$.Registered.email') = ?
+           OR json_extract(payload, '$.LinkedToAlpaca.email') = ?
         "#,
+        email.0,
         email.0
     )
     .fetch_optional(pool)
@@ -123,7 +138,7 @@ pub(crate) async fn find_by_wallet(
         FROM account_view
         WHERE EXISTS(
             SELECT 1
-            FROM json_each(payload, '$.Account.whitelisted_wallets')
+            FROM json_each(payload, '$.LinkedToAlpaca.whitelisted_wallets')
             WHERE value = ?
         )
         "#,
@@ -166,17 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn test_view_update_from_account_linked_event() {
+    fn test_view_update_from_registered_event() {
         let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
-        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let linked_at = Utc::now();
+        let registered_at = Utc::now();
 
-        let event = AccountEvent::Linked {
+        let event = AccountEvent::Registered {
             client_id,
             email: email.clone(),
-            alpaca_account: alpaca_account.clone(),
-            linked_at,
+            registered_at,
         };
 
         let envelope = EventEnvelope {
@@ -192,23 +205,66 @@ mod tests {
 
         view.update(&envelope);
 
-        let AccountView::Account {
+        let AccountView::Registered {
+            client_id: view_client_id,
+            email: view_email,
+            registered_at: view_registered_at,
+        } = view
+        else {
+            panic!("Expected Registered, got {view:?}")
+        };
+
+        assert_eq!(view_client_id, client_id);
+        assert_eq!(view_email, email);
+        assert_eq!(view_registered_at, registered_at);
+    }
+
+    #[test]
+    fn test_view_update_from_linked_to_alpaca_event() {
+        let client_id = ClientId::new();
+        let email = Email("user@example.com".to_string());
+        let registered_at = Utc::now();
+
+        let mut view = AccountView::Registered {
+            client_id,
+            email: email.clone(),
+            registered_at,
+        };
+
+        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
+        let linked_at = Utc::now();
+
+        let event = AccountEvent::LinkedToAlpaca {
+            alpaca_account: alpaca_account.clone(),
+            linked_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: client_id.to_string(),
+            sequence: 2,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let AccountView::LinkedToAlpaca {
             client_id: view_client_id,
             email: view_email,
             alpaca_account: view_alpaca,
             whitelisted_wallets,
-            status,
+            registered_at: view_registered_at,
             linked_at: view_linked_at,
         } = view
         else {
-            panic!("Expected Account, got Unavailable")
+            panic!("Expected LinkedToAlpaca, got {view:?}")
         };
 
         assert_eq!(view_client_id, client_id);
         assert_eq!(view_email, email);
         assert_eq!(view_alpaca, alpaca_account);
         assert!(whitelisted_wallets.is_empty());
-        assert_eq!(status, LinkedAccountStatus::Active);
+        assert_eq!(view_registered_at, registered_at);
         assert_eq!(view_linked_at, linked_at);
     }
 
@@ -219,14 +275,15 @@ mod tests {
         let client_id = ClientId::new();
         let email = Email("client@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
+        let registered_at = Utc::now();
         let linked_at = Utc::now();
 
-        let view = AccountView::Account {
+        let view = AccountView::LinkedToAlpaca {
             client_id,
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
             whitelisted_wallets: Vec::new(),
-            status: LinkedAccountStatus::Active,
+            registered_at,
             linked_at,
         };
 
@@ -245,27 +302,24 @@ mod tests {
         .await
         .expect("Failed to insert view");
 
-        let result = find_by_client_id(&pool, &client_id)
+        let view = find_by_client_id(&pool, &client_id)
             .await
-            .expect("Query should succeed");
+            .expect("Query should succeed")
+            .expect("View should exist");
 
-        assert!(result.is_some());
-
-        let AccountView::Account {
+        let AccountView::LinkedToAlpaca {
             client_id: found_client_id,
             email: found_email,
             alpaca_account: found_alpaca,
-            status,
             ..
-        } = result.unwrap()
+        } = view
         else {
-            panic!("Expected Account, got Unavailable")
+            panic!("Expected LinkedToAlpaca, got {view:?}")
         };
 
         assert_eq!(found_client_id, client_id);
         assert_eq!(found_email, email);
         assert_eq!(found_alpaca, alpaca_account);
-        assert_eq!(status, LinkedAccountStatus::Active);
     }
 
     #[tokio::test]
@@ -282,20 +336,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_by_email_returns_view() {
+    async fn test_find_by_email_returns_linked_to_alpaca_view() {
         let pool = setup_test_db().await;
 
         let client_id = ClientId::new();
         let email = Email("email@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA999".to_string());
+        let registered_at = Utc::now();
         let linked_at = Utc::now();
 
-        let view = AccountView::Account {
+        let view = AccountView::LinkedToAlpaca {
             client_id,
             email: email.clone(),
             alpaca_account: alpaca_account.clone(),
             whitelisted_wallets: Vec::new(),
-            status: LinkedAccountStatus::Active,
+            registered_at,
             linked_at,
         };
 
@@ -314,26 +369,71 @@ mod tests {
         .await
         .expect("Failed to insert view");
 
-        let result =
-            find_by_email(&pool, &email).await.expect("Query should succeed");
+        let view = find_by_email(&pool, &email)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
 
-        assert!(result.is_some());
-
-        let AccountView::Account {
+        let AccountView::LinkedToAlpaca {
             client_id: found_client_id,
             email: found_email,
             alpaca_account: found_alpaca,
-            status,
             ..
-        } = result.unwrap()
+        } = view
         else {
-            panic!("Expected Account, got Unavailable")
+            panic!("Expected LinkedToAlpaca, got {view:?}")
         };
 
         assert_eq!(found_client_id, client_id);
         assert_eq!(found_email, email);
         assert_eq!(found_alpaca, alpaca_account);
-        assert_eq!(status, LinkedAccountStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_email_returns_registered_view() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId::new();
+        let email = Email("registered@example.com".to_string());
+        let registered_at = Utc::now();
+
+        let view = AccountView::Registered {
+            client_id,
+            email: email.clone(),
+            registered_at,
+        };
+
+        let payload =
+            serde_json::to_string(&view).expect("Failed to serialize view");
+
+        sqlx::query!(
+            r"
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            client_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert view");
+
+        let view = find_by_email(&pool, &email)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let AccountView::Registered {
+            client_id: found_client_id,
+            email: found_email,
+            ..
+        } = view
+        else {
+            panic!("Expected Registered, got {view:?}")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
     }
 
     #[tokio::test]
@@ -350,12 +450,12 @@ mod tests {
 
     #[test]
     fn test_view_update_from_wallet_whitelisted_event() {
-        let mut view = AccountView::Account {
+        let mut view = AccountView::LinkedToAlpaca {
             client_id: ClientId(uuid::Uuid::new_v4()),
             email: Email("user@example.com".to_string()),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
             whitelisted_wallets: Vec::new(),
-            status: LinkedAccountStatus::Active,
+            registered_at: Utc::now(),
             linked_at: Utc::now(),
         };
 
@@ -368,15 +468,16 @@ mod tests {
 
         let envelope = EventEnvelope {
             aggregate_id: "user@example.com".to_string(),
-            sequence: 2,
+            sequence: 3,
             payload: event,
             metadata: HashMap::new(),
         };
 
         view.update(&envelope);
 
-        let AccountView::Account { whitelisted_wallets, .. } = view else {
-            panic!("Expected Account, got Unavailable")
+        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
         };
 
         assert_eq!(whitelisted_wallets.len(), 1);

@@ -5,15 +5,15 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use std::sync::Arc;
-use tracing::{Level, warn};
+use tracing::Level;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
-use crate::auth::IpWhitelist;
+use crate::auth::AuthConfig;
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
@@ -21,8 +21,7 @@ pub struct Config {
     pub private_key: B256,
     pub vault: Address,
     pub bot: Address,
-    pub issuer_api_key: String,
-    pub alpaca_ip_ranges: IpWhitelist,
+    pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
@@ -36,7 +35,7 @@ impl Config {
     /// Returns an error if command-line arguments or environment variables are invalid.
     pub fn parse() -> Result<Self, ConfigError> {
         let env = Env::try_parse()?;
-        env.into_config()
+        Ok(env.into_config())
     }
 
     pub(crate) async fn create_blockchain_service(
@@ -54,7 +53,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Parser, Clone)]
+#[derive(Parser, Clone)]
 #[command(name = "st0x-issuance")]
 #[command(about = "Issuance bot for tokenizing equities via Alpaca ITN")]
 struct Env {
@@ -102,20 +101,8 @@ struct Env {
     )]
     bot: Address,
 
-    #[arg(
-        long,
-        env = "ISSUER_API_KEY",
-        help = "API key for authenticating inbound requests from Alpaca"
-    )]
-    issuer_api_key: String,
-
-    #[arg(
-        long,
-        env = "ALPACA_IP_RANGES",
-        default_value = "",
-        help = "Comma-separated list of IP ranges (CIDR notation) allowed to call issuer endpoints. Leave empty to disable IP filtering (not recommended for production)."
-    )]
-    alpaca_ip_ranges: IpWhitelist,
+    #[clap(flatten)]
+    auth: AuthConfig,
 
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
@@ -128,38 +115,22 @@ struct Env {
 }
 
 impl Env {
-    fn into_config(self) -> Result<Config, ConfigError> {
-        if self.issuer_api_key.len() < 32 {
-            return Err(ConfigError::InvalidIssuerApiKey(format!(
-                "API key must be at least 32 characters, got {}",
-                self.issuer_api_key.len()
-            )));
-        }
-
-        if matches!(self.alpaca_ip_ranges, IpWhitelist::AllowAll) {
-            warn!(
-                "ALPACA_IP_RANGES not set - IP whitelisting is DISABLED. \
-                 This is NOT RECOMMENDED for production. Any IP can access issuer endpoints \
-                 if they have the API key."
-            );
-        }
-
+    fn into_config(self) -> Config {
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
 
-        Ok(Config {
+        Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
             private_key: self.private_key,
             vault: self.vault,
             bot: self.bot,
-            issuer_api_key: self.issuer_api_key,
-            alpaca_ip_ranges: self.alpaca_ip_ranges,
+            auth: self.auth,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
-        })
+        }
     }
 }
 
@@ -222,8 +193,6 @@ pub enum ConfigError {
     InvalidPrivateKeyFormat(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("Failed to connect to RPC endpoint")]
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
-    #[error("Invalid issuer API key: {0}")]
-    InvalidIssuerApiKey(String),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
 }
@@ -245,6 +214,7 @@ mod tests {
     use ipnetwork::IpNetwork;
 
     use super::*;
+    use crate::auth::IpWhitelist;
 
     fn minimal_args() -> Vec<&'static str> {
         vec![
@@ -272,7 +242,8 @@ mod tests {
     fn test_empty_ip_ranges_default() {
         let args = minimal_args();
         let env = Env::try_parse_from(args).unwrap();
-        assert_eq!(env.alpaca_ip_ranges, IpWhitelist::AllowAll);
+
+        assert_eq!(env.auth.alpaca_ip_ranges, IpWhitelist::AllowAll);
     }
 
     #[test]
@@ -281,7 +252,8 @@ mod tests {
         args.extend_from_slice(&["--alpaca-ip-ranges", ""]);
 
         let env = Env::try_parse_from(args).unwrap();
-        assert_eq!(env.alpaca_ip_ranges, IpWhitelist::AllowAll);
+
+        assert_eq!(env.auth.alpaca_ip_ranges, IpWhitelist::AllowAll);
     }
 
     #[test]
@@ -292,7 +264,8 @@ mod tests {
         let env = Env::try_parse_from(args).unwrap();
         let expected =
             IpWhitelist::single("192.168.1.0/24".parse::<IpNetwork>().unwrap());
-        assert_eq!(env.alpaca_ip_ranges, expected);
+
+        assert_eq!(env.auth.alpaca_ip_ranges, expected);
     }
 
     #[test]
@@ -309,7 +282,8 @@ mod tests {
             "10.0.0.0/8".parse::<IpNetwork>().unwrap(),
             "172.16.0.0/12".parse::<IpNetwork>().unwrap(),
         ]);
-        assert_eq!(env.alpaca_ip_ranges, expected);
+
+        assert_eq!(env.auth.alpaca_ip_ranges, expected);
     }
 
     #[test]
@@ -321,14 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn test_config_warns_about_empty_ip_ranges() {
+    fn test_config_with_empty_ip_ranges() {
         let mut args = minimal_args();
         args.extend_from_slice(&["--alpaca-ip-ranges", ""]);
 
         let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config().unwrap();
+        let config = env.into_config();
 
-        assert_eq!(config.alpaca_ip_ranges, IpWhitelist::AllowAll);
+        assert_eq!(config.auth.alpaca_ip_ranges, IpWhitelist::AllowAll);
     }
 
     #[test]
@@ -337,10 +311,38 @@ mod tests {
         args.extend_from_slice(&["--alpaca-ip-ranges", "10.0.0.0/8"]);
 
         let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config().unwrap();
+        let config = env.into_config();
 
         let expected =
             IpWhitelist::single("10.0.0.0/8".parse::<IpNetwork>().unwrap());
-        assert_eq!(config.alpaca_ip_ranges, expected);
+
+        assert_eq!(config.auth.alpaca_ip_ranges, expected);
+    }
+
+    #[test]
+    fn test_short_api_key_rejected_at_parse_time() {
+        let args = vec![
+            "test-binary",
+            "--rpc-url",
+            "wss://localhost:8545",
+            "--private-key",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--vault",
+            "0x1111111111111111111111111111111111111111",
+            "--bot",
+            "0x2222222222222222222222222222222222222222",
+            "--issuer-api-key",
+            "short-key", // Less than 32 characters
+            "--alpaca-account-id",
+            "alpaca-account-id",
+            "--alpaca-api-key",
+            "alpaca-test-key",
+            "--alpaca-api-secret",
+            "alpaca-test-secret",
+        ];
+
+        let result = Env::try_parse_from(args);
+
+        assert!(result.is_err());
     }
 }

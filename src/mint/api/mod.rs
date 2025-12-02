@@ -7,9 +7,7 @@ use tracing::error;
 use super::{
     ClientId, IssuerRequestId, Network, TokenSymbol, UnderlyingSymbol,
 };
-use crate::account::{
-    AccountView, LinkedAccountStatus, view::find_by_client_id,
-};
+use crate::account::{AccountView, view::find_by_client_id};
 
 mod confirm;
 mod initiate;
@@ -220,13 +218,9 @@ pub(crate) async fn validate_client_eligible(
             MintApiError::AccountQueryFailed(e)
         })?;
 
-    let Some(AccountView::Account { status, .. }) = account_view else {
+    let Some(AccountView::LinkedToAlpaca { .. }) = account_view else {
         return Err(MintApiError::ClientNotEligible);
     };
-
-    if status != LinkedAccountStatus::Active {
-        return Err(MintApiError::ClientNotEligible);
-    }
 
     Ok(())
 }

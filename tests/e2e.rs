@@ -10,11 +10,13 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-use st0x_issuance::account::AccountLinkResponse;
+use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_auth_header};
-use st0x_issuance::{AlpacaConfig, Config, IpWhitelist, initialize_rocket};
+use st0x_issuance::{
+    AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
+};
 
 async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
@@ -73,11 +75,26 @@ where
     }
 }
 
-async fn perform_mint_flow(
+async fn setup_account(
     client: &Client,
-    evm: &LocalEvm,
     user_wallet: Address,
-) -> Result<U256, Box<dyn std::error::Error>> {
+) -> AccountLinkResponse {
+    let register_response = client
+        .post("/accounts")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .body(json!({"email": "user@example.com"}).to_string())
+        .dispatch()
+        .await;
+
+    assert_eq!(register_response.status(), rocket::http::Status::Ok);
+    let _: RegisterAccountResponse =
+        register_response.into_json().await.unwrap();
+
     let link_response = client
         .post("/accounts/connect")
         .header(rocket::http::ContentType::JSON)
@@ -87,33 +104,39 @@ async fn perform_mint_flow(
         ))
         .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
         .body(
-            json!({
-                "email": "user@example.com",
-                "account": "USER123"
-            })
-            .to_string(),
+            json!({"email": "user@example.com", "account": "USER123"})
+                .to_string(),
         )
         .dispatch()
         .await;
 
     assert_eq!(link_response.status(), rocket::http::Status::Ok);
-
     let link_body: AccountLinkResponse =
         link_response.into_json().await.unwrap();
 
     let whitelist_response = client
         .post(format!("/accounts/{}/wallets", link_body.client_id))
         .header(rocket::http::ContentType::JSON)
-        .body(
-            json!({
-                "wallet": user_wallet
-            })
-            .to_string(),
-        )
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
 
     assert_eq!(whitelist_response.status(), rocket::http::Status::Ok);
+
+    link_body
+}
+
+async fn perform_mint_flow(
+    client: &Client,
+    evm: &LocalEvm,
+    user_wallet: Address,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    let link_body = setup_account(client, user_wallet).await;
 
     let mint_response = client
         .post("/inkind/issuance")
@@ -313,10 +336,17 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         private_key: evm.private_key,
         vault: evm.vault_address,
         bot: bot_wallet,
-        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-        alpaca_ip_ranges: IpWhitelist::single(
-            "127.0.0.1/32".parse().expect("Valid IP range"),
-        ),
+        auth: AuthConfig {
+            issuer_api_key: "test-key-12345678901234567890123456"
+                .parse()
+                .expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
+        },
         log_level: st0x_issuance::LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {

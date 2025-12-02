@@ -58,7 +58,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
-    use crate::auth::{FailedAuthRateLimiter, IpWhitelist};
+    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
 
     fn test_config() -> Config {
@@ -72,10 +72,7 @@ mod tests {
             private_key: B256::ZERO,
             vault: address!("0x1111111111111111111111111111111111111111"),
             bot: address!("0x2222222222222222222222222222222222222222"),
-            issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-            alpaca_ip_ranges: IpWhitelist::single(
-                "127.0.0.1/32".parse().expect("Valid IP range"),
-            ),
+            auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),

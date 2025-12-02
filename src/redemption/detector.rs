@@ -14,7 +14,7 @@ use super::{
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
 use crate::account::{
-    ClientId,
+    AccountView, ClientId,
     view::{AccountViewError, find_by_wallet},
 };
 use crate::bindings;
@@ -254,9 +254,7 @@ where
             RedemptionMonitorError::AccountNotFound { wallet: *wallet },
         )?;
 
-        let crate::account::AccountView::Account { client_id, .. } =
-            account_view
-        else {
+        let AccountView::LinkedToAlpaca { client_id, .. } = account_view else {
             return Err(RedemptionMonitorError::AccountNotLinked {
                 wallet: *wallet,
             });
@@ -484,9 +482,15 @@ mod tests {
             account_cqrs
                 .execute(
                     &client_id.to_string(),
-                    AccountCommand::Link {
-                        client_id,
-                        email,
+                    AccountCommand::Register { client_id, email },
+                )
+                .await
+                .unwrap();
+
+            account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::LinkToAlpaca {
                         alpaca_account: AlpacaAccountNumber(
                             "ALPACA123".to_string(),
                         ),

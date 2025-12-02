@@ -273,36 +273,59 @@ on-chain transfer through calling Alpaca to burning tokens.
 ### Account Aggregate
 
 The `Account` aggregate manages the relationship between AP accounts and our
-system.
+system. The account lifecycle follows these steps:
+
+1. **Registration**: We manually create an account for the AP with their email,
+   generating a `client_id`.
+2. **Alpaca Linking**: When Alpaca calls `/accounts/connect` with email +
+   account number, we look up the account by email and link it to the Alpaca
+   account.
+3. **Wallet Whitelisting**: APs whitelist wallet addresses they'll use for
+   minting and redemption.
 
 **Aggregate State:**
 
-- `client_id`: Our identifier for the linked account
-- `email`: AP's email address
-- `alpaca_account`: Alpaca account number
+- `client_id`: Our identifier for the account
+- `email`: AP's email address (set at registration)
+- `alpaca_account`: Alpaca account number (set when linked)
 - `whitelisted_wallets`: List of on-chain wallet addresses authorized for
-  redemptions
-- `status`: Active or inactive
+  minting and redemptions
 - Timestamps
 
 **Commands:**
 
-- `LinkAccount { email, alpaca_account }` - Create new account link
-- `WhitelistWallet { wallet }` - Authorize a wallet address for redemptions
+- `Register { email }` - Create a new AP account (before Alpaca linking)
+- `LinkToAlpaca { alpaca_account }` - Link existing account to Alpaca account
+  number
+- `WhitelistWallet { wallet }` - Authorize a wallet address for minting and
+  redemptions
 
 **Events:**
 
-- `AccountLinked { client_id, email, alpaca_account, linked_at }` - Account
-  successfully linked
+- `Registered { client_id, email, registered_at }` - New AP account created
+- `LinkedToAlpaca { alpaca_account, linked_at }` - Account linked to Alpaca
+  account number
 - `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
-  redemptions
+  minting and redemptions
 
 **Command → Event Mappings:**
 
 | Command           | Events Produced     | Notes                                |
 | ----------------- | ------------------- | ------------------------------------ |
-| `LinkAccount`     | `AccountLinked`     | New account link created             |
+| `Register`        | `Registered`        | New AP account created with email    |
+| `LinkToAlpaca`    | `LinkedToAlpaca`    | Existing account linked to Alpaca    |
 | `WhitelistWallet` | `WalletWhitelisted` | Wallet authorized (multiple allowed) |
+
+**Account State Machine:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: Register
+    Registered --> LinkedToAlpaca: LinkToAlpaca
+    LinkedToAlpaca --> LinkedToAlpaca: WhitelistWallet
+    Note right of Registered: Has email, client_id
+    Note right of LinkedToAlpaca: Has alpaca_account, can whitelist wallets
+```
 
 ### TokenizedAsset Aggregate
 
@@ -373,10 +396,62 @@ testable with mock services.
 
 ## Core Functionality
 
-### 1. Account Linking (Handshake Process)
+### 1. Account Lifecycle
 
-Before an AP can mint or redeem tokens, Alpaca needs to link the AP's Alpaca
-account with their account on our platform.
+The account lifecycle has three phases:
+
+1. **Registration** - We manually create an account for the AP (before Alpaca
+   involvement)
+2. **Alpaca Linking** - Alpaca calls `/accounts/connect` to link their account
+3. **Wallet Whitelisting** - We whitelist wallet addresses for the AP
+
+#### Phase 1: Account Registration (Internal)
+
+Before an AP can be linked to Alpaca, we must first create an account for them.
+This is a manual internal process where we create an account with the AP's email
+and generate a `client_id`.
+
+**Endpoint:** `POST /accounts` (internal, not exposed to Alpaca)
+
+**Request Body:**
+
+```json
+{
+  "email": "customer@firm.com"
+}
+```
+
+**Our Response:**
+
+```json
+{
+  "client_id": "5505-1234-ABC-4G45"
+}
+```
+
+**Status Codes:**
+
+- `201`: Account created
+- `409`: Email already registered
+
+**Data Structure:**
+
+```rust
+struct RegisterAccountRequest {
+    email: Email,
+}
+
+struct RegisterAccountResponse {
+    client_id: ClientId,
+}
+```
+
+#### Phase 2: Alpaca Linking
+
+When an AP tells Alpaca they want to use our tokenization services, Alpaca calls
+this endpoint to link their Alpaca account with the AP's existing account on our
+platform. Using the email, we look up the account and return the `client_id`
+that Alpaca will use for subsequent mint/redeem requests.
 
 **Endpoint:** `POST /accounts/connect`
 
@@ -400,8 +475,8 @@ account with their account on our platform.
 **Status Codes:**
 
 - `200`: Successful link
-- `404`: Email not found on our platform
-- `409`: Account already linked
+- `404`: Email not found on our platform (AP must register with us first)
+- `409`: Account already linked to Alpaca
 
 **Data Structure:**
 
@@ -416,12 +491,13 @@ struct AccountLinkResponse {
 }
 ```
 
-### 2. Wallet Whitelisting
+#### Phase 3: Wallet Whitelisting
 
 After account linking, APs must whitelist their wallet addresses before they can
-redeem tokens. Multiple wallets can be whitelisted per account.
+mint or redeem tokens. This is an internal endpoint (not exposed to Alpaca).
 
-**Endpoint:** `POST /accounts/{client_id}/wallets`
+**Endpoint:** `POST /accounts/{client_id}/wallets` (internal, not exposed to
+Alpaca)
 
 **Request Body:**
 
@@ -459,11 +535,13 @@ struct WhitelistWalletResponse {
 **Notes:**
 
 - An account can have multiple whitelisted wallets
-- Wallet addresses must be whitelisted before initiating redemptions
+- Wallet addresses must be whitelisted before minting or redeeming
+- During minting, we validate the provided `wallet_address` is whitelisted for
+  the `client_id`
 - During redemption, we look up which `client_id` owns the wallet that sent the
   tokens
 
-### 3. Tokenized Assets Data Endpoint
+### 2. Tokenized Assets Data Endpoint
 
 Alpaca needs to query which assets we support:
 
@@ -498,7 +576,7 @@ struct TokenizedAsset {
 }
 ```
 
-### 4. Token Minting (Alpaca ITN Flow)
+### 3. Token Minting (Alpaca ITN Flow)
 
 #### Receipt Custody Model
 
@@ -576,7 +654,7 @@ sequenceDiagram
 2. Verify `token_symbol` matches our convention
 3. Verify `network` is supported (our EVM chain)
 4. Verify `client_id` is a valid/linked AP
-5. Verify `wallet_address` is valid Ethereum address
+5. Verify `wallet_address` is a valid EVM address whitelisted for the AP
 6. Verify `qty` is reasonable (positive, not exceeding limits)
 
 **Note:** We do NOT check if we have sufficient off-chain shares at this stage.
@@ -854,7 +932,7 @@ enum MintStatus {
 }
 ```
 
-### 5. Token Redemption (Alpaca ITN Flow)
+### 4. Token Redemption (Alpaca ITN Flow)
 
 #### Complete Redemption Flow
 
@@ -1172,12 +1250,20 @@ enum RedemptionStatus {
 
 ### Endpoints We Implement
 
-We run an HTTP server that implements these endpoints for Alpaca to call:
+We run an HTTP server that implements these endpoints.
 
-1. **`POST /accounts/connect`** - Account linking
+**Endpoints Alpaca calls:**
+
+1. **`POST /accounts/connect`** - Link existing account to Alpaca (looks up by
+   email)
 2. **`GET /tokenized-assets`** - List supported assets
 3. **`POST /inkind/issuance`** - Mint request from Alpaca
 4. **`POST /inkind/issuance/confirm`** - Journal confirmation from Alpaca
+
+**Internal endpoints (not exposed to Alpaca):**
+
+1. **`POST /accounts`** - Register new AP account with email
+2. **`POST /accounts/{client_id}/wallets`** - Whitelist wallet address for AP
 
 ### Endpoints We Call
 
@@ -1307,7 +1393,7 @@ CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload,
 CREATE TABLE account_view (
     view_id TEXT PRIMARY KEY,         -- client_id
     version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {email, alpaca_account, status, timestamps}
+    payload JSON NOT NULL             -- {email, alpaca_account, whitelisted_wallets, status, timestamps}
 );
 
 CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
@@ -1407,10 +1493,10 @@ events.
 
 **AccountView** - Current accounts:
 
-- Listens to: `AccountLinked`
-- Updates: Account status, relationship data
+- Listens to: `Registered`, `LinkedToAlpaca`, `WalletWhitelisted`
+- Updates: Account status, relationship data, whitelisted wallets
 - Used for: Validating client IDs, looking up accounts by email or Alpaca
-  account number
+  account number, checking wallet whitelisting
 
 **TokenizedAssetView** - Supported assets:
 

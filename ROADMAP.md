@@ -221,3 +221,27 @@ Comprehensive documentation for APIs, operations, and incident response.
       deployment and operations guide
 - [ ] [#36](https://github.com/ST0x-Technology/st0x.issuance/issues/36) - Write
       recovery procedures runbook
+
+---
+
+## Fixes & Improvements
+
+Bug fixes and improvements that don't fit into the original phases.
+
+### Issues
+
+- [x] [#67](https://github.com/ST0x-Technology/st0x.issuance/issues/67) - Create
+      an AP wallet whitelisting endpoint
+  - **PR:** [#68](https://github.com/ST0x-Technology/st0x.issuance/pull/68)
+- [x] [#70](https://github.com/ST0x-Technology/st0x.issuance/issues/70) - Fix
+      /tokenized-assets response format
+  - **PR:** [#69](https://github.com/ST0x-Technology/st0x.issuance/pull/69)
+- [x] [#72](https://github.com/ST0x-Technology/st0x.issuance/issues/72) - Switch
+      auth header to X-API-KEY
+  - **PR:** [#71](https://github.com/ST0x-Technology/st0x.issuance/pull/71)
+- [x] [#74](https://github.com/ST0x-Technology/st0x.issuance/issues/74) - Fix IP
+      whitelisting and tokenized assets response format issues
+  - **PR:** [#73](https://github.com/ST0x-Technology/st0x.issuance/pull/73)
+- [x] [#76](https://github.com/ST0x-Technology/st0x.issuance/issues/76) - Split
+      account creation into Registration and Alpaca Linking
+  - **PR:** [#75](https://github.com/ST0x-Technology/st0x.issuance/pull/75)

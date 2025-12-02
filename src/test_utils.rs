@@ -8,19 +8,18 @@ use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-use ipnetwork::IpNetwork;
 use rocket::routes;
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::sqlite::SqlitePoolOptions;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
-use crate::auth::{FailedAuthRateLimiter, IpWhitelist};
+use crate::auth::{FailedAuthRateLimiter, test_auth_config};
 use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
@@ -48,25 +47,19 @@ pub fn test_alpaca_auth_header() -> String {
     )
 }
 
-pub(crate) fn test_localhost_ip_range() -> &'static IpNetwork {
-    static IP_RANGE: OnceLock<IpNetwork> = OnceLock::new();
-    IP_RANGE.get_or_init(|| "127.0.0.1/32".parse().expect("Valid IP range"))
-}
-
-fn test_config() -> Config {
-    Config {
+fn test_config() -> Result<Config, anyhow::Error> {
+    Ok(Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
-        rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
+        rpc_url: Url::parse("wss://localhost:8545")?,
         private_key: B256::ZERO,
         vault: address!("0x1111111111111111111111111111111111111111"),
         bot: address!("0x2222222222222222222222222222222222222222"),
-        issuer_api_key: "test-key-12345678901234567890123456".to_string(),
-        alpaca_ip_ranges: IpWhitelist::single(*test_localhost_ip_range()),
+        auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
-    }
+    })
 }
 
 /// Sets up a test Rocket instance with in-memory database and mock services.
@@ -153,7 +146,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Build rocket
     Ok(rocket::build()
-        .manage(test_config())
+        .manage(test_config()?)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
