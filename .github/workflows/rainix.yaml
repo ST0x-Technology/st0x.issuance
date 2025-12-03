@@ -6,24 +6,21 @@ concurrency:
   group: ${{ github.ref }}-rainix
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
-x-free-disk-space-step: &free-disk-space-step
-  name: Free disk space
-  uses: jlumbroso/free-disk-space@v1.3.1
-  with:
-    android: true
-    dotnet: true
-    haskell: true
-    large-packages: false
-    docker-images: false
-    swap-storage: false
-
 jobs:
   test:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
-      - *free-disk-space-step
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
 
       - uses: actions/checkout@v4
         with:
@@ -57,7 +54,15 @@ jobs:
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
-      - *free-disk-space-step
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
 
       - uses: actions/checkout@v4
         with:

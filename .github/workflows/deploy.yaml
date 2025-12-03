@@ -3,7 +3,7 @@ name: Build and deploy
 on:
   workflow_dispatch:
   push:
-    branches: [main, fix/account-lifecycle]
+    branches: [main, fix/internal-ip-whitelisting]
 
 env:
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
@@ -13,6 +13,16 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
