@@ -3,7 +3,7 @@ name: Build and deploy
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, fix/account-lifecycle]
 
 env:
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
