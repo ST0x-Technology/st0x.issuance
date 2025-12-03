@@ -415,7 +415,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .remote("8.8.8.8:8000".parse().unwrap())
             .dispatch()
             .await;
 
@@ -440,7 +440,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .remote("8.8.8.8:8000".parse().unwrap())
             .dispatch()
             .await;
 
@@ -460,7 +460,7 @@ mod tests {
             let response = client
                 .get("/issuer-test")
                 .header(Header::new("X-API-KEY", "wrong-key"))
-                .header(Header::new("X-Real-IP", "127.0.0.1"))
+                .remote("127.0.0.1:8000".parse().unwrap())
                 .dispatch()
                 .await;
 
@@ -475,7 +475,7 @@ mod tests {
         let response = client
             .get("/issuer-test")
             .header(Header::new("X-API-KEY", "wrong-key"))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
             .await;
 
@@ -498,7 +498,7 @@ mod tests {
                     "X-API-KEY",
                     "test-key-12345678901234567890123456",
                 ))
-                .header(Header::new("X-Real-IP", "127.0.0.1"))
+                .remote("127.0.0.1:8000".parse().unwrap())
                 .dispatch()
                 .await;
 
@@ -520,7 +520,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
             .await;
 
@@ -541,7 +541,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "::1"))
+            .remote("[::1]:8000".parse().unwrap())
             .dispatch()
             .await;
 
@@ -562,7 +562,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "8.8.8.8"))
+            .remote("8.8.8.8:8000".parse().unwrap())
             .dispatch()
             .await;
 
