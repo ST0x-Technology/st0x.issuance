@@ -34,6 +34,7 @@ pub mod tokenized_asset;
 
 pub(crate) mod alpaca;
 pub(crate) mod auth;
+pub(crate) mod catchers;
 pub(crate) mod config;
 pub(crate) mod receipt_inventory;
 pub(crate) mod telemetry;
@@ -207,7 +208,8 @@ pub async fn initialize_rocket(
 
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))
-        .merge(("port", 8000));
+        .merge(("port", 8000))
+        .merge(("ip_header", false));
 
     Ok(rocket::custom(figment)
         .manage(config)
@@ -230,7 +232,8 @@ pub async fn initialize_rocket(
                 mint::initiate_mint,
                 mint::confirm_journal
             ],
-        ))
+        )
+        .register("/", catchers::json_catchers()))
 }
 
 async fn setup_basic_cqrs(

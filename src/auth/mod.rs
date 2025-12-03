@@ -75,8 +75,9 @@ pub struct AuthConfig {
     #[arg(
         long,
         env = "INTERNAL_IP_RANGES",
-        default_value = "127.0.0.0/8,::1/128",
-        help = "Comma-separated list of IP ranges (CIDR notation) allowed to call internal endpoints."
+        default_value = "127.0.0.0/8,::1/128,172.16.0.0/12",
+        help = "Comma-separated CIDR ranges for internal endpoints. \
+                Default includes localhost and Docker networks."
     )]
     pub internal_ip_ranges: IpWhitelist,
 }
