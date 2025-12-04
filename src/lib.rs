@@ -209,6 +209,10 @@ pub async fn initialize_rocket(
     let figment = rocket::Config::figment()
         .merge(("address", "0.0.0.0"))
         .merge(("port", 8000))
+        // Disable header-based IP detection (X-Real-IP/X-Forwarded-For) to prevent
+        // IP spoofing. The app relies solely on TCP source address for client IP.
+        // If deployed behind a reverse proxy, the proxy must preserve the original
+        // client IP at the network layer (e.g., PROXY protocol) rather than headers.
         .merge(("ip_header", false));
 
     Ok(rocket::custom(figment)
