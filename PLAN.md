@@ -115,20 +115,22 @@ store `pool` and `event_store` to support recovery operations.
 
 Same pattern as Task 5 - add recovery methods directly to existing managers.
 
-### Changes Required
+### Changes Made
 
-- [ ] Add `find_detected()` query function to `redemption/view.rs`
-- [ ] Add `find_alpaca_called()` query function to `redemption/view.rs`
-- [ ] Add `find_burning()` query function to `redemption/view.rs`
-- [ ] Add `pool` and `event_store` fields to `RedeemCallManager`
-- [ ] Add `recover_detected_redemptions()` method to `RedeemCallManager`
-- [ ] Add `pool` and `event_store` fields to `JournalManager`
-- [ ] Add `recover_alpaca_called_redemptions()` method to `JournalManager`
-- [ ] Add `pool` and `event_store` fields to `BurnManager`
-- [ ] Add `recover_burning_redemptions()` method to `BurnManager`
-- [ ] Wire recovery into startup via `spawn_redemption_recovery()` in `lib.rs`
-- [ ] Add tests for view query functions
-- [ ] Add tests for recovery methods in all three managers
+- [x] Add `find_detected()` query function to `redemption/view.rs`
+- [x] Add `find_alpaca_called()` query function to `redemption/view.rs`
+- [x] Add `find_burning()` query function to `redemption/view.rs`
+- [x] Add `pool` and `event_store` fields to `RedeemCallManager`
+- [x] Add `recover_detected_redemptions()` method to `RedeemCallManager`
+- [x] Add `pool` and `event_store` fields to `JournalManager`
+- [x] Add `recover_alpaca_called_redemptions()` method to `JournalManager`
+- [x] Add `pool` and `event_store` fields to `BurnManager`
+- [x] Add `recover_burning_redemptions()` method to `BurnManager`
+- [x] Wire recovery into startup via `spawn_redemption_recovery()` in `lib.rs`
+- [x] Add tests for view query functions
+- [x] Add tests for recovery methods in all three managers
+- [x] Add E2E test for redemption recovery
+      (`test_redemption_recovery_after_restart`)
 
 ### Design Notes
 
@@ -139,10 +141,10 @@ Same pattern as Task 5 - add recovery methods directly to existing managers.
 
 ### Verification
 
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
       passes
-- [ ] `cargo fmt --all -- --check` passes
+- [x] `cargo fmt --all -- --check` passes
 
 ## Task 7. Manual recovery for existing stuck mints (operational)
 
