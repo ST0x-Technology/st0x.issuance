@@ -7,7 +7,7 @@ use tracing::error;
 use super::{
     ClientId, IssuerRequestId, Network, TokenSymbol, UnderlyingSymbol,
 };
-use crate::account::{AccountView, view::find_by_client_id};
+use crate::account::{AccountViewError, find_by_client_id};
 
 mod confirm;
 mod initiate;
@@ -41,12 +41,10 @@ pub(crate) enum MintApiError {
     ClientNotEligible,
 
     #[error("Failed to query enabled assets")]
-    AssetQueryFailed(
-        #[source] crate::tokenized_asset::view::TokenizedAssetViewError,
-    ),
+    AssetQueryFailed(#[source] crate::tokenized_asset::TokenizedAssetViewError),
 
     #[error("Failed to query account")]
-    AccountQueryFailed(#[source] crate::account::view::AccountViewError),
+    AccountQueryFailed(#[source] AccountViewError),
 
     #[error("Failed to execute mint command")]
     CommandExecutionFailed(#[source] Box<dyn std::error::Error + Send>),
@@ -185,10 +183,10 @@ pub(crate) async fn validate_asset_exists(
         r#"
         SELECT COUNT(*) as "count: i64"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Asset.underlying') = ?
-            AND json_extract(payload, '$.Asset.token') = ?
-            AND json_extract(payload, '$.Asset.network') = ?
-            AND json_extract(payload, '$.Asset.enabled') = 1
+        WHERE json_extract(payload, '$.Live.underlying') = ?
+            AND json_extract(payload, '$.Live.token') = ?
+            AND json_extract(payload, '$.Live.network') = ?
+            AND json_extract(payload, '$.Live.enabled') = 1
         "#,
         underlying_str,
         token_str,
@@ -218,9 +216,13 @@ pub(crate) async fn validate_client_eligible(
             MintApiError::AccountQueryFailed(e)
         })?;
 
-    let Some(AccountView::LinkedToAlpaca { .. }) = account_view else {
+    let Some(account) = account_view else {
         return Err(MintApiError::ClientNotEligible);
     };
+
+    if account.alpaca.is_none() {
+        return Err(MintApiError::ClientNotEligible);
+    }
 
     Ok(())
 }

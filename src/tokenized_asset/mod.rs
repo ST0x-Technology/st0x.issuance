@@ -1,18 +1,15 @@
 mod api;
-mod cmd;
-mod event;
-pub(crate) mod view;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::Aggregate;
+use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
+
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
 pub(crate) use api::list_tokenized_assets;
-pub(crate) use cmd::TokenizedAssetCommand;
-pub(crate) use event::TokenizedAssetEvent;
-pub(crate) use view::TokenizedAssetView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnderlyingSymbol(pub(crate) String);
@@ -60,26 +57,88 @@ impl Network {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum TokenizedAsset {
-    NotAdded,
+pub(crate) enum TokenizedAssetCommand {
+    Add {
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        vault: Address,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) enum TokenizedAssetEvent {
     Added {
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         network: Network,
         vault: Address,
-        enabled: bool,
         added_at: DateTime<Utc>,
     },
 }
 
-impl Default for TokenizedAsset {
-    fn default() -> Self {
-        Self::NotAdded
+impl DomainEvent for TokenizedAssetEvent {
+    fn event_type(&self) -> String {
+        match self {
+            Self::Added { .. } => "TokenizedAssetEvent::Added".to_string(),
+        }
+    }
+
+    fn event_version(&self) -> String {
+        "1.0".to_string()
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TokenizedAsset {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) enabled: bool,
+    pub(crate) added_at: DateTime<Utc>,
+}
+
+impl TokenizedAsset {
+    pub(crate) fn from_event(event: &TokenizedAssetEvent) -> Self {
+        match event {
+            TokenizedAssetEvent::Added {
+                underlying,
+                token,
+                network,
+                vault,
+                added_at,
+            } => Self {
+                underlying: underlying.clone(),
+                token: token.clone(),
+                network: network.clone(),
+                vault: *vault,
+                enabled: true,
+                added_at: *added_at,
+            },
+        }
+    }
+
+    pub(crate) fn apply_transition(
+        event: &TokenizedAssetEvent,
+        current: &Self,
+    ) -> Result<Self, LifecycleError<Never>> {
+        // TokenizedAsset has no transition events - Added is a genesis event
+        Err(LifecycleError::Mismatch {
+            state: format!("{current:?}"),
+            event: event.event_type(),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub(crate) enum TokenizedAssetError {
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError<Never>),
+}
+
 #[async_trait]
-impl Aggregate for TokenizedAsset {
+impl Aggregate for Lifecycle<TokenizedAsset, Never> {
     type Command = TokenizedAssetCommand;
     type Event = TokenizedAssetEvent;
     type Error = TokenizedAssetError;
@@ -87,6 +146,13 @@ impl Aggregate for TokenizedAsset {
 
     fn aggregate_type() -> String {
         "TokenizedAsset".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        *self = self
+            .clone()
+            .transition(&event, TokenizedAsset::apply_transition)
+            .or_initialize(&event, |e| Ok(TokenizedAsset::from_event(e)));
     }
 
     async fn handle(
@@ -101,7 +167,7 @@ impl Aggregate for TokenizedAsset {
                 network,
                 vault,
             } => {
-                if matches!(self, Self::Added { .. }) {
+                if self.live().is_ok() {
                     tracing::debug!(
                         underlying = %underlying.0,
                         "Asset already added, skipping"
@@ -121,43 +187,66 @@ impl Aggregate for TokenizedAsset {
             }
         }
     }
+}
 
-    fn apply(&mut self, event: Self::Event) {
-        match event {
-            TokenizedAssetEvent::Added {
-                underlying,
-                token,
-                network,
-                vault,
-                added_at,
-            } => {
-                *self = Self::Added {
-                    underlying,
-                    token,
-                    network,
-                    vault,
-                    enabled: true,
-                    added_at,
-                };
-            }
-        }
+impl View<Self> for Lifecycle<TokenizedAsset, Never> {
+    fn update(&mut self, event: &EventEnvelope<Self>) {
+        *self = self
+            .clone()
+            .transition(&event.payload, TokenizedAsset::apply_transition)
+            .or_initialize(&event.payload, |e| {
+                Ok(TokenizedAsset::from_event(e))
+            });
     }
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
-pub(crate) enum TokenizedAssetError {}
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TokenizedAssetViewError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+}
+
+pub(crate) async fn list_enabled_assets(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<TokenizedAsset>, TokenizedAssetViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM tokenized_asset_view
+        WHERE json_extract(payload, '$.Live.enabled') = 1
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let assets: Vec<TokenizedAsset> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let lifecycle: Lifecycle<TokenizedAsset, Never> =
+                serde_json::from_str(&row.payload).ok()?;
+
+            match lifecycle {
+                Lifecycle::Live(asset) if asset.enabled => Some(asset),
+                _ => None,
+            }
+        })
+        .collect();
+
+    Ok(assets)
+}
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 
-    use super::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetEvent, UnderlyingSymbol,
-    };
+    use super::*;
 
-    type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
+    type TokenizedAssetTestFramework =
+        TestFramework<Lifecycle<TokenizedAsset, Never>>;
 
     #[test]
     fn test_add_asset_creates_new_asset() {
@@ -227,9 +316,9 @@ mod tests {
 
     #[test]
     fn test_apply_asset_added_updates_state() {
-        let mut asset = TokenizedAsset::default();
+        let mut asset: Lifecycle<TokenizedAsset, Never> = Lifecycle::default();
 
-        assert!(matches!(asset, TokenizedAsset::NotAdded));
+        assert!(matches!(asset, Lifecycle::Uninitialized));
 
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
@@ -245,24 +334,16 @@ mod tests {
             added_at,
         });
 
-        match asset {
-            TokenizedAsset::Added {
-                underlying: added_underlying,
-                token: added_token,
-                network: added_network,
-                vault: added_vault,
-                enabled,
-                added_at: added_at_timestamp,
-            } => {
-                assert_eq!(added_underlying, underlying);
-                assert_eq!(added_token, token);
-                assert_eq!(added_network, network);
-                assert_eq!(added_vault, vault);
-                assert!(enabled);
-                assert_eq!(added_at_timestamp, added_at);
-            }
-            TokenizedAsset::NotAdded => panic!("Expected asset to be added"),
-        }
+        let Lifecycle::Live(inner) = asset else {
+            panic!("Expected Live state, got {asset:?}");
+        };
+
+        assert_eq!(inner.underlying, underlying);
+        assert_eq!(inner.token, token);
+        assert_eq!(inner.network, network);
+        assert_eq!(inner.vault, vault);
+        assert!(inner.enabled);
+        assert_eq!(inner.added_at, added_at);
     }
 
     #[test]
@@ -281,5 +362,95 @@ mod tests {
     fn test_network_display() {
         let network = Network::new("base");
         assert_eq!(format!("{network}"), "base");
+    }
+
+    async fn setup_test_db() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_list_enabled_assets_returns_only_enabled() {
+        let pool = setup_test_db().await;
+
+        let enabled_underlying = UnderlyingSymbol::new("AAPL");
+        let enabled_asset = TokenizedAsset {
+            underlying: enabled_underlying.clone(),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            enabled: true,
+            added_at: Utc::now(),
+        };
+        let enabled_lifecycle: Lifecycle<TokenizedAsset, Never> =
+            Lifecycle::Live(enabled_asset.clone());
+
+        let disabled_underlying = UnderlyingSymbol::new("TSLA");
+        let disabled_asset = TokenizedAsset {
+            underlying: disabled_underlying.clone(),
+            token: TokenSymbol::new("tTSLA"),
+            network: Network::new("base"),
+            vault: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            enabled: false,
+            added_at: Utc::now(),
+        };
+        let disabled_lifecycle: Lifecycle<TokenizedAsset, Never> =
+            Lifecycle::Live(disabled_asset);
+
+        let enabled_payload = serde_json::to_string(&enabled_lifecycle)
+            .expect("Failed to serialize view");
+        let disabled_payload = serde_json::to_string(&disabled_lifecycle)
+            .expect("Failed to serialize view");
+
+        sqlx::query!(
+            r"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            enabled_underlying.0,
+            enabled_payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert enabled view");
+
+        sqlx::query!(
+            r"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            disabled_underlying.0,
+            disabled_payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert disabled view");
+
+        let result =
+            list_enabled_assets(&pool).await.expect("Query should succeed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].underlying, enabled_underlying);
+        assert!(result[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn test_list_enabled_assets_returns_empty_when_none() {
+        let pool = setup_test_db().await;
+
+        let result =
+            list_enabled_assets(&pool).await.expect("Query should succeed");
+
+        assert!(result.is_empty());
     }
 }

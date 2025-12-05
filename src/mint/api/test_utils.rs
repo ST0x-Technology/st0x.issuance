@@ -6,19 +6,18 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::account::{
-    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
+    Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::AlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
 };
-use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
-};
+use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 
@@ -82,17 +81,17 @@ pub(super) async fn setup_test_environment() -> (
         .expect("Failed to run migrations");
 
     let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(pool.clone(), "account_view".to_string()));
     let account_query = GenericQuery::new(account_view_repo);
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
     let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
+        Lifecycle<TokenizedAsset, Never>,
+        Lifecycle<TokenizedAsset, Never>,
     >::new(
         pool.clone(),
         "tokenized_asset_view".to_string(),

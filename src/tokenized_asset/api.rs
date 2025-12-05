@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
 
-use super::{Network, TokenSymbol, UnderlyingSymbol, view::TokenizedAssetView};
+use super::{Network, TokenSymbol, UnderlyingSymbol, list_enabled_assets};
 use crate::auth::IssuerAuth;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,23 +25,17 @@ pub(crate) async fn list_tokenized_assets(
     _auth: IssuerAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetsListResponse>, rocket::http::Status> {
-    let views =
-        super::view::list_enabled_assets(pool.inner()).await.map_err(|e| {
-            error!("Failed to list enabled assets: {e}");
-            rocket::http::Status::InternalServerError
-        })?;
+    let assets = list_enabled_assets(pool.inner()).await.map_err(|e| {
+        error!("Failed to list enabled assets: {e}");
+        rocket::http::Status::InternalServerError
+    })?;
 
-    let tokens = views
+    let tokens = assets
         .into_iter()
-        .filter_map(|view| match view {
-            TokenizedAssetView::Asset {
-                underlying, token, network, ..
-            } => Some(TokenizedAssetResponse {
-                underlying,
-                token,
-                networks: vec![network],
-            }),
-            TokenizedAssetView::Unavailable => None,
+        .map(|asset| TokenizedAssetResponse {
+            underlying: asset.underlying,
+            token: asset.token,
+            networks: vec![asset.network],
         })
         .collect();
 
@@ -60,6 +54,8 @@ mod tests {
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
+    use crate::lifecycle::{Lifecycle, Never};
+    use crate::tokenized_asset::TokenizedAsset;
 
     fn test_config() -> Config {
         use alloy::primitives::{B256, address};
@@ -92,7 +88,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let enabled_view = TokenizedAssetView::Asset {
+        let enabled_asset = TokenizedAsset {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             network: Network::new("base"),
@@ -100,8 +96,10 @@ mod tests {
             enabled: true,
             added_at: Utc::now(),
         };
+        let enabled_lifecycle: Lifecycle<TokenizedAsset, Never> =
+            Lifecycle::Live(enabled_asset);
 
-        let disabled_view = TokenizedAssetView::Asset {
+        let disabled_asset = TokenizedAsset {
             underlying: UnderlyingSymbol::new("TSLA"),
             token: TokenSymbol::new("tTSLA"),
             network: Network::new("base"),
@@ -109,11 +107,13 @@ mod tests {
             enabled: false,
             added_at: Utc::now(),
         };
+        let disabled_lifecycle: Lifecycle<TokenizedAsset, Never> =
+            Lifecycle::Live(disabled_asset);
 
-        let enabled_payload =
-            serde_json::to_string(&enabled_view).expect("Failed to serialize");
-        let disabled_payload =
-            serde_json::to_string(&disabled_view).expect("Failed to serialize");
+        let enabled_payload = serde_json::to_string(&enabled_lifecycle)
+            .expect("Failed to serialize");
+        let disabled_payload = serde_json::to_string(&disabled_lifecycle)
+            .expect("Failed to serialize");
 
         sqlx::query!(
             r"

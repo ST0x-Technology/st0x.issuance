@@ -13,17 +13,12 @@ use super::{
     Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
-use crate::account::{
-    AccountView, ClientId,
-    view::{AccountViewError, find_by_wallet},
-};
+use crate::account::{AccountViewError, ClientId, find_by_wallet};
 use crate::bindings;
 use crate::mint::IssuerRequestId;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets,
-};
 use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
+    Network, TokenSymbol, TokenizedAssetViewError, UnderlyingSymbol,
+    list_enabled_assets,
 };
 use crate::{Quantity, QuantityConversionError};
 
@@ -188,15 +183,12 @@ where
 
         assets
             .into_iter()
-            .find_map(|view| match view {
-                TokenizedAssetView::Asset {
-                    underlying,
-                    token,
-                    network,
-                    vault: addr,
-                    ..
-                } if addr == self.vault => Some((underlying, token, network)),
-                _ => None,
+            .find_map(|asset| {
+                if asset.vault == self.vault {
+                    Some((asset.underlying, asset.token, asset.network))
+                } else {
+                    None
+                }
             })
             .ok_or(RedemptionMonitorError::NoMatchingAsset {
                 vault: self.vault,
@@ -250,17 +242,17 @@ where
         &self,
         wallet: &Address,
     ) -> Result<ClientId, RedemptionMonitorError> {
-        let account_view = find_by_wallet(&self.pool, wallet).await?.ok_or(
+        let account = find_by_wallet(&self.pool, wallet).await?.ok_or(
             RedemptionMonitorError::AccountNotFound { wallet: *wallet },
         )?;
 
-        let AccountView::LinkedToAlpaca { client_id, .. } = account_view else {
+        if account.alpaca.is_none() {
             return Err(RedemptionMonitorError::AccountNotLinked {
                 wallet: *wallet,
             });
-        };
+        }
 
-        Ok(client_id)
+        Ok(account.client_id)
     }
 
     async fn handle_alpaca_and_polling(
@@ -405,15 +397,15 @@ mod tests {
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
-        view::AccountView,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
+    use crate::lifecycle::{Lifecycle, Never};
     use crate::mint::IssuerRequestId;
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol, view::TokenizedAssetView,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
@@ -438,8 +430,8 @@ mod tests {
             .expect("Failed to run migrations");
 
         let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
+            Lifecycle<TokenizedAsset, Never>,
+            Lifecycle<TokenizedAsset, Never>,
         >::new(
             pool.clone(),
             "tokenized_asset_view".to_string(),
@@ -466,11 +458,13 @@ mod tests {
             .unwrap();
 
         if let Some(wallet) = ap_wallet {
-            let account_view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
+            let account_view_repo = Arc::new(SqliteViewRepository::<
+                Lifecycle<Account, Never>,
+                Lifecycle<Account, Never>,
+            >::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
 
             let account_query = GenericQuery::new(account_view_repo);
             let account_cqrs =

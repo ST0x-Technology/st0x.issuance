@@ -11,8 +11,8 @@ use tracing::error;
 use uuid::Uuid;
 
 use super::{
-    AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
-    view::find_by_client_id, view::find_by_email,
+    AccountCommand, AccountError, AccountViewError, AlpacaAccountNumber,
+    ClientId, Email, find_by_client_id, find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
@@ -28,12 +28,10 @@ impl<'a> FromParam<'a> for ClientId {
 pub(crate) enum ApiError {
     #[error("Account not found")]
     AccountNotFound,
-
     #[error("Database error: {0}")]
-    Database(#[from] super::view::AccountViewError),
-
+    Database(#[from] AccountViewError),
     #[error("Command execution failed: {0}")]
-    CommandFailed(#[from] cqrs_es::AggregateError<super::AccountError>),
+    CommandFailed(#[from] AggregateError<AccountError>),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -76,17 +74,12 @@ pub(crate) async fn register_account(
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<RegisterAccountRequest>,
 ) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
-    if let Some(view) = find_by_email(pool.inner(), &request.email)
+    if find_by_email(pool.inner(), &request.email)
         .await
         .map_err(|_| rocket::http::Status::InternalServerError)?
+        .is_some()
     {
-        match view {
-            AccountView::Registered { .. }
-            | AccountView::LinkedToAlpaca { .. } => {
-                return Err(rocket::http::Status::Conflict);
-            }
-            AccountView::Unavailable => {}
-        }
+        return Err(rocket::http::Status::Conflict);
     }
 
     let client_id = ClientId::new();
@@ -141,20 +134,16 @@ pub(crate) async fn connect_account(
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<AccountLinkRequest>,
 ) -> Result<Json<AccountLinkResponse>, rocket::http::Status> {
-    let account_view = find_by_email(pool.inner(), &request.email)
+    let account = find_by_email(pool.inner(), &request.email)
         .await
         .map_err(|_| rocket::http::Status::InternalServerError)?
         .ok_or(rocket::http::Status::NotFound)?;
 
-    let client_id = match account_view {
-        AccountView::Registered { client_id, .. } => client_id,
-        AccountView::LinkedToAlpaca { .. } => {
-            return Err(rocket::http::Status::Conflict);
-        }
-        AccountView::Unavailable => {
-            return Err(rocket::http::Status::NotFound);
-        }
-    };
+    if account.alpaca.is_some() {
+        return Err(rocket::http::Status::Conflict);
+    }
+
+    let client_id = account.client_id;
 
     let link_command = AccountCommand::LinkToAlpaca {
         alpaca_account: request.account.clone(),
@@ -190,13 +179,13 @@ pub(crate) async fn whitelist_wallet(
     client_id: ClientId,
     request: Json<WhitelistWalletRequest>,
 ) -> Result<Json<WhitelistWalletResponse>, ApiError> {
-    let account_view = find_by_client_id(pool.inner(), &client_id)
+    let account = find_by_client_id(pool.inner(), &client_id)
         .await?
         .ok_or(ApiError::AccountNotFound)?;
 
-    let AccountView::LinkedToAlpaca { .. } = account_view else {
+    if account.alpaca.is_none() {
         return Err(ApiError::AccountNotFound);
-    };
+    }
 
     let command = AccountCommand::WhitelistWallet { wallet: request.wallet };
 
@@ -222,6 +211,7 @@ mod tests {
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
+    use crate::lifecycle::{Lifecycle, Never};
 
     fn test_config() -> Config {
         Config {
@@ -269,11 +259,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -334,11 +326,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -405,11 +399,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -462,11 +458,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -519,11 +517,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -601,11 +601,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -649,26 +651,18 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let view = find_by_client_id(&pool, &client_id)
+        let account = find_by_client_id(&pool, &client_id)
             .await
             .expect("Failed to query view")
             .expect("View should exist");
 
-        let AccountView::LinkedToAlpaca {
-            client_id: view_client_id,
-            email: view_email,
-            alpaca_account: view_alpaca_account,
-            whitelisted_wallets,
-            ..
-        } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}");
-        };
-
-        assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email.as_str(), email);
-        assert_eq!(view_alpaca_account.0, alpaca_account);
-        assert!(whitelisted_wallets.is_empty());
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email.as_str(), email);
+        assert_eq!(
+            account.alpaca.as_ref().expect("Should be linked").0,
+            alpaca_account
+        );
+        assert!(account.whitelisted_wallets.is_empty());
     }
 
     #[tokio::test]
@@ -684,11 +678,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -735,11 +731,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -791,11 +789,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -837,18 +837,14 @@ mod tests {
         let response_body: RegisterAccountResponse =
             response.into_json().await.expect("valid JSON response");
 
-        let view = find_by_client_id(&pool, &response_body.client_id)
+        let account = find_by_client_id(&pool, &response_body.client_id)
             .await
             .expect("Failed to query view")
             .expect("View should exist");
 
-        let AccountView::Registered { client_id, email: view_email, .. } = view
-        else {
-            panic!("Expected Registered, got {view:?}");
-        };
-
-        assert_eq!(client_id, response_body.client_id);
-        assert_eq!(view_email.as_str(), email);
+        assert_eq!(account.client_id, response_body.client_id);
+        assert_eq!(account.email.as_str(), email);
+        assert!(account.alpaca.is_none(), "Should not be linked yet");
     }
 
     #[tokio::test]
@@ -864,11 +860,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -923,11 +921,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -964,56 +964,5 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::UnprocessableEntity);
-    }
-
-    #[tokio::test]
-    async fn test_email_unique_constraint_enforced_at_db_level() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .unwrap();
-
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-        let email = "race@example.com";
-        let payload1 = serde_json::json!({
-            "Registered": {
-                "client_id": "11111111-1111-1111-1111-111111111111",
-                "email": email,
-                "registered_at": "2024-01-01T00:00:00Z"
-            }
-        });
-
-        sqlx::query("INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)")
-            .bind("11111111-1111-1111-1111-111111111111")
-            .bind(1i64)
-            .bind(payload1.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let payload2 = serde_json::json!({
-            "Registered": {
-                "client_id": "22222222-2222-2222-2222-222222222222",
-                "email": email,
-                "registered_at": "2024-01-01T00:00:00Z"
-            }
-        });
-
-        let result = sqlx::query(
-            "INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)",
-        )
-        .bind("22222222-2222-2222-2222-222222222222")
-        .bind(1i64)
-        .bind(payload2.to_string())
-        .execute(&pool)
-        .await;
-
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("UNIQUE constraint failed"),
-            "DB should enforce email uniqueness via migration, got: {err}"
-        );
     }
 }

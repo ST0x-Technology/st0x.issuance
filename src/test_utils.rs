@@ -16,7 +16,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
-use crate::account::{Account, AccountView};
+use crate::account::Account;
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
@@ -25,11 +25,12 @@ use crate::bindings::{
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
 use crate::config::{Config, LogLevel};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
+    UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
 
@@ -87,10 +88,10 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Setup Account CQRS
     let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(pool.clone(), "account_view".to_string()));
 
     let account_query = GenericQuery::new(account_view_repo);
     let account_cqrs =
@@ -98,8 +99,8 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Setup TokenizedAsset CQRS
     let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
+        Lifecycle<TokenizedAsset, Never>,
+        Lifecycle<TokenizedAsset, Never>,
     >::new(
         pool.clone(),
         "tokenized_asset_view".to_string(),
@@ -167,7 +168,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 }
 
 async fn seed_test_assets(
-    cqrs: &SqliteCqrs<TokenizedAsset>,
+    cqrs: &SqliteCqrs<Lifecycle<TokenizedAsset, Never>>,
 ) -> Result<(), anyhow::Error> {
     let assets = vec![
         (
