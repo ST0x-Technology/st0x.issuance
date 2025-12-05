@@ -44,15 +44,15 @@ impl TokenizationRequestId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuerRequestId(pub String);
 
-impl std::fmt::Display for IssuerRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 impl IssuerRequestId {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+}
+
+impl std::fmt::Display for IssuerRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

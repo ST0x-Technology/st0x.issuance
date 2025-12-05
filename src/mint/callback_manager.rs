@@ -735,7 +735,7 @@ mod tests {
 
         for i in 1..=2 {
             let issuer_request_id =
-                IssuerRequestId::new(&format!("iss-recovery-multi-{i}"));
+                IssuerRequestId::new(format!("iss-recovery-multi-{i}"));
             let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
             mint_cqrs
@@ -744,7 +744,7 @@ mod tests {
                     MintCommand::Initiate {
                         issuer_request_id: issuer_request_id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
-                            &format!("tok-{i}"),
+                            format!("tok-{i}"),
                         ),
                         quantity: Quantity::new(Decimal::from(100)),
                         underlying: UnderlyingSymbol::new("AAPL"),
