@@ -5,6 +5,7 @@ use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
+use crate::account::AlpacaAccountNumber;
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
 use crate::mint::TokenizationRequestId;
 
@@ -39,6 +40,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
     ))]
     pub(crate) async fn handle_alpaca_called(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
     ) -> Result<(), JournalManagerError> {
@@ -73,7 +75,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
             let request_result = self
                 .alpaca_service
-                .poll_request_status(&tokenization_request_id)
+                .poll_request_status(alpaca_account, &tokenization_request_id)
                 .await;
 
             let should_continue = self
@@ -338,6 +340,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{JournalManager, JournalManagerError};
+    use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::redemption::{Redemption, RedemptionCommand};
@@ -345,6 +348,10 @@ mod tests {
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -425,6 +432,7 @@ mod tests {
     impl AlpacaService for StatefulMockAlpacaService {
         async fn send_mint_callback(
             &self,
+            _alpaca_account: &AlpacaAccountNumber,
             _request: crate::alpaca::MintCallbackRequest,
         ) -> Result<(), AlpacaError> {
             Ok(())
@@ -432,6 +440,7 @@ mod tests {
 
         async fn call_redeem_endpoint(
             &self,
+            _alpaca_account: &AlpacaAccountNumber,
             _request: crate::alpaca::RedeemRequest,
         ) -> Result<crate::alpaca::RedeemResponse, AlpacaError> {
             unreachable!()
@@ -439,6 +448,7 @@ mod tests {
 
         async fn poll_request_status(
             &self,
+            _alpaca_account: &AlpacaAccountNumber,
             tokenization_request_id: &TokenizationRequestId,
         ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError> {
             let index = {
@@ -491,7 +501,11 @@ mod tests {
         .await;
 
         let result = manager
-            .handle_alpaca_called(issuer_request_id, tokenization_request_id)
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
             .await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
@@ -529,7 +543,11 @@ mod tests {
         .await;
 
         let result = manager
-            .handle_alpaca_called(issuer_request_id, tokenization_request_id)
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
             .await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
@@ -566,6 +584,7 @@ mod tests {
 
         let result = manager
             .handle_alpaca_called(
+                &test_alpaca_account(),
                 issuer_request_id.clone(),
                 tokenization_request_id,
             )
@@ -618,7 +637,11 @@ mod tests {
         .await;
 
         let result = manager
-            .handle_alpaca_called(issuer_request_id, tokenization_request_id)
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
             .await;
 
         assert!(result.is_ok(), "Expected Ok after retries, got {result:?}");
@@ -655,6 +678,7 @@ mod tests {
 
         let result = manager
             .handle_alpaca_called(
+                &test_alpaca_account(),
                 issuer_request_id.clone(),
                 tokenization_request_id,
             )
@@ -704,6 +728,7 @@ mod tests {
 
         let result = manager
             .handle_alpaca_called(
+                &test_alpaca_account(),
                 issuer_request_id.clone(),
                 tokenization_request_id,
             )
@@ -740,6 +765,7 @@ mod tests {
         impl AlpacaService for QuantityMismatchMock {
             async fn send_mint_callback(
                 &self,
+                _alpaca_account: &AlpacaAccountNumber,
                 _request: crate::alpaca::MintCallbackRequest,
             ) -> Result<(), AlpacaError> {
                 Ok(())
@@ -747,6 +773,7 @@ mod tests {
 
             async fn call_redeem_endpoint(
                 &self,
+                _alpaca_account: &AlpacaAccountNumber,
                 _request: crate::alpaca::RedeemRequest,
             ) -> Result<crate::alpaca::RedeemResponse, AlpacaError>
             {
@@ -755,6 +782,7 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
+                _alpaca_account: &AlpacaAccountNumber,
                 tokenization_request_id: &TokenizationRequestId,
             ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError>
             {
@@ -794,7 +822,11 @@ mod tests {
         .await;
 
         let result = manager
-            .handle_alpaca_called(issuer_request_id, tokenization_request_id)
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
             .await;
 
         assert!(
@@ -850,7 +882,11 @@ mod tests {
         let start = std::time::Instant::now();
 
         let result = manager
-            .handle_alpaca_called(issuer_request_id, tokenization_request_id)
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
             .await;
 
         let elapsed = start.elapsed();

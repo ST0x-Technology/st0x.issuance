@@ -183,6 +183,18 @@ impl Mint {
         }
     }
 
+    pub(crate) const fn client_id(&self) -> Option<&ClientId> {
+        match self {
+            Self::Initiated { client_id, .. }
+            | Self::JournalConfirmed { client_id, .. }
+            | Self::JournalRejected { client_id, .. }
+            | Self::CallbackPending { client_id, .. }
+            | Self::MintingFailed { client_id, .. }
+            | Self::Completed { client_id, .. } => Some(client_id),
+            Self::Uninitialized => None,
+        }
+    }
+
     fn handle_confirm_journal(
         &self,
         provided_id: IssuerRequestId,
@@ -691,10 +703,15 @@ mod tests {
         MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
         UnderlyingSymbol, mint_manager::MintManager,
     };
+    use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
     use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     #[test]
     fn test_initiate_mint_creates_event() {
@@ -1946,7 +1963,11 @@ mod tests {
         let context =
             store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
         callback_manager
-            .handle_tokens_minted(&data.issuer_request_id, context.aggregate())
+            .handle_tokens_minted(
+                &test_alpaca_account(),
+                &data.issuer_request_id,
+                context.aggregate(),
+            )
             .await
             .unwrap();
 

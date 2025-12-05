@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
-use crate::account::ClientId;
+use crate::account::{AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
@@ -26,6 +26,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     ))]
     pub(crate) async fn handle_redemption_detected(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         issuer_request_id: &IssuerRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
@@ -59,7 +60,11 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             tx_hash: metadata.detected_tx_hash,
         };
 
-        match self.alpaca_service.call_redeem_endpoint(request).await {
+        match self
+            .alpaca_service
+            .call_redeem_endpoint(alpaca_account, request)
+            .await
+        {
             Ok(response) => {
                 info!(
                     issuer_request_id = %response.issuer_request_id.0,
@@ -142,7 +147,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
-    use crate::account::ClientId;
+    use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
     use crate::redemption::{Redemption, RedemptionCommand, UnderlyingSymbol};
@@ -150,6 +155,10 @@ mod tests {
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -219,6 +228,7 @@ mod tests {
 
         let result = manager
             .handle_redemption_detected(
+                &test_alpaca_account(),
                 &issuer_request_id,
                 &aggregate,
                 client_id,
@@ -261,6 +271,7 @@ mod tests {
 
         let result = manager
             .handle_redemption_detected(
+                &test_alpaca_account(),
                 &issuer_request_id,
                 &aggregate,
                 client_id,
@@ -303,6 +314,7 @@ mod tests {
 
         let result = manager
             .handle_redemption_detected(
+                &test_alpaca_account(),
                 &issuer_request_id,
                 &aggregate,
                 client_id,

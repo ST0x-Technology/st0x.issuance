@@ -21,87 +21,58 @@ not a static config value.
 
 ### Changes Required
 
-- [ ] Add `alpaca_account: &AlpacaAccountNumber` parameter to
+- [x] Add `alpaca_account: &AlpacaAccountNumber` parameter to
       `send_mint_callback`
-- [ ] Add `alpaca_account: &AlpacaAccountNumber` parameter to
+- [x] Add `alpaca_account: &AlpacaAccountNumber` parameter to
       `call_redeem_endpoint`
-- [ ] Add `alpaca_account: &AlpacaAccountNumber` parameter to
+- [x] Add `alpaca_account: &AlpacaAccountNumber` parameter to
       `poll_request_status`
-- [ ] Remove `account_id` field from `RealAlpacaService` struct
-- [ ] Remove `ALPACA_ACCOUNT_ID` from `AlpacaConfig`
-- [ ] Update `AlpacaService` trait signatures
-- [ ] Update `MockAlpacaService` to match new signatures
-- [ ] Update all tests for new signatures
+- [x] Remove `account_id` field from `RealAlpacaService` struct
+- [x] Remove `ALPACA_ACCOUNT_ID` from `AlpacaConfig`
+- [x] Update `AlpacaService` trait signatures
+- [x] Update `MockAlpacaService` to match new signatures
+- [x] Update all tests for new signatures
 
 ### Verification
 
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
       passes
-- [ ] `cargo fmt --all -- --check` passes
+- [x] `cargo fmt --all -- --check` passes
 
-## Task 2. Update CallbackManager to look up user's Alpaca account
+## Task 2-4. Add account lookups for Alpaca API calls (CONSOLIDATED)
 
-The `CallbackManager` needs to look up the user's Alpaca account from the
-`AccountView` using the `client_id` stored in the mint aggregate.
+Originally planned as 3 separate tasks, consolidated into one since the
+implementation is cleaner when done together at the call sites rather than in
+each manager.
 
-### Changes Required
+### Design Decision
 
-- [ ] Add `pool: Pool<Sqlite>` to `CallbackManager` constructor
-- [ ] In `handle_tokens_minted`, look up `AccountView` by `client_id`
-- [ ] Extract `alpaca_account` from `AccountView::LinkedToAlpaca`
-- [ ] Pass `alpaca_account` to `alpaca_service.send_mint_callback()`
-- [ ] Add error handling for account not found / not linked
-- [ ] Update tests with mock account lookups
-- [ ] Update wiring in `lib.rs` to pass pool to `CallbackManager`
+Instead of adding `pool` to each manager and doing lookups internally, we:
+
+1. Add `client_id()` accessor to `Mint` aggregate
+2. Look up account at call sites (`confirm.rs`, `detector.rs`)
+3. Pass `alpaca_account` as parameter through the call chain
+
+This keeps managers focused on their single responsibility and avoids
+duplicating database access across multiple components.
+
+### Changes Made
+
+- [x] Add `Mint::client_id()` accessor method
+- [x] In `confirm.rs`: pass `pool` to `process_journal_completion`, look up
+      account using `find_by_client_id`, pass to `CallbackManager`
+- [x] In `detector.rs`: update `get_account_info` to return both `client_id` and
+      `alpaca_account`, pass through to managers
+- [x] Update E2E test mock paths to use `USER123` (the actual account from test
+      setup)
 
 ### Verification
 
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] `cargo test --workspace` passes (296 tests + E2E)
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
       passes
-- [ ] `cargo fmt --all -- --check` passes
-
-## Task 3. Update RedeemCallManager to look up user's Alpaca account
-
-Same pattern as Task 2, but for the redemption flow.
-
-### Changes Required
-
-- [ ] Add `pool: Pool<Sqlite>` to `RedeemCallManager` constructor (if not
-      already present)
-- [ ] In the redeem call handler, look up `AccountView` by `client_id`
-- [ ] Extract `alpaca_account` from `AccountView::LinkedToAlpaca`
-- [ ] Pass `alpaca_account` to `alpaca_service.call_redeem_endpoint()`
-- [ ] Update tests
-- [ ] Update wiring in `lib.rs`
-
-### Verification
-
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-      passes
-- [ ] `cargo fmt --all -- --check` passes
-
-## Task 4. Update JournalManager to look up user's Alpaca account
-
-Same pattern for `poll_request_status`.
-
-### Changes Required
-
-- [ ] Add `pool: Pool<Sqlite>` to `JournalManager` constructor (if not already
-      present)
-- [ ] Look up `AccountView` by `client_id` before polling
-- [ ] Pass `alpaca_account` to `alpaca_service.poll_request_status()`
-- [ ] Update tests
-- [ ] Update wiring in `lib.rs`
-
-### Verification
-
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-      passes
-- [ ] `cargo fmt --all -- --check` passes
+- [x] `cargo fmt --all -- --check` passes
 
 ## Task 5. Add startup recovery for stuck mints
 

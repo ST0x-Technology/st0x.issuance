@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::{IssuerRequestId, Mint, MintCommand, MintError};
+use crate::account::AlpacaAccountNumber;
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 
 /// Orchestrates the Alpaca callback process in response to TokensMinted events.
@@ -42,6 +43,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     ///
     /// # Arguments
     ///
+    /// * `alpaca_account` - The user's Alpaca account number for API calls
     /// * `issuer_request_id` - ID of the mint request
     /// * `aggregate` - Current state of the Mint aggregate (must be CallbackPending)
     ///
@@ -59,6 +61,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     ))]
     pub(crate) async fn handle_tokens_minted(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         issuer_request_id: &IssuerRequestId,
         aggregate: &Mint,
     ) -> Result<(), CallbackManagerError> {
@@ -92,7 +95,11 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             network: network.clone(),
         };
 
-        match self.alpaca_service.send_mint_callback(callback_request).await {
+        match self
+            .alpaca_service
+            .send_mint_callback(alpaca_account, callback_request)
+            .await
+        {
             Ok(()) => {
                 info!(
                     issuer_request_id = %issuer_request_id_str,
@@ -148,6 +155,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{CallbackManager, CallbackManagerError};
+    use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
     use crate::mint::{
         ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
@@ -156,6 +164,10 @@ mod tests {
 
     type TestCqrs = CqrsFramework<Mint, MemStore<Mint>>;
     type TestStore = MemStore<Mint>;
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -254,8 +266,13 @@ mod tests {
         )
         .await;
 
-        let result =
-            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+        let result = manager
+            .handle_tokens_minted(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+            )
+            .await;
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
@@ -287,8 +304,13 @@ mod tests {
         )
         .await;
 
-        let result =
-            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+        let result = manager
+            .handle_tokens_minted(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+            )
+            .await;
 
         assert!(
             matches!(result, Err(CallbackManagerError::Alpaca(_))),
@@ -340,8 +362,13 @@ mod tests {
 
         let aggregate = load_aggregate(&store, &issuer_request_id).await;
 
-        let result =
-            manager.handle_tokens_minted(&issuer_request_id, &aggregate).await;
+        let result = manager
+            .handle_tokens_minted(
+                &test_alpaca_account(),
+                &issuer_request_id,
+                &aggregate,
+            )
+            .await;
 
         assert!(
             matches!(
