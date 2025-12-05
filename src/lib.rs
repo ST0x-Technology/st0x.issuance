@@ -183,7 +183,10 @@ pub async fn initialize_rocket(
     } = setup_aggregate_cqrs(&pool);
 
     let (mint_manager, callback_manager) =
-        setup_mint_managers(&config, &mint_cqrs).await?;
+        setup_mint_managers(&config, &mint_cqrs, &mint_event_store, &pool)
+            .await?;
+
+    spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
 
     let RedemptionManagers { redeem_call, journal, burn } =
         setup_redemption_managers(
@@ -334,6 +337,8 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
 async fn setup_mint_managers(
     config: &Config,
     mint_cqrs: &MintCqrs,
+    mint_event_store: &MintEventStore,
+    pool: &Pool<Sqlite>,
 ) -> Result<
     (
         Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
@@ -345,12 +350,18 @@ async fn setup_mint_managers(
     let mint_manager = Arc::new(MintManager::new(
         blockchain_service,
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
         config.bot,
     ));
 
     let alpaca_service = config.alpaca.service()?;
-    let callback_manager =
-        Arc::new(CallbackManager::new(alpaca_service, mint_cqrs.clone()));
+    let callback_manager = Arc::new(CallbackManager::new(
+        alpaca_service,
+        mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
+    ));
 
     Ok((mint_manager, callback_manager))
 }
@@ -422,6 +433,22 @@ fn spawn_redemption_detector(
 
     tokio::spawn(async move {
         detector.run().await;
+    });
+}
+
+fn spawn_mint_recovery(
+    mint_manager: Arc<
+        MintManager<PersistedEventStore<SqliteEventRepository, Mint>>,
+    >,
+    callback_manager: Arc<
+        CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>,
+    >,
+) {
+    info!("Spawning mint recovery task");
+
+    tokio::spawn(async move {
+        mint_manager.recover_journal_confirmed_mints().await;
+        callback_manager.recover_callback_pending_mints().await;
     });
 }
 

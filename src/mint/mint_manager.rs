@@ -2,14 +2,16 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use chrono::Utc;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
-use tracing::{info, warn};
+use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use sqlx::{Pool, Sqlite};
+use tracing::{debug, error, info, warn};
 
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
     OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
+use super::view::{MintViewError, find_journal_confirmed};
 use super::{
     IssuerRequestId, Mint, MintCommand, MintError, QuantityConversionError,
 };
@@ -25,6 +27,8 @@ use super::{
 pub(crate) struct MintManager<ES: EventStore<Mint>> {
     blockchain_service: Arc<dyn VaultService>,
     cqrs: Arc<CqrsFramework<Mint, ES>>,
+    event_store: Arc<ES>,
+    pool: Pool<Sqlite>,
     bot: Address,
 }
 
@@ -35,13 +39,17 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     ///
     /// * `blockchain_service` - Service for on-chain minting operations
     /// * `cqrs` - CQRS framework for executing commands on the Mint aggregate
+    /// * `event_store` - Event store for loading aggregates
+    /// * `pool` - Database pool for querying views
     /// * `bot` - Bot's address that receives ERC1155 receipts
-    pub(crate) const fn new(
+    pub(crate) fn new(
         blockchain_service: Arc<dyn VaultService>,
         cqrs: Arc<CqrsFramework<Mint, ES>>,
+        event_store: Arc<ES>,
+        pool: Pool<Sqlite>,
         bot: Address,
     ) -> Self {
-        Self { blockchain_service, cqrs, bot }
+        Self { blockchain_service, cqrs, event_store, pool, bot }
     }
 
     /// Handles a JournalConfirmed event by minting tokens on-chain.
@@ -176,6 +184,73 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
             }
         }
     }
+
+    /// Recovers mints stuck in JournalConfirmed state after a restart.
+    ///
+    /// This method queries for all mints in JournalConfirmed state and attempts to
+    /// process them by calling `handle_journal_confirmed` for each. Errors during
+    /// processing are logged but do not stop recovery of other mints.
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn recover_journal_confirmed_mints(&self) {
+        debug!("Starting recovery of JournalConfirmed mints");
+
+        let stuck_mints = match find_journal_confirmed(&self.pool).await {
+            Ok(mints) => mints,
+            Err(e) => {
+                error!(error = %e, "Failed to query for stuck JournalConfirmed mints");
+                return;
+            }
+        };
+
+        if stuck_mints.is_empty() {
+            debug!("No JournalConfirmed mints to recover");
+            return;
+        }
+
+        info!(
+            count = stuck_mints.len(),
+            "Recovering stuck JournalConfirmed mints"
+        );
+
+        for (issuer_request_id, _view) in stuck_mints {
+            let aggregate = match self
+                .event_store
+                .load_aggregate(&issuer_request_id.0)
+                .await
+            {
+                Ok(context) => context.aggregate().clone(),
+                Err(e) => {
+                    error!(
+                        issuer_request_id = %issuer_request_id.0,
+                        error = %e,
+                        "Failed to load aggregate for recovery"
+                    );
+                    continue;
+                }
+            };
+
+            match self
+                .handle_journal_confirmed(&issuer_request_id, &aggregate)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        issuer_request_id = %issuer_request_id.0,
+                        "Successfully recovered JournalConfirmed mint"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        issuer_request_id = %issuer_request_id.0,
+                        error = %e,
+                        "Failed to recover JournalConfirmed mint"
+                    );
+                }
+            }
+        }
+
+        debug!("Completed recovery of JournalConfirmed mints");
+    }
 }
 
 const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
@@ -203,6 +278,9 @@ pub(crate) enum MintManagerError {
 
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
+
+    #[error("View error: {0}")]
+    View(#[from] MintViewError),
 }
 
 #[cfg(test)]
@@ -210,13 +288,17 @@ mod tests {
     use std::sync::Arc;
 
     use alloy::primitives::address;
+    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     use crate::mint::{
-        ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintView, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
     use super::{MintManager, MintManagerError};
@@ -224,11 +306,19 @@ mod tests {
     type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
     type TestStore = MemStore<Mint>;
 
-    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
+    async fn setup_test_cqrs()
+    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
         let store = Arc::new(MemStore::default());
         let cqrs =
             Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
-        (cqrs, store)
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        (cqrs, store, pool)
     }
 
     async fn create_test_mint_in_journal_confirmed_state(
@@ -282,12 +372,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_success() {
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, pool) = setup_test_cqrs().await;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let manager = MintManager::new(blockchain_service, cqrs.clone(), bot);
+        let manager = MintManager::new(
+            blockchain_service,
+            cqrs.clone(),
+            store.clone(),
+            pool,
+            bot,
+        );
 
         let issuer_request_id = IssuerRequestId::new("iss-success-123");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -316,13 +412,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_blockchain_failure() {
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, pool) = setup_test_cqrs().await;
         let blockchain_service_mock =
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let manager = MintManager::new(blockchain_service, cqrs.clone(), bot);
+        let manager = MintManager::new(
+            blockchain_service,
+            cqrs.clone(),
+            store.clone(),
+            pool,
+            bot,
+        );
 
         let issuer_request_id = IssuerRequestId::new("iss-failure-456");
         let aggregate = create_test_mint_in_journal_confirmed_state(
@@ -358,11 +460,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_wrong_state_fails() {
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, pool) = setup_test_cqrs().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let manager = MintManager::new(blockchain_service, cqrs.clone(), bot);
+        let manager = MintManager::new(
+            blockchain_service,
+            cqrs.clone(),
+            store.clone(),
+            pool,
+            bot,
+        );
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
@@ -435,5 +543,196 @@ mod tests {
         let result = quantity.to_u256_with_18_decimals();
 
         assert!(result.is_err(), "Expected error for overflow, got {result:?}");
+    }
+
+    async fn setup_recovery_test_env() -> (
+        sqlx::Pool<sqlx::Sqlite>,
+        Arc<
+            cqrs_es::CqrsFramework<
+                Mint,
+                PersistedEventStore<SqliteEventRepository, Mint>,
+            >,
+        >,
+        Arc<PersistedEventStore<SqliteEventRepository, Mint>>,
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
+        let mint_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+
+        let mint_event_repo = SqliteEventRepository::new(pool.clone());
+        let mint_event_store = Arc::new(PersistedEventStore::<
+            SqliteEventRepository,
+            Mint,
+        >::new_event_store(
+            mint_event_repo
+        ));
+
+        (pool, mint_cqrs, mint_event_store)
+    }
+
+    #[tokio::test]
+    async fn test_recover_journal_confirmed_mints_processes_stuck_mints() {
+        let (pool, mint_cqrs, mint_event_store) =
+            setup_recovery_test_env().await;
+
+        let client_id = ClientId::new();
+        let issuer_request_id = IssuerRequestId::new("iss-recovery-test-1");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-1",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .expect("Failed to initiate mint");
+
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("Failed to confirm journal");
+
+        let blockchain_mock = Arc::new(MockVaultService::new_success());
+        let manager = MintManager::new(
+            blockchain_mock.clone() as Arc<dyn VaultService>,
+            mint_cqrs.clone(),
+            mint_event_store.clone(),
+            pool.clone(),
+            bot,
+        );
+
+        manager.recover_journal_confirmed_mints().await;
+
+        assert_eq!(
+            blockchain_mock.get_call_count(),
+            1,
+            "Expected blockchain service to be called once"
+        );
+
+        let results =
+            crate::mint::view::find_journal_confirmed(&pool).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "Expected no JournalConfirmed mints after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_journal_confirmed_mints_does_nothing_when_empty() {
+        let (pool, mint_cqrs, mint_event_store) =
+            setup_recovery_test_env().await;
+
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let blockchain_mock = Arc::new(MockVaultService::new_success());
+        let manager = MintManager::new(
+            blockchain_mock.clone() as Arc<dyn VaultService>,
+            mint_cqrs,
+            mint_event_store,
+            pool,
+            bot,
+        );
+
+        manager.recover_journal_confirmed_mints().await;
+
+        assert_eq!(
+            blockchain_mock.get_call_count(),
+            0,
+            "Expected no blockchain calls when no stuck mints"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_journal_confirmed_continues_on_individual_failure() {
+        let (pool, mint_cqrs, mint_event_store) =
+            setup_recovery_test_env().await;
+
+        let client_id = ClientId::new();
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        for i in 1..=2 {
+            let issuer_request_id =
+                IssuerRequestId::new(&format!("iss-recovery-multi-{i}"));
+            let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+            mint_cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::Initiate {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tokenization_request_id: TokenizationRequestId::new(
+                            &format!("tok-{i}"),
+                        ),
+                        quantity: Quantity::new(Decimal::from(100)),
+                        underlying: UnderlyingSymbol::new("AAPL"),
+                        token: TokenSymbol::new("tAAPL"),
+                        network: Network::new("base"),
+                        client_id,
+                        wallet,
+                    },
+                )
+                .await
+                .unwrap();
+
+            mint_cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::ConfirmJournal {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let blockchain_mock =
+            Arc::new(MockVaultService::new_failure("Network error"));
+        let manager = MintManager::new(
+            blockchain_mock.clone() as Arc<dyn VaultService>,
+            mint_cqrs,
+            mint_event_store,
+            pool,
+            bot,
+        );
+
+        manager.recover_journal_confirmed_mints().await;
+
+        assert_eq!(
+            blockchain_mock.get_call_count(),
+            2,
+            "Expected both mints to be attempted"
+        );
     }
 }

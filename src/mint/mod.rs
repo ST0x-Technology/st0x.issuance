@@ -1868,21 +1868,25 @@ mod tests {
 
     fn create_test_mint_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        store: Arc<MemStore<Mint>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
     ) -> MintManager<MemStore<Mint>> {
         let blockchain_service =
             Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-        MintManager::new(blockchain_service, cqrs, bot)
+        MintManager::new(blockchain_service, cqrs, store, pool, bot)
     }
 
     fn create_test_callback_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        store: Arc<MemStore<Mint>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
     ) -> CallbackManager<MemStore<Mint>> {
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn AlpacaService>;
 
-        CallbackManager::new(alpaca_service, cqrs)
+        CallbackManager::new(alpaca_service, cqrs, store, pool)
     }
 
     struct TestMintData {
@@ -1915,14 +1919,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_complete_mint_flow_with_managers() {
+    async fn setup_managers_test() -> (
+        Arc<MemStore<Mint>>,
+        Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        MintManager<MemStore<Mint>>,
+        CallbackManager<MemStore<Mint>>,
+    ) {
+        use sqlx::sqlite::SqlitePoolOptions;
+
         let store = Arc::new(MemStore::<Mint>::default());
         let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
 
-        let mint_manager = create_test_mint_manager(cqrs.clone());
-        let callback_manager = create_test_callback_manager(cqrs.clone());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
 
+        let mint_manager =
+            create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());
+        let callback_manager =
+            create_test_callback_manager(cqrs.clone(), store.clone(), pool);
+
+        (store, cqrs, mint_manager, callback_manager)
+    }
+
+    #[tokio::test]
+    async fn test_complete_mint_flow_with_managers() {
+        let (store, cqrs, mint_manager, callback_manager) =
+            setup_managers_test().await;
         let data = TestMintData::new();
 
         cqrs.execute(

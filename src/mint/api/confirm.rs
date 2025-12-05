@@ -310,8 +310,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -378,8 +386,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -447,8 +463,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -532,8 +556,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -620,8 +652,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -705,8 +745,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -797,8 +845,16 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -842,8 +898,16 @@ mod tests {
             setup_test_environment().await;
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -886,8 +950,16 @@ mod tests {
             setup_test_environment().await;
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(mint_cqrs.clone());
-        let callback_manager = create_test_callback_manager(mint_cqrs.clone());
+        let mint_manager = create_test_mint_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
+        let callback_manager = create_test_callback_manager(
+            mint_cqrs.clone(),
+            event_store.clone(),
+            pool.clone(),
+        );
 
         let rocket = rocket::build()
             .manage(test_config())

@@ -134,12 +134,16 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let mint_manager = Arc::new(MintManager::new(
         Arc::new(MockVaultService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
         bot,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(
         Arc::new(MockAlpacaService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
     ));
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
