@@ -19,7 +19,10 @@ use crate::mint::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
-pub(crate) use view::RedemptionView;
+pub(crate) use view::{
+    RedemptionView, RedemptionViewError, find_alpaca_called, find_burning,
+    find_detected,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RedemptionMetadata {

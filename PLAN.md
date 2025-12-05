@@ -78,58 +78,64 @@ duplicating database access across multiple components.
 
 When the bot starts, check for mints in recoverable states and process them.
 
-### Changes Required
+### Design Decision
 
-- [ ] Create `src/mint/recovery.rs` with `MintRecoveryService`
-- [ ] Add `recover_stuck_mints()` method that:
-  - Queries `mint_view` for mints in `JournalConfirmed` state
-  - Queries `mint_view` for mints in `CallbackPending` state
-  - For each `JournalConfirmed` mint, calls
-    `MintManager::handle_journal_confirmed`
-  - For each `CallbackPending` mint, calls
-    `CallbackManager::handle_tokens_minted`
-- [ ] Add structured logging for recovery attempts and outcomes
-- [ ] Wire recovery service into startup sequence in `lib.rs` (run after Rocket
-      launches)
-- [ ] Add tests for recovery logic
+Instead of creating a separate `MintRecoveryService`, recovery methods are added
+directly to the existing managers (`MintManager` and `CallbackManager`). This
+keeps the code simpler and avoids duplicating dependencies. The managers now
+store `pool` and `event_store` to support recovery operations.
+
+### Changes Made
+
+- [x] Add `find_journal_confirmed()` query function to `view.rs`
+- [x] Add `find_callback_pending()` query function to `view.rs`
+- [x] Add `pool` and `event_store` fields to `MintManager`
+- [x] Add `pool` and `event_store` fields to `CallbackManager`
+- [x] Add `recover_journal_confirmed_mints()` method to `MintManager`
+- [x] Add `recover_callback_pending_mints()` method to `CallbackManager`
+- [x] Add `lookup_alpaca_account_for_recovery()` helper to `CallbackManager`
+- [x] Wire recovery into startup via `spawn_mint_recovery()` in `lib.rs`
+- [x] Add tests for view query functions
+- [x] Add tests for recovery methods in both managers
 
 ### Design Notes
 
 - Recovery is idempotent - safe to run multiple times
 - Failed recovery attempts log errors but don't crash the bot
-- Recovery runs sequentially with delays between attempts to avoid overwhelming
-  services
+- Each mint is processed independently; failures don't stop other recoveries
 
 ### Verification
 
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
       passes
-- [ ] `cargo fmt --all -- --check` passes
+- [x] `cargo fmt --all -- --check` passes
 
 ## Task 6. Add startup recovery for stuck redemptions
 
-Same pattern as Task 5, but for redemptions.
+Same pattern as Task 5 - add recovery methods directly to existing managers.
 
 ### Changes Required
 
-- [ ] Create `src/redemption/recovery.rs` with `RedemptionRecoveryService`
-- [ ] Add `recover_stuck_redemptions()` method that:
-  - Queries `redemption_view` for redemptions in `Detected` state → retry
-    calling Alpaca
-  - Queries `redemption_view` for redemptions in `AlpacaCalled` state → retry
-    polling
-  - Queries `redemption_view` for redemptions in `Burning` state → retry burn
-    transaction
-- [ ] Add structured logging for recovery attempts and outcomes
-- [ ] Wire recovery service into startup sequence in `lib.rs`
-- [ ] Add tests for recovery logic
+- [ ] Add `find_detected()` query function to `redemption/view.rs`
+- [ ] Add `find_alpaca_called()` query function to `redemption/view.rs`
+- [ ] Add `find_burning()` query function to `redemption/view.rs`
+- [ ] Add `pool` and `event_store` fields to `RedeemCallManager`
+- [ ] Add `recover_detected_redemptions()` method to `RedeemCallManager`
+- [ ] Add `pool` and `event_store` fields to `JournalManager`
+- [ ] Add `recover_alpaca_called_redemptions()` method to `JournalManager`
+- [ ] Add `pool` and `event_store` fields to `BurnManager`
+- [ ] Add `recover_burning_redemptions()` method to `BurnManager`
+- [ ] Wire recovery into startup via `spawn_redemption_recovery()` in `lib.rs`
+- [ ] Add tests for view query functions
+- [ ] Add tests for recovery methods in all three managers
 
 ### Design Notes
 
 - Same idempotency and error handling approach as mint recovery
-- Recovery requires access to: `RedeemCallManager`, `JournalManager`,
-  `BurnManager`
+- Each manager handles recovery for its own state
+- Each redemption is processed independently; failures don't stop other
+  recoveries
 
 ### Verification
 

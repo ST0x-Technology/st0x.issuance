@@ -197,6 +197,12 @@ pub async fn initialize_rocket(
         )
         .await?;
 
+    spawn_redemption_recovery(
+        redeem_call.clone(),
+        journal.clone(),
+        burn.clone(),
+    );
+
     spawn_redemption_detector(
         &config,
         redemption_cqrs.clone(),
@@ -376,11 +382,14 @@ async fn setup_redemption_managers(
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_cqrs.clone(),
+        redemption_event_store.clone(),
+        pool.clone(),
     ));
     let journal = Arc::new(JournalManager::new(
         alpaca_service,
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
+        pool.clone(),
     ));
 
     let blockchain_service = config.create_blockchain_service().await?;
@@ -388,6 +397,7 @@ async fn setup_redemption_managers(
         blockchain_service,
         pool.clone(),
         redemption_cqrs.clone(),
+        redemption_event_store.clone(),
         config.bot,
     ));
 
@@ -449,6 +459,28 @@ fn spawn_mint_recovery(
     tokio::spawn(async move {
         mint_manager.recover_journal_confirmed_mints().await;
         callback_manager.recover_callback_pending_mints().await;
+    });
+}
+
+fn spawn_redemption_recovery(
+    redeem_call: Arc<
+        RedeemCallManager<
+            PersistedEventStore<SqliteEventRepository, Redemption>,
+        >,
+    >,
+    journal: Arc<
+        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+    burn: Arc<
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    >,
+) {
+    info!("Spawning redemption recovery task");
+
+    tokio::spawn(async move {
+        redeem_call.recover_detected_redemptions().await;
+        journal.recover_alpaca_called_redemptions().await;
+        burn.recover_burning_redemptions().await;
     });
 }
 

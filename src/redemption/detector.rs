@@ -570,11 +570,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -583,6 +586,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -647,11 +651,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -660,6 +667,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -712,11 +720,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -725,6 +736,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -779,11 +791,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -792,6 +807,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -846,11 +862,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -859,6 +878,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -921,11 +941,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -934,6 +957,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
