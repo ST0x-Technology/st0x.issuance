@@ -307,59 +307,6 @@ impl View<Self> for Lifecycle<Account, Never> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) enum AccountView {
-    Unavailable,
-    Registered {
-        client_id: ClientId,
-        email: Email,
-        registered_at: DateTime<Utc>,
-    },
-    LinkedToAlpaca {
-        client_id: ClientId,
-        email: Email,
-        alpaca_account: AlpacaAccountNumber,
-        whitelisted_wallets: Vec<Address>,
-        registered_at: DateTime<Utc>,
-        linked_at: DateTime<Utc>,
-    },
-}
-
-impl Default for AccountView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
-}
-
-impl From<&Lifecycle<Account, Never>> for AccountView {
-    fn from(lifecycle: &Lifecycle<Account, Never>) -> Self {
-        match lifecycle {
-            Lifecycle::Uninitialized | Lifecycle::Failed { .. } => {
-                Self::Unavailable
-            }
-            Lifecycle::Live(account) => {
-                match (&account.alpaca, account.linked_at) {
-                    (Some(alpaca), Some(linked_at)) => Self::LinkedToAlpaca {
-                        client_id: account.client_id,
-                        email: account.email.clone(),
-                        alpaca_account: alpaca.clone(),
-                        whitelisted_wallets: account
-                            .whitelisted_wallets
-                            .clone(),
-                        registered_at: account.registered_at,
-                        linked_at,
-                    },
-                    _ => Self::Registered {
-                        client_id: account.client_id,
-                        email: account.email.clone(),
-                        registered_at: account.registered_at,
-                    },
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccountViewError {
     #[error("Database error: {0}")]
@@ -372,7 +319,7 @@ pub(crate) enum AccountViewError {
 pub(crate) async fn find_by_client_id(
     pool: &Pool<Sqlite>,
     client_id: &ClientId,
-) -> Result<Option<AccountView>, AccountViewError> {
+) -> Result<Option<Account>, AccountViewError> {
     let client_id_str = client_id.to_string();
     let row = sqlx::query!(
         r#"
@@ -391,13 +338,17 @@ pub(crate) async fn find_by_client_id(
 
     let lifecycle: Lifecycle<Account, Never> =
         serde_json::from_str(&row.payload)?;
-    Ok(Some(AccountView::from(&lifecycle)))
+
+    match lifecycle {
+        Lifecycle::Live(account) => Ok(Some(account)),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) async fn find_by_email(
     pool: &Pool<Sqlite>,
     email: &Email,
-) -> Result<Option<AccountView>, AccountViewError> {
+) -> Result<Option<Account>, AccountViewError> {
     let row = sqlx::query!(
         r#"
         SELECT payload as "payload: String"
@@ -415,13 +366,17 @@ pub(crate) async fn find_by_email(
 
     let lifecycle: Lifecycle<Account, Never> =
         serde_json::from_str(&row.payload)?;
-    Ok(Some(AccountView::from(&lifecycle)))
+
+    match lifecycle {
+        Lifecycle::Live(account) => Ok(Some(account)),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) async fn find_by_wallet(
     pool: &Pool<Sqlite>,
     wallet: &Address,
-) -> Result<Option<AccountView>, AccountViewError> {
+) -> Result<Option<Account>, AccountViewError> {
     let wallet_str = format!("{wallet:#x}");
     let row = sqlx::query!(
         r#"
@@ -444,15 +399,22 @@ pub(crate) async fn find_by_wallet(
 
     let lifecycle: Lifecycle<Account, Never> =
         serde_json::from_str(&row.payload)?;
-    Ok(Some(AccountView::from(&lifecycle)))
+
+    match lifecycle {
+        Lifecycle::Live(account) => Ok(Some(account)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use cqrs_es::{Aggregate, test::TestFramework};
+    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+    use cqrs_es::{Aggregate, CqrsFramework, test::TestFramework};
+    use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     use super::*;
@@ -840,6 +802,23 @@ mod tests {
         pool
     }
 
+    fn setup_account_cqrs(
+        pool: &Pool<Sqlite>,
+    ) -> CqrsFramework<
+        Lifecycle<Account, Never>,
+        PersistedEventStore<SqliteEventRepository, Lifecycle<Account, Never>>,
+    > {
+        let view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(), "account_view".to_string()
+        ));
+
+        let query = GenericQuery::new(view_repo);
+        sqlite_cqrs(pool.clone(), vec![Box::new(query)], ())
+    }
+
     #[test]
     fn test_view_update_from_registered_event() {
         let client_id = ClientId::new();
@@ -865,20 +844,13 @@ mod tests {
 
         lifecycle.update(&envelope);
 
-        let view = AccountView::from(&lifecycle);
-
-        let AccountView::Registered {
-            client_id: view_client_id,
-            email: view_email,
-            registered_at: view_registered_at,
-        } = view
-        else {
-            panic!("Expected Registered, got {view:?}")
+        let Lifecycle::Live(account) = lifecycle else {
+            panic!("Expected Live, got {lifecycle:?}")
         };
 
-        assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email, email);
-        assert_eq!(view_registered_at, registered_at);
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email, email);
+        assert_eq!(account.registered_at, registered_at);
     }
 
     #[test]
@@ -914,80 +886,51 @@ mod tests {
 
         lifecycle.update(&envelope);
 
-        let view = AccountView::from(&lifecycle);
-
-        let AccountView::LinkedToAlpaca {
-            client_id: view_client_id,
-            email: view_email,
-            alpaca_account: view_alpaca,
-            whitelisted_wallets,
-            registered_at: view_registered_at,
-            linked_at: view_linked_at,
-        } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
+        let Lifecycle::Live(account) = lifecycle else {
+            panic!("Expected Live, got {lifecycle:?}")
         };
 
-        assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email, email);
-        assert_eq!(view_alpaca, alpaca);
-        assert!(whitelisted_wallets.is_empty());
-        assert_eq!(view_registered_at, registered_at);
-        assert_eq!(view_linked_at, linked_at);
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email, email);
+        assert_eq!(account.alpaca, Some(alpaca));
+        assert!(account.whitelisted_wallets.is_empty());
+        assert_eq!(account.registered_at, registered_at);
+        assert_eq!(account.linked_at, Some(linked_at));
     }
 
     #[tokio::test]
-    async fn test_find_by_client_id_returns_view() {
+    async fn test_find_by_client_id_returns_account() {
         let pool = setup_test_db().await;
+        let cqrs = setup_account_cqrs(&pool);
 
         let client_id = ClientId::new();
         let email = Email("client@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
-        let registered_at = Utc::now();
-        let linked_at = Utc::now();
 
-        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
-            client_id,
-            email: email.clone(),
-            registered_at,
-            alpaca: Some(alpaca_account.clone()),
-            linked_at: Some(linked_at),
-            whitelisted_wallets: Vec::new(),
-        });
-
-        let payload =
-            serde_json::to_string(&lifecycle).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
+        cqrs.execute(
+            &client_id.to_string(),
+            AccountCommand::Register { client_id, email: email.clone() },
         )
-        .execute(&pool)
         .await
-        .expect("Failed to insert view");
+        .expect("Failed to register");
 
-        let view = find_by_client_id(&pool, &client_id)
+        cqrs.execute(
+            &client_id.to_string(),
+            AccountCommand::LinkToAlpaca {
+                alpaca_account: alpaca_account.clone(),
+            },
+        )
+        .await
+        .expect("Failed to link");
+
+        let account = find_by_client_id(&pool, &client_id)
             .await
             .expect("Query should succeed")
-            .expect("View should exist");
+            .expect("Account should exist");
 
-        let AccountView::LinkedToAlpaca {
-            client_id: found_client_id,
-            email: found_email,
-            alpaca_account: found_alpaca,
-            ..
-        } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
-        };
-
-        assert_eq!(found_client_id, client_id);
-        assert_eq!(found_email, email);
-        assert_eq!(found_alpaca, alpaca_account);
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email, email);
+        assert_eq!(account.alpaca, Some(alpaca_account));
     }
 
     #[tokio::test]
@@ -1004,107 +947,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_by_email_returns_linked_to_alpaca_view() {
+    async fn test_find_by_email_returns_linked_account() {
         let pool = setup_test_db().await;
+        let cqrs = setup_account_cqrs(&pool);
 
         let client_id = ClientId::new();
         let email = Email("email@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA999".to_string());
-        let registered_at = Utc::now();
-        let linked_at = Utc::now();
 
-        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
-            client_id,
-            email: email.clone(),
-            registered_at,
-            alpaca: Some(alpaca_account.clone()),
-            linked_at: Some(linked_at),
-            whitelisted_wallets: Vec::new(),
-        });
-
-        let payload =
-            serde_json::to_string(&lifecycle).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
+        cqrs.execute(
+            &client_id.to_string(),
+            AccountCommand::Register { client_id, email: email.clone() },
         )
-        .execute(&pool)
         .await
-        .expect("Failed to insert view");
+        .expect("Failed to register");
 
-        let view = find_by_email(&pool, &email)
+        cqrs.execute(
+            &client_id.to_string(),
+            AccountCommand::LinkToAlpaca {
+                alpaca_account: alpaca_account.clone(),
+            },
+        )
+        .await
+        .expect("Failed to link");
+
+        let account = find_by_email(&pool, &email)
             .await
             .expect("Query should succeed")
-            .expect("View should exist");
+            .expect("Account should exist");
 
-        let AccountView::LinkedToAlpaca {
-            client_id: found_client_id,
-            email: found_email,
-            alpaca_account: found_alpaca,
-            ..
-        } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
-        };
-
-        assert_eq!(found_client_id, client_id);
-        assert_eq!(found_email, email);
-        assert_eq!(found_alpaca, alpaca_account);
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email, email);
+        assert_eq!(account.alpaca, Some(alpaca_account));
     }
 
     #[tokio::test]
-    async fn test_find_by_email_returns_registered_view() {
+    async fn test_find_by_email_returns_registered_account() {
         let pool = setup_test_db().await;
+        let cqrs = setup_account_cqrs(&pool);
 
         let client_id = ClientId::new();
         let email = Email("registered@example.com".to_string());
-        let registered_at = Utc::now();
 
-        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
-            client_id,
-            email: email.clone(),
-            registered_at,
-            alpaca: None,
-            linked_at: None,
-            whitelisted_wallets: Vec::new(),
-        });
-
-        let payload =
-            serde_json::to_string(&lifecycle).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
+        cqrs.execute(
+            &client_id.to_string(),
+            AccountCommand::Register { client_id, email: email.clone() },
         )
-        .execute(&pool)
         .await
-        .expect("Failed to insert view");
+        .expect("Failed to register");
 
-        let view = find_by_email(&pool, &email)
+        let account = find_by_email(&pool, &email)
             .await
             .expect("Query should succeed")
-            .expect("View should exist");
+            .expect("Account should exist");
 
-        let AccountView::Registered {
-            client_id: found_client_id,
-            email: found_email,
-            ..
-        } = view
-        else {
-            panic!("Expected Registered, got {view:?}")
-        };
-
-        assert_eq!(found_client_id, client_id);
-        assert_eq!(found_email, email);
+        assert_eq!(account.client_id, client_id);
+        assert_eq!(account.email, email);
+        assert!(account.alpaca.is_none());
     }
 
     #[tokio::test]
@@ -1149,14 +1048,11 @@ mod tests {
 
         lifecycle.update(&envelope);
 
-        let view = AccountView::from(&lifecycle);
-
-        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
+        let Lifecycle::Live(account) = lifecycle else {
+            panic!("Expected Live, got {lifecycle:?}")
         };
 
-        assert_eq!(whitelisted_wallets.len(), 1);
-        assert_eq!(whitelisted_wallets[0], wallet);
+        assert_eq!(account.whitelisted_wallets.len(), 1);
+        assert_eq!(account.whitelisted_wallets[0], wallet);
     }
 }

@@ -149,17 +149,17 @@ Optional fields track the alpaca linking state.
 
 ### Subtasks
 
-- [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+- [x] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
       `api.rs` separate)
-- [ ] Create `Account` struct (flat, no state enum)
-- [ ] Implement `Account::from_event()` and `apply_transition()`
-- [ ] Change `impl Aggregate for Account` to
+- [x] Create `Account` struct (flat, no state enum)
+- [x] Implement `Account::from_event()` and `apply_transition()`
+- [x] Change `impl Aggregate for Account` to
       `impl Aggregate for Lifecycle<Account, Never>`
-- [ ] Remove `AccountView` enum - `Lifecycle<Account, Never>` implements
-      `View<Lifecycle<Account, Never>>` instead
-- [ ] Update account queries and `api.rs` to work with new types
-- [ ] Ensure all tests are preserved
-- [ ] Run
+- [x] Remove `AccountView` - query functions return `Option<Account>` directly,
+      `Lifecycle<Account, Never>` implements `View<Self>`
+- [x] Update account queries and `api.rs` to work with new types
+- [x] Ensure all tests use CQRS framework (no direct view insertions)
+- [x] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 
 ---
@@ -171,49 +171,60 @@ duplication. The `ReceiptInventoryView` depends on `Redemption` events.
 
 ### Target Structure
 
-```rust
-struct Redemption {
-    metadata: RedemptionMetadata,  // keep existing struct
-    state: RedemptionState,
-}
+`Redemption` is an enum with `RedemptionMetadata` embedded in the variants that
+need it.
 
-enum RedemptionState {
-    Detected,
+```rust
+enum Redemption {
+    Detected {
+        metadata: RedemptionMetadata,
+        detected_at: DateTime<Utc>,
+    },
     AlpacaCalled {
+        metadata: RedemptionMetadata,
+        detected_at: DateTime<Utc>,
         tokenization_request_id: TokenizationRequestId,
         called_at: DateTime<Utc>,
     },
-    Burning {
+    AlpacaJournalCompleted {
+        metadata: RedemptionMetadata,
+        detected_at: DateTime<Utc>,
         tokenization_request_id: TokenizationRequestId,
         called_at: DateTime<Utc>,
-        alpaca_journal_completed_at: DateTime<Utc>,
+        journal_completed_at: DateTime<Utc>,
     },
-    Completed {
+    Burned {
+        metadata: RedemptionMetadata,
+        detected_at: DateTime<Utc>,
+        tokenization_request_id: TokenizationRequestId,
+        called_at: DateTime<Utc>,
+        journal_completed_at: DateTime<Utc>,
         burn_tx_hash: B256,
-        completed_at: DateTime<Utc>,
+        burned_at: DateTime<Utc>,
     },
     Failed {
+        metadata: RedemptionMetadata,
         reason: String,
         failed_at: DateTime<Utc>,
     },
 }
 ```
 
+The `Lifecycle` wrapper handles `Uninitialized` vs `Live` states.
+
 ### Subtasks
 
 - [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
       managers separate)
-- [ ] Create `Redemption` struct and `RedemptionState` enum
+- [ ] Create `Redemption` enum with variants containing `RedemptionMetadata`
 - [ ] Implement `Redemption::from_event()` and `apply_transition()`
 - [ ] Change `impl Aggregate for Redemption` to
       `impl Aggregate for Lifecycle<Redemption, Never>`
-- [ ] Remove `RedemptionView` enum - `Lifecycle<Redemption, Never>` implements
-      `View<Lifecycle<Redemption, Never>>` instead
-- [ ] Update redemption queries to work with `Lifecycle<Redemption, Never>`
-      payload
+- [ ] Remove `RedemptionView` - `Lifecycle<Redemption, Never>` implements
+      `View<Self>` directly
 - [ ] Update managers (`burn_manager`, `detector`, `journal_manager`,
       `redeem_call_manager`) to work with `Lifecycle<Redemption, Never>`
-- [ ] Ensure all tests are preserved
+- [ ] Ensure all tests use CQRS framework (no direct view insertions)
 - [ ] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 

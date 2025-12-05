@@ -13,7 +13,7 @@ use super::{
     Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
-use crate::account::{AccountView, AccountViewError, ClientId, find_by_wallet};
+use crate::account::{AccountViewError, ClientId, find_by_wallet};
 use crate::bindings;
 use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::{
@@ -242,17 +242,17 @@ where
         &self,
         wallet: &Address,
     ) -> Result<ClientId, RedemptionMonitorError> {
-        let account_view = find_by_wallet(&self.pool, wallet).await?.ok_or(
+        let account = find_by_wallet(&self.pool, wallet).await?.ok_or(
             RedemptionMonitorError::AccountNotFound { wallet: *wallet },
         )?;
 
-        let AccountView::LinkedToAlpaca { client_id, .. } = account_view else {
+        if account.alpaca.is_none() {
             return Err(RedemptionMonitorError::AccountNotLinked {
                 wallet: *wallet,
             });
-        };
+        }
 
-        Ok(client_id)
+        Ok(account.client_id)
     }
 
     async fn handle_alpaca_and_polling(
