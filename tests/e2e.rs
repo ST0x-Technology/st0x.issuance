@@ -86,7 +86,7 @@ async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .remote("127.0.0.1:8000".parse().unwrap())
         .body(json!({"email": "user@example.com"}).to_string())
         .dispatch()
         .await;
@@ -102,7 +102,7 @@ async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({"email": "user@example.com", "account": "USER123"})
                 .to_string(),
@@ -121,7 +121,7 @@ async fn setup_account(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .remote("127.0.0.1:8000".parse().unwrap())
         .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
@@ -145,7 +145,7 @@ async fn perform_mint_flow(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({
                 "tokenization_request_id": "alp-mint-789",
@@ -171,7 +171,7 @@ async fn perform_mint_flow(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
-        .header(rocket::http::Header::new("X-Real-IP", "127.0.0.1"))
+        .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({
                 "tokenization_request_id": "alp-mint-789",

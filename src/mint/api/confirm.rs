@@ -275,7 +275,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -343,7 +343,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -412,7 +412,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -497,7 +497,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -585,7 +585,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -670,7 +670,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -762,7 +762,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
@@ -807,7 +807,7 @@ mod tests {
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
-            .header(Header::new("X-Real-IP", "127.0.0.1"))
+            .remote("127.0.0.1:8000".parse().unwrap())
             .body(request_body.to_string())
             .dispatch()
             .await;
