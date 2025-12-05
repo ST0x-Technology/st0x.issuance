@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
@@ -23,7 +24,7 @@ use crate::redemption::{
 };
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
+    UnderlyingSymbol,
 };
 
 pub mod account;
@@ -50,9 +51,8 @@ pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 
-#[cfg(test)]
 pub(crate) type TokenizedAssetCqrs =
-    SqliteCqrs<tokenized_asset::TokenizedAsset>;
+    SqliteCqrs<Lifecycle<TokenizedAsset, Never>>;
 
 pub(crate) type MintCqrs = Arc<SqliteCqrs<mint::Mint>>;
 pub(crate) type MintEventStore =
@@ -154,8 +154,6 @@ pub(crate) enum QuantityConversionError {
     ParseFailed(#[from] rust_decimal::Error),
 }
 
-type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
-
 /// Initializes and configures the Rocket web server with all necessary state.
 ///
 /// Sets up database connections, CQRS infrastructure, service managers, and mounts
@@ -244,7 +242,7 @@ pub async fn initialize_rocket(
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
     vault: Address,
-) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
+) -> Result<(AccountCqrs, TokenizedAssetCqrs), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -255,8 +253,8 @@ async fn setup_basic_cqrs(
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
     let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
+        Lifecycle<TokenizedAsset, Never>,
+        Lifecycle<TokenizedAsset, Never>,
     >::new(
         pool.clone(),
         "tokenized_asset_view".to_string(),
@@ -427,7 +425,7 @@ fn spawn_redemption_detector(
 }
 
 async fn seed_initial_assets(
-    cqrs: &TokenizedAssetCqrsInternal,
+    cqrs: &TokenizedAssetCqrs,
     vault: Address,
 ) -> Result<(), anyhow::Error> {
     let assets = vec![("AAPL", "tAAPL", "base", vault)];

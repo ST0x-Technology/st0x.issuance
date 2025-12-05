@@ -19,11 +19,9 @@ use crate::account::{
 };
 use crate::bindings;
 use crate::mint::IssuerRequestId;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets,
-};
 use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
+    Network, TokenSymbol, TokenizedAssetViewError, UnderlyingSymbol,
+    list_enabled_assets,
 };
 use crate::{Quantity, QuantityConversionError};
 
@@ -188,15 +186,12 @@ where
 
         assets
             .into_iter()
-            .find_map(|view| match view {
-                TokenizedAssetView::Asset {
-                    underlying,
-                    token,
-                    network,
-                    vault: addr,
-                    ..
-                } if addr == self.vault => Some((underlying, token, network)),
-                _ => None,
+            .find_map(|asset| {
+                if asset.vault == self.vault {
+                    Some((asset.underlying, asset.token, asset.network))
+                } else {
+                    None
+                }
             })
             .ok_or(RedemptionMonitorError::NoMatchingAsset {
                 vault: self.vault,
@@ -409,11 +404,12 @@ mod tests {
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
+    use crate::lifecycle::{Lifecycle, Never};
     use crate::mint::IssuerRequestId;
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol, view::TokenizedAssetView,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
@@ -438,8 +434,8 @@ mod tests {
             .expect("Failed to run migrations");
 
         let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
+            Lifecycle<TokenizedAsset, Never>,
+            Lifecycle<TokenizedAsset, Never>,
         >::new(
             pool.clone(),
             "tokenized_asset_view".to_string(),

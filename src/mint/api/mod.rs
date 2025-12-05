@@ -41,9 +41,7 @@ pub(crate) enum MintApiError {
     ClientNotEligible,
 
     #[error("Failed to query enabled assets")]
-    AssetQueryFailed(
-        #[source] crate::tokenized_asset::view::TokenizedAssetViewError,
-    ),
+    AssetQueryFailed(#[source] crate::tokenized_asset::TokenizedAssetViewError),
 
     #[error("Failed to query account")]
     AccountQueryFailed(#[source] crate::account::view::AccountViewError),
@@ -185,10 +183,10 @@ pub(crate) async fn validate_asset_exists(
         r#"
         SELECT COUNT(*) as "count: i64"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Asset.underlying') = ?
-            AND json_extract(payload, '$.Asset.token') = ?
-            AND json_extract(payload, '$.Asset.network') = ?
-            AND json_extract(payload, '$.Asset.enabled') = 1
+        WHERE json_extract(payload, '$.Live.underlying') = ?
+            AND json_extract(payload, '$.Live.token') = ?
+            AND json_extract(payload, '$.Live.network') = ?
+            AND json_extract(payload, '$.Live.enabled') = 1
         "#,
         underlying_str,
         token_str,

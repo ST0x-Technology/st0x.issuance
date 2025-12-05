@@ -106,19 +106,21 @@ struct TokenizedAsset {
 
 ### Subtasks
 
-- [ ] Create `TokenizedAsset` struct (replaces enum)
-- [ ] Implement `TokenizedAsset::from_event()` for `Added` event
-- [ ] Implement `TokenizedAsset::apply_transition()` (returns `Mismatch` for all
-      events since no transitions exist)
-- [ ] Change `impl Aggregate for TokenizedAsset` to
+- [x] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+      `api.rs` separate)
+- [x] Create `TokenizedAsset` struct (replaces enum)
+- [x] Implement `TokenizedAsset::from_event()` and `apply_transition()`
+- [x] Change `impl Aggregate for TokenizedAsset` to
       `impl Aggregate for Lifecycle<TokenizedAsset, Never>`
-- [ ] Update `handle()` to use `self.live()` for state checking
-- [ ] Remove `TokenizedAssetView` enum - `Lifecycle<TokenizedAsset, Never>`
+- [x] Remove `TokenizedAssetView` enum - `Lifecycle<TokenizedAsset, Never>`
       implements `View<Lifecycle<TokenizedAsset, Never>>` instead
-- [ ] Update `list_enabled_assets` query to work with
+- [x] Update `list_enabled_assets` query to work with
       `Lifecycle<TokenizedAsset, Never>` payload
-- [ ] Update tests to use `TestFramework<Lifecycle<TokenizedAsset, Never>>`
-- [ ] Run
+- [x] Update `api.rs` to work with new types
+- [x] Update other query references (`validate_asset_available` in mint/api)
+- [x] Update lib.rs and test_utils.rs wiring
+- [x] Ensure all tests are preserved (aggregate tests, view tests, API tests)
+- [x] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 
 ---
@@ -150,17 +152,16 @@ enum AccountState {
 
 ### Subtasks
 
+- [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+      `api.rs` separate)
 - [ ] Create `Account` struct and `AccountState` enum
-- [ ] Implement `Account::from_event()` for `Registered` event
-- [ ] Implement `Account::apply_transition()` for `LinkedToAlpaca` and
-      `WalletWhitelisted` events
+- [ ] Implement `Account::from_event()` and `apply_transition()`
 - [ ] Change `impl Aggregate for Account` to
       `impl Aggregate for Lifecycle<Account, Never>`
-- [ ] Update `handle()` to use `self.live()` for state checking
 - [ ] Remove `AccountView` enum - `Lifecycle<Account, Never>` implements
       `View<Lifecycle<Account, Never>>` instead
-- [ ] Update account queries to work with `Lifecycle<Account, Never>` payload
-- [ ] Update tests to use `TestFramework<Lifecycle<Account, Never>>`
+- [ ] Update account queries and `api.rs` to work with new types
+- [ ] Ensure all tests are preserved
 - [ ] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 
@@ -203,19 +204,19 @@ enum RedemptionState {
 
 ### Subtasks
 
+- [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+      managers separate)
 - [ ] Create `Redemption` struct and `RedemptionState` enum
-- [ ] Implement `Redemption::from_event()` for `Detected` event
-- [ ] Implement `Redemption::apply_transition()` for all transition events
+- [ ] Implement `Redemption::from_event()` and `apply_transition()`
 - [ ] Change `impl Aggregate for Redemption` to
       `impl Aggregate for Lifecycle<Redemption, Never>`
-- [ ] Update `handle()` to use `self.live()` for state checking
 - [ ] Remove `RedemptionView` enum - `Lifecycle<Redemption, Never>` implements
       `View<Lifecycle<Redemption, Never>>` instead
 - [ ] Update redemption queries to work with `Lifecycle<Redemption, Never>`
       payload
 - [ ] Update managers (`burn_manager`, `detector`, `journal_manager`,
       `redeem_call_manager`) to work with `Lifecycle<Redemption, Never>`
-- [ ] Update tests to use `TestFramework<Lifecycle<Redemption, Never>>`
+- [ ] Ensure all tests are preserved
 - [ ] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 
@@ -284,19 +285,19 @@ enum MintState {
 
 ### Subtasks
 
+- [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+      `api.rs` and managers separate)
 - [ ] Create `MintRequest` struct for immutable request data
 - [ ] Create `Mint` struct and `MintState` enum
-- [ ] Implement `Mint::from_event()` for `Initiated` event
-- [ ] Implement `Mint::apply_transition()` for all transition events
+- [ ] Implement `Mint::from_event()` and `apply_transition()`
 - [ ] Change `impl Aggregate for Mint` to
       `impl Aggregate for Lifecycle<Mint, Never>`
-- [ ] Update `handle()` to use `self.live()` for state checking
 - [ ] Remove `MintView` enum - `Lifecycle<Mint, Never>` implements
       `View<Lifecycle<Mint, Never>>` instead
-- [ ] Update mint queries to work with `Lifecycle<Mint, Never>` payload
+- [ ] Update mint queries and `api.rs` to work with new types
 - [ ] Update managers (`mint_manager`, `callback_manager`) to work with
       `Lifecycle<Mint, Never>`
-- [ ] Update tests to use `TestFramework<Lifecycle<Mint, Never>>`
+- [ ] Ensure all tests are preserved
 - [ ] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 

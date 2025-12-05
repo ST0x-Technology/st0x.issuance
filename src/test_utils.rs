@@ -25,11 +25,12 @@ use crate::bindings::{
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
 use crate::config::{Config, LogLevel};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
+    UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
 
@@ -98,8 +99,8 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Setup TokenizedAsset CQRS
     let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
+        Lifecycle<TokenizedAsset, Never>,
+        Lifecycle<TokenizedAsset, Never>,
     >::new(
         pool.clone(),
         "tokenized_asset_view".to_string(),
@@ -167,7 +168,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 }
 
 async fn seed_test_assets(
-    cqrs: &SqliteCqrs<TokenizedAsset>,
+    cqrs: &SqliteCqrs<Lifecycle<TokenizedAsset, Never>>,
 ) -> Result<(), anyhow::Error> {
     let assets = vec![
         (
