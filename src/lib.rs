@@ -36,6 +36,7 @@ pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
+pub(crate) mod lifecycle;
 pub(crate) mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;

@@ -78,11 +78,10 @@ Copy the lifecycle infrastructure from `st0x.liquidity-b`.
 
 ### Subtasks
 
-- [ ] Copy `src/lifecycle.rs` from `st0x.liquidity-b/src/lifecycle.rs`
-- [ ] Add `mod lifecycle;` to `src/lib.rs`
-- [ ] Re-export `Lifecycle`, `LifecycleError`, `Never` as `pub(crate)`
-- [ ] Run
-      `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
+- [x] Copy `src/lifecycle.rs` from `st0x.liquidity-b/src/lifecycle.rs`
+- [x] Add `mod lifecycle;` to `src/lib.rs`
+- [x] Run tests and fmt (clippy has expected dead_code warning until aggregates
+      are migrated)
 
 ---
 
