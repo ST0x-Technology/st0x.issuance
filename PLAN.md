@@ -137,24 +137,21 @@ struct Account {
     client_id: ClientId,
     email: Email,
     registered_at: DateTime<Utc>,
-    state: AccountState,
-}
-
-enum AccountState {
-    Registered,
-    LinkedToAlpaca {
-        alpaca_account: AlpacaAccountNumber,
-        whitelisted_wallets: Vec<Address>,
-        linked_at: DateTime<Utc>,
-    },
+    alpaca_account: Option<AlpacaAccountNumber>,
+    whitelisted_wallets: Vec<Address>,
+    linked_at: Option<DateTime<Utc>>,
 }
 ```
+
+The `Lifecycle` wrapper handles `Uninitialized` vs `Live` states. Within `Live`,
+all accounts start as registered (no alpaca link), then optionally get linked.
+Optional fields track the alpaca linking state.
 
 ### Subtasks
 
 - [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
       `api.rs` separate)
-- [ ] Create `Account` struct and `AccountState` enum
+- [ ] Create `Account` struct (flat, no state enum)
 - [ ] Implement `Account::from_event()` and `apply_transition()`
 - [ ] Change `impl Aggregate for Account` to
       `impl Aggregate for Lifecycle<Account, Never>`

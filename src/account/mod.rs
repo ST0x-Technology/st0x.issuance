@@ -1,25 +1,20 @@
 mod api;
-mod cmd;
-mod event;
-pub(crate) mod view;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::Aggregate;
+use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use sqlx::{Sqlite, encode::IsNull, sqlite::SqliteArgumentValue};
+use sqlx::{Pool, Sqlite, encode::IsNull, sqlite::SqliteArgumentValue};
 use std::str::FromStr;
-use tracing::error;
 use uuid::Uuid;
+
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
 pub use api::{
     AccountLinkResponse, RegisterAccountResponse, WhitelistWalletResponse,
 };
 pub(crate) use api::{connect_account, register_account, whitelist_wallet};
-pub(crate) use cmd::AccountCommand;
-pub(crate) use event::AccountEvent;
-pub(crate) use view::AccountView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Email(String);
@@ -100,8 +95,221 @@ impl<'q> sqlx::Encode<'q, Sqlite> for ClientId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Account {
-    NotRegistered,
+pub(crate) enum AccountCommand {
+    Register { client_id: ClientId, email: Email },
+    LinkToAlpaca { alpaca_account: AlpacaAccountNumber },
+    WhitelistWallet { wallet: Address },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) enum AccountEvent {
+    Registered {
+        client_id: ClientId,
+        email: Email,
+        registered_at: DateTime<Utc>,
+    },
+    LinkedToAlpaca {
+        alpaca_account: AlpacaAccountNumber,
+        linked_at: DateTime<Utc>,
+    },
+    WalletWhitelisted {
+        wallet: Address,
+        whitelisted_at: DateTime<Utc>,
+    },
+}
+
+impl DomainEvent for AccountEvent {
+    fn event_type(&self) -> String {
+        match self {
+            Self::Registered { .. } => "AccountEvent::Registered".to_string(),
+            Self::LinkedToAlpaca { .. } => {
+                "AccountEvent::LinkedToAlpaca".to_string()
+            }
+            Self::WalletWhitelisted { .. } => {
+                "AccountEvent::WalletWhitelisted".to_string()
+            }
+        }
+    }
+
+    fn event_version(&self) -> String {
+        "1.0".to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Account {
+    pub(crate) client_id: ClientId,
+    pub(crate) email: Email,
+    pub(crate) registered_at: DateTime<Utc>,
+    pub(crate) alpaca: Option<AlpacaAccountNumber>,
+    pub(crate) linked_at: Option<DateTime<Utc>>,
+    pub(crate) whitelisted_wallets: Vec<Address>,
+}
+
+impl Account {
+    pub(crate) fn from_event(
+        event: &AccountEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match event {
+            AccountEvent::Registered { client_id, email, registered_at } => {
+                Ok(Self {
+                    client_id: *client_id,
+                    email: email.clone(),
+                    registered_at: *registered_at,
+                    alpaca: None,
+                    linked_at: None,
+                    whitelisted_wallets: Vec::new(),
+                })
+            }
+            _ => Err(LifecycleError::Mismatch {
+                state: "Uninitialized".to_string(),
+                event: event.event_type(),
+            }),
+        }
+    }
+
+    pub(crate) fn apply_transition(
+        event: &AccountEvent,
+        current: &Self,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match event {
+            AccountEvent::Registered { .. } => Err(LifecycleError::Mismatch {
+                state: "Live".to_string(),
+                event: event.event_type(),
+            }),
+            AccountEvent::LinkedToAlpaca { alpaca_account, linked_at } => {
+                if current.alpaca.is_some() {
+                    return Err(LifecycleError::Mismatch {
+                        state: "already linked".to_string(),
+                        event: event.event_type(),
+                    });
+                }
+                Ok(Self {
+                    client_id: current.client_id,
+                    email: current.email.clone(),
+                    registered_at: current.registered_at,
+                    alpaca: Some(alpaca_account.clone()),
+                    linked_at: Some(*linked_at),
+                    whitelisted_wallets: Vec::new(),
+                })
+            }
+            AccountEvent::WalletWhitelisted { wallet, .. } => {
+                if current.alpaca.is_none() {
+                    return Err(LifecycleError::Mismatch {
+                        state: "not linked".to_string(),
+                        event: event.event_type(),
+                    });
+                }
+                let mut new_wallets = current.whitelisted_wallets.clone();
+                new_wallets.push(*wallet);
+                Ok(Self {
+                    client_id: current.client_id,
+                    email: current.email.clone(),
+                    registered_at: current.registered_at,
+                    alpaca: current.alpaca.clone(),
+                    linked_at: current.linked_at,
+                    whitelisted_wallets: new_wallets,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub(crate) enum AccountError {
+    #[error("Invalid email format: {email}")]
+    InvalidEmail { email: String },
+    #[error("Account already registered for email: {email}")]
+    AccountAlreadyRegistered { email: String },
+    #[error("Account is already linked to Alpaca")]
+    AlreadyLinkedToAlpaca,
+    #[error("Account is not linked to Alpaca")]
+    NotLinkedToAlpaca,
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError<Never>),
+}
+
+#[async_trait]
+impl Aggregate for Lifecycle<Account, Never> {
+    type Command = AccountCommand;
+    type Event = AccountEvent;
+    type Error = AccountError;
+    type Services = ();
+
+    fn aggregate_type() -> String {
+        "Account".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        *self = self
+            .clone()
+            .transition(&event, Account::apply_transition)
+            .or_initialize(&event, Account::from_event);
+    }
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match (self.live(), &command) {
+            (Ok(_), AccountCommand::Register { email, .. }) => {
+                Err(AccountError::AccountAlreadyRegistered {
+                    email: email.as_str().to_string(),
+                })
+            }
+
+            (Err(_), AccountCommand::Register { client_id, email }) => {
+                Ok(vec![AccountEvent::Registered {
+                    client_id: *client_id,
+                    email: email.clone(),
+                    registered_at: Utc::now(),
+                }])
+            }
+
+            (Err(e), _) => Err(e.into()),
+
+            (Ok(account), AccountCommand::LinkToAlpaca { alpaca_account }) => {
+                if account.alpaca.is_some() {
+                    return Err(AccountError::AlreadyLinkedToAlpaca);
+                }
+
+                Ok(vec![AccountEvent::LinkedToAlpaca {
+                    alpaca_account: alpaca_account.clone(),
+                    linked_at: Utc::now(),
+                }])
+            }
+
+            (Ok(account), AccountCommand::WhitelistWallet { wallet }) => {
+                if account.alpaca.is_none() {
+                    return Err(AccountError::NotLinkedToAlpaca);
+                }
+
+                if account.whitelisted_wallets.contains(wallet) {
+                    Ok(vec![])
+                } else {
+                    Ok(vec![AccountEvent::WalletWhitelisted {
+                        wallet: *wallet,
+                        whitelisted_at: Utc::now(),
+                    }])
+                }
+            }
+        }
+    }
+}
+
+impl View<Self> for Lifecycle<Account, Never> {
+    fn update(&mut self, event: &EventEnvelope<Self>) {
+        *self = self
+            .clone()
+            .transition(&event.payload, Account::apply_transition)
+            .or_initialize(&event.payload, Account::from_event);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) enum AccountView {
+    Unavailable,
     Registered {
         client_id: ClientId,
         email: Email,
@@ -117,146 +325,140 @@ pub(crate) enum Account {
     },
 }
 
-impl Default for Account {
+impl Default for AccountView {
     fn default() -> Self {
-        Self::NotRegistered
+        Self::Unavailable
     }
 }
 
-#[async_trait]
-impl Aggregate for Account {
-    type Command = AccountCommand;
-    type Event = AccountEvent;
-    type Error = AccountError;
-    type Services = ();
-
-    fn aggregate_type() -> String {
-        "Account".to_string()
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            AccountCommand::Register { client_id, email } => {
-                if !matches!(self, Self::NotRegistered) {
-                    return Err(AccountError::AccountAlreadyRegistered {
-                        email: email.as_str().to_string(),
-                    });
-                }
-
-                let now = Utc::now();
-
-                Ok(vec![AccountEvent::Registered {
-                    client_id,
-                    email,
-                    registered_at: now,
-                }])
+impl From<&Lifecycle<Account, Never>> for AccountView {
+    fn from(lifecycle: &Lifecycle<Account, Never>) -> Self {
+        match lifecycle {
+            Lifecycle::Uninitialized | Lifecycle::Failed { .. } => {
+                Self::Unavailable
             }
-
-            AccountCommand::LinkToAlpaca { alpaca_account } => match self {
-                Self::NotRegistered => Err(AccountError::NotRegistered),
-                Self::Registered { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![AccountEvent::LinkedToAlpaca {
-                        alpaca_account,
-                        linked_at: now,
-                    }])
+            Lifecycle::Live(account) => {
+                match (&account.alpaca, account.linked_at) {
+                    (Some(alpaca), Some(linked_at)) => Self::LinkedToAlpaca {
+                        client_id: account.client_id,
+                        email: account.email.clone(),
+                        alpaca_account: alpaca.clone(),
+                        whitelisted_wallets: account
+                            .whitelisted_wallets
+                            .clone(),
+                        registered_at: account.registered_at,
+                        linked_at,
+                    },
+                    _ => Self::Registered {
+                        client_id: account.client_id,
+                        email: account.email.clone(),
+                        registered_at: account.registered_at,
+                    },
                 }
-                Self::LinkedToAlpaca { .. } => {
-                    Err(AccountError::AlreadyLinkedToAlpaca)
-                }
-            },
-
-            AccountCommand::WhitelistWallet { wallet } => match self {
-                Self::NotRegistered => Err(AccountError::NotRegistered),
-                Self::Registered { .. } => Err(AccountError::NotLinkedToAlpaca),
-                Self::LinkedToAlpaca { whitelisted_wallets, .. } => {
-                    if whitelisted_wallets.contains(&wallet) {
-                        Ok(vec![])
-                    } else {
-                        let now = Utc::now();
-
-                        Ok(vec![AccountEvent::WalletWhitelisted {
-                            wallet,
-                            whitelisted_at: now,
-                        }])
-                    }
-                }
-            },
-        }
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        match event {
-            AccountEvent::Registered { client_id, email, registered_at } => {
-                *self = Self::Registered { client_id, email, registered_at };
-            }
-
-            AccountEvent::LinkedToAlpaca { alpaca_account, linked_at } => {
-                let Self::Registered { client_id, email, registered_at } =
-                    self.clone()
-                else {
-                    error!(
-                        "LinkedToAlpaca event applied to non-Registered state"
-                    );
-                    return;
-                };
-
-                *self = Self::LinkedToAlpaca {
-                    client_id,
-                    email,
-                    alpaca_account,
-                    whitelisted_wallets: Vec::new(),
-                    registered_at,
-                    linked_at,
-                };
-            }
-
-            AccountEvent::WalletWhitelisted { wallet, .. } => {
-                let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self
-                else {
-                    error!(
-                        "WalletWhitelisted event applied to non-LinkedToAlpaca state"
-                    );
-                    return;
-                };
-
-                whitelisted_wallets.push(wallet);
             }
         }
     }
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
-pub(crate) enum AccountError {
-    #[error("Invalid email format: {email}")]
-    InvalidEmail { email: String },
-    #[error("Account already registered for email: {email}")]
-    AccountAlreadyRegistered { email: String },
-    #[error("Account is not registered")]
-    NotRegistered,
-    #[error("Account is already linked to Alpaca")]
-    AlreadyLinkedToAlpaca,
-    #[error("Account is not linked to Alpaca")]
-    NotLinkedToAlpaca,
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AccountViewError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+}
+
+pub(crate) async fn find_by_client_id(
+    pool: &Pool<Sqlite>,
+    client_id: &ClientId,
+) -> Result<Option<AccountView>, AccountViewError> {
+    let client_id_str = client_id.to_string();
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE json_extract(payload, '$.Live.client_id') = ?
+        "#,
+        client_id_str
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let lifecycle: Lifecycle<Account, Never> =
+        serde_json::from_str(&row.payload)?;
+    Ok(Some(AccountView::from(&lifecycle)))
+}
+
+pub(crate) async fn find_by_email(
+    pool: &Pool<Sqlite>,
+    email: &Email,
+) -> Result<Option<AccountView>, AccountViewError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE json_extract(payload, '$.Live.email') = ?
+        "#,
+        email.0
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let lifecycle: Lifecycle<Account, Never> =
+        serde_json::from_str(&row.payload)?;
+    Ok(Some(AccountView::from(&lifecycle)))
+}
+
+pub(crate) async fn find_by_wallet(
+    pool: &Pool<Sqlite>,
+    wallet: &Address,
+) -> Result<Option<AccountView>, AccountViewError> {
+    let wallet_str = format!("{wallet:#x}");
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM account_view
+        WHERE EXISTS(
+            SELECT 1
+            FROM json_each(payload, '$.Live.whitelisted_wallets')
+            WHERE value = ?
+        )
+        "#,
+        wallet_str
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let lifecycle: Lifecycle<Account, Never> =
+        serde_json::from_str(&row.payload)?;
+    Ok(Some(AccountView::from(&lifecycle)))
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
-    use super::{
-        Account, AccountCommand, AccountError, AccountEvent,
-        AlpacaAccountNumber, ClientId, Email,
-    };
+    use super::*;
+    use crate::lifecycle::LifecycleError;
 
-    type AccountTestFramework = TestFramework<Account>;
+    type AccountTestFramework = TestFramework<Lifecycle<Account, Never>>;
 
     #[test]
     fn test_register_creates_new_account() {
@@ -341,7 +543,9 @@ mod tests {
         AccountTestFramework::with(())
             .given_no_previous_events()
             .when(AccountCommand::LinkToAlpaca { alpaca_account })
-            .then_expect_error(AccountError::NotRegistered);
+            .then_expect_error(AccountError::Lifecycle(
+                LifecycleError::Uninitialized,
+            ));
     }
 
     #[test]
@@ -371,9 +575,9 @@ mod tests {
 
     #[test]
     fn test_apply_registered_updates_state() {
-        let mut account = Account::default();
+        let mut account: Lifecycle<Account, Never> = Lifecycle::default();
 
-        assert!(matches!(account, Account::NotRegistered));
+        assert!(matches!(account, Lifecycle::Uninitialized));
 
         let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
@@ -385,18 +589,16 @@ mod tests {
             registered_at,
         });
 
-        let Account::Registered {
-            client_id: reg_client_id,
-            email: reg_email,
-            registered_at: reg_at,
-        } = account
-        else {
-            panic!("Expected account to be Registered, got {account:?}")
+        let Lifecycle::Live(inner) = account else {
+            panic!("Expected Live state, got {account:?}")
         };
 
-        assert_eq!(reg_client_id, client_id);
-        assert_eq!(reg_email, email);
-        assert_eq!(reg_at, registered_at);
+        assert_eq!(inner.client_id, client_id);
+        assert_eq!(inner.email, email);
+        assert_eq!(inner.registered_at, registered_at);
+        assert!(inner.alpaca.is_none());
+        assert!(inner.whitelisted_wallets.is_empty());
+        assert!(inner.linked_at.is_none());
     }
 
     #[test]
@@ -405,11 +607,14 @@ mod tests {
         let email = Email("user@example.com".to_string());
         let registered_at = chrono::Utc::now();
 
-        let mut account = Account::Registered {
+        let mut account: Lifecycle<Account, Never> = Lifecycle::Live(Account {
             client_id,
             email: email.clone(),
             registered_at,
-        };
+            alpaca: None,
+            linked_at: None,
+            whitelisted_wallets: Vec::new(),
+        });
 
         let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
         let linked_at = chrono::Utc::now();
@@ -419,24 +624,15 @@ mod tests {
             linked_at,
         });
 
-        let Account::LinkedToAlpaca {
-            client_id: linked_client_id,
-            email: linked_email,
-            alpaca_account: linked_alpaca,
-            whitelisted_wallets,
-            registered_at: linked_reg_at,
-            linked_at: linked_at_timestamp,
-        } = account
-        else {
-            panic!("Expected account to be LinkedToAlpaca, got {account:?}")
+        let Lifecycle::Live(inner) = account else {
+            panic!("Expected Live state, got {account:?}")
         };
 
-        assert_eq!(linked_client_id, client_id);
-        assert_eq!(linked_email, email);
-        assert_eq!(linked_alpaca, alpaca_account);
-        assert!(whitelisted_wallets.is_empty());
-        assert_eq!(linked_reg_at, registered_at);
-        assert_eq!(linked_at_timestamp, linked_at);
+        assert_eq!(inner.client_id, client_id);
+        assert_eq!(inner.email, email);
+        assert_eq!(inner.alpaca, Some(alpaca_account));
+        assert_eq!(inner.linked_at, Some(linked_at));
+        assert!(inner.whitelisted_wallets.is_empty());
     }
 
     #[test]
@@ -525,7 +721,9 @@ mod tests {
         AccountTestFramework::with(())
             .given_no_previous_events()
             .when(AccountCommand::WhitelistWallet { wallet })
-            .then_expect_error(AccountError::NotRegistered);
+            .then_expect_error(AccountError::Lifecycle(
+                LifecycleError::Uninitialized,
+            ));
     }
 
     #[test]
@@ -570,14 +768,14 @@ mod tests {
 
     #[test]
     fn test_apply_wallet_whitelisted_adds_wallet() {
-        let mut account = Account::LinkedToAlpaca {
+        let mut account: Lifecycle<Account, Never> = Lifecycle::Live(Account {
             client_id: ClientId::new(),
             email: Email("user@example.com".to_string()),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            whitelisted_wallets: Vec::new(),
             registered_at: chrono::Utc::now(),
-            linked_at: chrono::Utc::now(),
-        };
+            alpaca: Some(AlpacaAccountNumber("ALPACA123".to_string())),
+            linked_at: Some(chrono::Utc::now()),
+            whitelisted_wallets: Vec::new(),
+        });
 
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
@@ -586,25 +784,24 @@ mod tests {
             whitelisted_at: chrono::Utc::now(),
         });
 
-        let Account::LinkedToAlpaca { whitelisted_wallets, .. } = account
-        else {
-            panic!("Expected account to be LinkedToAlpaca")
+        let Lifecycle::Live(inner) = account else {
+            panic!("Expected Live state")
         };
 
-        assert_eq!(whitelisted_wallets.len(), 1);
-        assert_eq!(whitelisted_wallets[0], wallet);
+        assert_eq!(inner.whitelisted_wallets.len(), 1);
+        assert_eq!(inner.whitelisted_wallets[0], wallet);
     }
 
     #[test]
     fn test_apply_wallet_whitelisted_adds_multiple_wallets() {
-        let mut account = Account::LinkedToAlpaca {
+        let mut account: Lifecycle<Account, Never> = Lifecycle::Live(Account {
             client_id: ClientId::new(),
             email: Email("user@example.com".to_string()),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            whitelisted_wallets: Vec::new(),
             registered_at: chrono::Utc::now(),
-            linked_at: chrono::Utc::now(),
-        };
+            alpaca: Some(AlpacaAccountNumber("ALPACA123".to_string())),
+            linked_at: Some(chrono::Utc::now()),
+            whitelisted_wallets: Vec::new(),
+        });
 
         let wallet1 = address!("0x1111111111111111111111111111111111111111");
         let wallet2 = address!("0x2222222222222222222222222222222222222222");
@@ -619,13 +816,347 @@ mod tests {
             whitelisted_at: chrono::Utc::now(),
         });
 
-        let Account::LinkedToAlpaca { whitelisted_wallets, .. } = account
-        else {
-            panic!("Expected account to be LinkedToAlpaca")
+        let Lifecycle::Live(inner) = account else {
+            panic!("Expected Live state")
         };
 
-        assert_eq!(whitelisted_wallets.len(), 2);
-        assert_eq!(whitelisted_wallets[0], wallet1);
-        assert_eq!(whitelisted_wallets[1], wallet2);
+        assert_eq!(inner.whitelisted_wallets.len(), 2);
+        assert_eq!(inner.whitelisted_wallets[0], wallet1);
+        assert_eq!(inner.whitelisted_wallets[1], wallet2);
+    }
+
+    async fn setup_test_db() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
+
+    #[test]
+    fn test_view_update_from_registered_event() {
+        let client_id = ClientId::new();
+        let email = Email("user@example.com".to_string());
+        let registered_at = Utc::now();
+
+        let event = AccountEvent::Registered {
+            client_id,
+            email: email.clone(),
+            registered_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: email.as_str().to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        let mut lifecycle: Lifecycle<Account, Never> = Lifecycle::default();
+
+        assert!(matches!(lifecycle, Lifecycle::Uninitialized));
+
+        lifecycle.update(&envelope);
+
+        let view = AccountView::from(&lifecycle);
+
+        let AccountView::Registered {
+            client_id: view_client_id,
+            email: view_email,
+            registered_at: view_registered_at,
+        } = view
+        else {
+            panic!("Expected Registered, got {view:?}")
+        };
+
+        assert_eq!(view_client_id, client_id);
+        assert_eq!(view_email, email);
+        assert_eq!(view_registered_at, registered_at);
+    }
+
+    #[test]
+    fn test_view_update_from_linked_to_alpaca_event() {
+        let client_id = ClientId::new();
+        let email = Email("user@example.com".to_string());
+        let registered_at = Utc::now();
+
+        let mut lifecycle: Lifecycle<Account, Never> =
+            Lifecycle::Live(Account {
+                client_id,
+                email: email.clone(),
+                registered_at,
+                alpaca: None,
+                linked_at: None,
+                whitelisted_wallets: Vec::new(),
+            });
+
+        let alpaca = AlpacaAccountNumber("ALPACA123".to_string());
+        let linked_at = Utc::now();
+
+        let event = AccountEvent::LinkedToAlpaca {
+            alpaca_account: alpaca.clone(),
+            linked_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: client_id.to_string(),
+            sequence: 2,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        lifecycle.update(&envelope);
+
+        let view = AccountView::from(&lifecycle);
+
+        let AccountView::LinkedToAlpaca {
+            client_id: view_client_id,
+            email: view_email,
+            alpaca_account: view_alpaca,
+            whitelisted_wallets,
+            registered_at: view_registered_at,
+            linked_at: view_linked_at,
+        } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert_eq!(view_client_id, client_id);
+        assert_eq!(view_email, email);
+        assert_eq!(view_alpaca, alpaca);
+        assert!(whitelisted_wallets.is_empty());
+        assert_eq!(view_registered_at, registered_at);
+        assert_eq!(view_linked_at, linked_at);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_client_id_returns_view() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId::new();
+        let email = Email("client@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
+        let registered_at = Utc::now();
+        let linked_at = Utc::now();
+
+        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
+            client_id,
+            email: email.clone(),
+            registered_at,
+            alpaca: Some(alpaca_account.clone()),
+            linked_at: Some(linked_at),
+            whitelisted_wallets: Vec::new(),
+        });
+
+        let payload =
+            serde_json::to_string(&lifecycle).expect("Failed to serialize");
+
+        sqlx::query!(
+            r"
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            client_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert view");
+
+        let view = find_by_client_id(&pool, &client_id)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let AccountView::LinkedToAlpaca {
+            client_id: found_client_id,
+            email: found_email,
+            alpaca_account: found_alpaca,
+            ..
+        } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+        assert_eq!(found_alpaca, alpaca_account);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_client_id_returns_none_when_not_found() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId(uuid::Uuid::new_v4());
+
+        let result = find_by_client_id(&pool, &client_id)
+            .await
+            .expect("Query should succeed");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_email_returns_linked_to_alpaca_view() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId::new();
+        let email = Email("email@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA999".to_string());
+        let registered_at = Utc::now();
+        let linked_at = Utc::now();
+
+        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
+            client_id,
+            email: email.clone(),
+            registered_at,
+            alpaca: Some(alpaca_account.clone()),
+            linked_at: Some(linked_at),
+            whitelisted_wallets: Vec::new(),
+        });
+
+        let payload =
+            serde_json::to_string(&lifecycle).expect("Failed to serialize");
+
+        sqlx::query!(
+            r"
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            client_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert view");
+
+        let view = find_by_email(&pool, &email)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let AccountView::LinkedToAlpaca {
+            client_id: found_client_id,
+            email: found_email,
+            alpaca_account: found_alpaca,
+            ..
+        } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+        assert_eq!(found_alpaca, alpaca_account);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_email_returns_registered_view() {
+        let pool = setup_test_db().await;
+
+        let client_id = ClientId::new();
+        let email = Email("registered@example.com".to_string());
+        let registered_at = Utc::now();
+
+        let lifecycle: Lifecycle<Account, Never> = Lifecycle::Live(Account {
+            client_id,
+            email: email.clone(),
+            registered_at,
+            alpaca: None,
+            linked_at: None,
+            whitelisted_wallets: Vec::new(),
+        });
+
+        let payload =
+            serde_json::to_string(&lifecycle).expect("Failed to serialize");
+
+        sqlx::query!(
+            r"
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+            client_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert view");
+
+        let view = find_by_email(&pool, &email)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let AccountView::Registered {
+            client_id: found_client_id,
+            email: found_email,
+            ..
+        } = view
+        else {
+            panic!("Expected Registered, got {view:?}")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_email_returns_none_when_not_found() {
+        let pool = setup_test_db().await;
+
+        let email = Email("nonexistent@example.com".to_string());
+
+        let result =
+            find_by_email(&pool, &email).await.expect("Query should succeed");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_view_update_from_wallet_whitelisted_event() {
+        let client_id = ClientId(uuid::Uuid::new_v4());
+
+        let mut lifecycle: Lifecycle<Account, Never> =
+            Lifecycle::Live(Account {
+                client_id,
+                email: Email("user@example.com".to_string()),
+                registered_at: Utc::now(),
+                alpaca: Some(AlpacaAccountNumber("ALPACA123".to_string())),
+                linked_at: Some(Utc::now()),
+                whitelisted_wallets: Vec::new(),
+            });
+
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let event = AccountEvent::WalletWhitelisted {
+            wallet,
+            whitelisted_at: Utc::now(),
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "user@example.com".to_string(),
+            sequence: 3,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        lifecycle.update(&envelope);
+
+        let view = AccountView::from(&lifecycle);
+
+        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert_eq!(whitelisted_wallets.len(), 1);
+        assert_eq!(whitelisted_wallets[0], wallet);
     }
 }

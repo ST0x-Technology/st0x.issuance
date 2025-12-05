@@ -6,7 +6,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::account::{
-    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
+    Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::AlpacaService;
 use crate::alpaca::service::AlpacaConfig;
@@ -81,10 +81,10 @@ pub(super) async fn setup_test_environment() -> (
         .expect("Failed to run migrations");
 
     let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(pool.clone(), "account_view".to_string()));
     let account_query = GenericQuery::new(account_view_repo);
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());

@@ -7,7 +7,7 @@ use tracing::error;
 use super::{
     ClientId, IssuerRequestId, Network, TokenSymbol, UnderlyingSymbol,
 };
-use crate::account::{AccountView, view::find_by_client_id};
+use crate::account::{AccountView, AccountViewError, find_by_client_id};
 
 mod confirm;
 mod initiate;
@@ -44,7 +44,7 @@ pub(crate) enum MintApiError {
     AssetQueryFailed(#[source] crate::tokenized_asset::TokenizedAssetViewError),
 
     #[error("Failed to query account")]
-    AccountQueryFailed(#[source] crate::account::view::AccountViewError),
+    AccountQueryFailed(#[source] AccountViewError),
 
     #[error("Failed to execute mint command")]
     CommandExecutionFailed(#[source] Box<dyn std::error::Error + Send>),

@@ -10,7 +10,7 @@ use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::info;
 
-use crate::account::{Account, AccountView};
+use crate::account::Account;
 use crate::auth::FailedAuthRateLimiter;
 use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
@@ -49,7 +49,7 @@ pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
-pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
+pub(crate) type AccountCqrs = SqliteCqrs<Lifecycle<Account, Never>>;
 
 pub(crate) type TokenizedAssetCqrs =
     SqliteCqrs<Lifecycle<TokenizedAsset, Never>>;
@@ -244,10 +244,10 @@ async fn setup_basic_cqrs(
     vault: Address,
 ) -> Result<(AccountCqrs, TokenizedAssetCqrs), anyhow::Error> {
     let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(pool.clone(), "account_view".to_string()));
     let account_query = GenericQuery::new(account_view_repo);
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());

@@ -13,10 +13,7 @@ use super::{
     Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
-use crate::account::{
-    AccountView, ClientId,
-    view::{AccountViewError, find_by_wallet},
-};
+use crate::account::{AccountView, AccountViewError, ClientId, find_by_wallet};
 use crate::bindings;
 use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::{
@@ -400,7 +397,6 @@ mod tests {
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
-        view::AccountView,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
@@ -462,11 +458,13 @@ mod tests {
             .unwrap();
 
         if let Some(wallet) = ap_wallet {
-            let account_view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
+            let account_view_repo = Arc::new(SqliteViewRepository::<
+                Lifecycle<Account, Never>,
+                Lifecycle<Account, Never>,
+            >::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
 
             let account_query = GenericQuery::new(account_view_repo);
             let account_cqrs =

@@ -11,8 +11,8 @@ use tracing::error;
 use uuid::Uuid;
 
 use super::{
-    AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
-    view::find_by_client_id, view::find_by_email,
+    AccountCommand, AccountView, AccountViewError, AlpacaAccountNumber,
+    ClientId, Email, find_by_client_id, find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
@@ -30,7 +30,7 @@ pub(crate) enum ApiError {
     AccountNotFound,
 
     #[error("Database error: {0}")]
-    Database(#[from] super::view::AccountViewError),
+    Database(#[from] AccountViewError),
 
     #[error("Command execution failed: {0}")]
     CommandFailed(#[from] cqrs_es::AggregateError<super::AccountError>),
@@ -222,6 +222,7 @@ mod tests {
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
+    use crate::lifecycle::{Lifecycle, Never};
 
     fn test_config() -> Config {
         Config {
@@ -269,11 +270,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -334,11 +337,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -405,11 +410,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -462,11 +469,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -519,11 +528,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -601,11 +612,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -684,11 +697,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -735,11 +750,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -791,11 +808,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -864,11 +883,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 
@@ -923,11 +944,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
+        let account_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
 
         let account_query = GenericQuery::new(account_view_repo);
 

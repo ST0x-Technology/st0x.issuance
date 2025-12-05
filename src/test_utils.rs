@@ -16,7 +16,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
-use crate::account::{Account, AccountView};
+use crate::account::Account;
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
@@ -88,10 +88,10 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 
     // Setup Account CQRS
     let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Account, Never>,
+            Lifecycle<Account, Never>,
+        >::new(pool.clone(), "account_view".to_string()));
 
     let account_query = GenericQuery::new(account_view_repo);
     let account_cqrs =
