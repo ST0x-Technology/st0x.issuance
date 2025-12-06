@@ -8,6 +8,7 @@ use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
     RedeemRequestStatus, RedeemResponse, TokenizationRequestType,
 };
+use crate::account::AlpacaAccountNumber;
 use crate::mint::TokenizationRequestId;
 
 /// Mock Alpaca service for testing.
@@ -66,6 +67,7 @@ impl MockAlpacaService {
 impl AlpacaService for MockAlpacaService {
     async fn send_mint_callback(
         &self,
+        _alpaca_account: &AlpacaAccountNumber,
         _request: MintCallbackRequest,
     ) -> Result<(), AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -89,6 +91,7 @@ impl AlpacaService for MockAlpacaService {
 
     async fn call_redeem_endpoint(
         &self,
+        _alpaca_account: &AlpacaAccountNumber,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +149,7 @@ impl AlpacaService for MockAlpacaService {
 
     async fn poll_request_status(
         &self,
+        _alpaca_account: &AlpacaAccountNumber,
         _tokenization_request_id: &TokenizationRequestId,
     ) -> Result<super::TokenizationRequest, AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -210,12 +214,16 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::MockAlpacaService;
-    use crate::account::ClientId;
+    use crate::account::{AlpacaAccountNumber, ClientId};
     use crate::alpaca::{
         AlpacaService, MintCallbackRequest, RedeemRequest, RedeemRequestStatus,
     };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     #[tokio::test]
     async fn test_mock_success_service() {
@@ -233,7 +241,8 @@ mod tests {
             network: Network::new("base"),
         };
 
-        let result = mock.send_mint_callback(request).await;
+        let result =
+            mock.send_mint_callback(&test_alpaca_account(), request).await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
         assert_eq!(mock.get_call_count(), 1);
@@ -255,7 +264,8 @@ mod tests {
             network: Network::new("base"),
         };
 
-        let result = mock.send_mint_callback(request).await;
+        let result =
+            mock.send_mint_callback(&test_alpaca_account(), request).await;
 
         assert!(result.is_err(), "Expected Err, got Ok");
         assert_eq!(mock.get_call_count(), 1);
@@ -283,9 +293,10 @@ mod tests {
             network: Network::new("base"),
         };
 
-        mock.send_mint_callback(request.clone()).await.unwrap();
-        mock.send_mint_callback(request.clone()).await.unwrap();
-        mock.send_mint_callback(request).await.unwrap();
+        let account = test_alpaca_account();
+        mock.send_mint_callback(&account, request.clone()).await.unwrap();
+        mock.send_mint_callback(&account, request.clone()).await.unwrap();
+        mock.send_mint_callback(&account, request).await.unwrap();
 
         assert_eq!(mock.get_call_count(), 3);
     }
@@ -310,7 +321,8 @@ mod tests {
         let mock = MockAlpacaService::new_success();
 
         let request = create_redeem_request();
-        let result = mock.call_redeem_endpoint(request).await;
+        let result =
+            mock.call_redeem_endpoint(&test_alpaca_account(), request).await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
         assert_eq!(mock.get_call_count(), 1);
@@ -325,7 +337,8 @@ mod tests {
         let mock = MockAlpacaService::new_failure("API timeout");
 
         let request = create_redeem_request();
-        let result = mock.call_redeem_endpoint(request).await;
+        let result =
+            mock.call_redeem_endpoint(&test_alpaca_account(), request).await;
 
         assert!(result.is_err(), "Expected Err, got Ok");
         assert_eq!(mock.get_call_count(), 1);
@@ -342,10 +355,11 @@ mod tests {
         let mock = MockAlpacaService::new_success();
 
         let request = create_redeem_request();
+        let account = test_alpaca_account();
 
-        mock.call_redeem_endpoint(request.clone()).await.unwrap();
-        mock.call_redeem_endpoint(request.clone()).await.unwrap();
-        mock.call_redeem_endpoint(request).await.unwrap();
+        mock.call_redeem_endpoint(&account, request.clone()).await.unwrap();
+        mock.call_redeem_endpoint(&account, request.clone()).await.unwrap();
+        mock.call_redeem_endpoint(&account, request).await.unwrap();
 
         assert_eq!(mock.get_call_count(), 3);
     }
@@ -367,9 +381,10 @@ mod tests {
         };
 
         let redeem_request = create_redeem_request();
+        let account = test_alpaca_account();
 
-        mock.send_mint_callback(mint_request).await.unwrap();
-        mock.call_redeem_endpoint(redeem_request).await.unwrap();
+        mock.send_mint_callback(&account, mint_request).await.unwrap();
+        mock.call_redeem_endpoint(&account, redeem_request).await.unwrap();
 
         assert_eq!(mock.get_call_count(), 2);
     }
@@ -379,7 +394,12 @@ mod tests {
         let mock = MockAlpacaService::new_success();
 
         let tokenization_request_id = TokenizationRequestId::new("tok-123");
-        let result = mock.poll_request_status(&tokenization_request_id).await;
+        let result = mock
+            .poll_request_status(
+                &test_alpaca_account(),
+                &tokenization_request_id,
+            )
+            .await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
         let request = result.unwrap();
@@ -393,7 +413,12 @@ mod tests {
 
         let tokenization_request_id =
             TokenizationRequestId::new("tok-not-found");
-        let result = mock.poll_request_status(&tokenization_request_id).await;
+        let result = mock
+            .poll_request_status(
+                &test_alpaca_account(),
+                &tokenization_request_id,
+            )
+            .await;
 
         assert!(result.is_err(), "Expected Err, got Ok");
         assert_eq!(mock.get_call_count(), 1);
@@ -410,10 +435,17 @@ mod tests {
         let mock = MockAlpacaService::new_success();
 
         let tokenization_request_id = TokenizationRequestId::new("tok-test");
+        let account = test_alpaca_account();
 
-        mock.poll_request_status(&tokenization_request_id).await.unwrap();
-        mock.poll_request_status(&tokenization_request_id).await.unwrap();
-        mock.poll_request_status(&tokenization_request_id).await.unwrap();
+        mock.poll_request_status(&account, &tokenization_request_id)
+            .await
+            .unwrap();
+        mock.poll_request_status(&account, &tokenization_request_id)
+            .await
+            .unwrap();
+        mock.poll_request_status(&account, &tokenization_request_id)
+            .await
+            .unwrap();
 
         assert_eq!(mock.get_call_count(), 3);
     }
@@ -436,10 +468,11 @@ mod tests {
 
         let redeem_request = create_redeem_request();
         let poll_id = TokenizationRequestId::new("poll-tok");
+        let account = test_alpaca_account();
 
-        mock.send_mint_callback(mint_request).await.unwrap();
-        mock.call_redeem_endpoint(redeem_request).await.unwrap();
-        mock.poll_request_status(&poll_id).await.unwrap();
+        mock.send_mint_callback(&account, mint_request).await.unwrap();
+        mock.call_redeem_endpoint(&account, redeem_request).await.unwrap();
+        mock.poll_request_status(&account, &poll_id).await.unwrap();
 
         assert_eq!(mock.get_call_count(), 3);
     }

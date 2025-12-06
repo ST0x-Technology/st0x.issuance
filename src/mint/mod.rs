@@ -44,15 +44,15 @@ impl TokenizationRequestId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuerRequestId(pub String);
 
-impl std::fmt::Display for IssuerRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 impl IssuerRequestId {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+}
+
+impl std::fmt::Display for IssuerRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -179,6 +179,18 @@ impl Mint {
             | Self::Completed { tokenization_request_id, .. } => {
                 Some(tokenization_request_id)
             }
+            Self::Uninitialized => None,
+        }
+    }
+
+    pub(crate) const fn client_id(&self) -> Option<&ClientId> {
+        match self {
+            Self::Initiated { client_id, .. }
+            | Self::JournalConfirmed { client_id, .. }
+            | Self::JournalRejected { client_id, .. }
+            | Self::CallbackPending { client_id, .. }
+            | Self::MintingFailed { client_id, .. }
+            | Self::Completed { client_id, .. } => Some(client_id),
             Self::Uninitialized => None,
         }
     }
@@ -691,10 +703,15 @@ mod tests {
         MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
         UnderlyingSymbol, mint_manager::MintManager,
     };
+    use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
     use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
+
+    fn test_alpaca_account() -> AlpacaAccountNumber {
+        AlpacaAccountNumber("test-account".to_string())
+    }
 
     #[test]
     fn test_initiate_mint_creates_event() {
@@ -1851,21 +1868,25 @@ mod tests {
 
     fn create_test_mint_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        store: Arc<MemStore<Mint>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
     ) -> MintManager<MemStore<Mint>> {
         let blockchain_service =
             Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-        MintManager::new(blockchain_service, cqrs, bot)
+        MintManager::new(blockchain_service, cqrs, store, pool, bot)
     }
 
     fn create_test_callback_manager(
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        store: Arc<MemStore<Mint>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
     ) -> CallbackManager<MemStore<Mint>> {
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn AlpacaService>;
 
-        CallbackManager::new(alpaca_service, cqrs)
+        CallbackManager::new(alpaca_service, cqrs, store, pool)
     }
 
     struct TestMintData {
@@ -1898,14 +1919,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_complete_mint_flow_with_managers() {
+    async fn setup_managers_test() -> (
+        Arc<MemStore<Mint>>,
+        Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        MintManager<MemStore<Mint>>,
+        CallbackManager<MemStore<Mint>>,
+    ) {
+        use sqlx::sqlite::SqlitePoolOptions;
+
         let store = Arc::new(MemStore::<Mint>::default());
         let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
 
-        let mint_manager = create_test_mint_manager(cqrs.clone());
-        let callback_manager = create_test_callback_manager(cqrs.clone());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
 
+        let mint_manager =
+            create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());
+        let callback_manager =
+            create_test_callback_manager(cqrs.clone(), store.clone(), pool);
+
+        (store, cqrs, mint_manager, callback_manager)
+    }
+
+    #[tokio::test]
+    async fn test_complete_mint_flow_with_managers() {
+        let (store, cqrs, mint_manager, callback_manager) =
+            setup_managers_test().await;
         let data = TestMintData::new();
 
         cqrs.execute(
@@ -1946,7 +1988,11 @@ mod tests {
         let context =
             store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
         callback_manager
-            .handle_tokens_minted(&data.issuer_request_id, context.aggregate())
+            .handle_tokens_minted(
+                &test_alpaca_account(),
+                &data.issuer_request_id,
+                context.aggregate(),
+            )
             .await
             .unwrap();
 

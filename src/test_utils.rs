@@ -6,7 +6,6 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use sqlite_es::{
@@ -33,18 +32,12 @@ use crate::tokenized_asset::{
 };
 use crate::vault::mock::MockVaultService;
 
-/// Returns a test Basic auth header value for mock Alpaca API requests.
+/// Returns test Alpaca API credentials for mock Alpaca API requests.
 ///
-/// Uses clearly fake test credentials: "test-key:test-secret"
+/// Uses clearly fake test credentials: "test-key" / "test-secret"
 #[must_use]
-pub fn test_alpaca_auth_header() -> String {
-    let test_api_key = "test-key";
-    let test_api_secret = "test-secret";
-
-    format!(
-        "Basic {}",
-        BASE64.encode(format!("{test_api_key}:{test_api_secret}"))
-    )
+pub fn test_alpaca_auth_headers() -> (String, String) {
+    ("test-key".to_string(), "test-secret".to_string())
 }
 
 fn test_config() -> Result<Config, anyhow::Error> {
@@ -134,12 +127,16 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let mint_manager = Arc::new(MintManager::new(
         Arc::new(MockVaultService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
         bot,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(
         Arc::new(MockAlpacaService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
     ));
 
     let rate_limiter = FailedAuthRateLimiter::new()?;

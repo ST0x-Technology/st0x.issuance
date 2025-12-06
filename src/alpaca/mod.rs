@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::account::ClientId;
+use crate::account::{AlpacaAccountNumber, ClientId};
 use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
@@ -24,6 +24,7 @@ pub(crate) trait AlpacaService: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `alpaca_account` - The user's Alpaca account number (e.g., "9792246OM")
     /// * `request` - Callback request containing mint details
     ///
     /// # Returns
@@ -36,11 +37,19 @@ pub(crate) trait AlpacaService: Send + Sync {
     /// or Alpaca returns an error response.
     async fn send_mint_callback(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         request: MintCallbackRequest,
     ) -> Result<(), AlpacaError>;
 
+    /// Calls Alpaca's redeem endpoint to initiate a redemption.
+    ///
+    /// # Arguments
+    ///
+    /// * `alpaca_account` - The user's Alpaca account number (e.g., "9792246OM")
+    /// * `request` - Redeem request containing redemption details
     async fn call_redeem_endpoint(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
 
@@ -48,6 +57,7 @@ pub(crate) trait AlpacaService: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `alpaca_account` - The user's Alpaca account number (e.g., "9792246OM")
     /// * `tokenization_request_id` - ID of the tokenization request to poll
     ///
     /// # Returns
@@ -68,6 +78,7 @@ pub(crate) trait AlpacaService: Send + Sync {
     /// - Response deserialization or parsing fails
     async fn poll_request_status(
         &self,
+        alpaca_account: &AlpacaAccountNumber,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaError>;
 }
