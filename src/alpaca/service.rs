@@ -139,8 +139,9 @@ impl AlpacaService for RealAlpacaService {
             let response = self
                 .client
                 .post(&url)
-                .header("Apca-Api-Key-Id", &self.api_key)
-                .header("Apca-Api-Secret-Key", &self.api_secret)
+                .basic_auth(&self.api_key, Some(&self.api_secret))
+                .header("APCA-API-KEY-ID", &self.api_key)
+                .header("APCA-API-SECRET-KEY", &self.api_secret)
                 .json(&request)
                 .send()
                 .await
@@ -209,8 +210,9 @@ impl AlpacaService for RealAlpacaService {
             let response = self
                 .client
                 .post(&url)
-                .header("Apca-Api-Key-Id", &self.api_key)
-                .header("Apca-Api-Secret-Key", &self.api_secret)
+                .basic_auth(&self.api_key, Some(&self.api_secret))
+                .header("APCA-API-KEY-ID", &self.api_key)
+                .header("APCA-API-SECRET-KEY", &self.api_secret)
                 .json(&request)
                 .send()
                 .await
@@ -286,8 +288,9 @@ impl AlpacaService for RealAlpacaService {
             let response = self
                 .client
                 .get(&url)
-                .header("Apca-Api-Key-Id", &self.api_key)
-                .header("Apca-Api-Secret-Key", &self.api_secret)
+                .basic_auth(&self.api_key, Some(&self.api_secret))
+                .header("APCA-API-KEY-ID", &self.api_key)
+                .header("APCA-API-SECRET-KEY", &self.api_secret)
                 .send()
                 .await
                 .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
@@ -405,8 +408,9 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/mint")
-                .header("Apca-Api-Key-Id", "test-key")
-                .header("Apca-Api-Secret-Key", "test-secret");
+                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret");
             then.status(200).body("");
         });
 
@@ -551,14 +555,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_mint_callback_uses_header_auth() {
+    async fn test_send_mint_callback_uses_legacy_auth() {
         let server = MockServer::start();
 
+        // Legacy auth requires both Basic auth AND the APCA headers
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/mint")
-                .header("Apca-Api-Key-Id", "mykey")
-                .header("Apca-Api-Secret-Key", "mysecret");
+                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "mykey")
+                .header("APCA-API-SECRET-KEY", "mysecret");
             then.status(200).body("");
         });
 
@@ -632,8 +638,9 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/redeem")
-                .header("Apca-Api-Key-Id", "test-key")
-                .header("Apca-Api-Secret-Key", "test-secret");
+                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
                 "issuer_request_id": "red-123",
@@ -805,14 +812,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_redeem_endpoint_uses_header_auth() {
+    async fn test_call_redeem_endpoint_uses_legacy_auth() {
         let server = MockServer::start();
 
+        // Legacy auth requires both Basic auth AND the APCA headers
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/redeem")
-                .header("Apca-Api-Key-Id", "mykey")
-                .header("Apca-Api-Secret-Key", "mysecret");
+                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "mykey")
+                .header("APCA-API-SECRET-KEY", "mysecret");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-001",
                 "issuer_request_id": "red-123",
@@ -906,8 +915,9 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests")
-                .header("Apca-Api-Key-Id", "test-key")
-                .header("Apca-Api-Secret-Key", "test-secret");
+                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "test-key")
+                .header("APCA-API-SECRET-KEY", "test-secret");
             then.status(200).json_body(serde_json::json!({
                 "requests": [
                     {
@@ -1190,14 +1200,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_request_status_uses_header_auth() {
+    async fn test_poll_request_status_uses_legacy_auth() {
         let server = MockServer::start();
 
+        // Legacy auth requires both Basic auth AND the APCA headers
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests")
-                .header("Apca-Api-Key-Id", "mykey")
-                .header("Apca-Api-Secret-Key", "mysecret");
+                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
+                .header("APCA-API-KEY-ID", "mykey")
+                .header("APCA-API-SECRET-KEY", "mysecret");
             then.status(200).json_body(serde_json::json!({
                 "requests": [
                     {

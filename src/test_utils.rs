@@ -6,6 +6,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::RpcError;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use sqlite_es::{
@@ -32,12 +33,18 @@ use crate::tokenized_asset::{
 };
 use crate::vault::mock::MockVaultService;
 
-/// Returns test Alpaca API credentials for mock Alpaca API requests.
+/// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
 /// Uses clearly fake test credentials: "test-key" / "test-secret"
+/// Returns (basic_auth_header, api_key, api_secret) for legacy auth which
+/// requires both Basic auth and APCA-API-KEY-ID/APCA-API-SECRET-KEY headers.
 #[must_use]
-pub fn test_alpaca_auth_headers() -> (String, String) {
-    ("test-key".to_string(), "test-secret".to_string())
+pub fn test_alpaca_legacy_auth() -> (String, String, String) {
+    let api_key = "test-key".to_string();
+    let api_secret = "test-secret".to_string();
+    let basic_auth =
+        format!("Basic {}", BASE64.encode(format!("{api_key}:{api_secret}")));
+    (basic_auth, api_key, api_secret)
 }
 
 fn test_config() -> Result<Config, anyhow::Error> {

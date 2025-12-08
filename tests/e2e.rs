@@ -14,7 +14,7 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::{IssuerRequestId, MintResponse};
-use st0x_issuance::test_utils::{LocalEvm, test_alpaca_auth_headers};
+use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
 };
@@ -225,13 +225,14 @@ async fn perform_mint_flow(
 }
 
 fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
-    let (api_key, api_secret) = test_alpaca_auth_headers();
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
 
     mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/USER123/tokenization/callback/mint")
-            .header("Apca-Api-Key-Id", api_key)
-            .header("Apca-Api-Secret-Key", api_secret);
+            .header("authorization", basic_auth)
+            .header("APCA-API-KEY-ID", api_key)
+            .header("APCA-API-SECRET-KEY", api_secret);
         then.status(200).body("");
     })
 }
@@ -240,7 +241,7 @@ fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
     user_wallet: Address,
 ) -> (Mock, Mock) {
-    let (api_key, api_secret) = test_alpaca_auth_headers();
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));
 
@@ -250,8 +251,9 @@ fn setup_redemption_mocks(
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/USER123/tokenization/redeem")
-            .header("Apca-Api-Key-Id", &api_key)
-            .header("Apca-Api-Secret-Key", &api_secret);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |req: &httpmock::HttpMockRequest| {
@@ -296,8 +298,9 @@ fn setup_redemption_mocks(
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
             .path_matches(r"^/v1/accounts/USER123/tokenization/requests.*")
-            .header("Apca-Api-Key-Id", &api_key)
-            .header("Apca-Api-Secret-Key", &api_secret);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |_req: &httpmock::HttpMockRequest| {
@@ -470,7 +473,7 @@ fn setup_redemption_mocks_with_shared_state(
     shared_tx_hash: Arc<Mutex<Option<TxHash>>>,
     poll_should_succeed: Arc<AtomicBool>,
 ) -> (Mock, Mock) {
-    let (api_key, api_secret) = test_alpaca_auth_headers();
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
 
     let shared_issuer_id_clone = Arc::clone(&shared_issuer_id);
     let shared_tx_hash_clone = Arc::clone(&shared_tx_hash);
@@ -478,8 +481,9 @@ fn setup_redemption_mocks_with_shared_state(
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/USER123/tokenization/redeem")
-            .header("Apca-Api-Key-Id", &api_key)
-            .header("Apca-Api-Secret-Key", &api_secret);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |req: &httpmock::HttpMockRequest| {
@@ -524,8 +528,9 @@ fn setup_redemption_mocks_with_shared_state(
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
             .path_matches(r"^/v1/accounts/USER123/tokenization/requests.*")
-            .header("Apca-Api-Key-Id", &api_key)
-            .header("Apca-Api-Secret-Key", &api_secret);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |_req: &httpmock::HttpMockRequest| {
