@@ -153,6 +153,31 @@ where
                 &log.inner,
             )?;
 
+        // Skip mint events where from=0x0.
+        //
+        // Call stack when our bot mints tokens to itself:
+        // 1. Bot calls vault.deposit() on OffchainAssetReceiptVault
+        // 2. OffchainAssetReceiptVault inherits from ReceiptVault
+        //    (lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol:243)
+        // 3. ReceiptVault._deposit() calls _mint(receiver, shares)
+        //    (lib/ethgild/src/abstract/ReceiptVault.sol:587)
+        // 4. ReceiptVault inherits from ERC20Upgradeable (aliased as ERC20)
+        //    (lib/ethgild/src/abstract/ReceiptVault.sol:5)
+        // 5. ERC20Upgradeable._mint() emits Transfer(address(0), account, amount)
+        //    (lib/ethgild/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/ERC20Upgradeable.sol:266)
+        //
+        // This Transfer event has from=0x0 and to=bot_wallet, which matches our
+        // subscription filter (we subscribe to transfers TO bot_wallet). These are
+        // mint events, not redemptions from users.
+        if transfer_event.from == Address::ZERO {
+            info!(
+                to = %transfer_event.to,
+                value = %transfer_event.value,
+                "Ignoring mint event (from=0x0)"
+            );
+            return Ok(());
+        }
+
         info!(
             from = %transfer_event.from,
             to = %transfer_event.to,
@@ -923,6 +948,85 @@ mod tests {
                 Err(RedemptionMonitorError::CqrsExecution(_))
             ),
             "Second detection should fail with CQRS error, got {second_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_transfer_log_ignores_mint_events() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let (cqrs, store) = setup_test_cqrs();
+        let pool = setup_test_db_with_asset(vault, None).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            bot_wallet,
+        ));
+
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
+            vault,
+            bot_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
+            cqrs,
+            store.clone(),
+            pool,
+            redeem_call_manager,
+            journal_manager,
+            burn_manager,
+        );
+
+        // Mint event: from=0x0 (zero address) indicates token minting
+        let log = create_transfer_log(
+            Address::ZERO,
+            bot_wallet,
+            U256::from_str_radix("100000000000000000000", 10).unwrap(),
+            b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            12345,
+        );
+
+        let result = detector.process_transfer_log(&log).await;
+
+        assert!(
+            result.is_ok(),
+            "Mint events should be silently ignored, got {result:?}"
+        );
+
+        // Verify no redemption was created
+        let issuer_request_id =
+            IssuerRequestId::new("red-abcdefab".to_string());
+        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let aggregate = context.aggregate();
+
+        assert!(
+            matches!(aggregate, Redemption::Uninitialized),
+            "No redemption should be created for mint events, got {aggregate:?}"
         );
     }
 
