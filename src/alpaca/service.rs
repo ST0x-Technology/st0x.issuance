@@ -136,7 +136,7 @@ impl AlpacaService for RealAlpacaService {
             alpaca_account.as_str()
         );
 
-        debug!(%url, "Sending mint callback to Alpaca");
+        debug!(%url, method = "POST", "Sending mint callback to Alpaca");
 
         (|| async {
             let response = self
@@ -209,7 +209,7 @@ impl AlpacaService for RealAlpacaService {
             alpaca_account.as_str()
         );
 
-        debug!(%url, "Calling Alpaca redeem endpoint");
+        debug!(%url, method = "POST", "Calling Alpaca redeem endpoint");
 
         (|| async {
             let response = self
@@ -289,7 +289,7 @@ impl AlpacaService for RealAlpacaService {
             alpaca_account.as_str()
         );
 
-        debug!(%url, "Polling Alpaca request status");
+        debug!(%url, method = "GET", "Polling Alpaca request status");
 
         (|| async {
             let response = self
