@@ -3,6 +3,7 @@ use backon::{ExponentialBuilder, Retryable};
 use clap::Args;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::debug;
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -135,6 +136,8 @@ impl AlpacaService for RealAlpacaService {
             alpaca_account.as_str()
         );
 
+        debug!(%url, "Sending mint callback to Alpaca");
+
         (|| async {
             let response = self
                 .client
@@ -205,6 +208,8 @@ impl AlpacaService for RealAlpacaService {
             self.base_url.trim_end_matches('/'),
             alpaca_account.as_str()
         );
+
+        debug!(%url, "Calling Alpaca redeem endpoint");
 
         (|| async {
             let response = self
@@ -283,6 +288,8 @@ impl AlpacaService for RealAlpacaService {
             self.base_url.trim_end_matches('/'),
             alpaca_account.as_str()
         );
+
+        debug!(%url, "Polling Alpaca request status");
 
         (|| async {
             let response = self
