@@ -189,11 +189,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             tx_hash: metadata.detected_tx_hash,
         };
 
-        match self
-            .alpaca_service
-            .call_redeem_endpoint(alpaca_account, request)
-            .await
-        {
+        match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
                 info!(
                     issuer_request_id = %response.issuer_request_id.0,

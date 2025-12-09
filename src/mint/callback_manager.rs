@@ -104,11 +104,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             network: network.clone(),
         };
 
-        match self
-            .alpaca_service
-            .send_mint_callback(alpaca_account, callback_request)
-            .await
-        {
+        match self.alpaca_service.send_mint_callback(callback_request).await {
             Ok(()) => {
                 info!(
                     issuer_request_id = %issuer_request_id_str,

@@ -229,7 +229,7 @@ fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
 
     mock_alpaca.mock(|when, then| {
         when.method(POST)
-            .path("/v1/accounts/USER123/tokenization/callback/mint")
+            .path("/v1/accounts/test-account/tokenization/callback/mint")
             .header("authorization", basic_auth)
             .header("APCA-API-KEY-ID", api_key)
             .header("APCA-API-SECRET-KEY", api_secret);
@@ -250,7 +250,7 @@ fn setup_redemption_mocks(
 
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
-            .path("/v1/accounts/USER123/tokenization/redeem")
+            .path("/v1/accounts/test-account/tokenization/redeem")
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
@@ -297,7 +297,7 @@ fn setup_redemption_mocks(
 
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
-            .path_matches(r"^/v1/accounts/USER123/tokenization/requests.*")
+            .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
@@ -378,6 +378,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
@@ -456,6 +457,7 @@ fn create_config_with_db(
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             connect_timeout_secs: 10,
@@ -480,7 +482,7 @@ fn setup_redemption_mocks_with_shared_state(
 
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
-            .path("/v1/accounts/USER123/tokenization/redeem")
+            .path("/v1/accounts/test-account/tokenization/redeem")
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
@@ -527,7 +529,7 @@ fn setup_redemption_mocks_with_shared_state(
 
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
-            .path_matches(r"^/v1/accounts/USER123/tokenization/requests.*")
+            .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);

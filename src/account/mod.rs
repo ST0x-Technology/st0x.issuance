@@ -60,12 +60,6 @@ impl<'de> Deserialize<'de> for Email {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaAccountNumber(pub(crate) String);
 
-impl AlpacaAccountNumber {
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientId(Uuid);
 

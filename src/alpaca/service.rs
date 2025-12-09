@@ -9,7 +9,6 @@ use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
     RedeemResponse, RequestsListResponse,
 };
-use crate::account::AlpacaAccountNumber;
 use crate::mint::TokenizationRequestId;
 
 #[derive(Args, Clone)]
@@ -21,6 +20,13 @@ pub struct AlpacaConfig {
         help = "Alpaca API base URL"
     )]
     pub api_base_url: String,
+
+    #[arg(
+        long = "alpaca-account-id",
+        env = "ALPACA_ACCOUNT_ID",
+        help = "Alpaca tokenization account ID"
+    )]
+    pub account_id: String,
 
     #[arg(
         long = "alpaca-api-key",
@@ -57,6 +63,7 @@ impl std::fmt::Debug for AlpacaConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlpacaConfig")
             .field("api_base_url", &self.api_base_url)
+            .field("account_id", &self.account_id)
             .field("api_key", &"<redacted>")
             .field("api_secret", &"<redacted>")
             .field("connect_timeout_secs", &self.connect_timeout_secs)
@@ -71,6 +78,7 @@ impl AlpacaConfig {
     ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
         let service = RealAlpacaService::new(
             self.api_base_url.clone(),
+            self.account_id.clone(),
             self.api_key.clone(),
             self.api_secret.clone(),
             self.connect_timeout_secs,
@@ -82,6 +90,7 @@ impl AlpacaConfig {
     pub(crate) fn test_default() -> Self {
         Self {
             api_base_url: "https://example.com".to_string(),
+            account_id: "test-account-id".to_string(),
             api_key: "test".to_string(),
             api_secret: "test".to_string(),
             connect_timeout_secs: 10,
@@ -93,6 +102,7 @@ impl AlpacaConfig {
 pub(crate) struct RealAlpacaService {
     client: reqwest::Client,
     base_url: String,
+    account_id: String,
     api_key: String,
     api_secret: String,
     max_retries: usize,
@@ -101,6 +111,7 @@ pub(crate) struct RealAlpacaService {
 impl RealAlpacaService {
     pub(crate) fn new(
         base_url: String,
+        account_id: String,
         api_key: String,
         api_secret: String,
         connect_timeout_secs: u64,
@@ -113,7 +124,14 @@ impl RealAlpacaService {
             .map_err(|e| AlpacaError::Http {
                 message: format!("Failed to build HTTP client: {e}"),
             })?;
-        Ok(Self { client, base_url, api_key, api_secret, max_retries: 5 })
+        Ok(Self {
+            client,
+            base_url,
+            account_id,
+            api_key,
+            api_secret,
+            max_retries: 5,
+        })
     }
 
     #[cfg(test)]
@@ -127,13 +145,12 @@ impl RealAlpacaService {
 impl AlpacaService for RealAlpacaService {
     async fn send_mint_callback(
         &self,
-        alpaca_account: &AlpacaAccountNumber,
         request: MintCallbackRequest,
     ) -> Result<(), AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/callback/mint",
             self.base_url.trim_end_matches('/'),
-            alpaca_account.as_str()
+            self.account_id
         );
 
         debug!(%url, method = "POST", "Sending mint callback to Alpaca");
@@ -200,13 +217,12 @@ impl AlpacaService for RealAlpacaService {
 
     async fn call_redeem_endpoint(
         &self,
-        alpaca_account: &AlpacaAccountNumber,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/redeem",
             self.base_url.trim_end_matches('/'),
-            alpaca_account.as_str()
+            self.account_id
         );
 
         debug!(%url, method = "POST", "Calling Alpaca redeem endpoint");
@@ -280,13 +296,12 @@ impl AlpacaService for RealAlpacaService {
 
     async fn poll_request_status(
         &self,
-        alpaca_account: &AlpacaAccountNumber,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<super::TokenizationRequest, AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/requests",
             self.base_url.trim_end_matches('/'),
-            alpaca_account.as_str()
+            self.account_id
         );
 
         debug!(%url, method = "GET", "Polling Alpaca request status");
@@ -376,7 +391,6 @@ mod tests {
     use alloy::primitives::{address, b256};
     use httpmock::prelude::*;
 
-    use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
@@ -385,10 +399,6 @@ mod tests {
         AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
         RedeemRequest,
     };
-
-    fn test_alpaca_account() -> AlpacaAccountNumber {
-        AlpacaAccountNumber("test-account".to_string())
-    }
 
     fn create_test_request() -> MintCallbackRequest {
         let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
@@ -423,6 +433,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -431,8 +442,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -450,6 +460,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "wrong-key".to_string(),
             "wrong-secret".to_string(),
             10,
@@ -458,8 +469,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(matches!(result, Err(AlpacaError::Auth { .. })));
         mock.assert();
@@ -477,6 +487,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -485,8 +496,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(matches!(result, Err(AlpacaError::Auth { .. })));
         mock.assert();
@@ -504,6 +514,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -512,8 +523,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         match result {
             Err(AlpacaError::Api { status_code, message }) => {
@@ -546,6 +556,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -554,8 +565,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -577,6 +587,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "mykey".to_string(),
             "mysecret".to_string(),
             10,
@@ -585,8 +596,7 @@ mod tests {
         .unwrap();
 
         let request = create_test_request();
-        let result =
-            service.send_mint_callback(&test_alpaca_account(), request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -605,6 +615,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "my-special-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -612,10 +623,8 @@ mod tests {
         )
         .unwrap();
 
-        let alpaca_account =
-            AlpacaAccountNumber("my-special-account".to_string());
         let request = create_test_request();
-        let result = service.send_mint_callback(&alpaca_account, request).await;
+        let result = service.send_mint_callback(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -667,6 +676,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -675,8 +685,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -699,6 +708,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "wrong-key".to_string(),
             "wrong-secret".to_string(),
             10,
@@ -707,8 +717,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(matches!(result, Err(AlpacaError::Auth { .. })));
         mock.assert();
@@ -726,6 +735,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -734,8 +744,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(matches!(result, Err(AlpacaError::Auth { .. })));
         mock.assert();
@@ -753,6 +762,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -761,8 +771,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         match result {
             Err(AlpacaError::Api { status_code, message }) => {
@@ -801,6 +810,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "my-special-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -808,11 +818,8 @@ mod tests {
         )
         .unwrap();
 
-        let alpaca_account =
-            AlpacaAccountNumber("my-special-account".to_string());
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&alpaca_account, request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -848,6 +855,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "mykey".to_string(),
             "mysecret".to_string(),
             10,
@@ -856,8 +864,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -900,6 +907,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -908,8 +916,7 @@ mod tests {
         .unwrap();
 
         let request = create_redeem_request();
-        let result =
-            service.call_redeem_endpoint(&test_alpaca_account(), request).await;
+        let result = service.call_redeem_endpoint(request).await;
 
         assert!(result.is_ok());
         mock.assert();
@@ -948,6 +955,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -956,12 +964,8 @@ mod tests {
         .unwrap();
 
         let tokenization_request_id = TokenizationRequestId::new("tok-123");
-        let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &tokenization_request_id,
-            )
-            .await;
+        let result =
+            service.poll_request_status(&tokenization_request_id).await;
 
         assert!(result.is_ok());
         let request = result.unwrap();
@@ -1029,6 +1033,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1037,10 +1042,7 @@ mod tests {
         .unwrap();
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-222"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-222"))
             .await;
 
         assert!(result.is_ok());
@@ -1079,6 +1081,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1088,12 +1091,8 @@ mod tests {
 
         let tokenization_request_id =
             TokenizationRequestId::new("tok-NOT-FOUND");
-        let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &tokenization_request_id,
-            )
-            .await;
+        let result =
+            service.poll_request_status(&tokenization_request_id).await;
 
         match result {
             Err(AlpacaError::RequestNotFound {
@@ -1121,6 +1120,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1129,10 +1129,7 @@ mod tests {
         .unwrap();
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-123"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
         assert!(matches!(result, Err(AlpacaError::RequestNotFound { .. })));
@@ -1151,6 +1148,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "wrong-key".to_string(),
             "wrong-secret".to_string(),
             10,
@@ -1159,10 +1157,7 @@ mod tests {
         .unwrap();
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-123"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
         assert!(matches!(result, Err(AlpacaError::Auth { .. })));
@@ -1181,6 +1176,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1190,10 +1186,7 @@ mod tests {
         .with_max_retries(0);
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-123"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
         match result {
@@ -1240,6 +1233,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "mykey".to_string(),
             "mysecret".to_string(),
             10,
@@ -1248,10 +1242,7 @@ mod tests {
         .unwrap();
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-auth-test"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-auth-test"))
             .await;
 
         assert!(result.is_ok());
@@ -1272,6 +1263,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "my-special-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1279,13 +1271,8 @@ mod tests {
         )
         .unwrap();
 
-        let alpaca_account =
-            AlpacaAccountNumber("my-special-account".to_string());
         let _ = service
-            .poll_request_status(
-                &alpaca_account,
-                &TokenizationRequestId::new("tok-123"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
         mock.assert();
@@ -1336,6 +1323,7 @@ mod tests {
 
         let service = RealAlpacaService::new(
             server.base_url(),
+            "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
             10,
@@ -1344,10 +1332,7 @@ mod tests {
         .unwrap();
 
         let result = service
-            .poll_request_status(
-                &test_alpaca_account(),
-                &TokenizationRequestId::new("tok-mint-legacy"),
-            )
+            .poll_request_status(&TokenizationRequestId::new("tok-mint-legacy"))
             .await;
 
         match result {

@@ -172,7 +172,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
             let request_result = self
                 .alpaca_service
-                .poll_request_status(alpaca_account, &tokenization_request_id)
+                .poll_request_status(&tokenization_request_id)
                 .await;
 
             let should_continue = self
@@ -552,7 +552,6 @@ mod tests {
     impl AlpacaService for StatefulMockAlpacaService {
         async fn send_mint_callback(
             &self,
-            _alpaca_account: &AlpacaAccountNumber,
             _request: crate::alpaca::MintCallbackRequest,
         ) -> Result<(), AlpacaError> {
             Ok(())
@@ -560,7 +559,6 @@ mod tests {
 
         async fn call_redeem_endpoint(
             &self,
-            _alpaca_account: &AlpacaAccountNumber,
             _request: crate::alpaca::RedeemRequest,
         ) -> Result<crate::alpaca::RedeemResponse, AlpacaError> {
             unreachable!()
@@ -568,7 +566,6 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            _alpaca_account: &AlpacaAccountNumber,
             tokenization_request_id: &TokenizationRequestId,
         ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError> {
             let index = {
@@ -891,7 +888,6 @@ mod tests {
         impl AlpacaService for QuantityMismatchMock {
             async fn send_mint_callback(
                 &self,
-                _alpaca_account: &AlpacaAccountNumber,
                 _request: crate::alpaca::MintCallbackRequest,
             ) -> Result<(), AlpacaError> {
                 Ok(())
@@ -899,7 +895,6 @@ mod tests {
 
             async fn call_redeem_endpoint(
                 &self,
-                _alpaca_account: &AlpacaAccountNumber,
                 _request: crate::alpaca::RedeemRequest,
             ) -> Result<crate::alpaca::RedeemResponse, AlpacaError>
             {
@@ -908,7 +903,6 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                _alpaca_account: &AlpacaAccountNumber,
                 tokenization_request_id: &TokenizationRequestId,
             ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError>
             {
