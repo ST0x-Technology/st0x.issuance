@@ -513,15 +513,20 @@ mod tests {
         .unwrap();
     }
 
+    enum MockResponse {
+        Success(RedeemRequestStatus),
+        Error { status_code: u16, body: String },
+    }
+
     struct StatefulMockAlpacaService {
         call_count: Mutex<usize>,
-        responses: Vec<Result<RedeemRequestStatus, AlpacaError>>,
+        responses: Vec<MockResponse>,
         issuer_request_id: IssuerRequestId,
     }
 
     impl StatefulMockAlpacaService {
         fn new(
-            responses: Vec<Result<RedeemRequestStatus, AlpacaError>>,
+            responses: Vec<MockResponse>,
             issuer_request_id: IssuerRequestId,
         ) -> Self {
             Self { call_count: Mutex::new(0), responses, issuer_request_id }
@@ -582,11 +587,16 @@ mod tests {
             };
 
             match response {
-                Ok(status) => Ok(self.create_mock_request(
+                MockResponse::Success(status) => Ok(self.create_mock_request(
                     tokenization_request_id,
                     status.clone(),
                 )),
-                Err(e) => Err(e.clone()),
+                MockResponse::Error { status_code, body } => {
+                    Err(AlpacaError::Api {
+                        status_code: *status_code,
+                        body: body.clone(),
+                    })
+                }
             }
         }
     }
@@ -600,7 +610,7 @@ mod tests {
             TokenizationRequestId::new("alp-poll-success-456");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             issuer_request_id.clone(),
         ));
 
@@ -639,10 +649,10 @@ mod tests {
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Completed),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Completed),
             ],
             issuer_request_id.clone(),
         ));
@@ -682,8 +692,8 @@ mod tests {
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Rejected),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Rejected),
             ],
             issuer_request_id.clone(),
         ));
@@ -736,9 +746,15 @@ mod tests {
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![
-                Err(AlpacaError::Http { message: "Network error".to_string() }),
-                Err(AlpacaError::Http { message: "Network error".to_string() }),
-                Ok(RedeemRequestStatus::Completed),
+                MockResponse::Error {
+                    status_code: 500,
+                    body: "Network error".to_string(),
+                },
+                MockResponse::Error {
+                    status_code: 500,
+                    body: "Network error".to_string(),
+                },
+                MockResponse::Success(RedeemRequestStatus::Completed),
             ],
             issuer_request_id.clone(),
         ));
@@ -777,7 +793,7 @@ mod tests {
             TokenizationRequestId::new("alp-timeout-456");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Pending)],
+            vec![MockResponse::Success(RedeemRequestStatus::Pending)],
             issuer_request_id.clone(),
         ));
 
@@ -831,7 +847,7 @@ mod tests {
             TokenizationRequestId::new("alp-validation-1");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             IssuerRequestId::new("wrong-issuer-id"),
         ));
 
@@ -975,11 +991,11 @@ mod tests {
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Pending),
-                Ok(RedeemRequestStatus::Completed),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Completed),
             ],
             issuer_request_id.clone(),
         ));
@@ -1071,7 +1087,7 @@ mod tests {
     async fn test_lookup_account_for_recovery_success() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             IssuerRequestId::new("test"),
         ));
         let manager = JournalManager::new(
@@ -1096,7 +1112,7 @@ mod tests {
     async fn test_lookup_account_for_recovery_not_found() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             IssuerRequestId::new("test"),
         ));
         let manager = JournalManager::new(
@@ -1120,7 +1136,7 @@ mod tests {
     async fn test_recover_alpaca_called_redemptions_empty() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             IssuerRequestId::new("test"),
         ));
         let manager = JournalManager::new(
@@ -1145,7 +1161,7 @@ mod tests {
         let tokenization_request_id = TokenizationRequestId::new("tok-recover");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             issuer_request_id.clone(),
         ));
         let manager = JournalManager::new(
@@ -1200,7 +1216,7 @@ mod tests {
             TokenizationRequestId::new("tok-no-account");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
-            vec![Ok(RedeemRequestStatus::Completed)],
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
             issuer_request_id.clone(),
         ));
         let manager = JournalManager::new(

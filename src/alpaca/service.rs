@@ -120,10 +120,7 @@ impl RealAlpacaService {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(request_timeout_secs))
-            .build()
-            .map_err(|e| AlpacaError::Http {
-                message: format!("Failed to build HTTP client: {e}"),
-            })?;
+            .build()?;
         Ok(Self {
             client,
             base_url,
@@ -164,8 +161,7 @@ impl AlpacaService for RealAlpacaService {
                 .header("APCA-API-SECRET-KEY", &self.api_secret)
                 .json(&request)
                 .send()
-                .await
-                .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
+                .await?;
 
             let status = response.status();
 
@@ -173,25 +169,12 @@ impl AlpacaService for RealAlpacaService {
                 reqwest::StatusCode::OK => Ok(()),
                 reqwest::StatusCode::UNAUTHORIZED
                 | reqwest::StatusCode::FORBIDDEN => {
-                    let body =
-                        response.text().await.unwrap_or_else(|_| String::new());
-                    let snippet = body.chars().take(200).collect::<String>();
-                    let reason = if snippet.is_empty() {
-                        "Authentication failed".to_string()
-                    } else {
-                        format!("Authentication failed: {snippet}")
-                    };
-                    Err(AlpacaError::Auth { reason })
+                    let body = response.text().await?;
+                    Err(AlpacaError::Auth(body))
                 }
                 status => {
-                    let message = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "Unknown error".to_string());
-                    Err(AlpacaError::Api {
-                        status_code: status.as_u16(),
-                        message,
-                    })
+                    let body = response.text().await?;
+                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
                 }
             }
         })
@@ -200,13 +183,7 @@ impl AlpacaService for RealAlpacaService {
                 .with_max_times(self.max_retries)
                 .with_jitter(),
         )
-        .when(|e: &AlpacaError| {
-            matches!(
-                e,
-                AlpacaError::Http { .. }
-                    | AlpacaError::Api { status_code: 500..=599 | 429, .. }
-            )
-        })
+        .when(|e: &AlpacaError| e.is_retryable())
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
             tracing::warn!(
                 "Alpaca API call failed with {err}, retrying after {dur:?}"
@@ -227,71 +204,40 @@ impl AlpacaService for RealAlpacaService {
 
         debug!(%url, method = "POST", "Calling Alpaca redeem endpoint");
 
-        (|| async {
-            let response = self
-                .client
-                .post(&url)
-                .basic_auth(&self.api_key, Some(&self.api_secret))
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
+        let response = self
+            .client
+            .post(&url)
+            .basic_auth(&self.api_key, Some(&self.api_secret))
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .json(&request)
+            .send()
+            .await?;
 
-            let status = response.status();
+        let status = response.status();
 
-            match status {
-                reqwest::StatusCode::OK => {
-                    let redeem_response = response.json::<RedeemResponse>().await.map_err(
-                        |e| AlpacaError::Http {
-                            message: format!("Failed to parse response: {e}"),
-                        },
-                    )?;
-                    Ok(redeem_response)
-                }
-                reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN => {
-                    let body =
-                        response.text().await.unwrap_or_else(|_| String::new());
-                    let snippet = body.chars().take(200).collect::<String>();
-                    let reason = if snippet.is_empty() {
-                        "Authentication failed".to_string()
-                    } else {
-                        format!("Authentication failed: {snippet}")
-                    };
-                    Err(AlpacaError::Auth { reason })
-                }
-                status => {
-                    let message = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "Unknown error".to_string());
-                    Err(AlpacaError::Api {
-                        status_code: status.as_u16(),
-                        message,
-                    })
-                }
+        match status {
+            reqwest::StatusCode::OK => {
+                let body = response.text().await?;
+                serde_json::from_str(&body).map_err(|e| {
+                    tracing::error!(
+                        %body,
+                        error = %e,
+                        "Failed to parse Alpaca redeem response"
+                    );
+                    AlpacaError::Parse { body, source: e }
+                })
             }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_max_times(self.max_retries)
-                .with_jitter(),
-        )
-        .when(|e: &AlpacaError| {
-            matches!(
-                e,
-                AlpacaError::Http { .. }
-                    | AlpacaError::Api { status_code: 500..=599 | 429, .. }
-            )
-        })
-        .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::warn!(
-                "Alpaca redeem API call failed with {err}, retrying after {dur:?}"
-            );
-        })
-        .await
+            reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN => {
+                let body = response.text().await?;
+                Err(AlpacaError::Auth(body))
+            }
+            status => {
+                let body = response.text().await?;
+                Err(AlpacaError::Api { status_code: status.as_u16(), body })
+            }
+        }
     }
 
     async fn poll_request_status(
@@ -314,18 +260,21 @@ impl AlpacaService for RealAlpacaService {
                 .header("APCA-API-KEY-ID", &self.api_key)
                 .header("APCA-API-SECRET-KEY", &self.api_secret)
                 .send()
-                .await
-                .map_err(|e| AlpacaError::Http { message: e.to_string() })?;
+                .await?;
 
             let status = response.status();
 
             match status {
                 reqwest::StatusCode::OK => {
-                    let list_response = response
-                        .json::<RequestsListResponse>()
-                        .await
-                        .map_err(|e| AlpacaError::Http {
-                            message: format!("Failed to parse response: {e}"),
+                    let body = response.text().await?;
+                    let list_response: RequestsListResponse =
+                        serde_json::from_str(&body).map_err(|e| {
+                            tracing::error!(
+                                %body,
+                                error = %e,
+                                "Failed to parse Alpaca requests list response"
+                            );
+                            AlpacaError::Parse { body: body.clone(), source: e }
                         })?;
 
                     let request = list_response
@@ -335,32 +284,22 @@ impl AlpacaService for RealAlpacaService {
                             &req.id == tokenization_request_id
                                 && req.r#type == super::TokenizationRequestType::Redeem
                         })
-                        .ok_or_else(|| AlpacaError::RequestNotFound {
-                            tokenization_request_id: tokenization_request_id.0.clone(),
+                        .ok_or_else(|| {
+                            AlpacaError::RequestNotFound(tokenization_request_id.clone())
                         })?;
 
                     Ok(request)
                 }
                 reqwest::StatusCode::UNAUTHORIZED
                 | reqwest::StatusCode::FORBIDDEN => {
-                    let body =
-                        response.text().await.unwrap_or_else(|_| String::new());
-                    let snippet = body.chars().take(200).collect::<String>();
-                    let reason = if snippet.is_empty() {
-                        "Authentication failed".to_string()
-                    } else {
-                        format!("Authentication failed: {snippet}")
-                    };
-                    Err(AlpacaError::Auth { reason })
+                    let body = response.text().await?;
+                    Err(AlpacaError::Auth(body))
                 }
                 status => {
-                    let message = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "Unknown error".to_string());
+                    let body = response.text().await?;
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
-                        message,
+                        body,
                     })
                 }
             }
@@ -370,13 +309,7 @@ impl AlpacaService for RealAlpacaService {
                 .with_max_times(self.max_retries)
                 .with_jitter(),
         )
-        .when(|e: &AlpacaError| {
-            matches!(
-                e,
-                AlpacaError::Http { .. }
-                    | AlpacaError::Api { status_code: 500..=599 | 429, .. }
-            )
-        })
+        .when(|e: &AlpacaError| e.is_retryable())
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
             tracing::warn!(
                 "Alpaca poll request status API call failed with {err}, retrying after {dur:?}"
@@ -471,7 +404,7 @@ mod tests {
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
 
-        assert!(matches!(result, Err(AlpacaError::Auth { .. })));
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
         mock.assert();
     }
 
@@ -498,7 +431,7 @@ mod tests {
         let request = create_test_request();
         let result = service.send_mint_callback(request).await;
 
-        assert!(matches!(result, Err(AlpacaError::Auth { .. })));
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
         mock.assert();
     }
 
@@ -526,9 +459,9 @@ mod tests {
         let result = service.send_mint_callback(request).await;
 
         match result {
-            Err(AlpacaError::Api { status_code, message }) => {
+            Err(AlpacaError::Api { status_code, body }) => {
                 assert_eq!(status_code, 400);
-                assert_eq!(message, "Bad Request");
+                assert_eq!(body, "Bad Request");
             }
             _ => panic!("Expected AlpacaError::Api, got {result:?}"),
         }
@@ -719,7 +652,7 @@ mod tests {
         let request = create_redeem_request();
         let result = service.call_redeem_endpoint(request).await;
 
-        assert!(matches!(result, Err(AlpacaError::Auth { .. })));
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
         mock.assert();
     }
 
@@ -746,7 +679,7 @@ mod tests {
         let request = create_redeem_request();
         let result = service.call_redeem_endpoint(request).await;
 
-        assert!(matches!(result, Err(AlpacaError::Auth { .. })));
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
         mock.assert();
     }
 
@@ -774,9 +707,9 @@ mod tests {
         let result = service.call_redeem_endpoint(request).await;
 
         match result {
-            Err(AlpacaError::Api { status_code, message }) => {
+            Err(AlpacaError::Api { status_code, body }) => {
                 assert_eq!(status_code, 400);
-                assert_eq!(message, "Invalid request");
+                assert_eq!(body, "Invalid request");
             }
             _ => panic!("Expected AlpacaError::Api, got {result:?}"),
         }
@@ -1095,10 +1028,8 @@ mod tests {
             service.poll_request_status(&tokenization_request_id).await;
 
         match result {
-            Err(AlpacaError::RequestNotFound {
-                tokenization_request_id: id,
-            }) => {
-                assert_eq!(id, "tok-NOT-FOUND");
+            Err(AlpacaError::RequestNotFound(id)) => {
+                assert_eq!(id.0, "tok-NOT-FOUND");
             }
             _ => panic!("Expected RequestNotFound error, got {result:?}"),
         }
@@ -1132,7 +1063,7 @@ mod tests {
             .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
-        assert!(matches!(result, Err(AlpacaError::RequestNotFound { .. })));
+        assert!(matches!(result, Err(AlpacaError::RequestNotFound(_))));
         mock.assert();
     }
 
@@ -1160,7 +1091,7 @@ mod tests {
             .poll_request_status(&TokenizationRequestId::new("tok-123"))
             .await;
 
-        assert!(matches!(result, Err(AlpacaError::Auth { .. })));
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
         mock.assert();
     }
 
@@ -1336,10 +1267,8 @@ mod tests {
             .await;
 
         match result {
-            Err(AlpacaError::RequestNotFound {
-                tokenization_request_id: id,
-            }) => {
-                assert_eq!(id, "tok-mint-legacy");
+            Err(AlpacaError::RequestNotFound(id)) => {
+                assert_eq!(id.0, "tok-mint-legacy");
             }
             _ => panic!(
                 "Expected RequestNotFound for legacy mint entry, got {result:?}"
@@ -1347,5 +1276,125 @@ mod tests {
         }
 
         mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_401_returns_non_retryable_auth_error() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/redeem");
+            then.status(401).body("Unauthorized");
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(matches!(result, Err(AlpacaError::Auth(_))));
+        assert!(!result.unwrap_err().is_retryable());
+        mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_400_returns_non_retryable_api_error() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/redeem");
+            then.status(400).body("Bad Request");
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(matches!(
+            result,
+            Err(AlpacaError::Api { status_code: 400, .. })
+        ));
+        assert!(!result.unwrap_err().is_retryable());
+        mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_500_returns_retryable_api_error() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/redeem");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap()
+        .with_max_retries(0);
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(matches!(
+            result,
+            Err(AlpacaError::Api { status_code: 500, .. })
+        ));
+        assert!(result.unwrap_err().is_retryable());
+        mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_200_with_invalid_json_returns_non_retryable_error() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/redeem");
+            then.status(200).body("invalid json");
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, AlpacaError::Parse { .. }));
+        assert!(!err.is_retryable(), "Parse errors must NOT be retryable");
+        mock.assert_calls(1);
     }
 }

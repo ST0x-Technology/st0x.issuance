@@ -184,20 +184,40 @@ pub struct TokenizationRequest {
 }
 
 /// Errors that can occur during Alpaca API operations.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaError {
-    /// HTTP request failed (network error, timeout, etc.)
-    #[error("HTTP request failed: {message}")]
-    Http { message: String },
+    #[error("Reqwest error")]
+    Reqwest(#[from] reqwest::Error),
+    /// Failed to parse response after 200 OK - NOT retryable
+    #[error("Failed to parse response: {source}")]
+    Parse {
+        body: String,
+        #[source]
+        source: serde_json::Error,
+    },
     /// Authentication failed (401/403 response)
-    #[error("Authentication failed: {reason}")]
-    Auth { reason: String },
+    #[error("Authentication failed: {0}")]
+    Auth(String),
     /// Alpaca API returned an error response
-    #[error("API error: {status_code} - {message}")]
-    Api { status_code: u16, message: String },
+    #[error("API error {status_code}: {body}")]
+    Api { status_code: u16, body: String },
     /// Tokenization request not found when polling status
-    #[error("Tokenization request not found: {tokenization_request_id}")]
-    RequestNotFound { tokenization_request_id: String },
+    #[error("Tokenization request not found: {0}")]
+    RequestNotFound(TokenizationRequestId),
+}
+
+impl AlpacaError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Reqwest(e) => !e.is_decode(),
+            Self::Api { status_code, .. } => {
+                matches!(status_code, 500..=599 | 429)
+            }
+            Self::Parse { .. } | Self::Auth(_) | Self::RequestNotFound(_) => {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]

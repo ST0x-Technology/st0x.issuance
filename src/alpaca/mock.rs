@@ -75,11 +75,11 @@ impl AlpacaService for MockAlpacaService {
             if self.should_succeed {
                 Ok(())
             } else {
-                let message = self
+                let body = self
                     .error_message
                     .clone()
                     .unwrap_or_else(|| "Mock error".to_string());
-                Err(AlpacaError::Http { message })
+                Err(AlpacaError::Api { status_code: 500, body })
             }
         }
 
@@ -114,11 +114,11 @@ impl AlpacaService for MockAlpacaService {
                     fees: Fees(Decimal::ZERO),
                 })
             } else {
-                let message = self
+                let body = self
                     .error_message
                     .clone()
                     .unwrap_or_else(|| "Mock error".to_string());
-                Err(AlpacaError::Http { message })
+                Err(AlpacaError::Api { status_code: 500, body })
             }
         }
 
@@ -146,7 +146,7 @@ impl AlpacaService for MockAlpacaService {
 
     async fn poll_request_status(
         &self,
-        _tokenization_request_id: &TokenizationRequestId,
+        tokenization_request_id: &TokenizationRequestId,
     ) -> Result<super::TokenizationRequest, AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
@@ -154,7 +154,7 @@ impl AlpacaService for MockAlpacaService {
         {
             if self.should_succeed {
                 Ok(super::TokenizationRequest {
-                    id: _tokenization_request_id.clone(),
+                    id: tokenization_request_id.clone(),
                     issuer_request_id: crate::mint::IssuerRequestId::new(
                         "mock-issuer-123",
                     ),
@@ -175,15 +175,15 @@ impl AlpacaService for MockAlpacaService {
                     ),
                 })
             } else {
-                Err(AlpacaError::RequestNotFound {
-                    tokenization_request_id: _tokenization_request_id.0.clone(),
-                })
+                Err(AlpacaError::RequestNotFound(
+                    tokenization_request_id.clone(),
+                ))
             }
         }
 
         #[cfg(not(test))]
         Ok(super::TokenizationRequest {
-            id: _tokenization_request_id.clone(),
+            id: tokenization_request_id.clone(),
             issuer_request_id: crate::mint::IssuerRequestId::new(
                 "mock-issuer-123",
             ),
