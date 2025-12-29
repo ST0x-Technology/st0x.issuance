@@ -596,6 +596,7 @@ fn setup_redemption_mocks_with_shared_state(
 /// With the bug present, the second mint fails.
 /// After the fix (shared provider), all operations succeed.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_mint_burn_mint_nonce_synchronization()
 -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;

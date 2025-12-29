@@ -61,6 +61,8 @@ type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
 type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
 
+type SqliteEventStore<A> = PersistedEventStore<SqliteEventRepository, A>;
+
 struct AggregateCqrsSetup {
     mint_cqrs: MintCqrs,
     mint_event_store: MintEventStore,
@@ -68,18 +70,15 @@ struct AggregateCqrsSetup {
     redemption_event_store: RedemptionEventStore,
 }
 
+struct MintManagers {
+    mint: Arc<MintManager<SqliteEventStore<Mint>>>,
+    callback: Arc<CallbackManager<SqliteEventStore<Mint>>>,
+}
+
 struct RedemptionManagers {
-    redeem_call: Arc<
-        RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-        >,
-    >,
-    journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
-    burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
+    redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
+    journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
+    burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,20 +181,27 @@ pub async fn initialize_rocket(
         redemption_event_store,
     } = setup_aggregate_cqrs(&pool);
 
-    let (mint_manager, callback_manager) =
-        setup_mint_managers(&config, &mint_cqrs, &mint_event_store, &pool)
-            .await?;
+    let blockchain_service = config.create_blockchain_service().await?;
+
+    let MintManagers { mint: mint_manager, callback: callback_manager } =
+        setup_mint_managers(
+            &config,
+            blockchain_service.clone(),
+            &mint_cqrs,
+            &mint_event_store,
+            &pool,
+        )?;
 
     spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
 
     let RedemptionManagers { redeem_call, journal, burn } =
         setup_redemption_managers(
             &config,
+            blockchain_service,
             &redemption_cqrs,
             &redemption_event_store,
             &pool,
-        )
-        .await?;
+        )?;
 
     spawn_redemption_recovery(
         redeem_call.clone(),
@@ -340,20 +346,14 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
     }
 }
 
-async fn setup_mint_managers(
+fn setup_mint_managers(
     config: &Config,
+    blockchain_service: Arc<dyn vault::VaultService>,
     mint_cqrs: &MintCqrs,
     mint_event_store: &MintEventStore,
     pool: &Pool<Sqlite>,
-) -> Result<
-    (
-        Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
-        Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
-    ),
-    anyhow::Error,
-> {
-    let blockchain_service = config.create_blockchain_service().await?;
-    let mint_manager = Arc::new(MintManager::new(
+) -> Result<MintManagers, anyhow::Error> {
+    let mint = Arc::new(MintManager::new(
         blockchain_service,
         mint_cqrs.clone(),
         mint_event_store.clone(),
@@ -362,18 +362,19 @@ async fn setup_mint_managers(
     ));
 
     let alpaca_service = config.alpaca.service()?;
-    let callback_manager = Arc::new(CallbackManager::new(
+    let callback = Arc::new(CallbackManager::new(
         alpaca_service,
         mint_cqrs.clone(),
         mint_event_store.clone(),
         pool.clone(),
     ));
 
-    Ok((mint_manager, callback_manager))
+    Ok(MintManagers { mint, callback })
 }
 
-async fn setup_redemption_managers(
+fn setup_redemption_managers(
     config: &Config,
+    blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
     pool: &Pool<Sqlite>,
@@ -392,7 +393,6 @@ async fn setup_redemption_managers(
         pool.clone(),
     ));
 
-    let blockchain_service = config.create_blockchain_service().await?;
     let burn = Arc::new(BurnManager::new(
         blockchain_service,
         pool.clone(),
