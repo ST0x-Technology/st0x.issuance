@@ -238,7 +238,7 @@ jobs:
           VAULT_ADDRESS: ${{ secrets.VAULT_ADDRESS }}
           BOT_WALLET: ${{ secrets.BOT_WALLET }}
           ISSUER_API_KEY: ${{ secrets.ISSUER_API_KEY }}
-          ALPACA_API_BASE_URL: "https://broker-api.sandbox.alpaca.markets"
+          ALPACA_API_BASE_URL: "https://broker-api.alpaca.markets"
           ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
