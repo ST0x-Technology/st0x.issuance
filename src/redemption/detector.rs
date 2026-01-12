@@ -129,7 +129,7 @@ where
 
         while let Some(log) = stream.next().await {
             if let Err(e) = self.process_transfer_log(&log).await {
-                warn!("Failed to process transfer log: {e}");
+                error!("Failed to process transfer log: {e}");
             }
         }
 
