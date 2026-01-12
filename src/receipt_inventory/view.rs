@@ -154,6 +154,7 @@ impl View<Mint> for ReceiptInventoryView {
             }
             MintEvent::JournalConfirmed { .. }
             | MintEvent::JournalRejected { .. }
+            | MintEvent::MintingStarted { .. }
             | MintEvent::MintingFailed { .. }
             | MintEvent::MintCompleted { .. } => {}
         }
@@ -1534,6 +1535,16 @@ mod tests {
             )
             .await
             .expect("ConfirmJournal should succeed");
+
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::StartMinting {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("StartMinting should succeed");
 
         mint_cqrs
             .execute(

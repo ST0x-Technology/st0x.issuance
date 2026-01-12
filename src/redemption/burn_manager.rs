@@ -110,10 +110,32 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         let aggregate = context.aggregate();
 
-        if !matches!(aggregate, Redemption::Burning { .. }) {
+        let Redemption::Burning { metadata, .. } = aggregate else {
             debug!(
                 issuer_request_id = %issuer_request_id.0,
                 "Redemption no longer in Burning state, skipping"
+            );
+            return Ok(());
+        };
+
+        let shares_to_burn = metadata.quantity.to_u256_with_18_decimals()?;
+
+        // Check on-chain balance before attempting burn. If the bot has insufficient
+        // shares, the burn likely already succeeded on-chain but we crashed before
+        // recording it. Skip this redemption to avoid recording a false failure.
+        // Manual intervention required to resolve.
+        // TODO: Implement automatic recovery - see #88
+        let on_chain_balance =
+            self.blockchain_service.get_share_balance(self.bot_wallet).await?;
+
+        if on_chain_balance < shares_to_burn {
+            warn!(
+                issuer_request_id = %issuer_request_id.0,
+                on_chain_balance = %on_chain_balance,
+                shares_to_burn = %shares_to_burn,
+                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
+                 Burn likely already succeeded but was not recorded. \
+                 Skipping to avoid recording false failure."
             );
             return Ok(());
         }
@@ -1138,6 +1160,55 @@ mod tests {
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
             "Expected Completed state after recovery, got {updated_aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_skips_when_balance_insufficient() {
+        let (cqrs, store, pool) = setup_test_environment().await;
+
+        // Configure mock to return balance less than required (100 shares = 100e18)
+        let blockchain_service_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_share_balance(uint!(50_000000000000000000_U256)),
+        );
+        let blockchain_service = blockchain_service_mock.clone()
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id =
+            IssuerRequestId::new("red-recovery-insufficient-balance");
+
+        // Create a redemption in Burning state (needs 100 shares)
+        create_test_redemption_in_burning_state(
+            &cqrs,
+            &store,
+            &issuer_request_id,
+        )
+        .await;
+
+        // Recovery should skip this redemption without attempting burn
+        manager.recover_burning_redemptions().await;
+
+        // No burn should have been attempted
+        assert_eq!(
+            blockchain_service_mock.get_burn_call_count(),
+            0,
+            "Should not call burn when on-chain balance is insufficient"
+        );
+
+        // Redemption should stay in Burning state (not move to Failed)
+        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "Expected Burning state unchanged when balance insufficient, got {aggregate:?}"
         );
     }
 

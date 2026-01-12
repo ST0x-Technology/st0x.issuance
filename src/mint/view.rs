@@ -57,6 +57,19 @@ pub(crate) enum MintView {
         reason: String,
         rejected_at: DateTime<Utc>,
     },
+    Minting {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        minting_started_at: DateTime<Utc>,
+    },
     CallbackPending {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -211,15 +224,7 @@ impl MintView {
         };
     }
 
-    fn handle_tokens_minted(
-        &mut self,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        gas_used: u64,
-        block_number: u64,
-        minted_at: DateTime<Utc>,
-    ) {
+    fn handle_minting_started(&mut self, started_at: DateTime<Utc>) {
         let Self::JournalConfirmed {
             issuer_request_id,
             tokenization_request_id,
@@ -231,6 +236,47 @@ impl MintView {
             wallet,
             initiated_at,
             journal_confirmed_at,
+        } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at: started_at,
+        };
+    }
+
+    fn handle_tokens_minted(
+        &mut self,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    ) {
+        let Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
         } = self.clone()
         else {
             return;
@@ -261,7 +307,7 @@ impl MintView {
         error: String,
         failed_at: DateTime<Utc>,
     ) {
-        let Self::JournalConfirmed {
+        let Self::Minting {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -272,6 +318,7 @@ impl MintView {
             wallet,
             initiated_at,
             journal_confirmed_at,
+            ..
         } = self.clone()
         else {
             return;
@@ -349,6 +396,9 @@ impl View<Mint> for MintView {
             }
             MintEvent::JournalRejected { reason, rejected_at, .. } => {
                 self.handle_journal_rejected(reason.clone(), *rejected_at);
+            }
+            MintEvent::MintingStarted { started_at, .. } => {
+                self.handle_minting_started(*started_at);
             }
             MintEvent::TokensMinted {
                 tx_hash,
@@ -451,12 +501,15 @@ pub(crate) async fn find_callback_pending(
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
-    use crate::mint::MintEvent;
+    use crate::mint::{Mint, MintCommand, MintEvent};
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -743,8 +796,9 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let journal_confirmed_at = Utc::now();
+        let minting_started_at = Utc::now();
 
-        let mut view = MintView::JournalConfirmed {
+        let mut view = MintView::Minting {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -755,6 +809,7 @@ mod tests {
             wallet,
             initiated_at,
             journal_confirmed_at,
+            minting_started_at,
         };
 
         let tx_hash = b256!(
@@ -820,8 +875,9 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
         let journal_confirmed_at = Utc::now();
+        let minting_started_at = Utc::now();
 
-        let mut view = MintView::JournalConfirmed {
+        let mut view = MintView::Minting {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             quantity,
@@ -832,6 +888,7 @@ mod tests {
             wallet,
             initiated_at,
             journal_confirmed_at,
+            minting_started_at,
         };
 
         let error_message = "Transaction failed: insufficient gas";
@@ -1236,12 +1293,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_journal_confirmed_returns_matching_mints() {
-        use cqrs_es::persist::GenericQuery;
-        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-        use std::sync::Arc;
-
-        use crate::mint::{Mint, MintCommand};
-
         let pool = setup_test_db().await;
 
         let mint_view_repo =
@@ -1308,12 +1359,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_callback_pending_returns_matching_mints() {
-        use cqrs_es::persist::GenericQuery;
-        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-        use std::sync::Arc;
-
-        use crate::mint::{Mint, MintCommand};
-
         let pool = setup_test_db().await;
 
         let mint_view_repo =
@@ -1351,6 +1396,11 @@ mod tests {
             MintCommand::ConfirmJournal { issuer_request_id: iss_1.clone() };
 
         mint_cqrs.execute(&iss_1.0, confirm_cmd).await.unwrap();
+
+        let start_minting_cmd =
+            MintCommand::StartMinting { issuer_request_id: iss_1.clone() };
+
+        mint_cqrs.execute(&iss_1.0, start_minting_cmd).await.unwrap();
 
         let mint_success_cmd = MintCommand::RecordMintSuccess {
             issuer_request_id: iss_1.clone(),
@@ -1400,12 +1450,6 @@ mod tests {
     #[tokio::test]
     async fn test_find_journal_confirmed_returns_multiple_when_multiple_stuck()
     {
-        use cqrs_es::persist::GenericQuery;
-        use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-        use std::sync::Arc;
-
-        use crate::mint::{Mint, MintCommand};
-
         let pool = setup_test_db().await;
 
         let mint_view_repo =

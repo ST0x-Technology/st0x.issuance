@@ -82,6 +82,23 @@ pub(crate) trait VaultService: Send + Sync {
         receiver: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<BurnResult, VaultError>;
+
+    /// Gets the ERC-20 share balance for an address.
+    ///
+    /// This queries the vault contract's balanceOf(address) to get the total
+    /// share balance for the given address.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner` - Address to check the balance for
+    ///
+    /// # Returns
+    ///
+    /// The share balance (with 18 decimals).
+    async fn get_share_balance(
+        &self,
+        owner: Address,
+    ) -> Result<U256, VaultError>;
 }
 
 /// Result of a successful on-chain minting operation.

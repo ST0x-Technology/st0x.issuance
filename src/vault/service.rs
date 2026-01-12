@@ -173,6 +173,16 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             block_number,
         })
     }
+
+    async fn get_share_balance(
+        &self,
+        owner: Address,
+    ) -> Result<U256, VaultError> {
+        let vault =
+            OffchainAssetReceiptVault::new(self.vault_address, &self.provider);
+
+        Ok(vault.balanceOf(owner).call().await?)
+    }
 }
 
 #[cfg(test)]

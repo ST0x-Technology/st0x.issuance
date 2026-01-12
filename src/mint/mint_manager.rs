@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
-    OperationType, ReceiptInformation, VaultError, VaultService,
+    MintResult, OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
 use super::view::{MintViewError, find_journal_confirmed};
@@ -109,6 +109,23 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
             "Starting on-chain minting process"
         );
 
+        // Transition to Minting state before blockchain call to prevent duplicate mints
+        // on recovery. Once in Minting state, this mint won't be picked up by
+        // `find_journal_confirmed()` if we crash before completing.
+        self.cqrs
+            .execute(
+                issuer_request_id_str,
+                MintCommand::StartMinting {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await?;
+
+        debug!(
+            issuer_request_id = %issuer_request_id_str,
+            "StartMinting command executed, proceeding with blockchain call"
+        );
+
         let assets = quantity.to_u256_with_18_decimals()?;
 
         let receipt_info = ReceiptInformation {
@@ -127,62 +144,80 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
             .await
         {
             Ok(result) => {
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    tx_hash = %result.tx_hash,
-                    receipt_id = %result.receipt_id,
-                    shares_minted = %result.shares_minted,
-                    gas_used = result.gas_used,
-                    block_number = result.block_number,
-                    "On-chain minting succeeded"
-                );
-
-                self.cqrs
-                    .execute(
-                        issuer_request_id_str,
-                        MintCommand::RecordMintSuccess {
-                            issuer_request_id: issuer_request_id.clone(),
-                            tx_hash: result.tx_hash,
-                            receipt_id: result.receipt_id,
-                            shares_minted: result.shares_minted,
-                            gas_used: result.gas_used,
-                            block_number: result.block_number,
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    "RecordMintSuccess command executed successfully"
-                );
-
-                Ok(())
+                self.record_mint_success(issuer_request_id, result).await
             }
-            Err(e) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id_str,
-                    error = %e,
-                    "On-chain minting failed"
-                );
-
-                self.cqrs
-                    .execute(
-                        issuer_request_id_str,
-                        MintCommand::RecordMintFailure {
-                            issuer_request_id: issuer_request_id.clone(),
-                            error: e.to_string(),
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    "RecordMintFailure command executed successfully"
-                );
-
-                Err(MintManagerError::Blockchain(e))
-            }
+            Err(e) => self.record_mint_failure(issuer_request_id, e).await,
         }
+    }
+
+    async fn record_mint_success(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        result: MintResult,
+    ) -> Result<(), MintManagerError> {
+        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
+
+        info!(
+            issuer_request_id = %issuer_request_id_str,
+            tx_hash = %result.tx_hash,
+            receipt_id = %result.receipt_id,
+            shares_minted = %result.shares_minted,
+            gas_used = result.gas_used,
+            block_number = result.block_number,
+            "On-chain minting succeeded"
+        );
+
+        self.cqrs
+            .execute(
+                issuer_request_id_str,
+                MintCommand::RecordMintSuccess {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: result.tx_hash,
+                    receipt_id: result.receipt_id,
+                    shares_minted: result.shares_minted,
+                    gas_used: result.gas_used,
+                    block_number: result.block_number,
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id_str,
+            "RecordMintSuccess command executed successfully"
+        );
+
+        Ok(())
+    }
+
+    async fn record_mint_failure(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        error: VaultError,
+    ) -> Result<(), MintManagerError> {
+        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
+
+        warn!(
+            issuer_request_id = %issuer_request_id_str,
+            error = %error,
+            "On-chain minting failed"
+        );
+
+        self.cqrs
+            .execute(
+                issuer_request_id_str,
+                MintCommand::RecordMintFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: error.to_string(),
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id_str,
+            "RecordMintFailure command executed successfully"
+        );
+
+        Err(MintManagerError::Blockchain(error))
     }
 
     /// Recovers mints stuck in JournalConfirmed state after a restart.
@@ -259,6 +294,7 @@ const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
         Mint::Initiated { .. } => "Initiated",
         Mint::JournalConfirmed { .. } => "JournalConfirmed",
         Mint::JournalRejected { .. } => "JournalRejected",
+        Mint::Minting { .. } => "Minting",
         Mint::CallbackPending { .. } => "CallbackPending",
         Mint::MintingFailed { .. } => "MintingFailed",
         Mint::Completed { .. } => "Completed",

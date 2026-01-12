@@ -352,6 +352,15 @@ mod tests {
         .await
         .unwrap();
 
+        cqrs.execute(
+            &issuer_request_id.0,
+            MintCommand::StartMinting {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
         let tx_hash = b256!(
             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         );
@@ -661,6 +670,16 @@ mod tests {
         mint_cqrs
             .execute(
                 &issuer_request_id.0,
+                MintCommand::StartMinting {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("Failed to start minting");
+
+        mint_cqrs
+            .execute(
+                &issuer_request_id.0,
                 MintCommand::RecordMintSuccess {
                     issuer_request_id: issuer_request_id.clone(),
                     tx_hash: b256!(
@@ -757,6 +776,16 @@ mod tests {
                 .execute(
                     &issuer_request_id.0,
                     MintCommand::ConfirmJournal {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            mint_cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::StartMinting {
                         issuer_request_id: issuer_request_id.clone(),
                     },
                 )
