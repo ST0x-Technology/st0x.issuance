@@ -6,7 +6,7 @@ use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use url::Url;
 
 use super::{

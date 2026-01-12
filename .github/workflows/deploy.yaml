@@ -3,7 +3,7 @@ name: Build and deploy
 on:
   workflow_dispatch:
   push:
-    branches: [main, fix/alpaca-account-id-and-recovery]
+    branches: [main]
 
 env:
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
