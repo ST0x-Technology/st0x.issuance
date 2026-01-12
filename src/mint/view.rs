@@ -411,8 +411,7 @@ pub(crate) async fn find_journal_confirmed(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload: String"
         FROM mint_view
-        WHERE json_extract(payload, '$') LIKE 'JournalConfirmed%'
-           OR json_extract(payload, '$.JournalConfirmed') IS NOT NULL
+        WHERE json_extract(payload, '$.JournalConfirmed') IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -434,8 +433,7 @@ pub(crate) async fn find_callback_pending(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload: String"
         FROM mint_view
-        WHERE json_extract(payload, '$') LIKE 'CallbackPending%'
-           OR json_extract(payload, '$.CallbackPending') IS NOT NULL
+        WHERE json_extract(payload, '$.CallbackPending') IS NOT NULL
         "#
     )
     .fetch_all(pool)

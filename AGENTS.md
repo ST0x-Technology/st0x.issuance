@@ -870,7 +870,7 @@ This is a zero-tolerance policy. Speculation presented as fact is unacceptable.
 
 **Example:**
 
-```
+```text
 // ❌ FORBIDDEN: "ERC-20 minting emits Transfer from zero address"
 
 // ✅ REQUIRED: "Let me check..." [reads files] "Found it:
