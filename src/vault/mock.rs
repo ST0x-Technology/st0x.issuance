@@ -57,6 +57,8 @@ pub(crate) struct MockVaultService {
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
     #[cfg(test)]
     last_burn_call: Arc<Mutex<Option<BurnTokensCall>>>,
+    #[cfg(test)]
+    share_balance: Arc<Mutex<U256>>,
 }
 
 impl MockVaultService {
@@ -72,6 +74,8 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             last_burn_call: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            share_balance: Arc::new(Mutex::new(U256::MAX)),
         }
     }
 
@@ -85,6 +89,7 @@ impl MockVaultService {
             burn_call_count: Arc::new(AtomicUsize::new(0)),
             last_call: Arc::new(Mutex::new(None)),
             last_burn_call: Arc::new(Mutex::new(None)),
+            share_balance: Arc::new(Mutex::new(U256::MAX)),
         }
     }
 
@@ -121,6 +126,12 @@ impl MockVaultService {
         self.burn_call_count.store(0, Ordering::Relaxed);
         *self.last_call.lock().unwrap() = None;
         *self.last_burn_call.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_share_balance(self, balance: U256) -> Self {
+        *self.share_balance.lock().unwrap() = balance;
+        self
     }
 }
 
@@ -208,6 +219,20 @@ impl VaultService for MockVaultService {
             MockBehavior::Failure { reason } => {
                 Err(VaultError::TransactionFailed { reason: reason.clone() })
             }
+        }
+    }
+
+    async fn get_share_balance(
+        &self,
+        _owner: Address,
+    ) -> Result<U256, VaultError> {
+        #[cfg(test)]
+        {
+            Ok(*self.share_balance.lock().unwrap())
+        }
+        #[cfg(not(test))]
+        {
+            Ok(U256::MAX)
         }
     }
 }

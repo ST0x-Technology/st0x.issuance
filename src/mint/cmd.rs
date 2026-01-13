@@ -25,6 +25,9 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerRequestId,
         reason: String,
     },
+    StartMinting {
+        issuer_request_id: IssuerRequestId,
+    },
     RecordMintSuccess {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,

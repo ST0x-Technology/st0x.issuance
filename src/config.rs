@@ -230,7 +230,7 @@ mod tests {
             "--issuer-api-key",
             "test-key-that-is-at-least-32-chars-long",
             "--alpaca-account-id",
-            "alpaca-account-id",
+            "test-alpaca-account-id",
             "--alpaca-api-key",
             "alpaca-test-key",
             "--alpaca-api-secret",
@@ -334,7 +334,7 @@ mod tests {
             "--issuer-api-key",
             "short-key", // Less than 32 characters
             "--alpaca-account-id",
-            "alpaca-account-id",
+            "test-alpaca-account-id",
             "--alpaca-api-key",
             "alpaca-test-key",
             "--alpaca-api-secret",

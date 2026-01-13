@@ -13,7 +13,7 @@ mod confirm;
 mod initiate;
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 
 pub(crate) use confirm::confirm_journal;
 pub(crate) use initiate::initiate_mint;

@@ -22,7 +22,7 @@ use crate::tokenized_asset::{
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 
-pub(super) fn test_config() -> Config {
+pub(crate) fn test_config() -> Config {
     Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
@@ -37,34 +37,44 @@ pub(super) fn test_config() -> Config {
     }
 }
 
-pub(super) fn create_test_mint_manager(
+pub(crate) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,
+    event_store: crate::MintEventStore,
+    pool: sqlx::Pool<sqlx::Sqlite>,
 ) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
     let blockchain_service =
         Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-    Arc::new(MintManager::new(blockchain_service, mint_cqrs, bot))
+    Arc::new(MintManager::new(
+        blockchain_service,
+        mint_cqrs,
+        event_store,
+        pool,
+        bot,
+    ))
 }
 
-pub(super) fn create_test_callback_manager(
+pub(crate) fn create_test_callback_manager(
     mint_cqrs: crate::MintCqrs,
+    event_store: crate::MintEventStore,
+    pool: sqlx::Pool<sqlx::Sqlite>,
 ) -> Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
     let alpaca_service =
         Arc::new(crate::alpaca::mock::MockAlpacaService::new_success())
             as Arc<dyn AlpacaService>;
 
-    Arc::new(CallbackManager::new(alpaca_service, mint_cqrs))
+    Arc::new(CallbackManager::new(alpaca_service, mint_cqrs, event_store, pool))
 }
 
-pub(super) fn create_test_event_store(
+pub(crate) fn create_test_event_store(
     pool: &sqlx::Pool<sqlx::Sqlite>,
 ) -> Arc<PersistedEventStore<SqliteEventRepository, Mint>> {
     let event_repo = SqliteEventRepository::new(pool.clone());
     Arc::new(PersistedEventStore::new_event_store(event_repo))
 }
 
-pub(super) async fn setup_test_environment() -> (
+pub(crate) async fn setup_test_environment() -> (
     sqlx::Pool<sqlx::Sqlite>,
     crate::AccountCqrs,
     crate::TokenizedAssetCqrs,
@@ -112,7 +122,7 @@ pub(super) async fn setup_test_environment() -> (
     (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs)
 }
 
-pub(super) async fn setup_with_account_and_asset(
+pub(crate) async fn setup_with_account_and_asset(
     account_cqrs: &crate::AccountCqrs,
     tokenized_asset_cqrs: &crate::TokenizedAssetCqrs,
 ) -> (ClientId, UnderlyingSymbol, TokenSymbol, Network) {

@@ -1,12 +1,15 @@
 use alloy::primitives::{Address, U256};
 use chrono::Utc;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
-use super::{Redemption, RedemptionCommand, RedemptionError};
-use crate::mint::{IssuerRequestId, QuantityConversionError};
+use super::{
+    IssuerRequestId, Redemption, RedemptionCommand, RedemptionError,
+    RedemptionViewError, find_burning,
+};
+use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::view::{
     ReceiptInventoryViewError, find_receipt_with_balance,
 };
@@ -28,6 +31,7 @@ pub(crate) struct BurnManager<ES: EventStore<Redemption>> {
     blockchain_service: Arc<dyn VaultService>,
     receipt_query_pool: Pool<Sqlite>,
     cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    store: Arc<ES>,
     bot_wallet: Address,
 }
 
@@ -39,14 +43,109 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     /// * `blockchain_service` - Service for on-chain burning operations
     /// * `receipt_query_pool` - Database pool for querying receipt inventory
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
+    /// * `store` - Event store for loading aggregate state during recovery
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
         blockchain_service: Arc<dyn VaultService>,
         receipt_query_pool: Pool<Sqlite>,
         cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        store: Arc<ES>,
         bot_wallet: Address,
     ) -> Self {
-        Self { blockchain_service, receipt_query_pool, cqrs, bot_wallet }
+        Self { blockchain_service, receipt_query_pool, cqrs, store, bot_wallet }
+    }
+
+    /// Recovers redemptions stuck in the `Burning` state at startup.
+    ///
+    /// Queries the view for all redemptions in `Burning` state and resumes
+    /// the burn process for each. This handles cases where the bot crashed
+    /// after Alpaca journal completion but before burn was executed.
+    pub(crate) async fn recover_burning_redemptions(&self) {
+        debug!("Starting recovery of Burning redemptions");
+
+        let stuck_redemptions = match find_burning(&self.receipt_query_pool)
+            .await
+        {
+            Ok(redemptions) => redemptions,
+            Err(e) => {
+                error!(error = %e, "Failed to query for stuck Burning redemptions");
+                return;
+            }
+        };
+
+        if stuck_redemptions.is_empty() {
+            debug!("No Burning redemptions to recover");
+            return;
+        }
+
+        info!(
+            count = stuck_redemptions.len(),
+            "Recovering stuck Burning redemptions"
+        );
+
+        for (issuer_request_id, _view) in stuck_redemptions {
+            if let Err(e) =
+                self.recover_single_burning(&issuer_request_id).await
+            {
+                warn!(
+                    issuer_request_id = %issuer_request_id.0,
+                    error = %e,
+                    "Failed to recover Burning redemption"
+                );
+            }
+        }
+
+        debug!("Completed recovery of Burning redemptions");
+    }
+
+    async fn recover_single_burning(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<(), BurnManagerError> {
+        let context = self
+            .store
+            .load_aggregate(&issuer_request_id.0)
+            .await
+            .map_err(|e| BurnManagerError::EventStore(e.to_string()))?;
+
+        let aggregate = context.aggregate();
+
+        let Redemption::Burning { metadata, .. } = aggregate else {
+            debug!(
+                issuer_request_id = %issuer_request_id.0,
+                "Redemption no longer in Burning state, skipping"
+            );
+            return Ok(());
+        };
+
+        let shares_to_burn = metadata.quantity.to_u256_with_18_decimals()?;
+
+        // Check on-chain balance before attempting burn. If the bot has insufficient
+        // shares, the burn likely already succeeded on-chain but we crashed before
+        // recording it. Skip this redemption to avoid recording a false failure.
+        // Manual intervention required to resolve.
+        // TODO: Implement automatic recovery - see #88
+        let on_chain_balance =
+            self.blockchain_service.get_share_balance(self.bot_wallet).await?;
+
+        if on_chain_balance < shares_to_burn {
+            warn!(
+                issuer_request_id = %issuer_request_id.0,
+                on_chain_balance = %on_chain_balance,
+                shares_to_burn = %shares_to_burn,
+                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
+                 Burn likely already succeeded but was not recorded. \
+                 Skipping to avoid recording false failure."
+            );
+            return Ok(());
+        }
+
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            "Recovering Burning redemption - resuming burn"
+        );
+
+        self.handle_burning_started(issuer_request_id, aggregate).await
     }
 
     /// Handles a `Burning` state by burning tokens on-chain.
@@ -348,39 +447,44 @@ pub(crate) enum BurnManagerError {
 
     #[error("Receipt inventory error: {0}")]
     ReceiptInventory(#[from] ReceiptInventoryViewError),
+
+    #[error("View error: {0}")]
+    View(#[from] RedemptionViewError),
+
+    #[error("Event store error: {0}")]
+    EventStore(String),
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use cqrs_es::{
+        AggregateContext, EventStore,
+        persist::{GenericQuery, PersistedEventStore},
+    };
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteCqrs, SqliteEventRepository, SqliteViewRepository};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::receipt_inventory::view::ReceiptInventoryView;
+    use crate::redemption::view::RedemptionView;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
 
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
-    type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
+    type TestCqrs = SqliteCqrs<Redemption>;
+    type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
 
-    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
-        let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
-        (cqrs, store)
-    }
-
-    async fn setup_test_db() -> sqlx::Pool<sqlx::Sqlite> {
+    async fn setup_test_environment()
+    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(5)
             .connect(":memory:")
             .await
             .expect("Failed to create in-memory database");
@@ -390,7 +494,24 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        pool
+        let redemption_view_repo =
+            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
+
+        let redemption_query = GenericQuery::new(redemption_view_repo);
+
+        let cqrs = Arc::new(sqlite_es::sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(redemption_query)],
+            (),
+        ));
+
+        let repo = SqliteEventRepository::new(pool.clone());
+        let store = Arc::new(PersistedEventStore::new_event_store(repo));
+
+        (cqrs, store, pool)
     }
 
     async fn seed_receipt_with_balance(
@@ -489,8 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_success() {
-        let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db().await;
+        let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -498,6 +618,7 @@ mod tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
@@ -539,8 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_blockchain_failure() {
-        let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db().await;
+        let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service_mock =
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
@@ -549,6 +669,7 @@ mod tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
@@ -597,14 +718,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_insufficient_balance() {
-        let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db().await;
+        let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
@@ -641,14 +762,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_wrong_state_fails() {
-        let (cqrs, store) = setup_test_cqrs();
-        let pool = setup_test_db().await;
+        let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
             pool,
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
@@ -691,163 +812,9 @@ mod tests {
             "Expected InvalidAggregateState error, got {result:?}"
         );
     }
-}
-
-#[cfg(test)]
-mod integration_tests {
-    use alloy::primitives::{Address, address, b256, uint};
-    use chrono::Utc;
-    use cqrs_es::{
-        AggregateContext, EventStore,
-        persist::{GenericQuery, PersistedEventStore},
-    };
-    use rust_decimal::Decimal;
-    use sqlite_es::{SqliteCqrs, SqliteEventRepository, SqliteViewRepository};
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
-
-    use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-    use crate::receipt_inventory::view::ReceiptInventoryView;
-    use crate::redemption::view::RedemptionView;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-    use crate::vault::mock::MockVaultService;
-
-    const TEST_WALLET: Address =
-        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-
-    type TestCqrs = SqliteCqrs<Redemption>;
-    type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
-
-    async fn setup_test_environment()
-    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        let redemption_view_repo =
-            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
-
-        let redemption_query = GenericQuery::new(redemption_view_repo);
-
-        let cqrs = Arc::new(sqlite_es::sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(redemption_query)],
-            (),
-        ));
-
-        let repo = SqliteEventRepository::new(pool.clone());
-        let store = Arc::new(PersistedEventStore::new_event_store(repo));
-
-        (cqrs, store, pool)
-    }
-
-    async fn create_test_redemption_in_burning_state(
-        cqrs: &TestCqrs,
-        store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
-        let tokenization_request_id =
-            TokenizationRequestId::new("alp-burn-integration-789");
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let quantity = Quantity::new(Decimal::from(100));
-        let tx_hash = b256!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-        let block_number = 12345;
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: issuer_request_id.clone(),
-                tokenization_request_id,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
-
-        load_aggregate(store, issuer_request_id).await
-    }
-
-    async fn load_aggregate(
-        store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
-        context.aggregate().clone()
-    }
-
-    async fn seed_receipt_with_balance(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        mint_issuer_request_id: &str,
-        receipt_id: alloy::primitives::U256,
-        underlying: &str,
-        token: &str,
-        shares: alloy::primitives::U256,
-    ) {
-        let receipt_view = ReceiptInventoryView::Active {
-            receipt_id,
-            underlying: UnderlyingSymbol::new(underlying),
-            token: TokenSymbol::new(token),
-            initial_amount: shares,
-            current_balance: shares,
-            minted_at: Utc::now(),
-        };
-
-        let view_payload = serde_json::to_string(&receipt_view)
-            .expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO receipt_inventory_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            mint_issuer_request_id,
-            view_payload
-        )
-        .execute(pool)
-        .await
-        .expect("Failed to insert receipt view");
-    }
 
     #[tokio::test]
-    async fn test_integration_complete_redemption_with_burn() {
+    async fn test_complete_redemption_with_burn() {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
@@ -856,11 +823,12 @@ mod integration_tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-integration-001");
-        let mint_issuer_request_id = "mint-integration-001";
+        let issuer_request_id = IssuerRequestId::new("red-complete-001");
+        let mint_issuer_request_id = "mint-complete-001";
 
         seed_receipt_with_balance(
             &pool,
@@ -897,7 +865,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_integration_partial_burn_receipt_remains_active() {
+    async fn test_partial_burn_receipt_remains_active() {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
@@ -905,11 +873,12 @@ mod integration_tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-integration-002");
-        let mint_issuer_request_id = "mint-integration-002";
+        let issuer_request_id = IssuerRequestId::new("red-partial-002");
+        let mint_issuer_request_id = "mint-partial-002";
 
         seed_receipt_with_balance(
             &pool,
@@ -984,7 +953,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_integration_burn_depletes_receipt() {
+    async fn test_burn_depletes_receipt() {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
@@ -992,11 +961,12 @@ mod integration_tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-integration-003");
-        let mint_issuer_request_id = "mint-integration-003";
+        let issuer_request_id = IssuerRequestId::new("red-depletes-003");
+        let mint_issuer_request_id = "mint-depletes-003";
 
         seed_receipt_with_balance(
             &pool,
@@ -1031,7 +1001,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_integration_burn_with_multiple_receipts() {
+    async fn test_burn_with_multiple_receipts() {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
@@ -1039,14 +1009,15 @@ mod integration_tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-integration-004");
+        let issuer_request_id = IssuerRequestId::new("red-multiple-004");
 
         seed_receipt_with_balance(
             &pool,
-            "mint-integration-004a",
+            "mint-multiple-004a",
             uint!(45_U256),
             "AAPL",
             "tAAPL",
@@ -1056,7 +1027,7 @@ mod integration_tests {
 
         seed_receipt_with_balance(
             &pool,
-            "mint-integration-004b",
+            "mint-multiple-004b",
             uint!(46_U256),
             "AAPL",
             "tAAPL",
@@ -1087,7 +1058,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_integration_insufficient_balance_scenario() {
+    async fn test_insufficient_balance_scenario() {
         let (cqrs, store, pool) = setup_test_environment().await;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
@@ -1095,10 +1066,11 @@ mod integration_tests {
             blockchain_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-integration-005");
+        let issuer_request_id = IssuerRequestId::new("red-insufficient-005");
 
         let aggregate = create_test_redemption_in_burning_state(
             &cqrs,
@@ -1126,6 +1098,173 @@ mod integration_tests {
         assert!(
             reason.contains("No receipt found with sufficient balance"),
             "Expected error message about no receipt, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_redemptions_empty() {
+        let (cqrs, store, pool) = setup_test_environment().await;
+        let blockchain_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        manager.recover_burning_redemptions().await;
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_redemptions_with_valid_redemption() {
+        let (cqrs, store, pool) = setup_test_environment().await;
+        let blockchain_service_mock = Arc::new(MockVaultService::new_success());
+        let blockchain_service = blockchain_service_mock.clone()
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRequestId::new("red-recovery-001");
+
+        seed_receipt_with_balance(
+            &pool,
+            "mint-recovery-001",
+            uint!(99_U256),
+            "AAPL",
+            "tAAPL",
+            uint!(100_000000000000000000_U256),
+        )
+        .await;
+
+        create_test_redemption_in_burning_state(
+            &cqrs,
+            &store,
+            &issuer_request_id,
+        )
+        .await;
+
+        manager.recover_burning_redemptions().await;
+
+        assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
+
+        let updated_aggregate =
+            load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(updated_aggregate, Redemption::Completed { .. }),
+            "Expected Completed state after recovery, got {updated_aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_skips_when_balance_insufficient() {
+        let (cqrs, store, pool) = setup_test_environment().await;
+
+        // Configure mock to return balance less than required (100 shares = 100e18)
+        let blockchain_service_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_share_balance(uint!(50_000000000000000000_U256)),
+        );
+        let blockchain_service = blockchain_service_mock.clone()
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id =
+            IssuerRequestId::new("red-recovery-insufficient-balance");
+
+        // Create a redemption in Burning state (needs 100 shares)
+        create_test_redemption_in_burning_state(
+            &cqrs,
+            &store,
+            &issuer_request_id,
+        )
+        .await;
+
+        // Recovery should skip this redemption without attempting burn
+        manager.recover_burning_redemptions().await;
+
+        // No burn should have been attempted
+        assert_eq!(
+            blockchain_service_mock.get_burn_call_count(),
+            0,
+            "Should not call burn when on-chain balance is insufficient"
+        );
+
+        // Redemption should stay in Burning state (not move to Failed)
+        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "Expected Burning state unchanged when balance insufficient, got {aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_burning_skips_non_burning_state() {
+        let (cqrs, store, pool) = setup_test_environment().await;
+        let blockchain_service_mock = Arc::new(MockVaultService::new_success());
+        let blockchain_service = blockchain_service_mock.clone()
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRequestId::new("red-recovery-skip-001");
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+        let block_number = 12345;
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            RedemptionCommand::Detect {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+            },
+        )
+        .await
+        .unwrap();
+
+        manager.recover_burning_redemptions().await;
+
+        assert_eq!(
+            blockchain_service_mock.get_burn_call_count(),
+            0,
+            "Should not call burn for Detected state"
+        );
+
+        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+
+        assert!(
+            matches!(aggregate, Redemption::Detected { .. }),
+            "Expected Detected state unchanged, got {aggregate:?}"
         );
     }
 }

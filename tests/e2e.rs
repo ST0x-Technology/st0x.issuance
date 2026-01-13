@@ -1,19 +1,20 @@
 #![allow(clippy::unwrap_used)]
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, U256, b256};
+use alloy::primitives::{Address, TxHash, U256, b256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::{Mock, prelude::*};
 use rocket::local::asynchronous::Client;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::mint::MintResponse;
-use st0x_issuance::test_utils::{LocalEvm, test_alpaca_auth_header};
+use st0x_issuance::mint::{IssuerRequestId, MintResponse};
+use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
 };
@@ -69,6 +70,26 @@ where
                 "Timeout waiting for burn. Balance: {balance}"
             )
             .into());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_mock_hit(
+    mock: &Mock<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(5);
+    let poll_interval = tokio::time::Duration::from_millis(50);
+
+    loop {
+        if mock.calls_async().await > 0 {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err("Timeout waiting for mock to be hit".into());
         }
 
         tokio::time::sleep(poll_interval).await;
@@ -204,12 +225,14 @@ async fn perform_mint_flow(
 }
 
 fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
-    let test_auth = test_alpaca_auth_header();
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
 
     mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/test-account/tokenization/callback/mint")
-            .header("authorization", &test_auth);
+            .header("authorization", basic_auth)
+            .header("APCA-API-KEY-ID", api_key)
+            .header("APCA-API-SECRET-KEY", api_secret);
         then.status(200).body("");
     })
 }
@@ -218,7 +241,7 @@ fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
     user_wallet: Address,
 ) -> (Mock, Mock) {
-    let test_auth = test_alpaca_auth_header();
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));
 
@@ -228,7 +251,9 @@ fn setup_redemption_mocks(
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
             .path("/v1/accounts/test-account/tokenization/redeem")
-            .header("authorization", &test_auth);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |req: &httpmock::HttpMockRequest| {
@@ -273,7 +298,9 @@ fn setup_redemption_mocks(
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
             .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
-            .header("authorization", &test_auth);
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
             move |_req: &httpmock::HttpMockRequest| {
@@ -397,6 +424,498 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         vault.balanceOf(user_wallet).call().await?,
         U256::ZERO,
         "User should have no shares after redemption"
+    );
+
+    Ok(())
+}
+
+/// Helper to create a config with a specific database path
+fn create_config_with_db(
+    db_path: &str,
+    mock_alpaca: &MockServer,
+    evm: &LocalEvm,
+) -> Result<Config, Box<dyn std::error::Error>> {
+    Ok(Config {
+        database_url: db_path.to_string(),
+        database_max_connections: 5,
+        rpc_url: Url::parse(&evm.endpoint)?,
+        private_key: evm.private_key,
+        vault: evm.vault_address,
+        bot: evm.wallet_address,
+        auth: AuthConfig {
+            issuer_api_key: "test-key-12345678901234567890123456"
+                .parse()
+                .expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
+        },
+        log_level: st0x_issuance::LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig {
+            api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+        },
+    })
+}
+
+/// Sets up redemption mocks that use shared state across restarts.
+/// The `poll_should_succeed` flag controls whether the poll returns "completed" or "pending".
+fn setup_redemption_mocks_with_shared_state(
+    mock_alpaca: &MockServer,
+    user_wallet: Address,
+    shared_issuer_id: Arc<Mutex<Option<IssuerRequestId>>>,
+    shared_tx_hash: Arc<Mutex<Option<TxHash>>>,
+    poll_should_succeed: Arc<AtomicBool>,
+) -> (Mock, Mock) {
+    let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
+
+    let shared_issuer_id_clone = Arc::clone(&shared_issuer_id);
+    let shared_tx_hash_clone = Arc::clone(&shared_tx_hash);
+
+    let redeem_mock = mock_alpaca.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/accounts/test-account/tokenization/redeem")
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
+
+        then.status(200).respond_with(
+            move |req: &httpmock::HttpMockRequest| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body().as_ref()).unwrap();
+                let issuer_request_id = IssuerRequestId(
+                    body["issuer_request_id"].as_str().unwrap().to_string(),
+                );
+                let tx_hash: TxHash =
+                    body["tx_hash"].as_str().unwrap().parse().unwrap();
+
+                *shared_issuer_id_clone.lock().unwrap() =
+                    Some(issuer_request_id.clone());
+                *shared_tx_hash_clone.lock().unwrap() = Some(tx_hash);
+
+                let response_body = serde_json::to_string(&json!({
+                    "tokenization_request_id": "tok-redeem-recovery",
+                    "issuer_request_id": issuer_request_id.to_string(),
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "50",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": user_wallet,
+                    "tx_hash": tx_hash,
+                    "fees": "0.5"
+                }))
+                .unwrap();
+
+                httpmock::HttpMockResponse {
+                    status: Some(200),
+                    headers: None,
+                    body: Some(response_body.into()),
+                }
+            },
+        );
+    });
+
+    let poll_mock = mock_alpaca.mock(|when, then| {
+        when.method(GET)
+            .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
+            .header("authorization", &basic_auth)
+            .header("APCA-API-KEY-ID", &api_key)
+            .header("APCA-API-SECRET-KEY", &api_secret);
+
+        then.status(200).respond_with(
+            move |_req: &httpmock::HttpMockRequest| {
+                let issuer_request_id =
+                    shared_issuer_id.lock().unwrap().clone().expect(
+                        "issuer_request_id should be set by redeem mock",
+                    );
+                let tx_hash = shared_tx_hash
+                    .lock()
+                    .unwrap()
+                    .expect("tx_hash should be set by redeem mock");
+
+                // Check the flag to determine status
+                let status = if poll_should_succeed.load(Ordering::SeqCst) {
+                    "completed"
+                } else {
+                    "pending"
+                };
+
+                let response_body = serde_json::to_string(&json!({
+                    "requests": [{
+                        "tokenization_request_id": "tok-redeem-recovery",
+                        "issuer_request_id": issuer_request_id.to_string(),
+                        "created_at": "2025-09-12T17:28:48.642437-04:00",
+                        "type": "redeem",
+                        "status": status,
+                        "underlying_symbol": "AAPL",
+                        "token_symbol": "tAAPL",
+                        "qty": "50",
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": user_wallet,
+                        "tx_hash": tx_hash,
+                        "fees": "0.5"
+                    }]
+                }))
+                .unwrap();
+
+                httpmock::HttpMockResponse {
+                    status: Some(200),
+                    headers: None,
+                    body: Some(response_body.into()),
+                }
+            },
+        );
+    });
+
+    (redeem_mock, poll_mock)
+}
+
+/// Tests that MintManager and BurnManager share nonce state correctly.
+///
+/// This test reproduces the "nonce too low" bug that occurs when:
+/// 1. MintManager and BurnManager have separate blockchain providers
+/// 2. Each provider has its own nonce cache
+/// 3. After a burn advances the on-chain nonce (via BurnManager's provider),
+///    MintManager's provider still has its old cached nonce
+/// 4. The next mint fails with "nonce too low"
+///
+/// The test performs: mint → burn → mint
+/// With the bug present, the second mint fails.
+/// After the fix (shared provider), all operations succeed.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_mint_burn_mint_nonce_synchronization()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        setup_redemption_mocks(&mock_alpaca, user_wallet);
+
+    let config = Config {
+        database_url: ":memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: Url::parse(&evm.endpoint)?,
+        private_key: evm.private_key,
+        vault: evm.vault_address,
+        bot: bot_wallet,
+        auth: AuthConfig {
+            issuer_api_key: "test-key-12345678901234567890123456"
+                .parse()
+                .expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
+        },
+        log_level: st0x_issuance::LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig {
+            api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+        },
+    };
+
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    // Setup roles
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Setup user provider for transfers
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    // === STEP 1: First mint (uses Provider #1) ===
+    let link_body = setup_account(&client, user_wallet).await;
+
+    let mint1_response = client
+        .post("/inkind/issuance")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-1",
+                "qty": "50.0",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "network": "base",
+                "client_id": link_body.client_id,
+                "wallet_address": user_wallet
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(mint1_response.status(), rocket::http::Status::Ok);
+    let mint1_body: MintResponse = mint1_response.into_json().await.unwrap();
+
+    let confirm1_response = client
+        .post("/inkind/issuance/confirm")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-1",
+                "issuer_request_id": mint1_body.issuer_request_id,
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(
+        confirm1_response.status(),
+        rocket::http::Status::Ok,
+        "First mint should succeed"
+    );
+
+    let shares_minted = wait_for_shares(&vault, user_wallet).await?;
+    assert!(
+        shares_minted > U256::ZERO,
+        "User should have shares after first mint"
+    );
+
+    // === STEP 2: Burn (uses Provider #2, advances on-chain nonce) ===
+    vault
+        .transfer(bot_wallet, shares_minted)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Wait for burn to complete
+    wait_for_burn(&vault, bot_wallet).await?;
+
+    // Verify user has no shares after burn
+    assert_eq!(
+        vault.balanceOf(user_wallet).call().await?,
+        U256::ZERO,
+        "User should have no shares after burn"
+    );
+
+    // === STEP 3: Second mint (should fail with stale nonce if bug is present) ===
+    let mint2_response = client
+        .post("/inkind/issuance")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-2",
+                "qty": "25.0",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "network": "base",
+                "client_id": link_body.client_id,
+                "wallet_address": user_wallet
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(mint2_response.status(), rocket::http::Status::Ok);
+    let mint2_body: MintResponse = mint2_response.into_json().await.unwrap();
+
+    let confirm2_response = client
+        .post("/inkind/issuance/confirm")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-2",
+                "issuer_request_id": mint2_body.issuer_request_id,
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    // With the bug: this would fail because MintManager's provider has stale nonce
+    // After the fix: this should succeed
+    assert_eq!(
+        confirm2_response.status(),
+        rocket::http::Status::Ok,
+        "Second mint should succeed (if nonce is synchronized)"
+    );
+
+    // Verify second mint completed by checking user has shares again
+    let final_balance = wait_for_shares(&vault, user_wallet).await?;
+    assert!(
+        final_balance > U256::ZERO,
+        "User should have shares after second mint"
+    );
+
+    Ok(())
+}
+
+/// Tests that redemption recovery works after a simulated restart.
+///
+/// This test simulates a scenario where:
+/// 1. A redemption is initiated (tokens transferred to bot wallet)
+/// 2. The redemption progresses to the "AlpacaCalled" state
+/// 3. The application "crashes" (we drop the rocket instance)
+/// 4. On restart, recovery picks up the stuck redemption and completes it
+#[tokio::test]
+async fn test_redemption_recovery_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    // Use a temp file for the database so it persists between rocket instances
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_recovery.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Shared state across mock instances - None until populated by the redeem mock
+    let shared_issuer_id: Arc<Mutex<Option<IssuerRequestId>>> =
+        Arc::new(Mutex::new(None));
+    let shared_tx_hash: Arc<Mutex<Option<TxHash>>> = Arc::new(Mutex::new(None));
+    let poll_should_succeed = Arc::new(AtomicBool::new(false));
+
+    // Setup mocks - poll returns "pending" until we flip the flag
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_shared_state(
+        &mock_alpaca,
+        user_wallet,
+        Arc::clone(&shared_issuer_id),
+        Arc::clone(&shared_tx_hash),
+        Arc::clone(&poll_should_succeed),
+    );
+
+    let config = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    // Grant roles
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Perform mint flow
+    let shares_minted = perform_mint_flow(&client, &evm, user_wallet).await?;
+    mint_callback_mock.assert();
+
+    // Setup user provider for transfer
+    let user_wallet_instance = EthereumWallet::from(user_signer.clone());
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    // Initiate redemption by transferring tokens to bot wallet
+    vault
+        .transfer(bot_wallet, shares_minted)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Wait for the redemption to be detected and Alpaca redeem endpoint to be called
+    // The poll mock returns "pending" so it will stay in AlpacaCalled state
+    wait_for_mock_hit(&redeem_mock).await?;
+
+    // Verify bot has the shares (redemption in progress)
+    let bot_balance = vault.balanceOf(bot_wallet).call().await?;
+    assert!(
+        bot_balance > U256::ZERO,
+        "Bot should have shares during redemption"
+    );
+
+    // "Crash" - drop the client and rocket instance
+    drop(client);
+
+    // Flip the flag so polls now return "completed"
+    poll_should_succeed.store(true, Ordering::SeqCst);
+
+    let config2 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    // Recovery should pick up the stuck redemption and complete the burn
+    wait_for_burn(&vault, bot_wallet).await?;
+
+    // Verify all shares are burned
+    assert_eq!(
+        vault.balanceOf(bot_wallet).call().await?,
+        U256::ZERO,
+        "Bot wallet should have no shares after recovery"
+    );
+    assert_eq!(
+        vault.balanceOf(user_wallet).call().await?,
+        U256::ZERO,
+        "User wallet should have no shares after recovery"
     );
 
     Ok(())

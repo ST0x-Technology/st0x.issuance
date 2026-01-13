@@ -30,6 +30,10 @@ pub(crate) enum MintEvent {
         reason: String,
         rejected_at: DateTime<Utc>,
     },
+    MintingStarted {
+        issuer_request_id: IssuerRequestId,
+        started_at: DateTime<Utc>,
+    },
     TokensMinted {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,
@@ -59,6 +63,9 @@ impl DomainEvent for MintEvent {
             }
             Self::JournalRejected { .. } => {
                 "MintEvent::JournalRejected".to_string()
+            }
+            Self::MintingStarted { .. } => {
+                "MintEvent::MintingStarted".to_string()
             }
             Self::TokensMinted { .. } => "MintEvent::TokensMinted".to_string(),
             Self::MintingFailed { .. } => {

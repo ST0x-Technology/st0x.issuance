@@ -33,18 +33,18 @@ use crate::tokenized_asset::{
 };
 use crate::vault::mock::MockVaultService;
 
-/// Returns a test Basic auth header value for mock Alpaca API requests.
+/// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
-/// Uses clearly fake test credentials: "test-key:test-secret"
+/// Uses clearly fake test credentials: "test-key" / "test-secret"
+/// Returns (basic_auth_header, api_key, api_secret) for legacy auth which
+/// requires both Basic auth and APCA-API-KEY-ID/APCA-API-SECRET-KEY headers.
 #[must_use]
-pub fn test_alpaca_auth_header() -> String {
-    let test_api_key = "test-key";
-    let test_api_secret = "test-secret";
-
-    format!(
-        "Basic {}",
-        BASE64.encode(format!("{test_api_key}:{test_api_secret}"))
-    )
+pub fn test_alpaca_legacy_auth() -> (String, String, String) {
+    let api_key = "test-key".to_string();
+    let api_secret = "test-secret".to_string();
+    let basic_auth =
+        format!("Basic {}", BASE64.encode(format!("{api_key}:{api_secret}")));
+    (basic_auth, api_key, api_secret)
 }
 
 fn test_config() -> Result<Config, anyhow::Error> {
@@ -134,12 +134,16 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let mint_manager = Arc::new(MintManager::new(
         Arc::new(MockVaultService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
         bot,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(
         Arc::new(MockAlpacaService::new_success()),
         mint_cqrs.clone(),
+        mint_event_store.clone(),
+        pool.clone(),
     ));
 
     let rate_limiter = FailedAuthRateLimiter::new()?;

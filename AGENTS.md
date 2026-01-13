@@ -845,6 +845,44 @@ sol!(
 This policy ensures code quality remains high and prevents technical debt
 accumulation through lint suppression.
 
+## CRITICAL: Evidence-Based Claims
+
+**NEVER make claims about code behavior, external systems, or technical facts
+without providing evidence from the actual source code or documentation.**
+
+This is a zero-tolerance policy. Speculation presented as fact is unacceptable.
+
+**FORBIDDEN:**
+
+- "This is how ERC-20 works" without citing the actual contract code
+- "The API expects X" without showing the documentation or code that proves it
+- "This function does Y" without reading the function first
+- Any claim about inheritance, call stacks, or behavior without tracing through
+  the actual source files
+
+**REQUIRED:**
+
+- Before making any claim about behavior, READ the relevant source code first
+- Cite exact file paths and line numbers that prove the claim
+- For inheritance chains or call stacks, trace through each step with file
+  references
+- If you haven't read the code, say "I don't know" or "let me check"
+
+**Example:**
+
+```text
+// ❌ FORBIDDEN: "ERC-20 minting emits Transfer from zero address"
+
+// ✅ REQUIRED: "Let me check..." [reads files] "Found it:
+// 1. deposit() → ReceiptVault._deposit() (lib/.../ReceiptVault.sol:559)
+// 2. _deposit() → _mint() (lib/.../ReceiptVault.sol:587)
+// 3. ReceiptVault inherits ERC20Upgradeable (lib/.../ReceiptVault.sol:5)
+// 4. _mint() emits Transfer(0, to, amt) (lib/.../ERC20Upgradeable.sol:266)"
+```
+
+**When documenting non-obvious behavior in code comments**, include the full
+reference chain. See `src/redemption/detector.rs` for an example.
+
 ## Commenting Guidelines
 
 Code should be self-documenting. Comment only when adding context that code

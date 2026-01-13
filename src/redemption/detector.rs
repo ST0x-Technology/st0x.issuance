@@ -6,7 +6,7 @@ use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use url::Url;
 
 use super::{
@@ -14,7 +14,7 @@ use super::{
     journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
 };
 use crate::account::{
-    AccountView, ClientId,
+    AccountView, AlpacaAccountNumber, ClientId,
     view::{AccountViewError, find_by_wallet},
 };
 use crate::bindings;
@@ -129,7 +129,7 @@ where
 
         while let Some(log) = stream.next().await {
             if let Err(e) = self.process_transfer_log(&log).await {
-                warn!("Failed to process transfer log: {e}");
+                error!("Failed to process transfer log: {e}");
             }
         }
 
@@ -153,6 +153,31 @@ where
                 &log.inner,
             )?;
 
+        // Skip mint events where from=0x0.
+        //
+        // Call stack when our bot mints tokens to itself:
+        // 1. Bot calls vault.deposit() on OffchainAssetReceiptVault
+        // 2. OffchainAssetReceiptVault inherits from ReceiptVault
+        //    (lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol:243)
+        // 3. ReceiptVault._deposit() calls _mint(receiver, shares)
+        //    (lib/ethgild/src/abstract/ReceiptVault.sol:587)
+        // 4. ReceiptVault inherits from ERC20Upgradeable (aliased as ERC20)
+        //    (lib/ethgild/src/abstract/ReceiptVault.sol:5)
+        // 5. ERC20Upgradeable._mint() emits Transfer(address(0), account, amount)
+        //    (lib/ethgild/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/ERC20Upgradeable.sol:266)
+        //
+        // This Transfer event has from=0x0 and to=bot_wallet, which matches our
+        // subscription filter (we subscribe to transfers TO bot_wallet). These are
+        // mint events, not redemptions from users.
+        if transfer_event.from == Address::ZERO {
+            info!(
+                to = %transfer_event.to,
+                value = %transfer_event.value,
+                "Ignoring mint event (from=0x0)"
+            );
+            return Ok(());
+        }
+
         info!(
             from = %transfer_event.from,
             to = %transfer_event.to,
@@ -171,11 +196,16 @@ where
             )
             .await?;
 
-        let client_id =
-            self.get_account_client_id(&transfer_event.from).await?;
+        let (client_id, alpaca_account) =
+            self.get_account_info(&transfer_event.from).await?;
 
-        self.handle_alpaca_and_polling(issuer_request_id, client_id, network)
-            .await?;
+        self.handle_alpaca_and_polling(
+            issuer_request_id,
+            client_id,
+            alpaca_account,
+            network,
+        )
+        .await?;
 
         Ok(())
     }
@@ -246,27 +276,33 @@ where
         Ok(issuer_request_id)
     }
 
-    async fn get_account_client_id(
+    /// Looks up account info by wallet address.
+    ///
+    /// Note: `find_by_wallet` searches in `whitelisted_wallets` which only exists
+    /// in `LinkedToAlpaca` accounts, so the result is always `LinkedToAlpaca` if found.
+    async fn get_account_info(
         &self,
         wallet: &Address,
-    ) -> Result<ClientId, RedemptionMonitorError> {
+    ) -> Result<(ClientId, AlpacaAccountNumber), RedemptionMonitorError> {
         let account_view = find_by_wallet(&self.pool, wallet).await?.ok_or(
             RedemptionMonitorError::AccountNotFound { wallet: *wallet },
         )?;
 
-        let AccountView::LinkedToAlpaca { client_id, .. } = account_view else {
-            return Err(RedemptionMonitorError::AccountNotLinked {
+        match account_view {
+            AccountView::LinkedToAlpaca {
+                client_id, alpaca_account, ..
+            } => Ok((client_id, alpaca_account)),
+            _ => Err(RedemptionMonitorError::AccountNotLinked {
                 wallet: *wallet,
-            });
-        };
-
-        Ok(client_id)
+            }),
+        }
     }
 
     async fn handle_alpaca_and_polling(
         &self,
         issuer_request_id: IssuerRequestId,
         client_id: ClientId,
+        alpaca_account: AlpacaAccountNumber,
         network: Network,
     ) -> Result<(), RedemptionMonitorError> {
         let aggregate_ctx =
@@ -275,6 +311,7 @@ where
         if let Err(e) = self
             .redeem_call_manager
             .handle_redemption_detected(
+                &alpaca_account,
                 &issuer_request_id,
                 aggregate_ctx.aggregate(),
                 client_id,
@@ -308,6 +345,7 @@ where
         tokio::spawn(async move {
             if let Err(e) = journal_manager
                 .handle_alpaca_called(
+                    &alpaca_account,
                     issuer_request_id_cloned.clone(),
                     tokenization_request_id_cloned,
                 )
@@ -557,11 +595,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -570,6 +611,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -634,11 +676,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -647,6 +692,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -699,11 +745,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -712,6 +761,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -766,11 +816,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -779,6 +832,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -833,11 +887,14 @@ mod tests {
         let redeem_call_manager = Arc::new(RedeemCallManager::new(
             alpaca_service.clone(),
             cqrs.clone(),
+            store.clone(),
+            pool.clone(),
         ));
         let journal_manager = Arc::new(JournalManager::new(
             alpaca_service,
             cqrs.clone(),
             store.clone(),
+            pool.clone(),
         ));
 
         let vault_service = Arc::new(MockVaultService::new_success())
@@ -846,6 +903,7 @@ mod tests {
             vault_service,
             pool.clone(),
             cqrs.clone(),
+            store.clone(),
             bot_wallet,
         ));
 
@@ -890,6 +948,157 @@ mod tests {
                 Err(RedemptionMonitorError::CqrsExecution(_))
             ),
             "Second detection should fail with CQRS error, got {second_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_transfer_log_ignores_mint_events() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let (cqrs, store) = setup_test_cqrs();
+        let pool = setup_test_db_with_asset(vault, None).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            bot_wallet,
+        ));
+
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
+            vault,
+            bot_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
+            cqrs,
+            store.clone(),
+            pool,
+            redeem_call_manager,
+            journal_manager,
+            burn_manager,
+        );
+
+        // Mint event: from=0x0 (zero address) indicates token minting
+        let log = create_transfer_log(
+            Address::ZERO,
+            bot_wallet,
+            U256::from_str_radix("100000000000000000000", 10).unwrap(),
+            b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            12345,
+        );
+
+        let result = detector.process_transfer_log(&log).await;
+
+        assert!(
+            result.is_ok(),
+            "Mint events should be silently ignored, got {result:?}"
+        );
+
+        // Verify no redemption was created
+        let issuer_request_id =
+            IssuerRequestId::new("red-abcdefab".to_string());
+        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let aggregate = context.aggregate();
+
+        assert!(
+            matches!(aggregate, Redemption::Uninitialized),
+            "No redemption should be created for mint events, got {aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_transfer_log_account_not_found() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let unknown_wallet =
+            address!("0x1111111111111111111111111111111111111111");
+
+        let (cqrs, store) = setup_test_cqrs();
+        let pool = setup_test_db_with_asset(vault, None).await;
+
+        let alpaca_service = Arc::new(MockAlpacaService::new_success())
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let redeem_call_manager = Arc::new(RedeemCallManager::new(
+            alpaca_service.clone(),
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+        let journal_manager = Arc::new(JournalManager::new(
+            alpaca_service,
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+        ));
+
+        let vault_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let burn_manager = Arc::new(BurnManager::new(
+            vault_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            bot_wallet,
+        ));
+
+        let config = RedemptionDetectorConfig {
+            rpc_url: "wss://fake.url".parse().unwrap(),
+            vault,
+            bot_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            config,
+            cqrs,
+            store,
+            pool,
+            redeem_call_manager,
+            journal_manager,
+            burn_manager,
+        );
+
+        let log = create_transfer_log(
+            unknown_wallet,
+            bot_wallet,
+            U256::from_str_radix("100000000000000000000", 10).unwrap(),
+            b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            12345,
+        );
+
+        let result = detector.process_transfer_log(&log).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(RedemptionMonitorError::AccountNotFound { .. })
+            ),
+            "Expected AccountNotFound error, got {result:?}"
         );
     }
 }
