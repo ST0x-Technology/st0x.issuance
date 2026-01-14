@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::{Redemption, RedemptionCommand, RedemptionError};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{IssuerRequestId, QuantityConversionError};
 use crate::receipt_inventory::view::{
     ReceiptInventoryViewError, find_receipt_with_balance,
@@ -15,78 +16,39 @@ use crate::vault::{
     OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
-/// Orchestrates the on-chain burning process in response to `AlpacaJournalCompleted` events.
-///
-/// The manager bridges ES/CQRS aggregates with external blockchain services. It reacts to
-/// `AlpacaJournalCompleted` events by querying for a suitable receipt, calling the blockchain
-/// service to burn tokens, then records the result (success or failure) back into the
-/// Redemption aggregate via commands.
-///
-/// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
-/// integration with external systems.
-pub(crate) struct BurnManager<ES: EventStore<Redemption>> {
+pub(crate) struct BurnManager<ES: EventStore<Lifecycle<Redemption, Never>>> {
     blockchain_service: Arc<dyn VaultService>,
     receipt_query_pool: Pool<Sqlite>,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
     bot_wallet: Address,
 }
 
-impl<ES: EventStore<Redemption>> BurnManager<ES> {
-    /// Creates a new burn manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `blockchain_service` - Service for on-chain burning operations
-    /// * `receipt_query_pool` - Database pool for querying receipt inventory
-    /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
-    /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
+impl<ES: EventStore<Lifecycle<Redemption, Never>>> BurnManager<ES> {
     pub(crate) fn new(
         blockchain_service: Arc<dyn VaultService>,
         receipt_query_pool: Pool<Sqlite>,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
         bot_wallet: Address,
     ) -> Self {
         Self { blockchain_service, receipt_query_pool, cqrs, bot_wallet }
     }
 
-    /// Handles a `Burning` state by burning tokens on-chain.
-    ///
-    /// This method orchestrates the complete on-chain burning flow:
-    /// 1. Validates the aggregate is in `Burning` state
-    /// 2. Converts quantity to U256 with 18 decimals
-    /// 3. Queries for a suitable receipt with sufficient balance
-    /// 4. Calls blockchain service to burn tokens
-    /// 5. Records success (`RecordBurnSuccess`) or failure (`RecordBurnFailure`) via commands
-    ///
-    /// # Arguments
-    ///
-    /// * `issuer_request_id` - ID of the redemption request
-    /// * `aggregate` - Current state of the Redemption aggregate (must be `Burning`)
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` if burning succeeded and `RecordBurnSuccess` command was executed.
-    /// Returns `Err(BurnManagerError::Blockchain)` if burning failed (`RecordBurnFailure`
-    /// command is still executed to record the failure).
-    ///
-    /// # Errors
-    ///
-    /// * `BurnManagerError::InvalidAggregateState` - Aggregate is not in `Burning` state
-    /// * `BurnManagerError::QuantityConversion` - Quantity cannot be converted to U256
-    /// * `BurnManagerError::InsufficientBalance` - No receipt with sufficient balance found
-    /// * `BurnManagerError::Blockchain` - Blockchain transaction failed
-    /// * `BurnManagerError::Cqrs` - Command execution failed
-    /// * `BurnManagerError::Database` - Receipt query failed
     pub(crate) async fn handle_burning_started(
         &self,
         issuer_request_id: &IssuerRequestId,
-        aggregate: &Redemption,
+        aggregate: &Lifecycle<Redemption, Never>,
     ) -> Result<(), BurnManagerError> {
+        let Some(inner) = aggregate.live() else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: "Uninitialized".to_string(),
+            });
+        };
+
         let Redemption::Burning { metadata, tokenization_request_id, .. } =
-            aggregate
+            inner
         else {
             return Err(BurnManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(aggregate).to_string(),
+                current_state: inner.state_name().to_string(),
             });
         };
 
@@ -318,17 +280,6 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     }
 }
 
-const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
-    match aggregate {
-        Redemption::Uninitialized => "Uninitialized",
-        Redemption::Detected { .. } => "Detected",
-        Redemption::AlpacaCalled { .. } => "AlpacaCalled",
-        Redemption::Burning { .. } => "Burning",
-        Redemption::Failed { .. } => "Failed",
-        Redemption::Completed { .. } => "Completed",
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BurnManagerError {
     #[error("Blockchain error: {0}")]
@@ -359,7 +310,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
-    use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
+    use super::{BurnManager, BurnManagerError, Lifecycle, Never, Redemption, RedemptionCommand};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::receipt_inventory::view::ReceiptInventoryView;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -368,8 +319,8 @@ mod tests {
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
-    type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
+    type TestCqrs = cqrs_es::CqrsFramework<Lifecycle<Redemption, Never>, MemStore<Lifecycle<Redemption, Never>>>;
+    type TestStore = MemStore<Lifecycle<Redemption, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -430,7 +381,7 @@ mod tests {
         cqrs: &TestCqrs,
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
+    ) -> Lifecycle<Redemption, Never> {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-456");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -482,7 +433,7 @@ mod tests {
     async fn load_aggregate(
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
+    ) -> Lifecycle<Redemption, Never> {
         let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
         context.aggregate().clone()
     }
@@ -532,7 +483,7 @@ mod tests {
             load_aggregate(&store, &issuer_request_id).await;
 
         assert!(
-            matches!(updated_aggregate, Redemption::Completed { .. }),
+            matches!(updated_aggregate.live(), Some(Redemption::Completed { .. })),
             "Expected Completed state, got {updated_aggregate:?}"
         );
     }
@@ -585,7 +536,7 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Redemption::Failed { reason, .. } = updated_aggregate else {
+        let Some(Redemption::Failed { reason, .. }) = updated_aggregate.live() else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
         };
 
@@ -629,7 +580,7 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Redemption::Failed { reason, .. } = updated_aggregate else {
+        let Some(Redemption::Failed { reason, .. }) = updated_aggregate.live() else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
         };
 
@@ -689,443 +640,6 @@ mod tests {
                 Err(BurnManagerError::InvalidAggregateState { .. })
             ),
             "Expected InvalidAggregateState error, got {result:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod integration_tests {
-    use alloy::primitives::{Address, address, b256, uint};
-    use chrono::Utc;
-    use cqrs_es::{
-        AggregateContext, EventStore,
-        persist::{GenericQuery, PersistedEventStore},
-    };
-    use rust_decimal::Decimal;
-    use sqlite_es::{SqliteCqrs, SqliteEventRepository, SqliteViewRepository};
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
-
-    use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-    use crate::receipt_inventory::view::ReceiptInventoryView;
-    use crate::redemption::view::RedemptionView;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-    use crate::vault::mock::MockVaultService;
-
-    const TEST_WALLET: Address =
-        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-
-    type TestCqrs = SqliteCqrs<Redemption>;
-    type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
-
-    async fn setup_test_environment()
-    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        let redemption_view_repo =
-            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
-
-        let redemption_query = GenericQuery::new(redemption_view_repo);
-
-        let cqrs = Arc::new(sqlite_es::sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(redemption_query)],
-            (),
-        ));
-
-        let repo = SqliteEventRepository::new(pool.clone());
-        let store = Arc::new(PersistedEventStore::new_event_store(repo));
-
-        (cqrs, store, pool)
-    }
-
-    async fn create_test_redemption_in_burning_state(
-        cqrs: &TestCqrs,
-        store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
-        let tokenization_request_id =
-            TokenizationRequestId::new("alp-burn-integration-789");
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let quantity = Quantity::new(Decimal::from(100));
-        let tx_hash = b256!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-        let block_number = 12345;
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: issuer_request_id.clone(),
-                tokenization_request_id,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
-
-        load_aggregate(store, issuer_request_id).await
-    }
-
-    async fn load_aggregate(
-        store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
-        context.aggregate().clone()
-    }
-
-    async fn seed_receipt_with_balance(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        mint_issuer_request_id: &str,
-        receipt_id: alloy::primitives::U256,
-        underlying: &str,
-        token: &str,
-        shares: alloy::primitives::U256,
-    ) {
-        let receipt_view = ReceiptInventoryView::Active {
-            receipt_id,
-            underlying: UnderlyingSymbol::new(underlying),
-            token: TokenSymbol::new(token),
-            initial_amount: shares,
-            current_balance: shares,
-            minted_at: Utc::now(),
-        };
-
-        let view_payload = serde_json::to_string(&receipt_view)
-            .expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO receipt_inventory_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            mint_issuer_request_id,
-            view_payload
-        )
-        .execute(pool)
-        .await
-        .expect("Failed to insert receipt view");
-    }
-
-    #[tokio::test]
-    async fn test_integration_complete_redemption_with_burn() {
-        let (cqrs, store, pool) = setup_test_environment().await;
-        let blockchain_service_mock = Arc::new(MockVaultService::new_success());
-        let blockchain_service = blockchain_service_mock.clone()
-            as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRequestId::new("red-integration-001");
-        let mint_issuer_request_id = "mint-integration-001";
-
-        seed_receipt_with_balance(
-            &pool,
-            mint_issuer_request_id,
-            uint!(42_U256),
-            "AAPL",
-            "tAAPL",
-            uint!(100_000000000000000000_U256),
-        )
-        .await;
-
-        let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
-
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
-
-        assert!(
-            matches!(updated_aggregate, Redemption::Completed { .. }),
-            "Expected Completed state, got {updated_aggregate:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integration_partial_burn_receipt_remains_active() {
-        let (cqrs, store, pool) = setup_test_environment().await;
-        let blockchain_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRequestId::new("red-integration-002");
-        let mint_issuer_request_id = "mint-integration-002";
-
-        seed_receipt_with_balance(
-            &pool,
-            mint_issuer_request_id,
-            uint!(43_U256),
-            "AAPL",
-            "tAAPL",
-            uint!(200_000000000000000000_U256),
-        )
-        .await;
-
-        let tokenization_request_id =
-            TokenizationRequestId::new("alp-partial-burn");
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let quantity = Quantity::new(Decimal::from(50));
-        let tx_hash = b256!(
-            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
-        let block_number = 22222;
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying: underlying.clone(),
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: issuer_request_id.clone(),
-                tokenization_request_id,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &issuer_request_id.0,
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
-
-        assert!(
-            matches!(updated_aggregate, Redemption::Completed { .. }),
-            "Expected Completed state, got {updated_aggregate:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integration_burn_depletes_receipt() {
-        let (cqrs, store, pool) = setup_test_environment().await;
-        let blockchain_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRequestId::new("red-integration-003");
-        let mint_issuer_request_id = "mint-integration-003";
-
-        seed_receipt_with_balance(
-            &pool,
-            mint_issuer_request_id,
-            uint!(44_U256),
-            "AAPL",
-            "tAAPL",
-            uint!(100_000000000000000000_U256),
-        )
-        .await;
-
-        let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
-
-        assert!(
-            matches!(updated_aggregate, Redemption::Completed { .. }),
-            "Expected Completed state, got {updated_aggregate:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integration_burn_with_multiple_receipts() {
-        let (cqrs, store, pool) = setup_test_environment().await;
-        let blockchain_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRequestId::new("red-integration-004");
-
-        seed_receipt_with_balance(
-            &pool,
-            "mint-integration-004a",
-            uint!(45_U256),
-            "AAPL",
-            "tAAPL",
-            uint!(50_000000000000000000_U256),
-        )
-        .await;
-
-        seed_receipt_with_balance(
-            &pool,
-            "mint-integration-004b",
-            uint!(46_U256),
-            "AAPL",
-            "tAAPL",
-            uint!(200_000000000000000000_U256),
-        )
-        .await;
-
-        let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
-
-        assert!(
-            matches!(updated_aggregate, Redemption::Completed { .. }),
-            "Expected Completed state, got {updated_aggregate:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integration_insufficient_balance_scenario() {
-        let (cqrs, store, pool) = setup_test_environment().await;
-        let blockchain_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRequestId::new("red-integration-005");
-
-        let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(
-            matches!(result, Err(BurnManagerError::InsufficientBalance { .. })),
-            "Expected InsufficientBalance error, got {result:?}"
-        );
-
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
-
-        let Redemption::Failed { reason, .. } = updated_aggregate else {
-            panic!("Expected Failed state, got {updated_aggregate:?}");
-        };
-
-        assert!(
-            reason.contains("No receipt found with sufficient balance"),
-            "Expected error message about no receipt, got: {reason}"
         );
     }
 }

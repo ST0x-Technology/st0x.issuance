@@ -190,7 +190,7 @@ impl Aggregate for Lifecycle<TokenizedAsset, Never> {
 }
 
 impl View<Self> for Lifecycle<TokenizedAsset, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<TokenizedAsset, Never>>) {
         *self = self
             .clone()
             .transition(&event.payload, TokenizedAsset::apply_transition)
@@ -334,9 +334,7 @@ mod tests {
             added_at,
         });
 
-        let Lifecycle::Live(inner) = asset else {
-            panic!("Expected Live state, got {asset:?}");
-        };
+        let inner = asset.live().unwrap();
 
         assert_eq!(inner.underlying, underlying);
         assert_eq!(inner.token, token);
