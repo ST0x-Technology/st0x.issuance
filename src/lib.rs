@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -21,10 +21,7 @@ use crate::redemption::{
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
 };
-use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
-};
+use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
 pub mod account;
 pub mod mint;
@@ -167,8 +164,7 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (account_cqrs, tokenized_asset_cqrs) =
-        setup_basic_cqrs(&pool, config.vault).await?;
+    let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
 
     let AggregateCqrsSetup {
         mint_cqrs,
@@ -252,10 +248,7 @@ pub async fn initialize_rocket(
         .register("/", catchers::json_catchers()))
 }
 
-async fn setup_basic_cqrs(
-    pool: &Pool<Sqlite>,
-    vault: Address,
-) -> Result<(AccountCqrs, TokenizedAssetCqrs), anyhow::Error> {
+fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -276,9 +269,7 @@ async fn setup_basic_cqrs(
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    seed_initial_assets(&tokenized_asset_cqrs, vault).await?;
-
-    Ok((account_cqrs, tokenized_asset_cqrs))
+    (account_cqrs, tokenized_asset_cqrs)
 }
 
 fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
@@ -479,31 +470,6 @@ fn spawn_redemption_recovery(
         journal.recover_alpaca_called_redemptions().await;
         burn.recover_burning_redemptions().await;
     });
-}
-
-async fn seed_initial_assets(
-    cqrs: &TokenizedAssetCqrs,
-    vault: Address,
-) -> Result<(), anyhow::Error> {
-    let assets = vec![("AAPL", "tAAPL", "base", vault)];
-
-    for (underlying, token, network, vault) in assets {
-        let command = TokenizedAssetCommand::Add {
-            underlying: UnderlyingSymbol::new(underlying),
-            token: TokenSymbol::new(token),
-            network: Network::new(network),
-            vault,
-        };
-
-        match cqrs.execute(underlying, command).await {
-            Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-    }
-
-    Ok(())
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
