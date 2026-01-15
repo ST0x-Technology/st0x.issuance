@@ -1,11 +1,16 @@
-use rocket::get;
+use alloy::primitives::Address;
+use rocket::http::Status;
 use rocket::serde::json::Json;
+use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use tracing::error;
 
-use super::{Network, TokenSymbol, UnderlyingSymbol, view::TokenizedAssetView};
-use crate::auth::IssuerAuth;
+use super::{
+    Network, TokenSymbol, TokenizedAssetCommand, UnderlyingSymbol,
+    view::TokenizedAssetView,
+};
+use crate::auth::{InternalAuth, IssuerAuth};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TokenizedAssetResponse {
@@ -241,6 +246,180 @@ mod tests {
             .expect("valid rocket instance");
 
         let response = client.get("/tokenized-assets").dispatch().await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    async fn setup_tokenized_asset_cqrs(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+    ) -> crate::TokenizedAssetCqrs {
+        let view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+
+        let query = GenericQuery::new(view_repo);
+
+        sqlite_cqrs(pool.clone(), vec![Box::new(query)], ())
+    }
+
+    #[tokio::test]
+    async fn test_add_new_asset_returns_201() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(cqrs)
+            .manage(pool)
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "network": "base",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(
+            response.status(),
+            Status::Created,
+            "Response body: {:?}",
+            response.into_string().await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_existing_asset_returns_200_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(cqrs)
+            .manage(pool)
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "network": "base",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Created);
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_add_asset_without_auth_returns_401() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(cqrs)
+            .manage(pool)
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "network": "base",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
     }

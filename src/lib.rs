@@ -48,8 +48,6 @@ pub use config::{Config, LogLevel, setup_tracing};
 pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
-
-#[cfg(test)]
 pub(crate) type TokenizedAssetCqrs =
     SqliteCqrs<tokenized_asset::TokenizedAsset>;
 
@@ -152,8 +150,6 @@ pub(crate) enum QuantityConversionError {
     ParseFailed(#[from] rust_decimal::Error),
 }
 
-type TokenizedAssetCqrsInternal = SqliteCqrs<TokenizedAsset>;
-
 /// Initializes and configures the Rocket web server with all necessary state.
 ///
 /// Sets up database connections, CQRS infrastructure, service managers, and mounts
@@ -248,6 +244,7 @@ pub async fn initialize_rocket(
                 account::connect_account,
                 account::whitelist_wallet,
                 tokenized_asset::list_tokenized_assets,
+                tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
                 mint::confirm_journal
             ],
@@ -258,7 +255,7 @@ pub async fn initialize_rocket(
 async fn setup_basic_cqrs(
     pool: &Pool<Sqlite>,
     vault: Address,
-) -> Result<(AccountCqrs, TokenizedAssetCqrsInternal), anyhow::Error> {
+) -> Result<(AccountCqrs, TokenizedAssetCqrs), anyhow::Error> {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -485,7 +482,7 @@ fn spawn_redemption_recovery(
 }
 
 async fn seed_initial_assets(
-    cqrs: &TokenizedAssetCqrsInternal,
+    cqrs: &TokenizedAssetCqrs,
     vault: Address,
 ) -> Result<(), anyhow::Error> {
     let assets = vec![("AAPL", "tAAPL", "base", vault)];

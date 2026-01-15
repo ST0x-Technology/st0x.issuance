@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
-pub(crate) use api::list_tokenized_assets;
+pub(crate) use api::{add_tokenized_asset, list_tokenized_assets};
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::TokenizedAssetView;
