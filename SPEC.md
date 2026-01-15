@@ -576,6 +576,30 @@ struct TokenizedAsset {
 }
 ```
 
+#### Adding Tokenized Assets
+
+**Endpoint:** `POST /tokenized-assets`
+
+**Request:**
+
+```json
+{
+  "underlying": "AAPL",
+  "token": "tAAPL",
+  "network": "base",
+  "vault": "0x..."
+}
+```
+
+**Response:** `201 Created` for new assets, `200 OK` if asset already exists
+(idempotent).
+
+```json
+{
+  "underlying": "AAPL"
+}
+```
+
 ### 3. Token Minting (Alpaca ITN Flow)
 
 #### Receipt Custody Model
@@ -1264,6 +1288,7 @@ We run an HTTP server that implements these endpoints.
 
 1. **`POST /accounts`** - Register new AP account with email
 2. **`POST /accounts/{client_id}/wallets`** - Whitelist wallet address for AP
+3. **`POST /tokenized-assets`** - Add a new tokenized asset
 
 ### Endpoints We Call
 
