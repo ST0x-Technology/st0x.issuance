@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use cqrs_es::AggregateError;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
@@ -66,7 +67,7 @@ pub(crate) struct AddTokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, cqrs), fields(
     underlying = %request.underlying,
     token = %request.token,
     network = %request.network,
@@ -76,18 +77,8 @@ pub(crate) struct AddTokenizedAssetResponse {
 pub(crate) async fn add_tokenized_asset(
     _auth: InternalAuth,
     cqrs: &rocket::State<crate::TokenizedAssetCqrs>,
-    pool: &rocket::State<Pool<Sqlite>>,
     request: Json<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
-    let existed_before =
-        super::view::find_by_underlying(pool.inner(), &request.underlying)
-            .await
-            .map_err(|e| {
-                error!("Failed to check existing asset: {e}");
-                Status::InternalServerError
-            })?
-            .is_some();
-
     let command = TokenizedAssetCommand::Add {
         underlying: request.underlying.clone(),
         token: request.token.clone(),
@@ -95,15 +86,19 @@ pub(crate) async fn add_tokenized_asset(
         vault: request.vault,
     };
 
-    cqrs.execute(&request.underlying.0, command).await.map_err(|e| {
-        error!("Failed to add tokenized asset: {e}");
-        Status::InternalServerError
-    })?;
-
-    let status = if existed_before { Status::Ok } else { Status::Created };
+    cqrs.execute(&request.underlying.0, command)
+        .await
+        .or_else(|e| match e {
+            AggregateError::AggregateConflict => Ok(()),
+            _ => Err(e),
+        })
+        .map_err(|e| {
+            error!("Failed to add tokenized asset: {e}");
+            Status::InternalServerError
+        })?;
 
     Ok((
-        status,
+        Status::Created,
         Json(AddTokenizedAssetResponse {
             underlying: request.underlying.clone(),
         }),
@@ -381,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_existing_asset_returns_200_idempotent() {
+    async fn test_add_existing_asset_is_idempotent() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -439,7 +434,67 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.status(), Status::Created);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_both_succeed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let cqrs = setup_tokenized_asset_cqrs(&pool);
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(cqrs)
+            .manage(pool)
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "network": "base",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let (response1, response2) = tokio::join!(
+            client
+                .post("/tokenized-assets")
+                .header(ContentType::JSON)
+                .header(Header::new(
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
+                ))
+                .remote("127.0.0.1:8000".parse().unwrap())
+                .body(request_body.to_string())
+                .dispatch(),
+            client
+                .post("/tokenized-assets")
+                .header(ContentType::JSON)
+                .header(Header::new(
+                    "X-API-KEY",
+                    "test-key-12345678901234567890123456",
+                ))
+                .remote("127.0.0.1:8000".parse().unwrap())
+                .body(request_body.to_string())
+                .dispatch()
+        );
+
+        assert_eq!(response1.status(), Status::Created);
+        assert_eq!(response2.status(), Status::Created);
     }
 
     #[tokio::test]

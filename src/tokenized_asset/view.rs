@@ -80,26 +80,6 @@ pub(crate) async fn list_enabled_assets(
     Ok(views)
 }
 
-pub(crate) async fn find_by_underlying(
-    pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
-) -> Result<Option<TokenizedAssetView>, TokenizedAssetViewError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM tokenized_asset_view
-        WHERE view_id = ?
-        "#,
-        underlying.0
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    row.map(|r| serde_json::from_str(&r.payload))
-        .transpose()
-        .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
