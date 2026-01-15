@@ -53,18 +53,79 @@ pub(crate) async fn list_tokenized_assets(
     Ok(Json(TokenizedAssetsListResponse { tokens }))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct AddTokenizedAssetRequest {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AddTokenizedAssetResponse {
+    pub(crate) underlying: UnderlyingSymbol,
+}
+
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+    underlying = %request.underlying,
+    token = %request.token,
+    network = %request.network,
+    vault = ?request.vault
+))]
+#[post("/tokenized-assets", format = "json", data = "<request>")]
+pub(crate) async fn add_tokenized_asset(
+    _auth: InternalAuth,
+    cqrs: &rocket::State<crate::TokenizedAssetCqrs>,
+    pool: &rocket::State<Pool<Sqlite>>,
+    request: Json<AddTokenizedAssetRequest>,
+) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
+    let existed_before =
+        super::view::find_by_underlying(pool.inner(), &request.underlying)
+            .await
+            .map_err(|e| {
+                error!("Failed to check existing asset: {e}");
+                Status::InternalServerError
+            })?
+            .is_some();
+
+    let command = TokenizedAssetCommand::Add {
+        underlying: request.underlying.clone(),
+        token: request.token.clone(),
+        network: request.network.clone(),
+        vault: request.vault,
+    };
+
+    cqrs.execute(&request.underlying.0, command).await.map_err(|e| {
+        error!("Failed to add tokenized asset: {e}");
+        Status::InternalServerError
+    })?;
+
+    let status = if existed_before { Status::Ok } else { Status::Created };
+
+    Ok((
+        status,
+        Json(AddTokenizedAssetResponse {
+            underlying: request.underlying.clone(),
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
     use chrono::Utc;
-    use rocket::http::{Header, Status};
+    use cqrs_es::persist::GenericQuery;
+    use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
+    use crate::tokenized_asset::TokenizedAsset;
 
     fn test_config() -> Config {
         use alloy::primitives::{B256, address};
@@ -250,7 +311,7 @@ mod tests {
         assert_eq!(response.status(), Status::Unauthorized);
     }
 
-    async fn setup_tokenized_asset_cqrs(
+    fn setup_tokenized_asset_cqrs(
         pool: &sqlx::Pool<sqlx::Sqlite>,
     ) -> crate::TokenizedAssetCqrs {
         let view_repo = Arc::new(SqliteViewRepository::<
@@ -279,7 +340,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+        let cqrs = setup_tokenized_asset_cqrs(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -332,7 +393,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+        let cqrs = setup_tokenized_asset_cqrs(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -394,7 +455,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool).await;
+        let cqrs = setup_tokenized_asset_cqrs(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())

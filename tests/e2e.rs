@@ -96,6 +96,35 @@ async fn wait_for_mock_hit(
     }
 }
 
+async fn seed_tokenized_asset(client: &Client, vault: Address) {
+    let response = client
+        .post("/tokenized-assets")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "network": "base",
+                "vault": format!("{vault:#x}")
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert!(
+        response.status() == rocket::http::Status::Created
+            || response.status() == rocket::http::Status::Ok,
+        "Failed to seed tokenized asset: {:?}",
+        response.into_string().await
+    );
+}
+
 async fn setup_account(
     client: &Client,
     user_wallet: Address,
@@ -389,6 +418,8 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
+    seed_tokenized_asset(&client, evm.vault_address).await;
+
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
     evm.grant_certify_role(evm.wallet_address).await?;
@@ -646,6 +677,8 @@ async fn test_mint_burn_mint_nonce_synchronization()
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
+    seed_tokenized_asset(&client, evm.vault_address).await;
+
     // Setup roles
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -850,6 +883,8 @@ async fn test_redemption_recovery_after_restart()
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    seed_tokenized_asset(&client, evm.vault_address).await;
 
     // Grant roles
     evm.grant_deposit_role(user_wallet).await?;
