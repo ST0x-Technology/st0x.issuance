@@ -248,5 +248,6 @@ Bug fixes and improvements that don't fit into the original phases.
 - [x] [#91](https://github.com/ST0x-Technology/st0x.issuance/issues/91) -
       Hardcoded tokenized asset seeding instead of admin endpoint
   - **PR:** [#92](https://github.com/ST0x-Technology/st0x.issuance/pull/92)
-- [ ] [#93](https://github.com/ST0x-Technology/st0x.issuance/issues/93) -
+- [x] [#93](https://github.com/ST0x-Technology/st0x.issuance/issues/93) -
       ALPACA_IP_RANGES not passed through during deployment
+  - **PR:** [#94](https://github.com/ST0x-Technology/st0x.issuance/pull/94)
