@@ -245,3 +245,5 @@ Bug fixes and improvements that don't fit into the original phases.
 - [x] [#76](https://github.com/ST0x-Technology/st0x.issuance/issues/76) - Split
       account creation into Registration and Alpaca Linking
   - **PR:** [#75](https://github.com/ST0x-Technology/st0x.issuance/pull/75)
+- [ ] [#91](https://github.com/ST0x-Technology/st0x.issuance/issues/91) -
+      Hardcoded tokenized asset seeding instead of admin endpoint
