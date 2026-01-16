@@ -5,13 +5,15 @@ use chrono::Utc;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use tracing::{info, warn};
 
+use crate::lifecycle::{Lifecycle, Never};
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
     OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
 use super::{
-    IssuerRequestId, Mint, MintCommand, MintError, QuantityConversionError,
+    IssuerRequestId, Mint, MintCommand, MintError, MintState,
+    QuantityConversionError,
 };
 
 /// Orchestrates the on-chain minting process in response to JournalConfirmed events.
@@ -22,13 +24,13 @@ use super::{
 ///
 /// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
 /// integration with external systems.
-pub(crate) struct MintManager<ES: EventStore<Mint>> {
+pub(crate) struct MintManager<ES: EventStore<Lifecycle<Mint, Never>>> {
     blockchain_service: Arc<dyn VaultService>,
-    cqrs: Arc<CqrsFramework<Mint, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Mint, Never>, ES>>,
     bot: Address,
 }
 
-impl<ES: EventStore<Mint>> MintManager<ES> {
+impl<ES: EventStore<Lifecycle<Mint, Never>>> MintManager<ES> {
     /// Creates a new mint manager.
     ///
     /// # Arguments
@@ -38,7 +40,7 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     /// * `bot` - Bot's address that receives ERC1155 receipts
     pub(crate) const fn new(
         blockchain_service: Arc<dyn VaultService>,
-        cqrs: Arc<CqrsFramework<Mint, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Mint, Never>, ES>>,
         bot: Address,
     ) -> Self {
         Self { blockchain_service, cqrs, bot }
@@ -75,39 +77,41 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
     pub(crate) async fn handle_journal_confirmed(
         &self,
         issuer_request_id: &IssuerRequestId,
-        aggregate: &Mint,
+        aggregate: &Lifecycle<Mint, Never>,
     ) -> Result<(), MintManagerError> {
-        let Mint::JournalConfirmed {
-            tokenization_request_id,
-            quantity,
-            underlying,
-            wallet,
-            ..
-        } = aggregate
-        else {
+        let inner = aggregate.live().map_err(|_| {
+            MintManagerError::InvalidAggregateState {
+                current_state: "Uninitialized".to_string(),
+            }
+        })?;
+
+        let MintState::JournalConfirmed { .. } = &inner.state else {
             return Err(MintManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(aggregate).to_string(),
+                current_state: inner.state_name().to_string(),
             });
         };
 
         let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-        let UnderlyingSymbol(underlying_str) = underlying;
+        let UnderlyingSymbol(underlying_str) = &inner.request.underlying;
 
         info!(
             issuer_request_id = %issuer_request_id_str,
             underlying = %underlying_str,
-            quantity = %quantity.0,
-            wallet = %wallet,
+            quantity = %inner.request.quantity.0,
+            wallet = %inner.request.wallet,
             "Starting on-chain minting process"
         );
 
-        let assets = quantity.to_u256_with_18_decimals()?;
+        let assets = inner.request.quantity.to_u256_with_18_decimals()?;
 
         let receipt_info = ReceiptInformation {
-            tokenization_request_id: tokenization_request_id.clone(),
+            tokenization_request_id: inner
+                .request
+                .tokenization_request_id
+                .clone(),
             issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            quantity: quantity.clone(),
+            underlying: inner.request.underlying.clone(),
+            quantity: inner.request.quantity.clone(),
             operation_type: OperationType::Mint,
             timestamp: Utc::now(),
             notes: None,
@@ -115,78 +119,85 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
 
         match self
             .blockchain_service
-            .mint_and_transfer_shares(assets, self.bot, *wallet, receipt_info)
+            .mint_and_transfer_shares(
+                assets,
+                self.bot,
+                inner.request.wallet,
+                receipt_info,
+            )
             .await
         {
             Ok(result) => {
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    tx_hash = %result.tx_hash,
-                    receipt_id = %result.receipt_id,
-                    shares_minted = %result.shares_minted,
-                    gas_used = result.gas_used,
-                    block_number = result.block_number,
-                    "On-chain minting succeeded"
-                );
-
-                self.cqrs
-                    .execute(
-                        issuer_request_id_str,
-                        MintCommand::RecordMintSuccess {
-                            issuer_request_id: issuer_request_id.clone(),
-                            tx_hash: result.tx_hash,
-                            receipt_id: result.receipt_id,
-                            shares_minted: result.shares_minted,
-                            gas_used: result.gas_used,
-                            block_number: result.block_number,
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    "RecordMintSuccess command executed successfully"
-                );
-
-                Ok(())
+                self.record_mint_success(issuer_request_id, result).await
             }
-            Err(e) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id_str,
-                    error = %e,
-                    "On-chain minting failed"
-                );
-
-                self.cqrs
-                    .execute(
-                        issuer_request_id_str,
-                        MintCommand::RecordMintFailure {
-                            issuer_request_id: issuer_request_id.clone(),
-                            error: e.to_string(),
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id_str,
-                    "RecordMintFailure command executed successfully"
-                );
-
-                Err(MintManagerError::Blockchain(e))
-            }
+            Err(e) => self.record_mint_failure(issuer_request_id, e).await,
         }
     }
-}
 
-const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
-    match aggregate {
-        Mint::Uninitialized => "Uninitialized",
-        Mint::Initiated { .. } => "Initiated",
-        Mint::JournalConfirmed { .. } => "JournalConfirmed",
-        Mint::JournalRejected { .. } => "JournalRejected",
-        Mint::CallbackPending { .. } => "CallbackPending",
-        Mint::MintingFailed { .. } => "MintingFailed",
-        Mint::Completed { .. } => "Completed",
+    async fn record_mint_success(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        result: crate::vault::MintResult,
+    ) -> Result<(), MintManagerError> {
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            tx_hash = %result.tx_hash,
+            receipt_id = %result.receipt_id,
+            shares_minted = %result.shares_minted,
+            gas_used = result.gas_used,
+            block_number = result.block_number,
+            "On-chain minting succeeded"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::RecordMintSuccess {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: result.tx_hash,
+                    receipt_id: result.receipt_id,
+                    shares_minted: result.shares_minted,
+                    gas_used: result.gas_used,
+                    block_number: result.block_number,
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            "RecordMintSuccess command executed successfully"
+        );
+
+        Ok(())
+    }
+
+    async fn record_mint_failure(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        error: VaultError,
+    ) -> Result<(), MintManagerError> {
+        warn!(
+            issuer_request_id = %issuer_request_id.0,
+            error = %error,
+            "On-chain minting failed"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                MintCommand::RecordMintFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: error.to_string(),
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            "RecordMintFailure command executed successfully"
+        );
+
+        Err(MintManagerError::Blockchain(error))
     }
 }
 
@@ -210,24 +221,27 @@ mod tests {
     use std::sync::Arc;
 
     use alloy::primitives::address;
-    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use cqrs_es::{
+        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
+    };
     use rust_decimal::Decimal;
 
+    use crate::lifecycle::{Lifecycle, Never};
     use crate::mint::{
-        ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintState, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
     use super::{MintManager, MintManagerError};
 
-    type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
-    type TestStore = MemStore<Mint>;
+    type TestCqrs =
+        CqrsFramework<Lifecycle<Mint, Never>, MemStore<Lifecycle<Mint, Never>>>;
+    type TestStore = MemStore<Lifecycle<Mint, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
         (cqrs, store)
     }
 
@@ -235,7 +249,7 @@ mod tests {
         cqrs: &TestCqrs,
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Mint {
+    ) -> Lifecycle<Mint, Never> {
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -275,7 +289,7 @@ mod tests {
     async fn load_aggregate(
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Mint {
+    ) -> Lifecycle<Mint, Never> {
         let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
         context.aggregate().clone()
     }
@@ -308,9 +322,12 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
+        let inner = updated_aggregate.live().expect("Expected Live state");
+
         assert!(
-            matches!(updated_aggregate, Mint::CallbackPending { .. }),
-            "Expected CallbackPending state, got {updated_aggregate:?}"
+            matches!(inner.state, MintState::CallbackPending { .. }),
+            "Expected CallbackPending state, got {:?}",
+            inner.state
         );
     }
 
@@ -346,8 +363,10 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Mint::MintingFailed { error, .. } = updated_aggregate else {
-            panic!("Expected MintingFailed state, got {updated_aggregate:?}");
+        let inner = updated_aggregate.live().expect("Expected Live state");
+
+        let MintState::MintingFailed { error, .. } = &inner.state else {
+            panic!("Expected MintingFailed state, got {:?}", inner.state);
         };
 
         assert!(

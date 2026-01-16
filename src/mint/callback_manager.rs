@@ -1,9 +1,11 @@
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use super::{IssuerRequestId, Mint, MintCommand, MintError};
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
+use crate::lifecycle::{Lifecycle, Never};
+
+use super::{IssuerRequestId, Mint, MintCommand, MintError, MintState};
 
 /// Orchestrates the Alpaca callback process in response to TokensMinted events.
 ///
@@ -13,12 +15,12 @@ use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 ///
 /// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
 /// integration with external systems.
-pub(crate) struct CallbackManager<ES: EventStore<Mint>> {
+pub(crate) struct CallbackManager<ES: EventStore<Lifecycle<Mint, Never>>> {
     alpaca_service: Arc<dyn AlpacaService>,
-    cqrs: Arc<CqrsFramework<Mint, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Mint, Never>, ES>>,
 }
 
-impl<ES: EventStore<Mint>> CallbackManager<ES> {
+impl<ES: EventStore<Lifecycle<Mint, Never>>> CallbackManager<ES> {
     /// Creates a new callback manager.
     ///
     /// # Arguments
@@ -27,7 +29,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     /// * `cqrs` - CQRS framework for executing commands on the Mint aggregate
     pub(crate) const fn new(
         alpaca_service: Arc<dyn AlpacaService>,
-        cqrs: Arc<CqrsFramework<Mint, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Mint, Never>, ES>>,
     ) -> Self {
         Self { alpaca_service, cqrs }
     }
@@ -60,48 +62,47 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     pub(crate) async fn handle_tokens_minted(
         &self,
         issuer_request_id: &IssuerRequestId,
-        aggregate: &Mint,
+        aggregate: &Lifecycle<Mint, Never>,
     ) -> Result<(), CallbackManagerError> {
-        let Mint::CallbackPending {
-            tokenization_request_id,
-            client_id,
-            wallet,
-            tx_hash,
-            network,
-            ..
-        } = aggregate
-        else {
+        let inner = aggregate.live().map_err(|_| {
+            CallbackManagerError::InvalidAggregateState {
+                current_state: "Uninitialized".to_string(),
+            }
+        })?;
+
+        let MintState::CallbackPending { tx_hash, .. } = &inner.state else {
             return Err(CallbackManagerError::InvalidAggregateState {
-                current_state: aggregate.state_name().to_string(),
+                current_state: inner.state_name().to_string(),
             });
         };
 
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id.0,
             tx_hash = %tx_hash,
             "Starting Alpaca callback process"
         );
 
         let callback_request = MintCallbackRequest {
-            tokenization_request_id: tokenization_request_id.clone(),
-            client_id: *client_id,
-            wallet_address: *wallet,
+            tokenization_request_id: inner
+                .request
+                .tokenization_request_id
+                .clone(),
+            client_id: inner.request.client_id,
+            wallet_address: inner.request.wallet,
             tx_hash: *tx_hash,
-            network: network.clone(),
+            network: inner.request.network.clone(),
         };
 
         match self.alpaca_service.send_mint_callback(callback_request).await {
             Ok(()) => {
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id.0,
                     "Alpaca callback succeeded"
                 );
 
                 self.cqrs
                     .execute(
-                        issuer_request_id_str,
+                        &issuer_request_id.0,
                         MintCommand::RecordCallback {
                             issuer_request_id: issuer_request_id.clone(),
                         },
@@ -109,7 +110,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                     .await?;
 
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id.0,
                     "RecordCallback command executed successfully"
                 );
 
@@ -117,7 +118,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             }
             Err(e) => {
                 warn!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id.0,
                     error = %e,
                     "Alpaca callback failed"
                 );
@@ -149,13 +150,15 @@ mod tests {
 
     use super::{CallbackManager, CallbackManagerError};
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::lifecycle::{Lifecycle, Never};
     use crate::mint::{
-        ClientId, IssuerRequestId, Mint, MintCommand, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintState, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
 
-    type TestCqrs = CqrsFramework<Mint, MemStore<Mint>>;
-    type TestStore = MemStore<Mint>;
+    type TestCqrs =
+        CqrsFramework<Lifecycle<Mint, Never>, MemStore<Lifecycle<Mint, Never>>>;
+    type TestStore = MemStore<Lifecycle<Mint, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -167,7 +170,7 @@ mod tests {
         cqrs: &TestCqrs,
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Mint {
+    ) -> Lifecycle<Mint, Never> {
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -232,7 +235,7 @@ mod tests {
     async fn load_aggregate(
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Mint {
+    ) -> Lifecycle<Mint, Never> {
         let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
         context.aggregate().clone()
     }
@@ -264,9 +267,12 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
+        let inner = updated_aggregate.live().expect("Expected Live state");
+
         assert!(
-            matches!(updated_aggregate, Mint::Completed { .. }),
-            "Expected Completed state, got {updated_aggregate:?}"
+            matches!(inner.state, MintState::Completed { .. }),
+            "Expected Completed state, got {:?}",
+            inner.state
         );
     }
 
@@ -300,9 +306,12 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
+        let inner = updated_aggregate.live().expect("Expected Live state");
+
         assert!(
-            matches!(updated_aggregate, Mint::CallbackPending { .. }),
-            "Expected state to remain CallbackPending after failure, got {updated_aggregate:?}"
+            matches!(inner.state, MintState::CallbackPending { .. }),
+            "Expected state to remain CallbackPending after failure, got {:?}",
+            inner.state
         );
     }
 
