@@ -5,6 +5,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{Mint, MintEvent};
 use crate::redemption::{Redemption, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -160,8 +161,8 @@ impl View<Mint> for ReceiptInventoryView {
     }
 }
 
-impl View<Redemption> for ReceiptInventoryView {
-    fn update(&mut self, event: &EventEnvelope<Redemption>) {
+impl View<Lifecycle<Redemption, Never>> for ReceiptInventoryView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<Redemption, Never>>) {
         match &event.payload {
             RedemptionEvent::TokensBurned {
                 receipt_id,
@@ -302,9 +303,7 @@ mod tests {
         ClientId, IssuerRequestId, Mint, MintCommand, MintEvent, MintView,
         Network, Quantity, TokenizationRequestId,
     };
-    use crate::redemption::{
-        Redemption, RedemptionCommand, RedemptionEvent, RedemptionView,
-    };
+    use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -391,14 +390,21 @@ mod tests {
     /// the issuer_request_id from event payloads to use as the view_id. This allows
     /// both Mint and Redemption aggregates to update the same receipt inventory view.
     struct ReceiptInventoryRedemptionQuery {
-        view_repository:
-            Arc<SqliteViewRepository<ReceiptInventoryView, Redemption>>,
+        view_repository: Arc<
+            SqliteViewRepository<
+                ReceiptInventoryView,
+                Lifecycle<Redemption, Never>,
+            >,
+        >,
     }
 
     impl ReceiptInventoryRedemptionQuery {
         const fn new(
             view_repository: Arc<
-                SqliteViewRepository<ReceiptInventoryView, Redemption>,
+                SqliteViewRepository<
+                    ReceiptInventoryView,
+                    Lifecycle<Redemption, Never>,
+                >,
             >,
         ) -> Self {
             Self { view_repository }
@@ -406,11 +412,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Query<Redemption> for ReceiptInventoryRedemptionQuery {
+    impl Query<Lifecycle<Redemption, Never>> for ReceiptInventoryRedemptionQuery {
         async fn dispatch(
             &self,
             _aggregate_id: &str,
-            events: &[EventEnvelope<Redemption>],
+            events: &[EventEnvelope<Lifecycle<Redemption, Never>>],
         ) {
             for event in events {
                 let view_id = match &event.payload {
@@ -903,12 +909,13 @@ mod tests {
             burned_at,
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-123".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-123".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -943,12 +950,13 @@ mod tests {
             burned_at,
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-456".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-456".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -994,12 +1002,13 @@ mod tests {
             burned_at,
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-789".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-789".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -1033,12 +1042,13 @@ mod tests {
             burned_at: Utc::now(),
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-wrong".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-wrong".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -1068,12 +1078,13 @@ mod tests {
             burned_at: Utc::now(),
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-pending".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-pending".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -1100,12 +1111,13 @@ mod tests {
             burned_at: Utc::now(),
         };
 
-        let envelope: EventEnvelope<Redemption> = EventEnvelope {
-            aggregate_id: "red-unavail".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+            EventEnvelope {
+                aggregate_id: "red-unavail".to_string(),
+                sequence: 1,
+                payload: event,
+                metadata: HashMap::new(),
+            };
 
         view.update(&envelope);
 
@@ -1167,12 +1179,13 @@ mod tests {
         ];
 
         for event in events {
-            let envelope: EventEnvelope<Redemption> = EventEnvelope {
-                aggregate_id: "red-123".to_string(),
-                sequence: 1,
-                payload: event,
-                metadata: HashMap::new(),
-            };
+            let envelope: EventEnvelope<Lifecycle<Redemption, Never>> =
+                EventEnvelope {
+                    aggregate_id: "red-123".to_string(),
+                    sequence: 1,
+                    payload: event,
+                    metadata: HashMap::new(),
+                };
 
             view.update(&envelope);
 
@@ -1432,19 +1445,22 @@ mod tests {
             (),
         ));
 
-        let redemption_view_repo =
-            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
+        let redemption_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<Redemption, Never>,
+            Lifecycle<Redemption, Never>,
+        >::new(
+            pool.clone(),
+            "redemption_view".to_string(),
+        ));
         let redemption_query = GenericQuery::new(redemption_view_repo);
 
-        let receipt_inventory_redemption_repo = Arc::new(
-            SqliteViewRepository::<ReceiptInventoryView, Redemption>::new(
-                pool.clone(),
-                "receipt_inventory_view".to_string(),
-            ),
-        );
+        let receipt_inventory_redemption_repo =
+            Arc::new(SqliteViewRepository::<
+                ReceiptInventoryView,
+                Lifecycle<Redemption, Never>,
+            >::new(
+                pool.clone(), "receipt_inventory_view".to_string()
+            ));
         let receipt_inventory_redemption_query =
             ReceiptInventoryRedemptionQuery::new(
                 receipt_inventory_redemption_repo,
@@ -1554,12 +1570,12 @@ mod tests {
     }
 
     async fn execute_redemption_flow<ES>(
-        redemption_cqrs: &Arc<CqrsFramework<Redemption, ES>>,
+        redemption_cqrs: &Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
         issuer_request_id: &IssuerRequestId,
         receipt_id: U256,
         shares_to_burn: U256,
     ) where
-        ES: EventStore<Redemption>,
+        ES: EventStore<Lifecycle<Redemption, Never>>,
     {
         let redemption_aggregate_id = "red-redemption-456";
 

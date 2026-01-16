@@ -13,7 +13,7 @@ use crate::receipt_inventory::view::{
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
-    OperationType, ReceiptInformation, VaultError, VaultService,
+    BurnResult, OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
 pub(crate) struct BurnManager<ES: EventStore<Lifecycle<Redemption, Never>>> {
@@ -38,9 +38,9 @@ impl<ES: EventStore<Lifecycle<Redemption, Never>>> BurnManager<ES> {
         issuer_request_id: &IssuerRequestId,
         aggregate: &Lifecycle<Redemption, Never>,
     ) -> Result<(), BurnManagerError> {
-        let Some(inner) = aggregate.live() else {
+        let Ok(inner) = aggregate.live() else {
             return Err(BurnManagerError::InvalidAggregateState {
-                current_state: "Uninitialized".to_string(),
+                current_state: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -209,7 +209,7 @@ impl<ES: EventStore<Lifecycle<Redemption, Never>>> BurnManager<ES> {
         wallet: alloy::primitives::Address,
         receipt_info: ReceiptInformation,
     ) -> Result<(), BurnManagerError> {
-        match self
+        let burn_result = self
             .blockchain_service
             .burn_tokens(
                 shares,
@@ -218,65 +218,80 @@ impl<ES: EventStore<Lifecycle<Redemption, Never>>> BurnManager<ES> {
                 wallet,
                 receipt_info,
             )
-            .await
-        {
+            .await;
+
+        match burn_result {
             Ok(result) => {
-                info!(
-                    issuer_request_id = %issuer_request_id,
-                    tx_hash = %result.tx_hash,
-                    receipt_id = %result.receipt_id,
-                    shares_burned = %result.shares_burned,
-                    gas_used = result.gas_used,
-                    block_number = result.block_number,
-                    "On-chain burning succeeded"
-                );
-
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
-                        RedemptionCommand::RecordBurnSuccess {
-                            issuer_request_id: issuer_request_id.clone(),
-                            tx_hash: result.tx_hash,
-                            receipt_id: result.receipt_id,
-                            shares_burned: result.shares_burned,
-                            gas_used: result.gas_used,
-                            block_number: result.block_number,
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id,
-                    "RecordBurnSuccess command executed successfully"
-                );
-
-                Ok(())
+                self.record_burn_success(issuer_request_id, result).await
             }
-            Err(e) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
-                    error = %e,
-                    "On-chain burning failed"
-                );
-
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
-                        RedemptionCommand::RecordBurnFailure {
-                            issuer_request_id: issuer_request_id.clone(),
-                            error: e.to_string(),
-                        },
-                    )
-                    .await?;
-
-                info!(
-                    issuer_request_id = %issuer_request_id,
-                    "RecordBurnFailure command executed successfully"
-                );
-
-                Err(BurnManagerError::Blockchain(e))
-            }
+            Err(e) => self.record_burn_failure(issuer_request_id, e).await,
         }
+    }
+
+    async fn record_burn_success(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        result: BurnResult,
+    ) -> Result<(), BurnManagerError> {
+        info!(
+            issuer_request_id = %issuer_request_id,
+            tx_hash = %result.tx_hash,
+            receipt_id = %result.receipt_id,
+            shares_burned = %result.shares_burned,
+            gas_used = result.gas_used,
+            block_number = result.block_number,
+            "On-chain burning succeeded"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                RedemptionCommand::RecordBurnSuccess {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: result.tx_hash,
+                    receipt_id: result.receipt_id,
+                    shares_burned: result.shares_burned,
+                    gas_used: result.gas_used,
+                    block_number: result.block_number,
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id,
+            "RecordBurnSuccess command executed successfully"
+        );
+
+        Ok(())
+    }
+
+    async fn record_burn_failure(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        error: VaultError,
+    ) -> Result<(), BurnManagerError> {
+        warn!(
+            issuer_request_id = %issuer_request_id,
+            error = %error,
+            "On-chain burning failed"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: error.to_string(),
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id,
+            "RecordBurnFailure command executed successfully"
+        );
+
+        Err(BurnManagerError::Blockchain(error))
     }
 }
 
@@ -310,7 +325,10 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
-    use super::{BurnManager, BurnManagerError, Lifecycle, Never, Redemption, RedemptionCommand};
+    use super::{
+        BurnManager, BurnManagerError, Lifecycle, Never, Redemption,
+        RedemptionCommand,
+    };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::receipt_inventory::view::ReceiptInventoryView;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -319,7 +337,10 @@ mod tests {
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
-    type TestCqrs = cqrs_es::CqrsFramework<Lifecycle<Redemption, Never>, MemStore<Lifecycle<Redemption, Never>>>;
+    type TestCqrs = cqrs_es::CqrsFramework<
+        Lifecycle<Redemption, Never>,
+        MemStore<Lifecycle<Redemption, Never>>,
+    >;
     type TestStore = MemStore<Lifecycle<Redemption, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
@@ -483,7 +504,10 @@ mod tests {
             load_aggregate(&store, &issuer_request_id).await;
 
         assert!(
-            matches!(updated_aggregate.live(), Some(Redemption::Completed { .. })),
+            matches!(
+                updated_aggregate.live(),
+                Ok(Redemption::Completed { .. })
+            ),
             "Expected Completed state, got {updated_aggregate:?}"
         );
     }
@@ -536,7 +560,8 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Some(Redemption::Failed { reason, .. }) = updated_aggregate.live() else {
+        let Ok(Redemption::Failed { reason, .. }) = updated_aggregate.live()
+        else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
         };
 
@@ -580,7 +605,8 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Some(Redemption::Failed { reason, .. }) = updated_aggregate.live() else {
+        let Ok(Redemption::Failed { reason, .. }) = updated_aggregate.live()
+        else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
         };
 

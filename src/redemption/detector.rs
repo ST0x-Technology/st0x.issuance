@@ -1,9 +1,11 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
 use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -15,6 +17,7 @@ use super::{
 };
 use crate::account::{AccountViewError, ClientId, find_by_wallet};
 use crate::bindings;
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::IssuerRequestId;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetViewError, UnderlyingSymbol,
@@ -34,11 +37,13 @@ pub(crate) struct RedemptionDetectorConfig {
 /// The detector subscribes to Transfer events on the vault contract, filtering for
 /// transfers to the redemption wallet. When a transfer is detected, it creates a
 /// RedemptionCommand::Detect to record the redemption in the aggregate.
-pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
+pub(crate) struct RedemptionDetector<
+    ES: EventStore<Lifecycle<Redemption, Never>>,
+> {
     rpc_url: Url,
     vault: Address,
     bot_wallet: Address,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
     event_store: Arc<ES>,
     pool: Pool<Sqlite>,
     redeem_call_manager: Arc<RedeemCallManager<ES>>,
@@ -46,7 +51,8 @@ pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
     burn_manager: Arc<BurnManager<ES>>,
 }
 
-impl<ES: EventStore<Redemption> + 'static> RedemptionDetector<ES>
+impl<ES: EventStore<Lifecycle<Redemption, Never>> + 'static>
+    RedemptionDetector<ES>
 where
     ES::AC: Send,
 {
@@ -63,7 +69,7 @@ where
     /// * `burn_manager` - Manager for handling token burning after Alpaca journal completes
     pub(crate) fn new(
         config: RedemptionDetectorConfig,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
         event_store: Arc<ES>,
         pool: Pool<Sqlite>,
         redeem_call_manager: Arc<RedeemCallManager<ES>>,
@@ -101,6 +107,22 @@ where
     ///
     /// Returns an error if the connection fails, subscription fails, or the stream ends.
     async fn monitor_once(&self) -> Result<(), RedemptionMonitorError> {
+        let mut stream = self.establish_websocket_subscription().await?;
+
+        info!("WebSocket subscription active, monitoring for redemptions");
+
+        while let Some(log) = stream.next().await {
+            if let Err(e) = self.process_transfer_log(&log).await {
+                warn!("Failed to process transfer log: {e}");
+            }
+        }
+
+        Err(RedemptionMonitorError::StreamEnded)
+    }
+
+    async fn establish_websocket_subscription(
+        &self,
+    ) -> Result<BoxStream<'static, Log>, RedemptionMonitorError> {
         info!("Connecting to WebSocket at {}", self.rpc_url);
 
         let provider =
@@ -118,17 +140,7 @@ where
 
         let sub = provider.subscribe_logs(&filter).await?;
 
-        let mut stream = sub.into_stream();
-
-        info!("WebSocket subscription active, monitoring for redemptions");
-
-        while let Some(log) = stream.next().await {
-            if let Err(e) = self.process_transfer_log(&log).await {
-                warn!("Failed to process transfer log: {e}");
-            }
-        }
-
-        Err(RedemptionMonitorError::StreamEnded)
+        Ok(sub.into_stream().boxed())
     }
 
     /// Processes a single Transfer event log.
@@ -285,8 +297,8 @@ where
         let aggregate_ctx =
             self.event_store.load_aggregate(&issuer_request_id.0).await?;
 
-        let Redemption::AlpacaCalled { tokenization_request_id, .. } =
-            aggregate_ctx.aggregate()
+        let Ok(Redemption::AlpacaCalled { tokenization_request_id, .. }) =
+            aggregate_ctx.aggregate().live()
         else {
             return Ok(());
         };
@@ -327,20 +339,20 @@ where
                 }
             };
 
-            if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
-                if let Err(e) = burn_manager
+            if let Ok(Redemption::Burning { .. }) =
+                aggregate_ctx.aggregate().live()
+                && let Err(e) = burn_manager
                     .handle_burning_started(
                         &issuer_request_id_cloned,
                         aggregate_ctx.aggregate(),
                     )
                     .await
-                {
-                    warn!(
-                        issuer_request_id = %issuer_request_id_cloned.0,
-                        error = ?e,
-                        "handle_burning_started failed"
-                    );
-                }
+            {
+                warn!(
+                    issuer_request_id = %issuer_request_id_cloned.0,
+                    error = ?e,
+                    "handle_burning_started failed"
+                );
             }
         });
 
@@ -392,25 +404,27 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BurnManager, JournalManager, RedeemCallManager, RedemptionDetector,
-        RedemptionDetectorConfig, RedemptionMonitorError,
+        BurnManager, JournalManager, Lifecycle, Never, RedeemCallManager,
+        Redemption, RedemptionDetector, RedemptionDetectorConfig,
+        RedemptionMonitorError,
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
-    use crate::lifecycle::{Lifecycle, Never};
     use crate::mint::IssuerRequestId;
-    use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
-    type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
+    type TestCqrs = CqrsFramework<
+        Lifecycle<Redemption, Never>,
+        MemStore<Lifecycle<Redemption, Never>>,
+    >;
+    type TestStore = MemStore<Lifecycle<Redemption, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
@@ -610,7 +624,7 @@ mod tests {
         let aggregate = context.aggregate();
 
         assert!(
-            matches!(aggregate, Redemption::AlpacaCalled { .. }),
+            matches!(aggregate.live(), Ok(Redemption::AlpacaCalled { .. })),
             "Expected AlpacaCalled state, got {aggregate:?}"
         );
     }

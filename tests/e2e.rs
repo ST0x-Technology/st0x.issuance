@@ -203,7 +203,7 @@ async fn perform_mint_flow(
     wait_for_shares(&vault, user_wallet).await
 }
 
-fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
+fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock<'_> {
     let test_auth = test_alpaca_auth_header();
 
     mock_alpaca.mock(|when, then| {
@@ -217,7 +217,7 @@ fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
 fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
     user_wallet: Address,
-) -> (Mock, Mock) {
+) -> (Mock<'_>, Mock<'_>) {
     let test_auth = test_alpaca_auth_header();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));

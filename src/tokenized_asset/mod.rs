@@ -190,7 +190,7 @@ impl Aggregate for Lifecycle<TokenizedAsset, Never> {
 }
 
 impl View<Self> for Lifecycle<TokenizedAsset, Never> {
-    fn update(&mut self, event: &EventEnvelope<Lifecycle<TokenizedAsset, Never>>) {
+    fn update(&mut self, event: &EventEnvelope<Self>) {
         *self = self
             .clone()
             .transition(&event.payload, TokenizedAsset::apply_transition)

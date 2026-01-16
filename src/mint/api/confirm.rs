@@ -72,17 +72,16 @@ pub(crate) async fn confirm_journal(
 
     if let Some(expected_tokenization_id) =
         mint_ctx.aggregate().tokenization_request_id()
+        && &tokenization_request_id != expected_tokenization_id
     {
-        if &tokenization_request_id != expected_tokenization_id {
-            error!(
-                "Tokenization request ID mismatch for issuer_request_id={}. \
-                 Expected: {}, provided: {}",
-                issuer_request_id.0,
-                expected_tokenization_id.0,
-                tokenization_request_id.0
-            );
-            return rocket::http::Status::BadRequest;
-        }
+        error!(
+            "Tokenization request ID mismatch for issuer_request_id={}. \
+             Expected: {}, provided: {}",
+            issuer_request_id.0,
+            expected_tokenization_id.0,
+            tokenization_request_id.0
+        );
+        return rocket::http::Status::BadRequest;
     }
 
     match status {

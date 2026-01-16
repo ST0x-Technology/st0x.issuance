@@ -5,17 +5,20 @@ use tracing::{info, warn};
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::account::ClientId;
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
-pub(crate) struct RedeemCallManager<ES: EventStore<Redemption>> {
+pub(crate) struct RedeemCallManager<
+    ES: EventStore<Lifecycle<Redemption, Never>>,
+> {
     alpaca_service: Arc<dyn AlpacaService>,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
 }
 
-impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
+impl<ES: EventStore<Lifecycle<Redemption, Never>>> RedeemCallManager<ES> {
     pub(crate) const fn new(
         alpaca_service: Arc<dyn AlpacaService>,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
     ) -> Self {
         Self { alpaca_service, cqrs }
     }
@@ -27,13 +30,19 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     pub(crate) async fn handle_redemption_detected(
         &self,
         issuer_request_id: &IssuerRequestId,
-        aggregate: &Redemption,
+        aggregate: &Lifecycle<Redemption, Never>,
         client_id: ClientId,
         network: Network,
     ) -> Result<(), RedeemCallManagerError> {
-        let Redemption::Detected { metadata } = aggregate else {
+        let Ok(inner) = aggregate.live() else {
             return Err(RedeemCallManagerError::InvalidAggregateState {
-                current_state: aggregate.state_name().to_string(),
+                current_state: "Uninitialized or Failed".to_string(),
+            });
+        };
+
+        let Redemption::Detected { metadata } = inner else {
+            return Err(RedeemCallManagerError::InvalidAggregateState {
+                current_state: inner.state_name().to_string(),
             });
         };
 
@@ -137,24 +146,30 @@ pub(crate) enum RedeemCallManagerError {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
-    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use cqrs_es::{
+        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
+    };
     use rust_decimal::Decimal;
     use std::sync::Arc;
 
-    use super::{RedeemCallManager, RedeemCallManagerError};
+    use super::{
+        Lifecycle, Never, RedeemCallManager, RedeemCallManagerError, Redemption,
+    };
     use crate::account::ClientId;
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
-    use crate::redemption::{Redemption, RedemptionCommand, UnderlyingSymbol};
+    use crate::redemption::{RedemptionCommand, UnderlyingSymbol};
     use crate::tokenized_asset::{Network, TokenSymbol};
 
-    type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
+    type TestCqrs = CqrsFramework<
+        Lifecycle<Redemption, Never>,
+        MemStore<Lifecycle<Redemption, Never>>,
+    >;
+    type TestStore = MemStore<Lifecycle<Redemption, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
         (cqrs, store)
     }
 
@@ -162,7 +177,7 @@ mod tests {
         cqrs: &TestCqrs,
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
+    ) -> Lifecycle<Redemption, Never> {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -193,7 +208,7 @@ mod tests {
     async fn load_aggregate(
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
-    ) -> Redemption {
+    ) -> Lifecycle<Redemption, Never> {
         let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
         context.aggregate().clone()
     }
@@ -234,7 +249,10 @@ mod tests {
             load_aggregate(&store, &issuer_request_id).await;
 
         assert!(
-            matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
+            matches!(
+                updated_aggregate.live(),
+                Ok(Redemption::AlpacaCalled { .. })
+            ),
             "Expected AlpacaCalled state, got {updated_aggregate:?}"
         );
     }
@@ -278,7 +296,8 @@ mod tests {
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
-        let Redemption::Failed { reason, .. } = updated_aggregate else {
+        let Ok(Redemption::Failed { reason, .. }) = updated_aggregate.live()
+        else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
         };
 
@@ -296,7 +315,7 @@ mod tests {
         let manager = RedeemCallManager::new(alpaca_service, cqrs.clone());
 
         let issuer_request_id = IssuerRequestId::new("red-wrong-state-789");
-        let aggregate = Redemption::Uninitialized;
+        let aggregate = Lifecycle::<Redemption, Never>::default();
 
         let client_id = ClientId::new();
         let network = Network::new("base");

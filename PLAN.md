@@ -214,18 +214,18 @@ The `Lifecycle` wrapper handles `Uninitialized` vs `Live` states.
 
 ### Subtasks
 
-- [ ] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
+- [x] Flatten module: merge `cmd.rs`, `event.rs`, `view.rs` into `mod.rs` (keep
       managers separate)
-- [ ] Create `Redemption` enum with variants containing `RedemptionMetadata`
-- [ ] Implement `Redemption::from_event()` and `apply_transition()`
-- [ ] Change `impl Aggregate for Redemption` to
+- [x] Create `Redemption` enum with variants containing `RedemptionMetadata`
+- [x] Implement `Redemption::from_event()` and `apply_transition()`
+- [x] Change `impl Aggregate for Redemption` to
       `impl Aggregate for Lifecycle<Redemption, Never>`
-- [ ] Remove `RedemptionView` - `Lifecycle<Redemption, Never>` implements
+- [x] Remove `RedemptionView` - `Lifecycle<Redemption, Never>` implements
       `View<Self>` directly
-- [ ] Update managers (`burn_manager`, `detector`, `journal_manager`,
+- [x] Update managers (`burn_manager`, `detector`, `journal_manager`,
       `redeem_call_manager`) to work with `Lifecycle<Redemption, Never>`
-- [ ] Ensure all tests use CQRS framework (no direct view insertions)
-- [ ] Run
+- [x] Ensure all tests use CQRS framework (no direct view insertions)
+- [x] Run
       `cargo test --workspace && cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings && cargo fmt`
 
 ---

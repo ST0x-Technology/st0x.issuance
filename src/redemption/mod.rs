@@ -104,7 +104,9 @@ impl DomainEvent for RedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Detected { .. } => "RedemptionEvent::Detected".to_string(),
-            Self::AlpacaCalled { .. } => "RedemptionEvent::AlpacaCalled".to_string(),
+            Self::AlpacaCalled { .. } => {
+                "RedemptionEvent::AlpacaCalled".to_string()
+            }
             Self::AlpacaCallFailed { .. } => {
                 "RedemptionEvent::AlpacaCallFailed".to_string()
             }
@@ -114,8 +116,12 @@ impl DomainEvent for RedemptionEvent {
             Self::RedemptionFailed { .. } => {
                 "RedemptionEvent::RedemptionFailed".to_string()
             }
-            Self::TokensBurned { .. } => "RedemptionEvent::TokensBurned".to_string(),
-            Self::BurningFailed { .. } => "RedemptionEvent::BurningFailed".to_string(),
+            Self::TokensBurned { .. } => {
+                "RedemptionEvent::TokensBurned".to_string()
+            }
+            Self::BurningFailed { .. } => {
+                "RedemptionEvent::BurningFailed".to_string()
+            }
         }
     }
 
@@ -184,7 +190,9 @@ impl Redemption {
         }
     }
 
-    fn from_event(event: &RedemptionEvent) -> Option<Self> {
+    fn from_event(
+        event: &RedemptionEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
         match event {
             RedemptionEvent::Detected {
                 issuer_request_id,
@@ -195,7 +203,7 @@ impl Redemption {
                 tx_hash,
                 block_number,
                 detected_at,
-            } => Some(Self::Detected {
+            } => Ok(Self::Detected {
                 metadata: RedemptionMetadata {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
@@ -207,15 +215,18 @@ impl Redemption {
                     detected_at: *detected_at,
                 },
             }),
-            _ => None,
+            other => Err(LifecycleError::Mismatch {
+                state: "Uninitialized".to_string(),
+                event: other.event_type(),
+            }),
         }
     }
 
     fn apply_transition(
-        self,
         event: &RedemptionEvent,
+        current: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
-        match (self, event) {
+        match (current, event) {
             (
                 Self::Detected { metadata },
                 RedemptionEvent::AlpacaCalled {
@@ -224,14 +235,22 @@ impl Redemption {
                     ..
                 },
             ) => Ok(Self::AlpacaCalled {
-                metadata,
+                metadata: metadata.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 called_at: *called_at,
             }),
 
             (
-                Self::Detected { metadata },
+                Self::Detected { .. } | Self::Burning { .. },
                 RedemptionEvent::AlpacaCallFailed {
+                    issuer_request_id,
+                    error,
+                    failed_at,
+                },
+            )
+            | (
+                Self::Burning { .. },
+                RedemptionEvent::BurningFailed {
                     issuer_request_id,
                     error,
                     failed_at,
@@ -243,7 +262,9 @@ impl Redemption {
             }),
 
             (
-                Self::Detected { metadata },
+                Self::Detected { .. }
+                | Self::AlpacaCalled { .. }
+                | Self::Burning { .. },
                 RedemptionEvent::RedemptionFailed {
                     issuer_request_id,
                     reason,
@@ -266,23 +287,10 @@ impl Redemption {
                     ..
                 },
             ) => Ok(Self::Burning {
-                metadata,
-                tokenization_request_id,
-                called_at,
+                metadata: metadata.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                called_at: *called_at,
                 alpaca_journal_completed_at: *alpaca_journal_completed_at,
-            }),
-
-            (
-                Self::AlpacaCalled { .. },
-                RedemptionEvent::RedemptionFailed {
-                    issuer_request_id,
-                    reason,
-                    failed_at,
-                },
-            ) => Ok(Self::Failed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: reason.clone(),
-                failed_at: *failed_at,
             }),
 
             (
@@ -299,35 +307,9 @@ impl Redemption {
                 completed_at: *burned_at,
             }),
 
-            (
-                Self::Burning { .. },
-                RedemptionEvent::BurningFailed {
-                    issuer_request_id,
-                    error,
-                    failed_at,
-                },
-            ) => Ok(Self::Failed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: error.clone(),
-                failed_at: *failed_at,
-            }),
-
-            (
-                Self::Burning { .. },
-                RedemptionEvent::RedemptionFailed {
-                    issuer_request_id,
-                    reason,
-                    failed_at,
-                },
-            ) => Ok(Self::Failed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: reason.clone(),
-                failed_at: *failed_at,
-            }),
-
-            (current, event) => Err(LifecycleError::InvalidTransition {
-                current_state: current.state_name().to_string(),
-                event_type: event.event_type(),
+            (current, event) => Err(LifecycleError::Mismatch {
+                state: current.state_name().to_string(),
+                event: event.event_type(),
             }),
         }
     }
@@ -342,31 +324,35 @@ pub(crate) enum RedemptionError {
     InvalidState { expected: String, found: String },
 }
 
+struct DetectionData {
+    issuer_request_id: IssuerRequestId,
+    underlying: UnderlyingSymbol,
+    token: TokenSymbol,
+    wallet: Address,
+    quantity: Quantity,
+    tx_hash: B256,
+    block_number: u64,
+}
+
 impl Lifecycle<Redemption, Never> {
     fn handle_detect(
         &self,
-        issuer_request_id: IssuerRequestId,
-        underlying: UnderlyingSymbol,
-        token: TokenSymbol,
-        wallet: Address,
-        quantity: Quantity,
-        tx_hash: B256,
-        block_number: u64,
+        data: DetectionData,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if self.live().is_some() {
+        if self.live().is_ok() {
             return Err(RedemptionError::AlreadyDetected {
-                issuer_request_id: issuer_request_id.0,
+                issuer_request_id: data.issuer_request_id.0,
             });
         }
 
         Ok(vec![RedemptionEvent::Detected {
-            issuer_request_id,
-            underlying,
-            token,
-            wallet,
-            quantity,
-            tx_hash,
-            block_number,
+            issuer_request_id: data.issuer_request_id,
+            underlying: data.underlying,
+            token: data.token,
+            wallet: data.wallet,
+            quantity: data.quantity,
+            tx_hash: data.tx_hash,
+            block_number: data.block_number,
             detected_at: Utc::now(),
         }])
     }
@@ -376,10 +362,10 @@ impl Lifecycle<Redemption, Never> {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "Detected".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -402,10 +388,10 @@ impl Lifecycle<Redemption, Never> {
         issuer_request_id: IssuerRequestId,
         error: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "Detected".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -427,10 +413,10 @@ impl Lifecycle<Redemption, Never> {
         &self,
         issuer_request_id: IssuerRequestId,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "AlpacaCalled".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -452,10 +438,10 @@ impl Lifecycle<Redemption, Never> {
         issuer_request_id: IssuerRequestId,
         reason: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "Detected, AlpacaCalled, or Burning".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -487,10 +473,10 @@ impl Lifecycle<Redemption, Never> {
         gas_used: u64,
         block_number: u64,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -517,10 +503,10 @@ impl Lifecycle<Redemption, Never> {
         issuer_request_id: IssuerRequestId,
         error: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Some(inner) = self.live() else {
+        let Ok(inner) = self.live() else {
             return Err(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
         };
 
@@ -564,7 +550,7 @@ impl cqrs_es::Aggregate for Lifecycle<Redemption, Never> {
                 quantity,
                 tx_hash,
                 block_number,
-            } => self.handle_detect(
+            } => self.handle_detect(DetectionData {
                 issuer_request_id,
                 underlying,
                 token,
@@ -572,13 +558,14 @@ impl cqrs_es::Aggregate for Lifecycle<Redemption, Never> {
                 quantity,
                 tx_hash,
                 block_number,
-            ),
+            }),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id,
                 tokenization_request_id,
-            } => {
-                self.handle_record_alpaca_call(issuer_request_id, tokenization_request_id)
-            }
+            } => self.handle_record_alpaca_call(
+                issuer_request_id,
+                tokenization_request_id,
+            ),
             RedemptionCommand::RecordAlpacaFailure {
                 issuer_request_id,
                 error,
@@ -616,6 +603,15 @@ impl cqrs_es::Aggregate for Lifecycle<Redemption, Never> {
             .clone()
             .transition(&event, Redemption::apply_transition)
             .or_initialize(&event, Redemption::from_event);
+    }
+}
+
+impl cqrs_es::View<Self> for Lifecycle<Redemption, Never> {
+    fn update(&mut self, event: &cqrs_es::EventEnvelope<Self>) {
+        *self = self
+            .clone()
+            .transition(&event.payload, Redemption::apply_transition)
+            .or_initialize(&event.payload, Redemption::from_event);
     }
 }
 
@@ -816,7 +812,7 @@ mod tests {
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Detected".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
     }
 
@@ -872,14 +868,15 @@ mod tests {
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Detected".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
     }
 
     #[test]
     fn test_confirm_alpaca_complete_from_alpaca_called_state() {
         let issuer_request_id = IssuerRequestId::new("red-complete-123");
-        let tokenization_request_id = TokenizationRequestId::new("alp-complete-456");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-complete-456");
 
         let validator = RedemptionTestFramework::with(())
             .given(vec![
@@ -929,10 +926,12 @@ mod tests {
 
         RedemptionTestFramework::with(())
             .given_no_previous_events()
-            .when(RedemptionCommand::ConfirmAlpacaComplete { issuer_request_id })
+            .when(RedemptionCommand::ConfirmAlpacaComplete {
+                issuer_request_id,
+            })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "AlpacaCalled".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
     }
 
@@ -941,7 +940,8 @@ mod tests {
         let mut lifecycle: Lifecycle<Redemption, Never> = Lifecycle::default();
 
         let issuer_request_id = IssuerRequestId::new("red-burning-123");
-        let tokenization_request_id = TokenizationRequestId::new("alp-burning-456");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
@@ -1161,7 +1161,7 @@ mod tests {
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
-                found: "Uninitialized".to_string(),
+                found: "Uninitialized or Failed".to_string(),
             });
     }
 
@@ -1170,7 +1170,8 @@ mod tests {
         let mut lifecycle: Lifecycle<Redemption, Never> = Lifecycle::default();
 
         let issuer_request_id = IssuerRequestId::new("red-complete-123");
-        let tokenization_request_id = TokenizationRequestId::new("alp-complete-456");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-complete-456");
         let underlying = UnderlyingSymbol::new("AMZN");
         let token = TokenSymbol::new("tAMZN");
         let wallet = address!("0xefefefefefefefefefefefefefefefefefefefef");
@@ -1236,7 +1237,8 @@ mod tests {
         let mut lifecycle: Lifecycle<Redemption, Never> = Lifecycle::default();
 
         let issuer_request_id = IssuerRequestId::new("red-failed-123");
-        let tokenization_request_id = TokenizationRequestId::new("alp-failed-456");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-failed-456");
         let underlying = UnderlyingSymbol::new("NFLX");
         let token = TokenSymbol::new("tNFLX");
         let wallet = address!("0x1212121212121212121212121212121212121212");

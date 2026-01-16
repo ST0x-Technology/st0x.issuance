@@ -6,21 +6,22 @@ use tracing::{info, warn};
 
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::TokenizationRequestId;
 
-pub(crate) struct JournalManager<ES: EventStore<Redemption>> {
+pub(crate) struct JournalManager<ES: EventStore<Lifecycle<Redemption, Never>>> {
     alpaca_service: Arc<dyn AlpacaService>,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
     store: Arc<ES>,
     max_duration: Duration,
     initial_poll_interval: Duration,
     max_interval: Duration,
 }
 
-impl<ES: EventStore<Redemption>> JournalManager<ES> {
+impl<ES: EventStore<Lifecycle<Redemption, Never>>> JournalManager<ES> {
     pub(crate) fn new(
         alpaca_service: Arc<dyn AlpacaService>,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<Redemption, Never>, ES>>,
         store: Arc<ES>,
     ) -> Self {
         Self {
@@ -110,16 +111,23 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 },
             )?;
 
-        let mut aggregate = Redemption::default();
+        let mut lifecycle = Lifecycle::<Redemption, Never>::default();
         for event in events {
-            aggregate.apply(event.payload);
+            lifecycle.apply(event.payload);
         }
 
-        let Some(metadata) = aggregate.metadata() else {
+        let Ok(inner) = lifecycle.live() else {
+            return Err(JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.0.clone(),
+                reason: "Redemption not initialized".to_string(),
+            });
+        };
+
+        let Some(metadata) = inner.metadata() else {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
-                    "Redemption not in expected state for validation: {aggregate:?}"
+                    "Redemption not in expected state for validation: {inner:?}"
                 ),
             });
         };
@@ -228,86 +236,102 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         elapsed: Duration,
         poll_interval: Duration,
     ) -> Result<bool, JournalManagerError> {
-        let IssuerRequestId(issuer_id_str) = issuer_request_id;
-        let TokenizationRequestId(tok_id_str) = tokenization_request_id;
-
-        match request_result {
-            Ok(request) => {
-                self.validate_request_fields(&request, issuer_request_id)
-                    .await?;
-
-                match request.status {
-                    RedeemRequestStatus::Completed => {
-                        info!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
-                            elapsed = ?elapsed,
-                            "Alpaca journal completed, confirming completion"
-                        );
-
-                        self.cqrs
-                            .execute(
-                                issuer_id_str,
-                                RedemptionCommand::ConfirmAlpacaComplete {
-                                    issuer_request_id: issuer_request_id
-                                        .clone(),
-                                },
-                            )
-                            .await?;
-
-                        info!(
-                            issuer_request_id = %issuer_id_str,
-                            "ConfirmAlpacaComplete command executed successfully"
-                        );
-
-                        Ok(false)
-                    }
-                    RedeemRequestStatus::Rejected => {
-                        warn!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
-                            "Alpaca journal rejected, marking redemption as failed"
-                        );
-
-                        self.cqrs
-                            .execute(
-                                issuer_id_str,
-                                RedemptionCommand::MarkFailed {
-                                    issuer_request_id: issuer_request_id
-                                        .clone(),
-                                    reason: "Alpaca journal rejected"
-                                        .to_string(),
-                                },
-                            )
-                            .await?;
-
-                        Err(JournalManagerError::Rejected {
-                            issuer_request_id: issuer_id_str.clone(),
-                        })
-                    }
-                    RedeemRequestStatus::Pending => {
-                        info!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
-                            status = "pending",
-                            next_poll_in = ?poll_interval,
-                            "Journal still pending, will retry"
-                        );
-                        Ok(true)
-                    }
-                }
-            }
+        let request = match request_result {
+            Ok(req) => req,
             Err(e) => {
                 warn!(
-                    issuer_request_id = %issuer_id_str,
-                    tokenization_request_id = %tok_id_str,
+                    issuer_request_id = %issuer_request_id.0,
+                    tokenization_request_id = %tokenization_request_id.0,
                     error = %e,
                     next_poll_in = ?poll_interval,
                     "Polling error, will retry"
                 );
+                return Ok(true);
+            }
+        };
+
+        self.validate_request_fields(&request, issuer_request_id).await?;
+
+        match request.status {
+            RedeemRequestStatus::Completed => {
+                self.handle_completed(
+                    issuer_request_id,
+                    tokenization_request_id,
+                    elapsed,
+                )
+                .await
+            }
+            RedeemRequestStatus::Rejected => {
+                self.handle_rejected(issuer_request_id, tokenization_request_id)
+                    .await
+            }
+            RedeemRequestStatus::Pending => {
+                info!(
+                    issuer_request_id = %issuer_request_id.0,
+                    tokenization_request_id = %tokenization_request_id.0,
+                    status = "pending",
+                    next_poll_in = ?poll_interval,
+                    "Journal still pending, will retry"
+                );
                 Ok(true)
             }
         }
+    }
+
+    async fn handle_completed(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        tokenization_request_id: &TokenizationRequestId,
+        elapsed: Duration,
+    ) -> Result<bool, JournalManagerError> {
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            tokenization_request_id = %tokenization_request_id.0,
+            elapsed = ?elapsed,
+            "Alpaca journal completed, confirming completion"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id.0,
+            "ConfirmAlpacaComplete command executed successfully"
+        );
+
+        Ok(false)
+    }
+
+    async fn handle_rejected(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<bool, JournalManagerError> {
+        warn!(
+            issuer_request_id = %issuer_request_id.0,
+            tokenization_request_id = %tokenization_request_id.0,
+            "Alpaca journal rejected, marking redemption as failed"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "Alpaca journal rejected".to_string(),
+                },
+            )
+            .await?;
+
+        Err(JournalManagerError::Rejected {
+            issuer_request_id: issuer_request_id.0.clone(),
+        })
     }
 }
 
@@ -332,24 +356,26 @@ mod tests {
     use alloy::primitives::{address, b256};
     use async_trait::async_trait;
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{Aggregate, EventStore};
+    use cqrs_es::{Aggregate, CqrsFramework, EventStore};
     use rust_decimal::Decimal;
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use super::{JournalManager, JournalManagerError};
+    use super::{JournalManager, JournalManagerError, Lifecycle, Never};
     use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::redemption::{Redemption, RedemptionCommand};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
-    type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
+    type TestCqrs = CqrsFramework<
+        Lifecycle<Redemption, Never>,
+        MemStore<Lifecycle<Redemption, Never>>,
+    >;
+    type TestStore = MemStore<Lifecycle<Redemption, Never>>;
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
         (cqrs, store)
     }
 
@@ -577,13 +603,13 @@ mod tests {
         );
 
         let events = store.load_events(&issuer_request_id.0).await.unwrap();
-        let mut aggregate = Redemption::default();
+        let mut lifecycle = Lifecycle::<Redemption, Never>::default();
         for event in events {
-            aggregate.apply(event.payload);
+            lifecycle.apply(event.payload);
         }
         assert!(
-            matches!(aggregate, Redemption::Failed { .. }),
-            "Expected Failed state, got {aggregate:?}"
+            matches!(lifecycle.live(), Ok(Redemption::Failed { .. })),
+            "Expected Failed state, got {lifecycle:?}"
         );
     }
 
@@ -666,13 +692,13 @@ mod tests {
         );
 
         let events = store.load_events(&issuer_request_id.0).await.unwrap();
-        let mut aggregate = Redemption::default();
+        let mut lifecycle = Lifecycle::<Redemption, Never>::default();
         for event in events {
-            aggregate.apply(event.payload);
+            lifecycle.apply(event.payload);
         }
         assert!(
-            matches!(aggregate, Redemption::Failed { .. }),
-            "Expected Failed state, got {aggregate:?}"
+            matches!(lifecycle.live(), Ok(Redemption::Failed { .. })),
+            "Expected Failed state, got {lifecycle:?}"
         );
     }
 

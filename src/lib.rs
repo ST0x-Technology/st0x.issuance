@@ -16,7 +16,7 @@ use crate::lifecycle::{Lifecycle, Never};
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::ReceiptInventoryView;
 use crate::redemption::{
-    Redemption, RedemptionView,
+    Redemption,
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
@@ -58,9 +58,10 @@ pub(crate) type MintCqrs = Arc<SqliteCqrs<mint::Mint>>;
 pub(crate) type MintEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, mint::Mint>>;
 
-type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
-type RedemptionEventStore =
-    Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
+type RedemptionCqrs = Arc<SqliteCqrs<Lifecycle<Redemption, Never>>>;
+type RedemptionEventStore = Arc<
+    PersistedEventStore<SqliteEventRepository, Lifecycle<Redemption, Never>>,
+>;
 
 struct AggregateCqrsSetup {
     mint_cqrs: MintCqrs,
@@ -72,14 +73,27 @@ struct AggregateCqrsSetup {
 struct RedemptionManagers {
     redeem_call: Arc<
         RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
         >,
     >,
     journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        JournalManager<
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
+        >,
     >,
     burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        BurnManager<
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
+        >,
     >,
 }
 
@@ -293,15 +307,15 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
     ));
 
     let redemption_view_repo =
-        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-            pool.clone(),
-            "redemption_view".to_string(),
-        ));
+        Arc::new(SqliteViewRepository::<
+            Lifecycle<Redemption, Never>,
+            Lifecycle<Redemption, Never>,
+        >::new(pool.clone(), "redemption_view".to_string()));
     let redemption_query = GenericQuery::new(redemption_view_repo);
 
     let receipt_inventory_redemption_repo = Arc::new(SqliteViewRepository::<
         ReceiptInventoryView,
-        Redemption,
+        Lifecycle<Redemption, Never>,
     >::new(
         pool.clone(),
         "receipt_inventory_view".to_string(),
@@ -384,21 +398,37 @@ async fn setup_redemption_managers(
 
 fn spawn_redemption_detector(
     config: &Config,
-    redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
+    redemption_cqrs: Arc<SqliteCqrs<Lifecycle<Redemption, Never>>>,
     redemption_event_store: Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
+        PersistedEventStore<
+            SqliteEventRepository,
+            Lifecycle<Redemption, Never>,
+        >,
     >,
     pool: Pool<Sqlite>,
     redeem_call: Arc<
         RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
         >,
     >,
     journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        JournalManager<
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
+        >,
     >,
     burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        BurnManager<
+            PersistedEventStore<
+                SqliteEventRepository,
+                Lifecycle<Redemption, Never>,
+            >,
+        >,
     >,
 ) {
     info!("WebSocket monitoring task spawned for bot wallet {}", config.bot);
