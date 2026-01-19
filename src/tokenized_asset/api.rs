@@ -108,7 +108,6 @@ pub(crate) async fn add_tokenized_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use chrono::Utc;
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
@@ -120,7 +119,7 @@ mod tests {
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
-    use crate::tokenized_asset::TokenizedAsset;
+    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
     fn test_config() -> Config {
         use alloy::primitives::{B256, address};
@@ -140,7 +139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tokenized_assets_returns_enabled_assets() {
+    async fn test_list_tokenized_assets_returns_added_assets() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -152,52 +151,19 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let enabled_view = TokenizedAssetView::Asset {
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            enabled: true,
-            added_at: Utc::now(),
-        };
+        let cqrs = setup_tokenized_asset_cqrs(&pool);
 
-        let disabled_view = TokenizedAssetView::Asset {
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            network: Network::new("base"),
-            vault: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            enabled: false,
-            added_at: Utc::now(),
-        };
-
-        let enabled_payload =
-            serde_json::to_string(&enabled_view).expect("Failed to serialize");
-        let disabled_payload =
-            serde_json::to_string(&disabled_view).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"
-            INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
+        cqrs.execute(
             "AAPL",
-            enabled_payload
+            TokenizedAssetCommand::Add {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            },
         )
-        .execute(&pool)
         .await
-        .expect("Failed to insert enabled view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            "TSLA",
-            disabled_payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert disabled view");
+        .expect("Failed to add asset");
 
         let rocket = rocket::build()
             .manage(test_config())

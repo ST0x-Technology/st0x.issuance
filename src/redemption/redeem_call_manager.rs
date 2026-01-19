@@ -278,26 +278,146 @@ pub(crate) enum RedeemCallManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256};
+    use alloy::primitives::{address, b256};
+    use cqrs_es::persist::GenericQuery;
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
-    use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
+    use crate::account::{
+        Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId,
+        Email,
+    };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
     use crate::redemption::{
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
-    use crate::tokenized_asset::{Network, TokenSymbol, TokenizedAssetView};
+    use crate::tokenized_asset::{
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        TokenizedAssetView,
+    };
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
 
     fn test_alpaca_account() -> AlpacaAccountNumber {
         AlpacaAccountNumber("test-account".to_string())
+    }
+
+    struct TestHarness {
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        redemption_cqrs: SqliteCqrs<Redemption>,
+        account_cqrs: SqliteCqrs<Account>,
+        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let redemption_view_repo = Arc::new(SqliteViewRepository::<
+                RedemptionView,
+                Redemption,
+            >::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
+            let redemption_query = GenericQuery::new(redemption_view_repo);
+            let redemption_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(redemption_query)], ());
+
+            let account_view_repo =
+                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                    pool.clone(),
+                    "account_view".to_string(),
+                ));
+            let account_query = GenericQuery::new(account_view_repo);
+            let account_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+            let asset_view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let asset_query = GenericQuery::new(asset_view_repo);
+            let asset_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
+            Self { pool, redemption_cqrs, account_cqrs, asset_cqrs }
+        }
+
+        async fn register_and_link_account(
+            &self,
+            client_id: ClientId,
+            email: &str,
+            alpaca_account: &AlpacaAccountNumber,
+            wallet: alloy::primitives::Address,
+        ) {
+            let email = Email::new(email.to_string()).unwrap();
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::Register { client_id, email },
+                )
+                .await
+                .expect("Failed to register account");
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::LinkToAlpaca {
+                        alpaca_account: alpaca_account.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to link to Alpaca");
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::WhitelistWallet { wallet },
+                )
+                .await
+                .expect("Failed to whitelist wallet");
+        }
+
+        async fn add_asset(
+            &self,
+            underlying: &UnderlyingSymbol,
+            network: &Network,
+        ) {
+            self.asset_cqrs
+                .execute(
+                    &underlying.0,
+                    TokenizedAssetCommand::Add {
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        network: network.clone(),
+                        vault: address!(
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        ),
+                    },
+                )
+                .await
+                .expect("Failed to add asset");
+        }
     }
 
     async fn setup_test_cqrs()

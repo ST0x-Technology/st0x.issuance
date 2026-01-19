@@ -12,6 +12,7 @@ use super::{
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct MintTokensCall {
+    pub(crate) vault: Address,
     pub(crate) assets: U256,
     pub(crate) receiver: Address,
     pub(crate) receipt_info: ReceiptInformation,
@@ -20,6 +21,7 @@ pub(crate) struct MintTokensCall {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct BurnTokensCall {
+    pub(crate) vault: Address,
     pub(crate) shares: U256,
     pub(crate) receipt_id: U256,
     pub(crate) owner: Address,
@@ -140,6 +142,7 @@ impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
     async fn mint_and_transfer_shares(
         &self,
+        vault: Address,
         assets: U256,
         bot: Address,
         _user: Address,
@@ -157,6 +160,7 @@ impl VaultService for MockVaultService {
         #[cfg(test)]
         {
             *self.last_call.lock().unwrap() = Some(MintTokensCall {
+                vault,
                 assets,
                 receiver: bot,
                 receipt_info: receipt_info.clone(),
@@ -181,6 +185,7 @@ impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
     async fn burn_tokens(
         &self,
+        vault: Address,
         shares: U256,
         receipt_id: U256,
         owner: Address,
@@ -199,6 +204,7 @@ impl VaultService for MockVaultService {
         #[cfg(test)]
         {
             *self.last_burn_call.lock().unwrap() = Some(BurnTokensCall {
+                vault,
                 shares,
                 receipt_id,
                 owner,
@@ -224,6 +230,7 @@ impl VaultService for MockVaultService {
 
     async fn get_share_balance(
         &self,
+        _vault: Address,
         _owner: Address,
     ) -> Result<U256, VaultError> {
         #[cfg(test)]
@@ -267,9 +274,14 @@ mod tests {
         address!("0000000000000000000000000000000000000001")
     }
 
+    fn test_vault() -> Address {
+        address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    }
+
     #[tokio::test]
     async fn test_new_success_returns_mint_result() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -278,6 +290,7 @@ mod tests {
 
         let result = mock
             .mint_and_transfer_shares(
+                vault,
                 assets,
                 bot_wallet,
                 user_wallet,
@@ -296,6 +309,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_failure_returns_error() {
         let mock = MockVaultService::new_failure("network error");
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -304,6 +318,7 @@ mod tests {
 
         let result = mock
             .mint_and_transfer_shares(
+                vault,
                 assets,
                 bot_wallet,
                 user_wallet,
@@ -321,6 +336,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_call_count_increments() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -329,6 +345,7 @@ mod tests {
         assert_eq!(mock.get_call_count(), 0);
 
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -339,6 +356,7 @@ mod tests {
         assert_eq!(mock.get_call_count(), 1);
 
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -352,6 +370,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_last_call_captures_arguments() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -361,6 +380,7 @@ mod tests {
         assert!(mock.get_last_call().is_none());
 
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -373,6 +393,7 @@ mod tests {
         assert!(last_call.is_some());
 
         let call = last_call.unwrap();
+        assert_eq!(call.vault, vault);
         assert_eq!(call.assets, assets);
         assert_eq!(call.receiver, bot_wallet);
         assert_eq!(
@@ -385,6 +406,7 @@ mod tests {
     async fn test_with_delay_causes_delay() {
         let delay_ms = 50;
         let mock = MockVaultService::new_success().with_delay(delay_ms);
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -393,6 +415,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -408,6 +431,7 @@ mod tests {
     #[tokio::test]
     async fn test_reset_clears_state() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -415,6 +439,7 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -423,6 +448,7 @@ mod tests {
         .await
         .unwrap();
         mock.mint_and_transfer_shares(
+            vault,
             assets,
             bot_wallet,
             user_wallet,
@@ -443,6 +469,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_new_success_returns_burn_result() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
@@ -450,7 +477,14 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let result = mock
-            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .burn_tokens(
+                vault,
+                shares,
+                receipt_id,
+                owner,
+                receiver,
+                receipt_info,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -464,6 +498,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_new_failure_returns_error() {
         let mock = MockVaultService::new_failure("blockchain error");
+        let vault = test_vault();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
@@ -471,7 +506,14 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let result = mock
-            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .burn_tokens(
+                vault,
+                shares,
+                receipt_id,
+                owner,
+                receiver,
+                receipt_info,
+            )
             .await;
 
         assert!(result.is_err());
@@ -484,6 +526,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_get_call_count_increments() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
@@ -492,6 +535,7 @@ mod tests {
         assert_eq!(mock.get_burn_call_count(), 0);
 
         mock.burn_tokens(
+            vault,
             shares,
             receipt_id,
             owner,
@@ -503,6 +547,7 @@ mod tests {
         assert_eq!(mock.get_burn_call_count(), 1);
 
         mock.burn_tokens(
+            vault,
             shares,
             receipt_id,
             owner,
@@ -517,6 +562,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_get_last_call_captures_arguments() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
@@ -526,6 +572,7 @@ mod tests {
         assert!(mock.get_last_burn_call().is_none());
 
         mock.burn_tokens(
+            vault,
             shares,
             receipt_id,
             owner,
@@ -539,6 +586,7 @@ mod tests {
         assert!(last_call.is_some());
 
         let call = last_call.unwrap();
+        assert_eq!(call.vault, vault);
         assert_eq!(call.shares, shares);
         assert_eq!(call.receipt_id, receipt_id);
         assert_eq!(call.owner, owner);
@@ -552,6 +600,7 @@ mod tests {
     #[tokio::test]
     async fn test_reset_clears_burn_state() {
         let mock = MockVaultService::new_success();
+        let vault = test_vault();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
@@ -559,6 +608,7 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         mock.burn_tokens(
+            vault,
             shares,
             receipt_id,
             owner,
@@ -567,9 +617,16 @@ mod tests {
         )
         .await
         .unwrap();
-        mock.burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
-            .await
-            .unwrap();
+        mock.burn_tokens(
+            vault,
+            shares,
+            receipt_id,
+            owner,
+            receiver,
+            receipt_info,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(mock.get_burn_call_count(), 2);
         assert!(mock.get_last_burn_call().is_some());

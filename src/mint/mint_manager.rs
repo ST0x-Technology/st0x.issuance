@@ -7,6 +7,9 @@ use sqlx::{Pool, Sqlite};
 use tracing::{debug, error, info, warn};
 
 use crate::tokenized_asset::UnderlyingSymbol;
+use crate::tokenized_asset::view::{
+    TokenizedAssetViewError, find_vault_by_underlying,
+};
 use crate::vault::{
     MintResult, OperationType, ReceiptInformation, VaultError, VaultService,
 };
@@ -101,11 +104,18 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
         let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
         let UnderlyingSymbol(underlying_str) = underlying;
 
+        let vault = find_vault_by_underlying(&self.pool, underlying)
+            .await?
+            .ok_or_else(|| MintManagerError::AssetNotFound {
+                underlying: underlying_str.clone(),
+            })?;
+
         info!(
             issuer_request_id = %issuer_request_id_str,
             underlying = %underlying_str,
             quantity = %quantity.0,
             wallet = %wallet,
+            vault = %vault,
             "Starting on-chain minting process"
         );
 
@@ -140,7 +150,13 @@ impl<ES: EventStore<Mint>> MintManager<ES> {
 
         match self
             .blockchain_service
-            .mint_and_transfer_shares(assets, self.bot, *wallet, receipt_info)
+            .mint_and_transfer_shares(
+                vault,
+                assets,
+                self.bot,
+                *wallet,
+                receipt_info,
+            )
             .await
         {
             Ok(result) => {
@@ -305,61 +321,116 @@ const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
 pub(crate) enum MintManagerError {
     #[error("Blockchain error: {0}")]
     Blockchain(#[from] VaultError),
-
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<MintError>),
-
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
-
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
-
-    #[error("View error: {0}")]
-    View(#[from] MintViewError),
+    #[error("Mint view error: {0}")]
+    MintView(#[from] MintViewError),
+    #[error("Tokenized asset view error: {0}")]
+    TokenizedAssetView(#[from] TokenizedAssetViewError),
+    #[error("Asset not found for underlying: {underlying}")]
+    AssetNotFound { underlying: String },
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
     use cqrs_es::persist::{GenericQuery, PersistedEventStore};
     use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::{
+        SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
+    };
     use sqlx::sqlite::SqlitePoolOptions;
 
     use crate::mint::{
         ClientId, IssuerRequestId, Mint, MintCommand, MintView, Network,
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
+    };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
     use super::{MintManager, MintManagerError};
 
-    type TestCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
-    type TestStore = MemStore<Mint>;
+    type TestMintCqrs = cqrs_es::CqrsFramework<Mint, MemStore<Mint>>;
+    type TestMintStore = MemStore<Mint>;
 
-    async fn setup_test_cqrs()
-    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
-        let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+    struct TestHarness {
+        cqrs: Arc<TestMintCqrs>,
+        store: Arc<TestMintStore>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+    }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
+    impl TestHarness {
+        async fn new() -> Self {
+            let store = Arc::new(MemStore::default());
+            let cqrs = Arc::new(cqrs_es::CqrsFramework::new(
+                (*store).clone(),
+                vec![],
+                (),
+            ));
 
-        (cqrs, store, pool)
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let tokenized_asset_query =
+                GenericQuery::new(tokenized_asset_view_repo);
+            let asset_cqrs = sqlite_cqrs(
+                pool.clone(),
+                vec![Box::new(tokenized_asset_query)],
+                (),
+            );
+
+            Self { cqrs, store, pool, asset_cqrs }
+        }
+
+        async fn add_asset(
+            &self,
+            underlying: &UnderlyingSymbol,
+            vault: Address,
+        ) {
+            self.asset_cqrs
+                .execute(
+                    &underlying.0,
+                    TokenizedAssetCommand::Add {
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        network: Network::new("base"),
+                        vault,
+                    },
+                )
+                .await
+                .expect("Failed to add tokenized asset");
+        }
     }
 
     async fn create_test_mint_in_journal_confirmed_state(
-        cqrs: &TestCqrs,
-        store: &TestStore,
+        cqrs: &TestMintCqrs,
+        store: &TestMintStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Mint {
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
@@ -399,7 +470,7 @@ mod tests {
     }
 
     async fn load_aggregate(
-        store: &TestStore,
+        store: &TestMintStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Mint {
         let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
@@ -408,7 +479,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_success() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let TestHarness { cqrs, store, pool, .. } = harness;
+
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -437,6 +514,11 @@ mod tests {
 
         assert_eq!(blockchain_service_mock.get_call_count(), 1);
 
+        let last_call = blockchain_service_mock
+            .get_last_call()
+            .expect("Expected a mint call");
+        assert_eq!(last_call.vault, vault, "Expected vault address to match");
+
         let updated_aggregate =
             load_aggregate(&store, &issuer_request_id).await;
 
@@ -448,7 +530,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_blockchain_failure() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let TestHarness { cqrs, store, pool, .. } = harness;
+
         let blockchain_service_mock =
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
@@ -496,7 +584,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_wrong_state_fails() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -504,7 +594,7 @@ mod tests {
             blockchain_service,
             cqrs.clone(),
             store.clone(),
-            pool,
+            pool.clone(),
             bot,
         );
 
@@ -590,6 +680,7 @@ mod tests {
             >,
         >,
         Arc<PersistedEventStore<SqliteEventRepository, Mint>>,
+        SqliteCqrs<TokenizedAsset>,
     ) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -619,13 +710,43 @@ mod tests {
             mint_event_repo
         ));
 
-        (pool, mint_cqrs, mint_event_store)
+        let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let tokenized_asset_query =
+            GenericQuery::new(tokenized_asset_view_repo);
+        let tokenized_asset_cqrs = sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(tokenized_asset_query)],
+            (),
+        );
+
+        (pool, mint_cqrs, mint_event_store, tokenized_asset_cqrs)
     }
 
     #[tokio::test]
     async fn test_recover_journal_confirmed_mints_processes_stuck_mints() {
-        let (pool, mint_cqrs, mint_event_store) =
+        let (pool, mint_cqrs, mint_event_store, asset_cqrs) =
             setup_recovery_test_env().await;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault,
+                },
+            )
+            .await
+            .expect("Failed to add asset");
 
         let client_id = ClientId::new();
         let issuer_request_id = IssuerRequestId::new("iss-recovery-test-1");
@@ -688,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_journal_confirmed_mints_does_nothing_when_empty() {
-        let (pool, mint_cqrs, mint_event_store) =
+        let (pool, mint_cqrs, mint_event_store, _asset_cqrs) =
             setup_recovery_test_env().await;
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -712,8 +833,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_journal_confirmed_continues_on_individual_failure() {
-        let (pool, mint_cqrs, mint_event_store) =
+        let (pool, mint_cqrs, mint_event_store, asset_cqrs) =
             setup_recovery_test_env().await;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault,
+                },
+            )
+            .await
+            .expect("Failed to add asset");
 
         let client_id = ClientId::new();
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");

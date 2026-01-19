@@ -765,7 +765,7 @@ pub(crate) enum MintError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{Address, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::View;
     use cqrs_es::{
@@ -782,6 +782,7 @@ mod tests {
     };
     use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
@@ -2225,6 +2226,15 @@ mod tests {
             .connect(":memory:")
             .await
             .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        insert_tokenized_asset(&pool, &underlying, vault).await;
 
         let mint_manager =
             create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());

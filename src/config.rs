@@ -53,7 +53,7 @@ impl Config {
             .connect(self.rpc_url.as_str())
             .await?;
 
-        Ok(Arc::new(RealBlockchainService::new(provider, self.vault)))
+        Ok(Arc::new(RealBlockchainService::new(provider)))
     }
 }
 

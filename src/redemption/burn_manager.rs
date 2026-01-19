@@ -14,6 +14,9 @@ use crate::receipt_inventory::view::{
     ReceiptInventoryViewError, find_receipt_with_balance,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
+use crate::tokenized_asset::view::{
+    TokenizedAssetViewError, find_vault_by_underlying,
+};
 use crate::vault::{
     OperationType, ReceiptInformation, VaultError, VaultService,
 };
@@ -118,6 +121,15 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             return Ok(());
         };
 
+        let vault = find_vault_by_underlying(
+            &self.receipt_query_pool,
+            &metadata.underlying,
+        )
+        .await?
+        .ok_or_else(|| BurnManagerError::AssetNotFound {
+            underlying: metadata.underlying.0.clone(),
+        })?;
+
         let shares_to_burn = metadata.quantity.to_u256_with_18_decimals()?;
 
         // Check on-chain balance before attempting burn. If the bot has insufficient
@@ -125,8 +137,10 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         // recording it. Skip this redemption to avoid recording a false failure.
         // Manual intervention required to resolve.
         // TODO: Implement automatic recovery - see #88
-        let on_chain_balance =
-            self.blockchain_service.get_share_balance(self.bot_wallet).await?;
+        let on_chain_balance = self
+            .blockchain_service
+            .get_share_balance(vault, self.bot_wallet)
+            .await?;
 
         if on_chain_balance < shares_to_burn {
             warn!(
@@ -189,11 +203,21 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             });
         };
 
+        let vault = find_vault_by_underlying(
+            &self.receipt_query_pool,
+            &metadata.underlying,
+        )
+        .await?
+        .ok_or_else(|| BurnManagerError::AssetNotFound {
+            underlying: metadata.underlying.0.clone(),
+        })?;
+
         info!(
             issuer_request_id = %issuer_request_id,
             underlying = %metadata.underlying,
             quantity = %metadata.quantity,
             wallet = %metadata.wallet,
+            vault = %vault,
             "Starting on-chain burning process"
         );
 
@@ -219,6 +243,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         self.execute_burn_and_record_result(
             issuer_request_id,
+            vault,
             shares,
             receipt_id,
             metadata.wallet,
@@ -341,14 +366,16 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
     async fn execute_burn_and_record_result(
         &self,
         issuer_request_id: &IssuerRequestId,
+        vault: Address,
         shares: U256,
         receipt_id: U256,
-        wallet: alloy::primitives::Address,
+        wallet: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<(), BurnManagerError> {
         match self
             .blockchain_service
             .burn_tokens(
+                vault,
                 shares,
                 receipt_id,
                 self.bot_wallet,
@@ -432,25 +459,22 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 pub(crate) enum BurnManagerError {
     #[error("Blockchain error: {0}")]
     Blockchain(#[from] VaultError),
-
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
-
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
-
     #[error("Insufficient balance: required {required}, available {available}")]
     InsufficientBalance { required: U256, available: U256 },
-
     #[error("Receipt inventory error: {0}")]
     ReceiptInventory(#[from] ReceiptInventoryViewError),
-
-    #[error("View error: {0}")]
-    View(#[from] RedemptionViewError),
-
+    #[error("Redemption view error: {0}")]
+    RedemptionView(#[from] RedemptionViewError),
+    #[error("Tokenized asset view error: {0}")]
+    TokenizedAssetView(#[from] TokenizedAssetViewError),
+    #[error("Asset not found for underlying: {underlying}")]
+    AssetNotFound { underlying: String },
     #[error("Event store error: {0}")]
     EventStore(String),
 }
@@ -469,10 +493,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{
+        IssuerRequestId, Network, Quantity, TokenizationRequestId,
+    };
     use crate::receipt_inventory::view::ReceiptInventoryView;
     use crate::redemption::view::RedemptionView;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::view::TokenizedAssetView;
+    use crate::tokenized_asset::{
+        TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+    };
     use crate::vault::mock::MockVaultService;
 
     const TEST_WALLET: Address =
@@ -481,37 +510,84 @@ mod tests {
     type TestCqrs = SqliteCqrs<Redemption>;
     type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
 
-    async fn setup_test_environment()
-    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
+    struct TestHarness {
+        cqrs: Arc<TestCqrs>,
+        store: Arc<TestStore>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+    }
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
 
-        let redemption_view_repo =
-            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let redemption_view_repo = Arc::new(SqliteViewRepository::<
+                RedemptionView,
+                Redemption,
+            >::new(
                 pool.clone(),
                 "redemption_view".to_string(),
             ));
 
-        let redemption_query = GenericQuery::new(redemption_view_repo);
+            let redemption_query = GenericQuery::new(redemption_view_repo);
 
-        let cqrs = Arc::new(sqlite_es::sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(redemption_query)],
-            (),
-        ));
+            let cqrs = Arc::new(sqlite_es::sqlite_cqrs(
+                pool.clone(),
+                vec![Box::new(redemption_query)],
+                (),
+            ));
 
-        let repo = SqliteEventRepository::new(pool.clone());
-        let store = Arc::new(PersistedEventStore::new_event_store(repo));
+            let repo = SqliteEventRepository::new(pool.clone());
+            let store = Arc::new(PersistedEventStore::new_event_store(repo));
 
-        (cqrs, store, pool)
+            let asset_view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let asset_query = GenericQuery::new(asset_view_repo);
+            let asset_cqrs = sqlite_es::sqlite_cqrs(
+                pool.clone(),
+                vec![Box::new(asset_query)],
+                (),
+            );
+
+            Self { cqrs, store, pool, asset_cqrs }
+        }
+
+        async fn add_asset(
+            &self,
+            underlying: &UnderlyingSymbol,
+            vault: Address,
+        ) {
+            self.asset_cqrs
+                .execute(
+                    &underlying.0,
+                    TokenizedAssetCommand::Add {
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        network: Network::new("base"),
+                        vault,
+                    },
+                )
+                .await
+                .expect("Failed to add tokenized asset");
+        }
+    }
+
+    async fn setup_test_environment() -> TestHarness {
+        TestHarness::new().await
     }
 
     async fn seed_receipt_with_balance(
@@ -610,7 +686,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_success() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -660,7 +742,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_blockchain_failure() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service_mock =
             Arc::new(MockVaultService::new_failure("Network error: timeout"));
         let blockchain_service = blockchain_service_mock.clone()
@@ -718,7 +806,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_insufficient_balance() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -762,12 +856,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_wrong_state_fails() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
-            pool,
+            pool.clone(),
             cqrs.clone(),
             store.clone(),
             TEST_WALLET,
@@ -815,7 +910,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_redemption_with_burn() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -866,7 +967,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_burn_receipt_remains_active() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying_symbol = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying_symbol, vault).await;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -954,7 +1061,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_burn_depletes_receipt() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1002,7 +1115,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_burn_with_multiple_receipts() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1059,7 +1178,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_insufficient_balance_scenario() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1103,7 +1228,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_burning_redemptions_empty() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1119,7 +1245,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_burning_redemptions_with_valid_redemption() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -1165,7 +1297,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_burning_skips_when_balance_insufficient() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
 
         // Configure mock to return balance less than required (100 shares = 100e18)
         let blockchain_service_mock = Arc::new(
@@ -1214,7 +1351,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_burning_skips_non_burning_state() {
-        let (cqrs, store, pool) = setup_test_environment().await;
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
