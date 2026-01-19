@@ -503,13 +503,66 @@ mod tests {
     use cqrs_es::EventEnvelope;
     use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
     use crate::mint::{Mint, MintCommand, MintEvent};
+
+    struct TestHarness {
+        pool: Pool<Sqlite>,
+        cqrs: SqliteCqrs<Mint>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let view_repo =
+                Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                    pool.clone(),
+                    "mint_view".to_string(),
+                ));
+            let query = GenericQuery::new(view_repo);
+            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+
+            Self { pool, cqrs }
+        }
+
+        async fn initiate_mint(&self, issuer_request_id: &IssuerRequestId) {
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::Initiate {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tokenization_request_id: TokenizationRequestId::new(
+                            "alp-888",
+                        ),
+                        quantity: Quantity::new(Decimal::from(50)),
+                        underlying: UnderlyingSymbol::new("TSLA"),
+                        token: TokenSymbol::new("tTSLA"),
+                        network: Network::new("base"),
+                        client_id: ClientId::new(),
+                        wallet: address!(
+                            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                        ),
+                    },
+                )
+                .await
+                .expect("Failed to initiate mint");
+        }
+    }
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()

@@ -765,14 +765,15 @@ pub(crate) enum MintError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256, uint};
+    use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
     use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
-        mem_store::MemStore, test::TestFramework,
+        mem_store::MemStore, persist::GenericQuery, test::TestFramework,
     };
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use std::sync::Arc;
 
     use super::{
@@ -782,7 +783,9 @@ mod tests {
     };
     use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
-    use crate::tokenized_asset::view::TokenizedAssetView;
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
+    };
     use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
@@ -2232,9 +2235,32 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
+        let asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let asset_query = GenericQuery::new(asset_view_repo);
+        let asset_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
-        insert_tokenized_asset(&pool, &underlying, vault).await;
+
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault,
+                },
+            )
+            .await
+            .expect("Failed to add tokenized asset");
 
         let mint_manager =
             create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());
