@@ -20,7 +20,6 @@ pub struct Config {
     pub rpc_url: Url,
     pub private_key: B256,
     pub vault: Address,
-    pub bot: Address,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
@@ -36,6 +35,11 @@ impl Config {
     pub fn parse() -> Result<Self, ConfigError> {
         let env = Env::try_parse()?;
         Ok(env.into_config())
+    }
+
+    /// Derives the bot wallet address from the private key.
+    pub(crate) fn bot_wallet(&self) -> Result<Address, ConfigError> {
+        Ok(PrivateKeySigner::from_bytes(&self.private_key)?.address())
     }
 
     pub(crate) async fn create_blockchain_service(
@@ -94,13 +98,6 @@ struct Env {
     )]
     vault: Address,
 
-    #[arg(
-        long,
-        env = "BOT_WALLET",
-        help = "Bot's wallet address that controls minting and redemption"
-    )]
-    bot: Address,
-
     #[clap(flatten)]
     auth: AuthConfig,
 
@@ -125,7 +122,6 @@ impl Env {
             rpc_url: self.rpc_url,
             private_key: self.private_key,
             vault: self.vault,
-            bot: self.bot,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,
@@ -211,6 +207,7 @@ pub fn setup_tracing(log_level: &LogLevel) {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use ipnetwork::IpNetwork;
 
     use super::*;
@@ -225,8 +222,6 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
-            "--bot",
-            "0x2222222222222222222222222222222222222222",
             "--issuer-api-key",
             "test-key-that-is-at-least-32-chars-long",
             "--alpaca-account-id",
@@ -329,8 +324,6 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
-            "--bot",
-            "0x2222222222222222222222222222222222222222",
             "--issuer-api-key",
             "short-key", // Less than 32 characters
             "--alpaca-account-id",
@@ -344,5 +337,17 @@ mod tests {
         let result = Env::try_parse_from(args);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bot_wallet_derived_from_private_key() {
+        let args = minimal_args();
+        let env = Env::try_parse_from(args).unwrap();
+        let config = env.into_config();
+
+        // Private key 0x...01 derives to this well-known address
+        let expected = address!("7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
+
+        assert_eq!(config.bot_wallet().unwrap(), expected);
     }
 }

@@ -391,7 +391,6 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
-        bot: bot_wallet,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -472,7 +471,6 @@ fn create_config_with_db(
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
-        bot: evm.wallet_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -650,7 +648,6 @@ async fn test_mint_burn_mint_nonce_synchronization()
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
-        bot: bot_wallet,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
