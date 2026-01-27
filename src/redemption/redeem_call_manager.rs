@@ -279,25 +279,205 @@ pub(crate) enum RedeemCallManagerError {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
-    use cqrs_es::{AggregateContext, EventStore, mem_store::MemStore};
+    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+    use cqrs_es::{
+        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
+    };
     use rust_decimal::Decimal;
+    use sqlite_es::{
+        SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
+    };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
-    use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
+    use crate::account::{
+        Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId,
+        Email,
+    };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::{IssuerRequestId, Quantity};
     use crate::redemption::{
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
-    use crate::tokenized_asset::{Network, TokenSymbol, TokenizedAssetView};
+    use crate::tokenized_asset::{
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        TokenizedAssetView,
+    };
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
 
     fn test_alpaca_account() -> AlpacaAccountNumber {
         AlpacaAccountNumber("test-account".to_string())
+    }
+
+    type RedemptionStore =
+        PersistedEventStore<SqliteEventRepository, Redemption>;
+
+    struct TestHarness {
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        redemption_store: Arc<RedemptionStore>,
+        redemption_cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+        account_cqrs: SqliteCqrs<Account>,
+        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let redemption_store =
+                Arc::new(PersistedEventStore::new_event_store(
+                    SqliteEventRepository::new(pool.clone()),
+                ));
+            let redemption_view_repo = Arc::new(SqliteViewRepository::<
+                RedemptionView,
+                Redemption,
+            >::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
+            let redemption_query = GenericQuery::new(redemption_view_repo);
+            let redemption_cqrs = Arc::new(CqrsFramework::new(
+                PersistedEventStore::new_event_store(
+                    SqliteEventRepository::new(pool.clone()),
+                ),
+                vec![Box::new(redemption_query)],
+                (),
+            ));
+
+            let account_view_repo =
+                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                    pool.clone(),
+                    "account_view".to_string(),
+                ));
+            let account_query = GenericQuery::new(account_view_repo);
+            let account_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+            let asset_view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let asset_query = GenericQuery::new(asset_view_repo);
+            let asset_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
+            Self {
+                pool,
+                redemption_store,
+                redemption_cqrs,
+                account_cqrs,
+                asset_cqrs,
+            }
+        }
+
+        async fn register_and_link_account(
+            &self,
+            client_id: ClientId,
+            email: &str,
+            alpaca_account: &AlpacaAccountNumber,
+            wallet: Address,
+        ) {
+            let email = Email::new(email.to_string()).unwrap();
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::Register { client_id, email },
+                )
+                .await
+                .expect("Failed to register account");
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::LinkToAlpaca {
+                        alpaca_account: alpaca_account.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to link to Alpaca");
+
+            self.account_cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::WhitelistWallet { wallet },
+                )
+                .await
+                .expect("Failed to whitelist wallet");
+        }
+
+        async fn add_asset(
+            &self,
+            underlying: &UnderlyingSymbol,
+            network: &Network,
+        ) {
+            self.asset_cqrs
+                .execute(
+                    &underlying.0,
+                    TokenizedAssetCommand::Add {
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        network: network.clone(),
+                        vault: address!(
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        ),
+                    },
+                )
+                .await
+                .expect("Failed to add asset");
+        }
+
+        async fn detect_redemption(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            underlying: &UnderlyingSymbol,
+            wallet: Address,
+        ) {
+            self.redemption_cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    RedemptionCommand::Detect {
+                        issuer_request_id: issuer_request_id.clone(),
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        wallet,
+                        quantity: Quantity::new(Decimal::from(100)),
+                        tx_hash: b256!(
+                            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                        ),
+                        block_number: 12345,
+                    },
+                )
+                .await
+                .expect("Failed to detect redemption");
+        }
+
+        fn create_manager(
+            &self,
+            alpaca_service: Arc<dyn crate::alpaca::AlpacaService>,
+        ) -> RedeemCallManager<RedemptionStore> {
+            RedeemCallManager::new(
+                alpaca_service,
+                self.redemption_cqrs.clone(),
+                self.redemption_store.clone(),
+                self.pool.clone(),
+            )
+        }
     }
 
     async fn setup_test_cqrs()
@@ -494,94 +674,25 @@ mod tests {
         );
     }
 
-    async fn insert_account_view(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        wallet: Address,
-        client_id: &ClientId,
-        alpaca_account: &AlpacaAccountNumber,
-    ) {
-        let view = AccountView::LinkedToAlpaca {
-            client_id: *client_id,
-            email: Email::new("test@example.com".to_string()).unwrap(),
-            alpaca_account: alpaca_account.clone(),
-            whitelisted_wallets: vec![wallet],
-            registered_at: chrono::Utc::now(),
-            linked_at: chrono::Utc::now(),
-        };
-        let payload = serde_json::to_string(&view).unwrap();
-        let view_id = format!("{wallet:?}");
-        sqlx::query!(
-            r#"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES ($1, 1, $2)
-            "#,
-            view_id,
-            payload
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn insert_asset_view(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        underlying: &UnderlyingSymbol,
-        network: &Network,
-    ) {
-        let view = TokenizedAssetView::Asset {
-            underlying: underlying.clone(),
-            token: TokenSymbol::new(format!("t{}", underlying.0)),
-            network: network.clone(),
-            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            enabled: true,
-            added_at: chrono::Utc::now(),
-        };
-        let payload = serde_json::to_string(&view).unwrap();
-        sqlx::query!(
-            r#"
-            INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ($1, 1, $2)
-            "#,
-            underlying.0,
-            payload
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn insert_redemption_view(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        view_id: &str,
-        view: &RedemptionView,
-    ) {
-        let payload = serde_json::to_string(view).unwrap();
-        sqlx::query!(
-            r#"
-            INSERT INTO redemption_view (view_id, version, payload)
-            VALUES ($1, 1, $2)
-            "#,
-            view_id,
-            payload
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn test_lookup_account_for_recovery_success() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, cqrs, store, pool.clone());
+        let manager = harness.create_manager(alpaca_service);
 
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-123".to_string());
 
-        insert_account_view(&pool, wallet, &client_id, &alpaca_account).await;
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
 
         let result = manager.lookup_account_for_recovery(&wallet).await;
 
@@ -613,16 +724,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_network_for_asset_success() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, cqrs, store, pool.clone());
+        let manager = harness.create_manager(alpaca_service);
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let network = Network::new("base");
 
-        insert_asset_view(&pool, &underlying, &network).await;
+        harness.add_asset(&underlying, &network).await;
 
         let result = manager.lookup_network_for_asset(&underlying).await;
 
@@ -666,16 +776,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_detected_redemptions_with_valid_redemption() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        );
+        let manager = harness.create_manager(alpaca_service);
 
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
@@ -683,30 +788,20 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         let network = Network::new("base");
 
-        insert_account_view(&pool, wallet, &client_id, &alpaca_account).await;
-        insert_asset_view(&pool, &underlying, &network).await;
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &network).await;
 
         let issuer_request_id = IssuerRequestId::new("red-recovery-1");
-        create_test_redemption_in_detected_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let view = RedemptionView::Detected {
-            issuer_request_id: issuer_request_id.clone(),
-            underlying,
-            token: TokenSymbol::new("tAAPL"),
-            wallet,
-            quantity: Quantity::new(Decimal::from(100)),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            block_number: 12345,
-            detected_at: chrono::Utc::now(),
-        };
-        insert_redemption_view(&pool, &issuer_request_id.0, &view).await;
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
 
         manager.recover_detected_redemptions().await;
 
@@ -716,8 +811,12 @@ mod tests {
             "Should call Alpaca once for the detected redemption"
         );
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let context = harness
+            .redemption_store
+            .load_aggregate(&issuer_request_id.0)
+            .await
+            .unwrap();
+        let updated_aggregate = context.aggregate();
         assert!(
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
             "Expected AlpacaCalled state, got {updated_aggregate:?}"
@@ -758,29 +857,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_single_detected_missing_asset() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        );
+        let manager = harness.create_manager(alpaca_service);
 
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-no-asset".to_string());
-        insert_account_view(&pool, wallet, &client_id, &alpaca_account).await;
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
 
         let issuer_request_id = IssuerRequestId::new("red-no-asset");
-        create_test_redemption_in_detected_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
 
         let result = manager.recover_single_detected(&issuer_request_id).await;
 

@@ -251,3 +251,11 @@ Bug fixes and improvements that don't fit into the original phases.
 - [x] [#93](https://github.com/ST0x-Technology/st0x.issuance/issues/93) -
       ALPACA_IP_RANGES not passed through during deployment
   - **PR:** [#94](https://github.com/ST0x-Technology/st0x.issuance/pull/94)
+- [x] [#89](https://github.com/ST0x-Technology/st0x.issuance/issues/89) -
+      VaultService uses global config vault address instead of per-asset vault
+  - **PR:** [#95](https://github.com/ST0x-Technology/st0x.issuance/pull/95)
+- [x] [#90](https://github.com/ST0x-Technology/st0x.issuance/issues/90) -
+      BOT_WALLET should be derived from PRIVATE_KEY instead of separate config;
+      removed `Config.bot` field, now using `bot_wallet()` to derive from
+      private key
+  - **PR:** [#95](https://github.com/ST0x-Technology/st0x.issuance/pull/95)

@@ -770,9 +770,10 @@ mod tests {
     use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
-        mem_store::MemStore, test::TestFramework,
+        mem_store::MemStore, persist::GenericQuery, test::TestFramework,
     };
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use std::sync::Arc;
 
     use super::{
@@ -782,6 +783,9 @@ mod tests {
     };
     use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
+    };
     use crate::vault::{VaultService, mock::MockVaultService};
 
     type MintTestFramework = TestFramework<Mint>;
@@ -2225,6 +2229,38 @@ mod tests {
             .connect(":memory:")
             .await
             .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let asset_query = GenericQuery::new(asset_view_repo);
+        let asset_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault,
+                },
+            )
+            .await
+            .expect("Failed to add tokenized asset");
 
         let mint_manager =
             create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());

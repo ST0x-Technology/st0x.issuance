@@ -27,6 +27,7 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `vault` - Address of the vault contract to interact with
     /// * `assets` - Amount of assets to deposit (18-decimal fixed-point)
     /// * `bot` - Bot's address that will hold the receipts
     /// * `user` - User's address that will receive the shares
@@ -49,6 +50,7 @@ pub(crate) trait VaultService: Send + Sync {
     /// the multicall to be encoded before execution.
     async fn mint_and_transfer_shares(
         &self,
+        vault: Address,
         assets: U256,
         bot: Address,
         user: Address,
@@ -59,6 +61,7 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `vault` - Address of the vault contract to interact with
     /// * `shares` - Number of shares to burn (18-decimal fixed-point)
     /// * `receipt_id` - ERC-1155 receipt ID to burn from
     /// * `owner` - Address of the account whose shares are being burned
@@ -76,6 +79,7 @@ pub(crate) trait VaultService: Send + Sync {
     /// or RPC communication fails.
     async fn burn_tokens(
         &self,
+        vault: Address,
         shares: U256,
         receipt_id: U256,
         owner: Address,
@@ -90,6 +94,7 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `vault` - Address of the vault contract to query
     /// * `owner` - Address to check the balance for
     ///
     /// # Returns
@@ -97,6 +102,7 @@ pub(crate) trait VaultService: Send + Sync {
     /// The share balance (with 18 decimals).
     async fn get_share_balance(
         &self,
+        vault: Address,
         owner: Address,
     ) -> Result<U256, VaultError>;
 }

@@ -160,10 +160,68 @@ pub(crate) async fn find_by_wallet(
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::GenericQuery;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::account::{Account, AccountCommand};
+
+    struct TestHarness {
+        pool: Pool<Sqlite>,
+        cqrs: SqliteCqrs<Account>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let view_repo =
+                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                    pool.clone(),
+                    "account_view".to_string(),
+                ));
+            let query = GenericQuery::new(view_repo);
+            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+
+            Self { pool, cqrs }
+        }
+
+        async fn register_account(&self, client_id: ClientId, email: Email) {
+            self.cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::Register { client_id, email },
+                )
+                .await
+                .expect("Failed to register account");
+        }
+
+        async fn link_to_alpaca(
+            &self,
+            client_id: &ClientId,
+            alpaca_account: AlpacaAccountNumber,
+        ) {
+            self.cqrs
+                .execute(
+                    &client_id.to_string(),
+                    AccountCommand::LinkToAlpaca { alpaca_account },
+                )
+                .await
+                .expect("Failed to link to Alpaca");
+        }
+    }
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -270,39 +328,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_client_id_returns_view() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
         let email = Email("client@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA789".to_string());
-        let registered_at = Utc::now();
-        let linked_at = Utc::now();
 
-        let view = AccountView::LinkedToAlpaca {
-            client_id,
-            email: email.clone(),
-            alpaca_account: alpaca_account.clone(),
-            whitelisted_wallets: Vec::new(),
-            registered_at,
-            linked_at,
-        };
+        harness.register_account(client_id, email.clone()).await;
+        harness.link_to_alpaca(&client_id, alpaca_account.clone()).await;
 
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let view = find_by_client_id(&pool, &client_id)
+        let view = find_by_client_id(pool, &client_id)
             .await
             .expect("Query should succeed")
             .expect("View should exist");
@@ -337,39 +373,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_email_returns_linked_to_alpaca_view() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
         let email = Email("email@example.com".to_string());
         let alpaca_account = AlpacaAccountNumber("ALPACA999".to_string());
-        let registered_at = Utc::now();
-        let linked_at = Utc::now();
 
-        let view = AccountView::LinkedToAlpaca {
-            client_id,
-            email: email.clone(),
-            alpaca_account: alpaca_account.clone(),
-            whitelisted_wallets: Vec::new(),
-            registered_at,
-            linked_at,
-        };
+        harness.register_account(client_id, email.clone()).await;
+        harness.link_to_alpaca(&client_id, alpaca_account.clone()).await;
 
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let view = find_by_email(&pool, &email)
+        let view = find_by_email(pool, &email)
             .await
             .expect("Query should succeed")
             .expect("View should exist");
@@ -391,34 +405,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_email_returns_registered_view() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let client_id = ClientId::new();
         let email = Email("registered@example.com".to_string());
-        let registered_at = Utc::now();
 
-        let view = AccountView::Registered {
-            client_id,
-            email: email.clone(),
-            registered_at,
-        };
+        harness.register_account(client_id, email.clone()).await;
 
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            client_id,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let view = find_by_email(&pool, &email)
+        let view = find_by_email(pool, &email)
             .await
             .expect("Query should succeed")
             .expect("View should exist");

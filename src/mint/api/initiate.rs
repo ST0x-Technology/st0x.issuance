@@ -106,7 +106,7 @@ mod tests {
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        setup_test_environment, setup_with_account_and_asset, test_config,
+        TestAccountAndAsset, TestHarness, test_config,
     };
     use crate::mint::api::{ErrorResponse, MintResponse};
     use crate::mint::{
@@ -118,8 +118,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_returns_issuer_request_id() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = TestHarness::new().await;
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
@@ -207,8 +211,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_rejects_unknown_asset() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = TestHarness::new().await;
 
         let email = Email::new("test@placeholder.com".to_string())
             .expect("Valid email");
@@ -282,8 +290,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_rejects_negative_quantity() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = TestHarness::new().await;
 
         let client_id = ClientId::new();
 
@@ -337,8 +349,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_rejects_unknown_client_id() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = TestHarness::new().await;
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -408,12 +424,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_are_persisted_correctly() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -491,12 +510,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_views_are_updated_correctly() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -578,12 +600,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_rejects_invalid_wallet_address() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -625,12 +650,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_rejects_wrong_network() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, _network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, .. } =
+            harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -682,12 +710,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_with_duplicate_issuer_request_id() {
-        let (_pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { mint_cqrs, .. } = harness;
 
         let issuer_request_id = "test-issuer-request-id";
 
@@ -714,8 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_mint_without_auth_returns_401() {
-        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
 
         let rocket = rocket::build()
             .manage(test_config())

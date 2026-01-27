@@ -209,7 +209,7 @@ pub async fn initialize_rocket(
         redeem_call,
         journal,
         burn,
-    );
+    )?;
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -346,7 +346,7 @@ fn setup_mint_managers(
         mint_cqrs.clone(),
         mint_event_store.clone(),
         pool.clone(),
-        config.bot,
+        config.bot_wallet()?,
     ));
 
     let alpaca_service = config.alpaca.service()?;
@@ -386,7 +386,7 @@ fn setup_redemption_managers(
         pool.clone(),
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
-        config.bot,
+        config.bot_wallet()?,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -410,13 +410,14 @@ fn spawn_redemption_detector(
     burn: Arc<
         BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
-) {
-    info!("WebSocket monitoring task spawned for bot wallet {}", config.bot);
+) -> Result<(), config::ConfigError> {
+    let bot_wallet = config.bot_wallet()?;
+    info!("WebSocket monitoring task spawned for bot wallet {bot_wallet}");
 
     let detector_config = RedemptionDetectorConfig {
         rpc_url: config.rpc_url.clone(),
         vault: config.vault,
-        bot_wallet: config.bot,
+        bot_wallet,
     };
 
     let detector = RedemptionDetector::new(
@@ -432,6 +433,8 @@ fn spawn_redemption_detector(
     tokio::spawn(async move {
         detector.run().await;
     });
+
+    Ok(())
 }
 
 fn spawn_mint_recovery(
