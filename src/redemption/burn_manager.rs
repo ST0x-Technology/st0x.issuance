@@ -203,14 +203,37 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             });
         };
 
-        let vault = find_vault_by_underlying(
+        let Some(vault) = find_vault_by_underlying(
             &self.receipt_query_pool,
             &metadata.underlying,
         )
         .await?
-        .ok_or_else(|| BurnManagerError::AssetNotFound {
-            underlying: metadata.underlying.0.clone(),
-        })?;
+        else {
+            let error_msg = format!(
+                "No vault configured for underlying asset {}",
+                metadata.underlying
+            );
+
+            warn!(
+                issuer_request_id = %issuer_request_id,
+                underlying = %metadata.underlying,
+                "{error_msg}"
+            );
+
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    RedemptionCommand::RecordBurnFailure {
+                        issuer_request_id: issuer_request_id.clone(),
+                        error: error_msg,
+                    },
+                )
+                .await?;
+
+            return Err(BurnManagerError::AssetNotFound {
+                underlying: metadata.underlying.0.clone(),
+            });
+        };
 
         info!(
             issuer_request_id = %issuer_request_id,
