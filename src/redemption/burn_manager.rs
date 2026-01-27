@@ -707,7 +707,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-burn-success-123");
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             "mint-for-burn",
             uint!(42_U256),
             "AAPL",
@@ -717,8 +717,8 @@ mod tests {
         .await;
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -731,8 +731,7 @@ mod tests {
 
         assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -764,7 +763,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-burn-failure-456");
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             "mint-for-fail",
             uint!(7_U256),
             "AAPL",
@@ -774,8 +773,8 @@ mod tests {
         .await;
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -791,8 +790,7 @@ mod tests {
 
         assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -826,8 +824,8 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-insufficient-789");
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -841,8 +839,7 @@ mod tests {
             "Expected InsufficientBalance error, got {result:?}"
         );
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -893,7 +890,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -932,7 +929,7 @@ mod tests {
         let mint_issuer_request_id = "mint-complete-001";
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             mint_issuer_request_id,
             uint!(42_U256),
             "AAPL",
@@ -942,8 +939,8 @@ mod tests {
         .await;
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -956,8 +953,7 @@ mod tests {
 
         assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -988,7 +984,7 @@ mod tests {
         let mint_issuer_request_id = "mint-partial-002";
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             mint_issuer_request_id,
             uint!(43_U256),
             "AAPL",
@@ -1042,7 +1038,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -1050,8 +1046,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -1082,7 +1077,7 @@ mod tests {
         let mint_issuer_request_id = "mint-depletes-003";
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             mint_issuer_request_id,
             uint!(44_U256),
             "AAPL",
@@ -1092,8 +1087,8 @@ mod tests {
         .await;
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -1104,8 +1099,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -1135,7 +1129,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-multiple-004");
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             "mint-multiple-004a",
             uint!(45_U256),
             "AAPL",
@@ -1145,7 +1139,7 @@ mod tests {
         .await;
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             "mint-multiple-004b",
             uint!(46_U256),
             "AAPL",
@@ -1155,8 +1149,8 @@ mod tests {
         .await;
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -1167,8 +1161,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -1198,8 +1191,8 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-insufficient-005");
 
         let aggregate = create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -1213,8 +1206,7 @@ mod tests {
             "Expected InsufficientBalance error, got {result:?}"
         );
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -1266,7 +1258,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-recovery-001");
 
         seed_receipt_with_balance(
-            &pool,
+            pool,
             "mint-recovery-001",
             uint!(99_U256),
             "AAPL",
@@ -1276,8 +1268,8 @@ mod tests {
         .await;
 
         create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -1286,8 +1278,7 @@ mod tests {
 
         assert_eq!(blockchain_service_mock.get_burn_call_count(), 1);
 
-        let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(updated_aggregate, Redemption::Completed { .. }),
@@ -1324,8 +1315,8 @@ mod tests {
 
         // Create a redemption in Burning state (needs 100 shares)
         create_test_redemption_in_burning_state(
-            &cqrs,
-            &store,
+            cqrs,
+            store,
             &issuer_request_id,
         )
         .await;
@@ -1341,7 +1332,7 @@ mod tests {
         );
 
         // Redemption should stay in Burning state (not move to Failed)
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(aggregate, Redemption::Burning { .. }),
@@ -1398,7 +1389,7 @@ mod tests {
             "Should not call burn for Detected state"
         );
 
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
 
         assert!(
             matches!(aggregate, Redemption::Detected { .. }),

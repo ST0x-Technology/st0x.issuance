@@ -623,7 +623,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aggregate = load_aggregate(&store, &issuer_request_id).await;
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
 
         let result = manager
             .handle_journal_confirmed(&issuer_request_id, &aggregate)

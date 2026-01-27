@@ -250,7 +250,7 @@ mod tests {
                 TokenizedAssetView::Asset { underlying, .. } => {
                     Some(underlying.0.as_str())
                 }
-                _ => None,
+                TokenizedAssetView::Unavailable => None,
             })
             .collect();
 

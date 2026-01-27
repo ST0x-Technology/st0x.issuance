@@ -21,6 +21,7 @@ use crate::tokenized_asset::{
 };
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
+use crate::{AccountCqrs, MintCqrs, TokenizedAssetCqrs};
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -73,96 +74,111 @@ pub(crate) fn create_test_event_store(
     Arc::new(PersistedEventStore::new_event_store(event_repo))
 }
 
-pub(crate) async fn setup_test_environment() -> (
-    sqlx::Pool<sqlx::Sqlite>,
-    crate::AccountCqrs,
-    crate::TokenizedAssetCqrs,
-    crate::MintCqrs,
-) {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(":memory:")
-        .await
-        .expect("Failed to create in-memory database");
-
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
-    let account_query = GenericQuery::new(account_view_repo);
-    let account_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
-
-    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
-    let tokenized_asset_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
-
-    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-        pool.clone(),
-        "mint_view".to_string(),
-    ));
-    let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
-    (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs)
+pub(crate) struct TestHarness {
+    pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
+    pub(crate) account_cqrs: AccountCqrs,
+    pub(crate) asset_cqrs: TokenizedAssetCqrs,
+    pub(crate) mint_cqrs: MintCqrs,
 }
 
-pub(crate) async fn setup_with_account_and_asset(
-    account_cqrs: &crate::AccountCqrs,
-    tokenized_asset_cqrs: &crate::TokenizedAssetCqrs,
-) -> (ClientId, UnderlyingSymbol, TokenSymbol, Network) {
-    let email =
-        Email::new("test@placeholder.com".to_string()).expect("Valid email");
-    let client_id = ClientId::new();
+impl TestHarness {
+    pub(crate) async fn new() -> Self {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
 
-    let register_cmd =
-        AccountCommand::Register { client_id, email: email.clone() };
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
 
-    let aggregate_id = client_id.to_string();
-    account_cqrs
-        .execute(&aggregate_id, register_cmd)
-        .await
-        .expect("Failed to register account");
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+        let account_query = GenericQuery::new(account_view_repo);
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-    let link_cmd = AccountCommand::LinkToAlpaca {
-        alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-    };
+        let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
+            TokenizedAssetView,
+            TokenizedAsset,
+        >::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+        let tokenized_asset_query =
+            GenericQuery::new(tokenized_asset_view_repo);
+        let asset_cqrs = sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(tokenized_asset_query)],
+            (),
+        );
 
-    account_cqrs
-        .execute(&aggregate_id, link_cmd)
-        .await
-        .expect("Failed to link account to Alpaca");
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
+        let mint_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
 
-    let underlying = UnderlyingSymbol::new("AAPL");
-    let token = TokenSymbol::new("tAAPL");
-    let network = Network::new("base");
-    let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        Self { pool, account_cqrs, asset_cqrs, mint_cqrs }
+    }
+}
 
-    let asset_cmd = TokenizedAssetCommand::Add {
-        underlying: underlying.clone(),
-        token: token.clone(),
-        network: network.clone(),
-        vault,
-    };
+pub(crate) struct TestAccountAndAsset {
+    pub(crate) client_id: ClientId,
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+}
 
-    tokenized_asset_cqrs
-        .execute(&underlying.0, asset_cmd)
-        .await
-        .expect("Failed to add asset");
+impl TestHarness {
+    pub(crate) async fn setup_account_and_asset(&self) -> TestAccountAndAsset {
+        let email = Email::new("test@placeholder.com".to_string())
+            .expect("Valid email");
+        let client_id = ClientId::new();
 
-    (client_id, underlying, token, network)
+        let register_cmd =
+            AccountCommand::Register { client_id, email: email.clone() };
+
+        let aggregate_id = client_id.to_string();
+        self.account_cqrs
+            .execute(&aggregate_id, register_cmd)
+            .await
+            .expect("Failed to register account");
+
+        let link_cmd = AccountCommand::LinkToAlpaca {
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+        };
+
+        self.account_cqrs
+            .execute(&aggregate_id, link_cmd)
+            .await
+            .expect("Failed to link account to Alpaca");
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let asset_cmd = TokenizedAssetCommand::Add {
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            vault,
+        };
+
+        self.asset_cqrs
+            .execute(&underlying.0, asset_cmd)
+            .await
+            .expect("Failed to add asset");
+
+        TestAccountAndAsset { client_id, underlying, token, network }
+    }
 }

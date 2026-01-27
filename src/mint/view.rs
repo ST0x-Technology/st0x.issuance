@@ -644,46 +644,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_issuer_request_id_returns_view() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-999");
-        let tokenization_request_id = TokenizationRequestId::new("alp-888");
-        let quantity = Quantity::new(Decimal::from(50));
-        let underlying = UnderlyingSymbol::new("TSLA");
-        let token = TokenSymbol::new("tTSLA");
-        let network = Network::new("base");
-        let client_id = ClientId::new();
-        let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let initiated_at = Utc::now();
 
-        let view = MintView::Initiated {
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            quantity: quantity.clone(),
-            underlying: underlying.clone(),
-            token: token.clone(),
-            network: network.clone(),
-            client_id,
-            wallet,
-            initiated_at,
-        };
+        harness.initiate_mint(&issuer_request_id).await;
 
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO mint_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            issuer_request_id.0,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let result = find_by_issuer_request_id(&pool, &issuer_request_id)
+        let result = find_by_issuer_request_id(pool, &issuer_request_id)
             .await
             .expect("Query should succeed");
 
@@ -696,22 +664,21 @@ mod tests {
             underlying: found_underlying,
             token: found_token,
             network: found_network,
-            client_id: found_client_id,
-            wallet: found_wallet,
-            initiated_at: _,
+            ..
         } = result.unwrap()
         else {
             panic!("Expected Initiated variant")
         };
 
         assert_eq!(found_issuer_id, issuer_request_id);
-        assert_eq!(found_tokenization_id, tokenization_request_id);
-        assert_eq!(found_quantity, quantity);
-        assert_eq!(found_underlying, underlying);
-        assert_eq!(found_token, token);
-        assert_eq!(found_network, network);
-        assert_eq!(found_client_id, client_id);
-        assert_eq!(found_wallet, wallet);
+        assert_eq!(
+            found_tokenization_id,
+            TokenizationRequestId::new("alp-888")
+        );
+        assert_eq!(found_quantity, Quantity::new(Decimal::from(50)));
+        assert_eq!(found_underlying, UnderlyingSymbol::new("TSLA"));
+        assert_eq!(found_token, TokenSymbol::new("tTSLA"));
+        assert_eq!(found_network, Network::new("base"));
     }
 
     #[tokio::test]
