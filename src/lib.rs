@@ -43,6 +43,7 @@ pub mod bindings;
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
+pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
@@ -183,7 +184,8 @@ pub async fn initialize_rocket(
             &mint_cqrs,
             &mint_event_store,
             &pool,
-        )?;
+        )
+        .await?;
 
     spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
 
@@ -194,7 +196,8 @@ pub async fn initialize_rocket(
             &redemption_cqrs,
             &redemption_event_store,
             &pool,
-        )?;
+        )
+        .await?;
 
     spawn_redemption_recovery(
         redeem_call.clone(),
@@ -210,7 +213,8 @@ pub async fn initialize_rocket(
         redeem_call,
         journal,
         burn,
-    )?;
+    )
+    .await?;
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -335,7 +339,7 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
     }
 }
 
-fn setup_mint_managers(
+async fn setup_mint_managers(
     config: &Config,
     blockchain_service: Arc<dyn vault::VaultService>,
     mint_cqrs: &MintCqrs,
@@ -347,7 +351,7 @@ fn setup_mint_managers(
         mint_cqrs.clone(),
         mint_event_store.clone(),
         pool.clone(),
-        config.bot_wallet()?,
+        config.bot_wallet().await?,
     ));
 
     let alpaca_service = config.alpaca.service()?;
@@ -361,7 +365,7 @@ fn setup_mint_managers(
     Ok(MintManagers { mint, callback })
 }
 
-fn setup_redemption_managers(
+async fn setup_redemption_managers(
     config: &Config,
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
@@ -387,13 +391,13 @@ fn setup_redemption_managers(
         pool.clone(),
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
-        config.bot_wallet()?,
+        config.bot_wallet().await?,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
-fn spawn_redemption_detector(
+async fn spawn_redemption_detector(
     config: &Config,
     redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
     redemption_event_store: Arc<
@@ -412,7 +416,7 @@ fn spawn_redemption_detector(
         BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) -> Result<(), config::ConfigError> {
-    let bot_wallet = config.bot_wallet()?;
+    let bot_wallet = config.bot_wallet().await?;
     info!("WebSocket monitoring task spawned for bot wallet {bot_wallet}");
 
     let detector_config = RedemptionDetectorConfig {

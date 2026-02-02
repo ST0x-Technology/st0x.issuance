@@ -389,7 +389,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -469,7 +469,7 @@ fn create_config_with_db(
         database_url: db_path.to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -646,7 +646,7 @@ async fn test_mint_burn_mint_nonce_synchronization()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"

@@ -1,7 +1,5 @@
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use std::sync::Arc;
@@ -10,6 +8,9 @@ use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
+use crate::fireblocks::{
+    SignerConfig, SignerConfigError, SignerEnv, SignerResolveError,
+};
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
@@ -18,7 +19,7 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub rpc_url: Url,
-    pub private_key: B256,
+    pub signer: SignerConfig,
     pub vault: Address,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
@@ -34,22 +35,21 @@ impl Config {
     /// Returns an error if command-line arguments or environment variables are invalid.
     pub fn parse() -> Result<Self, ConfigError> {
         let env = Env::try_parse()?;
-        Ok(env.into_config())
+        env.into_config()
     }
 
-    /// Derives the bot wallet address from the private key.
-    pub(crate) fn bot_wallet(&self) -> Result<Address, ConfigError> {
-        Ok(PrivateKeySigner::from_bytes(&self.private_key)?.address())
+    /// Derives the bot wallet address from the signer configuration.
+    pub(crate) async fn bot_wallet(&self) -> Result<Address, ConfigError> {
+        Ok(self.signer.address().await?)
     }
 
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
+        let resolved = self.signer.resolve().await?;
 
         let provider = ProviderBuilder::new()
-            .wallet(wallet)
+            .wallet(resolved.wallet)
             .connect(self.rpc_url.as_str())
             .await?;
 
@@ -84,12 +84,8 @@ struct Env {
     )]
     rpc_url: Url,
 
-    #[arg(
-        long,
-        env = "PRIVATE_KEY",
-        help = "Private key for signing blockchain transactions"
-    )]
-    private_key: B256,
+    #[clap(flatten)]
+    signer: SignerEnv,
 
     #[arg(
         long,
@@ -112,21 +108,22 @@ struct Env {
 }
 
 impl Env {
-    fn into_config(self) -> Config {
+    fn into_config(self) -> Result<Config, ConfigError> {
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
+        let signer = self.signer.into_config()?;
 
-        Config {
+        Ok(Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
-            private_key: self.private_key,
+            signer,
             vault: self.vault,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
-        }
+        })
     }
 }
 
@@ -183,10 +180,10 @@ impl HyperDxEnv {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("Invalid private key")]
-    InvalidPrivateKey(#[from] alloy::signers::local::LocalSignerError),
-    #[error("Invalid private key format")]
-    InvalidPrivateKeyFormat(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("Signer configuration error")]
+    SignerConfig(#[from] SignerConfigError),
+    #[error("Failed to resolve signer")]
+    SignerResolve(#[from] SignerResolveError),
     #[error("Failed to connect to RPC endpoint")]
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
@@ -218,7 +215,7 @@ mod tests {
             "test-binary",
             "--rpc-url",
             "wss://localhost:8545",
-            "--private-key",
+            "--evm-private-key",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
@@ -295,7 +292,7 @@ mod tests {
         args.extend_from_slice(&["--alpaca-ip-ranges", ""]);
 
         let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config();
+        let config = env.into_config().unwrap();
 
         assert_eq!(config.auth.alpaca_ip_ranges, IpWhitelist::AllowAll);
     }
@@ -306,7 +303,7 @@ mod tests {
         args.extend_from_slice(&["--alpaca-ip-ranges", "10.0.0.0/8"]);
 
         let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config();
+        let config = env.into_config().unwrap();
 
         let expected =
             IpWhitelist::single("10.0.0.0/8".parse::<IpNetwork>().unwrap());
@@ -320,7 +317,7 @@ mod tests {
             "test-binary",
             "--rpc-url",
             "wss://localhost:8545",
-            "--private-key",
+            "--evm-private-key",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
@@ -339,15 +336,15 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_bot_wallet_derived_from_private_key() {
+    #[tokio::test]
+    async fn test_bot_wallet_derived_from_private_key() {
         let args = minimal_args();
         let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config();
+        let config = env.into_config().unwrap();
 
         // Private key 0x...01 derives to this well-known address
         let expected = address!("7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
 
-        assert_eq!(config.bot_wallet().unwrap(), expected);
+        assert_eq!(config.bot_wallet().await.unwrap(), expected);
     }
 }
