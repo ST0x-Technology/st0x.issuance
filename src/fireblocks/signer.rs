@@ -360,16 +360,3 @@ impl TxSigner<Signature> for FireblocksSigner {
         Ok(signature)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fireblocks_signer_debug_redacts_client() {
-        // Verify Debug output doesn't leak sensitive client details
-        let debug_output = format!(
-            "{:?}",
-            "FireblocksSigner { vault_account_id: \"0\", asset_id: \"ETH\", address: 0x..., chain_id: None }"
-        );
-        assert!(debug_output.contains("FireblocksSigner"));
-    }
-}

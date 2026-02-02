@@ -72,6 +72,9 @@ pub(crate) fn parse_chain_asset_ids(s: &str) -> Result<ChainAssetIds, String> {
             .map_err(|_| format!("invalid chain ID: {chain_str:?}"))?;
 
         let asset_id = asset_id.trim().to_string();
+        if asset_id.is_empty() {
+            return Err(format!("empty asset ID for chain {chain_id}"));
+        }
 
         if default_asset_id.is_none() {
             default_asset_id = Some(asset_id.clone());
@@ -130,6 +133,12 @@ mod tests {
     #[test]
     fn parse_empty_string() {
         let result = parse_chain_asset_ids("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_empty_asset_id() {
+        let result = parse_chain_asset_ids("1:");
         assert!(result.is_err());
     }
 }
