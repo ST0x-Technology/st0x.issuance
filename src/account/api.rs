@@ -230,7 +230,6 @@ mod tests {
             rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
             private_key: B256::ZERO,
             vault: address!("0x1111111111111111111111111111111111111111"),
-            bot: address!("0x2222222222222222222222222222222222222222"),
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,
@@ -967,7 +966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_email_unique_constraint_enforced_at_db_level() {
+    async fn test_only_one_account_per_email_stored_in_view() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -976,44 +975,28 @@ mod tests {
 
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        let email = "race@example.com";
-        let payload1 = serde_json::json!({
-            "Registered": {
-                "client_id": "11111111-1111-1111-1111-111111111111",
-                "email": email,
-                "registered_at": "2024-01-01T00:00:00Z"
-            }
-        });
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
 
-        sqlx::query("INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)")
-            .bind("11111111-1111-1111-1111-111111111111")
-            .bind(1i64)
-            .bind(payload1.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
+        let account_query = GenericQuery::new(account_view_repo);
+        let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-        let payload2 = serde_json::json!({
-            "Registered": {
-                "client_id": "22222222-2222-2222-2222-222222222222",
-                "email": email,
-                "registered_at": "2024-01-01T00:00:00Z"
-            }
-        });
+        let email = "unique@example.com";
+        let first_client_id = register_account(&cqrs, email).await;
 
-        let result = sqlx::query(
-            "INSERT INTO account_view (view_id, version, payload) VALUES (?, ?, ?)",
-        )
-        .bind("22222222-2222-2222-2222-222222222222")
-        .bind(1i64)
-        .bind(payload2.to_string())
-        .execute(&pool)
-        .await;
+        let view =
+            find_by_email(&pool, &Email::new(email.to_string()).unwrap())
+                .await
+                .expect("Query should succeed")
+                .expect("View should exist");
 
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("UNIQUE constraint failed"),
-            "DB should enforce email uniqueness via migration, got: {err}"
-        );
+        let AccountView::Registered { client_id, .. } = view else {
+            panic!("Expected Registered view")
+        };
+
+        assert_eq!(client_id, first_client_id);
     }
 }

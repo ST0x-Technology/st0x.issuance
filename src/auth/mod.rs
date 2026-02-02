@@ -350,7 +350,6 @@ mod tests {
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
             private_key: B256::ZERO,
             vault: address!("0x1111111111111111111111111111111111111111"),
-            bot: address!("0x2222222222222222222222222222222222222222"),
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

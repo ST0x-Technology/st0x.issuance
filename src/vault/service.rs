@@ -14,7 +14,6 @@ use crate::bindings::OffchainAssetReceiptVault;
 /// for testing.
 pub(crate) struct RealBlockchainService<P> {
     provider: P,
-    vault_address: Address,
 }
 
 impl<P: Provider + Clone> RealBlockchainService<P> {
@@ -23,9 +22,8 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
     /// # Arguments
     ///
     /// * `provider` - Alloy provider for blockchain communication
-    /// * `vault_address` - Address of the OffchainAssetReceiptVault contract
-    pub(crate) const fn new(provider: P, vault_address: Address) -> Self {
-        Self { provider, vault_address }
+    pub(crate) const fn new(provider: P) -> Self {
+        Self { provider }
     }
 }
 
@@ -35,6 +33,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 {
     async fn mint_and_transfer_shares(
         &self,
+        vault: Address,
         assets: U256,
         bot: Address,
         user: Address,
@@ -49,25 +48,27 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 }
             })?);
 
-        let vault =
-            OffchainAssetReceiptVault::new(self.vault_address, &self.provider);
+        let vault_contract =
+            OffchainAssetReceiptVault::new(vault, &self.provider);
 
         let share_ratio = U256::from(10).pow(U256::from(18));
 
         // Preview deposit to get the exact number shares that will be minted
-        let shares = vault.previewDeposit(assets, share_ratio).call().await?;
+        let shares =
+            vault_contract.previewDeposit(assets, share_ratio).call().await?;
 
         // Encode deposit call - mints shares + receipts to bot
-        let deposit_call = vault
+        let deposit_call = vault_contract
             .deposit(assets, bot, share_ratio, receipt_info_bytes)
             .calldata()
             .clone();
 
         // Encode transfer call - transfers exact shares from bot to user
-        let transfer_call = vault.transfer(user, shares).calldata().clone();
+        let transfer_call =
+            vault_contract.transfer(user, shares).calldata().clone();
 
         // Execute both operations atomically via multicall
-        let receipt = vault
+        let receipt = vault_contract
             .multicall(vec![deposit_call, transfer_call])
             .send()
             .await
@@ -111,6 +112,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
     async fn burn_tokens(
         &self,
+        vault: Address,
         shares: U256,
         receipt_id: U256,
         owner: Address,
@@ -126,13 +128,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 }
             })?);
 
-        let vault =
-            OffchainAssetReceiptVault::new(self.vault_address, &self.provider);
+        let vault_contract =
+            OffchainAssetReceiptVault::new(vault, &self.provider);
 
         // The vault's redeem() function burns shares and returns underlying assets to receiver.
         // Parameters: shares to burn, receiver address, owner address, receipt ID, metadata.
         // The owner parameter specifies whose shares are being burned, while receiver gets the assets.
-        let receipt = vault
+        let receipt = vault_contract
             .redeem(shares, receiver, owner, receipt_id, receipt_info_bytes)
             .send()
             .await
@@ -176,12 +178,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
     async fn get_share_balance(
         &self,
+        vault: Address,
         owner: Address,
     ) -> Result<U256, VaultError> {
-        let vault =
-            OffchainAssetReceiptVault::new(self.vault_address, &self.provider);
+        let vault_contract =
+            OffchainAssetReceiptVault::new(vault, &self.provider);
 
-        Ok(vault.balanceOf(owner).call().await?)
+        Ok(vault_contract.balanceOf(owner).call().await?)
     }
 }
 
@@ -346,10 +349,11 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider, vault_address);
+        let service = RealBlockchainService::new(provider);
 
         let result = service
             .mint_and_transfer_shares(
+                vault_address,
                 assets,
                 bot_wallet,
                 user_wallet,
@@ -368,12 +372,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_mint_and_transfer_shares_missing_deposit_event() {
+        let vault_address = test_vault_address();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
             address!("0x2222222222222222222222222222222222222222");
         let receipt_info = test_receipt_info();
-        let vault_address = test_vault_address();
 
         let tx_hash = fixed_bytes!(
             "0x1234567890123456789012345678901234567890123456789012345678901234"
@@ -453,10 +457,11 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider, vault_address);
+        let service = RealBlockchainService::new(provider);
 
         let result = service
             .mint_and_transfer_shares(
+                vault_address,
                 assets,
                 bot_wallet,
                 user_wallet,
@@ -474,12 +479,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_burn_tokens_success() {
+        let vault_address = test_vault_address();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let receiver = test_receiver();
         let mut receipt_info = test_receipt_info();
         receipt_info.operation_type = OperationType::Redeem;
-        let vault_address = test_vault_address();
 
         let tx_hash = fixed_bytes!(
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -584,10 +589,17 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider, vault_address);
+        let service = RealBlockchainService::new(provider);
 
         let result = service
-            .burn_tokens(shares, receipt_id, receiver, receiver, receipt_info)
+            .burn_tokens(
+                vault_address,
+                shares,
+                receipt_id,
+                receiver,
+                receiver,
+                receipt_info,
+            )
             .await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
@@ -601,13 +613,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_burn_tokens_missing_withdraw_event() {
+        let vault_address = test_vault_address();
         let shares = U256::from(500);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
         let receiver = test_receiver();
         let mut receipt_info = test_receipt_info();
         receipt_info.operation_type = OperationType::Redeem;
-        let vault_address = test_vault_address();
 
         let tx_hash = fixed_bytes!(
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -684,10 +696,17 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider, vault_address);
+        let service = RealBlockchainService::new(provider);
 
         let result = service
-            .burn_tokens(shares, receipt_id, owner, receiver, receipt_info)
+            .burn_tokens(
+                vault_address,
+                shares,
+                receipt_id,
+                owner,
+                receiver,
+                receipt_info,
+            )
             .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");

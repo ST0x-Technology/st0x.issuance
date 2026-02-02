@@ -306,19 +306,129 @@ pub(crate) async fn find_burning(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
+    use cqrs_es::persist::GenericQuery;
     use cqrs_es::{EventEnvelope, View};
     use rust_decimal::Decimal;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::{
         RedemptionView, find_alpaca_called, find_burning, find_detected,
     };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-    use crate::redemption::{Redemption, RedemptionEvent};
+    use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+
+    struct TestHarness {
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        cqrs: SqliteCqrs<Redemption>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let view_repo = Arc::new(SqliteViewRepository::<
+                RedemptionView,
+                Redemption,
+            >::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
+            let query = GenericQuery::new(view_repo);
+            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+
+            Self { pool, cqrs }
+        }
+
+        async fn detect_redemption(
+            &self,
+            id: &str,
+            underlying: &str,
+            wallet: Address,
+            quantity: u64,
+            tx_hash: B256,
+            block_number: u64,
+        ) {
+            self.cqrs
+                .execute(
+                    id,
+                    RedemptionCommand::Detect {
+                        issuer_request_id: IssuerRequestId::new(id),
+                        underlying: UnderlyingSymbol::new(underlying),
+                        token: TokenSymbol::new(format!("t{underlying}")),
+                        wallet,
+                        quantity: Quantity::new(Decimal::from(quantity)),
+                        tx_hash,
+                        block_number,
+                    },
+                )
+                .await
+                .expect("Failed to detect redemption");
+        }
+
+        async fn call_alpaca(&self, id: &str, tokenization_request_id: &str) {
+            self.cqrs
+                .execute(
+                    id,
+                    RedemptionCommand::RecordAlpacaCall {
+                        issuer_request_id: IssuerRequestId::new(id),
+                        tokenization_request_id: TokenizationRequestId::new(
+                            tokenization_request_id,
+                        ),
+                    },
+                )
+                .await
+                .expect("Failed to record alpaca call");
+        }
+
+        async fn confirm_alpaca_complete(&self, id: &str) {
+            self.cqrs
+                .execute(
+                    id,
+                    RedemptionCommand::ConfirmAlpacaComplete {
+                        issuer_request_id: IssuerRequestId::new(id),
+                    },
+                )
+                .await
+                .expect("Failed to confirm alpaca complete");
+        }
+
+        async fn record_burn_success(
+            &self,
+            id: &str,
+            burn_tx_hash: B256,
+            block_number: u64,
+        ) {
+            self.cqrs
+                .execute(
+                    id,
+                    RedemptionCommand::RecordBurnSuccess {
+                        issuer_request_id: IssuerRequestId::new(id),
+                        tx_hash: burn_tx_hash,
+                        receipt_id: U256::from(1),
+                        shares_burned: U256::from(100),
+                        gas_used: 21000,
+                        block_number,
+                    },
+                )
+                .await
+                .expect("Failed to record burn success");
+        }
+    }
 
     #[test]
     fn test_view_starts_as_unavailable() {
@@ -664,88 +774,58 @@ mod tests {
         assert_eq!(view_failed_at, failed_at);
     }
 
-    async fn setup_test_db() -> sqlx::Pool<sqlx::Sqlite> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        pool
-    }
-
-    async fn insert_view_row(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        view_id: &str,
-        view: &RedemptionView,
-    ) {
-        let payload = serde_json::to_string(view).unwrap();
-        sqlx::query!(
-            r#"
-            INSERT INTO redemption_view (view_id, version, payload)
-            VALUES ($1, 1, $2)
-            "#,
-            view_id,
-            payload
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn test_find_detected_returns_only_detected_views() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let detected_id = "red-detected-1";
-        let detected_view = RedemptionView::Detected {
-            issuer_request_id: IssuerRequestId::new(detected_id),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            block_number: 12345,
-            detected_at: Utc::now(),
-        };
-        insert_view_row(&pool, detected_id, &detected_view).await;
+        harness
+            .detect_redemption(
+                detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
 
         let alpaca_called_id = "red-alpaca-called-1";
-        let alpaca_called_view = RedemptionView::AlpacaCalled {
-            issuer_request_id: IssuerRequestId::new(alpaca_called_id),
-            tokenization_request_id: TokenizationRequestId::new("tok-1"),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
-            quantity: Quantity::new(Decimal::from(50)),
-            tx_hash: b256!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            block_number: 54321,
-            detected_at: Utc::now(),
-            called_at: Utc::now(),
-        };
-        insert_view_row(&pool, alpaca_called_id, &alpaca_called_view).await;
+        harness
+            .detect_redemption(
+                alpaca_called_id,
+                "TSLA",
+                address!("0x9876543210fedcba9876543210fedcba98765432"),
+                50,
+                b256!("0x1111111111111111111111111111111111111111111111111111111111111111"),
+                54321,
+            )
+            .await;
+        harness.call_alpaca(alpaca_called_id, "tok-1").await;
 
         let completed_id = "red-completed-1";
-        let completed_view = RedemptionView::Completed {
-            issuer_request_id: IssuerRequestId::new(completed_id),
-            burn_tx_hash: b256!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
-            block_number: 99999,
-            completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, completed_id, &completed_view).await;
+        harness
+            .detect_redemption(
+                completed_id,
+                "NVDA",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                25,
+                b256!("0x2222222222222222222222222222222222222222222222222222222222222222"),
+                77777,
+            )
+            .await;
+        harness.call_alpaca(completed_id, "tok-2").await;
+        harness.confirm_alpaca_complete(completed_id).await;
+        harness
+            .record_burn_success(
+                completed_id,
+                b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
+                99999,
+            )
+            .await;
 
-        let result = find_detected(&pool).await.unwrap();
+        let result = find_detected(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0.0, detected_id);
@@ -754,105 +834,104 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_detected_returns_empty_when_none_exist() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let completed_id = "red-completed-only";
-        let completed_view = RedemptionView::Completed {
-            issuer_request_id: IssuerRequestId::new(completed_id),
-            burn_tx_hash: b256!(
-                "0x3333333333333333333333333333333333333333333333333333333333333333"
-            ),
-            block_number: 88888,
-            completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, completed_id, &completed_view).await;
+        harness
+            .detect_redemption(
+                completed_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
+        harness.call_alpaca(completed_id, "tok-1").await;
+        harness.confirm_alpaca_complete(completed_id).await;
+        harness
+            .record_burn_success(
+                completed_id,
+                b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
+                88888,
+            )
+            .await;
 
-        let result = find_detected(&pool).await.unwrap();
+        let result = find_detected(pool).await.unwrap();
 
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn test_find_detected_returns_multiple_detected_views() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=3 {
             let id = format!("red-detected-{i}");
-            let view = RedemptionView::Detected {
-                issuer_request_id: IssuerRequestId::new(&id),
-                underlying: UnderlyingSymbol::new("AAPL"),
-                token: TokenSymbol::new("tAAPL"),
-                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-                quantity: Quantity::new(Decimal::from(i * 10)),
-                tx_hash: b256!(
-                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                ),
-                block_number: 12345 + i,
-                detected_at: Utc::now(),
-            };
-            insert_view_row(&pool, &id, &view).await;
+            harness
+                .detect_redemption(
+                    &id,
+                    "AAPL",
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                    i * 10,
+                    b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                    12345 + i,
+                )
+                .await;
         }
 
-        let result = find_detected(&pool).await.unwrap();
+        let result = find_detected(pool).await.unwrap();
 
         assert_eq!(result.len(), 3);
     }
 
     #[tokio::test]
     async fn test_find_alpaca_called_returns_only_alpaca_called_views() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let detected_id = "red-detected-for-alpaca";
-        let detected_view = RedemptionView::Detected {
-            issuer_request_id: IssuerRequestId::new(detected_id),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            block_number: 12345,
-            detected_at: Utc::now(),
-        };
-        insert_view_row(&pool, detected_id, &detected_view).await;
+        harness
+            .detect_redemption(
+                detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
 
         let alpaca_called_id = "red-alpaca-called-query";
-        let alpaca_called_view = RedemptionView::AlpacaCalled {
-            issuer_request_id: IssuerRequestId::new(alpaca_called_id),
-            tokenization_request_id: TokenizationRequestId::new("tok-query"),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
-            quantity: Quantity::new(Decimal::from(50)),
-            tx_hash: b256!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            block_number: 54321,
-            detected_at: Utc::now(),
-            called_at: Utc::now(),
-        };
-        insert_view_row(&pool, alpaca_called_id, &alpaca_called_view).await;
+        harness
+            .detect_redemption(
+                alpaca_called_id,
+                "TSLA",
+                address!("0x9876543210fedcba9876543210fedcba98765432"),
+                50,
+                b256!("0x1111111111111111111111111111111111111111111111111111111111111111"),
+                54321,
+            )
+            .await;
+        harness.call_alpaca(alpaca_called_id, "tok-query").await;
 
         let burning_id = "red-burning-for-alpaca";
-        let burning_view = RedemptionView::Burning {
-            issuer_request_id: IssuerRequestId::new(burning_id),
-            tokenization_request_id: TokenizationRequestId::new("tok-burn"),
-            underlying: UnderlyingSymbol::new("NVDA"),
-            token: TokenSymbol::new("tNVDA"),
-            wallet: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            quantity: Quantity::new(Decimal::from(25)),
-            tx_hash: b256!(
-                "0x4444444444444444444444444444444444444444444444444444444444444444"
-            ),
-            block_number: 77777,
-            detected_at: Utc::now(),
-            called_at: Utc::now(),
-            alpaca_journal_completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, burning_id, &burning_view).await;
+        harness
+            .detect_redemption(
+                burning_id,
+                "NVDA",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                25,
+                b256!("0x4444444444444444444444444444444444444444444444444444444444444444"),
+                77777,
+            )
+            .await;
+        harness.call_alpaca(burning_id, "tok-burn").await;
+        harness.confirm_alpaca_complete(burning_id).await;
 
-        let result = find_alpaca_called(&pool).await.unwrap();
+        let result = find_alpaca_called(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0.0, alpaca_called_id);
@@ -861,96 +940,92 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_alpaca_called_returns_empty_when_none_exist() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let detected_id = "red-only-detected";
-        let detected_view = RedemptionView::Detected {
-            issuer_request_id: IssuerRequestId::new(detected_id),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            block_number: 12345,
-            detected_at: Utc::now(),
-        };
-        insert_view_row(&pool, detected_id, &detected_view).await;
+        harness
+            .detect_redemption(
+                detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
 
-        let result = find_alpaca_called(&pool).await.unwrap();
+        let result = find_alpaca_called(pool).await.unwrap();
 
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn test_find_burning_returns_only_burning_views() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let detected_id = "red-detected-for-burn";
-        let detected_view = RedemptionView::Detected {
-            issuer_request_id: IssuerRequestId::new(detected_id),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            block_number: 12345,
-            detected_at: Utc::now(),
-        };
-        insert_view_row(&pool, detected_id, &detected_view).await;
+        harness
+            .detect_redemption(
+                detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
 
         let alpaca_called_id = "red-alpaca-for-burn";
-        let alpaca_called_view = RedemptionView::AlpacaCalled {
-            issuer_request_id: IssuerRequestId::new(alpaca_called_id),
-            tokenization_request_id: TokenizationRequestId::new("tok-2"),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
-            quantity: Quantity::new(Decimal::from(50)),
-            tx_hash: b256!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            block_number: 54321,
-            detected_at: Utc::now(),
-            called_at: Utc::now(),
-        };
-        insert_view_row(&pool, alpaca_called_id, &alpaca_called_view).await;
+        harness
+            .detect_redemption(
+                alpaca_called_id,
+                "TSLA",
+                address!("0x9876543210fedcba9876543210fedcba98765432"),
+                50,
+                b256!("0x1111111111111111111111111111111111111111111111111111111111111111"),
+                54321,
+            )
+            .await;
+        harness.call_alpaca(alpaca_called_id, "tok-2").await;
 
         let burning_id = "red-burning-query";
-        let burning_view = RedemptionView::Burning {
-            issuer_request_id: IssuerRequestId::new(burning_id),
-            tokenization_request_id: TokenizationRequestId::new(
-                "tok-burn-query",
-            ),
-            underlying: UnderlyingSymbol::new("NVDA"),
-            token: TokenSymbol::new("tNVDA"),
-            wallet: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            quantity: Quantity::new(Decimal::from(25)),
-            tx_hash: b256!(
-                "0x4444444444444444444444444444444444444444444444444444444444444444"
-            ),
-            block_number: 77777,
-            detected_at: Utc::now(),
-            called_at: Utc::now(),
-            alpaca_journal_completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, burning_id, &burning_view).await;
+        harness
+            .detect_redemption(
+                burning_id,
+                "NVDA",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                25,
+                b256!("0x4444444444444444444444444444444444444444444444444444444444444444"),
+                77777,
+            )
+            .await;
+        harness.call_alpaca(burning_id, "tok-burn-query").await;
+        harness.confirm_alpaca_complete(burning_id).await;
 
         let completed_id = "red-completed-for-burn";
-        let completed_view = RedemptionView::Completed {
-            issuer_request_id: IssuerRequestId::new(completed_id),
-            burn_tx_hash: b256!(
-                "0x5555555555555555555555555555555555555555555555555555555555555555"
-            ),
-            block_number: 88888,
-            completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, completed_id, &completed_view).await;
+        harness
+            .detect_redemption(
+                completed_id,
+                "META",
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                75,
+                b256!("0x5555555555555555555555555555555555555555555555555555555555555555"),
+                66666,
+            )
+            .await;
+        harness.call_alpaca(completed_id, "tok-complete").await;
+        harness.confirm_alpaca_complete(completed_id).await;
+        harness
+            .record_burn_success(
+                completed_id,
+                b256!("0x6666666666666666666666666666666666666666666666666666666666666666"),
+                88888,
+            )
+            .await;
 
-        let result = find_burning(&pool).await.unwrap();
+        let result = find_burning(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0.0, burning_id);
@@ -959,51 +1034,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_burning_returns_empty_when_none_exist() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let completed_id = "red-completed-only-burn";
-        let completed_view = RedemptionView::Completed {
-            issuer_request_id: IssuerRequestId::new(completed_id),
-            burn_tx_hash: b256!(
-                "0x6666666666666666666666666666666666666666666666666666666666666666"
-            ),
-            block_number: 99999,
-            completed_at: Utc::now(),
-        };
-        insert_view_row(&pool, completed_id, &completed_view).await;
+        harness
+            .detect_redemption(
+                completed_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
+        harness.call_alpaca(completed_id, "tok-1").await;
+        harness.confirm_alpaca_complete(completed_id).await;
+        harness
+            .record_burn_success(
+                completed_id,
+                b256!("0x6666666666666666666666666666666666666666666666666666666666666666"),
+                99999,
+            )
+            .await;
 
-        let result = find_burning(&pool).await.unwrap();
+        let result = find_burning(pool).await.unwrap();
 
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn test_find_burning_returns_multiple_burning_views() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=2 {
             let id = format!("red-burning-{i}");
-            let view = RedemptionView::Burning {
-                issuer_request_id: IssuerRequestId::new(&id),
-                tokenization_request_id: TokenizationRequestId::new(format!(
-                    "tok-{i}"
-                )),
-                underlying: UnderlyingSymbol::new("AAPL"),
-                token: TokenSymbol::new("tAAPL"),
-                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-                quantity: Quantity::new(Decimal::from(i * 10)),
-                tx_hash: b256!(
-                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                ),
-                block_number: 12345 + i,
-                detected_at: Utc::now(),
-                called_at: Utc::now(),
-                alpaca_journal_completed_at: Utc::now(),
-            };
-            insert_view_row(&pool, &id, &view).await;
+            harness
+                .detect_redemption(
+                    &id,
+                    "AAPL",
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                    i * 10,
+                    b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                    12345 + i,
+                )
+                .await;
+            harness.call_alpaca(&id, &format!("tok-{i}")).await;
+            harness.confirm_alpaca_complete(&id).await;
         }
 
-        let result = find_burning(&pool).await.unwrap();
+        let result = find_burning(pool).await.unwrap();
 
         assert_eq!(result.len(), 2);
     }

@@ -80,28 +80,96 @@ pub(crate) async fn list_enabled_assets(
     Ok(views)
 }
 
+/// Finds the vault address for a given underlying symbol.
+///
+/// Returns `Ok(Some(vault))` if an enabled asset with that underlying exists,
+/// `Ok(None)` if not found or disabled, or an error on database failure.
+pub(crate) async fn find_vault_by_underlying(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<Option<Address>, TokenizedAssetViewError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT payload as "payload: String"
+        FROM tokenized_asset_view
+        WHERE view_id = ?
+          AND json_extract(payload, '$.Asset.enabled') = 1
+        "#,
+        underlying.0
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let view: TokenizedAssetView = serde_json::from_str(&row.payload)?;
+
+    match view {
+        TokenizedAssetView::Asset { vault, .. } => Ok(Some(vault)),
+        TokenizedAssetView::Unavailable => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::GenericQuery;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
-    async fn setup_test_db() -> Pool<Sqlite> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
+    struct TestHarness {
+        pool: Pool<Sqlite>,
+        cqrs: SqliteCqrs<TokenizedAsset>,
+    }
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
+    impl TestHarness {
+        async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .expect("Failed to create in-memory database");
 
-        pool
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            let view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let query = GenericQuery::new(view_repo);
+            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+
+            Self { pool, cqrs }
+        }
+
+        async fn add_asset(&self, underlying: &str, vault: Address) {
+            self.cqrs
+                .execute(
+                    underlying,
+                    TokenizedAssetCommand::Add {
+                        underlying: UnderlyingSymbol::new(underlying),
+                        token: TokenSymbol::new(format!("t{underlying}")),
+                        network: Network::new("base"),
+                        vault,
+                    },
+                )
+                .await
+                .expect("Failed to add asset");
+        }
     }
 
     #[test]
@@ -154,79 +222,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_enabled_assets_returns_only_enabled() {
-        let pool = setup_test_db().await;
+    async fn test_list_enabled_assets_returns_added_assets() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
-        let enabled_underlying = UnderlyingSymbol::new("AAPL");
-        let enabled_view = TokenizedAssetView::Asset {
-            underlying: enabled_underlying.clone(),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            enabled: true,
-            added_at: Utc::now(),
-        };
-
-        let disabled_underlying = UnderlyingSymbol::new("TSLA");
-        let disabled_view = TokenizedAssetView::Asset {
-            underlying: disabled_underlying.clone(),
-            token: TokenSymbol::new("tTSLA"),
-            network: Network::new("base"),
-            vault: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            enabled: false,
-            added_at: Utc::now(),
-        };
-
-        let enabled_payload = serde_json::to_string(&enabled_view)
-            .expect("Failed to serialize view");
-        let disabled_payload = serde_json::to_string(&disabled_view)
-            .expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            enabled_underlying.0,
-            enabled_payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert enabled view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            disabled_underlying.0,
-            disabled_payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert disabled view");
+        harness
+            .add_asset(
+                "AAPL",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await;
+        harness
+            .add_asset(
+                "TSLA",
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await;
 
         let result =
-            list_enabled_assets(&pool).await.expect("Query should succeed");
+            list_enabled_assets(pool).await.expect("Query should succeed");
 
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
 
-        let TokenizedAssetView::Asset { underlying, enabled, .. } = &result[0]
-        else {
-            panic!("Expected Asset, got Unavailable")
-        };
+        let underlyings: Vec<_> = result
+            .iter()
+            .filter_map(|v| match v {
+                TokenizedAssetView::Asset { underlying, .. } => {
+                    Some(underlying.0.as_str())
+                }
+                TokenizedAssetView::Unavailable => None,
+            })
+            .collect();
 
-        assert_eq!(underlying, &enabled_underlying);
-        assert!(enabled);
+        assert!(underlyings.contains(&"AAPL"));
+        assert!(underlyings.contains(&"TSLA"));
     }
 
     #[tokio::test]
     async fn test_list_enabled_assets_returns_empty_when_none() {
-        let pool = setup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
         let result =
-            list_enabled_assets(&pool).await.expect("Query should succeed");
+            list_enabled_assets(pool).await.expect("Query should succeed");
 
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_vault_by_underlying_returns_vault_when_exists() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        let expected_vault =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        harness.add_asset("AAPL", expected_vault).await;
+
+        let result =
+            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await
+                .expect("Query should succeed");
+
+        assert_eq!(result, Some(expected_vault));
+    }
+
+    #[tokio::test]
+    async fn test_find_vault_by_underlying_returns_none_when_not_exists() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        let result =
+            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await
+                .expect("Query should succeed");
+
+        assert_eq!(result, None);
     }
 }

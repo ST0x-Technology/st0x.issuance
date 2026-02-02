@@ -260,21 +260,20 @@ async fn process_journal_completion(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use chrono::Utc;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
         AlpacaAccountLookupError, confirm_journal, lookup_alpaca_account,
     };
-    use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
+    use crate::account::{
+        AccountCommand, AlpacaAccountNumber, ClientId, Email,
+    };
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        create_test_callback_manager, create_test_event_store,
-        create_test_mint_manager, setup_test_environment,
-        setup_with_account_and_asset, test_config,
+        TestAccountAndAsset, TestHarness, create_test_callback_manager,
+        create_test_event_store, create_test_mint_manager, test_config,
     };
     use crate::mint::{
         IssuerRequestId, MintCommand, MintView, Quantity,
@@ -283,12 +282,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
 
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-ok-test");
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -358,12 +356,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_rejected_returns_ok() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
         let tokenization_request_id =
@@ -435,12 +431,10 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_completed_executes_command_and_persists_events()
      {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-complete-123");
         let tokenization_request_id =
@@ -528,12 +522,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_completed_updates_view() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-view-123");
         let tokenization_request_id =
@@ -624,12 +616,10 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_rejected_executes_command_and_persists_events()
      {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-123");
         let tokenization_request_id =
@@ -717,12 +707,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_rejected_updates_view() {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
         let tokenization_request_id =
@@ -815,12 +803,10 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_with_mismatched_tokenization_request_id_returns_bad_request()
      {
-        let (pool, account_cqrs, tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
-
-        let (client_id, underlying, token, network) =
-            setup_with_account_and_asset(&account_cqrs, &tokenized_asset_cqrs)
-                .await;
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, network } =
+            harness.setup_account_and_asset().await;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
         let correct_tokenization_request_id =
@@ -894,8 +880,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(
@@ -946,8 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let (pool, _account_cqrs, _tokenized_asset_cqrs, mint_cqrs) =
-            setup_test_environment().await;
+        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(
@@ -991,56 +975,34 @@ mod tests {
         assert_eq!(response.status(), Status::Unauthorized);
     }
 
-    async fn setup_lookup_test_db() -> sqlx::SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        pool
-    }
-
-    async fn insert_account_view(
-        pool: &sqlx::SqlitePool,
-        client_id: ClientId,
-        view: &AccountView,
-    ) {
-        let payload = serde_json::to_string(view).unwrap();
-
-        sqlx::query!(
-            r"INSERT INTO account_view (view_id, version, payload) VALUES (?, 1, ?)",
-            client_id,
-            payload
-        )
-        .execute(pool)
-        .await
-        .expect("Failed to insert account view");
-    }
-
     #[tokio::test]
     async fn test_lookup_alpaca_account_returns_account_when_linked() {
-        let pool = setup_lookup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, account_cqrs, .. } = &harness;
+
         let client_id = ClientId::new();
         let expected_account = AlpacaAccountNumber("ALPACA-12345".to_string());
+        let email = Email::new("test@example.com".to_string()).unwrap();
 
-        let view = AccountView::LinkedToAlpaca {
-            client_id,
-            email: Email::new("test@example.com".to_string()).unwrap(),
-            alpaca_account: expected_account.clone(),
-            whitelisted_wallets: vec![],
-            registered_at: Utc::now(),
-            linked_at: Utc::now(),
-        };
+        account_cqrs
+            .execute(
+                &client_id.to_string(),
+                AccountCommand::Register { client_id, email },
+            )
+            .await
+            .expect("Failed to register account");
 
-        insert_account_view(&pool, client_id, &view).await;
+        account_cqrs
+            .execute(
+                &client_id.to_string(),
+                AccountCommand::LinkToAlpaca {
+                    alpaca_account: expected_account.clone(),
+                },
+            )
+            .await
+            .expect("Failed to link to Alpaca");
 
-        let result = lookup_alpaca_account(&pool, &client_id).await;
+        let result = lookup_alpaca_account(pool, &client_id).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected_account);
@@ -1049,18 +1011,21 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_alpaca_account_returns_not_linked_when_only_registered()
      {
-        let pool = setup_lookup_test_db().await;
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, account_cqrs, .. } = &harness;
+
         let client_id = ClientId::new();
+        let email = Email::new("test@example.com".to_string()).unwrap();
 
-        let view = AccountView::Registered {
-            client_id,
-            email: Email::new("test@example.com".to_string()).unwrap(),
-            registered_at: Utc::now(),
-        };
+        account_cqrs
+            .execute(
+                &client_id.to_string(),
+                AccountCommand::Register { client_id, email },
+            )
+            .await
+            .expect("Failed to register account");
 
-        insert_account_view(&pool, client_id, &view).await;
-
-        let result = lookup_alpaca_account(&pool, &client_id).await;
+        let result = lookup_alpaca_account(pool, &client_id).await;
 
         assert!(
             matches!(result, Err(AlpacaAccountLookupError::NotLinked { .. })),
@@ -1070,10 +1035,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_alpaca_account_returns_not_found_when_no_account() {
-        let pool = setup_lookup_test_db().await;
+        let harness = TestHarness::new().await;
         let client_id = ClientId::new();
 
-        let result = lookup_alpaca_account(&pool, &client_id).await;
+        let result = lookup_alpaca_account(&harness.pool, &client_id).await;
 
         assert!(
             matches!(result, Err(AlpacaAccountLookupError::NotFound { .. })),
