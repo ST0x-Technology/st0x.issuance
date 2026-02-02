@@ -13,7 +13,7 @@ use tracing::debug;
 use super::config::{ChainAssetIds, FireblocksEnv};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum FireblocksError {
+pub enum FireblocksError {
     #[error("failed to read Fireblocks secret key from {path}")]
     ReadSecret {
         path: std::path::PathBuf,

@@ -179,7 +179,7 @@ impl HyperDxEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to resolve signer")]

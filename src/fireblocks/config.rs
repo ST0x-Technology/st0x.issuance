@@ -5,7 +5,7 @@ use clap::Parser;
 
 /// Environment configuration for Fireblocks signing.
 #[derive(Parser, Debug, Clone)]
-pub(crate) struct FireblocksEnv {
+pub struct FireblocksEnv {
     /// Fireblocks API key
     #[clap(long = "fireblocks-api-key", env = "FIREBLOCKS_API_KEY")]
     pub(crate) api_key: String,
@@ -38,7 +38,7 @@ pub(crate) struct FireblocksEnv {
 
 /// Parsed chain ID to Fireblocks asset ID mapping.
 #[derive(Debug, Clone)]
-pub(crate) struct ChainAssetIds {
+pub struct ChainAssetIds {
     map: HashMap<u64, String>,
     /// The first asset ID in the mapping, used as default for address lookup.
     default_asset_id: String,

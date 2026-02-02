@@ -15,7 +15,6 @@ pub(crate) use signer::{FireblocksError, FireblocksSigner};
 /// Consumers don't need to know which backend produced the wallet.
 pub(crate) struct ResolvedSigner {
     pub(crate) wallet: EthereumWallet,
-    pub(crate) address: Address,
 }
 
 /// Determines which signing backend to use at runtime.
@@ -58,7 +57,7 @@ pub enum SignerConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SignerConfigError {
+pub enum SignerConfigError {
     #[error("exactly one of FIREBLOCKS_API_KEY or EVM_PRIVATE_KEY must be set")]
     NeitherConfigured,
     #[error(
@@ -76,7 +75,7 @@ pub(crate) enum SignerConfigError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SignerResolveError {
+pub enum SignerResolveError {
     #[error(transparent)]
     Fireblocks(#[from] FireblocksError),
     #[error("invalid EVM private key")]
@@ -120,16 +119,14 @@ impl SignerConfig {
         match self {
             Self::Fireblocks(env) => {
                 let signer = FireblocksSigner::new(env).await?;
-                let address = signer.address();
                 let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet, address })
+                Ok(ResolvedSigner { wallet })
             }
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)
                     .map_err(SignerResolveError::InvalidPrivateKey)?;
-                let address = signer.address();
                 let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet, address })
+                Ok(ResolvedSigner { wallet })
             }
         }
     }
@@ -220,25 +217,13 @@ mod tests {
         key.0[31] = 1;
         let config = SignerConfig::Local(key);
 
-        let resolved = config.resolve().await.unwrap();
+        let address = config.address().await.unwrap();
 
         assert_eq!(
-            resolved.address,
+            address,
             "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
                 .parse::<Address>()
                 .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn local_signer_address_matches_resolve() {
-        let mut key = B256::ZERO;
-        key.0[31] = 1;
-        let config = SignerConfig::Local(key);
-
-        let address = config.address().await.unwrap();
-        let resolved = config.resolve().await.unwrap();
-
-        assert_eq!(address, resolved.address);
     }
 }
