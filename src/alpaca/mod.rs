@@ -170,8 +170,25 @@ pub struct TokenizationRequest {
     pub quantity: Quantity,
     #[serde(rename = "wallet_address")]
     pub wallet: Address,
-    #[serde(rename = "tx_hash")]
-    pub tx_hash: B256,
+    #[serde(
+        rename = "tx_hash",
+        deserialize_with = "deserialize_optional_b256"
+    )]
+    pub tx_hash: Option<B256>,
+}
+
+fn deserialize_optional_b256<'de, D>(
+    deserializer: D,
+) -> Result<Option<B256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: &str = serde::Deserialize::deserialize(deserializer)?;
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        s.parse().map(Some).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Errors that can occur during Alpaca API operations.

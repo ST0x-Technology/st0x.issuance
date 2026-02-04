@@ -282,11 +282,11 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         }
 
-        if request.tx_hash != metadata.detected_tx_hash {
+        if request.tx_hash != Some(metadata.detected_tx_hash) {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
-                    "Transaction hash mismatch: expected {}, got {}",
+                    "Transaction hash mismatch: expected {}, got {:?}",
                     metadata.detected_tx_hash, request.tx_hash
                 ),
             });
@@ -564,9 +564,9 @@ mod tests {
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(Decimal::from(100)),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-                tx_hash: b256!(
+                tx_hash: Some(b256!(
                     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                ),
+                )),
             }
         }
     }
@@ -951,9 +951,9 @@ mod tests {
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
-                    tx_hash: b256!(
+                    tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
+                    )),
                 })
             }
         }
