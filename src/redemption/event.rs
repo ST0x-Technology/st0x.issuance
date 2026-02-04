@@ -21,6 +21,10 @@ pub(crate) enum RedemptionEvent {
     AlpacaCalled {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        /// Quantity sent to Alpaca (truncated to 9 decimals)
+        alpaca_quantity: Quantity,
+        /// Dust quantity to be returned to user (original - alpaca_quantity)
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     },
     AlpacaCallFailed {
@@ -85,7 +89,7 @@ impl DomainEvent for RedemptionEvent {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{b256, uint};
+    use alloy::primitives::{U256, address, b256, uint};
     use chrono::Utc;
 
     use super::*;
@@ -112,6 +116,10 @@ mod tests {
             ),
             receipt_id: uint!(42_U256),
             shares_burned: uint!(100_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 1000,
             burned_at: Utc::now(),
@@ -130,6 +138,10 @@ mod tests {
             ),
             receipt_id: uint!(7_U256),
             shares_burned: uint!(250_500000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 75000,
             block_number: 2000,
             burned_at: Utc::now(),

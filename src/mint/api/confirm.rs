@@ -283,8 +283,9 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
 
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
@@ -357,8 +358,9 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_rejected_returns_ok() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
@@ -432,8 +434,9 @@ mod tests {
     async fn test_confirm_journal_completed_executes_command_and_persists_events()
      {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-complete-123");
@@ -523,8 +526,9 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_completed_updates_view() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-view-123");
@@ -617,8 +621,9 @@ mod tests {
     async fn test_confirm_journal_rejected_executes_command_and_persists_events()
      {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-123");
@@ -708,8 +713,9 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_rejected_updates_view() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
@@ -804,8 +810,9 @@ mod tests {
     async fn test_confirm_journal_with_mismatched_tokenization_request_id_returns_bad_request()
      {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");

@@ -287,7 +287,7 @@ pub(crate) async fn get_receipt(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::persist::{GenericQuery, ViewContext, ViewRepository};
     use cqrs_es::{CqrsFramework, EventEnvelope, EventStore, Query};
@@ -306,6 +306,8 @@ mod tests {
     use crate::redemption::{
         Redemption, RedemptionCommand, RedemptionEvent, RedemptionView,
     };
+    use crate::vault::mock::MockVaultService;
+    use crate::vault::{OperationType, ReceiptInformation, VaultService};
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -899,6 +901,10 @@ mod tests {
             ),
             receipt_id: uint!(42_U256),
             shares_burned: uint!(30_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 2000,
             burned_at,
@@ -939,6 +945,10 @@ mod tests {
             ),
             receipt_id: uint!(7_U256),
             shares_burned: uint!(50_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 3000,
             burned_at,
@@ -990,6 +1000,10 @@ mod tests {
             ),
             receipt_id: uint!(10_U256),
             shares_burned: uint!(50_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 4000,
             burned_at,
@@ -1029,6 +1043,10 @@ mod tests {
             ),
             receipt_id: uint!(99_U256),
             shares_burned: uint!(50_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 5000,
             burned_at: Utc::now(),
@@ -1064,6 +1082,10 @@ mod tests {
             ),
             receipt_id: uint!(1_U256),
             shares_burned: uint!(50_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 6000,
             burned_at: Utc::now(),
@@ -1096,6 +1118,10 @@ mod tests {
             ),
             receipt_id: uint!(1_U256),
             shares_burned: uint!(50_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            dust_recipient: address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
             gas_used: 50000,
             block_number: 7000,
             burned_at: Utc::now(),
@@ -1144,6 +1170,8 @@ mod tests {
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id: IssuerRequestId::new("red-123"),
                 tokenization_request_id: TokenizationRequestId::new("alp-456"),
+                alpaca_quantity: Quantity::new(Decimal::from(10)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at: Utc::now(),
             },
             RedemptionEvent::AlpacaCallFailed {
@@ -1451,13 +1479,15 @@ mod tests {
                 receipt_inventory_redemption_repo,
             );
 
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
         let redemption_cqrs = Arc::new(sqlite_cqrs(
             pool.clone(),
             vec![
                 Box::new(redemption_query),
                 Box::new(receipt_inventory_redemption_query),
             ],
-            (),
+            vault_service,
         ));
 
         let issuer_request_id = IssuerRequestId::new("iss-mint-123");
@@ -1600,6 +1630,8 @@ mod tests {
                     tokenization_request_id: TokenizationRequestId::new(
                         "alp-redeem-789",
                     ),
+                    alpaca_quantity: Quantity::new(Decimal::from(30)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
                 },
             )
             .await
@@ -1615,22 +1647,37 @@ mod tests {
             .await
             .expect("ConfirmAlpacaComplete should succeed");
 
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new(
+                "alp-redeem-789",
+            ),
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity::new(Decimal::from(30)),
+            operation_type: OperationType::Redeem,
+            timestamp: Utc::now(),
+            notes: None,
+        };
+
         redemption_cqrs
             .execute(
                 redemption_aggregate_id,
-                RedemptionCommand::RecordBurnSuccess {
+                RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
-                    tx_hash: b256!(
-                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),
+                    burn_shares: shares_to_burn,
+                    dust_shares: U256::ZERO,
                     receipt_id,
-                    shares_burned: shares_to_burn,
-                    gas_used: 45000,
-                    block_number: 2000,
+                    owner: address!(
+                        "0x1111111111111111111111111111111111111111"
+                    ),
+                    receipt_info,
                 },
             )
             .await
-            .expect("RecordBurnSuccess should succeed");
+            .expect("BurnTokens should succeed");
     }
 
     async fn verify_active_receipt(

@@ -460,7 +460,13 @@ mod tests {
 
     fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
         let store = Arc::new(MemStore::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+        let vault_service: Arc<dyn crate::vault::VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let cqrs = Arc::new(CqrsFramework::new(
+            (*store).clone(),
+            vec![],
+            vault_service,
+        ));
         (cqrs, store)
     }
 

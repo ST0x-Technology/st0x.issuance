@@ -12,11 +12,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::Quantity;
 use crate::mint::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::{BurnParams, ReceiptInformation, VaultService};
+
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
 pub(crate) use view::{
@@ -45,11 +48,19 @@ pub(crate) enum Redemption {
     AlpacaCalled {
         metadata: RedemptionMetadata,
         tokenization_request_id: TokenizationRequestId,
+        /// Quantity sent to Alpaca (truncated to 9 decimals)
+        alpaca_quantity: Quantity,
+        /// Dust quantity to be returned to user
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     },
     Burning {
         metadata: RedemptionMetadata,
         tokenization_request_id: TokenizationRequestId,
+        /// Quantity to burn (what Alpaca processed, 9 decimals)
+        alpaca_quantity: Quantity,
+        /// Dust quantity to return to user
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
     },
@@ -71,12 +82,35 @@ impl Default for Redemption {
     }
 }
 
+/// Input parameters for the BurnTokens command handler.
+///
+/// Groups burn-related parameters to reduce argument count. The `user` field
+/// is derived from aggregate state, not passed in the command.
+struct BurnInput {
+    vault: Address,
+    burn_shares: U256,
+    dust_shares: U256,
+    receipt_id: U256,
+    owner: Address,
+    receipt_info: ReceiptInformation,
+}
+
 impl Redemption {
     pub(crate) const fn metadata(&self) -> Option<&RedemptionMetadata> {
         match self {
             Self::Detected { metadata }
             | Self::AlpacaCalled { metadata, .. }
             | Self::Burning { metadata, .. } => Some(metadata),
+            _ => None,
+        }
+    }
+
+    /// Returns the quantity sent to Alpaca (truncated to 9 decimals).
+    /// Only available in AlpacaCalled and Burning states.
+    pub(crate) const fn alpaca_quantity(&self) -> Option<&Quantity> {
+        match self {
+            Self::AlpacaCalled { alpaca_quantity, .. }
+            | Self::Burning { alpaca_quantity, .. } => Some(alpaca_quantity),
             _ => None,
         }
     }
@@ -96,6 +130,8 @@ impl Redemption {
         &self,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(self, Self::Detected { .. }) {
             return Err(RedemptionError::InvalidState {
@@ -107,6 +143,8 @@ impl Redemption {
         Ok(vec![RedemptionEvent::AlpacaCalled {
             issuer_request_id,
             tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
             called_at: Utc::now(),
         }])
     }
@@ -154,29 +192,42 @@ impl Redemption {
         }])
     }
 
-    fn handle_record_burn_success(
+    async fn handle_burn_tokens(
         &self,
+        services: &Arc<dyn VaultService>,
         issuer_request_id: IssuerRequestId,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_burned: U256,
-        gas_used: u64,
-        block_number: u64,
+        input: BurnInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if !matches!(self, Self::Burning { .. }) {
+        let Self::Burning { metadata, .. } = self else {
             return Err(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
                 found: self.state_name().to_string(),
             });
-        }
+        };
+
+        let user_wallet = metadata.wallet;
+
+        let burn = services
+            .burn_and_return_dust(BurnParams {
+                vault: input.vault,
+                burn_shares: input.burn_shares,
+                dust_shares: input.dust_shares,
+                receipt_id: input.receipt_id,
+                owner: input.owner,
+                user: user_wallet,
+                receipt_info: input.receipt_info,
+            })
+            .await?;
 
         Ok(vec![RedemptionEvent::TokensBurned {
             issuer_request_id,
-            tx_hash,
-            receipt_id,
-            shares_burned,
-            gas_used,
-            block_number,
+            tx_hash: burn.tx_hash,
+            receipt_id: burn.receipt_id,
+            shares_burned: burn.shares_burned,
+            dust_returned: burn.dust_returned,
+            dust_recipient: user_wallet,
+            gas_used: burn.gas_used,
+            block_number: burn.block_number,
             burned_at: Utc::now(),
         }])
     }
@@ -221,6 +272,8 @@ impl Redemption {
         &mut self,
         issuer_request_id: &IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     ) {
         let Self::Detected { metadata } = self else {
@@ -235,6 +288,8 @@ impl Redemption {
         *self = Self::AlpacaCalled {
             metadata: metadata.clone(),
             tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
             called_at,
         };
     }
@@ -244,8 +299,13 @@ impl Redemption {
         issuer_request_id: &IssuerRequestId,
         alpaca_journal_completed_at: DateTime<Utc>,
     ) {
-        let Self::AlpacaCalled { metadata, tokenization_request_id, called_at } =
-            self
+        let Self::AlpacaCalled {
+            metadata,
+            tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
+            called_at,
+        } = self
         else {
             warn!(
                 issuer_request_id = %issuer_request_id.0,
@@ -258,19 +318,40 @@ impl Redemption {
         *self = Self::Burning {
             metadata: metadata.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
+            alpaca_quantity: alpaca_quantity.clone(),
+            dust_quantity: dust_quantity.clone(),
             called_at: *called_at,
             alpaca_journal_completed_at,
         };
     }
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionError {
     #[error("Redemption already detected for request: {issuer_request_id}")]
     AlreadyDetected { issuer_request_id: String },
 
     #[error("Invalid state for operation: expected {expected}, found {found}")]
     InvalidState { expected: String, found: String },
+
+    #[error("Burn operation failed: {0}")]
+    BurnFailed(#[from] crate::vault::VaultError),
+}
+
+impl PartialEq for RedemptionError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::AlreadyDetected { issuer_request_id: a },
+                Self::AlreadyDetected { issuer_request_id: b },
+            ) => a == b,
+            (
+                Self::InvalidState { expected: e1, found: f1 },
+                Self::InvalidState { expected: e2, found: f2 },
+            ) => e1 == e2 && f1 == f2,
+            _ => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -278,7 +359,7 @@ impl Aggregate for Redemption {
     type Command = RedemptionCommand;
     type Event = RedemptionEvent;
     type Error = RedemptionError;
-    type Services = ();
+    type Services = Arc<dyn VaultService>;
 
     fn aggregate_type() -> String {
         "Redemption".to_string()
@@ -287,7 +368,7 @@ impl Aggregate for Redemption {
     async fn handle(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             RedemptionCommand::Detect {
@@ -319,9 +400,13 @@ impl Aggregate for Redemption {
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id,
                 tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
             } => self.handle_record_alpaca_call(
                 issuer_request_id,
                 tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
             ),
             RedemptionCommand::RecordAlpacaFailure {
                 issuer_request_id,
@@ -333,21 +418,29 @@ impl Aggregate for Redemption {
             RedemptionCommand::MarkFailed { issuer_request_id, reason } => {
                 self.handle_mark_failed(issuer_request_id, reason)
             }
-            RedemptionCommand::RecordBurnSuccess {
+            RedemptionCommand::BurnTokens {
                 issuer_request_id,
-                tx_hash,
+                vault,
+                burn_shares,
+                dust_shares,
                 receipt_id,
-                shares_burned,
-                gas_used,
-                block_number,
-            } => self.handle_record_burn_success(
-                issuer_request_id,
-                tx_hash,
-                receipt_id,
-                shares_burned,
-                gas_used,
-                block_number,
-            ),
+                owner,
+                receipt_info,
+            } => {
+                self.handle_burn_tokens(
+                    services,
+                    issuer_request_id,
+                    BurnInput {
+                        vault,
+                        burn_shares,
+                        dust_shares,
+                        receipt_id,
+                        owner,
+                        receipt_info,
+                    },
+                )
+                .await
+            }
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error,
@@ -383,11 +476,15 @@ impl Aggregate for Redemption {
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id,
                 tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
                 called_at,
             } => {
                 self.apply_alpaca_called(
                     &issuer_request_id,
                     tokenization_request_id,
+                    alpaca_quantity,
+                    dust_quantity,
                     called_at,
                 );
             }
@@ -439,10 +536,11 @@ impl Aggregate for Redemption {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
+    use alloy::primitives::{U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{Aggregate, test::TestFramework};
     use rust_decimal::Decimal;
+    use std::sync::Arc;
 
     use super::{
         Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
@@ -450,8 +548,14 @@ mod tests {
     };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::vault::mock::MockVaultService;
+    use crate::vault::{OperationType, ReceiptInformation, VaultService};
 
     type RedemptionTestFramework = TestFramework<Redemption>;
+
+    fn mock_services() -> Arc<dyn VaultService> {
+        Arc::new(MockVaultService::new_success())
+    }
 
     #[test]
     fn test_detect_redemption_creates_event() {
@@ -465,7 +569,7 @@ mod tests {
         );
         let block_number = 12345;
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
@@ -516,7 +620,7 @@ mod tests {
         );
         let block_number = 54321;
 
-        RedemptionTestFramework::with(())
+        RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
@@ -591,7 +695,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-call-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL"),
@@ -609,6 +713,8 @@ mod tests {
             .when(RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
             });
 
         let events = validator.inspect_result().unwrap();
@@ -618,6 +724,7 @@ mod tests {
             issuer_request_id: event_id,
             tokenization_request_id: event_tok_id,
             called_at,
+            ..
         } = &events[0]
         else {
             panic!("Expected AlpacaCalled event, got {:?}", &events[0]);
@@ -633,11 +740,13 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-call-fail-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-789");
 
-        RedemptionTestFramework::with(())
+        RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id,
                 tokenization_request_id,
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Detected".to_string(),
@@ -650,7 +759,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-fail-123");
         let error = "API timeout".to_string();
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("TSLA"),
@@ -691,7 +800,7 @@ mod tests {
     fn test_record_alpaca_failure_from_wrong_state_fails() {
         let issuer_request_id = IssuerRequestId::new("red-fail-wrong-123");
 
-        RedemptionTestFramework::with(())
+        RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::RecordAlpacaFailure {
                 issuer_request_id,
@@ -709,7 +818,7 @@ mod tests {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
@@ -728,6 +837,8 @@ mod tests {
                 RedemptionEvent::AlpacaCalled {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id,
+                    alpaca_quantity: Quantity::new(Decimal::from(100)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
                     called_at: Utc::now(),
                 },
             ])
@@ -757,7 +868,7 @@ mod tests {
     fn test_confirm_alpaca_complete_from_wrong_state_fails() {
         let issuer_request_id = IssuerRequestId::new("red-complete-wrong-123");
 
-        RedemptionTestFramework::with(())
+        RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::ConfirmAlpacaComplete {
                 issuer_request_id,
@@ -798,9 +909,14 @@ mod tests {
             detected_at,
         });
 
+        let alpaca_quantity = Quantity::new(Decimal::from(50));
+        let dust_quantity = Quantity::new(Decimal::ZERO);
+
         redemption.apply(RedemptionEvent::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
+            alpaca_quantity: alpaca_quantity.clone(),
+            dust_quantity: dust_quantity.clone(),
             called_at,
         });
 
@@ -823,6 +939,8 @@ mod tests {
                     detected_at,
                 },
                 tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
             }
@@ -835,7 +953,7 @@ mod tests {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-one-event-456");
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
@@ -854,6 +972,8 @@ mod tests {
                 RedemptionEvent::AlpacaCalled {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id,
+                    alpaca_quantity: Quantity::new(Decimal::from(100)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
                     called_at: Utc::now(),
                 },
             ])
@@ -880,25 +1000,32 @@ mod tests {
     }
 
     #[test]
-    fn test_record_burn_success_from_burning_state() {
+    fn test_burn_tokens_from_burning_state() {
         let issuer_request_id = IssuerRequestId::new("red-burn-success-123");
-        let tx_hash = b256!(
-            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
         let receipt_id = uint!(42_U256);
-        let shares_burned = uint!(100_000000000000000000_U256);
-        let gas_used = 50000;
-        let block_number = 20000;
+        let burn_shares = uint!(100_000000000000000000_U256);
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let owner = address!("0x1111111111111111111111111111111111111111");
+        let user_wallet =
+            address!("0x9876543210fedcba9876543210fedcba98765432");
 
-        let validator = RedemptionTestFramework::with(())
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("alp-burn-456"),
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("TSLA"),
+            quantity: Quantity::new(Decimal::from(100)),
+            operation_type: OperationType::Redeem,
+            timestamp: Utc::now(),
+            notes: None,
+        };
+
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("TSLA"),
                     token: TokenSymbol::new("tTSLA"),
-                    wallet: address!(
-                        "0x9876543210fedcba9876543210fedcba98765432"
-                    ),
+                    wallet: user_wallet,
                     quantity: Quantity::new(Decimal::from(100)),
                     tx_hash: b256!(
                         "0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -908,7 +1035,9 @@ mod tests {
                 },
                 RedemptionEvent::AlpacaCalled {
                     issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: crate::mint::TokenizationRequestId::new("alp-burn-456"),
+                    tokenization_request_id: TokenizationRequestId::new("alp-burn-456"),
+                    alpaca_quantity: Quantity::new(Decimal::from(100)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
                     called_at: Utc::now(),
                 },
                 RedemptionEvent::AlpacaJournalCompleted {
@@ -916,13 +1045,14 @@ mod tests {
                     alpaca_journal_completed_at: Utc::now(),
                 },
             ])
-            .when(RedemptionCommand::RecordBurnSuccess {
+            .when(RedemptionCommand::BurnTokens {
                 issuer_request_id: issuer_request_id.clone(),
-                tx_hash,
+                vault,
+                burn_shares,
+                dust_shares: U256::ZERO,
                 receipt_id,
-                shares_burned,
-                gas_used,
-                block_number,
+                owner,
+                receipt_info,
             });
 
         let events = validator.inspect_result().unwrap();
@@ -930,31 +1060,38 @@ mod tests {
 
         let RedemptionEvent::TokensBurned {
             issuer_request_id: event_id,
-            tx_hash: event_tx_hash,
             receipt_id: event_receipt_id,
             shares_burned: event_shares_burned,
-            gas_used: event_gas_used,
-            block_number: event_block_number,
+            dust_recipient: event_dust_recipient,
             burned_at,
+            ..
         } = &events[0]
         else {
             panic!("Expected TokensBurned event, got {:?}", &events[0]);
         };
 
         assert_eq!(event_id, &issuer_request_id);
-        assert_eq!(event_tx_hash, &tx_hash);
         assert_eq!(event_receipt_id, &receipt_id);
-        assert_eq!(event_shares_burned, &shares_burned);
-        assert_eq!(event_gas_used, &gas_used);
-        assert_eq!(event_block_number, &block_number);
+        assert_eq!(event_shares_burned, &burn_shares);
+        assert_eq!(event_dust_recipient, &user_wallet);
         assert!(burned_at.timestamp() > 0);
     }
 
     #[test]
-    fn test_record_burn_success_from_wrong_state_fails() {
+    fn test_burn_tokens_from_wrong_state_fails() {
         let issuer_request_id = IssuerRequestId::new("red-burn-wrong-123");
 
-        RedemptionTestFramework::with(())
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("alp-123"),
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("NVDA"),
+            quantity: Quantity::new(Decimal::from(25)),
+            operation_type: OperationType::Redeem,
+            timestamp: Utc::now(),
+            notes: None,
+        };
+
+        RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("NVDA"),
@@ -969,15 +1106,14 @@ mod tests {
                 block_number: 15000,
                 detected_at: Utc::now(),
             }])
-            .when(RedemptionCommand::RecordBurnSuccess {
+            .when(RedemptionCommand::BurnTokens {
                 issuer_request_id,
-                tx_hash: b256!(
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                ),
+                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                burn_shares: uint!(25_000000000000000000_U256),
+                dust_shares: U256::ZERO,
                 receipt_id: uint!(1_U256),
-                shares_burned: uint!(25_000000000000000000_U256),
-                gas_used: 40000,
-                block_number: 16000,
+                owner: address!("0x1111111111111111111111111111111111111111"),
+                receipt_info,
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
@@ -990,7 +1126,7 @@ mod tests {
         let issuer_request_id = IssuerRequestId::new("red-burn-fail-123");
         let error = "Insufficient gas".to_string();
 
-        let validator = RedemptionTestFramework::with(())
+        let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
@@ -1009,6 +1145,8 @@ mod tests {
                 RedemptionEvent::AlpacaCalled {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: crate::mint::TokenizationRequestId::new("alp-fail-789"),
+                    alpaca_quantity: Quantity::new(Decimal::from(50)),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
                     called_at: Utc::now(),
                 },
                 RedemptionEvent::AlpacaJournalCompleted {
@@ -1042,7 +1180,7 @@ mod tests {
     fn test_record_burn_failure_from_wrong_state_fails() {
         let issuer_request_id = IssuerRequestId::new("red-fail-wrong-123");
 
-        RedemptionTestFramework::with(())
+        RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
             .when(RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
@@ -1093,6 +1231,8 @@ mod tests {
         redemption.apply(RedemptionEvent::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
+            alpaca_quantity: Quantity::new(Decimal::from(75)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
             called_at,
         });
 
@@ -1106,6 +1246,8 @@ mod tests {
             tx_hash: burn_tx_hash,
             receipt_id,
             shares_burned,
+            dust_returned: U256::ZERO,
+            dust_recipient: wallet,
             gas_used: 60000,
             block_number: 51000,
             burned_at,
@@ -1156,6 +1298,8 @@ mod tests {
         redemption.apply(RedemptionEvent::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
+            alpaca_quantity: Quantity::new(Decimal::from(150)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
             called_at,
         });
 

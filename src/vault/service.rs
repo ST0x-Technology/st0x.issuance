@@ -2,9 +2,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 
-use super::{
-    BurnResult, MintResult, ReceiptInformation, VaultError, VaultService,
-};
+use super::{MintResult, ReceiptInformation, VaultError, VaultService};
 use crate::bindings::OffchainAssetReceiptVault;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
