@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-    RedeemResponse, RequestsListResponse,
+    RedeemResponse, TokenizationRequest,
 };
 use crate::mint::TokenizationRequestId;
 
@@ -267,7 +267,7 @@ impl AlpacaService for RealAlpacaService {
             match status {
                 reqwest::StatusCode::OK => {
                     let body = response.text().await?;
-                    let list_response: RequestsListResponse =
+                    let requests: Vec<TokenizationRequest> =
                         serde_json::from_str(&body).map_err(|e| {
                             tracing::error!(
                                 %body,
@@ -277,8 +277,7 @@ impl AlpacaService for RealAlpacaService {
                             AlpacaError::Parse { body: body.clone(), source: e }
                         })?;
 
-                    let request = list_response
-                        .requests
+                    let request = requests
                         .into_iter()
                         .find(|req| {
                             &req.id == tokenization_request_id
@@ -908,25 +907,23 @@ mod tests {
                 .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
                 .header("APCA-API-KEY-ID", "test-key")
                 .header("APCA-API-SECRET-KEY", "test-secret");
-            then.status(200).json_body(serde_json::json!({
-                "requests": [
-                    {
-                        "tokenization_request_id": "tok-123",
-                        "issuer_request_id": "red-456",
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "completed",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "100",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                        "fees": "0.5"
-                    }
-                ]
-            }));
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "tokenization_request_id": "tok-123",
+                    "issuer_request_id": "red-456",
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.5"
+                }
+            ]));
         });
 
         let service = RealAlpacaService::new(
@@ -956,55 +953,53 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests");
-            then.status(200).json_body(serde_json::json!({
-                "requests": [
-                    {
-                        "tokenization_request_id": "tok-111",
-                        "issuer_request_id": "red-1",
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "pending",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "100",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                        "fees": "0.0"
-                    },
-                    {
-                        "tokenization_request_id": "tok-222",
-                        "issuer_request_id": "red-2",
-                        "created_at": "2025-09-12T17:30:00.000000-04:00",
-                        "type": "redeem",
-                        "status": "completed",
-                        "underlying_symbol": "TSLA",
-                        "token_symbol": "tTSLA",
-                        "qty": "50",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                        "fees": "0.0"
-                    },
-                    {
-                        "tokenization_request_id": "tok-333",
-                        "issuer_request_id": "red-3",
-                        "created_at": "2025-09-12T17:31:00.000000-04:00",
-                        "type": "redeem",
-                        "status": "rejected",
-                        "underlying_symbol": "NVDA",
-                        "token_symbol": "tNVDA",
-                        "qty": "25",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
-                        "fees": "0.0"
-                    }
-                ]
-            }));
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "tokenization_request_id": "tok-111",
+                    "issuer_request_id": "red-1",
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.0"
+                },
+                {
+                    "tokenization_request_id": "tok-222",
+                    "issuer_request_id": "red-2",
+                    "created_at": "2025-09-12T17:30:00.000000-04:00",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "TSLA",
+                    "token_symbol": "tTSLA",
+                    "qty": "50",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
+                    "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "fees": "0.0"
+                },
+                {
+                    "tokenization_request_id": "tok-333",
+                    "issuer_request_id": "red-3",
+                    "created_at": "2025-09-12T17:31:00.000000-04:00",
+                    "type": "redeem",
+                    "status": "rejected",
+                    "underlying_symbol": "NVDA",
+                    "token_symbol": "tNVDA",
+                    "qty": "25",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                    "fees": "0.0"
+                }
+            ]));
         });
 
         let service = RealAlpacaService::new(
@@ -1034,25 +1029,23 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests");
-            then.status(200).json_body(serde_json::json!({
-                "requests": [
-                    {
-                        "tokenization_request_id": "tok-999",
-                        "issuer_request_id": "red-999",
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "pending",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "100",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                        "fees": "0.0"
-                    }
-                ]
-            }));
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "tokenization_request_id": "tok-999",
+                    "issuer_request_id": "red-999",
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.0"
+                }
+            ]));
         });
 
         let service = RealAlpacaService::new(
@@ -1087,9 +1080,7 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests");
-            then.status(200).json_body(serde_json::json!({
-                "requests": []
-            }));
+            then.status(200).json_body(serde_json::json!([]));
         });
 
         let service = RealAlpacaService::new(
@@ -1184,25 +1175,23 @@ mod tests {
                 .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
                 .header("APCA-API-KEY-ID", "mykey")
                 .header("APCA-API-SECRET-KEY", "mysecret");
-            then.status(200).json_body(serde_json::json!({
-                "requests": [
-                    {
-                        "tokenization_request_id": "tok-auth-test",
-                        "issuer_request_id": "red-123",
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "pending",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "100",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                        "fees": "0.0"
-                    }
-                ]
-            }));
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "tokenization_request_id": "tok-auth-test",
+                    "issuer_request_id": "red-123",
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.0"
+                }
+            ]));
         });
 
         let service = RealAlpacaService::new(
@@ -1230,9 +1219,7 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/my-special-account/tokenization/requests");
-            then.status(200).json_body(serde_json::json!({
-                "requests": []
-            }));
+            then.status(200).json_body(serde_json::json!([]));
         });
 
         let service = RealAlpacaService::new(
@@ -1259,40 +1246,38 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests");
-            then.status(200).json_body(serde_json::json!({
-                "requests": [
-                    {
-                        "tokenization_request_id": "tok-mint-legacy",
-                        "issuer_request_id": "mint-123",
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "mint",
-                        "status": "completed",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "100",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                        "fees": "0.0"
-                    },
-                    {
-                        "tokenization_request_id": "tok-redeem-valid",
-                        "issuer_request_id": "red-456",
-                        "created_at": "2025-09-12T17:30:00.000000-04:00",
-                        "type": "redeem",
-                        "status": "pending",
-                        "underlying_symbol": "TSLA",
-                        "token_symbol": "tTSLA",
-                        "qty": "50",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                        "fees": "0.0"
-                    }
-                ]
-            }));
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "tokenization_request_id": "tok-mint-legacy",
+                    "issuer_request_id": "mint-123",
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "mint",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.0"
+                },
+                {
+                    "tokenization_request_id": "tok-redeem-valid",
+                    "issuer_request_id": "red-456",
+                    "created_at": "2025-09-12T17:30:00.000000-04:00",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "TSLA",
+                    "token_symbol": "tTSLA",
+                    "qty": "50",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
+                    "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "fees": "0.0"
+                }
+            ]));
         });
 
         let service = RealAlpacaService::new(
@@ -1410,6 +1395,77 @@ mod tests {
         ));
         assert!(result.unwrap_err().is_retryable());
         mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_poll_request_status_parses_bare_array_response() {
+        let server = MockServer::start();
+
+        // Real production Alpaca response - returns bare array, not {"requests": [...]}
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests");
+            then.status(200).body(r#"[
+                {
+                    "tokenization_request_id": "8e085fe9-933e-400e-9f7e-6f985c331be0",
+                    "issuer_request_id": "red-842331fb",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "RKLB",
+                    "token_symbol": "tRKLB",
+                    "qty": "4.764333351",
+                    "account": "1481094OM",
+                    "issuer_account": "58ced8fa-0cff-4573-aebd-3d6a3cb9f901",
+                    "created_at": "2026-02-04T14:17:41.396729Z",
+                    "updated_at": "2026-02-04T16:40:23.393243Z",
+                    "wallet_address": "0xfcc6238ceb129c6308a567712edc8f8d36db2754",
+                    "network": "base",
+                    "issuer": "st0x",
+                    "fees": "0.07",
+                    "tx_hash": "0x842331fbcff22069db2702aa3cb8183ec24ed88943cf5a6aa85721c4204046db"
+                },
+                {
+                    "tokenization_request_id": "8cd6c568-3de2-417a-8cea-312852e4a31c",
+                    "issuer_request_id": "red-7ba33782",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "RKLB",
+                    "token_symbol": "tRKLB",
+                    "qty": "3",
+                    "account": "1481094OM",
+                    "issuer_account": "58ced8fa-0cff-4573-aebd-3d6a3cb9f901",
+                    "created_at": "2026-02-04T14:23:15.465284Z",
+                    "updated_at": "2026-02-04T16:40:23.460721Z",
+                    "wallet_address": "0xfcc6238ceb129c6308a567712edc8f8d36db2754",
+                    "network": "base",
+                    "issuer": "st0x",
+                    "fees": "0.04",
+                    "tx_hash": "0x7ba33782a0136bf449a2a6033deaeb0fa2b459d9c6d669e5d4b86d05b172cdca"
+                }
+            ]"#);
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let result = service
+            .poll_request_status(&TokenizationRequestId::new(
+                "8e085fe9-933e-400e-9f7e-6f985c331be0",
+            ))
+            .await;
+
+        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+        let request = result.unwrap();
+        assert_eq!(request.issuer_request_id.0, "red-842331fb");
+        assert!(matches!(request.status, RedeemRequestStatus::Completed));
+        mock.assert();
     }
 
     #[tokio::test]
