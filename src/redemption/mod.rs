@@ -348,6 +348,9 @@ impl PartialEq for RedemptionError {
                 Self::InvalidState { expected: e1, found: f1 },
                 Self::InvalidState { expected: e2, found: f2 },
             ) => e1 == e2 && f1 == f2,
+            (Self::BurnFailed(a), Self::BurnFailed(b)) => {
+                a.to_string() == b.to_string()
+            }
             _ => false,
         }
     }

@@ -8,6 +8,7 @@ use super::{
     IssuerRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionViewError, find_detected,
 };
+use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
@@ -172,7 +173,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
         // Truncate to 9 decimals for Alpaca - they don't support 18 decimal precision
         let (alpaca_quantity, dust_quantity) =
-            metadata.quantity.truncate_for_alpaca();
+            metadata.quantity.truncate_for_alpaca()?;
 
         info!(
             issuer_request_id = %issuer_request_id_str,
@@ -282,6 +283,8 @@ pub(crate) enum RedeemCallManagerError {
     AssetView(#[from] TokenizedAssetViewError),
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: UnderlyingSymbol },
+    #[error("Quantity conversion error: {0}")]
+    QuantityConversion(#[from] QuantityConversionError),
 }
 
 #[cfg(test)]

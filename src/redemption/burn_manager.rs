@@ -138,7 +138,9 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         // We need to burn alpaca_quantity and transfer dust_quantity
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
-        let total_shares_needed = burn_shares + dust_shares;
+        let total_shares_needed = burn_shares
+            .checked_add(dust_shares)
+            .ok_or(BurnManagerError::SharesOverflow)?;
 
         // Check on-chain balance before attempting burn. If the bot has insufficient
         // shares, the burn likely already succeeded on-chain but we crashed before
@@ -253,6 +255,9 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         // Convert quantities to U256 for on-chain operations
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
+        let total_shares_needed = burn_shares
+            .checked_add(dust_shares)
+            .ok_or(BurnManagerError::SharesOverflow)?;
 
         info!(
             issuer_request_id = %issuer_request_id,
@@ -270,7 +275,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             .select_receipt_for_burning(
                 issuer_request_id,
                 &metadata.underlying,
-                burn_shares,
+                total_shares_needed,
             )
             .await?;
 
@@ -501,6 +506,8 @@ pub(crate) enum BurnManagerError {
     AssetNotFound { underlying: String },
     #[error("Event store error: {0}")]
     EventStore(String),
+    #[error("Arithmetic overflow when computing total shares needed")]
+    SharesOverflow,
 }
 
 #[cfg(test)]

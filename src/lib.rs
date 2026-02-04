@@ -101,12 +101,22 @@ impl Quantity {
     /// - `dust` is the remainder (`original - truncated`)
     ///
     /// Invariant: `truncated + dust == original`
-    pub(crate) fn truncate_to_decimals(&self, decimals: u32) -> (Self, Self) {
-        let multiplier = Decimal::from(10_u64.pow(decimals));
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuantityConversionError::Overflow` if computing 10^decimals overflows.
+    pub(crate) fn truncate_to_decimals(
+        &self,
+        decimals: u32,
+    ) -> Result<(Self, Self), QuantityConversionError> {
+        let power = 10_u64
+            .checked_pow(decimals)
+            .ok_or(QuantityConversionError::Overflow)?;
+        let multiplier = Decimal::from(power);
         let truncated_scaled = (self.0 * multiplier).trunc();
         let truncated = truncated_scaled / multiplier;
         let dust = self.0 - truncated;
-        (Self(truncated), Self(dust))
+        Ok((Self(truncated), Self(dust)))
     }
 
     /// Truncates quantity to Alpaca's maximum supported precision (9 decimals).
@@ -114,7 +124,13 @@ impl Quantity {
     /// Returns a tuple of `(alpaca_quantity, dust_quantity)` where:
     /// - `alpaca_quantity` can be safely sent to Alpaca's API
     /// - `dust_quantity` should be returned to the user
-    pub(crate) fn truncate_for_alpaca(&self) -> (Self, Self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuantityConversionError::Overflow` if computing the multiplier overflows.
+    pub(crate) fn truncate_for_alpaca(
+        &self,
+    ) -> Result<(Self, Self), QuantityConversionError> {
         self.truncate_to_decimals(ALPACA_MAX_DECIMALS)
     }
 
@@ -634,7 +650,7 @@ mod tests {
         let original =
             Quantity::new(Decimal::from_str("0.450574852280275235").unwrap());
 
-        let (truncated, dust) = original.truncate_to_decimals(9);
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
 
         assert_eq!(truncated.0, Decimal::from_str("0.450574852").unwrap());
         assert_eq!(dust.0, Decimal::from_str("0.000000000280275235").unwrap());
@@ -648,7 +664,7 @@ mod tests {
         // Exactly 9 decimals - no dust
         let original = Quantity::new(Decimal::from_str("0.123456789").unwrap());
 
-        let (truncated, dust) = original.truncate_to_decimals(9);
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
 
         assert_eq!(truncated.0, original.0);
         assert_eq!(dust.0, Decimal::ZERO);
@@ -658,7 +674,7 @@ mod tests {
     fn test_truncate_to_decimals_whole_number() {
         let original = Quantity::new(Decimal::from(100));
 
-        let (truncated, dust) = original.truncate_to_decimals(9);
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
 
         assert_eq!(truncated.0, Decimal::from(100));
         assert_eq!(dust.0, Decimal::ZERO);
@@ -668,10 +684,20 @@ mod tests {
     fn test_truncate_to_decimals_zero() {
         let original = Quantity::new(Decimal::ZERO);
 
-        let (truncated, dust) = original.truncate_to_decimals(9);
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
 
         assert_eq!(truncated.0, Decimal::ZERO);
         assert_eq!(dust.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_overflow() {
+        let original = Quantity::new(Decimal::from(1));
+
+        // 10^100 would overflow u64
+        let result = original.truncate_to_decimals(100);
+
+        assert!(matches!(result, Err(QuantityConversionError::Overflow)));
     }
 
     #[test]
@@ -680,7 +706,7 @@ mod tests {
         let original =
             Quantity::new(Decimal::from_str("1.123456789123456789").unwrap());
 
-        let (alpaca_qty, dust_qty) = original.truncate_for_alpaca();
+        let (alpaca_qty, dust_qty) = original.truncate_for_alpaca().unwrap();
 
         assert_eq!(alpaca_qty.0, Decimal::from_str("1.123456789").unwrap());
         assert_eq!(
@@ -698,7 +724,7 @@ mod tests {
         let original =
             Quantity::new(Decimal::from_str("0.450574852280275235").unwrap());
 
-        let (truncated, dust) = original.truncate_for_alpaca();
+        let (truncated, dust) = original.truncate_for_alpaca().unwrap();
 
         // Both should convert to U256 without error
         let truncated_u256 = truncated.to_u256_with_18_decimals().unwrap();

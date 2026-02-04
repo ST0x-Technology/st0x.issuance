@@ -235,8 +235,7 @@ pub(crate) async fn validate_client_eligible(
     if !whitelisted_wallets.contains(wallet) {
         error!(
             client_id = %client_id,
-            wallet = %wallet,
-            whitelisted_wallets = ?whitelisted_wallets,
+            whitelisted_wallet_count = whitelisted_wallets.len(),
             "Wallet not in client's whitelisted wallets"
         );
         return Err(MintApiError::WalletNotWhitelisted);
