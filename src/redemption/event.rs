@@ -21,6 +21,14 @@ pub(crate) enum RedemptionEvent {
     AlpacaCalled {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        /// Quantity sent to Alpaca (truncated to 9 decimals).
+        /// For events prior to dust handling feature: defaults to zero.
+        #[serde(default)]
+        alpaca_quantity: Quantity,
+        /// Dust quantity to be returned to user (original - alpaca_quantity).
+        /// For events prior to dust handling feature: defaults to zero.
+        #[serde(default)]
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     },
     AlpacaCallFailed {
@@ -42,6 +50,11 @@ pub(crate) enum RedemptionEvent {
         tx_hash: B256,
         receipt_id: U256,
         shares_burned: U256,
+        /// Amount of dust returned to user (with 18 decimals).
+        /// Dust recipient is always `metadata.wallet` from the `Detected` event.
+        /// For events prior to dust handling feature: defaults to zero.
+        #[serde(default)]
+        dust_returned: U256,
         gas_used: u64,
         block_number: u64,
         burned_at: DateTime<Utc>,
@@ -85,7 +98,7 @@ impl DomainEvent for RedemptionEvent {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{b256, uint};
+    use alloy::primitives::{U256, b256, uint};
     use chrono::Utc;
 
     use super::*;
@@ -112,6 +125,7 @@ mod tests {
             ),
             receipt_id: uint!(42_U256),
             shares_burned: uint!(100_000000000000000000_U256),
+            dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
             burned_at: Utc::now(),
@@ -130,6 +144,7 @@ mod tests {
             ),
             receipt_id: uint!(7_U256),
             shares_burned: uint!(250_500000000000000000_U256),
+            dust_returned: U256::ZERO,
             gas_used: 75000,
             block_number: 2000,
             burned_at: Utc::now(),
@@ -167,5 +182,53 @@ mod tests {
             serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_backwards_compat_alpaca_called_without_dust_fields() {
+        let json = r#"{
+            "AlpacaCalled": {
+                "issuer_request_id": "red-old-123",
+                "tokenization_request_id": "tok-old-123",
+                "called_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::AlpacaCalled {
+            alpaca_quantity,
+            dust_quantity,
+            ..
+        } = event
+        else {
+            panic!("Expected AlpacaCalled variant");
+        };
+
+        assert_eq!(alpaca_quantity, Quantity::default());
+        assert_eq!(dust_quantity, Quantity::default());
+    }
+
+    #[test]
+    fn test_backwards_compat_tokens_burned_without_dust_fields() {
+        let json = r#"{
+            "TokensBurned": {
+                "issuer_request_id": "red-old-456",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "receipt_id": "0x42",
+                "shares_burned": "0x56bc75e2d63100000",
+                "gas_used": 50000,
+                "block_number": 1000,
+                "burned_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::TokensBurned { dust_returned, .. } = event else {
+            panic!("Expected TokensBurned variant");
+        };
+
+        assert_eq!(dust_returned, U256::ZERO);
     }
 }

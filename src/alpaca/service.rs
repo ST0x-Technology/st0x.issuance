@@ -630,6 +630,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_call_redeem_endpoint_success_without_fees() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/redeem");
+            then.status(200).json_body(serde_json::json!({
+                "tokenization_request_id": "tok-456",
+                "issuer_request_id": "red-123",
+                "created_at": "2025-09-12T17:28:48.642437-04:00",
+                "type": "redeem",
+                "status": "rejected",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "100",
+                "issuer": "test-issuer",
+                "network": "base",
+                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            }));
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+        let response = result.unwrap();
+        assert_eq!(response.tokenization_request_id.0, "tok-456");
+        assert!(matches!(response.status, RedeemRequestStatus::Rejected));
+        mock.assert();
+    }
+
+    #[tokio::test]
     async fn test_call_redeem_endpoint_unauthorized() {
         let server = MockServer::start();
 

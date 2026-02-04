@@ -127,7 +127,7 @@ pub(crate) struct RedeemResponse {
     #[serde(rename = "wallet_address")]
     pub(crate) wallet: Address,
     pub(crate) tx_hash: B256,
-    pub(crate) fees: Fees,
+    pub(crate) fees: Option<Fees>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

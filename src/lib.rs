@@ -76,7 +76,7 @@ struct RedemptionManagers {
     burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Quantity(pub(crate) Decimal);
 
 impl std::fmt::Display for Quantity {
@@ -85,9 +85,53 @@ impl std::fmt::Display for Quantity {
     }
 }
 
+/// Maximum decimal places supported by Alpaca's tokenization API.
+/// Quantities with more decimals must be truncated before sending to Alpaca.
+pub(crate) const ALPACA_MAX_DECIMALS: u32 = 9;
+
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
         Self(value)
+    }
+
+    /// Truncates quantity to the specified number of decimal places.
+    ///
+    /// Returns a tuple of `(truncated, dust)` where:
+    /// - `truncated` is the quantity rounded down to `decimals` places
+    /// - `dust` is the remainder (`original - truncated`)
+    ///
+    /// Invariant: `truncated + dust == original`
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuantityConversionError::Overflow` if computing 10^decimals overflows.
+    pub(crate) fn truncate_to_decimals(
+        &self,
+        decimals: u32,
+    ) -> Result<(Self, Self), QuantityConversionError> {
+        let power = 10_u64
+            .checked_pow(decimals)
+            .ok_or(QuantityConversionError::Overflow)?;
+        let multiplier = Decimal::from(power);
+        let truncated_scaled = (self.0 * multiplier).trunc();
+        let truncated = truncated_scaled / multiplier;
+        let dust = self.0 - truncated;
+        Ok((Self(truncated), Self(dust)))
+    }
+
+    /// Truncates quantity to Alpaca's maximum supported precision (9 decimals).
+    ///
+    /// Returns a tuple of `(alpaca_quantity, dust_quantity)` where:
+    /// - `alpaca_quantity` can be safely sent to Alpaca's API
+    /// - `dust_quantity` should be returned to the user
+    ///
+    /// # Errors
+    ///
+    /// Returns `QuantityConversionError::Overflow` if computing the multiplier overflows.
+    pub(crate) fn truncate_for_alpaca(
+        &self,
+    ) -> Result<(Self, Self), QuantityConversionError> {
+        self.truncate_to_decimals(ALPACA_MAX_DECIMALS)
     }
 
     pub(crate) fn to_u256_with_18_decimals(
@@ -166,14 +210,14 @@ pub async fn initialize_rocket(
 
     let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
 
+    let blockchain_service = config.create_blockchain_service().await?;
+
     let AggregateCqrsSetup {
         mint_cqrs,
         mint_event_store,
         redemption_cqrs,
         redemption_event_store,
-    } = setup_aggregate_cqrs(&pool);
-
-    let blockchain_service = config.create_blockchain_service().await?;
+    } = setup_aggregate_cqrs(&pool, blockchain_service.clone());
 
     let MintManagers { mint: mint_manager, callback: callback_manager } =
         setup_mint_managers(
@@ -272,7 +316,10 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
     (account_cqrs, tokenized_asset_cqrs)
 }
 
-fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
+fn setup_aggregate_cqrs(
+    pool: &Pool<Sqlite>,
+    vault_service: Arc<dyn vault::VaultService>,
+) -> AggregateCqrsSetup {
     let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
         pool.clone(),
         "mint_view".to_string(),
@@ -319,7 +366,7 @@ fn setup_aggregate_cqrs(pool: &Pool<Sqlite>) -> AggregateCqrsSetup {
             Box::new(redemption_query),
             Box::new(receipt_inventory_redemption_query),
         ],
-        (),
+        vault_service,
     ));
     let redemption_event_store =
         Arc::new(PersistedEventStore::new_event_store(
@@ -486,6 +533,7 @@ async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
 mod tests {
     use alloy::primitives::{U256, uint};
     use rust_decimal::Decimal;
+    use std::str::FromStr;
 
     use super::{Quantity, QuantityConversionError};
 
@@ -593,5 +641,97 @@ mod tests {
         let round_trip =
             Quantity::from_u256_with_18_decimals(u256_value).unwrap();
         assert_eq!(original, round_trip);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_with_dust() {
+        // 0.450574852280275235 -> truncated to 9 decimals
+        // Expected: truncated = 0.450574852, dust = 0.000000000280275235
+        let original =
+            Quantity::new(Decimal::from_str("0.450574852280275235").unwrap());
+
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
+
+        assert_eq!(truncated.0, Decimal::from_str("0.450574852").unwrap());
+        assert_eq!(dust.0, Decimal::from_str("0.000000000280275235").unwrap());
+
+        // Verify invariant: truncated + dust == original
+        assert_eq!(truncated.0 + dust.0, original.0);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_no_dust() {
+        // Exactly 9 decimals - no dust
+        let original = Quantity::new(Decimal::from_str("0.123456789").unwrap());
+
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
+
+        assert_eq!(truncated.0, original.0);
+        assert_eq!(dust.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_whole_number() {
+        let original = Quantity::new(Decimal::from(100));
+
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
+
+        assert_eq!(truncated.0, Decimal::from(100));
+        assert_eq!(dust.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_zero() {
+        let original = Quantity::new(Decimal::ZERO);
+
+        let (truncated, dust) = original.truncate_to_decimals(9).unwrap();
+
+        assert_eq!(truncated.0, Decimal::ZERO);
+        assert_eq!(dust.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_truncate_to_decimals_overflow() {
+        let original = Quantity::new(Decimal::from(1));
+
+        // 10^100 would overflow u64
+        let result = original.truncate_to_decimals(100);
+
+        assert!(matches!(result, Err(QuantityConversionError::Overflow)));
+    }
+
+    #[test]
+    fn test_truncate_for_alpaca() {
+        // Uses ALPACA_MAX_DECIMALS = 9
+        let original =
+            Quantity::new(Decimal::from_str("1.123456789123456789").unwrap());
+
+        let (alpaca_qty, dust_qty) = original.truncate_for_alpaca().unwrap();
+
+        assert_eq!(alpaca_qty.0, Decimal::from_str("1.123456789").unwrap());
+        assert_eq!(
+            dust_qty.0,
+            Decimal::from_str("0.000000000123456789").unwrap()
+        );
+
+        // Verify invariant
+        assert_eq!(alpaca_qty.0 + dust_qty.0, original.0);
+    }
+
+    #[test]
+    fn test_truncate_preserves_u256_conversion_integrity() {
+        // Ensure truncated values can still be converted to U256
+        let original =
+            Quantity::new(Decimal::from_str("0.450574852280275235").unwrap());
+
+        let (truncated, dust) = original.truncate_for_alpaca().unwrap();
+
+        // Both should convert to U256 without error
+        let truncated_u256 = truncated.to_u256_with_18_decimals().unwrap();
+        let dust_u256 = dust.to_u256_with_18_decimals().unwrap();
+        let original_u256 = original.to_u256_with_18_decimals().unwrap();
+
+        // Verify: truncated_u256 + dust_u256 == original_u256
+        assert_eq!(truncated_u256 + dust_u256, original_u256);
     }
 }

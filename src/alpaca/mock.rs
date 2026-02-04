@@ -111,7 +111,7 @@ impl AlpacaService for MockAlpacaService {
                     network: request.network,
                     wallet: request.wallet,
                     tx_hash: request.tx_hash,
-                    fees: Fees(Decimal::ZERO),
+                    fees: Some(Fees(Decimal::ZERO)),
                 })
             } else {
                 let body = self
@@ -139,7 +139,7 @@ impl AlpacaService for MockAlpacaService {
                 network: request.network,
                 wallet: request.wallet,
                 tx_hash: request.tx_hash,
-                fees: Fees(Decimal::ZERO),
+                fees: Some(Fees(Decimal::ZERO)),
             })
         }
     }

@@ -253,12 +253,21 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         }
 
-        if request.quantity != metadata.quantity {
+        let Some(alpaca_quantity) = aggregate.alpaca_quantity() else {
+            return Err(JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.0.clone(),
+                reason: format!(
+                    "Redemption not in AlpacaCalled state for validation: {aggregate:?}"
+                ),
+            });
+        };
+
+        if &request.quantity != alpaca_quantity {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Quantity mismatch: expected {}, got {}",
-                    metadata.quantity.0, request.quantity.0
+                    alpaca_quantity.0, request.quantity.0
                 ),
             });
         }
@@ -453,6 +462,8 @@ mod tests {
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
     use crate::tokenized_asset::TokenSymbol;
+    use crate::vault::VaultService;
+    use crate::vault::mock::MockVaultService;
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -475,8 +486,13 @@ mod tests {
             .expect("Failed to run migrations");
 
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let cqrs = Arc::new(cqrs_es::CqrsFramework::new(
+            (*store).clone(),
+            vec![],
+            vault_service,
+        ));
         (cqrs, store, pool)
     }
 
@@ -507,6 +523,8 @@ mod tests {
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
             },
         )
         .await
