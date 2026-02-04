@@ -204,7 +204,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     network = %response.network.0,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
-                    fees = %response.fees.0,
+                    fees = ?response.fees.as_ref().map(|f| f.0),
                     "Alpaca redeem API call succeeded"
                 );
 
