@@ -363,23 +363,21 @@ fn setup_redemption_mocks_with_qty_capture(
                     shared_issuer_id.lock().unwrap().clone();
                 let tx_hash = shared_tx_hash.lock().unwrap().clone();
 
-                let response_body = serde_json::to_string(&json!({
-                    "requests": [{
-                        "tokenization_request_id": "tok-redeem-dust",
-                        "issuer_request_id": issuer_request_id,
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "completed",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": TRUNCATED_QTY_STR,
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": user_wallet,
-                        "tx_hash": tx_hash,
-                        "fees": "0.001"
-                    }]
-                }))
+                let response_body = serde_json::to_string(&json!([{
+                    "tokenization_request_id": "tok-redeem-dust",
+                    "issuer_request_id": issuer_request_id,
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": TRUNCATED_QTY_STR,
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": user_wallet,
+                    "tx_hash": tx_hash,
+                    "fees": "0.001"
+                }]))
                 .unwrap();
 
                 httpmock::HttpMockResponse {

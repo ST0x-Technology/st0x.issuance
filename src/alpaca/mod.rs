@@ -148,15 +148,6 @@ pub(crate) enum RedeemRequestStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Fees(pub(crate) Decimal);
 
-/// Response from Alpaca's tokenization requests list endpoint.
-///
-/// This struct deserializes the JSON response from:
-/// `GET /v1/accounts/{account_id}/tokenization/requests`
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RequestsListResponse {
-    pub(crate) requests: Vec<TokenizationRequest>,
-}
-
 /// Individual tokenization request from the list endpoint.
 ///
 /// This struct represents both mint and redeem requests returned by Alpaca's
