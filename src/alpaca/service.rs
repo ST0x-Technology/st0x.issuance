@@ -1398,51 +1398,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poll_request_status_parses_bare_array_response() {
+    async fn test_poll_request_status_parses_full_production_response() {
         let server = MockServer::start();
 
-        // Real production Alpaca response - returns bare array, not {"requests": [...]}
+        // FULL production Alpaca response - exact payload from logs
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account/tokenization/requests");
-            then.status(200).body(r#"[
-                {
-                    "tokenization_request_id": "8e085fe9-933e-400e-9f7e-6f985c331be0",
-                    "issuer_request_id": "red-842331fb",
-                    "type": "redeem",
-                    "status": "completed",
-                    "underlying_symbol": "RKLB",
-                    "token_symbol": "tRKLB",
-                    "qty": "4.764333351",
-                    "account": "1481094OM",
-                    "issuer_account": "58ced8fa-0cff-4573-aebd-3d6a3cb9f901",
-                    "created_at": "2026-02-04T14:17:41.396729Z",
-                    "updated_at": "2026-02-04T16:40:23.393243Z",
-                    "wallet_address": "0xfcc6238ceb129c6308a567712edc8f8d36db2754",
-                    "network": "base",
-                    "issuer": "st0x",
-                    "fees": "0.07",
-                    "tx_hash": "0x842331fbcff22069db2702aa3cb8183ec24ed88943cf5a6aa85721c4204046db"
-                },
-                {
-                    "tokenization_request_id": "8cd6c568-3de2-417a-8cea-312852e4a31c",
-                    "issuer_request_id": "red-7ba33782",
-                    "type": "redeem",
-                    "status": "completed",
-                    "underlying_symbol": "RKLB",
-                    "token_symbol": "tRKLB",
-                    "qty": "3",
-                    "account": "1481094OM",
-                    "issuer_account": "58ced8fa-0cff-4573-aebd-3d6a3cb9f901",
-                    "created_at": "2026-02-04T14:23:15.465284Z",
-                    "updated_at": "2026-02-04T16:40:23.460721Z",
-                    "wallet_address": "0xfcc6238ceb129c6308a567712edc8f8d36db2754",
-                    "network": "base",
-                    "issuer": "st0x",
-                    "fees": "0.04",
-                    "tx_hash": "0x7ba33782a0136bf449a2a6033deaeb0fa2b459d9c6d669e5d4b86d05b172cdca"
-                }
-            ]"#);
+            then.status(200).body(r#"[{"tokenization_request_id":"f466e81d-f7c9-4ea3-8b18-35b02775472e","issuer_request_id":"514113fd-0ff9-413a-8e0c-e1212ddf9ecf","type":"mint","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-01-16T15:37:31.205212Z","updated_at":"2026-01-17T13:33:03.766747Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.08","tx_hash":"0xac5c7d090d50dac63bfde725480eb411ec60fa06f8ec00c0e6673c69dbd8febf"},{"tokenization_request_id":"65f62c42-0b14-494f-93d4-70379bc03592","issuer_request_id":"","type":"mint","status":"rejected","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-01-16T19:48:50.712619Z","updated_at":"2026-01-16T19:48:50.712619Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0","tx_hash":""},{"tokenization_request_id":"f2354b82-89a1-41e7-86c8-75df9312d6fd","issuer_request_id":"red-008ab414","type":"redeem","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-01-26T15:39:37.472855Z","updated_at":"2026-01-26T15:39:37.755401Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.07","tx_hash":"0x008ab414f0e0d0c32a743b865b4f7d7aa509fbff74b6899189ac3085d4a4e026"},{"tokenization_request_id":"b093448c-5871-4a68-ad8b-64611b9fffe7","issuer_request_id":"d6e63f65-345d-4dcd-8b84-e9643987b35e","type":"mint","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"3","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-01-26T16:17:15.136105Z","updated_at":"2026-01-26T16:17:15.757746Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.19","tx_hash":"0x28680a47f1129c83b83fd9cfaffa37bf462553337b5b9a60c4920133ff10d95f"},{"tokenization_request_id":"f4a13943-ed97-4abc-8c70-505af8bc7d05","issuer_request_id":"069071bb-6c78-42d4-8d6f-8fbcf755dbd3","type":"mint","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-03T15:17:38.210539Z","updated_at":"2026-02-03T15:17:39.632607Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.06","tx_hash":"0xbb9e45fb122019f33ba2b7a83ae4bae90045e3bc6cf57e0b3ece70b244ac33f3"},{"tokenization_request_id":"f2280c35-3a82-4460-8c0a-9c51a5526859","issuer_request_id":"red-942e171e","type":"redeem","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-03T15:27:01.815061Z","updated_at":"2026-02-03T15:27:01.907492Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.06","tx_hash":"0x942e171ed76ab0286064209315e320ccd540d2c998a0a536ac5ac839370b4637"},{"tokenization_request_id":"0bdf6745-b513-469a-8ddd-874f5192cee8","issuer_request_id":"red-22e66b2d","type":"redeem","status":"rejected","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"0.450574852280275235","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-03T23:59:27.63446Z","updated_at":"2026-02-03T23:59:27.63446Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0","tx_hash":"0x22e66b2dfa9635e63158ef85e665229f222f2a19a92555ddd1b0d09f621cbc60"},{"tokenization_request_id":"5319180c-d5b0-4db0-a4d3-346603b5b353","issuer_request_id":"","type":"mint","status":"rejected","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"3.1762222348598623822654992091","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-04T10:20:58.185982Z","updated_at":"2026-02-04T10:20:58.185982Z","wallet_address":"0xe75f9042728c3ad626b1aa283fd9a7fcaf63bf1d","network":"base","issuer":"st0x","fees":"0","tx_hash":""},{"tokenization_request_id":"a87b2566-e297-4240-99e2-9846c988c400","issuer_request_id":"1246cb25-25d9-42d1-bf04-f83d7bc9f615","type":"mint","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"3.176222234","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-04T12:03:27.256796Z","updated_at":"2026-02-04T12:03:29.873395Z","wallet_address":"0xe75f9042728c3ad626b1aa283fd9a7fcaf63bf1d","network":"base","issuer":"st0x","fees":"0.2","tx_hash":"0xd391531167cae58f80a0984d1335b8e02b1d757417fdcaa5330fbf6ed024edb2"},{"tokenization_request_id":"adb7d2f6-1e2d-40d8-bcb9-3b6ac382332d","issuer_request_id":"65bcf988-1907-4c87-916a-4b8808ffd26e","type":"mint","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"1.588111117","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-04T12:47:38.92726Z","updated_at":"2026-02-04T12:47:41.805323Z","wallet_address":"0xe75f9042728c3ad626b1aa283fd9a7fcaf63bf1d","network":"base","issuer":"st0x","fees":"0.1","tx_hash":"0x1224289b2b8f901d74ea3287feb36bf9add03f22789068e9acfdd6902aa6ff73"},{"tokenization_request_id":"8e085fe9-933e-400e-9f7e-6f985c331be0","issuer_request_id":"red-842331fb","type":"redeem","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"4.764333351","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-04T14:17:41.396729Z","updated_at":"2026-02-04T16:40:23.393243Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.07","tx_hash":"0x842331fbcff22069db2702aa3cb8183ec24ed88943cf5a6aa85721c4204046db"},{"tokenization_request_id":"8cd6c568-3de2-417a-8cea-312852e4a31c","issuer_request_id":"red-7ba33782","type":"redeem","status":"completed","underlying_symbol":"RKLB","token_symbol":"tRKLB","qty":"3","account":"1481094OM","issuer_account":"58ced8fa-0cff-4573-aebd-3d6a3cb9f901","created_at":"2026-02-04T14:23:15.465284Z","updated_at":"2026-02-04T16:40:23.460721Z","wallet_address":"0xfcc6238ceb129c6308a567712edc8f8d36db2754","network":"base","issuer":"st0x","fees":"0.04","tx_hash":"0x7ba33782a0136bf449a2a6033deaeb0fa2b459d9c6d669e5d4b86d05b172cdca"}]"#);
         });
 
         let service = RealAlpacaService::new(
