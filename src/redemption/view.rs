@@ -166,6 +166,7 @@ impl View<Redemption> for RedemptionView {
                 issuer_request_id,
                 tokenization_request_id,
                 called_at,
+                ..
             } => {
                 self.update_alpaca_called(
                     issuer_request_id.clone(),
@@ -322,6 +323,8 @@ mod tests {
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::vault::mock::MockVaultService;
+    use crate::vault::{OperationType, ReceiptInformation};
 
     struct TestHarness {
         pool: sqlx::Pool<sqlx::Sqlite>,
@@ -349,7 +352,9 @@ mod tests {
                 "redemption_view".to_string(),
             ));
             let query = GenericQuery::new(view_repo);
-            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+            let vault_service = Arc::new(MockVaultService::new_success());
+            let cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(query)], vault_service);
 
             Self { pool, cqrs }
         }
@@ -389,6 +394,8 @@ mod tests {
                         tokenization_request_id: TokenizationRequestId::new(
                             tokenization_request_id,
                         ),
+                        alpaca_quantity: Quantity::new(Decimal::from(100)),
+                        dust_quantity: Quantity::new(Decimal::ZERO),
                     },
                 )
                 .await
@@ -407,26 +414,36 @@ mod tests {
                 .expect("Failed to confirm alpaca complete");
         }
 
-        async fn record_burn_success(
-            &self,
-            id: &str,
-            burn_tx_hash: B256,
-            block_number: u64,
-        ) {
+        async fn burn_tokens(&self, id: &str) {
             self.cqrs
                 .execute(
                     id,
-                    RedemptionCommand::RecordBurnSuccess {
+                    RedemptionCommand::BurnTokens {
                         issuer_request_id: IssuerRequestId::new(id),
-                        tx_hash: burn_tx_hash,
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burn_shares: U256::from(100),
+                        dust_shares: U256::ZERO,
                         receipt_id: U256::from(1),
-                        shares_burned: U256::from(100),
-                        gas_used: 21000,
-                        block_number,
+                        owner: address!(
+                            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+                        ),
+                        receipt_info: ReceiptInformation {
+                            tokenization_request_id: TokenizationRequestId::new(
+                                "tok-test",
+                            ),
+                            issuer_request_id: IssuerRequestId::new(id),
+                            underlying: UnderlyingSymbol::new("AAPL"),
+                            quantity: Quantity::new(Decimal::from(100)),
+                            operation_type: OperationType::Redeem,
+                            timestamp: Utc::now(),
+                            notes: None,
+                        },
                     },
                 )
                 .await
-                .expect("Failed to record burn success");
+                .expect("Failed to burn tokens");
         }
     }
 
@@ -534,6 +551,8 @@ mod tests {
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: quantity.clone(),
+                dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at,
             },
             metadata: HashMap::default(),
@@ -610,6 +629,8 @@ mod tests {
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: quantity.clone(),
+                dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at,
             },
             metadata: HashMap::default(),
@@ -817,13 +838,7 @@ mod tests {
             .await;
         harness.call_alpaca(completed_id, "tok-2").await;
         harness.confirm_alpaca_complete(completed_id).await;
-        harness
-            .record_burn_success(
-                completed_id,
-                b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
-                99999,
-            )
-            .await;
+        harness.burn_tokens(completed_id).await;
 
         let result = find_detected(pool).await.unwrap();
 
@@ -850,13 +865,7 @@ mod tests {
             .await;
         harness.call_alpaca(completed_id, "tok-1").await;
         harness.confirm_alpaca_complete(completed_id).await;
-        harness
-            .record_burn_success(
-                completed_id,
-                b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
-                88888,
-            )
-            .await;
+        harness.burn_tokens(completed_id).await;
 
         let result = find_detected(pool).await.unwrap();
 
@@ -1017,13 +1026,7 @@ mod tests {
             .await;
         harness.call_alpaca(completed_id, "tok-complete").await;
         harness.confirm_alpaca_complete(completed_id).await;
-        harness
-            .record_burn_success(
-                completed_id,
-                b256!("0x6666666666666666666666666666666666666666666666666666666666666666"),
-                88888,
-            )
-            .await;
+        harness.burn_tokens(completed_id).await;
 
         let result = find_burning(pool).await.unwrap();
 
@@ -1050,13 +1053,7 @@ mod tests {
             .await;
         harness.call_alpaca(completed_id, "tok-1").await;
         harness.confirm_alpaca_complete(completed_id).await;
-        harness
-            .record_burn_success(
-                completed_id,
-                b256!("0x6666666666666666666666666666666666666666666666666666666666666666"),
-                99999,
-            )
-            .await;
+        harness.burn_tokens(completed_id).await;
 
         let result = find_burning(pool).await.unwrap();
 

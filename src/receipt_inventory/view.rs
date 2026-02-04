@@ -902,9 +902,6 @@ mod tests {
             receipt_id: uint!(42_U256),
             shares_burned: uint!(30_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 2000,
             burned_at,
@@ -946,9 +943,6 @@ mod tests {
             receipt_id: uint!(7_U256),
             shares_burned: uint!(50_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 3000,
             burned_at,
@@ -1001,9 +995,6 @@ mod tests {
             receipt_id: uint!(10_U256),
             shares_burned: uint!(50_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 4000,
             burned_at,
@@ -1044,9 +1035,6 @@ mod tests {
             receipt_id: uint!(99_U256),
             shares_burned: uint!(50_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 5000,
             burned_at: Utc::now(),
@@ -1083,9 +1071,6 @@ mod tests {
             receipt_id: uint!(1_U256),
             shares_burned: uint!(50_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 6000,
             burned_at: Utc::now(),
@@ -1119,9 +1104,6 @@ mod tests {
             receipt_id: uint!(1_U256),
             shares_burned: uint!(50_000000000000000000_U256),
             dust_returned: U256::ZERO,
-            dust_recipient: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
             gas_used: 50000,
             block_number: 7000,
             burned_at: Utc::now(),

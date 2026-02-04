@@ -225,7 +225,6 @@ impl Redemption {
             receipt_id: burn.receipt_id,
             shares_burned: burn.shares_burned,
             dust_returned: burn.dust_returned,
-            dust_recipient: user_wallet,
             gas_used: burn.gas_used,
             block_number: burn.block_number,
             burned_at: Utc::now(),
@@ -1062,7 +1061,6 @@ mod tests {
             issuer_request_id: event_id,
             receipt_id: event_receipt_id,
             shares_burned: event_shares_burned,
-            dust_recipient: event_dust_recipient,
             burned_at,
             ..
         } = &events[0]
@@ -1073,7 +1071,6 @@ mod tests {
         assert_eq!(event_id, &issuer_request_id);
         assert_eq!(event_receipt_id, &receipt_id);
         assert_eq!(event_shares_burned, &burn_shares);
-        assert_eq!(event_dust_recipient, &user_wallet);
         assert!(burned_at.timestamp() > 0);
     }
 
@@ -1247,7 +1244,6 @@ mod tests {
             receipt_id,
             shares_burned,
             dust_returned: U256::ZERO,
-            dust_recipient: wallet,
             gas_used: 60000,
             block_number: 51000,
             burned_at,

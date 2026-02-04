@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use rocket::http::{ContentType, Status};
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
@@ -40,6 +41,9 @@ pub(crate) enum MintApiError {
     #[error("Client not eligible")]
     ClientNotEligible,
 
+    #[error("Wallet not whitelisted for client")]
+    WalletNotWhitelisted,
+
     #[error("Failed to query enabled assets")]
     AssetQueryFailed(
         #[source] crate::tokenized_asset::view::TokenizedAssetViewError,
@@ -75,6 +79,9 @@ impl<'r> Responder<'r, 'static> for MintApiError {
             ),
             Self::ClientNotEligible => MintErrorResponse::bad_request(
                 "Insufficient Eligibility: Client not eligible",
+            ),
+            Self::WalletNotWhitelisted => MintErrorResponse::bad_request(
+                "Insufficient Eligibility: Wallet not whitelisted for client",
             ),
             Self::CommandExecutionFailed(e) => {
                 Self::handle_command_execution_error(e.as_ref())
@@ -211,6 +218,7 @@ pub(crate) async fn validate_asset_exists(
 pub(crate) async fn validate_client_eligible(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     client_id: &ClientId,
+    wallet: &Address,
 ) -> Result<(), MintApiError> {
     let account_view =
         find_by_client_id(pool, client_id).await.map_err(|e| {
@@ -218,9 +226,21 @@ pub(crate) async fn validate_client_eligible(
             MintApiError::AccountQueryFailed(e)
         })?;
 
-    let Some(AccountView::LinkedToAlpaca { .. }) = account_view else {
+    let Some(AccountView::LinkedToAlpaca { whitelisted_wallets, .. }) =
+        account_view
+    else {
         return Err(MintApiError::ClientNotEligible);
     };
+
+    if !whitelisted_wallets.contains(wallet) {
+        error!(
+            client_id = %client_id,
+            wallet = %wallet,
+            whitelisted_wallets = ?whitelisted_wallets,
+            "Wallet not in client's whitelisted wallets"
+        );
+        return Err(MintApiError::WalletNotWhitelisted);
+    }
 
     Ok(())
 }

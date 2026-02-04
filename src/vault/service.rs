@@ -38,13 +38,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info).map_err(|e| {
-                VaultError::RpcError {
-                    message: format!(
-                        "Failed to encode receipt information: {e}"
-                    ),
-                }
-            })?);
+            Bytes::from(serde_json::to_vec(&receipt_info)?);
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
@@ -69,15 +63,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let receipt = vault_contract
             .multicall(vec![deposit_call, transfer_call])
             .send()
-            .await
-            .map_err(|e| VaultError::TransactionFailed {
-                reason: format!("Failed to send multicall transaction: {e}"),
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| VaultError::RpcError {
-                message: format!("Failed to get transaction receipt: {e}"),
-            })?;
+            .await?;
 
         let (receipt_id, shares_minted) = receipt
             .inner
@@ -108,43 +96,57 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         })
     }
 
-    async fn burn_tokens(
+    async fn get_share_balance(
         &self,
         vault: Address,
-        shares: U256,
-        receipt_id: U256,
         owner: Address,
-        receiver: Address,
-        receipt_info: ReceiptInformation,
-    ) -> Result<BurnResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info).map_err(|e| {
-                VaultError::RpcError {
-                    message: format!(
-                        "Failed to encode receipt information: {e}"
-                    ),
-                }
-            })?);
-
+    ) -> Result<U256, VaultError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
 
-        // The vault's redeem() function burns shares and returns underlying assets to receiver.
-        // Parameters: shares to burn, receiver address, owner address, receipt ID, metadata.
-        // The owner parameter specifies whose shares are being burned, while receiver gets the assets.
-        let receipt = vault_contract
-            .redeem(shares, receiver, owner, receipt_id, receipt_info_bytes)
-            .send()
-            .await
-            .map_err(|e| VaultError::TransactionFailed {
-                reason: format!("Failed to send transaction: {e}"),
-            })?
-            .get_receipt()
-            .await
-            .map_err(|e| VaultError::RpcError {
-                message: format!("Failed to get transaction receipt: {e}"),
-            })?;
+        Ok(vault_contract.balanceOf(owner).call().await?)
+    }
 
+    async fn burn_and_return_dust(
+        &self,
+        params: super::BurnParams,
+    ) -> Result<super::BurnWithDustResult, VaultError> {
+        let receipt_info_bytes =
+            Bytes::from(serde_json::to_vec(&params.receipt_info)?);
+
+        let vault_contract =
+            OffchainAssetReceiptVault::new(params.vault, &self.provider);
+
+        // Encode redeem call - burns shares from owner
+        let redeem_call = vault_contract
+            .redeem(
+                params.burn_shares,
+                params.user,
+                params.owner,
+                params.receipt_id,
+                receipt_info_bytes,
+            )
+            .calldata()
+            .clone();
+
+        // Build multicall with redeem, and optionally transfer for dust
+        let calls = if params.dust_shares > U256::ZERO {
+            // Encode transfer call for dust - transfers from bot to user
+            let transfer_call = vault_contract
+                .transfer(params.user, params.dust_shares)
+                .calldata()
+                .clone();
+            vec![redeem_call, transfer_call]
+        } else {
+            // No dust, just burn
+            vec![redeem_call]
+        };
+
+        // Execute atomically via multicall
+        let receipt =
+            vault_contract.multicall(calls).send().await?.get_receipt().await?;
+
+        // Extract Withdraw event to verify burn succeeded
         let (parsed_receipt_id, shares_burned) = receipt
             .inner
             .logs()
@@ -165,24 +167,14 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(BurnResult {
+        Ok(super::BurnWithDustResult {
             tx_hash: receipt.transaction_hash,
             receipt_id: parsed_receipt_id,
             shares_burned,
+            dust_returned: params.dust_shares,
             gas_used,
             block_number,
         })
-    }
-
-    async fn get_share_balance(
-        &self,
-        vault: Address,
-        owner: Address,
-    ) -> Result<U256, VaultError> {
-        let vault_contract =
-            OffchainAssetReceiptVault::new(vault, &self.provider);
-
-        Ok(vault_contract.balanceOf(owner).call().await?)
     }
 }
 
@@ -208,7 +200,7 @@ mod tests {
         IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::vault::{
-        OperationType, ReceiptInformation, VaultError, VaultService,
+        BurnParams, OperationType, ReceiptInformation, VaultError, VaultService,
     };
 
     fn test_receipt_info() -> ReceiptInformation {
@@ -229,6 +221,43 @@ mod tests {
 
     fn test_vault_address() -> Address {
         address!("0000000000000000000000000000000000000002")
+    }
+
+    fn test_fee_history() -> FeeHistory {
+        FeeHistory {
+            base_fee_per_gas: vec![1_000_000_000],
+            gas_used_ratio: vec![0.5],
+            base_fee_per_blob_gas: vec![],
+            blob_gas_used_ratio: vec![],
+            oldest_block: 2000,
+            reward: Some(vec![vec![10_000]]),
+        }
+    }
+
+    fn setup_asserter_for_transaction(
+        asserter: &Asserter,
+        tx_hash: alloy::primitives::B256,
+        receipt: &TransactionReceipt,
+    ) {
+        let block: Block<alloy::rpc::types::Transaction> = Block::default();
+        asserter.push_success(&0u64); // eth_getTransactionCount
+        asserter.push_success(&test_fee_history()); // eth_feeHistory
+        asserter.push_success(&block); // eth_getBlockByNumber
+        asserter.push_success(&1u64); // eth_chainId
+        asserter.push_success(&100_000_u64); // eth_estimateGas
+        asserter.push_success(&1_000_000_000_u64); // eth_maxPriorityFeePerGas
+        asserter.push_success(&0u64); // eth_getTransactionCount again
+        asserter.push_success(&tx_hash); // eth_sendRawTransaction
+        asserter.push_success(receipt); // eth_getTransactionReceipt
+        asserter.push_success(receipt); // eth_getTransactionReceipt (polling)
+    }
+
+    fn create_service_with_asserter(asserter: Asserter) -> impl VaultService {
+        let signer = PrivateKeySigner::random();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect_mocked_client(asserter);
+        RealBlockchainService::new(provider)
     }
 
     #[tokio::test]
@@ -475,35 +504,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_burn_tokens_success() {
-        let vault_address = test_vault_address();
-        let shares = U256::from(500);
-        let receipt_id = U256::from(42);
-        let receiver = test_receiver();
-        let mut receipt_info = test_receipt_info();
-        receipt_info.operation_type = OperationType::Redeem;
-
-        let tx_hash = fixed_bytes!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-
+    fn create_withdraw_receipt(
+        vault_address: Address,
+        tx_hash: alloy::primitives::B256,
+        owner: Address,
+        user: Address,
+        shares: U256,
+        receipt_id: U256,
+    ) -> TransactionReceipt {
         let withdraw_event = OffchainAssetReceiptVault::Withdraw {
-            sender: receiver,
-            receiver,
-            owner: receiver,
+            sender: owner,
+            receiver: user,
+            owner,
             assets: shares,
             shares,
             id: receipt_id,
             receiptInformation: Bytes::new(),
         };
 
-        let log_data = withdraw_event.into_log_data();
-
         let log = alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
                 address: vault_address,
-                data: log_data,
+                data: withdraw_event.into_log_data(),
             },
             block_hash: Some(fixed_bytes!(
                 "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -522,10 +544,7 @@ mod tests {
             logs: vec![log],
         };
 
-        let receipt_with_bloom =
-            ReceiptWithBloom::new(consensus_receipt, Bloom::default());
-
-        let receipt = TransactionReceipt {
+        TransactionReceipt {
             transaction_hash: tx_hash,
             transaction_index: Some(0),
             block_hash: Some(fixed_bytes!(
@@ -539,83 +558,21 @@ mod tests {
             contract_address: None,
             blob_gas_used: None,
             blob_gas_price: None,
-            inner: ReceiptEnvelope::Eip1559(receipt_with_bloom),
-        };
-
-        let fee_history = FeeHistory {
-            base_fee_per_gas: vec![1_000_000_000],
-            gas_used_ratio: vec![0.5],
-            base_fee_per_blob_gas: vec![],
-            blob_gas_used_ratio: vec![],
-            oldest_block: 2000,
-            reward: Some(vec![vec![10_000]]),
-        };
-
-        let block: Block = Block::default();
-
-        let asserter = Asserter::new();
-
-        // Mock eth_getTransactionCount (get nonce)
-        asserter.push_success(&0u64);
-
-        // Mock eth_feeHistory
-        asserter.push_success(&fee_history);
-
-        // Mock eth_getBlockByNumber (get latest block)
-        asserter.push_success(&block);
-
-        // Mock eth_chainId
-        asserter.push_success(&1u64);
-
-        // Mock eth_estimateGas
-        asserter.push_success(&100_000_u64);
-
-        // Mock eth_maxPriorityFeePerGas or another u64 call
-        asserter.push_success(&1_000_000_000_u64);
-
-        // Mock eth_getTransactionCount again (wallet's nonce manager)
-        asserter.push_success(&0u64);
-
-        // Mock eth_sendRawTransaction (returns pending tx hash)
-        asserter.push_success(&tx_hash);
-
-        // Mock eth_getTransactionReceipt for .get_receipt() polling (may poll multiple times)
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
-
-        let signer = PrivateKeySigner::random();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
-            .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider);
-
-        let result = service
-            .burn_tokens(
-                vault_address,
-                shares,
-                receipt_id,
-                receiver,
-                receiver,
-                receipt_info,
-            )
-            .await;
-
-        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
-        let burn_result = result.unwrap();
-        assert_eq!(burn_result.tx_hash, tx_hash);
-        assert_eq!(burn_result.receipt_id, receipt_id);
-        assert_eq!(burn_result.shares_burned, shares);
-        assert_eq!(burn_result.gas_used, 0x6100);
-        assert_eq!(burn_result.block_number, 0x7d0);
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
     }
 
     #[tokio::test]
-    async fn test_burn_tokens_missing_withdraw_event() {
+    async fn test_burn_and_return_dust_success() {
         let vault_address = test_vault_address();
-        let shares = U256::from(500);
+        let burn_shares = U256::from(500);
+        let dust_shares = U256::from(10);
         let receipt_id = U256::from(42);
         let owner = test_receiver();
-        let receiver = test_receiver();
+        let user = address!("0x3333333333333333333333333333333333333333");
         let mut receipt_info = test_receipt_info();
         receipt_info.operation_type = OperationType::Redeem;
 
@@ -623,16 +580,53 @@ mod tests {
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
 
+        let receipt = create_withdraw_receipt(
+            vault_address,
+            tx_hash,
+            owner,
+            user,
+            burn_shares,
+            receipt_id,
+        );
+
+        let asserter = Asserter::new();
+        setup_asserter_for_transaction(&asserter, tx_hash, &receipt);
+
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .burn_and_return_dust(BurnParams {
+                vault: vault_address,
+                burn_shares,
+                dust_shares,
+                receipt_id,
+                owner,
+                user,
+                receipt_info,
+            })
+            .await;
+
+        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
+        let burn_result = result.unwrap();
+        assert_eq!(burn_result.tx_hash, tx_hash);
+        assert_eq!(burn_result.receipt_id, receipt_id);
+        assert_eq!(burn_result.shares_burned, burn_shares);
+        assert_eq!(burn_result.dust_returned, dust_shares);
+        assert_eq!(burn_result.gas_used, 0x6100);
+        assert_eq!(burn_result.block_number, 0x7d0);
+    }
+
+    fn create_empty_receipt(
+        vault_address: Address,
+        tx_hash: alloy::primitives::B256,
+    ) -> TransactionReceipt {
         let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
             status: Eip658Value::Eip658(true),
             cumulative_gas_used: 0x6100,
             logs: vec![],
         };
 
-        let receipt_with_bloom =
-            ReceiptWithBloom::new(consensus_receipt, Bloom::default());
-
-        let receipt = TransactionReceipt {
+        TransactionReceipt {
             transaction_hash: tx_hash,
             transaction_index: Some(0),
             block_hash: Some(fixed_bytes!(
@@ -646,65 +640,40 @@ mod tests {
             contract_address: None,
             blob_gas_used: None,
             blob_gas_price: None,
-            inner: ReceiptEnvelope::Eip1559(receipt_with_bloom),
-        };
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
+    }
 
-        let fee_history = FeeHistory {
-            base_fee_per_gas: vec![1_000_000_000],
-            gas_used_ratio: vec![0.5],
-            base_fee_per_blob_gas: vec![],
-            blob_gas_used_ratio: vec![],
-            oldest_block: 2000,
-            reward: Some(vec![vec![10_000]]),
-        };
+    #[tokio::test]
+    async fn test_burn_and_return_dust_missing_withdraw_event() {
+        let vault_address = test_vault_address();
+        let mut receipt_info = test_receipt_info();
+        receipt_info.operation_type = OperationType::Redeem;
 
-        let block: Block = Block::default();
+        let tx_hash = fixed_bytes!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        let receipt = create_empty_receipt(vault_address, tx_hash);
 
         let asserter = Asserter::new();
+        setup_asserter_for_transaction(&asserter, tx_hash, &receipt);
 
-        // Mock eth_getTransactionCount (get nonce)
-        asserter.push_success(&0u64);
-
-        // Mock eth_feeHistory
-        asserter.push_success(&fee_history);
-
-        // Mock eth_getBlockByNumber (get latest block)
-        asserter.push_success(&block);
-
-        // Mock eth_chainId
-        asserter.push_success(&1u64);
-
-        // Mock eth_estimateGas
-        asserter.push_success(&100_000_u64);
-
-        // Mock eth_maxPriorityFeePerGas or another u64 call
-        asserter.push_success(&1_000_000_000_u64);
-
-        // Mock eth_getTransactionCount again (wallet's nonce manager)
-        asserter.push_success(&0u64);
-
-        // Mock eth_sendRawTransaction (returns pending tx hash)
-        asserter.push_success(&tx_hash);
-
-        // Mock eth_getTransactionReceipt for .get_receipt() polling (may poll multiple times)
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
-
-        let signer = PrivateKeySigner::random();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
-            .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider);
+        let service = create_service_with_asserter(asserter);
 
         let result = service
-            .burn_tokens(
-                vault_address,
-                shares,
-                receipt_id,
-                owner,
-                receiver,
+            .burn_and_return_dust(BurnParams {
+                vault: vault_address,
+                burn_shares: U256::from(500),
+                dust_shares: U256::ZERO,
+                receipt_id: U256::from(42),
+                owner: test_receiver(),
+                user: address!("0x3333333333333333333333333333333333333333"),
                 receipt_info,
-            )
+            })
             .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");

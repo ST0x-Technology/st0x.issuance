@@ -774,8 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_burning_started_with_blockchain_failure() {
-        let vault_mock =
-            Arc::new(MockVaultService::new_failure("Network error: timeout"));
+        let vault_mock = Arc::new(MockVaultService::new_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { cqrs, store, pool, .. } = &harness;
 
@@ -830,8 +829,8 @@ mod tests {
         };
 
         assert!(
-            reason.contains("Network error: timeout"),
-            "Expected error message to contain 'Network error: timeout', got: {reason}"
+            reason.contains("Invalid receipt"),
+            "Expected error message to contain 'Invalid receipt', got: {reason}"
         );
     }
 

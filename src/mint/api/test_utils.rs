@@ -1,4 +1,4 @@
-use alloy::primitives::{B256, address};
+use alloy::primitives::{Address, B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -136,6 +136,7 @@ pub(crate) struct TestAccountAndAsset {
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
     pub(crate) network: Network,
+    pub(crate) wallet: Address,
 }
 
 impl TestHarness {
@@ -162,6 +163,15 @@ impl TestHarness {
             .await
             .expect("Failed to link account to Alpaca");
 
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_cmd = AccountCommand::WhitelistWallet { wallet };
+
+        self.account_cqrs
+            .execute(&aggregate_id, whitelist_cmd)
+            .await
+            .expect("Failed to whitelist wallet");
+
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
@@ -179,6 +189,6 @@ impl TestHarness {
             .await
             .expect("Failed to add asset");
 
-        TestAccountAndAsset { client_id, underlying, token, network }
+        TestAccountAndAsset { client_id, underlying, token, network, wallet }
     }
 }
