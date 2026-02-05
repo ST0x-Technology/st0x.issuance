@@ -58,6 +58,21 @@ pub(crate) enum RedemptionView {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    BurnFailed {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        called_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for RedemptionView {
@@ -183,11 +198,6 @@ impl View<Redemption> for RedemptionView {
                 issuer_request_id,
                 reason: error,
                 failed_at,
-            }
-            | RedemptionEvent::BurningFailed {
-                issuer_request_id,
-                error,
-                failed_at,
             } => {
                 *self = Self::Failed {
                     issuer_request_id: issuer_request_id.clone(),
@@ -195,6 +205,42 @@ impl View<Redemption> for RedemptionView {
                     failed_at: *failed_at,
                 };
             }
+
+            RedemptionEvent::BurningFailed { error, failed_at, .. } => {
+                if let Self::Burning {
+                    issuer_request_id,
+                    tokenization_request_id,
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                    detected_at,
+                    called_at,
+                    alpaca_journal_completed_at,
+                } = self
+                {
+                    *self = Self::BurnFailed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tokenization_request_id: tokenization_request_id
+                            .clone(),
+                        underlying: underlying.clone(),
+                        token: token.clone(),
+                        wallet: *wallet,
+                        quantity: quantity.clone(),
+                        tx_hash: *tx_hash,
+                        block_number: *block_number,
+                        detected_at: *detected_at,
+                        called_at: *called_at,
+                        alpaca_journal_completed_at:
+                            *alpaca_journal_completed_at,
+                        error: error.clone(),
+                        failed_at: *failed_at,
+                    };
+                }
+            }
+
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id,
                 alpaca_journal_completed_at,
@@ -283,7 +329,7 @@ pub(crate) async fn find_alpaca_called(
 /// Finds all redemptions in the `Burning` state.
 ///
 /// These are redemptions where Alpaca journal completed but the on-chain
-/// burn hasn't been executed yet (or failed).
+/// burn hasn't been executed yet.
 pub(crate) async fn find_burning(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
@@ -292,6 +338,31 @@ pub(crate) async fn find_burning(
         SELECT view_id as "view_id!: String", payload as "payload!: String"
         FROM redemption_view
         WHERE json_extract(payload, '$.Burning') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let view: RedemptionView = serde_json::from_str(&row.payload)?;
+            Ok((IssuerRequestId::new(&row.view_id), view))
+        })
+        .collect()
+}
+
+/// Finds all redemptions in the `BurnFailed` state.
+///
+/// These are redemptions where Alpaca journal completed but the on-chain
+/// burn failed. They need recovery - the burn should be retried.
+pub(crate) async fn find_burn_failed(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
+        FROM redemption_view
+        WHERE json_extract(payload, '$.BurnFailed') IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -318,7 +389,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        RedemptionView, find_alpaca_called, find_burning, find_detected,
+        RedemptionView, find_alpaca_called, find_burn_failed, find_burning,
+        find_detected,
     };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
@@ -1084,5 +1156,192 @@ mod tests {
         let result = find_burning(pool).await.unwrap();
 
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_view_updates_on_burning_failed_event() {
+        let mut view = RedemptionView::default();
+
+        let issuer_request_id = IssuerRequestId::new("red-burn-failed-123");
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-burn-failed-456");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let wallet = address!("0xdddddddddddddddddddddddddddddddddddddddd");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0x6666666666666666666666666666666666666666666666666666666666666666"
+        );
+        let block_number = 88888;
+        let detected_at = Utc::now();
+        let called_at = Utc::now();
+        let alpaca_journal_completed_at = Utc::now();
+        let error = "On-chain burn failed: insufficient gas".to_string();
+        let failed_at = Utc::now();
+
+        // Progress through states: Detected -> AlpacaCalled -> Burning
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 1,
+            payload: RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: underlying.clone(),
+                token: token.clone(),
+                wallet,
+                quantity: quantity.clone(),
+                tx_hash,
+                block_number,
+                detected_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 2,
+            payload: RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: quantity.clone(),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 3,
+            payload: RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: issuer_request_id.clone(),
+                alpaca_journal_completed_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        assert!(
+            matches!(view, RedemptionView::Burning { .. }),
+            "Should be in Burning state before BurningFailed"
+        );
+
+        // Now apply BurningFailed
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.0.clone(),
+            sequence: 4,
+            payload: RedemptionEvent::BurningFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: error.clone(),
+                failed_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        let RedemptionView::BurnFailed {
+            issuer_request_id: view_id,
+            tokenization_request_id: view_tok_id,
+            underlying: view_underlying,
+            token: view_token,
+            wallet: view_wallet,
+            quantity: view_quantity,
+            tx_hash: view_tx_hash,
+            block_number: view_block_number,
+            detected_at: view_detected_at,
+            called_at: view_called_at,
+            alpaca_journal_completed_at: view_alpaca_journal_completed_at,
+            error: view_error,
+            failed_at: view_failed_at,
+        } = view
+        else {
+            panic!("Expected BurnFailed view, got {view:?}");
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_tok_id, tokenization_request_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(view_wallet, wallet);
+        assert_eq!(view_quantity, quantity);
+        assert_eq!(view_tx_hash, tx_hash);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_detected_at, detected_at);
+        assert_eq!(view_called_at, called_at);
+        assert_eq!(
+            view_alpaca_journal_completed_at,
+            alpaca_journal_completed_at
+        );
+        assert_eq!(view_error, error);
+        assert_eq!(view_failed_at, failed_at);
+    }
+
+    #[tokio::test]
+    async fn test_find_burn_failed_returns_only_burn_failed_views() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, cqrs } = &harness;
+
+        // Create a redemption in Detected state
+        let detected_id = "red-detected-for-burn-fail";
+        harness
+            .detect_redemption(
+                detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                12345,
+            )
+            .await;
+
+        // Create a redemption in Burning state
+        let burning_id = "red-burning-for-burn-fail";
+        harness
+            .detect_redemption(
+                burning_id,
+                "TSLA",
+                address!("0x9876543210fedcba9876543210fedcba98765432"),
+                50,
+                b256!(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                ),
+                54321,
+            )
+            .await;
+        harness.call_alpaca(burning_id, "tok-burning").await;
+        harness.confirm_alpaca_complete(burning_id).await;
+
+        // Create a redemption in BurnFailed state
+        let burn_failed_id = "red-burn-failed-query";
+        harness
+            .detect_redemption(
+                burn_failed_id,
+                "NVDA",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                25,
+                b256!(
+                    "0x2222222222222222222222222222222222222222222222222222222222222222"
+                ),
+                77777,
+            )
+            .await;
+        harness.call_alpaca(burn_failed_id, "tok-burn-fail").await;
+        harness.confirm_alpaca_complete(burn_failed_id).await;
+
+        // Record burn failure
+        cqrs.execute(
+            burn_failed_id,
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: IssuerRequestId::new(burn_failed_id),
+                error: "Insufficient gas".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        let result = find_burn_failed(pool).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0.0, burn_failed_id);
+        assert!(matches!(result[0].1, RedemptionView::BurnFailed { .. }));
     }
 }

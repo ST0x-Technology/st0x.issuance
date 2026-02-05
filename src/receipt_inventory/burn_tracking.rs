@@ -1,13 +1,16 @@
 use alloy::primitives::{U256, ruint::ParseError};
 use chrono::{DateTime, Utc};
-use cqrs_es::{EventEnvelope, View};
+use cqrs_es::persist::{GenericQuery, QueryReplay};
+use cqrs_es::{AggregateError, EventEnvelope, View};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::mint::IssuerRequestId;
-use crate::redemption::{Redemption, RedemptionEvent};
+use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
 use crate::tokenized_asset::UnderlyingSymbol;
 
 /// Tracks a single burn operation.
@@ -61,6 +64,8 @@ pub enum BurnTrackingError {
     Json(#[from] serde_json::Error),
     #[error("Parse error: {0}")]
     Parse(#[from] ParseError),
+    #[error("Replay error: {0}")]
+    Replay(#[from] AggregateError<RedemptionError>),
 }
 
 /// Represents a receipt with its available balance (initial - burned).
@@ -77,6 +82,31 @@ pub struct ReceiptWithBalance {
 
 fn parse_u256_hex(s: &str) -> Result<U256, ParseError> {
     U256::from_str_radix(s.trim_start_matches("0x"), 16)
+}
+
+/// Replays all `Redemption` events through the `receipt_burns_view`.
+///
+/// Uses `QueryReplay` to re-project the view from existing events in the event store.
+/// This is used at startup to recover view state after the view schema was added.
+///
+/// # Errors
+///
+/// Returns `BurnTrackingError::Replay` if event replay fails.
+pub async fn replay_receipt_burns_view(
+    pool: Pool<Sqlite>,
+) -> Result<(), BurnTrackingError> {
+    let view_repo =
+        Arc::new(SqliteViewRepository::<ReceiptBurnsView, Redemption>::new(
+            pool.clone(),
+            "receipt_burns_view".to_string(),
+        ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    Ok(())
 }
 
 /// Finds a receipt with sufficient available balance for burning.
@@ -169,10 +199,13 @@ pub async fn find_receipt_with_available_balance(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::uint;
+    use alloy::primitives::{address, b256, uint};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::ReceiptInventoryView;
     use crate::tokenized_asset::TokenSymbol;
 
@@ -273,7 +306,7 @@ mod tests {
 
         let event = RedemptionEvent::TokensBurned {
             issuer_request_id: IssuerRequestId::new("mint-123"),
-            tx_hash: alloy::primitives::b256!(
+            tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
             receipt_id: uint!(42_U256),
@@ -316,14 +349,10 @@ mod tests {
             RedemptionEvent::Detected {
                 issuer_request_id: IssuerRequestId::new("red-123"),
                 underlying: UnderlyingSymbol::new("AAPL"),
-                token: crate::tokenized_asset::TokenSymbol::new("tAAPL"),
-                wallet: alloy::primitives::address!(
-                    "0x1111111111111111111111111111111111111111"
-                ),
-                quantity: crate::mint::Quantity::new(
-                    rust_decimal::Decimal::from(10),
-                ),
-                tx_hash: alloy::primitives::b256!(
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!("0x1111111111111111111111111111111111111111"),
+                quantity: Quantity::new(dec!(10)),
+                tx_hash: b256!(
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 ),
                 block_number: 500,
@@ -331,14 +360,9 @@ mod tests {
             },
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id: IssuerRequestId::new("red-123"),
-                tokenization_request_id:
-                    crate::mint::TokenizationRequestId::new("tok-123"),
-                alpaca_quantity: crate::mint::Quantity::new(
-                    rust_decimal::Decimal::from(10),
-                ),
-                dust_quantity: crate::mint::Quantity::new(
-                    rust_decimal::Decimal::ZERO,
-                ),
+                tokenization_request_id: TokenizationRequestId::new("tok-123"),
+                alpaca_quantity: Quantity::new(dec!(10)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at: Utc::now(),
             },
             RedemptionEvent::BurningFailed {
@@ -362,5 +386,213 @@ mod tests {
             matches!(view, ReceiptBurnsView::Unavailable),
             "View should remain Unavailable for non-burn events"
         );
+    }
+
+    /// Tests re-projection of receipt_burns_view from existing TokensBurned events.
+    ///
+    /// This simulates a production scenario where the view table is empty but
+    /// TokensBurned events exist in the event store. The re-projection should
+    /// scan events and populate the view.
+    #[tokio::test]
+    async fn test_reproject_burns_from_events_populates_view() {
+        let pool = setup_test_db().await;
+
+        // Insert a TokensBurned event directly into the event store
+        let aggregate_id = "red-reproject-123";
+        let receipt_id = uint!(42_U256);
+        let shares_burned = uint!(100_000000000000000000_U256);
+
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("iss-mint-123"),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            receipt_id,
+            shares_burned,
+            dust_returned: U256::ZERO,
+            gas_used: 50000,
+            block_number: 1000,
+            burned_at: Utc::now(),
+        };
+
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query!(
+            r#"
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+            "#,
+            aggregate_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify view is initially empty
+        let initial_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM receipt_burns_view"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            initial_count, 0,
+            "View should be empty before re-projection"
+        );
+
+        // Run replay
+        replay_receipt_burns_view(pool.clone())
+            .await
+            .expect("Replay should succeed");
+
+        // Verify view is now populated
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                view_id as "view_id!: String",
+                json_extract(payload, '$.Burned.receipt_id') as "receipt_id: String",
+                json_extract(payload, '$.Burned.shares_burned') as "shares_burned: String"
+            FROM receipt_burns_view
+            WHERE view_id = ?
+            "#,
+            aggregate_id
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        let row = row.expect("View should have been populated");
+        assert_eq!(
+            parse_u256_hex(&row.receipt_id.unwrap()).unwrap(),
+            receipt_id
+        );
+        assert_eq!(
+            parse_u256_hex(&row.shares_burned.unwrap()).unwrap(),
+            shares_burned
+        );
+    }
+
+    /// Tests that re-projection handles multiple TokensBurned events correctly.
+    #[tokio::test]
+    async fn test_reproject_burns_handles_multiple_events() {
+        let pool = setup_test_db().await;
+
+        // Insert multiple TokensBurned events for different redemptions
+        for i in 1..=3 {
+            let aggregate_id = format!("red-multi-{i}");
+            let event = RedemptionEvent::TokensBurned {
+                issuer_request_id: IssuerRequestId::new(&format!(
+                    "iss-mint-{i}"
+                )),
+                tx_hash: b256!(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                receipt_id: U256::from(i),
+                shares_burned: U256::from(i * 100),
+                dust_returned: U256::ZERO,
+                gas_used: 50000,
+                block_number: 1000 + i as u64,
+                burned_at: Utc::now(),
+            };
+
+            let payload = serde_json::to_string(&event).unwrap();
+            sqlx::query!(
+                r#"
+                INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
+                VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+                "#,
+                aggregate_id,
+                payload
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        replay_receipt_burns_view(pool.clone())
+            .await
+            .expect("Replay should succeed");
+
+        // Verify all three burns were projected
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM receipt_burns_view"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(count, 3, "All three burns should be in the view");
+    }
+
+    /// Tests that re-projection is idempotent - running it twice doesn't duplicate entries.
+    #[tokio::test]
+    async fn test_reproject_burns_is_idempotent() {
+        let pool = setup_test_db().await;
+
+        let aggregate_id = "red-idempotent-123";
+        let event = RedemptionEvent::TokensBurned {
+            issuer_request_id: IssuerRequestId::new("iss-mint-123"),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            receipt_id: uint!(42_U256),
+            shares_burned: uint!(100_000000000000000000_U256),
+            dust_returned: U256::ZERO,
+            gas_used: 50000,
+            block_number: 1000,
+            burned_at: Utc::now(),
+        };
+
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query!(
+            r#"
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+            "#,
+            aggregate_id,
+            payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Run replay twice
+        replay_receipt_burns_view(pool.clone())
+            .await
+            .expect("First replay should succeed");
+
+        replay_receipt_burns_view(pool.clone())
+            .await
+            .expect("Second replay should succeed");
+
+        // Verify only one entry exists
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM receipt_burns_view WHERE view_id = ?",
+            aggregate_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+
+        assert_eq!(count, 1, "Re-projection should be idempotent");
     }
 }
