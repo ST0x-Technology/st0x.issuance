@@ -1649,4 +1649,82 @@ mod tests {
             "Expected Completed state after recovery, got {updated_aggregate:?}"
         );
     }
+
+    #[tokio::test]
+    async fn test_recover_burn_failed_skips_when_balance_insufficient() {
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        // Configure mock to return balance less than required (100 shares = 100e18)
+        let blockchain_service_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_share_balance(uint!(50_000000000000000000_U256)),
+        );
+        let blockchain_service =
+            blockchain_service_mock.clone() as Arc<dyn VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id =
+            IssuerRequestId::new("red-burn-failed-insufficient");
+
+        seed_receipt_with_balance(
+            pool,
+            "mint-burn-failed-insufficient",
+            uint!(99_U256),
+            "AAPL",
+            "tAAPL",
+            uint!(100_000000000000000000_U256),
+        )
+        .await;
+
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        cqrs.execute(
+            &issuer_request_id.0,
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "RPC timeout".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed state before recovery, got {aggregate:?}"
+        );
+
+        // Recovery should skip due to insufficient balance
+        manager.recover_burn_failed_redemptions().await;
+
+        // No burn should have been attempted
+        assert_eq!(
+            blockchain_service_mock.get_burn_with_dust_call_count(),
+            0,
+            "Should not call burn when on-chain balance is insufficient"
+        );
+
+        // Aggregate should stay in Failed state (not re-fail or change)
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated_aggregate, Redemption::Failed { .. }),
+            "Expected Failed state unchanged when balance insufficient, got {updated_aggregate:?}"
+        );
+    }
 }

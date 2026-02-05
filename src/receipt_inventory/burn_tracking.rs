@@ -611,4 +611,62 @@ mod tests {
 
         assert_eq!(count, 1, "Re-projection should be idempotent");
     }
+
+    #[tokio::test]
+    async fn test_find_receipt_errors_when_burns_exceed_initial_amount() {
+        let pool = setup_test_db().await;
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        let initial_amount = uint!(50_000000000000000000_U256);
+        let shares_burned = uint!(100_000000000000000000_U256); // More than initial
+
+        let receipt_view = ReceiptInventoryView::Active {
+            receipt_id: uint!(42_U256),
+            underlying: underlying.clone(),
+            token: TokenSymbol::new("tAAPL"),
+            initial_amount,
+            current_balance: initial_amount,
+            minted_at: Utc::now(),
+        };
+        let receipt_payload = serde_json::to_string(&receipt_view).unwrap();
+
+        sqlx::query!(
+            "INSERT INTO receipt_inventory_view (view_id, version, payload) \
+             VALUES (?, 1, ?)",
+            "iss-123",
+            receipt_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let burn_view = ReceiptBurnsView::Burned {
+            receipt_id: uint!(42_U256),
+            redemption_issuer_request_id: IssuerRequestId::new("red-456"),
+            shares_burned,
+            burned_at: Utc::now(),
+        };
+        let burn_payload = serde_json::to_string(&burn_view).unwrap();
+
+        sqlx::query!(
+            "INSERT INTO receipt_burns_view (view_id, version, payload) \
+             VALUES (?, 1, ?)",
+            "red-456",
+            burn_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result =
+            find_receipt_with_available_balance(&pool, &underlying, U256::ZERO)
+                .await;
+
+        let err =
+            result.expect_err("Should return error when burns exceed initial");
+        assert!(
+            matches!(err, BurnTrackingError::BurnsExceedInitialAmount { .. }),
+            "Expected BurnsExceedInitialAmount, got {err:?}"
+        );
+    }
 }
