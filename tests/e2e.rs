@@ -266,16 +266,20 @@ fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
     })
 }
 
+struct RedemptionState {
+    issuer_request_id: String,
+    tx_hash: String,
+    qty: String,
+}
+
 fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
     user_wallet: Address,
 ) -> (Mock, Mock) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
-    let shared_issuer_id = Arc::new(Mutex::new(String::new()));
-    let shared_tx_hash = Arc::new(Mutex::new(String::new()));
+    let shared_state = Arc::new(Mutex::new(Vec::<RedemptionState>::new()));
 
-    let shared_issuer_id_clone = Arc::clone(&shared_issuer_id);
-    let shared_tx_hash_clone = Arc::clone(&shared_tx_hash);
+    let shared_state_redeem = Arc::clone(&shared_state);
 
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
@@ -291,22 +295,23 @@ fn setup_redemption_mocks(
                 let issuer_request_id =
                     body["issuer_request_id"].as_str().unwrap().to_string();
                 let tx_hash = body["tx_hash"].as_str().unwrap().to_string();
+                let qty = body["qty"].as_str().unwrap().to_string();
 
-                shared_issuer_id_clone
-                    .lock()
-                    .unwrap()
-                    .clone_from(&issuer_request_id);
-                shared_tx_hash_clone.lock().unwrap().clone_from(&tx_hash);
+                shared_state_redeem.lock().unwrap().push(RedemptionState {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: tx_hash.clone(),
+                    qty: qty.clone(),
+                });
 
                 let response_body = serde_json::to_string(&json!({
-                    "tokenization_request_id": "tok-redeem-123",
+                    "tokenization_request_id": format!("tok-redeem-{}", issuer_request_id),
                     "issuer_request_id": issuer_request_id,
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
-                    "qty": "50",
+                    "qty": qty,
                     "issuer": "test-issuer",
                     "network": "base",
                     "wallet_address": user_wallet,
@@ -333,26 +338,26 @@ fn setup_redemption_mocks(
 
         then.status(200).respond_with(
             move |_req: &httpmock::HttpMockRequest| {
-                let issuer_request_id =
-                    shared_issuer_id.lock().unwrap().clone();
-                let tx_hash = shared_tx_hash.lock().unwrap().clone();
+                let states = shared_state.lock().unwrap();
+                let responses: Vec<_> = states.iter().map(|state| {
+                    json!({
+                        "tokenization_request_id": format!("tok-redeem-{}", state.issuer_request_id),
+                        "issuer_request_id": state.issuer_request_id,
+                        "created_at": "2025-09-12T17:28:48.642437-04:00",
+                        "type": "redeem",
+                        "status": "completed",
+                        "underlying_symbol": "AAPL",
+                        "token_symbol": "tAAPL",
+                        "qty": state.qty,
+                        "issuer": "test-issuer",
+                        "network": "base",
+                        "wallet_address": user_wallet,
+                        "tx_hash": state.tx_hash,
+                        "fees": "0.5"
+                    })
+                }).collect();
 
-                let response_body = serde_json::to_string(&json!([{
-                    "tokenization_request_id": "tok-redeem-123",
-                    "issuer_request_id": issuer_request_id,
-                    "created_at": "2025-09-12T17:28:48.642437-04:00",
-                    "type": "redeem",
-                    "status": "completed",
-                    "underlying_symbol": "AAPL",
-                    "token_symbol": "tAAPL",
-                    "qty": "50",
-                    "issuer": "test-issuer",
-                    "network": "base",
-                    "wallet_address": user_wallet,
-                    "tx_hash": tx_hash,
-                    "fees": "0.5"
-                }]))
-                .unwrap();
+                let response_body = serde_json::to_string(&responses).unwrap();
 
                 httpmock::HttpMockResponse {
                     status: Some(200),
@@ -826,6 +831,208 @@ async fn test_mint_burn_mint_nonce_synchronization()
     assert!(
         final_balance > U256::ZERO,
         "User should have shares after second mint"
+    );
+
+    Ok(())
+}
+
+/// Tests that receipt inventory view is correctly updated after burns.
+///
+/// This test reproduces the production bug where the receipt_inventory_view
+/// is NOT updated at the mint's aggregate_id after a burn. The bug occurs
+/// because GenericQuery uses aggregate_id as view_id, but:
+/// - Mint aggregate_id is a UUID like "99fe5878-aba2-4d9b-aded-5ebdbda2917a"
+/// - Redemption aggregate_id is "red-xxx"
+///
+/// So when a burn happens, the view update goes to "red-xxx" (creating an
+/// "Unavailable" record there) instead of updating the receipt at the mint's UUID.
+///
+/// The test verifies:
+/// 1. After mint: receipt_inventory_view has correct initial_amount and current_balance
+/// 2. After burn: current_balance should be decremented
+///
+/// With the bug: current_balance remains unchanged after burn.
+#[tokio::test]
+async fn test_receipt_inventory_view_updated_after_burn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    // Use file-based database so we can query it directly
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_receipt_inventory.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        setup_redemption_mocks(&mock_alpaca, user_wallet);
+
+    let config = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    seed_tokenized_asset(&client, evm.vault_address).await;
+
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Setup user provider
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    // Setup account and perform mint
+    let link_body = setup_account(&client, user_wallet).await;
+
+    let mint_response = client
+        .post("/inkind/issuance")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-inventory",
+                "qty": "50.0",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "network": "base",
+                "client_id": link_body.client_id,
+                "wallet_address": user_wallet
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(mint_response.status(), rocket::http::Status::Ok);
+    let mint_body: MintResponse = mint_response.into_json().await.unwrap();
+    let issuer_request_id = mint_body.issuer_request_id.to_string();
+
+    let confirm_response = client
+        .post("/inkind/issuance/confirm")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-inventory",
+                "issuer_request_id": mint_body.issuer_request_id,
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
+
+    // Wait for shares to be minted
+    let shares_minted = wait_for_shares(&vault, user_wallet).await?;
+    assert!(shares_minted > U256::ZERO, "Mint should create shares");
+
+    // Query receipt_inventory_view to get initial state
+    let query_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await?;
+
+    let initial_view: (String,) = sqlx::query_as(
+        "SELECT payload FROM receipt_inventory_view WHERE view_id = ?",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(&query_pool)
+    .await?;
+
+    let initial_payload: serde_json::Value =
+        serde_json::from_str(&initial_view.0)?;
+    let initial_balance = initial_payload["Active"]["current_balance"]
+        .as_str()
+        .expect("Should have current_balance");
+
+    assert_eq!(
+        initial_balance,
+        format!("{shares_minted:#x}"),
+        "Initial balance should match minted shares"
+    );
+
+    // Transfer all shares to bot wallet to trigger redemption
+    vault
+        .transfer(bot_wallet, shares_minted)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Wait for burn to complete
+    wait_for_burn(&vault, bot_wallet).await?;
+
+    // Query receipt_inventory_view AFTER burn
+    let after_burn_view: (String,) = sqlx::query_as(
+        "SELECT payload FROM receipt_inventory_view WHERE view_id = ?",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(&query_pool)
+    .await?;
+
+    let after_burn_payload: serde_json::Value =
+        serde_json::from_str(&after_burn_view.0)?;
+
+    // The view should now be Depleted (balance = 0) or Active with reduced balance
+    // With the bug: it will still show the initial balance because the update
+    // went to "red-xxx" instead of the mint's issuer_request_id
+    let final_balance = if after_burn_payload.get("Depleted").is_some() {
+        U256::ZERO
+    } else {
+        let balance_hex = after_burn_payload["Active"]["current_balance"]
+            .as_str()
+            .expect("Should have current_balance in Active state");
+        U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)?
+    };
+
+    // This assertion will FAIL with the bug - balance stays at initial_amount
+    assert_eq!(
+        final_balance,
+        U256::ZERO,
+        "Receipt inventory should show zero balance after full burn. \
+         Initial balance was {initial_balance}, but after burn it shows {final_balance:#x}. \
+         This indicates the view was NOT updated at the mint's aggregate_id."
+    );
+
+    // Also verify that no spurious "red-xxx" records were created
+    let red_records: Vec<(String, String)> = sqlx::query_as(
+        "SELECT view_id, payload FROM receipt_inventory_view WHERE view_id LIKE 'red-%'"
+    )
+    .fetch_all(&query_pool)
+    .await?;
+
+    assert!(
+        red_records.is_empty(),
+        "No receipt_inventory_view records should exist at redemption aggregate IDs. \
+         Found {} records: {:?}",
+        red_records.len(),
+        red_records.iter().map(|(id, _)| id).collect::<Vec<_>>()
     );
 
     Ok(())
