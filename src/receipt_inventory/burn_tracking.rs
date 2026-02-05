@@ -92,7 +92,7 @@ fn parse_u256_hex(s: &str) -> Result<U256, ParseError> {
 /// # Errors
 ///
 /// Returns `BurnTrackingError::Replay` if event replay fails.
-pub async fn replay_receipt_burns_view(
+pub(crate) async fn replay_receipt_burns_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), BurnTrackingError> {
     let view_repo =
@@ -120,7 +120,7 @@ pub async fn replay_receipt_burns_view(
 ///
 /// Returns `BurnTrackingError::Database` if a database query fails.
 /// Returns `BurnTrackingError::Parse` if a U256 hex value cannot be parsed.
-pub async fn find_receipt_with_available_balance(
+pub(crate) async fn find_receipt_with_available_balance(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
     minimum_balance: U256,
@@ -487,10 +487,10 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Insert multiple TokensBurned events for different redemptions
-        for i in 1..=3 {
+        for i in 1_u64..=3 {
             let aggregate_id = format!("red-multi-{i}");
             let event = RedemptionEvent::TokensBurned {
-                issuer_request_id: IssuerRequestId::new(&format!(
+                issuer_request_id: IssuerRequestId::new(format!(
                     "iss-mint-{i}"
                 )),
                 tx_hash: b256!(
@@ -500,7 +500,7 @@ mod tests {
                 shares_burned: U256::from(i * 100),
                 dust_returned: U256::ZERO,
                 gas_used: 50000,
-                block_number: 1000 + i as u64,
+                block_number: 1000 + i,
                 burned_at: Utc::now(),
             };
 

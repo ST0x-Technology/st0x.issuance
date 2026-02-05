@@ -1,12 +1,15 @@
 use alloy::primitives::{Address, B256};
 use chrono::{DateTime, Utc};
-use cqrs_es::{EventEnvelope, View};
+use cqrs_es::persist::{GenericQuery, QueryReplay};
+use cqrs_es::{AggregateError, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-use crate::redemption::{Redemption, RedemptionEvent};
+use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,8 @@ pub(crate) enum RedemptionView {
         token: TokenSymbol,
         wallet: Address,
         quantity: Quantity,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
@@ -41,6 +46,8 @@ pub(crate) enum RedemptionView {
         token: TokenSymbol,
         wallet: Address,
         quantity: Quantity,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
@@ -65,6 +72,8 @@ pub(crate) enum RedemptionView {
         token: TokenSymbol,
         wallet: Address,
         quantity: Quantity,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
@@ -86,6 +95,8 @@ impl RedemptionView {
         &mut self,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
         called_at: DateTime<Utc>,
     ) {
         let Self::Detected {
@@ -109,6 +120,8 @@ impl RedemptionView {
             token: token.clone(),
             wallet: *wallet,
             quantity: quantity.clone(),
+            alpaca_quantity,
+            dust_quantity,
             tx_hash: *tx_hash,
             block_number: *block_number,
             detected_at: *detected_at,
@@ -127,6 +140,8 @@ impl RedemptionView {
             token,
             wallet,
             quantity,
+            alpaca_quantity,
+            dust_quantity,
             tx_hash,
             block_number,
             detected_at,
@@ -144,11 +159,52 @@ impl RedemptionView {
             token: token.clone(),
             wallet: *wallet,
             quantity: quantity.clone(),
+            alpaca_quantity: alpaca_quantity.clone(),
+            dust_quantity: dust_quantity.clone(),
             tx_hash: *tx_hash,
             block_number: *block_number,
             detected_at: *detected_at,
             called_at: *called_at,
             alpaca_journal_completed_at,
+        };
+    }
+
+    fn update_burning_failed(&mut self, error: &str, failed_at: DateTime<Utc>) {
+        let Self::Burning {
+            issuer_request_id,
+            tokenization_request_id,
+            underlying,
+            token,
+            wallet,
+            quantity,
+            alpaca_quantity,
+            dust_quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at,
+        } = self
+        else {
+            return;
+        };
+
+        *self = Self::BurnFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            alpaca_quantity: alpaca_quantity.clone(),
+            dust_quantity: dust_quantity.clone(),
+            tx_hash: *tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+            called_at: *called_at,
+            alpaca_journal_completed_at: *alpaca_journal_completed_at,
+            error: error.to_string(),
+            failed_at,
         };
     }
 }
@@ -180,12 +236,15 @@ impl View<Redemption> for RedemptionView {
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id,
                 tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
                 called_at,
-                ..
             } => {
                 self.update_alpaca_called(
                     issuer_request_id.clone(),
                     tokenization_request_id.clone(),
+                    alpaca_quantity.clone(),
+                    dust_quantity.clone(),
                     *called_at,
                 );
             }
@@ -207,38 +266,7 @@ impl View<Redemption> for RedemptionView {
             }
 
             RedemptionEvent::BurningFailed { error, failed_at, .. } => {
-                if let Self::Burning {
-                    issuer_request_id,
-                    tokenization_request_id,
-                    underlying,
-                    token,
-                    wallet,
-                    quantity,
-                    tx_hash,
-                    block_number,
-                    detected_at,
-                    called_at,
-                    alpaca_journal_completed_at,
-                } = self
-                {
-                    *self = Self::BurnFailed {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tokenization_request_id: tokenization_request_id
-                            .clone(),
-                        underlying: underlying.clone(),
-                        token: token.clone(),
-                        wallet: *wallet,
-                        quantity: quantity.clone(),
-                        tx_hash: *tx_hash,
-                        block_number: *block_number,
-                        detected_at: *detected_at,
-                        called_at: *called_at,
-                        alpaca_journal_completed_at:
-                            *alpaca_journal_completed_at,
-                        error: error.clone(),
-                        failed_at: *failed_at,
-                    };
-                }
+                self.update_burning_failed(error, *failed_at);
             }
 
             RedemptionEvent::AlpacaJournalCompleted {
@@ -274,6 +302,30 @@ pub(crate) enum RedemptionViewError {
     Database(#[from] sqlx::Error),
     #[error("JSON deserialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Replay error: {0}")]
+    Replay(#[from] AggregateError<RedemptionError>),
+}
+
+/// Replays all `Redemption` events through the `redemption_view`.
+///
+/// Uses `QueryReplay` to re-project the view from existing events in the event store.
+/// This is used at startup to ensure the view includes new fields (alpaca_quantity,
+/// dust_quantity) that were added after the original events were stored.
+pub async fn replay_redemption_view(
+    pool: Pool<Sqlite>,
+) -> Result<(), RedemptionViewError> {
+    let view_repo =
+        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+            pool.clone(),
+            "redemption_view".to_string(),
+        ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    Ok(())
 }
 
 /// Finds all redemptions in the `Detected` state.
@@ -397,6 +449,44 @@ mod tests {
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{OperationType, ReceiptInformation};
+
+    fn make_detected_envelope(
+        aggregate_id: &str,
+        sequence: usize,
+        event: RedemptionEvent,
+    ) -> EventEnvelope<Redemption> {
+        EventEnvelope::<Redemption> {
+            aggregate_id: aggregate_id.to_string(),
+            sequence,
+            payload: event,
+            metadata: HashMap::default(),
+        }
+    }
+
+    async fn insert_event_raw(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query!(
+            r#"
+            INSERT INTO events (
+                aggregate_type, aggregate_id, sequence,
+                event_type, event_version, payload, metadata
+            )
+            VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+            "#,
+            aggregate_id,
+            sequence,
+            event_type,
+            payload
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     struct TestHarness {
         pool: sqlx::Pool<sqlx::Sqlite>,
@@ -639,6 +729,8 @@ mod tests {
             token: view_token,
             wallet: view_wallet,
             quantity: view_quantity,
+            alpaca_quantity: view_alpaca_quantity,
+            dust_quantity: view_dust_quantity,
             tx_hash: view_tx_hash,
             block_number: view_block_number,
             detected_at: view_detected_at,
@@ -654,6 +746,8 @@ mod tests {
         assert_eq!(view_token, token);
         assert_eq!(view_wallet, wallet);
         assert_eq!(view_quantity, quantity);
+        assert_eq!(view_alpaca_quantity, quantity);
+        assert_eq!(view_dust_quantity, Quantity::new(Decimal::ZERO));
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_detected_at, detected_at);
@@ -725,6 +819,8 @@ mod tests {
             token: view_token,
             wallet: view_wallet,
             quantity: view_quantity,
+            alpaca_quantity: view_alpaca_quantity,
+            dust_quantity: view_dust_quantity,
             tx_hash: view_tx_hash,
             block_number: view_block_number,
             detected_at: view_detected_at,
@@ -741,6 +837,8 @@ mod tests {
         assert_eq!(view_token, token);
         assert_eq!(view_wallet, wallet);
         assert_eq!(view_quantity, quantity);
+        assert_eq!(view_alpaca_quantity, quantity);
+        assert_eq!(view_dust_quantity, Quantity::new(Decimal::ZERO));
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_detected_at, detected_at);
@@ -1161,8 +1259,8 @@ mod tests {
     #[test]
     fn test_view_updates_on_burning_failed_event() {
         let mut view = RedemptionView::default();
-
-        let issuer_request_id = IssuerRequestId::new("red-burn-failed-123");
+        let id = "red-burn-failed-123";
+        let issuer_request_id = IssuerRequestId::new(id);
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-failed-456");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1179,11 +1277,10 @@ mod tests {
         let error = "On-chain burn failed: insufficient gas".to_string();
         let failed_at = Utc::now();
 
-        // Progress through states: Detected -> AlpacaCalled -> Burning
-        view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
-            sequence: 1,
-            payload: RedemptionEvent::Detected {
+        view.update(&make_detected_envelope(
+            id,
+            1,
+            RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
@@ -1193,48 +1290,40 @@ mod tests {
                 block_number,
                 detected_at,
             },
-            metadata: HashMap::default(),
-        });
+        ));
 
-        view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
-            sequence: 2,
-            payload: RedemptionEvent::AlpacaCalled {
+        view.update(&make_detected_envelope(
+            id,
+            2,
+            RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
                 alpaca_quantity: quantity.clone(),
                 dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at,
             },
-            metadata: HashMap::default(),
-        });
+        ));
 
-        view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
-            sequence: 3,
-            payload: RedemptionEvent::AlpacaJournalCompleted {
+        view.update(&make_detected_envelope(
+            id,
+            3,
+            RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: issuer_request_id.clone(),
                 alpaca_journal_completed_at,
             },
-            metadata: HashMap::default(),
-        });
+        ));
 
-        assert!(
-            matches!(view, RedemptionView::Burning { .. }),
-            "Should be in Burning state before BurningFailed"
-        );
+        assert!(matches!(view, RedemptionView::Burning { .. }));
 
-        // Now apply BurningFailed
-        view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
-            sequence: 4,
-            payload: RedemptionEvent::BurningFailed {
+        view.update(&make_detected_envelope(
+            id,
+            4,
+            RedemptionEvent::BurningFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
                 failed_at,
             },
-            metadata: HashMap::default(),
-        });
+        ));
 
         let RedemptionView::BurnFailed {
             issuer_request_id: view_id,
@@ -1243,13 +1332,12 @@ mod tests {
             token: view_token,
             wallet: view_wallet,
             quantity: view_quantity,
+            alpaca_quantity: view_alpaca_quantity,
+            dust_quantity: view_dust_quantity,
             tx_hash: view_tx_hash,
             block_number: view_block_number,
-            detected_at: view_detected_at,
-            called_at: view_called_at,
-            alpaca_journal_completed_at: view_alpaca_journal_completed_at,
             error: view_error,
-            failed_at: view_failed_at,
+            ..
         } = view
         else {
             panic!("Expected BurnFailed view, got {view:?}");
@@ -1261,16 +1349,11 @@ mod tests {
         assert_eq!(view_token, token);
         assert_eq!(view_wallet, wallet);
         assert_eq!(view_quantity, quantity);
+        assert_eq!(view_alpaca_quantity, quantity);
+        assert_eq!(view_dust_quantity, Quantity::new(Decimal::ZERO));
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_block_number, block_number);
-        assert_eq!(view_detected_at, detected_at);
-        assert_eq!(view_called_at, called_at);
-        assert_eq!(
-            view_alpaca_journal_completed_at,
-            alpaca_journal_completed_at
-        );
         assert_eq!(view_error, error);
-        assert_eq!(view_failed_at, failed_at);
     }
 
     #[tokio::test]
@@ -1343,5 +1426,103 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0.0, burn_failed_id);
         assert!(matches!(result[0].1, RedemptionView::BurnFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_replay_redemption_view_populates_from_events() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let id = "red-replay-123";
+        let quantity = Quantity::new(Decimal::from(100));
+
+        let detected_event = RedemptionEvent::Detected {
+            issuer_request_id: IssuerRequestId::new(id),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: quantity.clone(),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            block_number: 12345,
+            detected_at: Utc::now(),
+        };
+
+        let detected_payload = serde_json::to_string(&detected_event).unwrap();
+        insert_event_raw(
+            &pool,
+            id,
+            1,
+            "RedemptionEvent::Detected",
+            &detected_payload,
+        )
+        .await;
+
+        let alpaca_called_event = RedemptionEvent::AlpacaCalled {
+            issuer_request_id: IssuerRequestId::new(id),
+            tokenization_request_id: TokenizationRequestId::new(
+                "tok-replay-123",
+            ),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::new(Decimal::ZERO),
+            called_at: Utc::now(),
+        };
+
+        let alpaca_payload =
+            serde_json::to_string(&alpaca_called_event).unwrap();
+        insert_event_raw(
+            &pool,
+            id,
+            2,
+            "RedemptionEvent::AlpacaCalled",
+            &alpaca_payload,
+        )
+        .await;
+
+        let initial_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM redemption_view"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(initial_count, 0, "View should be empty before replay");
+
+        super::replay_redemption_view(pool.clone())
+            .await
+            .expect("Replay should succeed");
+
+        let row = sqlx::query!(
+            r#"SELECT payload as "payload!: String" FROM redemption_view WHERE view_id = ?"#,
+            id
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        let row = row.expect("View should be populated after replay");
+        let view: RedemptionView = serde_json::from_str(&row.payload).unwrap();
+
+        let RedemptionView::AlpacaCalled {
+            issuer_request_id: view_id,
+            alpaca_quantity: view_alpaca_qty,
+            dust_quantity: view_dust_qty,
+            ..
+        } = view
+        else {
+            panic!("Expected AlpacaCalled view, got {view:?}");
+        };
+
+        assert_eq!(view_id.0, id);
+        assert_eq!(view_alpaca_qty, quantity);
+        assert_eq!(view_dust_qty, Quantity::new(Decimal::ZERO));
     }
 }

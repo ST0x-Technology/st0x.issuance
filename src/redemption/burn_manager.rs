@@ -10,8 +10,8 @@ use super::view::{
 };
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::mint::QuantityConversionError;
-use crate::receipt_inventory::view::{
-    ReceiptInventoryViewError, find_receipt_with_balance,
+use crate::receipt_inventory::burn_tracking::{
+    BurnTrackingError, find_receipt_with_available_balance,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
@@ -154,6 +154,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             wallet,
             tokenization_request_id,
             quantity,
+            alpaca_quantity,
+            dust_quantity,
             ..
         } = view
         else {
@@ -171,13 +173,18 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                     underlying: underlying.0.clone(),
                 })?;
 
-        let burn_shares = quantity.to_u256_with_18_decimals()?;
+        let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
+        let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
+
+        let total_shares = burn_shares
+            .checked_add(dust_shares)
+            .ok_or(BurnManagerError::SharesOverflow)?;
 
         let receipt_id = self
             .select_receipt_for_retry(
                 issuer_request_id,
                 underlying,
-                burn_shares,
+                total_shares,
             )
             .await?;
 
@@ -193,6 +200,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         info!(
             issuer_request_id = %issuer_request_id.0,
+            burn_shares = %burn_shares,
+            dust_shares = %dust_shares,
             "Retrying burn for BurnFailed redemption"
         );
 
@@ -203,6 +212,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
                     burn_shares,
+                    dust_shares,
                     receipt_id,
                     owner: self.bot_wallet,
                     receipt_info,
@@ -225,20 +235,19 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         underlying: &UnderlyingSymbol,
         shares: U256,
     ) -> Result<U256, BurnManagerError> {
-        let receipt_view = find_receipt_with_balance(
+        let receipt_view = find_receipt_with_available_balance(
             &self.receipt_query_pool,
             underlying,
             shares,
         )
         .await?;
 
-        let Some(receipt_view) = receipt_view else {
-            let error_msg = format!(
-                "No receipt found with sufficient balance for {shares} shares of {underlying}"
-            );
+        let Some(receipt) = receipt_view else {
             warn!(
                 issuer_request_id = %issuer_request_id,
-                "{error_msg}"
+                %shares,
+                %underlying,
+                "No receipt found with sufficient balance"
             );
             return Err(BurnManagerError::InsufficientBalance {
                 required: shares,
@@ -246,18 +255,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             });
         };
 
-        let crate::receipt_inventory::view::ReceiptInventoryView::Active {
-            receipt_id,
-            ..
-        } = receipt_view
-        else {
-            return Err(BurnManagerError::InsufficientBalance {
-                required: shares,
-                available: U256::ZERO,
-            });
-        };
-
-        Ok(receipt_id)
+        Ok(receipt.receipt_id)
     }
 
     async fn recover_single_burning(
@@ -466,40 +464,26 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         underlying: &UnderlyingSymbol,
         shares: U256,
     ) -> Result<U256, BurnManagerError> {
-        let receipt_view = find_receipt_with_balance(
+        let receipt_view = find_receipt_with_available_balance(
             &self.receipt_query_pool,
             underlying,
             shares,
         )
         .await?;
 
-        let Some(receipt_view) = receipt_view else {
+        let Some(receipt) = receipt_view else {
             return self
                 .handle_no_receipt_found(issuer_request_id, underlying, shares)
                 .await;
         };
 
-        let crate::receipt_inventory::view::ReceiptInventoryView::Active {
-            receipt_id,
-            ..
-        } = receipt_view
-        else {
-            return self
-                .handle_receipt_not_active(
-                    issuer_request_id,
-                    underlying,
-                    shares,
-                )
-                .await;
-        };
-
         info!(
             issuer_request_id = %issuer_request_id,
-            receipt_id = %receipt_id,
+            receipt_id = %receipt.receipt_id,
             "Selected receipt for burning"
         );
 
-        Ok(receipt_id)
+        Ok(receipt.receipt_id)
     }
 
     async fn handle_no_receipt_found(
@@ -533,37 +517,6 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             issuer_request_id = %issuer_request_id,
             "RecordBurnFailure command executed successfully"
         );
-
-        Err(BurnManagerError::InsufficientBalance {
-            required: shares,
-            available: U256::ZERO,
-        })
-    }
-
-    async fn handle_receipt_not_active(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        underlying: &UnderlyingSymbol,
-        shares: U256,
-    ) -> Result<U256, BurnManagerError> {
-        let error_msg = format!(
-            "Receipt found but not in Active state for {shares} shares of {underlying}"
-        );
-
-        warn!(
-            issuer_request_id = %issuer_request_id,
-            "{error_msg}"
-        );
-
-        self.cqrs
-            .execute(
-                &issuer_request_id.0,
-                RedemptionCommand::RecordBurnFailure {
-                    issuer_request_id: issuer_request_id.clone(),
-                    error: error_msg.clone(),
-                },
-            )
-            .await?;
 
         Err(BurnManagerError::InsufficientBalance {
             required: shares,
@@ -657,7 +610,7 @@ pub(crate) enum BurnManagerError {
     #[error("Insufficient balance: required {required}, available {available}")]
     InsufficientBalance { required: U256, available: U256 },
     #[error("Receipt inventory error: {0}")]
-    ReceiptInventory(#[from] ReceiptInventoryViewError),
+    BurnTracking(#[from] BurnTrackingError),
     #[error("Redemption view error: {0}")]
     RedemptionView(#[from] RedemptionViewError),
     #[error("Tokenized asset view error: {0}")]

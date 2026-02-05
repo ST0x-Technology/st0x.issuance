@@ -1,9 +1,7 @@
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
 
 use crate::mint::{Mint, MintEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -122,77 +120,12 @@ impl View<Mint> for ReceiptInventoryView {
     }
 }
 
-/// Lists all Active receipts for a given underlying symbol.
-///
-/// Returns only receipts in the Active state (has available balance > 0).
-/// Pending, Unavailable, and Depleted receipts are excluded.
-///
-/// # Use Case
-/// View all available receipt inventory for a specific asset, useful for
-/// operational dashboards and manual receipt selection.
-pub(crate) async fn list_active_receipts(
-    pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
-) -> Result<Vec<ReceiptInventoryView>, ReceiptInventoryViewError> {
-    let underlying_str = &underlying.0;
-    let rows = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM receipt_inventory_view
-        WHERE json_extract(payload, '$.Active.underlying') = ?
-        "#,
-        underlying_str
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let views: Result<Vec<ReceiptInventoryView>, serde_json::Error> = rows
-        .into_iter()
-        .map(|row| serde_json::from_str(&row.payload))
-        .collect();
-
-    Ok(views?)
-}
-
-/// Finds a receipt with sufficient balance for a given underlying symbol.
-///
-/// Returns the receipt with the highest balance that meets or exceeds the
-/// minimum balance requirement. Returns `None` if no receipt has sufficient
-/// balance.
-///
-/// # Use Case
-/// Primary method for selecting which receipt to burn from during redemption.
-/// The burn logic will call this to find a suitable receipt, then use that
-/// receipt's ID in the vault.withdraw() call.
-pub(crate) async fn find_receipt_with_balance(
-    pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
-    minimum_balance: U256,
-) -> Result<Option<ReceiptInventoryView>, ReceiptInventoryViewError> {
-    let receipts = list_active_receipts(pool, underlying).await?;
-
-    Ok(receipts
-        .into_iter()
-        .filter_map(|view| match view {
-            ReceiptInventoryView::Active { current_balance, .. }
-                if current_balance >= minimum_balance =>
-            {
-                Some((current_balance, view))
-            }
-            _ => None,
-        })
-        .sorted_by(|(a, _), (b, _)| b.cmp(a))
-        .map(|(_, view)| view)
-        .next())
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
     use cqrs_es::EventEnvelope;
     use rust_decimal::Decimal;
-    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
 
     use super::*;
@@ -200,21 +133,6 @@ mod tests {
         ClientId, IssuerRequestId, Mint, MintEvent, Network, Quantity,
         TokenizationRequestId,
     };
-
-    async fn setup_test_db() -> Pool<Sqlite> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        pool
-    }
 
     #[test]
     fn test_unavailable_to_pending_on_mint_initiated() {
@@ -508,186 +426,5 @@ mod tests {
 
             assert_eq!(view, original_view);
         }
-    }
-
-    #[tokio::test]
-    async fn test_list_active_receipts_returns_only_active() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("GOOG");
-
-        let active_view1 = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tGOOG"),
-            initial_amount: uint!(100_000000000000000000_U256),
-            current_balance: uint!(100_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let active_view2 = ReceiptInventoryView::Active {
-            receipt_id: uint!(2_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tGOOG"),
-            initial_amount: uint!(50_000000000000000000_U256),
-            current_balance: uint!(50_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let pending_view = ReceiptInventoryView::Pending {
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tGOOG"),
-        };
-
-        let payload1 =
-            serde_json::to_string(&active_view1).expect("Failed to serialize");
-        let payload2 =
-            serde_json::to_string(&active_view2).expect("Failed to serialize");
-        let payload3 =
-            serde_json::to_string(&pending_view).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-1",
-            payload1
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-2",
-            payload2
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-3",
-            payload3
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        let results = list_active_receipts(&pool, &underlying)
-            .await
-            .expect("Query should succeed");
-
-        assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|v| matches!(v, ReceiptInventoryView::Active { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_receipt_with_balance_returns_highest() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("AMZN");
-
-        let view1 = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tAMZN"),
-            initial_amount: uint!(50_000000000000000000_U256),
-            current_balance: uint!(50_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let view2 = ReceiptInventoryView::Active {
-            receipt_id: uint!(2_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tAMZN"),
-            initial_amount: uint!(150_000000000000000000_U256),
-            current_balance: uint!(150_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let payload1 =
-            serde_json::to_string(&view1).expect("Failed to serialize");
-        let payload2 =
-            serde_json::to_string(&view2).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-1",
-            payload1
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-2",
-            payload2
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        let result = find_receipt_with_balance(
-            &pool,
-            &underlying,
-            uint!(40_000000000000000000_U256),
-        )
-        .await
-        .expect("Query should succeed");
-
-        assert!(result.is_some());
-
-        let ReceiptInventoryView::Active {
-            receipt_id, current_balance, ..
-        } = result.unwrap()
-        else {
-            panic!("Expected Active variant");
-        };
-
-        assert_eq!(receipt_id, uint!(2_U256));
-        assert_eq!(current_balance, uint!(150_000000000000000000_U256));
-    }
-
-    #[tokio::test]
-    async fn test_find_receipt_with_balance_returns_none_when_insufficient() {
-        let pool = setup_test_db().await;
-
-        let underlying = UnderlyingSymbol::new("META");
-
-        let view = ReceiptInventoryView::Active {
-            receipt_id: uint!(1_U256),
-            underlying: underlying.clone(),
-            token: TokenSymbol::new("tMETA"),
-            initial_amount: uint!(50_000000000000000000_U256),
-            current_balance: uint!(50_000000000000000000_U256),
-            minted_at: Utc::now(),
-        };
-
-        let payload =
-            serde_json::to_string(&view).expect("Failed to serialize");
-
-        sqlx::query!(
-            r"INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
-            "iss-1",
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert");
-
-        let result = find_receipt_with_balance(
-            &pool,
-            &underlying,
-            uint!(100_000000000000000000_U256),
-        )
-        .await
-        .expect("Query should succeed");
-
-        assert!(result.is_none());
     }
 }

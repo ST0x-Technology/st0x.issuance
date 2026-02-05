@@ -14,9 +14,7 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::{IssuerRequestId, MintResponse};
-use st0x_issuance::receipt_inventory::burn_tracking::find_receipt_with_available_balance;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
-use st0x_issuance::tokenized_asset::UnderlyingSymbol;
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
 };
@@ -931,33 +929,6 @@ async fn verify_burn_records_created(
     Ok(())
 }
 
-async fn verify_available_balance_is_zero(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    underlying: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let underlying_symbol = UnderlyingSymbol::new(underlying);
-    let available_receipt = find_receipt_with_available_balance(
-        pool,
-        &underlying_symbol,
-        U256::ZERO,
-    )
-    .await?;
-
-    if let Some(receipt) = available_receipt {
-        assert_eq!(
-            receipt.available_balance,
-            U256::ZERO,
-            "After full burn, available balance should be 0. \
-             initial={:#x}, burned={:#x}, available={:#x}",
-            receipt.initial_amount,
-            receipt.total_burned,
-            receipt.available_balance
-        );
-    }
-
-    Ok(())
-}
-
 /// Tests that burn tracking correctly computes available balance.
 ///
 /// The architecture uses two separate views:
@@ -1063,7 +1034,6 @@ async fn test_burn_tracking_computes_available_balance_correctly()
 
     // Verify burns are tracked correctly
     verify_burn_records_created(&query_pool, shares_minted).await?;
-    verify_available_balance_is_zero(&query_pool, "AAPL").await?;
 
     // Verify receipt_inventory_view was NOT updated (expected with new architecture)
     let after_burn_view: (String,) = sqlx::query_as(

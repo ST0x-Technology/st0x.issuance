@@ -23,8 +23,8 @@ use crate::vault::{BurnParams, ReceiptInformation, VaultService};
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::RedemptionEvent;
 pub(crate) use view::{
-    RedemptionView, RedemptionViewError, find_alpaca_called, find_burning,
-    find_detected,
+    RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
+    replay_redemption_view,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -13,6 +13,7 @@ use tracing::info;
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::receipt_inventory::burn_tracking::replay_receipt_burns_view;
 use crate::receipt_inventory::{ReceiptBurnsView, ReceiptInventoryView};
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -20,6 +21,7 @@ use crate::redemption::{
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
+    replay_redemption_view,
 };
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
@@ -238,6 +240,10 @@ pub async fn initialize_rocket(
             &redemption_event_store,
             &pool,
         )?;
+
+    info!("Replaying views to ensure schema updates are applied");
+    replay_redemption_view(pool.clone()).await?;
+    replay_receipt_burns_view(pool.clone()).await?;
 
     spawn_redemption_recovery(
         redeem_call.clone(),
@@ -516,6 +522,7 @@ fn spawn_redemption_recovery(
         redeem_call.recover_detected_redemptions().await;
         journal.recover_alpaca_called_redemptions().await;
         burn.recover_burning_redemptions().await;
+        burn.recover_burn_failed_redemptions().await;
     });
 }
 
