@@ -347,6 +347,15 @@ instead.
 - Methods: `watch_transfers()`, `get_transfer_details()`
 - Uses a WebSocket subscription to detect redemption events
 
+**Signing Backends (`src/fireblocks/`):**
+
+Two mutually exclusive signing backends, both implementing `VaultService` trait:
+- **Local**: `EVM_PRIVATE_KEY` → `RealBlockchainService` (dev/test)
+- **Fireblocks**: CONTRACT_CALL → `FireblocksVaultService` (prod, TAP policies)
+
+Key files: `fireblocks/mod.rs` (SignerConfig), `fireblocks/vault_service.rs`
+(FireblocksVaultService), `config.rs` (backend selection)
+
 ### Core Flows
 
 **Mint Flow:**
@@ -377,17 +386,11 @@ instead.
 
 ### Configuration
 
-Environment variables (can be set via `.env` file):
-
-- `DATABASE_URL`: SQLite database path
-- `WS_RPC_URL`: WebSocket RPC endpoint for blockchain monitoring
-- `CHAIN_ID`: Chain ID (e.g., 8453 for Base)
-- `VAULT_ADDRESS`: OffchainAssetReceiptVault contract address
-- `PRIVATE_KEY`: Bot's private key for signing blockchain transactions
-- `BOT_WALLET_ADDRESS`: Bot's wallet address (derived from private key)
-- `REDEMPTION_WALLET_ADDRESS`: Address where APs send tokens to redeem
-- Alpaca API credentials and endpoints
-- Server configuration (host, port, API key)
+See `.env.example` for full list. Key variables:
+- `DATABASE_URL`, `RPC_URL`, `VAULT_ADDRESS`
+- **Signing (choose ONE):** `EVM_PRIVATE_KEY` (local) OR Fireblocks vars
+  (`FIREBLOCKS_API_KEY`, `FIREBLOCKS_SECRET_PATH`, `FIREBLOCKS_VAULT_ACCOUNT_ID`)
+- Alpaca API credentials, `ISSUER_API_KEY`
 
 ### Code Quality & Best Practices
 

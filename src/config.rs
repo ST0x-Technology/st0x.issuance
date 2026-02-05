@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use std::sync::Arc;
@@ -9,7 +9,8 @@ use url::Url;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::fireblocks::{
-    SignerConfig, SignerConfigError, SignerEnv, SignerResolveError,
+    FireblocksVaultError, FireblocksVaultService, SignerConfig,
+    SignerConfigError, SignerEnv, SignerResolveError,
 };
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
@@ -46,14 +47,31 @@ impl Config {
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let resolved = self.signer.resolve().await?;
+        match &self.signer {
+            SignerConfig::Local(_) => {
+                let resolved = self.signer.resolve()?;
+                let provider = ProviderBuilder::new()
+                    .wallet(resolved.wallet)
+                    .connect(self.rpc_url.as_str())
+                    .await?;
+                Ok(Arc::new(RealBlockchainService::new(provider)))
+            }
 
-        let provider = ProviderBuilder::new()
-            .wallet(resolved.wallet)
-            .connect(self.rpc_url.as_str())
-            .await?;
+            SignerConfig::Fireblocks(env) => {
+                // Create a read-only provider for view calls and receipt fetching
+                let read_provider = ProviderBuilder::new()
+                    .connect(self.rpc_url.as_str())
+                    .await?;
 
-        Ok(Arc::new(RealBlockchainService::new(provider)))
+                // Get chain_id from the provider
+                let chain_id = read_provider.get_chain_id().await?;
+
+                let service =
+                    FireblocksVaultService::new(env, read_provider, chain_id)?;
+
+                Ok(Arc::new(service))
+            }
+        }
     }
 }
 
@@ -188,6 +206,8 @@ pub enum ConfigError {
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
+    #[error("Fireblocks vault service initialization failed")]
+    FireblocksVault(#[from] FireblocksVaultError),
 }
 
 pub fn setup_tracing(log_level: &LogLevel) {

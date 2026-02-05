@@ -1,18 +1,19 @@
 mod config;
-mod signer;
+pub(crate) mod vault_service;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
-use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 
 pub(crate) use config::{ChainAssetIds, FireblocksEnv};
-pub(crate) use signer::{FireblocksError, FireblocksSigner};
+pub(crate) use vault_service::{
+    FireblocksVaultError, FireblocksVaultService, fetch_vault_address,
+};
 
 /// Resolved signer: an `EthereumWallet` and the corresponding address.
 ///
-/// Consumers don't need to know which backend produced the wallet.
+/// Only used for local signing. Fireblocks path uses `FireblocksVaultService` directly.
 pub(crate) struct ResolvedSigner {
     pub(crate) wallet: EthereumWallet,
 }
@@ -77,7 +78,7 @@ pub enum SignerConfigError {
 #[derive(Debug, thiserror::Error)]
 pub enum SignerResolveError {
     #[error(transparent)]
-    Fireblocks(#[from] FireblocksError),
+    FireblocksVault(#[from] FireblocksVaultError),
     #[error("invalid EVM private key")]
     InvalidPrivateKey(#[source] alloy::signers::k256::ecdsa::Error),
 }
@@ -109,18 +110,19 @@ impl SignerEnv {
 }
 
 impl SignerConfig {
-    /// Resolve the signer config into a wallet + address.
+    /// Resolve the local signer config into a wallet.
     ///
-    /// For Fireblocks, this makes an async API call to fetch the vault address.
-    /// For local keys, this is a synchronous derivation.
-    pub(crate) async fn resolve(
-        &self,
-    ) -> Result<ResolvedSigner, SignerResolveError> {
+    /// Only valid for `SignerConfig::Local`. For Fireblocks, use
+    /// `FireblocksVaultService` directly which handles transaction submission.
+    pub(crate) fn resolve(&self) -> Result<ResolvedSigner, SignerResolveError> {
         match self {
-            Self::Fireblocks(env) => {
-                let signer = FireblocksSigner::new(env).await?;
-                let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet })
+            Self::Fireblocks(_) => {
+                // Fireblocks path should use FireblocksVaultService directly.
+                // This method should not be called for Fireblocks config.
+                unreachable!(
+                    "resolve() should not be called for Fireblocks config; \
+                     use FireblocksVaultService directly"
+                )
             }
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)
@@ -134,12 +136,12 @@ impl SignerConfig {
     /// Derive the address without creating a wallet.
     ///
     /// For local keys this is synchronous. For Fireblocks, this requires an
-    /// async API call (same as `resolve()`).
+    /// async API call to fetch the vault address.
     pub(crate) async fn address(&self) -> Result<Address, SignerResolveError> {
         match self {
             Self::Fireblocks(env) => {
-                let signer = FireblocksSigner::new(env).await?;
-                Ok(signer.address())
+                let address = fetch_vault_address(env).await?;
+                Ok(address)
             }
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)
