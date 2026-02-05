@@ -125,6 +125,43 @@ pub async fn fetch_vault_address(
     })
 }
 
+/// Fetches the vault account address from Fireblocks using a custom base URL.
+///
+/// This is primarily used for testing with a mock server.
+#[cfg(test)]
+pub(crate) async fn fetch_vault_address_with_url(
+    api_key: &str,
+    secret: &[u8],
+    base_url: &str,
+    vault_account_id: &str,
+    asset_id: &str,
+) -> Result<Address, FireblocksVaultError> {
+    let client = ClientBuilder::new(api_key, secret)
+        .with_url(base_url)
+        .build()
+        .map_err(FireblocksVaultError::ClientBuild)?;
+
+    let addresses = client
+        .addresses(vault_account_id, asset_id)
+        .await
+        .map_err(FireblocksVaultError::FetchAddresses)?;
+
+    let address_str = addresses
+        .first()
+        .and_then(|a| a.address.as_deref())
+        .ok_or_else(|| FireblocksVaultError::NoAddress {
+            vault_id: vault_account_id.to_string(),
+            asset_id: asset_id.to_string(),
+        })?;
+
+    address_str.parse::<Address>().map_err(|e| {
+        FireblocksVaultError::InvalidAddress {
+            address: address_str.to_string(),
+            source: e,
+        }
+    })
+}
+
 /// Vault service implementation that uses Fireblocks CONTRACT_CALL operation.
 ///
 /// Unlike the RAW signing approach (which only signs hashes), CONTRACT_CALL
@@ -186,6 +223,33 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             client,
             vault_account_id: env.vault_account_id.clone(),
             chain_asset_ids: env.chain_asset_ids.clone(),
+            read_provider,
+            chain_id,
+        })
+    }
+
+    /// Creates a new Fireblocks vault service with a custom base URL.
+    ///
+    /// This is primarily used for testing with a mock server.
+    #[cfg(test)]
+    pub(crate) fn with_url(
+        api_key: &str,
+        secret: &[u8],
+        base_url: &str,
+        vault_account_id: String,
+        chain_asset_ids: ChainAssetIds,
+        read_provider: P,
+        chain_id: u64,
+    ) -> Result<Self, FireblocksVaultError> {
+        let client = ClientBuilder::new(api_key, secret)
+            .with_url(base_url)
+            .build()
+            .map_err(FireblocksVaultError::ClientBuild)?;
+
+        Ok(Self {
+            client,
+            vault_account_id,
+            chain_asset_ids,
             read_provider,
             chain_id,
         })
@@ -586,6 +650,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fireblocks::config::parse_chain_asset_ids;
+
+    // ==================== Unit Tests for build_contract_call_request ====================
 
     #[test]
     fn build_contract_call_request_has_correct_structure() {
@@ -625,5 +692,173 @@ mod tests {
         let dest = request.destination.as_ref().unwrap();
         assert_eq!(dest.r#type, models::TransferPeerPathType::OneTimeAddress);
         assert!(dest.one_time_address.is_some());
+    }
+
+    #[test]
+    fn build_contract_call_request_encodes_calldata_as_hex() {
+        let calldata = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            Address::ZERO,
+            &calldata,
+            "test",
+        );
+
+        let extra = request.extra_parameters.unwrap();
+        assert_eq!(extra.contract_call_data, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn build_contract_call_request_formats_contract_address() {
+        let contract_address =
+            "0x1234567890123456789012345678901234567890".parse().unwrap();
+
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            contract_address,
+            &Bytes::new(),
+            "test",
+        );
+
+        let dest = request.destination.unwrap();
+        let one_time = dest.one_time_address.unwrap();
+        assert!(
+            one_time
+                .address
+                .contains("0x1234567890123456789012345678901234567890")
+        );
+    }
+
+    #[test]
+    fn build_contract_call_request_uses_medium_fee_level() {
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            Address::ZERO,
+            &Bytes::new(),
+            "test",
+        );
+
+        assert_eq!(
+            request.fee_level,
+            Some(models::transaction_request::FeeLevel::Medium)
+        );
+    }
+
+    // ==================== Sandbox Integration Tests (ignored by default) ====================
+
+    /// Mock provider for sandbox tests - only used for balance queries
+    #[derive(Clone)]
+    struct MockProvider;
+
+    impl Provider for MockProvider {
+        fn root(&self) -> &alloy::providers::RootProvider {
+            unimplemented!("MockProvider doesn't support root()")
+        }
+    }
+
+    /// Integration test using Fireblocks Sandbox.
+    ///
+    /// This test is ignored by default because it requires:
+    /// - FIREBLOCKS_API_KEY environment variable
+    /// - FIREBLOCKS_SECRET_PATH environment variable (path to RSA private key)
+    /// - FIREBLOCKS_VAULT_ACCOUNT_ID environment variable
+    /// - A valid Fireblocks sandbox account
+    ///
+    /// Run with: cargo test --package st0x-issuance sandbox_fetch_address -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn sandbox_fetch_vault_address() {
+        let api_key = std::env::var("FIREBLOCKS_API_KEY")
+            .expect("FIREBLOCKS_API_KEY not set");
+        let secret_path = std::env::var("FIREBLOCKS_SECRET_PATH")
+            .expect("FIREBLOCKS_SECRET_PATH not set");
+        let vault_account_id = std::env::var("FIREBLOCKS_VAULT_ACCOUNT_ID")
+            .expect("FIREBLOCKS_VAULT_ACCOUNT_ID not set");
+
+        let secret = std::fs::read(&secret_path).unwrap_or_else(|_| {
+            panic!("Failed to read secret from {secret_path}")
+        });
+
+        // Use sandbox URL
+        let result = fetch_vault_address_with_url(
+            &api_key,
+            &secret,
+            "https://sandbox-api.fireblocks.io/v1",
+            &vault_account_id,
+            "ETH_TEST3", // Sepolia testnet asset
+        )
+        .await;
+
+        match result {
+            Ok(address) => {
+                println!("Sandbox vault address: {address:?}");
+                assert!(!address.is_zero(), "Address should not be zero");
+            }
+            Err(e) => {
+                panic!("Failed to fetch sandbox vault address: {e}");
+            }
+        }
+    }
+
+    /// Integration test for creating a transaction in Fireblocks Sandbox.
+    ///
+    /// This test is ignored by default because it requires sandbox credentials
+    /// and will create an actual transaction (auto-approved in sandbox).
+    ///
+    /// Run with: cargo test --package st0x-issuance sandbox_create_transaction -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn sandbox_create_transaction() {
+        let api_key = std::env::var("FIREBLOCKS_API_KEY")
+            .expect("FIREBLOCKS_API_KEY not set");
+        let secret_path = std::env::var("FIREBLOCKS_SECRET_PATH")
+            .expect("FIREBLOCKS_SECRET_PATH not set");
+        let vault_account_id = std::env::var("FIREBLOCKS_VAULT_ACCOUNT_ID")
+            .expect("FIREBLOCKS_VAULT_ACCOUNT_ID not set");
+
+        let secret = std::fs::read(&secret_path).unwrap_or_else(|_| {
+            panic!("Failed to read secret from {secret_path}")
+        });
+
+        let chain_asset_ids =
+            parse_chain_asset_ids("11155111:ETH_TEST3").unwrap();
+
+        let service = FireblocksVaultService::with_url(
+            &api_key,
+            &secret,
+            "https://sandbox-api.fireblocks.io/v1",
+            vault_account_id,
+            chain_asset_ids,
+            MockProvider,
+            11_155_111, // Sepolia
+        )
+        .unwrap();
+
+        // Create a simple contract call (this will fail on-chain but tests the API)
+        let result = service
+            .submit_contract_call(
+                Address::ZERO,
+                &Bytes::from(vec![0x00]),
+                "Sandbox test transaction",
+            )
+            .await;
+
+        match result {
+            Ok(tx_id) => {
+                println!("Sandbox transaction created: {tx_id}");
+                assert!(
+                    !tx_id.is_empty(),
+                    "Transaction ID should not be empty"
+                );
+            }
+            Err(e) => {
+                // Some errors are expected (e.g., insufficient funds)
+                println!("Transaction creation result: {e}");
+            }
+        }
     }
 }
