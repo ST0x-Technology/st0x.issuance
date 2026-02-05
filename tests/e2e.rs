@@ -14,7 +14,9 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::{IssuerRequestId, MintResponse};
+use st0x_issuance::receipt_inventory::burn_tracking::find_receipt_with_available_balance;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
+use st0x_issuance::tokenized_asset::UnderlyingSymbol;
 use st0x_issuance::{
     AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
 };
@@ -836,24 +838,132 @@ async fn test_mint_burn_mint_nonce_synchronization()
     Ok(())
 }
 
-/// Tests that receipt inventory view is correctly updated after burns.
+async fn perform_mint_and_confirm(
+    client: &Client,
+    wallet: Address,
+    client_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mint_response = client
+        .post("/inkind/issuance")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-inventory",
+                "qty": "50.0",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "network": "base",
+                "client_id": client_id,
+                "wallet_address": wallet
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(mint_response.status(), rocket::http::Status::Ok);
+    let mint_body: MintResponse = mint_response.into_json().await.unwrap();
+    let issuer_request_id = mint_body.issuer_request_id.to_string();
+
+    let confirm_response = client
+        .post("/inkind/issuance/confirm")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "tokenization_request_id": "alp-mint-inventory",
+                "issuer_request_id": mint_body.issuer_request_id,
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
+
+    Ok(issuer_request_id)
+}
+
+async fn verify_burn_records_created(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    expected_burned: U256,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let burn_records: Vec<(String, String)> = sqlx::query_as(
+        "SELECT view_id, payload FROM receipt_burns_view \
+         WHERE json_extract(payload, '$.Burned') IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    assert!(
+        !burn_records.is_empty(),
+        "Should have at least one burn record in receipt_burns_view"
+    );
+
+    let burn_payload: serde_json::Value =
+        serde_json::from_str(&burn_records[0].1)?;
+    let burned_shares_hex = burn_payload["Burned"]["shares_burned"]
+        .as_str()
+        .expect("Should have shares_burned");
+    let burned_shares =
+        U256::from_str_radix(burned_shares_hex.trim_start_matches("0x"), 16)?;
+
+    assert_eq!(
+        burned_shares, expected_burned,
+        "Burn record should show expected shares were burned"
+    );
+
+    Ok(())
+}
+
+async fn verify_available_balance_is_zero(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    underlying: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let underlying_symbol = UnderlyingSymbol::new(underlying);
+    let available_receipt = find_receipt_with_available_balance(
+        pool,
+        &underlying_symbol,
+        U256::ZERO,
+    )
+    .await?;
+
+    if let Some(receipt) = available_receipt {
+        assert_eq!(
+            receipt.available_balance,
+            U256::ZERO,
+            "After full burn, available balance should be 0. \
+             initial={:#x}, burned={:#x}, available={:#x}",
+            receipt.initial_amount,
+            receipt.total_burned,
+            receipt.available_balance
+        );
+    }
+
+    Ok(())
+}
+
+/// Tests that burn tracking correctly computes available balance.
 ///
-/// This test reproduces the production bug where the receipt_inventory_view
-/// is NOT updated at the mint's aggregate_id after a burn. The bug occurs
-/// because GenericQuery uses aggregate_id as view_id, but:
-/// - Mint aggregate_id is a UUID like "99fe5878-aba2-4d9b-aded-5ebdbda2917a"
-/// - Redemption aggregate_id is "red-xxx"
+/// The architecture uses two separate views:
+/// - `ReceiptInventoryView`: tracks mints (keyed by mint's issuer_request_id)
+/// - `ReceiptBurnsView`: tracks burns (keyed by redemption aggregate_id)
 ///
-/// So when a burn happens, the view update goes to "red-xxx" (creating an
-/// "Unavailable" record there) instead of updating the receipt at the mint's UUID.
-///
-/// The test verifies:
-/// 1. After mint: receipt_inventory_view has correct initial_amount and current_balance
-/// 2. After burn: current_balance should be decremented
-///
-/// With the bug: current_balance remains unchanged after burn.
+/// Available balance is computed at query time by joining these views.
+/// This avoids the cross-aggregate update problem where cqrs-es GenericQuery
+/// uses aggregate_id as view_id.
 #[tokio::test]
-async fn test_receipt_inventory_view_updated_after_burn()
+async fn test_burn_tracking_computes_available_balance_correctly()
 -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
@@ -899,54 +1009,12 @@ async fn test_receipt_inventory_view_updated_after_burn()
 
     // Setup account and perform mint
     let link_body = setup_account(&client, user_wallet).await;
-
-    let mint_response = client
-        .post("/inkind/issuance")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-inventory",
-                "qty": "50.0",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "network": "base",
-                "client_id": link_body.client_id,
-                "wallet_address": user_wallet
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    assert_eq!(mint_response.status(), rocket::http::Status::Ok);
-    let mint_body: MintResponse = mint_response.into_json().await.unwrap();
-    let issuer_request_id = mint_body.issuer_request_id.to_string();
-
-    let confirm_response = client
-        .post("/inkind/issuance/confirm")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-inventory",
-                "issuer_request_id": mint_body.issuer_request_id,
-                "status": "completed"
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    assert_eq!(confirm_response.status(), rocket::http::Status::Ok);
+    let issuer_request_id = perform_mint_and_confirm(
+        &client,
+        user_wallet,
+        &link_body.client_id.to_string(),
+    )
+    .await?;
 
     // Wait for shares to be minted
     let shares_minted = wait_for_shares(&vault, user_wallet).await?;
@@ -988,7 +1056,11 @@ async fn test_receipt_inventory_view_updated_after_burn()
     // Wait for burn to complete
     wait_for_burn(&vault, bot_wallet).await?;
 
-    // Query receipt_inventory_view AFTER burn
+    // Verify burns are tracked correctly
+    verify_burn_records_created(&query_pool, shares_minted).await?;
+    verify_available_balance_is_zero(&query_pool, "AAPL").await?;
+
+    // Verify receipt_inventory_view was NOT updated (expected with new architecture)
     let after_burn_view: (String,) = sqlx::query_as(
         "SELECT payload FROM receipt_inventory_view WHERE view_id = ?",
     )
@@ -998,41 +1070,15 @@ async fn test_receipt_inventory_view_updated_after_burn()
 
     let after_burn_payload: serde_json::Value =
         serde_json::from_str(&after_burn_view.0)?;
+    let view_balance_hex = after_burn_payload["Active"]["current_balance"]
+        .as_str()
+        .expect("Should still be Active state");
+    let view_balance =
+        U256::from_str_radix(view_balance_hex.trim_start_matches("0x"), 16)?;
 
-    // The view should now be Depleted (balance = 0) or Active with reduced balance
-    // With the bug: it will still show the initial balance because the update
-    // went to "red-xxx" instead of the mint's issuer_request_id
-    let final_balance = if after_burn_payload.get("Depleted").is_some() {
-        U256::ZERO
-    } else {
-        let balance_hex = after_burn_payload["Active"]["current_balance"]
-            .as_str()
-            .expect("Should have current_balance in Active state");
-        U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)?
-    };
-
-    // This assertion will FAIL with the bug - balance stays at initial_amount
     assert_eq!(
-        final_balance,
-        U256::ZERO,
-        "Receipt inventory should show zero balance after full burn. \
-         Initial balance was {initial_balance}, but after burn it shows {final_balance:#x}. \
-         This indicates the view was NOT updated at the mint's aggregate_id."
-    );
-
-    // Also verify that no spurious "red-xxx" records were created
-    let red_records: Vec<(String, String)> = sqlx::query_as(
-        "SELECT view_id, payload FROM receipt_inventory_view WHERE view_id LIKE 'red-%'"
-    )
-    .fetch_all(&query_pool)
-    .await?;
-
-    assert!(
-        red_records.is_empty(),
-        "No receipt_inventory_view records should exist at redemption aggregate IDs. \
-         Found {} records: {:?}",
-        red_records.len(),
-        red_records.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        view_balance, shares_minted,
+        "ReceiptInventoryView.current_balance should remain at initial value"
     );
 
     Ok(())

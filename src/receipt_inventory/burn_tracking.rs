@@ -1,8 +1,10 @@
-use alloy::primitives::U256;
+use alloy::primitives::{U256, ruint::ParseError};
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 
 use crate::mint::IssuerRequestId;
 use crate::redemption::{Redemption, RedemptionEvent};
@@ -52,123 +54,217 @@ impl View<Redemption> for ReceiptBurnsView {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BurnTrackingError {
+pub enum BurnTrackingError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("JSON deserialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Parse error: {0}")]
-    Parse(String),
+    Parse(#[from] ParseError),
 }
 
 /// Represents a receipt with its available balance (initial - burned).
 #[derive(Debug, Clone)]
-pub(crate) struct ReceiptWithBalance {
-    pub(crate) receipt_id: U256,
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) initial_amount: U256,
-    pub(crate) total_burned: U256,
-    pub(crate) available_balance: U256,
+pub struct ReceiptWithBalance {
+    pub receipt_id: U256,
+    pub underlying: UnderlyingSymbol,
+    pub initial_amount: U256,
+    pub total_burned: U256,
+    pub available_balance: U256,
     /// The mint's issuer_request_id (for traceability)
-    pub(crate) mint_issuer_request_id: IssuerRequestId,
+    pub mint_issuer_request_id: IssuerRequestId,
+}
+
+fn parse_u256_hex(s: &str) -> Result<U256, ParseError> {
+    U256::from_str_radix(s.trim_start_matches("0x"), 16)
 }
 
 /// Finds a receipt with sufficient available balance for burning.
 ///
-/// Joins receipt_inventory_view with receipt_burns_view to compute
-/// available balance at query time. Returns the receipt with the highest
-/// available balance that meets the minimum requirement.
-pub(crate) async fn find_receipt_with_available_balance(
+/// Queries receipt_inventory_view and receipt_burns_view separately, then
+/// computes available balance in Rust using proper U256 arithmetic.
+/// Returns the receipt with the highest available balance that meets the
+/// minimum requirement.
+///
+/// # Errors
+///
+/// Returns `BurnTrackingError::Database` if a database query fails.
+/// Returns `BurnTrackingError::Parse` if a U256 hex value cannot be parsed.
+pub async fn find_receipt_with_available_balance(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
     minimum_balance: U256,
 ) -> Result<Option<ReceiptWithBalance>, BurnTrackingError> {
     let underlying_str = &underlying.0;
-    let min_balance_hex = format!("{minimum_balance:#x}");
 
-    // Single SQL query with LEFT JOIN to compute available balance
-    // receipt_inventory_view: keyed by mint's issuer_request_id, has receipt_id in payload
-    // receipt_burns_view: keyed by redemption_id, has receipt_id in payload
-    let row = sqlx::query!(
+    let receipt_rows = sqlx::query!(
         r#"
         SELECT
-            riv.view_id as "mint_issuer_request_id!: String",
-            json_extract(riv.payload, '$.Active.receipt_id') as "receipt_id!: String",
-            json_extract(riv.payload, '$.Active.initial_amount') as "initial_amount!: String",
-            COALESCE(SUM(
-                CASE
-                    WHEN rbv.payload IS NOT NULL
-                    THEN CAST(json_extract(rbv.payload, '$.Burned.shares_burned') AS INTEGER)
-                    ELSE 0
-                END
-            ), 0) as "total_burned!: i64"
-        FROM receipt_inventory_view riv
-        LEFT JOIN receipt_burns_view rbv
-            ON json_extract(riv.payload, '$.Active.receipt_id')
-                = json_extract(rbv.payload, '$.Burned.receipt_id')
-        WHERE json_extract(riv.payload, '$.Active.underlying') = ?
-        GROUP BY riv.view_id
-        HAVING (
-            CAST(json_extract(riv.payload, '$.Active.initial_amount') AS INTEGER)
-            - COALESCE(SUM(
-                CASE
-                    WHEN rbv.payload IS NOT NULL
-                    THEN CAST(json_extract(rbv.payload, '$.Burned.shares_burned') AS INTEGER)
-                    ELSE 0
-                END
-            ), 0)
-        ) >= CAST(? AS INTEGER)
-        ORDER BY (
-            CAST(json_extract(riv.payload, '$.Active.initial_amount') AS INTEGER)
-            - COALESCE(SUM(
-                CASE
-                    WHEN rbv.payload IS NOT NULL
-                    THEN CAST(json_extract(rbv.payload, '$.Burned.shares_burned') AS INTEGER)
-                    ELSE 0
-                END
-            ), 0)
-        ) DESC
-        LIMIT 1
+            view_id as "mint_issuer_request_id!: String",
+            json_extract(payload, '$.Active.receipt_id') as "receipt_id!: String",
+            json_extract(payload, '$.Active.initial_amount') as "initial_amount!: String"
+        FROM receipt_inventory_view
+        WHERE json_extract(payload, '$.Active.underlying') = ?
         "#,
-        underlying_str,
-        min_balance_hex
+        underlying_str
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
+    let burn_rows = sqlx::query!(
+        r#"
+        SELECT
+            json_extract(payload, '$.Burned.receipt_id') as "receipt_id!: String",
+            json_extract(payload, '$.Burned.shares_burned') as "shares_burned!: String"
+        FROM receipt_burns_view
+        WHERE json_extract(payload, '$.Burned') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
 
-    let receipt_id =
-        U256::from_str_radix(row.receipt_id.trim_start_matches("0x"), 16)
-            .map_err(|e| BurnTrackingError::Parse(e.to_string()))?;
+    let burns_by_receipt: HashMap<String, U256> = burn_rows
+        .into_iter()
+        .map(|b| {
+            parse_u256_hex(&b.shares_burned)
+                .map(|shares| (b.receipt_id, shares))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .into_group_map()
+        .into_iter()
+        .map(|(receipt_id, burns)| (receipt_id, burns.into_iter().sum()))
+        .collect();
 
-    let initial_amount =
-        U256::from_str_radix(row.initial_amount.trim_start_matches("0x"), 16)
-            .map_err(|e| BurnTrackingError::Parse(e.to_string()))?;
+    receipt_rows
+        .into_iter()
+        .map(|row| {
+            let receipt_id = parse_u256_hex(&row.receipt_id)?;
+            let initial_amount = parse_u256_hex(&row.initial_amount)?;
+            let total_burned = burns_by_receipt
+                .get(&row.receipt_id)
+                .copied()
+                .unwrap_or(U256::ZERO);
+            let available_balance = initial_amount.saturating_sub(total_burned);
 
-    let total_burned = U256::from(row.total_burned as u64);
-    let available_balance = initial_amount.saturating_sub(total_burned);
-
-    Ok(Some(ReceiptWithBalance {
-        receipt_id,
-        underlying: underlying.clone(),
-        initial_amount,
-        total_burned,
-        available_balance,
-        mint_issuer_request_id: IssuerRequestId::new(
-            &row.mint_issuer_request_id,
-        ),
-    }))
+            Ok(ReceiptWithBalance {
+                receipt_id,
+                underlying: underlying.clone(),
+                initial_amount,
+                total_burned,
+                available_balance,
+                mint_issuer_request_id: IssuerRequestId::new(
+                    &row.mint_issuer_request_id,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, BurnTrackingError>>()
+        .map(|receipts| {
+            receipts
+                .into_iter()
+                .filter(|r| r.available_balance >= minimum_balance)
+                .max_by_key(|r| r.available_balance)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::uint;
-    use std::collections::HashMap;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::receipt_inventory::ReceiptInventoryView;
+    use crate::tokenized_asset::TokenSymbol;
+
+    async fn setup_test_db() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
+
+    /// Tests that find_receipt_with_available_balance correctly handles
+    /// U256 values that exceed i64::MAX (which is ~9.2 * 10^18).
+    ///
+    /// With 18 decimal places, even 10 tokens = 10 * 10^18 = 10^19 > i64::MAX.
+    /// This test verifies the implementation uses proper U256 arithmetic.
+    #[tokio::test]
+    async fn test_find_receipt_handles_u256_values_exceeding_i64() {
+        let pool = setup_test_db().await;
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        // 100 tokens with 18 decimals = 100 * 10^18 = 10^20, far exceeds i64::MAX
+        let initial_amount = uint!(100_000000000000000000_U256);
+        // 30 tokens burned
+        let shares_burned = uint!(30_000000000000000000_U256);
+        // Expected available: 70 tokens
+        let expected_available = uint!(70_000000000000000000_U256);
+
+        // Insert an active receipt
+        let receipt_view = ReceiptInventoryView::Active {
+            receipt_id: uint!(42_U256),
+            underlying: underlying.clone(),
+            token: TokenSymbol::new("tAAPL"),
+            initial_amount,
+            current_balance: initial_amount, // Note: this field is stale, we compute from burns
+            minted_at: Utc::now(),
+        };
+        let receipt_payload = serde_json::to_string(&receipt_view).unwrap();
+
+        sqlx::query!(
+            "INSERT INTO receipt_inventory_view (view_id, version, payload) VALUES (?, 1, ?)",
+            "iss-123",
+            receipt_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert a burn record
+        let burn_view = ReceiptBurnsView::Burned {
+            receipt_id: uint!(42_U256),
+            mint_issuer_request_id: IssuerRequestId::new("iss-123"),
+            shares_burned,
+            burned_at: Utc::now(),
+        };
+        let burn_payload = serde_json::to_string(&burn_view).unwrap();
+
+        sqlx::query!(
+            "INSERT INTO receipt_burns_view (view_id, version, payload) VALUES (?, 1, ?)",
+            "red-456",
+            burn_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Query for a receipt with at least 50 tokens available
+        let minimum = uint!(50_000000000000000000_U256);
+        let result =
+            find_receipt_with_available_balance(&pool, &underlying, minimum)
+                .await
+                .expect("Query should succeed");
+
+        let receipt =
+            result.expect("Should find a receipt with sufficient balance");
+
+        assert_eq!(receipt.receipt_id, uint!(42_U256));
+        assert_eq!(receipt.initial_amount, initial_amount);
+        assert_eq!(receipt.total_burned, shares_burned);
+        assert_eq!(
+            receipt.available_balance, expected_available,
+            "Available balance should be computed correctly with U256 arithmetic"
+        );
+    }
 
     #[test]
     fn test_view_updates_on_tokens_burned() {
