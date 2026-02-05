@@ -153,7 +153,6 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             underlying,
             wallet,
             tokenization_request_id,
-            quantity,
             alpaca_quantity,
             dust_quantity,
             ..
@@ -192,7 +191,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             tokenization_request_id: tokenization_request_id.clone(),
             issuer_request_id: issuer_request_id.clone(),
             underlying: underlying.clone(),
-            quantity: quantity.clone(),
+            quantity: alpaca_quantity.clone(),
             operation_type: OperationType::Redeem,
             timestamp: Utc::now(),
             notes: Some("Retry after burn failure".to_string()),

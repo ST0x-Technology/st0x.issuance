@@ -66,6 +66,15 @@ pub(crate) enum BurnTrackingError {
     Parse(#[from] ParseError),
     #[error("Replay error: {0}")]
     Replay(#[from] AggregateError<RedemptionError>),
+    #[error(
+        "Burns exceed initial amount for receipt {receipt_id}: \
+         initial_amount={initial_amount}, total_burned={total_burned}"
+    )]
+    BurnsExceedInitialAmount {
+        receipt_id: U256,
+        initial_amount: U256,
+        total_burned: U256,
+    },
 }
 
 /// Represents a receipt with its available balance (initial - burned).
@@ -175,7 +184,13 @@ pub(crate) async fn find_receipt_with_available_balance(
                 .get(&row.receipt_id)
                 .copied()
                 .unwrap_or(U256::ZERO);
-            let available_balance = initial_amount.saturating_sub(total_burned);
+            let available_balance = initial_amount
+                .checked_sub(total_burned)
+                .ok_or(BurnTrackingError::BurnsExceedInitialAmount {
+                    receipt_id,
+                    initial_amount,
+                    total_burned,
+                })?;
 
             Ok(ReceiptWithBalance {
                 receipt_id,
