@@ -250,6 +250,44 @@ impl Redemption {
         }])
     }
 
+    async fn handle_retry_burn(
+        &self,
+        services: &Arc<dyn VaultService>,
+        issuer_request_id: IssuerRequestId,
+        input: BurnInput,
+        user_wallet: Address,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::Failed { .. }) {
+            return Err(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: self.state_name().to_string(),
+            });
+        }
+
+        let burn = services
+            .burn_and_return_dust(BurnParams {
+                vault: input.vault,
+                burn_shares: input.burn_shares,
+                dust_shares: input.dust_shares,
+                receipt_id: input.receipt_id,
+                owner: input.owner,
+                user: user_wallet,
+                receipt_info: input.receipt_info,
+            })
+            .await?;
+
+        Ok(vec![RedemptionEvent::TokensBurned {
+            issuer_request_id,
+            tx_hash: burn.tx_hash,
+            receipt_id: burn.receipt_id,
+            shares_burned: burn.shares_burned,
+            dust_returned: burn.dust_returned,
+            gas_used: burn.gas_used,
+            block_number: burn.block_number,
+            burned_at: Utc::now(),
+        }])
+    }
+
     fn handle_confirm_alpaca_complete(
         &self,
         issuer_request_id: IssuerRequestId,
@@ -447,6 +485,31 @@ impl Aggregate for Redemption {
                 issuer_request_id,
                 error,
             } => self.handle_record_burn_failure(issuer_request_id, error),
+            RedemptionCommand::RetryBurn {
+                issuer_request_id,
+                vault,
+                burn_shares,
+                dust_shares,
+                receipt_id,
+                owner,
+                receipt_info,
+                user_wallet,
+            } => {
+                self.handle_retry_burn(
+                    services,
+                    issuer_request_id,
+                    BurnInput {
+                        vault,
+                        burn_shares,
+                        dust_shares,
+                        receipt_id,
+                        owner,
+                        receipt_info,
+                    },
+                    user_wallet,
+                )
+                .await
+            }
         }
     }
 

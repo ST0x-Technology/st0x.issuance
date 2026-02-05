@@ -57,7 +57,7 @@ impl View<Redemption> for ReceiptBurnsView {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum BurnTrackingError {
+pub(crate) enum BurnTrackingError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("JSON deserialization error: {0}")]
@@ -528,7 +528,6 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .unwrap()
         .unwrap();
 
         assert_eq!(count, 3, "All three burns should be in the view");
@@ -590,8 +589,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .unwrap()
-        .unwrap_or(0);
+        .unwrap();
 
         assert_eq!(count, 1, "Re-projection should be idempotent");
     }

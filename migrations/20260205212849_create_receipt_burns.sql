@@ -8,4 +8,4 @@ CREATE TABLE IF NOT EXISTS receipt_burns_view (
 );
 
 CREATE INDEX IF NOT EXISTS idx_receipt_burns_view_receipt_id
-    ON receipt_burns_view(json_extract(payload, '$.receipt_id'));
+    ON receipt_burns_view(json_extract(payload, '$.Burned.receipt_id'));
