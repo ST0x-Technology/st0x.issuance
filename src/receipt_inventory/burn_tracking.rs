@@ -27,8 +27,8 @@ pub(crate) enum ReceiptBurnsView {
     Burned {
         /// The on-chain receipt ID that was burned from
         receipt_id: U256,
-        /// The mint's issuer_request_id (for traceability to original mint)
-        mint_issuer_request_id: IssuerRequestId,
+        /// The redemption's issuer_request_id
+        redemption_issuer_request_id: IssuerRequestId,
         /// Number of shares burned
         shares_burned: U256,
         /// When the burn occurred
@@ -48,7 +48,7 @@ impl View<Redemption> for ReceiptBurnsView {
         {
             *self = Self::Burned {
                 receipt_id: *receipt_id,
-                mint_issuer_request_id: issuer_request_id.clone(),
+                redemption_issuer_request_id: issuer_request_id.clone(),
                 shares_burned: *shares_burned,
                 burned_at: *burned_at,
             };
@@ -280,7 +280,7 @@ mod tests {
         // Insert a burn record
         let burn_view = ReceiptBurnsView::Burned {
             receipt_id: uint!(42_U256),
-            mint_issuer_request_id: IssuerRequestId::new("iss-123"),
+            redemption_issuer_request_id: IssuerRequestId::new("red-456"),
             shares_burned,
             burned_at: Utc::now(),
         };
@@ -320,7 +320,7 @@ mod tests {
         assert!(matches!(view, ReceiptBurnsView::Unavailable));
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("mint-123"),
+            issuer_request_id: IssuerRequestId::new("red-123"),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -343,7 +343,7 @@ mod tests {
 
         let ReceiptBurnsView::Burned {
             receipt_id,
-            mint_issuer_request_id,
+            redemption_issuer_request_id,
             shares_burned,
             ..
         } = view
@@ -352,7 +352,10 @@ mod tests {
         };
 
         assert_eq!(receipt_id, uint!(42_U256));
-        assert_eq!(mint_issuer_request_id, IssuerRequestId::new("mint-123"));
+        assert_eq!(
+            redemption_issuer_request_id,
+            IssuerRequestId::new("red-123")
+        );
         assert_eq!(shares_burned, uint!(100_000000000000000000_U256));
     }
 

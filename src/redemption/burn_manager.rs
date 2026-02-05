@@ -179,6 +179,29 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             .checked_add(dust_shares)
             .ok_or(BurnManagerError::SharesOverflow)?;
 
+        // Check on-chain balance before attempting burn. If the bot has insufficient
+        // shares, the burn likely already succeeded on-chain but we crashed before
+        // recording it (e.g., RPC timeout via VaultError::PendingTransaction).
+        // Skip this redemption to avoid double-burning. Manual intervention required.
+        let on_chain_balance = self
+            .vault_service
+            .get_share_balance(vault, self.bot_wallet)
+            .await?;
+
+        if on_chain_balance < total_shares {
+            warn!(
+                issuer_request_id = %issuer_request_id.0,
+                on_chain_balance = %on_chain_balance,
+                burn_shares = %burn_shares,
+                dust_shares = %dust_shares,
+                total_shares = %total_shares,
+                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for BurnFailed recovery. \
+                 Burn likely already succeeded but was not recorded. \
+                 Skipping to avoid double-burning."
+            );
+            return Ok(());
+        }
+
         let receipt_id = self
             .select_receipt_for_retry(
                 issuer_request_id,
