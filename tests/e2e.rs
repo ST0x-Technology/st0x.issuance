@@ -340,24 +340,29 @@ fn setup_redemption_mocks(
 
         then.status(200).respond_with(
             move |_req: &httpmock::HttpMockRequest| {
-                let states = shared_state.lock().unwrap();
-                let responses: Vec<_> = states.iter().map(|state| {
-                    json!({
-                        "tokenization_request_id": format!("tok-redeem-{}", state.issuer_request_id),
-                        "issuer_request_id": state.issuer_request_id,
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "type": "redeem",
-                        "status": "completed",
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": state.qty,
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": user_wallet,
-                        "tx_hash": state.tx_hash,
-                        "fees": "0.5"
-                    })
-                }).collect();
+                let responses: Vec<_> = {
+                    let states = shared_state.lock().unwrap();
+                    states
+                        .iter()
+                        .map(|state| {
+                            json!({
+                                "tokenization_request_id": format!("tok-redeem-{}", state.issuer_request_id),
+                                "issuer_request_id": state.issuer_request_id,
+                                "created_at": "2025-09-12T17:28:48.642437-04:00",
+                                "type": "redeem",
+                                "status": "completed",
+                                "underlying_symbol": "AAPL",
+                                "token_symbol": "tAAPL",
+                                "qty": state.qty,
+                                "issuer": "test-issuer",
+                                "network": "base",
+                                "wallet_address": user_wallet,
+                                "tx_hash": state.tx_hash,
+                                "fees": "0.5"
+                            })
+                        })
+                        .collect()
+                };
 
                 let response_body = serde_json::to_string(&responses).unwrap();
 
