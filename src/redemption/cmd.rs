@@ -51,4 +51,18 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRequestId,
         error: String,
     },
+    /// Retries a failed burn operation.
+    /// Only valid from Failed state after a BurningFailed event.
+    /// Uses view data to reconstruct burn parameters since Failed state loses metadata.
+    RetryBurn {
+        issuer_request_id: IssuerRequestId,
+        vault: Address,
+        burn_shares: U256,
+        dust_shares: U256,
+        receipt_id: U256,
+        owner: Address,
+        receipt_info: ReceiptInformation,
+        /// Wallet to return dust to (from view metadata)
+        user_wallet: Address,
+    },
 }

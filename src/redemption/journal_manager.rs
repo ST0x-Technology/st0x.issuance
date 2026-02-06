@@ -450,6 +450,7 @@ mod tests {
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{Aggregate, EventStore};
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1196,13 +1197,16 @@ mod tests {
         )
         .await;
 
+        let quantity = Quantity::new(dec!(100));
         let view = RedemptionView::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             wallet,
-            quantity: Quantity::new(Decimal::from(100)),
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::new(dec!(0)),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -1251,13 +1255,16 @@ mod tests {
         )
         .await;
 
+        let quantity = Quantity::new(dec!(100));
         let view = RedemptionView::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::new(dec!(0)),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),

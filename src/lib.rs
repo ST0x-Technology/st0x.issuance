@@ -13,13 +13,15 @@ use tracing::info;
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
-use crate::receipt_inventory::ReceiptInventoryView;
+use crate::receipt_inventory::burn_tracking::replay_receipt_burns_view;
+use crate::receipt_inventory::{ReceiptBurnsView, ReceiptInventoryView};
 use crate::redemption::{
     Redemption, RedemptionView,
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
+    replay_redemption_view,
 };
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
@@ -33,7 +35,7 @@ pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
-pub(crate) mod receipt_inventory;
+pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 
@@ -239,6 +241,10 @@ pub async fn initialize_rocket(
             &pool,
         )?;
 
+    info!("Replaying views to ensure schema updates are applied");
+    replay_redemption_view(pool.clone()).await?;
+    replay_receipt_burns_view(pool.clone()).await?;
+
     spawn_redemption_recovery(
         redeem_call.clone(),
         journal.clone(),
@@ -350,22 +356,19 @@ fn setup_aggregate_cqrs(
         ));
     let redemption_query = GenericQuery::new(redemption_view_repo);
 
-    let receipt_inventory_redemption_repo = Arc::new(SqliteViewRepository::<
-        ReceiptInventoryView,
-        Redemption,
-    >::new(
-        pool.clone(),
-        "receipt_inventory_view".to_string(),
-    ));
-    let receipt_inventory_redemption_query =
-        GenericQuery::new(receipt_inventory_redemption_repo);
+    // ReceiptBurnsView tracks burns keyed by redemption aggregate_id (red-xxx).
+    // Use GenericQuery since aggregate_id = view_id is correct for this view.
+    // Available balance is computed at query time by joining with receipt_inventory_view.
+    let receipt_burns_repo =
+        Arc::new(SqliteViewRepository::<ReceiptBurnsView, Redemption>::new(
+            pool.clone(),
+            "receipt_burns_view".to_string(),
+        ));
+    let receipt_burns_query = GenericQuery::new(receipt_burns_repo);
 
     let redemption_cqrs = Arc::new(sqlite_cqrs(
         pool.clone(),
-        vec![
-            Box::new(redemption_query),
-            Box::new(receipt_inventory_redemption_query),
-        ],
+        vec![Box::new(redemption_query), Box::new(receipt_burns_query)],
         vault_service,
     ));
     let redemption_event_store =
@@ -519,6 +522,7 @@ fn spawn_redemption_recovery(
         redeem_call.recover_detected_redemptions().await;
         journal.recover_alpaca_called_redemptions().await;
         burn.recover_burning_redemptions().await;
+        burn.recover_burn_failed_redemptions().await;
     });
 }
 
