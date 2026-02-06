@@ -671,6 +671,38 @@ See `migrations/` for all view table definitions and indexes.
 
 ## Testing Strategy
 
+### Testing Pyramid
+
+Follow the testing pyramid - more tests at lower levels, fewer at higher:
+
+1. **Property tests** - Most numerous. Use proptest for invariant testing
+2. **Unit tests** - Aggregate logic with MemStore, exhaustive edge cases
+3. **Integration tests** - HTTP endpoints with mocked dependencies
+4. **E2E tests** - Fewest, but essential for system orchestration
+
+**The pyramid is about quantity, not avoidance.** You should have MANY
+property/unit tests, SOME integration tests, and a FEW e2e tests. But e2e tests
+are still required when testing full system orchestration.
+
+**When e2e tests ARE required:**
+
+- Testing that multiple async processes coordinate correctly (backfilling,
+  monitoring, processing)
+- Testing startup/shutdown behavior and recovery
+- Testing flows that span multiple aggregates AND external systems
+- Testing that the service handles events that occurred before it started
+
+**Example:** Receipt backfilling and live monitoring REQUIRE e2e testing
+because:
+
+- Unit tests can verify backfiller logic in isolation
+- Unit tests can verify monitor logic in isolation
+- But only e2e can verify: (1) service starts, (2) backfills historic receipts,
+  (3) monitors new receipts, (4) redemption uses receipts from both sources
+
+A single well-designed e2e test can cover the orchestration, while dozens of
+unit tests cover the edge cases in each component.
+
 ### Given-When-Then Aggregate Testing
 
 ES/CQRS enables testable business logic: **Given** previous events → **When**
@@ -694,24 +726,29 @@ fn test_journal_confirmed() {
   determinism
 - **Database isolation**: In-memory SQLite per test
 
-### End-to-End Tests
+### End-to-End Tests: Strict Definition
 
-E2E tests in `./tests/` reproduce complete production flows with real wiring.
+**A test is ONLY considered e2e if it:**
 
-**Mock only external systems:**
+1. Spins up the full HTTP service
+2. Uses ONLY the public API as an external consumer would
+3. Uses Anvil for local blockchain
+4. Mocks only truly external systems (Alpaca API)
+5. Asserts correctness via API responses, Anvil state, and mock interactions
 
-- Alpaca API via httpmock
-- Blockchain via Anvil (local chain)
+**A test is NOT e2e if it:**
 
-**Use real implementations for:** CQRS framework, managers, service traits,
-SQLite
+- Touches implementation details for setup (e.g., directly calling CQRS
+  commands)
+- Touches implementation details for verification (e.g., querying aggregates
+  directly)
+- Requires access to internal types or functions
 
-**Test types:**
+**If a test requires touching implementation details**, it belongs in `src/` as
+a unit or integration test, NOT in `tests/`.
 
-- **Unit** (`src/*/mod.rs`): Aggregate logic with MemStore, exhaustive edge
-  cases
-- **Integration** (`src/*/api/*.rs`): HTTP endpoints with mocked dependencies
-- **E2E** (`tests/*.rs`): Complete flows, happy paths only, real blockchain
+E2E tests live in `./tests/`. They test complete production flows, happy paths
+only, with real blockchain (Anvil).
 
 ### Testing Guidelines
 
