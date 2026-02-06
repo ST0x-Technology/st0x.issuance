@@ -11,6 +11,8 @@ Relevant docs:
 - README.md
 - ROADMAP.md
 - SPEC.md
+- docs/alloy.md - Alloy patterns (mocks, encoding, type aliases)
+- docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
 
 ## Plan & Review
 
