@@ -1,3 +1,4 @@
+pub(crate) mod backfill;
 pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
