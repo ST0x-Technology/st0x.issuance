@@ -1,7 +1,9 @@
 use alloy::primitives::{Address, U256};
 use chrono::Utc;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -10,8 +12,9 @@ use super::view::{
 };
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::mint::QuantityConversionError;
-use crate::receipt_inventory::burn_tracking::{
-    BurnPlan, BurnTrackingError, plan_multi_receipt_burn,
+use crate::receipt_inventory::{
+    BurnPlan, BurnTrackingError, ReceiptId, ReceiptWithBalance, Shares,
+    plan_burn,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
@@ -203,15 +206,20 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         }
 
         let plan = self
-            .plan_burn(issuer_request_id, underlying, burn_shares, dust_shares)
+            .plan_burn_for_redemption(
+                issuer_request_id,
+                underlying,
+                burn_shares,
+                dust_shares,
+            )
             .await?;
 
         let burns: Vec<MultiBurnEntry> = plan
             .allocations
             .into_iter()
             .map(|alloc| MultiBurnEntry {
-                receipt_id: alloc.receipt.receipt_id,
-                burn_shares: alloc.burn_amount,
+                receipt_id: alloc.receipt.receipt_id.inner(),
+                burn_shares: alloc.burn_amount.inner(),
             })
             .collect();
 
@@ -240,7 +248,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
                     burns,
-                    dust_shares: plan.dust,
+                    dust_shares: plan.dust.inner(),
                     owner: self.bot_wallet,
                     receipt_info,
                     user_wallet: *wallet,
@@ -425,7 +433,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         );
 
         let plan = self
-            .plan_burn(
+            .plan_burn_for_redemption(
                 issuer_request_id,
                 &metadata.underlying,
                 burn_shares,
@@ -542,8 +550,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             .allocations
             .into_iter()
             .map(|alloc| MultiBurnEntry {
-                receipt_id: alloc.receipt.receipt_id,
-                burn_shares: alloc.burn_amount,
+                receipt_id: alloc.receipt.receipt_id.inner(),
+                burn_shares: alloc.burn_amount.inner(),
             })
             .collect();
 
@@ -555,7 +563,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
                     burns,
-                    dust_shares: plan.dust,
+                    dust_shares: plan.dust.inner(),
                     owner: self.bot_wallet,
                     receipt_info,
                 },
@@ -614,6 +622,8 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 pub(crate) enum BurnManagerError {
     #[error("Blockchain error: {0}")]
     Blockchain(#[from] VaultError),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
     #[error("Invalid aggregate state: {current_state}")]
@@ -621,7 +631,7 @@ pub(crate) enum BurnManagerError {
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
     #[error("Insufficient balance: required {required}, available {available}")]
-    InsufficientBalance { required: U256, available: U256 },
+    InsufficientBalance { required: Shares, available: Shares },
     #[error("Receipt inventory error: {0}")]
     BurnTracking(#[from] BurnTrackingError),
     #[error("Redemption view error: {0}")]

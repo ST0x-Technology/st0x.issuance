@@ -6,18 +6,18 @@ use super::{ReceiptId, Shares};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum ReceiptInventoryEvent {
-    ReceiptDiscovered {
+    Discovered {
         receipt_id: ReceiptId,
         balance: Shares,
         block_number: u64,
         tx_hash: B256,
     },
-    ReceiptBurned {
+    Burned {
         receipt_id: ReceiptId,
         amount_burned: Shares,
         new_balance: Shares,
     },
-    ReceiptDepleted {
+    Depleted {
         receipt_id: ReceiptId,
     },
 }
@@ -25,14 +25,12 @@ pub(crate) enum ReceiptInventoryEvent {
 impl DomainEvent for ReceiptInventoryEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::ReceiptDiscovered { .. } => {
-                "ReceiptInventoryEvent::ReceiptDiscovered".to_string()
+            Self::Discovered { .. } => {
+                "ReceiptInventoryEvent::Discovered".to_string()
             }
-            Self::ReceiptBurned { .. } => {
-                "ReceiptInventoryEvent::ReceiptBurned".to_string()
-            }
-            Self::ReceiptDepleted { .. } => {
-                "ReceiptInventoryEvent::ReceiptDepleted".to_string()
+            Self::Burned { .. } => "ReceiptInventoryEvent::Burned".to_string(),
+            Self::Depleted { .. } => {
+                "ReceiptInventoryEvent::Depleted".to_string()
             }
         }
     }
