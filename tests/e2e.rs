@@ -901,20 +901,35 @@ async fn verify_burn_records_created(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     expected_burned: U256,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let burn_records: Vec<(String, String)> = sqlx::query_as(
-        "SELECT view_id, payload FROM receipt_burns_view \
-         WHERE json_extract(payload, '$.Burned') IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(5);
+    let poll_interval = tokio::time::Duration::from_millis(100);
 
-    assert!(
-        !burn_records.is_empty(),
-        "Should have at least one burn record in receipt_burns_view"
-    );
+    let burn_records = loop {
+        let records = sqlx::query!(
+            r#"
+            SELECT view_id, payload as "payload!: String"
+            FROM receipt_burns_view
+            WHERE json_extract(payload, '$.Burned') IS NOT NULL
+            "#
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if !records.is_empty() {
+            break records;
+        }
+
+        assert!(
+            start.elapsed() <= timeout,
+            "Timeout waiting for burn record in receipt_burns_view"
+        );
+
+        tokio::time::sleep(poll_interval).await;
+    };
 
     let burn_payload: serde_json::Value =
-        serde_json::from_str(&burn_records[0].1)?;
+        serde_json::from_str(&burn_records[0].payload)?;
     let burned_shares_hex = burn_payload["Burned"]["shares_burned"]
         .as_str()
         .expect("Should have shares_burned");
