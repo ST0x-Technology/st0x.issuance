@@ -155,6 +155,58 @@ pub(crate) struct BurnParams {
     pub(crate) receipt_info: ReceiptInformation,
 }
 
+/// A single burn within a multi-receipt burn operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MultiBurnEntry {
+    /// ERC-1155 receipt ID to burn from
+    pub(crate) receipt_id: U256,
+    /// Amount of shares to burn from this receipt
+    pub(crate) burn_shares: U256,
+}
+
+/// Parameters for a multi-receipt burn operation.
+///
+/// Atomically burns shares from multiple receipts in a single transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MultiBurnParams {
+    /// Address of the vault contract
+    pub(crate) vault: Address,
+    /// List of burns to perform (receipt_id, burn_amount)
+    pub(crate) burns: Vec<MultiBurnEntry>,
+    /// Amount of dust to return to user (can be zero)
+    pub(crate) dust_shares: U256,
+    /// Address that owns the shares being burned (typically bot wallet)
+    pub(crate) owner: Address,
+    /// User's address that will receive the dust
+    pub(crate) user: Address,
+    /// Metadata about the operation for on-chain audit trail
+    pub(crate) receipt_info: ReceiptInformation,
+}
+
+/// Result of a single burn within a multi-receipt burn operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MultiBurnResultEntry {
+    /// ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of ERC-20 shares burned from this receipt
+    pub(crate) shares_burned: U256,
+}
+
+/// Result of a successful multi-receipt burn operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MultiBurnResult {
+    /// Transaction hash of the multicall transaction
+    pub(crate) tx_hash: B256,
+    /// Per-receipt burn results
+    pub(crate) burns: Vec<MultiBurnResultEntry>,
+    /// Amount of dust returned to user (with 18 decimals)
+    pub(crate) dust_returned: U256,
+    /// Gas consumed by the transaction
+    pub(crate) gas_used: u64,
+    /// Block number where the transaction was included
+    pub(crate) block_number: u64,
+}
+
 /// On-chain metadata stored with each vault deposit or withdrawal.
 ///
 /// This struct is serialized to JSON and stored as bytes in the vault's receiptInformation

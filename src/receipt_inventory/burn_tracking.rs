@@ -75,18 +75,77 @@ pub(crate) enum BurnTrackingError {
         initial_amount: U256,
         total_burned: U256,
     },
+    #[error(
+        "Insufficient balance for burn: required={required}, available={available}"
+    )]
+    InsufficientBalance { required: U256, available: U256 },
 }
 
 /// Represents a receipt with its available balance (initial - burned).
 #[derive(Debug, Clone)]
-pub struct ReceiptWithBalance {
-    pub receipt_id: U256,
-    pub underlying: UnderlyingSymbol,
-    pub initial_amount: U256,
-    pub total_burned: U256,
-    pub available_balance: U256,
+pub(crate) struct ReceiptWithBalance {
+    pub(crate) receipt_id: U256,
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) initial_amount: U256,
+    pub(crate) total_burned: U256,
+    pub(crate) available_balance: U256,
     /// The mint's issuer_request_id (for traceability)
-    pub mint_issuer_request_id: IssuerRequestId,
+    pub(crate) mint_issuer_request_id: IssuerRequestId,
+}
+
+/// A single allocation within a multi-receipt burn plan.
+///
+/// Represents how much to burn from a specific receipt.
+#[derive(Debug, Clone)]
+pub(crate) struct BurnAllocation {
+    /// The receipt to burn from
+    pub(crate) receipt: ReceiptWithBalance,
+    /// Amount to burn from this receipt (may be partial)
+    pub(crate) burn_amount: U256,
+}
+
+/// A plan for burning shares across multiple receipts.
+///
+/// Created by `plan_multi_receipt_burn()` to determine which receipts
+/// to use and how much to burn from each.
+#[derive(Debug, Clone)]
+pub(crate) struct BurnPlan {
+    /// Ordered list of allocations (largest receipts first)
+    pub(crate) allocations: Vec<BurnAllocation>,
+    /// Total amount to burn across all allocations
+    pub(crate) total_burn: U256,
+    /// Dust amount to return to user
+    pub(crate) dust: U256,
+}
+
+/// Plans a multi-receipt burn by selecting receipts with available balance.
+///
+/// Selects receipts in descending order of available balance until the
+/// required burn amount is satisfied. The last receipt may be partially burned.
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `underlying` - The underlying asset symbol to filter receipts
+/// * `burn_amount` - Total amount of shares to burn
+/// * `dust_amount` - Amount of dust to return to user
+///
+/// # Returns
+///
+/// A `BurnPlan` with allocations for each receipt, or an error if
+/// insufficient balance is available.
+///
+/// # Errors
+///
+/// Returns `BurnTrackingError::InsufficientBalance` if total available
+/// balance across all receipts is less than the burn amount.
+pub(crate) async fn plan_multi_receipt_burn(
+    _pool: &Pool<Sqlite>,
+    _underlying: &UnderlyingSymbol,
+    _burn_amount: U256,
+    _dust_amount: U256,
+) -> Result<BurnPlan, BurnTrackingError> {
+    todo!("Task 4: Implement multi-receipt burn planning")
 }
 
 fn parse_u256_hex(s: &str) -> Result<U256, ParseError> {

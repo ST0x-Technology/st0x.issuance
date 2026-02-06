@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
+/// A single burn operation within a multi-receipt burn.
+///
+/// Each burn targets a specific ERC-1155 receipt and burns a portion
+/// (or all) of the shares associated with that receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct BurnRecord {
+    /// The ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of shares burned from this receipt
+    pub(crate) shares_burned: U256,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum RedemptionEvent {
     Detected {
@@ -48,8 +60,10 @@ pub(crate) enum RedemptionEvent {
     TokensBurned {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,
-        receipt_id: U256,
-        shares_burned: U256,
+        /// All receipt burns performed in this transaction.
+        /// v2.0 format: multiple burns in a single atomic transaction.
+        /// v1.0 events are upcasted to this format via SemanticVersionEventUpcaster.
+        burns: Vec<BurnRecord>,
         /// Amount of dust returned to user (with 18 decimals).
         /// Dust recipient is always `metadata.wallet` from the `Detected` event.
         /// For events prior to dust handling feature: defaults to zero.
@@ -92,7 +106,10 @@ impl DomainEvent for RedemptionEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        match self {
+            Self::TokensBurned { .. } => "2.0".to_string(),
+            _ => "1.0".to_string(),
+        }
     }
 }
 
