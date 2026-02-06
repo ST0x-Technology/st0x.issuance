@@ -14,7 +14,9 @@ use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
 use crate::receipt_inventory::burn_tracking::replay_receipt_burns_view;
-use crate::receipt_inventory::{ReceiptBurnsView, ReceiptInventoryView};
+use crate::receipt_inventory::{
+    ReceiptBurnsView, ReceiptInventory, ReceiptInventoryView,
+};
 use crate::redemption::{
     Redemption, RedemptionView,
     burn_manager::BurnManager,
@@ -58,6 +60,8 @@ pub(crate) type MintEventStore =
 type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
 type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
+type ReceiptInventoryEventStore =
+    Arc<PersistedEventStore<SqliteEventRepository, ReceiptInventory>>;
 
 type SqliteEventStore<A> = PersistedEventStore<SqliteEventRepository, A>;
 
@@ -66,6 +70,7 @@ struct AggregateCqrsSetup {
     mint_event_store: MintEventStore,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
+    receipt_inventory_event_store: ReceiptInventoryEventStore,
 }
 
 struct MintManagers {
@@ -76,7 +81,12 @@ struct MintManagers {
 struct RedemptionManagers {
     redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
     journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
-    burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
+    burn: Arc<
+        BurnManager<
+            SqliteEventStore<Redemption>,
+            SqliteEventStore<ReceiptInventory>,
+        >,
+    >,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +230,7 @@ pub async fn initialize_rocket(
         mint_event_store,
         redemption_cqrs,
         redemption_event_store,
+        receipt_inventory_event_store,
     } = setup_aggregate_cqrs(&pool, blockchain_service.clone());
 
     let MintManagers { mint: mint_manager, callback: callback_manager } =
@@ -239,6 +250,7 @@ pub async fn initialize_rocket(
             blockchain_service,
             &redemption_cqrs,
             &redemption_event_store,
+            &receipt_inventory_event_store,
             &pool,
         )?;
 
@@ -379,11 +391,17 @@ fn setup_aggregate_cqrs(
         .with_upcasters(vec![create_tokens_burned_upcaster()]),
     );
 
+    let receipt_inventory_event_store =
+        Arc::new(PersistedEventStore::new_event_store(
+            SqliteEventRepository::new(pool.clone()),
+        ));
+
     AggregateCqrsSetup {
         mint_cqrs,
         mint_event_store,
         redemption_cqrs,
         redemption_event_store,
+        receipt_inventory_event_store,
     }
 }
 
@@ -418,6 +436,7 @@ fn setup_redemption_managers(
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
+    receipt_inventory_event_store: &ReceiptInventoryEventStore,
     pool: &Pool<Sqlite>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
@@ -439,6 +458,7 @@ fn setup_redemption_managers(
         pool.clone(),
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
+        receipt_inventory_event_store.clone(),
         config.bot_wallet()?,
     ));
 
@@ -461,7 +481,10 @@ fn spawn_redemption_detector(
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
     burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        BurnManager<
+            PersistedEventStore<SqliteEventRepository, Redemption>,
+            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
+        >,
     >,
 ) -> Result<(), config::ConfigError> {
     let bot_wallet = config.bot_wallet()?;
@@ -516,7 +539,10 @@ fn spawn_redemption_recovery(
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
     burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+        BurnManager<
+            PersistedEventStore<SqliteEventRepository, Redemption>,
+            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
+        >,
     >,
 ) {
     info!("Spawning redemption recovery task");

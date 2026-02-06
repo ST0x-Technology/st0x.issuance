@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn test_plan_single_receipt_sufficient_returns_one_allocation() {
         let receipts = vec![ReceiptWithBalance {
-            receipt_id: ReceiptId::new(uint!(1_U256)),
+            receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
         }];
 
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(plan.allocations[0].burn_amount, burn_amount);
         assert_eq!(
             plan.allocations[0].receipt.receipt_id,
-            ReceiptId::new(uint!(1_U256))
+            ReceiptId::from(uint!(1_U256))
         );
     }
 
@@ -564,19 +564,19 @@ mod tests {
     fn test_plan_multiple_receipts_needed_returns_n_allocations() {
         let receipts = vec![
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(1_U256)),
+                receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(2_U256)),
+                receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(3_U256)),
+                receipt_id: ReceiptId::from(uint!(3_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_plan_insufficient_total_balance_returns_error() {
         let receipts = vec![ReceiptWithBalance {
-            receipt_id: ReceiptId::new(uint!(1_U256)),
+            receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(50_000000000000000000_U256)),
         }];
 
@@ -635,19 +635,19 @@ mod tests {
         // Receipts provided in non-sorted order to verify sorting
         let receipts = vec![
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(1_U256)),
+                receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(uint!(
                     10_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(2_U256)),
+                receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(3_U256)),
+                receipt_id: ReceiptId::from(uint!(3_U256)),
                 available_balance: Shares::new(uint!(
                     60_000000000000000000_U256
                 )),
@@ -665,7 +665,7 @@ mod tests {
         // First allocation should be from largest receipt (id=3, 60 tokens)
         assert_eq!(
             plan.allocations[0].receipt.receipt_id,
-            ReceiptId::new(uint!(3_U256)),
+            ReceiptId::from(uint!(3_U256)),
             "First allocation should be from largest receipt"
         );
         assert_eq!(
@@ -677,7 +677,7 @@ mod tests {
         // Second allocation should be partial from medium receipt (id=2)
         assert_eq!(
             plan.allocations[1].receipt.receipt_id,
-            ReceiptId::new(uint!(2_U256)),
+            ReceiptId::from(uint!(2_U256)),
             "Second allocation should be from medium receipt"
         );
         assert_eq!(
@@ -692,13 +692,13 @@ mod tests {
     fn test_plan_last_allocation_is_partial() {
         let receipts = vec![
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(1_U256)),
+                receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(2_U256)),
+                receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
@@ -744,13 +744,13 @@ mod tests {
         // Receipt 2: initial 50, no burns → 50 available
         let receipts = vec![
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(1_U256)),
+                receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(2_U256)),
+                receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
@@ -775,7 +775,7 @@ mod tests {
         // First receipt should be id=2 (50 available > 40 available)
         assert_eq!(
             plan.allocations[0].receipt.receipt_id,
-            ReceiptId::new(uint!(2_U256)),
+            ReceiptId::from(uint!(2_U256)),
             "Should select receipt with higher available balance first"
         );
         assert_eq!(
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn test_plan_includes_dust_amount() {
         let receipts = vec![ReceiptWithBalance {
-            receipt_id: ReceiptId::new(uint!(1_U256)),
+            receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
         }];
 
@@ -825,11 +825,11 @@ mod tests {
     fn test_plan_filters_zero_balance_receipts() {
         let receipts = vec![
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(1_U256)),
+                receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(U256::ZERO),
             },
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(uint!(2_U256)),
+                receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
@@ -849,7 +849,7 @@ mod tests {
         );
         assert_eq!(
             plan.allocations[0].receipt.receipt_id,
-            ReceiptId::new(uint!(2_U256))
+            ReceiptId::from(uint!(2_U256))
         );
     }
 
@@ -859,7 +859,7 @@ mod tests {
             balance in 1u64..=max_balance,
         ) -> ReceiptWithBalance {
             ReceiptWithBalance {
-                receipt_id: ReceiptId::new(U256::from(id)),
+                receipt_id: ReceiptId::from(U256::from(id)),
                 available_balance: Shares::new(U256::from(balance)),
             }
         }

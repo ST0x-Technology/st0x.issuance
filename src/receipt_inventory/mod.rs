@@ -25,10 +25,6 @@ pub(crate) use view::ReceiptInventoryView;
 pub(crate) struct ReceiptId(U256);
 
 impl ReceiptId {
-    pub(crate) const fn new(id: U256) -> Self {
-        Self(id)
-    }
-
     pub(crate) const fn inner(&self) -> U256 {
         self.0
     }
@@ -100,6 +96,18 @@ impl std::iter::Sum for Shares {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReceiptInventory {
     receipts: HashMap<ReceiptId, Shares>,
+}
+
+impl ReceiptInventory {
+    pub(crate) fn receipts_with_balance(&self) -> Vec<ReceiptWithBalance> {
+        self.receipts
+            .iter()
+            .map(|(receipt_id, balance)| ReceiptWithBalance {
+                receipt_id: *receipt_id,
+                available_balance: *balance,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -232,7 +240,7 @@ mod tests {
     use super::*;
 
     fn make_receipt_id(n: u64) -> ReceiptId {
-        ReceiptId::new(U256::from(n))
+        ReceiptId::from(U256::from(n))
     }
 
     fn make_shares(n: u64) -> Shares {
@@ -534,7 +542,7 @@ mod tests {
             new_balance: make_shares(0),
         });
 
-        assert!(aggregate.receipts.get(&make_receipt_id(42)).is_none());
+        assert!(!aggregate.receipts.contains_key(&make_receipt_id(42)));
     }
 
     #[test]
@@ -546,6 +554,30 @@ mod tests {
             receipt_id: make_receipt_id(42),
         });
 
-        assert!(aggregate.receipts.get(&make_receipt_id(42)).is_none());
+        assert!(!aggregate.receipts.contains_key(&make_receipt_id(42)));
+    }
+
+    #[test]
+    fn test_receipts_with_balance_returns_all_receipts() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.receipts.insert(make_receipt_id(1), make_shares(100));
+        aggregate.receipts.insert(make_receipt_id(2), make_shares(200));
+
+        let receipts = aggregate.receipts_with_balance();
+
+        assert_eq!(receipts.len(), 2);
+
+        let total: Shares =
+            receipts.iter().map(|receipt| receipt.available_balance).sum();
+        assert_eq!(total, make_shares(300));
+    }
+
+    #[test]
+    fn test_receipts_with_balance_empty_aggregate() {
+        let aggregate = ReceiptInventory::default();
+
+        let receipts = aggregate.receipts_with_balance();
+
+        assert!(receipts.is_empty());
     }
 }

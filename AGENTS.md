@@ -426,6 +426,11 @@ Environment variables (can be set via `.env` file):
   - **CORRECT**: `tx_hash: B256` or `address: Address` directly in error struct
   - The `#[error(...)]` attribute in thiserror handles display formatting -
     that's where formatting belongs, not in the error field types
+- **Let the Compiler Guide Error Variants**: Don't waste time figuring out which
+  error variants you'll need ahead of time. Write functions using the `?`
+  operator as if all required variants exist, then let the compiler tell you
+  exactly which `From` impls are missing. Add `#[from]` variants only for errors
+  the compiler complains about.
 - **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
   principle of type modeling in this codebase. Use algebraic data types (ADTs)
   and enums to encode business rules and state transitions directly in types
