@@ -144,16 +144,22 @@ impl SignerConfig {
     ///
     /// For Fireblocks, this makes an async API call to fetch the vault address.
     /// For local keys, this is a synchronous derivation.
+    ///
+    /// The chain_id is required for Fireblocks to determine which asset ID to use
+    /// when signing transactions.
     pub(crate) async fn resolve(
         &self,
+        chain_id: u64,
     ) -> Result<ResolvedSigner, SignerResolveError> {
         let wallet = match self {
             Self::Fireblocks(config) => {
-                let signer = FireblocksSigner::new(config).await?;
+                let mut signer = FireblocksSigner::new(config).await?;
+                signer.set_chain_id(Some(chain_id));
                 EthereumWallet::from(signer)
             }
             Self::Local(key) => {
-                let signer = PrivateKeySigner::from_bytes(key)?;
+                let mut signer = PrivateKeySigner::from_bytes(key)?;
+                signer.set_chain_id(Some(chain_id));
                 EthereumWallet::from(signer)
             }
         };
