@@ -11,14 +11,14 @@ use super::view::{
 use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::burn_tracking::{
-    BurnTrackingError, find_receipt_with_available_balance,
+    BurnPlan, BurnTrackingError, plan_multi_receipt_burn,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
 use crate::vault::{
-    OperationType, ReceiptInformation, VaultError, VaultService,
+    MultiBurnEntry, OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
 /// Orchestrates the on-chain burning process in response to `AlpacaJournalCompleted` events.
@@ -202,13 +202,18 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             return Ok(());
         }
 
-        let receipt_id = self
-            .select_receipt_for_retry(
-                issuer_request_id,
-                underlying,
-                total_shares,
-            )
+        let plan = self
+            .plan_burn(issuer_request_id, underlying, burn_shares, dust_shares)
             .await?;
+
+        let burns: Vec<MultiBurnEntry> = plan
+            .allocations
+            .into_iter()
+            .map(|alloc| MultiBurnEntry {
+                receipt_id: alloc.receipt.receipt_id,
+                burn_shares: alloc.burn_amount,
+            })
+            .collect();
 
         let receipt_info = ReceiptInformation {
             tokenization_request_id: tokenization_request_id.clone(),
@@ -224,6 +229,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             issuer_request_id = %issuer_request_id.0,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
+            num_receipts = burns.len(),
             "Retrying burn for BurnFailed redemption"
         );
 
@@ -233,9 +239,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                 RedemptionCommand::RetryBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
-                    burn_shares,
-                    dust_shares,
-                    receipt_id,
+                    burns,
+                    dust_shares: plan.dust,
                     owner: self.bot_wallet,
                     receipt_info,
                     user_wallet: *wallet,
@@ -249,35 +254,6 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         );
 
         Ok(())
-    }
-
-    async fn select_receipt_for_retry(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        underlying: &UnderlyingSymbol,
-        shares: U256,
-    ) -> Result<U256, BurnManagerError> {
-        let receipt_view = find_receipt_with_available_balance(
-            &self.receipt_query_pool,
-            underlying,
-            shares,
-        )
-        .await?;
-
-        let Some(receipt) = receipt_view else {
-            warn!(
-                issuer_request_id = %issuer_request_id,
-                %shares,
-                %underlying,
-                "No receipt found with sufficient balance"
-            );
-            return Err(BurnManagerError::InsufficientBalance {
-                required: shares,
-                available: U256::ZERO,
-            });
-        };
-
-        Ok(receipt.receipt_id)
     }
 
     async fn recover_single_burning(
@@ -435,9 +411,6 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         // Convert quantities to U256 for on-chain operations
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
-        let total_shares_needed = burn_shares
-            .checked_add(dust_shares)
-            .ok_or(BurnManagerError::SharesOverflow)?;
 
         info!(
             issuer_request_id = %issuer_request_id,
@@ -451,11 +424,12 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             "Starting on-chain burning process with dust handling"
         );
 
-        let receipt_id = self
-            .select_receipt_for_burning(
+        let plan = self
+            .plan_burn(
                 issuer_request_id,
                 &metadata.underlying,
-                total_shares_needed,
+                burn_shares,
+                dust_shares,
             )
             .await?;
 
@@ -472,55 +446,69 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         self.execute_burn_and_record_result(
             issuer_request_id,
             vault,
-            burn_shares,
-            dust_shares,
-            receipt_id,
+            plan,
             receipt_info,
         )
         .await
     }
 
-    async fn select_receipt_for_burning(
+    async fn plan_burn(
         &self,
         issuer_request_id: &IssuerRequestId,
         underlying: &UnderlyingSymbol,
-        shares: U256,
-    ) -> Result<U256, BurnManagerError> {
-        let receipt_view = find_receipt_with_available_balance(
+        burn_shares: U256,
+        dust_shares: U256,
+    ) -> Result<BurnPlan, BurnManagerError> {
+        let plan = plan_multi_receipt_burn(
             &self.receipt_query_pool,
             underlying,
-            shares,
+            burn_shares,
+            dust_shares,
         )
-        .await?;
+        .await;
 
-        let Some(receipt) = receipt_view else {
-            return self
-                .handle_no_receipt_found(issuer_request_id, underlying, shares)
-                .await;
-        };
-
-        info!(
-            issuer_request_id = %issuer_request_id,
-            receipt_id = %receipt.receipt_id,
-            "Selected receipt for burning"
-        );
-
-        Ok(receipt.receipt_id)
+        match plan {
+            Ok(plan) => {
+                info!(
+                    issuer_request_id = %issuer_request_id,
+                    num_receipts = plan.allocations.len(),
+                    total_burn = %plan.total_burn,
+                    dust = %plan.dust,
+                    "Planned multi-receipt burn"
+                );
+                Ok(plan)
+            }
+            Err(BurnTrackingError::InsufficientBalance {
+                required,
+                available,
+            }) => {
+                self.handle_insufficient_balance(
+                    issuer_request_id,
+                    underlying,
+                    required,
+                    available,
+                )
+                .await
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
-    async fn handle_no_receipt_found(
+    async fn handle_insufficient_balance(
         &self,
         issuer_request_id: &IssuerRequestId,
         underlying: &UnderlyingSymbol,
-        shares: U256,
-    ) -> Result<U256, BurnManagerError> {
+        required: U256,
+        available: U256,
+    ) -> Result<BurnPlan, BurnManagerError> {
         let error_msg = format!(
-            "No receipt found with sufficient balance for {shares} shares of {underlying}"
+            "Insufficient balance for {underlying}: required {required}, available {available}"
         );
 
         warn!(
             issuer_request_id = %issuer_request_id,
-            required_shares = %shares,
+            %required,
+            %available,
             underlying = %underlying,
             "{error_msg}"
         );
@@ -540,21 +528,25 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             "RecordBurnFailure command executed successfully"
         );
 
-        Err(BurnManagerError::InsufficientBalance {
-            required: shares,
-            available: U256::ZERO,
-        })
+        Err(BurnManagerError::InsufficientBalance { required, available })
     }
 
     async fn execute_burn_and_record_result(
         &self,
         issuer_request_id: &IssuerRequestId,
         vault: Address,
-        burn_shares: U256,
-        dust_shares: U256,
-        receipt_id: U256,
+        plan: BurnPlan,
         receipt_info: ReceiptInformation,
     ) -> Result<(), BurnManagerError> {
+        let burns: Vec<MultiBurnEntry> = plan
+            .allocations
+            .into_iter()
+            .map(|alloc| MultiBurnEntry {
+                receipt_id: alloc.receipt.receipt_id,
+                burn_shares: alloc.burn_amount,
+            })
+            .collect();
+
         let burn_result = self
             .cqrs
             .execute(
@@ -562,9 +554,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
-                    burn_shares,
-                    dust_shares,
-                    receipt_id,
+                    burns,
+                    dust_shares: plan.dust,
                     owner: self.bot_wallet,
                     receipt_info,
                 },
@@ -905,7 +896,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
-        assert_eq!(vault_mock.get_burn_with_dust_call_count(), 1);
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -963,7 +954,7 @@ mod tests {
             "Expected blockchain error, got {result:?}"
         );
 
-        assert_eq!(vault_mock.get_burn_with_dust_call_count(), 1);
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -1021,8 +1012,8 @@ mod tests {
         };
 
         assert!(
-            reason.contains("No receipt found with sufficient balance"),
-            "Expected error message about no receipt, got: {reason}"
+            reason.contains("Insufficient balance"),
+            "Expected error message about insufficient balance, got: {reason}"
         );
     }
 
@@ -1126,7 +1117,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got error: {result:?}");
 
-        assert_eq!(vault_mock.get_burn_with_dust_call_count(), 1);
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -1390,8 +1381,8 @@ mod tests {
         };
 
         assert!(
-            reason.contains("No receipt found with sufficient balance"),
-            "Expected error message about no receipt, got: {reason}"
+            reason.contains("Insufficient balance"),
+            "Expected error message about insufficient balance, got: {reason}"
         );
     }
 
@@ -1453,7 +1444,7 @@ mod tests {
 
         manager.recover_burning_redemptions().await;
 
-        assert_eq!(vault_mock.get_burn_with_dust_call_count(), 1);
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
         let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -1503,7 +1494,7 @@ mod tests {
 
         // No burn should have been attempted
         assert_eq!(
-            blockchain_service_mock.get_burn_with_dust_call_count(),
+            blockchain_service_mock.get_multi_burn_call_count(),
             0,
             "Should not call burn when on-chain balance is insufficient"
         );
@@ -1561,7 +1552,7 @@ mod tests {
         manager.recover_burning_redemptions().await;
 
         assert_eq!(
-            blockchain_service_mock.get_burn_with_dust_call_count(),
+            blockchain_service_mock.get_multi_burn_call_count(),
             0,
             "Should not call burn for Detected state"
         );
@@ -1637,7 +1628,7 @@ mod tests {
 
         // Burn should have been retried
         assert_eq!(
-            vault_mock.get_burn_with_dust_call_count(),
+            vault_mock.get_multi_burn_call_count(),
             1,
             "Should have retried the burn"
         );
@@ -1715,7 +1706,7 @@ mod tests {
 
         // No burn should have been attempted
         assert_eq!(
-            blockchain_service_mock.get_burn_with_dust_call_count(),
+            blockchain_service_mock.get_multi_burn_call_count(),
             0,
             "Should not call burn when on-chain balance is insufficient"
         );

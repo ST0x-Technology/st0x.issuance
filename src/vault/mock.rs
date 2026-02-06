@@ -6,9 +6,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    BurnParams, BurnWithDustResult, MintResult, MultiBurnParams,
-    MultiBurnResult, MultiBurnResultEntry, ReceiptInformation, VaultError,
-    VaultService,
+    MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
+    ReceiptInformation, VaultError, VaultService,
 };
 
 #[cfg(test)]
@@ -17,18 +16,6 @@ pub(crate) struct MintTokensCall {
     pub(crate) vault: Address,
     pub(crate) assets: U256,
     pub(crate) receiver: Address,
-    pub(crate) receipt_info: ReceiptInformation,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct BurnWithDustCall {
-    pub(crate) vault: Address,
-    pub(crate) burn_shares: U256,
-    pub(crate) dust_shares: U256,
-    pub(crate) receipt_id: U256,
-    pub(crate) owner: Address,
-    pub(crate) user: Address,
     pub(crate) receipt_info: ReceiptInformation,
 }
 
@@ -53,13 +40,10 @@ enum MockBehavior {
 pub(crate) struct MockVaultService {
     behavior: MockBehavior,
     mint_delay_ms: u64,
-    burn_delay_ms: u64,
     call_count: Arc<AtomicUsize>,
-    burn_with_dust_call_count: Arc<AtomicUsize>,
+    multi_burn_call_count: Arc<AtomicUsize>,
     #[cfg(test)]
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
-    #[cfg(test)]
-    last_burn_with_dust_call: Arc<Mutex<Option<BurnWithDustCall>>>,
     #[cfg(test)]
     share_balance: Arc<Mutex<U256>>,
 }
@@ -70,13 +54,10 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Success,
             mint_delay_ms: 0,
-            burn_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
-            burn_with_dust_call_count: Arc::new(AtomicUsize::new(0)),
+            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             last_call: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            last_burn_with_dust_call: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             share_balance: Arc::new(Mutex::new(U256::MAX)),
         }
@@ -87,11 +68,9 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Failure,
             mint_delay_ms: 0,
-            burn_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
-            burn_with_dust_call_count: Arc::new(AtomicUsize::new(0)),
+            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             last_call: Arc::new(Mutex::new(None)),
-            last_burn_with_dust_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
         }
     }
@@ -114,23 +93,15 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
-    pub(crate) fn get_burn_with_dust_call_count(&self) -> usize {
-        self.burn_with_dust_call_count.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_last_burn_with_dust_call(
-        &self,
-    ) -> Option<BurnWithDustCall> {
-        self.last_burn_with_dust_call.lock().unwrap().clone()
+    pub(crate) fn get_multi_burn_call_count(&self) -> usize {
+        self.multi_burn_call_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.call_count.store(0, Ordering::Relaxed);
-        self.burn_with_dust_call_count.store(0, Ordering::Relaxed);
+        self.multi_burn_call_count.store(0, Ordering::Relaxed);
         *self.last_call.lock().unwrap() = None;
-        *self.last_burn_with_dust_call.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -198,52 +169,12 @@ impl VaultService for MockVaultService {
         }
     }
 
-    #[cfg_attr(not(test), allow(unused_variables))]
-    async fn burn_and_return_dust(
-        &self,
-        params: BurnParams,
-    ) -> Result<BurnWithDustResult, VaultError> {
-        if self.burn_delay_ms > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                self.burn_delay_ms,
-            ))
-            .await;
-        }
-
-        self.burn_with_dust_call_count.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(test)]
-        {
-            *self.last_burn_with_dust_call.lock().unwrap() =
-                Some(BurnWithDustCall {
-                    vault: params.vault,
-                    burn_shares: params.burn_shares,
-                    dust_shares: params.dust_shares,
-                    receipt_id: params.receipt_id,
-                    owner: params.owner,
-                    user: params.user,
-                    receipt_info: params.receipt_info.clone(),
-                });
-        }
-
-        match &self.behavior {
-            MockBehavior::Success => Ok(BurnWithDustResult {
-                tx_hash: B256::from([0x44; 32]),
-                receipt_id: params.receipt_id,
-                shares_burned: params.burn_shares,
-                dust_returned: params.dust_shares,
-                gas_used: 30000,
-                block_number: 3000,
-            }),
-            #[cfg(test)]
-            MockBehavior::Failure => Err(VaultError::InvalidReceipt),
-        }
-    }
-
     async fn burn_multiple_receipts(
         &self,
         params: MultiBurnParams,
     ) -> Result<MultiBurnResult, VaultError> {
+        self.multi_burn_call_count.fetch_add(1, Ordering::Relaxed);
+
         match &self.behavior {
             MockBehavior::Success => {
                 let burns = params
@@ -280,7 +211,8 @@ mod tests {
         IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::vault::{
-        BurnParams, OperationType, ReceiptInformation, VaultError, VaultService,
+        MultiBurnEntry, MultiBurnParams, OperationType, ReceiptInformation,
+        VaultError, VaultService,
     };
 
     fn test_receipt_info() -> ReceiptInformation {
@@ -488,58 +420,14 @@ mod tests {
         assert!(mock.get_last_call().is_none());
     }
 
-    #[tokio::test]
-    async fn test_burn_and_return_dust_success() {
-        let mock = MockVaultService::new_success();
-        let burn_shares = U256::from(500);
-        let dust_shares = U256::from(10);
-        let receipt_id = U256::from(42);
-        let params = BurnParams {
+    fn test_multi_burn_params() -> MultiBurnParams {
+        MultiBurnParams {
             vault: test_vault(),
-            burn_shares,
-            dust_shares,
-            receipt_id,
-            owner: test_receiver(),
-            user: address!("0x2222222222222222222222222222222222222222"),
-            receipt_info: test_receipt_info(),
-        };
-
-        let result = mock.burn_and_return_dust(params).await;
-
-        assert!(result.is_ok());
-        let burn_result = result.unwrap();
-        assert_eq!(burn_result.receipt_id, receipt_id);
-        assert_eq!(burn_result.shares_burned, burn_shares);
-        assert_eq!(burn_result.dust_returned, dust_shares);
-        assert_eq!(burn_result.gas_used, 30000);
-        assert_eq!(burn_result.block_number, 3000);
-    }
-
-    #[tokio::test]
-    async fn test_burn_and_return_dust_failure() {
-        let mock = MockVaultService::new_failure();
-        let params = BurnParams {
-            vault: test_vault(),
-            burn_shares: U256::from(500),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(42),
+                burn_shares: U256::from(500),
+            }],
             dust_shares: U256::from(10),
-            receipt_id: U256::from(42),
-            owner: test_receiver(),
-            user: address!("0x2222222222222222222222222222222222222222"),
-            receipt_info: test_receipt_info(),
-        };
-
-        let result = mock.burn_and_return_dust(params).await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VaultError::InvalidReceipt));
-    }
-
-    fn test_burn_params() -> BurnParams {
-        BurnParams {
-            vault: test_vault(),
-            burn_shares: U256::from(500),
-            dust_shares: U256::from(10),
-            receipt_id: U256::from(42),
             owner: test_receiver(),
             user: address!("0x2222222222222222222222222222222222222222"),
             receipt_info: test_receipt_info(),
@@ -547,56 +435,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_burn_with_dust_call_count_increments() {
+    async fn test_multi_burn_call_count_increments() {
         let mock = MockVaultService::new_success();
 
-        assert_eq!(mock.get_burn_with_dust_call_count(), 0);
+        assert_eq!(mock.get_multi_burn_call_count(), 0);
 
-        mock.burn_and_return_dust(test_burn_params()).await.unwrap();
-        assert_eq!(mock.get_burn_with_dust_call_count(), 1);
+        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        assert_eq!(mock.get_multi_burn_call_count(), 1);
 
-        mock.burn_and_return_dust(test_burn_params()).await.unwrap();
-        assert_eq!(mock.get_burn_with_dust_call_count(), 2);
+        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        assert_eq!(mock.get_multi_burn_call_count(), 2);
     }
 
     #[tokio::test]
-    async fn test_burn_with_dust_last_call_captures_arguments() {
-        let mock = MockVaultService::new_success();
-        let params = test_burn_params();
-
-        assert!(mock.get_last_burn_with_dust_call().is_none());
-
-        mock.burn_and_return_dust(params.clone()).await.unwrap();
-
-        let last_call = mock.get_last_burn_with_dust_call();
-        assert!(last_call.is_some());
-
-        let call = last_call.unwrap();
-        assert_eq!(call.vault, params.vault);
-        assert_eq!(call.burn_shares, params.burn_shares);
-        assert_eq!(call.dust_shares, params.dust_shares);
-        assert_eq!(call.receipt_id, params.receipt_id);
-        assert_eq!(call.owner, params.owner);
-        assert_eq!(call.user, params.user);
-        assert_eq!(
-            call.receipt_info.tokenization_request_id.0,
-            params.receipt_info.tokenization_request_id.0
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reset_clears_burn_with_dust_state() {
+    async fn test_reset_clears_multi_burn_state() {
         let mock = MockVaultService::new_success();
 
-        mock.burn_and_return_dust(test_burn_params()).await.unwrap();
-        mock.burn_and_return_dust(test_burn_params()).await.unwrap();
+        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
 
-        assert_eq!(mock.get_burn_with_dust_call_count(), 2);
-        assert!(mock.get_last_burn_with_dust_call().is_some());
+        assert_eq!(mock.get_multi_burn_call_count(), 2);
 
         mock.reset();
 
-        assert_eq!(mock.get_burn_with_dust_call_count(), 0);
-        assert!(mock.get_last_burn_with_dust_call().is_none());
+        assert_eq!(mock.get_multi_burn_call_count(), 0);
     }
 }

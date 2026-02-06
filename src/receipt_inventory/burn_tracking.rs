@@ -10,10 +10,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mint::IssuerRequestId;
-use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
+use crate::redemption::{
+    BurnRecord, Redemption, RedemptionError, RedemptionEvent,
+};
 use crate::tokenized_asset::UnderlyingSymbol;
 
-/// Tracks a single burn operation.
+/// Tracks burn operations for a redemption.
 ///
 /// This is a cqrs-es view keyed by redemption aggregate_id (red-xxx).
 /// Each successful burn creates one record. Use GenericQuery to update.
@@ -25,12 +27,10 @@ pub(crate) enum ReceiptBurnsView {
     #[default]
     Unavailable,
     Burned {
-        /// The on-chain receipt ID that was burned from
-        receipt_id: U256,
         /// The redemption's issuer_request_id
         redemption_issuer_request_id: IssuerRequestId,
-        /// Number of shares burned
-        shares_burned: U256,
+        /// All burns performed in this redemption (may span multiple receipts)
+        burns: Vec<BurnRecord>,
         /// When the burn occurred
         burned_at: DateTime<Utc>,
     },
@@ -38,11 +38,18 @@ pub(crate) enum ReceiptBurnsView {
 
 impl View<Redemption> for ReceiptBurnsView {
     fn update(&mut self, event: &EventEnvelope<Redemption>) {
-        if let RedemptionEvent::TokensBurned { .. } = &event.payload {
-            // TODO Task 8: Extract burns from v2.0 event and update view
-            todo!(
-                "Task 8: Update ReceiptBurnsView from TokensBurned v2.0 event"
-            )
+        if let RedemptionEvent::TokensBurned {
+            issuer_request_id,
+            burns,
+            burned_at,
+            ..
+        } = &event.payload
+        {
+            *self = Self::Burned {
+                redemption_issuer_request_id: issuer_request_id.clone(),
+                burns: burns.clone(),
+                burned_at: *burned_at,
+            };
         }
     }
 }
@@ -72,16 +79,11 @@ pub(crate) enum BurnTrackingError {
     InsufficientBalance { required: U256, available: U256 },
 }
 
-/// Represents a receipt with its available balance (initial - burned).
+/// Represents a receipt with its available balance for burn planning.
 #[derive(Debug, Clone)]
 pub(crate) struct ReceiptWithBalance {
     pub(crate) receipt_id: U256,
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) initial_amount: U256,
-    pub(crate) total_burned: U256,
     pub(crate) available_balance: U256,
-    /// The mint's issuer_request_id (for traceability)
-    pub(crate) mint_issuer_request_id: IssuerRequestId,
 }
 
 /// A single allocation within a multi-receipt burn plan.

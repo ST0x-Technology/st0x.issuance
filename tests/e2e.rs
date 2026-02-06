@@ -930,7 +930,7 @@ async fn verify_burn_records_created(
 
     let burn_payload: serde_json::Value =
         serde_json::from_str(&burn_records[0].payload)?;
-    let burned_shares_hex = burn_payload["Burned"]["shares_burned"]
+    let burned_shares_hex = burn_payload["Burned"]["burns"][0]["shares_burned"]
         .as_str()
         .expect("Should have shares_burned");
     let burned_shares =

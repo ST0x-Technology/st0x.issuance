@@ -1,5 +1,6 @@
 mod cmd;
 mod event;
+pub(crate) mod upcaster;
 mod view;
 
 pub(crate) mod burn_manager;
@@ -18,7 +19,9 @@ use tracing::warn;
 use crate::Quantity;
 use crate::mint::{IssuerRequestId, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-use crate::vault::{BurnParams, ReceiptInformation, VaultService};
+use crate::vault::{
+    MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultService,
+};
 
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent};
@@ -88,9 +91,8 @@ impl Default for Redemption {
 /// is derived from aggregate state, not passed in the command.
 struct BurnInput {
     vault: Address,
-    burn_shares: U256,
+    burns: Vec<MultiBurnEntry>,
     dust_shares: U256,
-    receipt_id: U256,
     owner: Address,
     receipt_info: ReceiptInformation,
 }
@@ -207,21 +209,35 @@ impl Redemption {
 
         let user_wallet = metadata.wallet;
 
-        let burn = services
-            .burn_and_return_dust(BurnParams {
+        let result = services
+            .burn_multiple_receipts(MultiBurnParams {
                 vault: input.vault,
-                burn_shares: input.burn_shares,
+                burns: input.burns,
                 dust_shares: input.dust_shares,
-                receipt_id: input.receipt_id,
                 owner: input.owner,
                 user: user_wallet,
                 receipt_info: input.receipt_info,
             })
             .await?;
 
-        // TODO Task 7: Convert single burn result to v2.0 event format
-        let _ = burn;
-        todo!("Task 7: Build TokensBurned v2.0 event from burn result")
+        let burns = result
+            .burns
+            .into_iter()
+            .map(|b| BurnRecord {
+                receipt_id: b.receipt_id,
+                shares_burned: b.shares_burned,
+            })
+            .collect();
+
+        Ok(vec![RedemptionEvent::TokensBurned {
+            issuer_request_id,
+            tx_hash: result.tx_hash,
+            burns,
+            dust_returned: result.dust_returned,
+            gas_used: result.gas_used,
+            block_number: result.block_number,
+            burned_at: Utc::now(),
+        }])
     }
 
     fn handle_record_burn_failure(
@@ -257,21 +273,35 @@ impl Redemption {
             });
         }
 
-        let burn = services
-            .burn_and_return_dust(BurnParams {
+        let result = services
+            .burn_multiple_receipts(MultiBurnParams {
                 vault: input.vault,
-                burn_shares: input.burn_shares,
+                burns: input.burns,
                 dust_shares: input.dust_shares,
-                receipt_id: input.receipt_id,
                 owner: input.owner,
                 user: user_wallet,
                 receipt_info: input.receipt_info,
             })
             .await?;
 
-        // TODO Task 7: Convert single burn result to v2.0 event format
-        let _ = burn;
-        todo!("Task 7: Build TokensBurned v2.0 event from burn result")
+        let burns = result
+            .burns
+            .into_iter()
+            .map(|b| BurnRecord {
+                receipt_id: b.receipt_id,
+                shares_burned: b.shares_burned,
+            })
+            .collect();
+
+        Ok(vec![RedemptionEvent::TokensBurned {
+            issuer_request_id,
+            tx_hash: result.tx_hash,
+            burns,
+            dust_returned: result.dust_returned,
+            gas_used: result.gas_used,
+            block_number: result.block_number,
+            burned_at: Utc::now(),
+        }])
     }
 
     fn handle_confirm_alpaca_complete(
@@ -447,9 +477,8 @@ impl Aggregate for Redemption {
             RedemptionCommand::BurnTokens {
                 issuer_request_id,
                 vault,
-                burn_shares,
+                burns,
                 dust_shares,
-                receipt_id,
                 owner,
                 receipt_info,
             } => {
@@ -458,9 +487,8 @@ impl Aggregate for Redemption {
                     issuer_request_id,
                     BurnInput {
                         vault,
-                        burn_shares,
+                        burns,
                         dust_shares,
-                        receipt_id,
                         owner,
                         receipt_info,
                     },
@@ -474,9 +502,8 @@ impl Aggregate for Redemption {
             RedemptionCommand::RetryBurn {
                 issuer_request_id,
                 vault,
-                burn_shares,
+                burns,
                 dust_shares,
-                receipt_id,
                 owner,
                 receipt_info,
                 user_wallet,
@@ -486,9 +513,8 @@ impl Aggregate for Redemption {
                     issuer_request_id,
                     BurnInput {
                         vault,
-                        burn_shares,
+                        burns,
                         dust_shares,
-                        receipt_id,
                         owner,
                         receipt_info,
                     },
@@ -600,7 +626,9 @@ mod tests {
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{OperationType, ReceiptInformation, VaultService};
+    use crate::vault::{
+        MultiBurnEntry, OperationType, ReceiptInformation, VaultService,
+    };
 
     type RedemptionTestFramework = TestFramework<Redemption>;
 
@@ -1099,9 +1127,11 @@ mod tests {
             .when(RedemptionCommand::BurnTokens {
                 issuer_request_id: issuer_request_id.clone(),
                 vault,
-                burn_shares,
+                burns: vec![MultiBurnEntry {
+                    receipt_id,
+                    burn_shares,
+                }],
                 dust_shares: U256::ZERO,
-                receipt_id,
                 owner,
                 receipt_info,
             });
@@ -1158,9 +1188,11 @@ mod tests {
             .when(RedemptionCommand::BurnTokens {
                 issuer_request_id,
                 vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                burn_shares: uint!(25_000000000000000000_U256),
+                burns: vec![MultiBurnEntry {
+                    receipt_id: uint!(1_U256),
+                    burn_shares: uint!(25_000000000000000000_U256),
+                }],
                 dust_shares: U256::ZERO,
-                receipt_id: uint!(1_U256),
                 owner: address!("0x1111111111111111111111111111111111111111"),
                 receipt_info,
             })

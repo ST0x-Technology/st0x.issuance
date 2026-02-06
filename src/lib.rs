@@ -22,6 +22,7 @@ use crate::redemption::{
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
     replay_redemption_view,
+    upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetView};
 
@@ -371,10 +372,12 @@ fn setup_aggregate_cqrs(
         vec![Box::new(redemption_query), Box::new(receipt_burns_query)],
         vault_service,
     ));
-    let redemption_event_store =
-        Arc::new(PersistedEventStore::new_event_store(
-            SqliteEventRepository::new(pool.clone()),
-        ));
+    let redemption_event_store = Arc::new(
+        PersistedEventStore::new_event_store(SqliteEventRepository::new(
+            pool.clone(),
+        ))
+        .with_upcasters(vec![create_tokens_burned_upcaster()]),
+    );
 
     AggregateCqrsSetup {
         mint_cqrs,

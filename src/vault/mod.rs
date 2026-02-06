@@ -76,26 +76,6 @@ pub(crate) trait VaultService: Send + Sync {
         owner: Address,
     ) -> Result<U256, VaultError>;
 
-    /// Atomically burns tokens and returns dust to user using multicall.
-    ///
-    /// This method implements the dust handling pattern for redemptions where the
-    /// on-chain quantity (18 decimals) exceeds Alpaca's precision (9 decimals).
-    /// It uses multicall to atomically:
-    /// 1. Burn the truncated amount (what Alpaca processed)
-    /// 2. Transfer the dust back to the user's wallet
-    ///
-    /// Both operations succeed or fail atomically in a single transaction.
-    /// If dust is zero, only the burn is executed.
-    ///
-    /// # Returns
-    ///
-    /// On success, returns [`BurnWithDustResult`] containing transaction details
-    /// and the amount of dust returned.
-    async fn burn_and_return_dust(
-        &self,
-        params: BurnParams,
-    ) -> Result<BurnWithDustResult, VaultError>;
-
     /// Atomically burns tokens from multiple receipts and returns dust using multicall.
     ///
     /// This method handles redemptions that require burning from multiple receipts
@@ -115,25 +95,6 @@ pub(crate) trait VaultService: Send + Sync {
     ) -> Result<MultiBurnResult, VaultError>;
 }
 
-/// Result of a successful burn-with-dust operation.
-///
-/// Contains all transaction details and the dust returned to the user.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BurnWithDustResult {
-    /// Transaction hash of the multicall transaction
-    pub(crate) tx_hash: B256,
-    /// ERC-1155 receipt ID that was burned from
-    pub(crate) receipt_id: U256,
-    /// Number of ERC-20 shares burned (with 18 decimals)
-    pub(crate) shares_burned: U256,
-    /// Amount of dust returned to user (with 18 decimals)
-    pub(crate) dust_returned: U256,
-    /// Gas consumed by the transaction
-    pub(crate) gas_used: u64,
-    /// Block number where the transaction was included
-    pub(crate) block_number: u64,
-}
-
 /// Result of a successful on-chain minting operation.
 ///
 /// Contains all transaction details needed to track the mint in the Mint aggregate
@@ -150,27 +111,6 @@ pub(crate) struct MintResult {
     pub(crate) gas_used: u64,
     /// Block number where the transaction was included
     pub(crate) block_number: u64,
-}
-
-/// Parameters for a burn-with-dust operation.
-///
-/// Groups all inputs needed to atomically burn tokens and return dust to the user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BurnParams {
-    /// Address of the vault contract
-    pub(crate) vault: Address,
-    /// Amount of shares to burn (truncated to 9 decimals)
-    pub(crate) burn_shares: U256,
-    /// Amount of dust to return to user (can be zero)
-    pub(crate) dust_shares: U256,
-    /// ERC-1155 receipt ID to burn from
-    pub(crate) receipt_id: U256,
-    /// Address that owns the shares being burned (typically bot wallet)
-    pub(crate) owner: Address,
-    /// User's address that will receive the dust
-    pub(crate) user: Address,
-    /// Metadata about the operation for on-chain audit trail
-    pub(crate) receipt_info: ReceiptInformation,
 }
 
 /// A single burn within a multi-receipt burn operation.
@@ -264,8 +204,8 @@ pub(crate) enum VaultError {
     #[error("Invalid receipt")]
     InvalidReceipt,
     /// Expected event (e.g., Deposit) not found in transaction logs
-    #[error("Event not found in transaction: {tx_hash}")]
-    EventNotFound { tx_hash: String },
+    #[error("Event not found in transaction: {tx_hash:?}")]
+    EventNotFound { tx_hash: B256 },
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
