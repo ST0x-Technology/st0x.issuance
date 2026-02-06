@@ -1,3 +1,4 @@
+use alloy::primitives::{address, b256};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -6,9 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
-    RedeemRequestStatus, RedeemResponse, TokenizationRequestType,
+    RedeemRequestStatus, RedeemResponse, TokenizationRequest,
+    TokenizationRequestType,
 };
-use crate::mint::TokenizationRequestId;
+use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 /// Mock Alpaca service for testing.
 ///
@@ -97,7 +100,7 @@ impl AlpacaService for MockAlpacaService {
         {
             if self.should_succeed {
                 Ok(RedeemResponse {
-                    tokenization_request_id: crate::mint::TokenizationRequestId(
+                    tokenization_request_id: TokenizationRequestId(
                         "mock-tok-123".to_string(),
                     ),
                     issuer_request_id: request.issuer_request_id,
@@ -111,7 +114,7 @@ impl AlpacaService for MockAlpacaService {
                     network: request.network,
                     wallet: request.wallet,
                     tx_hash: request.tx_hash,
-                    fees: Fees(Decimal::ZERO),
+                    fees: Some(Fees(Decimal::ZERO)),
                 })
             } else {
                 let body = self
@@ -125,7 +128,7 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(not(test))]
         {
             Ok(RedeemResponse {
-                tokenization_request_id: crate::mint::TokenizationRequestId(
+                tokenization_request_id: TokenizationRequestId(
                     "mock-tok-123".to_string(),
                 ),
                 issuer_request_id: request.issuer_request_id,
@@ -139,7 +142,7 @@ impl AlpacaService for MockAlpacaService {
                 network: request.network,
                 wallet: request.wallet,
                 tx_hash: request.tx_hash,
-                fees: Fees(Decimal::ZERO),
+                fees: Some(Fees(Decimal::ZERO)),
             })
         }
     }
@@ -147,7 +150,7 @@ impl AlpacaService for MockAlpacaService {
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<super::TokenizationRequest, AlpacaError> {
+    ) -> Result<TokenizationRequest, AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
@@ -155,24 +158,18 @@ impl AlpacaService for MockAlpacaService {
             if self.should_succeed {
                 Ok(super::TokenizationRequest {
                     id: tokenization_request_id.clone(),
-                    issuer_request_id: crate::mint::IssuerRequestId::new(
-                        "mock-issuer-123",
-                    ),
-                    r#type: super::TokenizationRequestType::Redeem,
-                    status: super::RedeemRequestStatus::Completed,
-                    underlying: crate::tokenized_asset::UnderlyingSymbol::new(
-                        "AAPL",
-                    ),
-                    token: crate::tokenized_asset::TokenSymbol::new("tAAPL"),
-                    quantity: crate::mint::Quantity::new(
-                        rust_decimal::Decimal::from(100),
-                    ),
-                    wallet: alloy::primitives::address!(
+                    issuer_request_id: IssuerRequestId::new("mock-issuer-123"),
+                    r#type: TokenizationRequestType::Redeem,
+                    status: RedeemRequestStatus::Completed,
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
-                    tx_hash: alloy::primitives::b256!(
+                    tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
+                    )),
                 })
             } else {
                 Err(AlpacaError::RequestNotFound(
@@ -184,22 +181,16 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(not(test))]
         Ok(super::TokenizationRequest {
             id: tokenization_request_id.clone(),
-            issuer_request_id: crate::mint::IssuerRequestId::new(
-                "mock-issuer-123",
-            ),
-            r#type: super::TokenizationRequestType::Redeem,
-            status: super::RedeemRequestStatus::Completed,
-            underlying: crate::tokenized_asset::UnderlyingSymbol::new("AAPL"),
-            token: crate::tokenized_asset::TokenSymbol::new("tAAPL"),
-            quantity: crate::mint::Quantity::new(rust_decimal::Decimal::from(
-                100,
-            )),
-            wallet: alloy::primitives::address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
-            tx_hash: alloy::primitives::b256!(
+            issuer_request_id: IssuerRequestId::new("mock-issuer-123"),
+            r#type: TokenizationRequestType::Redeem,
+            status: RedeemRequestStatus::Completed,
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            quantity: Quantity::new(rust_decimal::Decimal::from(100)),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            tx_hash: Some(b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
+            )),
         })
     }
 }

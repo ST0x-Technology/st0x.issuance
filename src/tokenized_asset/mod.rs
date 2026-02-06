@@ -15,7 +15,7 @@ pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::TokenizedAssetView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct UnderlyingSymbol(pub(crate) String);
+pub struct UnderlyingSymbol(pub(crate) String);
 
 impl std::fmt::Display for UnderlyingSymbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -24,7 +24,7 @@ impl std::fmt::Display for UnderlyingSymbol {
 }
 
 impl UnderlyingSymbol {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 }

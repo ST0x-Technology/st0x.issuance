@@ -57,7 +57,8 @@ pub(crate) async fn initiate_mint(
     )
     .await?;
 
-    validate_client_eligible(pool.inner(), &request.client_id).await?;
+    validate_client_eligible(pool.inner(), &request.client_id, &request.wallet)
+        .await?;
 
     let issuer_request_id =
         IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
@@ -146,6 +147,15 @@ mod tests {
             .execute(&aggregate_id, link_cmd)
             .await
             .expect("Failed to link account to Alpaca");
+
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_cmd = AccountCommand::WhitelistWallet { wallet };
+
+        account_cqrs
+            .execute(&aggregate_id, whitelist_cmd)
+            .await
+            .expect("Failed to whitelist wallet");
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -425,8 +435,9 @@ mod tests {
     #[tokio::test]
     async fn test_events_are_persisted_correctly() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
             account_cqrs,
@@ -511,8 +522,9 @@ mod tests {
     #[tokio::test]
     async fn test_views_are_updated_correctly() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
             account_cqrs,
@@ -601,8 +613,9 @@ mod tests {
     #[tokio::test]
     async fn test_initiate_mint_rejects_invalid_wallet_address() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
             account_cqrs,
@@ -711,8 +724,9 @@ mod tests {
     #[tokio::test]
     async fn test_initiate_mint_with_duplicate_issuer_request_id() {
         let harness = TestHarness::new().await;
-        let TestAccountAndAsset { client_id, underlying, token, network } =
-            harness.setup_account_and_asset().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
         let TestHarness { mint_cqrs, .. } = harness;
 
         let issuer_request_id = "test-issuer-request-id";
@@ -771,5 +785,78 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_mint_rejects_non_whitelisted_wallet() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset {
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet: whitelisted_wallet,
+        } = harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_cqrs,
+            asset_cqrs: tokenized_asset_cqrs,
+            mint_cqrs,
+        } = harness;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_cqrs)
+            .manage(account_cqrs)
+            .manage(tokenized_asset_cqrs)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let non_whitelisted_wallet =
+            address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        assert_ne!(
+            whitelisted_wallet, non_whitelisted_wallet,
+            "Test requires different wallet addresses"
+        );
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.0,
+            "token_symbol": token.0,
+            "network": network.0,
+            "client_id": client_id,
+            "wallet_address": non_whitelisted_wallet.to_string()
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+
+        let error_response: ErrorResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        assert_eq!(
+            error_response.error,
+            "Insufficient Eligibility: Wallet not whitelisted for client"
+        );
     }
 }

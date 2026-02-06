@@ -253,12 +253,21 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         }
 
-        if request.quantity != metadata.quantity {
+        let Some(alpaca_quantity) = aggregate.alpaca_quantity() else {
+            return Err(JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.0.clone(),
+                reason: format!(
+                    "Redemption not in AlpacaCalled state for validation: {aggregate:?}"
+                ),
+            });
+        };
+
+        if &request.quantity != alpaca_quantity {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
                     "Quantity mismatch: expected {}, got {}",
-                    metadata.quantity.0, request.quantity.0
+                    alpaca_quantity.0, request.quantity.0
                 ),
             });
         }
@@ -273,11 +282,11 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         }
 
-        if request.tx_hash != metadata.detected_tx_hash {
+        if request.tx_hash != Some(metadata.detected_tx_hash) {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.0.clone(),
                 reason: format!(
-                    "Transaction hash mismatch: expected {}, got {}",
+                    "Transaction hash mismatch: expected {}, got {:?}",
                     metadata.detected_tx_hash, request.tx_hash
                 ),
             });
@@ -441,6 +450,7 @@ mod tests {
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{Aggregate, EventStore};
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -453,6 +463,8 @@ mod tests {
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
     use crate::tokenized_asset::TokenSymbol;
+    use crate::vault::VaultService;
+    use crate::vault::mock::MockVaultService;
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -475,8 +487,13 @@ mod tests {
             .expect("Failed to run migrations");
 
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let cqrs = Arc::new(cqrs_es::CqrsFramework::new(
+            (*store).clone(),
+            vec![],
+            vault_service,
+        ));
         (cqrs, store, pool)
     }
 
@@ -507,6 +524,8 @@ mod tests {
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
             },
         )
         .await
@@ -546,9 +565,9 @@ mod tests {
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(Decimal::from(100)),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-                tx_hash: b256!(
+                tx_hash: Some(b256!(
                     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                ),
+                )),
             }
         }
     }
@@ -933,9 +952,9 @@ mod tests {
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
-                    tx_hash: b256!(
+                    tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                    ),
+                    )),
                 })
             }
         }
@@ -1178,13 +1197,16 @@ mod tests {
         )
         .await;
 
+        let quantity = Quantity::new(dec!(100));
         let view = RedemptionView::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             wallet,
-            quantity: Quantity::new(Decimal::from(100)),
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::new(dec!(0)),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -1233,13 +1255,16 @@ mod tests {
         )
         .await;
 
+        let quantity = Quantity::new(dec!(100));
         let view = RedemptionView::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            quantity: Quantity::new(Decimal::from(100)),
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::new(dec!(0)),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
