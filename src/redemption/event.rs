@@ -140,8 +140,10 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            receipt_id: uint!(42_U256),
-            shares_burned: uint!(100_000000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
@@ -149,7 +151,7 @@ mod tests {
         };
 
         assert_eq!(event.event_type(), "RedemptionEvent::TokensBurned");
-        assert_eq!(event.event_version(), "1.0");
+        assert_eq!(event.event_version(), "2.0");
     }
 
     #[test]
@@ -159,8 +161,10 @@ mod tests {
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
-            receipt_id: uint!(7_U256),
-            shares_burned: uint!(250_500000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(7_U256),
+                shares_burned: uint!(250_500000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 75000,
             block_number: 2000,
@@ -226,14 +230,14 @@ mod tests {
         assert_eq!(dust_quantity, Quantity::default());
     }
 
+    /// Tests that v2.0 TokensBurned events without dust_returned field default to zero.
     #[test]
-    fn test_backwards_compat_tokens_burned_without_dust_fields() {
+    fn test_backwards_compat_tokens_burned_v2_without_dust_fields() {
         let json = r#"{
             "TokensBurned": {
                 "issuer_request_id": "red-old-456",
                 "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "receipt_id": "0x42",
-                "shares_burned": "0x56bc75e2d63100000",
+                "burns": [{"receipt_id": "0x42", "shares_burned": "0x56bc75e2d63100000"}],
                 "gas_used": 50000,
                 "block_number": 1000,
                 "burned_at": "2025-01-01T00:00:00Z"
@@ -242,10 +246,13 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::TokensBurned { dust_returned, .. } = event else {
+        let RedemptionEvent::TokensBurned { dust_returned, burns, .. } = event
+        else {
             panic!("Expected TokensBurned variant");
         };
 
         assert_eq!(dust_returned, U256::ZERO);
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0].receipt_id, uint!(0x42_U256));
     }
 }

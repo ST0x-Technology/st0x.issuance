@@ -95,6 +95,24 @@ pub(crate) trait VaultService: Send + Sync {
         &self,
         params: BurnParams,
     ) -> Result<BurnWithDustResult, VaultError>;
+
+    /// Atomically burns tokens from multiple receipts and returns dust using multicall.
+    ///
+    /// This method handles redemptions that require burning from multiple receipts
+    /// when no single receipt has sufficient balance. It uses multicall to atomically:
+    /// 1. Execute N redeem() calls, one for each receipt
+    /// 2. Transfer the dust back to the user's wallet (if dust > 0)
+    ///
+    /// All operations succeed or fail atomically in a single transaction.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns [`MultiBurnResult`] containing transaction details
+    /// and per-receipt burn amounts.
+    async fn burn_multiple_receipts(
+        &self,
+        params: MultiBurnParams,
+    ) -> Result<MultiBurnResult, VaultError>;
 }
 
 /// Result of a successful burn-with-dust operation.

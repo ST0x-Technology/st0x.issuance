@@ -176,6 +176,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             block_number,
         })
     }
+
+    async fn burn_multiple_receipts(
+        &self,
+        _params: super::MultiBurnParams,
+    ) -> Result<super::MultiBurnResult, VaultError> {
+        todo!("Task 6: Implement multi-receipt burn in VaultService")
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    BurnParams, BurnWithDustResult, MintResult, ReceiptInformation, VaultError,
+    BurnParams, BurnWithDustResult, MintResult, MultiBurnParams,
+    MultiBurnResult, MultiBurnResultEntry, ReceiptInformation, VaultError,
     VaultService,
 };
 
@@ -234,6 +235,34 @@ impl VaultService for MockVaultService {
                 gas_used: 30000,
                 block_number: 3000,
             }),
+            #[cfg(test)]
+            MockBehavior::Failure => Err(VaultError::InvalidReceipt),
+        }
+    }
+
+    async fn burn_multiple_receipts(
+        &self,
+        params: MultiBurnParams,
+    ) -> Result<MultiBurnResult, VaultError> {
+        match &self.behavior {
+            MockBehavior::Success => {
+                let burns = params
+                    .burns
+                    .into_iter()
+                    .map(|entry| MultiBurnResultEntry {
+                        receipt_id: entry.receipt_id,
+                        shares_burned: entry.burn_shares,
+                    })
+                    .collect();
+
+                Ok(MultiBurnResult {
+                    tx_hash: B256::from([0x45; 32]),
+                    burns,
+                    dust_returned: params.dust_shares,
+                    gas_used: 50000,
+                    block_number: 5000,
+                })
+            }
             #[cfg(test)]
             MockBehavior::Failure => Err(VaultError::InvalidReceipt),
         }

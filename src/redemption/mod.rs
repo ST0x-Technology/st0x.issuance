@@ -21,7 +21,7 @@ use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::{BurnParams, ReceiptInformation, VaultService};
 
 pub(crate) use cmd::RedemptionCommand;
-pub(crate) use event::RedemptionEvent;
+pub(crate) use event::{BurnRecord, RedemptionEvent};
 pub(crate) use view::{
     RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
     replay_redemption_view,
@@ -219,16 +219,9 @@ impl Redemption {
             })
             .await?;
 
-        Ok(vec![RedemptionEvent::TokensBurned {
-            issuer_request_id,
-            tx_hash: burn.tx_hash,
-            receipt_id: burn.receipt_id,
-            shares_burned: burn.shares_burned,
-            dust_returned: burn.dust_returned,
-            gas_used: burn.gas_used,
-            block_number: burn.block_number,
-            burned_at: Utc::now(),
-        }])
+        // TODO Task 7: Convert single burn result to v2.0 event format
+        let _ = burn;
+        todo!("Task 7: Build TokensBurned v2.0 event from burn result")
     }
 
     fn handle_record_burn_failure(
@@ -276,16 +269,9 @@ impl Redemption {
             })
             .await?;
 
-        Ok(vec![RedemptionEvent::TokensBurned {
-            issuer_request_id,
-            tx_hash: burn.tx_hash,
-            receipt_id: burn.receipt_id,
-            shares_burned: burn.shares_burned,
-            dust_returned: burn.dust_returned,
-            gas_used: burn.gas_used,
-            block_number: burn.block_number,
-            burned_at: Utc::now(),
-        }])
+        // TODO Task 7: Convert single burn result to v2.0 event format
+        let _ = burn;
+        todo!("Task 7: Build TokensBurned v2.0 event from burn result")
     }
 
     fn handle_confirm_alpaca_complete(
@@ -608,8 +594,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Redemption, RedemptionCommand, RedemptionError, RedemptionEvent,
-        RedemptionMetadata,
+        BurnRecord, Redemption, RedemptionCommand, RedemptionError,
+        RedemptionEvent, RedemptionMetadata,
     };
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -1125,8 +1111,7 @@ mod tests {
 
         let RedemptionEvent::TokensBurned {
             issuer_request_id: event_id,
-            receipt_id: event_receipt_id,
-            shares_burned: event_shares_burned,
+            burns,
             burned_at,
             ..
         } = &events[0]
@@ -1135,8 +1120,9 @@ mod tests {
         };
 
         assert_eq!(event_id, &issuer_request_id);
-        assert_eq!(event_receipt_id, &receipt_id);
-        assert_eq!(event_shares_burned, &burn_shares);
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0].receipt_id, receipt_id);
+        assert_eq!(burns[0].shares_burned, burn_shares);
         assert!(burned_at.timestamp() > 0);
     }
 
@@ -1307,8 +1293,7 @@ mod tests {
         redemption.apply(RedemptionEvent::TokensBurned {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: burn_tx_hash,
-            receipt_id,
-            shares_burned,
+            burns: vec![BurnRecord { receipt_id, shares_burned }],
             dust_returned: U256::ZERO,
             gas_used: 60000,
             block_number: 51000,

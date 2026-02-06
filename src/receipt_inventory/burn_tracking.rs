@@ -38,20 +38,11 @@ pub(crate) enum ReceiptBurnsView {
 
 impl View<Redemption> for ReceiptBurnsView {
     fn update(&mut self, event: &EventEnvelope<Redemption>) {
-        if let RedemptionEvent::TokensBurned {
-            issuer_request_id,
-            receipt_id,
-            shares_burned,
-            burned_at,
-            ..
-        } = &event.payload
-        {
-            *self = Self::Burned {
-                receipt_id: *receipt_id,
-                redemption_issuer_request_id: issuer_request_id.clone(),
-                shares_burned: *shares_burned,
-                burned_at: *burned_at,
-            };
+        if let RedemptionEvent::TokensBurned { .. } = &event.payload {
+            // TODO Task 8: Extract burns from v2.0 event and update view
+            todo!(
+                "Task 8: Update ReceiptBurnsView from TokensBurned v2.0 event"
+            )
         }
     }
 }
@@ -281,6 +272,7 @@ mod tests {
     use super::*;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::ReceiptInventoryView;
+    use crate::redemption::BurnRecord;
     use crate::tokenized_asset::TokenSymbol;
 
     async fn setup_test_db() -> Pool<Sqlite> {
@@ -383,8 +375,10 @@ mod tests {
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            receipt_id: uint!(42_U256),
-            shares_burned: uint!(100_000000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
@@ -484,8 +478,7 @@ mod tests {
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            receipt_id,
-            shares_burned,
+            burns: vec![BurnRecord { receipt_id, shares_burned }],
             dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
@@ -504,7 +497,7 @@ mod tests {
                 payload,
                 metadata
             )
-            VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+            VALUES ('Redemption', ?, 1, 'TokensBurned', '2.0', ?, '{}')
             "#,
             aggregate_id,
             payload
@@ -573,8 +566,10 @@ mod tests {
                 tx_hash: b256!(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ),
-                receipt_id: U256::from(i),
-                shares_burned: U256::from(i * 100),
+                burns: vec![BurnRecord {
+                    receipt_id: U256::from(i),
+                    shares_burned: U256::from(i * 100),
+                }],
                 dust_returned: U256::ZERO,
                 gas_used: 50000,
                 block_number: 1000 + i,
@@ -585,7 +580,7 @@ mod tests {
             sqlx::query!(
                 r#"
                 INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
-                VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+                VALUES ('Redemption', ?, 1, 'TokensBurned', '2.0', ?, '{}')
                 "#,
                 aggregate_id,
                 payload
@@ -621,8 +616,10 @@ mod tests {
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            receipt_id: uint!(42_U256),
-            shares_burned: uint!(100_000000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
@@ -641,7 +638,7 @@ mod tests {
                 payload,
                 metadata
             )
-            VALUES ('Redemption', ?, 1, 'TokensBurned', '1.0', ?, '{}')
+            VALUES ('Redemption', ?, 1, 'TokensBurned', '2.0', ?, '{}')
             "#,
             aggregate_id,
             payload
