@@ -2,28 +2,26 @@ use std::time::Duration;
 
 use alloy::consensus::SignableTransaction;
 use alloy::network::TxSigner;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::{Signature, Signer};
 use async_trait::async_trait;
-use fireblocks_sdk::apis::transactions_api::CreateTransactionParams;
+use fireblocks_sdk::apis::transactions_api::{
+    CreateTransactionError, CreateTransactionParams,
+};
 use fireblocks_sdk::models;
-use fireblocks_sdk::{Client, ClientBuilder};
+use fireblocks_sdk::{Client, ClientBuilder, apis};
 use tracing::debug;
 
-use super::config::{ChainAssetIds, FireblocksEnv};
+use super::config::{
+    AssetId, ChainAssetIds, Environment, FireblocksConfig, VaultAccountId,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FireblocksError {
-    #[error("failed to read Fireblocks secret key from {path}")]
-    ReadSecret {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to build Fireblocks client")]
-    ClientBuild(#[source] fireblocks_sdk::FireblocksError),
-    #[error("failed to fetch vault deposit addresses")]
-    FetchAddresses(#[source] fireblocks_sdk::FireblocksError),
+    #[error("failed to read Fireblocks secret key")]
+    ReadSecret(#[from] std::io::Error),
+    #[error("Fireblocks SDK error")]
+    Sdk(#[from] fireblocks_sdk::FireblocksError),
     #[error("no deposit address found for vault {vault_id}, asset {asset_id}")]
     NoAddress { vault_id: String, asset_id: String },
     #[error("invalid deposit address from Fireblocks: {address}")]
@@ -33,9 +31,9 @@ pub enum FireblocksError {
         source: alloy::hex::FromHexError,
     },
     #[error("failed to create Fireblocks transaction")]
-    CreateTransaction(String),
-    #[error("Fireblocks transaction {tx_id} did not return an ID")]
-    MissingTransactionId { tx_id: String },
+    CreateTransaction(#[from] apis::Error<CreateTransactionError>),
+    #[error("Fireblocks transaction response missing ID")]
+    MissingTransactionId,
     #[error("failed to poll Fireblocks transaction {tx_id}")]
     PollTransaction {
         tx_id: String,
@@ -51,7 +49,7 @@ pub enum FireblocksError {
     #[error("Fireblocks transaction {tx_id} returned signature without r/s/v")]
     IncompleteSignature { tx_id: String },
     #[error("failed to parse signature component from Fireblocks response")]
-    ParseSignature(#[source] alloy::hex::FromHexError),
+    ParseSignature(#[from] alloy::hex::FromHexError),
     #[error("no asset ID configured for chain {chain_id}")]
     UnknownChain { chain_id: u64 },
     #[error("chain_id not set on signer, cannot determine asset ID")]
@@ -65,7 +63,7 @@ pub enum FireblocksError {
 #[derive(Clone)]
 pub(crate) struct FireblocksSigner {
     client: Client,
-    vault_account_id: String,
+    vault_account_id: VaultAccountId,
     chain_asset_ids: ChainAssetIds,
     address: Address,
     chain_id: Option<u64>,
@@ -88,34 +86,31 @@ impl FireblocksSigner {
     /// Reads the RSA secret key from disk, builds the SDK client, and fetches
     /// the vault's deposit address to cache locally.
     pub(crate) async fn new(
-        env: &FireblocksEnv,
+        config: &FireblocksConfig,
     ) -> Result<Self, FireblocksError> {
-        let secret = std::fs::read(&env.secret_path).map_err(|e| {
-            FireblocksError::ReadSecret {
-                path: env.secret_path.clone(),
-                source: e,
-            }
-        })?;
+        let secret = std::fs::read(&config.secret_path)?;
 
-        let mut builder = ClientBuilder::new(&env.api_key, &secret);
-        if env.sandbox {
+        let mut builder = ClientBuilder::new(config.api_key.as_str(), &secret);
+        if config.environment == Environment::Sandbox {
             builder = builder.use_sandbox();
         }
-        let client = builder.build().map_err(FireblocksError::ClientBuild)?;
+        let client = builder.build()?;
 
-        let default_asset_id = env.chain_asset_ids.default_asset_id();
+        let default_asset_id = config.chain_asset_ids.default_asset_id();
 
         let addresses = client
-            .addresses(&env.vault_account_id, default_asset_id)
-            .await
-            .map_err(FireblocksError::FetchAddresses)?;
+            .addresses(
+                config.vault_account_id.as_str(),
+                default_asset_id.as_str(),
+            )
+            .await?;
 
         let address_str = addresses
             .first()
             .and_then(|a| a.address.as_deref())
             .ok_or_else(|| FireblocksError::NoAddress {
-                vault_id: env.vault_account_id.clone(),
-                asset_id: default_asset_id.to_string(),
+                vault_id: config.vault_account_id.as_str().to_string(),
+                asset_id: default_asset_id.as_str().to_string(),
             })?;
 
         let address = address_str.parse::<Address>().map_err(|e| {
@@ -126,16 +121,16 @@ impl FireblocksSigner {
         })?;
 
         debug!(
-            vault_account_id = %env.vault_account_id,
-            chain_asset_ids = ?env.chain_asset_ids,
+            vault_account_id = %config.vault_account_id.as_str(),
+            chain_asset_ids = ?config.chain_asset_ids,
             %address,
             "Fireblocks signer initialized"
         );
 
         Ok(Self {
             client,
-            vault_account_id: env.vault_account_id.clone(),
-            chain_asset_ids: env.chain_asset_ids.clone(),
+            vault_account_id: config.vault_account_id.clone(),
+            chain_asset_ids: config.chain_asset_ids.clone(),
             address,
             chain_id: None,
         })
@@ -151,6 +146,7 @@ impl FireblocksSigner {
             .chain_asset_ids
             .get(chain_id)
             .ok_or(FireblocksError::UnknownChain { chain_id })?;
+
         let hash_hex = alloy::hex::encode(hash);
         let tx_request = Self::build_raw_signing_request(
             asset_id,
@@ -162,18 +158,11 @@ impl FireblocksSigner {
             .transaction_request(tx_request)
             .build();
 
-        let create_response = self
-            .client
-            .transactions_api()
-            .create_transaction(params)
-            .await
-            .map_err(|e| FireblocksError::CreateTransaction(e.to_string()))?;
+        let create_response =
+            self.client.transactions_api().create_transaction(params).await?;
 
-        let tx_id = create_response.id.ok_or_else(|| {
-            FireblocksError::MissingTransactionId {
-                tx_id: "unknown".to_string(),
-            }
-        })?;
+        let tx_id =
+            create_response.id.ok_or(FireblocksError::MissingTransactionId)?;
 
         debug!(fireblocks_tx_id = %tx_id, "Fireblocks RAW signing transaction created, polling...");
 
@@ -204,13 +193,25 @@ impl FireblocksSigner {
             });
         }
 
-        Self::extract_signature(&tx_id, &result).map_err(|e| *e)
+        Self::extract_signature(&tx_id, &result)
     }
 
     /// Build the Fireblocks RAW signing transaction request.
+    ///
+    /// For RAW signing operations, Fireblocks requires:
+    /// - `operation`: Must be `RAW` for off-chain message signing
+    /// - `asset_id`: Determines the key derivation path
+    /// - `source`: VaultAccount with the vault ID containing the signing key
+    /// - `extra_parameters.raw_message_data`: Contains the message(s) to sign
+    ///   and the signing algorithm (ECDSA secp256k1 for EVM)
+    ///
+    /// All other fields (destination, amount, fee parameters, etc.) are for
+    /// on-chain transfers and are not applicable to RAW signing.
+    ///
+    /// Reference: https://developers.fireblocks.com/docs/raw-signing
     fn build_raw_signing_request(
-        asset_id: &str,
-        vault_account_id: &str,
+        asset_id: &AssetId,
+        vault_account_id: &VaultAccountId,
         hash_hex: &str,
     ) -> models::TransactionRequest {
         let unsigned_msg = models::UnsignedMessage {
@@ -239,10 +240,10 @@ impl FireblocksSigner {
 
         models::TransactionRequest {
             operation: Some(models::TransactionOperation::Raw),
-            asset_id: Some(asset_id.to_string()),
+            asset_id: Some(asset_id.as_str().to_string()),
             source: Some(models::SourceTransferPeerPath {
                 r#type: models::TransferPeerPathType::VaultAccount,
-                id: Some(vault_account_id.to_string()),
+                id: Some(vault_account_id.as_str().to_string()),
                 sub_type: None,
                 name: None,
                 wallet_id: None,
@@ -278,21 +279,17 @@ impl FireblocksSigner {
     fn extract_signature(
         tx_id: &str,
         result: &models::TransactionResponse,
-    ) -> Result<Signature, Box<FireblocksError>> {
-        let incomplete = || {
-            Box::new(FireblocksError::IncompleteSignature {
-                tx_id: tx_id.to_string(),
-            })
+    ) -> Result<Signature, FireblocksError> {
+        let incomplete = || FireblocksError::IncompleteSignature {
+            tx_id: tx_id.to_string(),
         };
 
         let signed_msg = result
             .signed_messages
             .as_ref()
             .and_then(|msgs| msgs.first())
-            .ok_or_else(|| {
-                Box::new(FireblocksError::NoSignedMessages {
-                    tx_id: tx_id.to_string(),
-                })
+            .ok_or_else(|| FireblocksError::NoSignedMessages {
+                tx_id: tx_id.to_string(),
             })?;
 
         let sig = signed_msg.signature.as_ref().ok_or_else(incomplete)?;
@@ -301,23 +298,17 @@ impl FireblocksSigner {
         let s_hex = sig.s.as_deref().ok_or_else(incomplete)?;
         let v = sig.v.as_ref().ok_or_else(incomplete)?;
 
-        let r_bytes: [u8; 32] = alloy::hex::decode(r_hex)
-            .map_err(FireblocksError::ParseSignature)
-            .map_err(Box::new)?
-            .try_into()
-            .map_err(|_| incomplete())?;
+        let r_bytes: [u8; 32] =
+            alloy::hex::decode(r_hex)?.try_into().map_err(|_| incomplete())?;
 
-        let s_bytes: [u8; 32] = alloy::hex::decode(s_hex)
-            .map_err(FireblocksError::ParseSignature)
-            .map_err(Box::new)?
-            .try_into()
-            .map_err(|_| incomplete())?;
+        let s_bytes: [u8; 32] =
+            alloy::hex::decode(s_hex)?.try_into().map_err(|_| incomplete())?;
 
         let y_parity =
             matches!(v, models::signed_message_signature::V::Variant1);
 
-        let r = alloy::primitives::U256::from_be_bytes(r_bytes);
-        let s = alloy::primitives::U256::from_be_bytes(s_bytes);
+        let r = U256::from_be_bytes(r_bytes);
+        let s = U256::from_be_bytes(s_bytes);
 
         Ok(Signature::new(r, s, y_parity))
     }
@@ -356,7 +347,156 @@ impl TxSigner<Signature> for FireblocksSigner {
         tx: &mut dyn SignableTransaction<Signature>,
     ) -> alloy::signers::Result<Signature> {
         let hash = tx.signature_hash();
-        let signature = self.sign_hash(&hash).await?;
-        Ok(signature)
+        self.sign_hash(&hash).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fireblocks_sdk::models::{
+        SignedMessage, SignedMessageSignature, TransactionResponse,
+    };
+
+    use super::*;
+
+    #[test]
+    fn build_raw_signing_request_sets_required_fields() {
+        let asset_id: AssetId = "ETH".parse().unwrap();
+        let vault_id: VaultAccountId = "123".to_string().into();
+        let hash_hex = "abcd1234";
+
+        let request = FireblocksSigner::build_raw_signing_request(
+            &asset_id, &vault_id, hash_hex,
+        );
+
+        assert_eq!(request.operation, Some(models::TransactionOperation::Raw));
+        assert_eq!(request.asset_id, Some("ETH".to_string()));
+
+        let source = request.source.unwrap();
+        assert_eq!(source.r#type, models::TransferPeerPathType::VaultAccount);
+        assert_eq!(source.id, Some("123".to_string()));
+
+        let extra = request.extra_parameters.unwrap();
+        let raw_data = extra.raw_message_data.unwrap();
+        assert_eq!(
+            raw_data.algorithm,
+            Some(models::extra_parameters_raw_message_data::Algorithm::MpcEcdsaSecp256K1)
+        );
+
+        let messages = raw_data.messages.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, hash_hex);
+    }
+
+    #[test]
+    fn extract_signature_succeeds_with_valid_response() {
+        let response = TransactionResponse {
+            signed_messages: Some(vec![SignedMessage {
+                signature: Some(SignedMessageSignature {
+                    r: Some("a".repeat(64)),
+                    s: Some("b".repeat(64)),
+                    v: Some(models::signed_message_signature::V::Variant0),
+                    full_sig: None,
+                }),
+                content: None,
+                derivation_path: None,
+                algorithm: None,
+                public_key: None,
+            }]),
+            ..Default::default()
+        };
+
+        let sig =
+            FireblocksSigner::extract_signature("tx-123", &response).unwrap();
+
+        let expected_r = U256::from_be_bytes([0xaa; 32]);
+        let expected_s = U256::from_be_bytes([0xbb; 32]);
+
+        assert_eq!(sig.r(), expected_r);
+        assert_eq!(sig.s(), expected_s);
+        assert!(!sig.v());
+    }
+
+    #[test]
+    fn extract_signature_fails_without_signed_messages() {
+        let response =
+            TransactionResponse { signed_messages: None, ..Default::default() };
+
+        let result = FireblocksSigner::extract_signature("tx-123", &response);
+        assert!(matches!(
+            result,
+            Err(FireblocksError::NoSignedMessages { .. })
+        ));
+    }
+
+    #[test]
+    fn extract_signature_fails_with_missing_r() {
+        let response = TransactionResponse {
+            signed_messages: Some(vec![SignedMessage {
+                signature: Some(SignedMessageSignature {
+                    r: None,
+                    s: Some("b".repeat(64)),
+                    v: Some(models::signed_message_signature::V::Variant0),
+                    full_sig: None,
+                }),
+                content: None,
+                derivation_path: None,
+                algorithm: None,
+                public_key: None,
+            }]),
+            ..Default::default()
+        };
+
+        let result = FireblocksSigner::extract_signature("tx-123", &response);
+        assert!(matches!(
+            result,
+            Err(FireblocksError::IncompleteSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn extract_signature_parses_v_variant1_as_odd_parity() {
+        let response = TransactionResponse {
+            signed_messages: Some(vec![SignedMessage {
+                signature: Some(SignedMessageSignature {
+                    r: Some("0".repeat(64)),
+                    s: Some("0".repeat(64)),
+                    v: Some(models::signed_message_signature::V::Variant1),
+                    full_sig: None,
+                }),
+                content: None,
+                derivation_path: None,
+                algorithm: None,
+                public_key: None,
+            }]),
+            ..Default::default()
+        };
+
+        let sig =
+            FireblocksSigner::extract_signature("tx-123", &response).unwrap();
+        assert!(sig.v());
+    }
+
+    #[test]
+    fn extract_signature_parses_v_variant0_as_even_parity() {
+        let response = TransactionResponse {
+            signed_messages: Some(vec![SignedMessage {
+                signature: Some(SignedMessageSignature {
+                    r: Some("0".repeat(64)),
+                    s: Some("0".repeat(64)),
+                    v: Some(models::signed_message_signature::V::Variant0),
+                    full_sig: None,
+                }),
+                content: None,
+                derivation_path: None,
+                algorithm: None,
+                public_key: None,
+            }]),
+            ..Default::default()
+        };
+
+        let sig =
+            FireblocksSigner::extract_signature("tx-123", &response).unwrap();
+        assert!(!sig.v());
     }
 }
