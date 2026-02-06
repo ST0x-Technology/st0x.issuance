@@ -19,6 +19,7 @@ use crate::account::{
 };
 use crate::bindings;
 use crate::mint::IssuerRequestId;
+use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
@@ -39,21 +40,29 @@ pub(crate) struct RedemptionDetectorConfig {
 /// The detector subscribes to Transfer events on the vault contract, filtering for
 /// transfers to the redemption wallet. When a transfer is detected, it creates a
 /// RedemptionCommand::Detect to record the redemption in the aggregate.
-pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
+pub(crate) struct RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+where
+    RedemptionStore: EventStore<Redemption>,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
+{
     rpc_url: Url,
     vault: Address,
     bot_wallet: Address,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
-    event_store: Arc<ES>,
+    cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+    event_store: Arc<RedemptionStore>,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<RedeemCallManager<ES>>,
-    journal_manager: Arc<JournalManager<ES>>,
-    burn_manager: Arc<BurnManager<ES>>,
+    redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
+    journal_manager: Arc<JournalManager<RedemptionStore>>,
+    burn_manager: Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
 }
 
-impl<ES: EventStore<Redemption> + 'static> RedemptionDetector<ES>
+impl<RedemptionStore, ReceiptInventoryStore>
+    RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
 where
-    ES::AC: Send,
+    RedemptionStore: EventStore<Redemption> + 'static,
+    ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
+    RedemptionStore::AC: Send,
+    ReceiptInventoryStore::AC: Send,
 {
     /// Creates a new redemption detector.
     ///
@@ -68,12 +77,12 @@ where
     /// * `burn_manager` - Manager for handling token burning after Alpaca journal completes
     pub(crate) fn new(
         config: RedemptionDetectorConfig,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
-        event_store: Arc<ES>,
+        cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+        event_store: Arc<RedemptionStore>,
         pool: Pool<Sqlite>,
-        redeem_call_manager: Arc<RedeemCallManager<ES>>,
-        journal_manager: Arc<JournalManager<ES>>,
-        burn_manager: Arc<BurnManager<ES>>,
+        redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
+        journal_manager: Arc<JournalManager<RedemptionStore>>,
+        burn_manager: Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
     ) -> Self {
         Self {
             rpc_url: config.rpc_url,
@@ -448,6 +457,7 @@ mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
+    use crate::receipt_inventory::ReceiptInventory;
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -457,9 +467,12 @@ mod tests {
 
     type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+    type TestReceiptInventoryStore = MemStore<ReceiptInventory>;
 
-    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
+    fn setup_test_cqrs()
+    -> (Arc<TestCqrs>, Arc<TestStore>, Arc<TestReceiptInventoryStore>) {
         let store = Arc::new(MemStore::default());
+        let receipt_inventory_store = Arc::new(MemStore::default());
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
         let cqrs = Arc::new(CqrsFramework::new(
@@ -467,7 +480,7 @@ mod tests {
             vec![],
             vault_service,
         ));
-        (cqrs, store)
+        (cqrs, store, receipt_inventory_store)
     }
 
     async fn setup_test_db_with_asset(
@@ -593,7 +606,7 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -618,6 +631,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -674,7 +688,7 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -699,6 +713,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -743,7 +758,7 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -768,6 +783,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -814,7 +830,7 @@ mod tests {
             address!("0x9876543210fedcba9876543210fedcba98765432");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(wrong_vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -839,6 +855,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -885,7 +902,7 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -910,6 +927,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -962,7 +980,7 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -987,6 +1005,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 
@@ -1043,7 +1062,7 @@ mod tests {
         let unknown_wallet =
             address!("0x1111111111111111111111111111111111111111");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -1068,6 +1087,7 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_inventory_store.clone(),
             bot_wallet,
         ));
 

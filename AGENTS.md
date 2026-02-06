@@ -11,6 +11,8 @@ Relevant docs:
 - README.md
 - ROADMAP.md
 - SPEC.md
+- docs/alloy.md - Alloy patterns (mocks, encoding, type aliases)
+- docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
 
 ## Plan & Review
 
@@ -26,8 +28,8 @@ Relevant docs:
     downstream from the plan, and the plan is downstream from the spec. Never
     start planning implementation until the spec accurately reflects what should
     be built.
-- Write a comprehensive step-by-step plan to PLAN.md with each task having a
-  corresponding section and a list of subtasks as checkboxes inside of it
+- Write a comprehensive step-by-step plan with each task having a corresponding
+  section and a list of subtasks as checkboxes inside of it
 - The task sections should follow the format `## Task N. <TASK NAME>`
 - The plan should be a detailed implementation plan and the reasoning behind the
   design decisions
@@ -54,33 +56,17 @@ Relevant docs:
 - **CRITICAL: Tasks must be ordered correctly in plans**
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks
-  - All checks (tests, clippy, fmt) SHOULD pass at the end of each task whenever
-    possible
-  - Focused git diffs and passing checks make reviewing much easier
-- **CRITICAL: Keep PLAN.md in sync with implementation decisions**
-  - If you change approach during implementation, immediately update PLAN.md to
-    reflect the new approach
-  - Plans are living documents during development - update them when you
-    discover better solutions
-  - Implementation and plan must always match - out-of-sync plans are worse than
-    no plan
-- Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
-- Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
-  sections or verbose changelogs
+  - All tests SHOULD pass at the end of each task whenever possible
+  - Focused git diffs and passing tests make reviewing much easier sections or
+    verbose changelogs
 - The code diffs themselves should be self-explanatory and easy to review
-- **CRITICAL: TODO comments are for redundancy only** - PLAN.md is the source of
-  truth for tracking work. TODO comments in code serve as backup reminders, not
-  primary tracking. When completing a task, always `grep -r "TODO.*Task N"` (or
-  similar) to find and address any related TODOs in the codebase.
 
 ### After completing a plan
 
-When all tasks in PLAN.md are complete, perform this checklist **before**
-creating or updating a PR:
+When all tasks are complete, perform this checklist **before** creating or
+updating a PR:
 
-1. **Delete PLAN.md** - It's a transient development file that should ONLY exist
-   on development branches, never in PRs or merged to main
-2. **Update ROADMAP.md**:
+1. **Update ROADMAP.md**:
    - Mark completed issues as `[x]` with PR link
    - Format: `- [x] [#N](issue-url) - Task description`
    - Add: `- **PR:** [#N](pr-url)`
@@ -88,13 +74,13 @@ creating or updating a PR:
      section
    - Use `gh issue list` and `gh pr list` to verify all related issues/PRs are
      linked
-3. **Update other documentation** as needed:
+2. **Update other documentation** as needed:
    - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
      changed
    - **README.md**: If project structure, features, commands, or architecture
      changed
    - **AGENTS.md**: If new patterns or conventions were introduced
-4. **Verify GitHub state**:
+3. **Verify GitHub state**:
    - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
      description)
    - Check that no issues are marked complete in ROADMAP.md but still open on
@@ -294,6 +280,31 @@ different purposes which should be reflected in their naming.
 `Option<View(Option<Data>)>` creates confusing nested Options. Use enum variants
 instead.
 
+### CRITICAL: Reading Views with GenericQuery
+
+**ALWAYS use `GenericQuery::load()` to read views. NEVER use raw SQL to parse
+JSON from view tables.**
+
+```rust
+// CORRECT - Use GenericQuery
+pub(crate) type MintViewQuery = GenericQuery<
+    SqliteViewRepository<MintView, Mint>, MintView, Mint,
+>;
+
+pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerRequestId) -> Option<MintView> {
+    query.load(&Mint::aggregate_id(id)).await
+}
+
+// FORBIDDEN - Raw SQL with JSON parsing bypasses type safety
+sqlx::query!(r#"SELECT json_extract(payload, '$.field') FROM view"#)
+```
+
+**For cross-aggregate queries** (e.g., "find all receipts for underlying X"):
+
+- Create a dedicated read model with proper SQL columns (not JSON)
+- Or maintain an in-memory index updated by event handlers
+- Or iterate through known aggregate IDs using `GenericQuery::load()`
+
 ### HTTP Integration
 
 **Our HTTP Server (Rocket.rs):**
@@ -410,6 +421,18 @@ Environment variables (can be set via `.env` file):
 - **Event-Driven Architecture**: Commands produce events which update views
 - **SQLite Persistence**: Event store and view repositories backed by SQLite
 - **Comprehensive Error Handling**: Custom error types with proper propagation
+- **CRITICAL: Use Typed Values in Errors**: Error types must store typed values,
+  not string representations. Never use `format!("{value:?}")` or `.to_string()`
+  to convert typed data (addresses, hashes, IDs) into strings for error fields.
+  - **FORBIDDEN**: `tx_hash: format!("{hash:?}")` or `address: addr.to_string()`
+  - **CORRECT**: `tx_hash: B256` or `address: Address` directly in error struct
+  - The `#[error(...)]` attribute in thiserror handles display formatting -
+    that's where formatting belongs, not in the error field types
+- **Let the Compiler Guide Error Variants**: Don't waste time figuring out which
+  error variants you'll need ahead of time. Write functions using the `?`
+  operator as if all required variants exist, then let the compiler tell you
+  exactly which `From` impls are missing. Add `#[from]` variants only for errors
+  the compiler complains about.
 - **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
   principle of type modeling in this codebase. Use algebraic data types (ADTs)
   and enums to encode business rules and state transitions directly in types
@@ -442,7 +465,7 @@ Environment variables (can be set via `.env` file):
     validates
   - Example of **FORBIDDEN** pattern:
     ```rust
-    // ❌ WRONG - validate() can be forgotten, value can exist invalid
+    // WRONG - validate() can be forgotten, value can exist invalid
     pub struct ApiKey(pub String);
     impl ApiKey {
         pub fn validate(&self) -> Result<(), Error> {
@@ -453,7 +476,7 @@ Environment variables (can be set via `.env` file):
     ```
   - Example of **CORRECT** pattern:
     ```rust
-    // ✅ CORRECT - if ApiKey exists, it's guaranteed valid
+    // CORRECT - if ApiKey exists, it's guaranteed valid
     pub struct ApiKey(String);  // Private inner value
     impl ApiKey {
         pub fn new(value: String) -> Result<Self, ApiKeyError> {
@@ -512,7 +535,7 @@ Environment variables (can be set via `.env` file):
     ```
   - Example of **INCORRECT** import organization:
     ```rust
-    // ❌ WRONG - Three groups, internal imports mixed with external
+    // WRONG - Three groups, internal imports mixed with external
     use std::sync::Arc;
 
     use alloy::primitives::{Address, B256};
@@ -521,9 +544,15 @@ Environment variables (can be set via `.env` file):
 
     use super::Mint;
     ```
-- **Import Conventions**: Use qualified imports when they prevent ambiguity
-  (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
-  module is clear (e.g. use `info!` instead of `tracing::info!`)
+- **Import Conventions**: Always import types and use them unqualified unless
+  the name is genuinely ambiguous within the crate (e.g.,
+  `alloy::rpc::types::Log` vs `alloy::primitives::Log`). When ambiguity exists,
+  use qualified imports like `rpc_types::Log`. Never use fully qualified paths
+  for non-ambiguous types - import them at the top of the module.
+  - **FORBIDDEN**: `alloy::primitives::B256` inline - import `B256` at module
+    top
+  - **CORRECT**: `rpc_types::Log` when `Log` is ambiguous (multiple `Log` types)
+  - **CORRECT**: `contract::Error` to disambiguate from other `Error` types
 - **CRITICAL: Zero Tolerance for Panics in Non-Test Code**: This is a
   mission-critical financial application. ANY panic in production code is
   completely unacceptable and can lead to catastrophic failures.
@@ -560,19 +589,19 @@ failures. FORBIDDEN patterns:
 **All financial operations must use explicit error handling:**
 
 ```rust
-// ❌ WRONG - Silent cap          | ✅ CORRECT - Explicit error
+// WRONG - Silent cap             | CORRECT - Explicit error
 fn to_i64(v: u64) -> i64 {        | fn to_i64(v: u64) -> Result<i64, Error> {
     if v > i64::MAX as u64 {      |     v.try_into().map_err(|_| Error::TooLarge { v })
         i64::MAX // silent cap    | }
     } else { v as i64 }           |
 }                                 |
 
-// ❌ WRONG - Hides parse error   | ✅ CORRECT - Propagates error
+// WRONG - Hides parse error      | CORRECT - Propagates error
 fn parse(s: &str) -> f64 {        | fn parse(s: &str) -> Result<Decimal, ParseError> {
     s.parse().unwrap_or(0.0)      |     Decimal::from_str(s).map_err(Into::into)
 }                                 | }
 
-// ❌ WRONG - Masks DB violation  | ✅ CORRECT - Let constraint fail
+// WRONG - Masks DB violation     | CORRECT - Let constraint fail
 let safe = amt.clamp(0, MAX);     | sqlx::query!("INSERT ...", amt).execute(pool)?;
 sqlx::query!("...", safe)...      |
 ```
@@ -584,67 +613,16 @@ violations, parse failures, arithmetic (use checked ops), DB constraints.
 
 ### CRITICAL: Security and Secrets Management
 
-**⚠️ ABSOLUTE PROHIBITION: NEVER, UNDER ANY CIRCUMSTANCES, READ FILES CONTAINING
-CREDENTIALS OR SECRETS WITHOUT EXPLICIT USER PERMISSION ⚠️**
+**NEVER read credential files without explicit user permission.**
 
-**This is a ZERO-TOLERANCE policy. Violations are deployment-blocking.**
+**Common credential files to avoid:**
 
-This project handles financial transactions and sensitive API credentials.
-Unauthorized access to secrets can lead to:
+- `.env`, `.env.*`, `.env.local`, `.env.production` - API keys, secrets
+- `credentials.json`, `secrets.json` - Credential storage
+- `*.key`, `*.pem`, `*.p12`, `*.pfx` - Private keys and certificates
 
-- Account compromise and theft
-- Financial losses (potentially millions of dollars)
-- Security breaches
-- Regulatory violations
-- Complete system compromise
-
-**DO NOT attempt to "help" by reading credential files. DO NOT make exceptions.
-DO NOT read these files even if you think it would solve the user's problem.**
-
-#### Files That Require Explicit Permission
-
-The following files MUST NOT be read without explicit user permission:
-
-- `.env` - Environment variables containing API keys, secrets, and credentials
-- `.env.*` - Environment-specific configuration files (`.env.local`,
-  `.env.production`, etc.)
-- `credentials.json` - Credential storage files
-- `*.key`, `*.pem` - Private keys and certificates
-- `*.p12`, `*.pfx` - Certificate bundles
-- Database files containing sensitive data (unless necessary for debugging with
-  permission)
-- Any file that may contain API keys, tokens, passwords, or other secrets
-
-#### Required Practice
-
-**Before reading any file that may contain secrets:**
-
-1. **Ask the user explicitly** for permission to read the file
-2. **Explain why** you need to read it
-3. **Wait for confirmation** before proceeding
-
-**Example of correct behavior:**
-
-```
-User: "Why isn't the bot connecting to Alpaca?"
-Assistant: "I can help debug this. To check the configuration, I would need to
-read your .env file which contains sensitive credentials. May I have permission
-to read it?"
-```
-
-#### Alternative Approaches
-
-When debugging configuration issues, prefer these approaches:
-
-1. **Ask the user** to verify specific environment variables are set
-2. **Request sanitized output** where sensitive values are redacted
-3. **Check example files** like `.env.example` instead of the actual `.env`
-4. **Review code** that uses the configuration rather than the configuration
-   itself
-
-**Remember: Protecting secrets is critical for application security. Always
-respect the sensitivity of credential files and never access them without
-explicit permission.**
+**When debugging config issues:** Ask the user to verify env vars are set,
+request sanitized output, or check `.env.example` instead of the real `.env`.
 
 ## Database Schema
 
@@ -695,6 +673,38 @@ See `migrations/` for all view table definitions and indexes.
 
 ## Testing Strategy
 
+### Testing Pyramid
+
+Follow the testing pyramid - more tests at lower levels, fewer at higher:
+
+1. **Property tests** - Most numerous. Use proptest for invariant testing
+2. **Unit tests** - Aggregate logic with MemStore, exhaustive edge cases
+3. **Integration tests** - HTTP endpoints with mocked dependencies
+4. **E2E tests** - Fewest, but essential for system orchestration
+
+**The pyramid is about quantity, not avoidance.** You should have MANY
+property/unit tests, SOME integration tests, and a FEW e2e tests. But e2e tests
+are still required when testing full system orchestration.
+
+**When e2e tests ARE required:**
+
+- Testing that multiple async processes coordinate correctly (backfilling,
+  monitoring, processing)
+- Testing startup/shutdown behavior and recovery
+- Testing flows that span multiple aggregates AND external systems
+- Testing that the service handles events that occurred before it started
+
+**Example:** Receipt backfilling and live monitoring REQUIRE e2e testing
+because:
+
+- Unit tests can verify backfiller logic in isolation
+- Unit tests can verify monitor logic in isolation
+- But only e2e can verify: (1) service starts, (2) backfills historic receipts,
+  (3) monitors new receipts, (4) redemption uses receipts from both sources
+
+A single well-designed e2e test can cover the orchestration, while dozens of
+unit tests cover the edge cases in each component.
+
 ### Given-When-Then Aggregate Testing
 
 ES/CQRS enables testable business logic: **Given** previous events → **When**
@@ -718,24 +728,29 @@ fn test_journal_confirmed() {
   determinism
 - **Database isolation**: In-memory SQLite per test
 
-### End-to-End Tests
+### End-to-End Tests: Strict Definition
 
-E2E tests in `./tests/` reproduce complete production flows with real wiring.
+**A test is ONLY considered e2e if it:**
 
-**Mock only external systems:**
+1. Spins up the full HTTP service
+2. Uses ONLY the public API as an external consumer would
+3. Uses Anvil for local blockchain
+4. Mocks only truly external systems (Alpaca API)
+5. Asserts correctness via API responses, Anvil state, and mock interactions
 
-- Alpaca API via httpmock
-- Blockchain via Anvil (local chain)
+**A test is NOT e2e if it:**
 
-**Use real implementations for:** CQRS framework, managers, service traits,
-SQLite
+- Touches implementation details for setup (e.g., directly calling CQRS
+  commands)
+- Touches implementation details for verification (e.g., querying aggregates
+  directly)
+- Requires access to internal types or functions
 
-**Test types:**
+**If a test requires touching implementation details**, it belongs in `src/` as
+a unit or integration test, NOT in `tests/`.
 
-- **Unit** (`src/*/mod.rs`): Aggregate logic with MemStore, exhaustive edge
-  cases
-- **Integration** (`src/*/api/*.rs`): HTTP endpoints with mocked dependencies
-- **E2E** (`tests/*.rs`): Complete flows, happy paths only, real blockchain
+E2E tests live in `./tests/`. They test complete production flows, happy paths
+only, with real blockchain (Anvil).
 
 ### Testing Guidelines
 
@@ -743,13 +758,13 @@ SQLite
 - Never test language features - test business logic
 
 ```rust
-// ❌ Bad: Tests struct assignment, not our code
+// Bad: Tests struct assignment, not our code
 fn test_fields() {
     let r = MintRequest { qty: 100.into(), underlying: "AAPL".into() };
     assert_eq!(r.qty, 100.into());
 }
 
-// ✅ Good: Tests our validation logic
+// Good: Tests our validation logic
 fn test_validates_quantity() {
     let result = Mint::default().handle(InitiateMint { qty: (-10).into(), .. });
     assert!(matches!(result, Err(MintError::InvalidQuantity)));
@@ -758,13 +773,19 @@ fn test_validates_quantity() {
 
 ## Workflow Best Practices
 
-- **Always run tests, clippy, and formatters before handing over a piece of
-  work**
-  - Run `cargo test --workspace` first, as changing tests can break clippy
-  - Run
-    `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-    next, as fixing linting errors can break formatting
-  - Always run `cargo fmt` last to ensure clean code formatting
+- **Type checking and tests are the primary feedback mechanism during
+  development** - Use `cargo build` and `cargo test --workspace` iteratively as
+  you write code. Do NOT run clippy until all tests pass.
+- **Clippy is for cleanup, not development** - Only run clippy after all tests
+  pass. Clippy warnings about unused code, unused imports, etc. are expected
+  during development when you're defining types before implementing logic (TTDD
+  pattern). Running clippy prematurely wastes time on warnings that will resolve
+  themselves once implementation is complete.
+- **Before handing over a piece of work**, run checks in this order:
+  1. `cargo test --workspace` - All tests must pass
+  2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
+     Fix any linting issues (these should be minimal if code is well-structured)
+  3. `cargo fmt --all` - Format the code
 
 ### CRITICAL: Lint Policy
 
@@ -782,24 +803,24 @@ user permission.** This applies to ALL lint attributes:
 **Examples of FORBIDDEN practices:**
 
 ```rust
-// ❌ NEVER DO THIS - Suppressing lints is forbidden
+// NEVER DO THIS - Suppressing lints is forbidden
 #[allow(clippy::too_many_lines)]
 fn large_function() { /* ... */ }
 
 #[allow(clippy::needless_continue)]
-// ❌ NEVER DO THIS - Fix the code structure instead
+// NEVER DO THIS - Fix the code structure instead
 
 #[allow(dead_code)]
-struct Unused { /* ... */ }  // ❌ Remove the unused code instead
+struct Unused { /* ... */ }  // Remove the unused code instead
 
 #[allow(unused_imports)]
-use some_module::Thing;  // ❌ Remove the unused import instead
+use some_module::Thing;  // Remove the unused import instead
 ```
 
 **Required approach:**
 
 ```rust
-// ✅ CORRECT - Refactor to address the issue
+// CORRECT - Refactor to address the issue
 fn process_data() -> Result<(), Error> {
     let data = get_data()?;
     validate_data(&data)?;
@@ -833,7 +854,7 @@ For example, to deal with a function generated from a smart contract's ABI, we
 can add `allow` inside the `sol!` macro invocation.
 
 ```rust
-// ✅ CORRECT - Suppressing lint for third-party ABI generated code
+// CORRECT - Suppressing lint for third-party ABI generated code
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
@@ -871,9 +892,9 @@ This is a zero-tolerance policy. Speculation presented as fact is unacceptable.
 **Example:**
 
 ```text
-// ❌ FORBIDDEN: "ERC-20 minting emits Transfer from zero address"
+// FORBIDDEN: "ERC-20 minting emits Transfer from zero address"
 
-// ✅ REQUIRED: "Let me check..." [reads files] "Found it:
+// REQUIRED: "Let me check..." [reads files] "Found it:
 // 1. deposit() → ReceiptVault._deposit() (lib/.../ReceiptVault.sol:559)
 // 2. _deposit() → _mint() (lib/.../ReceiptVault.sol:587)
 // 3. ReceiptVault inherits ERC20Upgradeable (lib/.../ReceiptVault.sol:5)
@@ -888,19 +909,21 @@ reference chain. See `src/redemption/detector.rs` for an example.
 Code should be self-documenting. Comment only when adding context that code
 structure cannot express.
 
-**✅ DO comment:** Complex business logic, algorithm rationale, external system
+** DO comment:** Complex business logic, algorithm rationale, external system
 behavior, non-obvious constraints, test data context, workarounds.
 
-**❌ DON'T comment:** Self-explanatory code, restating what code does, obvious
-assignments, test section markers.
+** DON'T comment:** Self-explanatory code, restating what code does, obvious
+assignments, test section markers, section dividers (e.g., `// ========`),
+references to tasks/issues (reviewers and future maintainers won't have access
+to transient planning artifacts).
 
 ```rust
-// ✅ Good: Explains WHY (business rule)
+// Good: Explains WHY (business rule)
 // Alpaca requires journal confirmation before minting - otherwise we risk
 // minting without backing shares.
 let confirmed = wait_for_journal_confirmation(&mint_id).await?;
 
-// ❌ Bad: Restates WHAT (obvious from code)
+// Bad: Restates WHAT (obvious from code)
 // Execute mint command
 execute_mint_command(mint);
 ```
@@ -933,7 +956,7 @@ fn row_to_mint(row: MintRow) -> Result<MintRequest, Error> { }   // Private help
 Use `.unwrap()` directly - if unexpected, you see the value immediately:
 
 ```rust
-// ❌ Verbose                           | ✅ Concise
+// Verbose                           | Concise
 assert!(result.is_err());               | assert!(matches!(result.unwrap_err(),
 assert!(matches!(result.unwrap_err(),   |     MintError::InvalidQuantity));
     MintError::InvalidQuantity));       |
@@ -944,7 +967,7 @@ assert!(matches!(result.unwrap_err(),   |     MintError::InvalidQuantity));
 **Make invalid states unrepresentable** - use enums, not nullable fields:
 
 ```rust
-// ❌ Bad: Options can contradict         | ✅ Good: Each state has its data
+// Bad: Options can contradict         | Good: Each state has its data
 pub struct Mint {                         | pub enum MintStatus {
     pub status: String,                   |     Pending,
     pub tx_hash: Option<String>,          |     Completed { tx_hash: String, shares: u64 },
@@ -955,8 +978,8 @@ pub struct Mint {                         | pub enum MintStatus {
 **Use newtypes** to prevent mixing incompatible values:
 
 ```rust
-// ❌ fn mint(tok_id: String, iss_id: String, sym: String) - easy to mix up
-// ✅ fn mint(tok_id: TokenizationId, iss_id: IssuerId, sym: Symbol) - type-safe
+// fn mint(tok_id: String, iss_id: String, sym: String) - easy to mix up
+// fn mint(tok_id: TokenizationId, iss_id: IssuerId, sym: Symbol) - type-safe
 ```
 
 ### Avoid deep nesting
@@ -964,7 +987,7 @@ pub struct Mint {                         | pub enum MintStatus {
 Use early returns and `let-else` for flat code:
 
 ```rust
-// ❌ Nested                              | ✅ Flat with early returns
+// Nested                              | Flat with early returns
 fn validate(d: Option<&Data>) -> Res<()> | fn validate(d: Option<&Data>) -> Res<()> {
 {                                         |     let d = d.ok_or(Error::NoData)?;
     if let Some(d) = d {                  |     if d.qty <= 0 { return Err(Error::Qty); }
@@ -981,11 +1004,11 @@ fn validate(d: Option<&Data>) -> Res<()> | fn validate(d: Option<&Data>) -> Res<
 Prefer direct field access over unnecessary constructors/getters:
 
 ```rust
-// ✅ Use struct literals directly
+// Use struct literals directly
 let req = MintRequest { qty: 100.into(), underlying: "AAPL".into(), .. };
 println!("{}", req.qty);  // Direct access
 
-// ❌ Don't add getters/constructors that just forward to fields
+// Don't add getters/constructors that just forward to fields
 impl MintRequest {
     pub fn qty(&self) -> Decimal { self.qty }  // Unnecessary
 }
