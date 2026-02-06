@@ -26,8 +26,8 @@ Relevant docs:
     downstream from the plan, and the plan is downstream from the spec. Never
     start planning implementation until the spec accurately reflects what should
     be built.
-- Write a comprehensive step-by-step plan to PLAN.md with each task having a
-  corresponding section and a list of subtasks as checkboxes inside of it
+- Write a comprehensive step-by-step plan with each task having a corresponding
+  section and a list of subtasks as checkboxes inside of it
 - The task sections should follow the format `## Task N. <TASK NAME>`
 - The plan should be a detailed implementation plan and the reasoning behind the
   design decisions
@@ -54,33 +54,17 @@ Relevant docs:
 - **CRITICAL: Tasks must be ordered correctly in plans**
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks
-  - All checks (tests, clippy, fmt) SHOULD pass at the end of each task whenever
-    possible
-  - Focused git diffs and passing checks make reviewing much easier
-- **CRITICAL: Keep PLAN.md in sync with implementation decisions**
-  - If you change approach during implementation, immediately update PLAN.md to
-    reflect the new approach
-  - Plans are living documents during development - update them when you
-    discover better solutions
-  - Implementation and plan must always match - out-of-sync plans are worse than
-    no plan
-- Update PLAN.md every time you complete a task by marking checkboxes as `[x]`
-- Keep PLAN.md concise - just tick off checkboxes, do not add "Changes Made"
-  sections or verbose changelogs
+  - All tests SHOULD pass at the end of each task whenever possible
+  - Focused git diffs and passing tests make reviewing much easier sections or
+    verbose changelogs
 - The code diffs themselves should be self-explanatory and easy to review
-- **CRITICAL: TODO comments are for redundancy only** - PLAN.md is the source of
-  truth for tracking work. TODO comments in code serve as backup reminders, not
-  primary tracking. When completing a task, always `grep -r "TODO.*Task N"` (or
-  similar) to find and address any related TODOs in the codebase.
 
 ### After completing a plan
 
-When all tasks in PLAN.md are complete, perform this checklist **before**
-creating or updating a PR:
+When all tasks are complete, perform this checklist **before** creating or
+updating a PR:
 
-1. **Delete PLAN.md** - It's a transient development file that should ONLY exist
-   on development branches, never in PRs or merged to main
-2. **Update ROADMAP.md**:
+1. **Update ROADMAP.md**:
    - Mark completed issues as `[x]` with PR link
    - Format: `- [x] [#N](issue-url) - Task description`
    - Add: `- **PR:** [#N](pr-url)`
@@ -88,13 +72,13 @@ creating or updating a PR:
      section
    - Use `gh issue list` and `gh pr list` to verify all related issues/PRs are
      linked
-3. **Update other documentation** as needed:
+2. **Update other documentation** as needed:
    - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
      changed
    - **README.md**: If project structure, features, commands, or architecture
      changed
    - **AGENTS.md**: If new patterns or conventions were introduced
-4. **Verify GitHub state**:
+3. **Verify GitHub state**:
    - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
      description)
    - Check that no issues are marked complete in ROADMAP.md but still open on
@@ -758,13 +742,19 @@ fn test_validates_quantity() {
 
 ## Workflow Best Practices
 
-- **Always run tests, clippy, and formatters before handing over a piece of
-  work**
-  - Run `cargo test --workspace` first, as changing tests can break clippy
-  - Run
-    `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings`
-    next, as fixing linting errors can break formatting
-  - Always run `cargo fmt` last to ensure clean code formatting
+- **Type checking and tests are the primary feedback mechanism during
+  development** - Use `cargo build` and `cargo test --workspace` iteratively as
+  you write code. Do NOT run clippy until all tests pass.
+- **Clippy is for cleanup, not development** - Only run clippy after all tests
+  pass. Clippy warnings about unused code, unused imports, etc. are expected
+  during development when you're defining types before implementing logic (TTDD
+  pattern). Running clippy prematurely wastes time on warnings that will resolve
+  themselves once implementation is complete.
+- **Before handing over a piece of work**, run checks in this order:
+  1. `cargo test --workspace` - All tests must pass
+  2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
+     Fix any linting issues (these should be minimal if code is well-structured)
+  3. `cargo fmt --all` - Format the code
 
 ### CRITICAL: Lint Policy
 
