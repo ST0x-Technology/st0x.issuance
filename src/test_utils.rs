@@ -25,6 +25,7 @@ use crate::bindings::{
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
 use crate::config::{Config, LogLevel};
+use crate::fireblocks::SignerConfig;
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
 use crate::tokenized_asset::{
@@ -52,7 +53,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse("wss://localhost:8545")?,
-        private_key: B256::ZERO,
+        signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,

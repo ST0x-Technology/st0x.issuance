@@ -34,7 +34,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 use st0x_issuance::{
-    AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
+    AlpacaConfig, AuthConfig, Config, IpWhitelist, SignerConfig,
+    initialize_rocket,
 };
 
 /// Quantity with >9 decimal precision (18 decimals on-chain).
@@ -426,7 +427,7 @@ async fn test_redemption_returns_dust_to_user()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -560,7 +561,7 @@ async fn test_redemption_no_dust_when_9_decimals()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"

@@ -1,4 +1,4 @@
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -35,6 +35,7 @@ pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
+pub(crate) mod fireblocks;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
@@ -44,6 +45,7 @@ pub mod bindings;
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
+pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
@@ -221,6 +223,9 @@ pub async fn initialize_rocket(
         redemption_event_store,
     } = setup_aggregate_cqrs(&pool, blockchain_service.clone());
 
+    let bot_wallet = config.signer.address().await?;
+    info!("Bot wallet address: {bot_wallet}");
+
     let MintManagers { mint: mint_manager, callback: callback_manager } =
         setup_mint_managers(
             &config,
@@ -228,27 +233,28 @@ pub async fn initialize_rocket(
             &mint_cqrs,
             &mint_event_store,
             &pool,
+            bot_wallet,
         )?;
 
     spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
 
-    let RedemptionManagers { redeem_call, journal, burn } =
-        setup_redemption_managers(
-            &config,
-            blockchain_service,
-            &redemption_cqrs,
-            &redemption_event_store,
-            &pool,
-        )?;
+    let managers = setup_redemption_managers(
+        &config,
+        blockchain_service,
+        &redemption_cqrs,
+        &redemption_event_store,
+        &pool,
+        bot_wallet,
+    )?;
 
     info!("Replaying views to ensure schema updates are applied");
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 
     spawn_redemption_recovery(
-        redeem_call.clone(),
-        journal.clone(),
-        burn.clone(),
+        managers.redeem_call.clone(),
+        managers.journal.clone(),
+        managers.burn.clone(),
     );
 
     spawn_redemption_detector(
@@ -256,10 +262,9 @@ pub async fn initialize_rocket(
         redemption_cqrs.clone(),
         redemption_event_store,
         pool.clone(),
-        redeem_call,
-        journal,
-        burn,
-    )?;
+        managers,
+        bot_wallet,
+    );
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -390,13 +395,14 @@ fn setup_mint_managers(
     mint_cqrs: &MintCqrs,
     mint_event_store: &MintEventStore,
     pool: &Pool<Sqlite>,
+    bot_wallet: Address,
 ) -> Result<MintManagers, anyhow::Error> {
     let mint = Arc::new(MintManager::new(
         blockchain_service,
         mint_cqrs.clone(),
         mint_event_store.clone(),
         pool.clone(),
-        config.bot_wallet()?,
+        bot_wallet,
     ));
 
     let alpaca_service = config.alpaca.service()?;
@@ -416,6 +422,7 @@ fn setup_redemption_managers(
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
     pool: &Pool<Sqlite>,
+    bot_wallet: Address,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
@@ -436,7 +443,7 @@ fn setup_redemption_managers(
         pool.clone(),
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
-        config.bot_wallet()?,
+        bot_wallet,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -449,20 +456,10 @@ fn spawn_redemption_detector(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     pool: Pool<Sqlite>,
-    redeem_call: Arc<
-        RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-        >,
-    >,
-    journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
-    burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
-) -> Result<(), config::ConfigError> {
-    let bot_wallet = config.bot_wallet()?;
-    info!("WebSocket monitoring task spawned for bot wallet {bot_wallet}");
+    managers: RedemptionManagers,
+    bot_wallet: Address,
+) {
+    info!("Spawning WebSocket monitoring task for bot wallet {bot_wallet}");
 
     let detector_config = RedemptionDetectorConfig {
         rpc_url: config.rpc_url.clone(),
@@ -475,16 +472,14 @@ fn spawn_redemption_detector(
         redemption_cqrs,
         redemption_event_store,
         pool,
-        redeem_call,
-        journal,
-        burn,
+        managers.redeem_call,
+        managers.journal,
+        managers.burn,
     );
 
     tokio::spawn(async move {
         detector.run().await;
     });
-
-    Ok(())
 }
 
 fn spawn_mint_recovery(
