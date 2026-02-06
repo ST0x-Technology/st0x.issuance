@@ -427,6 +427,7 @@ async fn test_redemption_returns_dust_to_user()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
@@ -561,6 +562,7 @@ async fn test_redemption_no_dust_when_9_decimals()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {

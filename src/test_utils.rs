@@ -48,11 +48,15 @@ pub fn test_alpaca_legacy_auth() -> (String, String, String) {
     (basic_auth, api_key, api_secret)
 }
 
+/// Anvil local chain ID
+pub const ANVIL_CHAIN_ID: u64 = 31337;
+
 fn test_config() -> Result<Config, anyhow::Error> {
     Ok(Config {
         database_url: "sqlite::memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse("wss://localhost:8545")?,
+        chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
         auth: test_auth_config()?,

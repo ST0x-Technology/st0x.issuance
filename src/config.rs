@@ -14,11 +14,15 @@ use crate::fireblocks::{
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
+/// Default chain ID (Base mainnet)
+pub const DEFAULT_CHAIN_ID: u64 = 8453;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub rpc_url: Url,
+    pub chain_id: u64,
     pub signer: SignerConfig,
     pub vault: Address,
     pub auth: AuthConfig,
@@ -41,7 +45,7 @@ impl Config {
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let resolved = self.signer.resolve().await?;
+        let resolved = self.signer.resolve(self.chain_id).await?;
 
         let provider = ProviderBuilder::new()
             .wallet(resolved.wallet)
@@ -79,6 +83,14 @@ struct Env {
     )]
     rpc_url: Url,
 
+    #[arg(
+        long,
+        env = "CHAIN_ID",
+        default_value_t = DEFAULT_CHAIN_ID,
+        help = "Chain ID for signing transactions (default: Base mainnet)"
+    )]
+    chain_id: u64,
+
     #[clap(flatten)]
     signer: SignerEnv,
 
@@ -112,6 +124,7 @@ impl Env {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
+            chain_id: self.chain_id,
             signer,
             vault: self.vault,
             auth: self.auth,

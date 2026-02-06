@@ -397,6 +397,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
@@ -477,6 +478,7 @@ fn create_config_with_db(
         database_url: db_path.to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {
@@ -652,6 +654,7 @@ async fn test_mint_burn_mint_nonce_synchronization()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         auth: AuthConfig {

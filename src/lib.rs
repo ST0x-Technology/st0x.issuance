@@ -12,7 +12,10 @@ use tracing::info;
 
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
-use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::mint::{
+    CallbackManager, Mint, MintView, mint_manager::MintManager,
+    replay_mint_view,
+};
 use crate::receipt_inventory::burn_tracking::replay_receipt_burns_view;
 use crate::receipt_inventory::{ReceiptBurnsView, ReceiptInventoryView};
 use crate::redemption::{
@@ -47,6 +50,7 @@ pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
 pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
+pub use test_utils::ANVIL_CHAIN_ID;
 
 pub(crate) type AccountCqrs = SqliteCqrs<account::Account>;
 pub(crate) type TokenizedAssetCqrs =
@@ -248,6 +252,7 @@ pub async fn initialize_rocket(
     )?;
 
     info!("Replaying views to ensure schema updates are applied");
+    replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 
