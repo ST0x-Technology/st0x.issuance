@@ -90,7 +90,8 @@ impl FireblocksSigner {
     ) -> Result<Self, FireblocksError> {
         let secret = std::fs::read(&config.secret_path)?;
 
-        let mut builder = ClientBuilder::new(config.api_key.as_str(), &secret);
+        let mut builder =
+            ClientBuilder::new(config.api_user_id.as_str(), &secret);
         if config.environment == Environment::Sandbox {
             builder = builder.use_sandbox();
         }

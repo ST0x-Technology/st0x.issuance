@@ -3,17 +3,17 @@ use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// Fireblocks API key for authentication.
+/// Fireblocks API User ID for authentication.
 #[derive(Debug, Clone)]
-pub(crate) struct ApiKey(String);
+pub(crate) struct ApiUserId(String);
 
-impl ApiKey {
+impl ApiUserId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl From<String> for ApiKey {
+impl From<String> for ApiUserId {
     fn from(s: String) -> Self {
         Self(s)
     }
@@ -74,7 +74,7 @@ pub(crate) enum Environment {
 /// Validated Fireblocks configuration.
 #[derive(Debug, Clone)]
 pub struct FireblocksConfig {
-    pub(crate) api_key: ApiKey,
+    pub(crate) api_user_id: ApiUserId,
     pub(crate) secret_path: PathBuf,
     pub(crate) vault_account_id: VaultAccountId,
     pub(crate) chain_asset_ids: ChainAssetIds,

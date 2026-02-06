@@ -21,7 +21,7 @@ pub(crate) struct ResolvedSigner {
 ///
 /// Exactly one of the two signing backends must be configured:
 /// - Local: `--evm-private-key` / `EVM_PRIVATE_KEY`
-/// - Fireblocks: `--fireblocks-api-key` + related options
+/// - Fireblocks: `--fireblocks-api-user-id` / `FIREBLOCKS_API_USER_ID`
 #[derive(Parser, Debug, Clone)]
 pub(crate) struct SignerEnv {
     #[clap(flatten)]
@@ -42,15 +42,15 @@ struct LocalSignerEnv {
 
 /// Fireblocks signer configuration.
 #[derive(Args, Debug, Clone)]
-#[group(id = "fireblocks_signer", requires_all = ["fireblocks_api_key", "fireblocks_secret_path", "fireblocks_vault_account_id"])]
+#[group(id = "fireblocks_signer")]
 struct FireblocksEnv {
-    /// Fireblocks API key (mutually exclusive with local private key)
+    /// Fireblocks API User ID (mutually exclusive with local private key)
     #[clap(
-        id = "fireblocks_api_key",
-        long = "fireblocks-api-key",
-        env = "FIREBLOCKS_API_KEY"
+        id = "fireblocks_api_user_id",
+        long = "fireblocks-api-user-id",
+        env = "FIREBLOCKS_API_USER_ID"
     )]
-    api_key: Option<String>,
+    api_user_id: Option<String>,
 
     /// Path to the RSA private key file for Fireblocks API authentication
     #[clap(
@@ -60,13 +60,14 @@ struct FireblocksEnv {
     )]
     secret_path: Option<std::path::PathBuf>,
 
-    /// Fireblocks vault account ID containing the signing key
+    /// Fireblocks vault account ID containing the signing key (defaults to "0")
     #[clap(
         id = "fireblocks_vault_account_id",
         long = "fireblocks-vault-account-id",
-        env = "FIREBLOCKS_VAULT_ACCOUNT_ID"
+        env = "FIREBLOCKS_VAULT_ACCOUNT_ID",
+        default_value = "0"
     )]
-    vault_account_id: Option<String>,
+    vault_account_id: String,
 
     /// Mapping of chain ID to Fireblocks asset ID, e.g. "1:ETH,8453:BASECHAIN_ETH"
     #[clap(id = "fireblocks_chain_asset_ids", long = "fireblocks-chain-asset-ids", env = "FIREBLOCKS_CHAIN_ASSET_IDS", default_value = "8453:BASECHAIN_ETH", value_parser = parse_chain_asset_ids)]
@@ -92,20 +93,18 @@ pub enum SignerConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignerConfigError {
-    #[error("exactly one of EVM_PRIVATE_KEY or FIREBLOCKS_API_KEY must be set")]
+    #[error(
+        "exactly one of EVM_PRIVATE_KEY or FIREBLOCKS_API_USER_ID must be set"
+    )]
     NeitherConfigured,
     #[error(
-        "both EVM_PRIVATE_KEY and FIREBLOCKS_API_KEY are set; use only one"
+        "both EVM_PRIVATE_KEY and FIREBLOCKS_API_USER_ID are set; use only one"
     )]
     BothConfigured,
     #[error(
-        "FIREBLOCKS_SECRET_PATH is required when FIREBLOCKS_API_KEY is set"
+        "FIREBLOCKS_SECRET_PATH is required when FIREBLOCKS_API_USER_ID is set"
     )]
     MissingSecretPath,
-    #[error(
-        "FIREBLOCKS_VAULT_ACCOUNT_ID is required when FIREBLOCKS_API_KEY is set"
-    )]
-    MissingVaultAccountId,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,25 +117,20 @@ pub enum SignerResolveError {
 
 impl SignerEnv {
     pub(crate) fn into_config(self) -> Result<SignerConfig, SignerConfigError> {
-        match (self.local.evm_private_key, self.fireblocks.api_key) {
+        match (self.local.evm_private_key, self.fireblocks.api_user_id) {
             (Some(_), Some(_)) => Err(SignerConfigError::BothConfigured),
             (None, None) => Err(SignerConfigError::NeitherConfigured),
             (Some(key), None) => Ok(SignerConfig::Local(key)),
-            (None, Some(api_key)) => {
+            (None, Some(api_user_id)) => {
                 let secret_path = self
                     .fireblocks
                     .secret_path
                     .ok_or(SignerConfigError::MissingSecretPath)?;
-                let vault_account_id = self
-                    .fireblocks
-                    .vault_account_id
-                    .ok_or(SignerConfigError::MissingVaultAccountId)?
-                    .into();
 
                 Ok(SignerConfig::Fireblocks(FireblocksConfig {
-                    api_key: api_key.into(),
+                    api_user_id: api_user_id.into(),
                     secret_path,
-                    vault_account_id,
+                    vault_account_id: self.fireblocks.vault_account_id.into(),
                     chain_asset_ids: self.fireblocks.chain_asset_ids,
                     environment: self.fireblocks.environment,
                 }))
@@ -200,9 +194,9 @@ mod tests {
         let env = SignerEnv {
             local: LocalSignerEnv { evm_private_key: Some(key) },
             fireblocks: FireblocksEnv {
-                api_key: None,
+                api_user_id: None,
                 secret_path: None,
-                vault_account_id: None,
+                vault_account_id: "0".to_string(),
                 chain_asset_ids: default_chain_asset_ids(),
                 environment: Environment::Production,
             },
@@ -220,9 +214,9 @@ mod tests {
         let env = SignerEnv {
             local: LocalSignerEnv { evm_private_key: None },
             fireblocks: FireblocksEnv {
-                api_key: None,
+                api_user_id: None,
                 secret_path: None,
-                vault_account_id: None,
+                vault_account_id: "0".to_string(),
                 chain_asset_ids: default_chain_asset_ids(),
                 environment: Environment::Production,
             },
@@ -240,9 +234,9 @@ mod tests {
         let env = SignerEnv {
             local: LocalSignerEnv { evm_private_key: Some(B256::ZERO) },
             fireblocks: FireblocksEnv {
-                api_key: Some("test-key".to_string()),
+                api_user_id: Some("test-user-id".to_string()),
                 secret_path: Some("/path/to/key".into()),
-                vault_account_id: Some("0".to_string()),
+                vault_account_id: "0".to_string(),
                 chain_asset_ids: default_chain_asset_ids(),
                 environment: Environment::Production,
             },
@@ -260,9 +254,9 @@ mod tests {
         let env = SignerEnv {
             local: LocalSignerEnv { evm_private_key: None },
             fireblocks: FireblocksEnv {
-                api_key: Some("test-key".to_string()),
+                api_user_id: Some("test-user-id".to_string()),
                 secret_path: None,
-                vault_account_id: Some("0".to_string()),
+                vault_account_id: "0".to_string(),
                 chain_asset_ids: default_chain_asset_ids(),
                 environment: Environment::Production,
             },
@@ -272,26 +266,6 @@ mod tests {
         assert!(
             matches!(result, Err(SignerConfigError::MissingSecretPath)),
             "Expected MissingSecretPath error, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn fireblocks_missing_vault_account_id_fails() {
-        let env = SignerEnv {
-            local: LocalSignerEnv { evm_private_key: None },
-            fireblocks: FireblocksEnv {
-                api_key: Some("test-key".to_string()),
-                secret_path: Some("/path/to/key".into()),
-                vault_account_id: None,
-                chain_asset_ids: default_chain_asset_ids(),
-                environment: Environment::Production,
-            },
-        };
-
-        let result = env.into_config();
-        assert!(
-            matches!(result, Err(SignerConfigError::MissingVaultAccountId)),
-            "Expected MissingVaultAccountId error, got {result:?}"
         );
     }
 
