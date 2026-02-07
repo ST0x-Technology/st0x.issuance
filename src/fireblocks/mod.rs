@@ -112,7 +112,7 @@ pub enum SignerConfigError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SignerResolveError {
+pub(crate) enum SignerResolveError {
     #[error(transparent)]
     FireblocksVault(#[from] FireblocksVaultError),
     #[error("invalid EVM private key")]

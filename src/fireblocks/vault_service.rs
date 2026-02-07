@@ -21,7 +21,7 @@ use crate::vault::{
 
 /// Fireblocks-specific errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
-pub enum FireblocksVaultError {
+pub(crate) enum FireblocksVaultError {
     #[error("failed to read Fireblocks secret key from {path}")]
     ReadSecret {
         path: std::path::PathBuf,
@@ -69,7 +69,7 @@ pub enum FireblocksVaultError {
 /// This is used to derive the bot wallet address from the Fireblocks configuration.
 /// It builds a temporary client, fetches the deposit address for the default asset,
 /// and returns the address.
-pub async fn fetch_vault_address(
+pub(crate) async fn fetch_vault_address(
     config: &FireblocksConfig,
 ) -> Result<Address, FireblocksVaultError> {
     let secret = std::fs::read(&config.secret_path).map_err(|e| {
@@ -116,7 +116,7 @@ pub async fn fetch_vault_address(
 /// The service uses a read-only RPC provider for:
 /// - Calling view functions (previewDeposit, balanceOf)
 /// - Fetching transaction receipts to parse events
-pub struct FireblocksVaultService<P> {
+pub(crate) struct FireblocksVaultService<P> {
     client: Client,
     vault_account_id: String,
     chain_asset_ids: ChainAssetIds,

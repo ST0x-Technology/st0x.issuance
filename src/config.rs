@@ -9,8 +9,8 @@ use url::Url;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::fireblocks::{
-    FireblocksVaultError, FireblocksVaultService, SignerConfig,
-    SignerConfigError, SignerEnv, SignerResolveError, resolve_local_signer,
+    FireblocksVaultService, SignerConfig, SignerConfigError, SignerEnv,
+    resolve_local_signer,
 };
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
@@ -48,7 +48,8 @@ impl Config {
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
         match &self.signer {
             SignerConfig::Local(key) => {
-                let resolved = resolve_local_signer(key, self.chain_id)?;
+                let resolved = resolve_local_signer(key, self.chain_id)
+                    .map_err(|e| ConfigError::SignerResolve(Box::new(e)))?;
                 let provider = ProviderBuilder::new()
                     .wallet(resolved.wallet)
                     .connect(self.rpc_url.as_str())
@@ -82,7 +83,8 @@ impl Config {
                     env,
                     read_provider,
                     self.chain_id,
-                )?;
+                )
+                .map_err(|e| ConfigError::FireblocksVault(Box::new(e)))?;
 
                 Ok(Arc::new(service))
             }
@@ -224,14 +226,14 @@ impl HyperDxEnv {
 pub enum ConfigError {
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
-    #[error("Failed to resolve signer")]
-    SignerResolve(#[from] SignerResolveError),
+    #[error("Failed to resolve signer: {0}")]
+    SignerResolve(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Failed to connect to RPC endpoint")]
     ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
-    #[error("Fireblocks vault service initialization failed")]
-    FireblocksVault(#[from] FireblocksVaultError),
+    #[error("Fireblocks vault service initialization failed: {0}")]
+    FireblocksVault(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(
         "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
     )]
