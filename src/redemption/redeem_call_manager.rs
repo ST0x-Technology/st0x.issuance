@@ -8,6 +8,7 @@ use super::{
     IssuerRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionViewError, find_detected,
 };
+use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
@@ -170,10 +171,16 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
         let UnderlyingSymbol(underlying_str) = &metadata.underlying;
 
+        // Truncate to 9 decimals for Alpaca - they don't support 18 decimal precision
+        let (alpaca_quantity, dust_quantity) =
+            metadata.quantity.truncate_for_alpaca()?;
+
         info!(
             issuer_request_id = %issuer_request_id_str,
             underlying = %underlying_str,
-            quantity = %metadata.quantity.0,
+            original_quantity = %metadata.quantity.0,
+            alpaca_quantity = %alpaca_quantity.0,
+            dust_quantity = %dust_quantity.0,
             wallet = %metadata.wallet,
             "Calling Alpaca redeem endpoint"
         );
@@ -183,7 +190,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
             client_id,
-            quantity: metadata.quantity.clone(),
+            quantity: alpaca_quantity.clone(),
             network,
             wallet: metadata.wallet,
             tx_hash: metadata.detected_tx_hash,
@@ -204,7 +211,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     network = %response.network.0,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
-                    fees = %response.fees.0,
+                    fees = ?response.fees.as_ref().map(|f| f.0),
                     "Alpaca redeem API call succeeded"
                 );
 
@@ -215,6 +222,8 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                             issuer_request_id: issuer_request_id.clone(),
                             tokenization_request_id: response
                                 .tokenization_request_id,
+                            alpaca_quantity,
+                            dust_quantity,
                         },
                     )
                     .await?;
@@ -274,6 +283,8 @@ pub(crate) enum RedeemCallManagerError {
     AssetView(#[from] TokenizedAssetViewError),
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: UnderlyingSymbol },
+    #[error("Quantity conversion error: {0}")]
+    QuantityConversion(#[from] QuantityConversionError),
 }
 
 #[cfg(test)]
@@ -304,6 +315,8 @@ mod tests {
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetView,
     };
+    use crate::vault::VaultService;
+    use crate::vault::mock::MockVaultService;
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -348,12 +361,13 @@ mod tests {
                 "redemption_view".to_string(),
             ));
             let redemption_query = GenericQuery::new(redemption_view_repo);
+            let vault_service = Arc::new(MockVaultService::new_success());
             let redemption_cqrs = Arc::new(CqrsFramework::new(
                 PersistedEventStore::new_event_store(
                     SqliteEventRepository::new(pool.clone()),
                 ),
                 vec![Box::new(redemption_query)],
-                (),
+                vault_service,
             ));
 
             let account_view_repo =
@@ -494,8 +508,13 @@ mod tests {
             .expect("Failed to run migrations");
 
         let store = Arc::new(MemStore::default());
-        let cqrs =
-            Arc::new(cqrs_es::CqrsFramework::new((*store).clone(), vec![], ()));
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        let cqrs = Arc::new(cqrs_es::CqrsFramework::new(
+            (*store).clone(),
+            vec![],
+            vault_service,
+        ));
         (cqrs, store, pool)
     }
 

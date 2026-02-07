@@ -57,36 +57,6 @@ pub(crate) trait VaultService: Send + Sync {
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError>;
 
-    /// Burns tokens on-chain by calling the vault's withdraw() function.
-    ///
-    /// # Arguments
-    ///
-    /// * `vault` - Address of the vault contract to interact with
-    /// * `shares` - Number of shares to burn (18-decimal fixed-point)
-    /// * `receipt_id` - ERC-1155 receipt ID to burn from
-    /// * `owner` - Address of the account whose shares are being burned
-    /// * `receiver` - Address that will receive the underlying assets
-    /// * `receipt_info` - Metadata about the burn operation for on-chain audit trail
-    ///
-    /// # Returns
-    ///
-    /// On success, returns [`BurnResult`] containing transaction hash, receipt ID,
-    /// shares burned, gas used, and block number.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError`] if the transaction fails, events are missing,
-    /// or RPC communication fails.
-    async fn burn_tokens(
-        &self,
-        vault: Address,
-        shares: U256,
-        receipt_id: U256,
-        owner: Address,
-        receiver: Address,
-        receipt_info: ReceiptInformation,
-    ) -> Result<BurnResult, VaultError>;
-
     /// Gets the ERC-20 share balance for an address.
     ///
     /// This queries the vault contract's balanceOf(address) to get the total
@@ -105,6 +75,45 @@ pub(crate) trait VaultService: Send + Sync {
         vault: Address,
         owner: Address,
     ) -> Result<U256, VaultError>;
+
+    /// Atomically burns tokens and returns dust to user using multicall.
+    ///
+    /// This method implements the dust handling pattern for redemptions where the
+    /// on-chain quantity (18 decimals) exceeds Alpaca's precision (9 decimals).
+    /// It uses multicall to atomically:
+    /// 1. Burn the truncated amount (what Alpaca processed)
+    /// 2. Transfer the dust back to the user's wallet
+    ///
+    /// Both operations succeed or fail atomically in a single transaction.
+    /// If dust is zero, only the burn is executed.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns [`BurnWithDustResult`] containing transaction details
+    /// and the amount of dust returned.
+    async fn burn_and_return_dust(
+        &self,
+        params: BurnParams,
+    ) -> Result<BurnWithDustResult, VaultError>;
+}
+
+/// Result of a successful burn-with-dust operation.
+///
+/// Contains all transaction details and the dust returned to the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BurnWithDustResult {
+    /// Transaction hash of the multicall transaction
+    pub(crate) tx_hash: B256,
+    /// ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of ERC-20 shares burned (with 18 decimals)
+    pub(crate) shares_burned: U256,
+    /// Amount of dust returned to user (with 18 decimals)
+    pub(crate) dust_returned: U256,
+    /// Gas consumed by the transaction
+    pub(crate) gas_used: u64,
+    /// Block number where the transaction was included
+    pub(crate) block_number: u64,
 }
 
 /// Result of a successful on-chain minting operation.
@@ -125,22 +134,25 @@ pub(crate) struct MintResult {
     pub(crate) block_number: u64,
 }
 
-/// Result of a successful on-chain burning operation.
+/// Parameters for a burn-with-dust operation.
 ///
-/// Contains all transaction details needed to track the burn in the Redemption aggregate
-/// and for audit trails.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BurnResult {
-    /// Transaction hash of the withdraw transaction
-    pub(crate) tx_hash: B256,
-    /// ERC-1155 receipt ID that was burned from
+/// Groups all inputs needed to atomically burn tokens and return dust to the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BurnParams {
+    /// Address of the vault contract
+    pub(crate) vault: Address,
+    /// Amount of shares to burn (truncated to 9 decimals)
+    pub(crate) burn_shares: U256,
+    /// Amount of dust to return to user (can be zero)
+    pub(crate) dust_shares: U256,
+    /// ERC-1155 receipt ID to burn from
     pub(crate) receipt_id: U256,
-    /// Number of ERC-20 shares burned (with 18 decimals)
-    pub(crate) shares_burned: U256,
-    /// Gas consumed by the transaction
-    pub(crate) gas_used: u64,
-    /// Block number where the transaction was included
-    pub(crate) block_number: u64,
+    /// Address that owns the shares being burned (typically bot wallet)
+    pub(crate) owner: Address,
+    /// User's address that will receive the dust
+    pub(crate) user: Address,
+    /// Metadata about the operation for on-chain audit trail
+    pub(crate) receipt_info: ReceiptInformation,
 }
 
 /// On-chain metadata stored with each vault deposit or withdrawal.
@@ -178,19 +190,25 @@ pub(crate) enum OperationType {
 /// Errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultError {
-    /// Transaction was sent but failed on-chain
-    #[error("Transaction failed: {reason}")]
-    TransactionFailed { reason: String },
     /// Transaction receipt is missing required data
     #[error("Invalid receipt")]
     InvalidReceipt,
-    /// RPC communication error
-    #[error("RPC error: {message}")]
-    RpcError { message: String },
     /// Expected event (e.g., Deposit) not found in transaction logs
     #[error("Event not found in transaction: {tx_hash}")]
     EventNotFound { tx_hash: String },
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
+    /// Failed to serialize receipt information
+    #[error("Failed to serialize receipt information")]
+    ReceiptInfoSerialization(#[from] serde_json::Error),
+    /// Failed to get transaction receipt
+    #[error(transparent)]
+    PendingTransaction(#[from] alloy::providers::PendingTransactionError),
+    /// RPC communication error
+    #[error("RPC error: {message}")]
+    RpcError { message: String },
+    /// Transaction submission or execution failed
+    #[error("Transaction failed: {reason}")]
+    TransactionFailed { reason: String },
 }

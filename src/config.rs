@@ -15,11 +15,15 @@ use crate::fireblocks::{
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
+/// Default chain ID (Base mainnet)
+pub const DEFAULT_CHAIN_ID: u64 = 8453;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub rpc_url: Url,
+    pub chain_id: u64,
     pub signer: SignerConfig,
     pub vault: Address,
     pub auth: AuthConfig,
@@ -39,17 +43,12 @@ impl Config {
         env.into_config()
     }
 
-    /// Derives the bot wallet address from the signer configuration.
-    pub(crate) async fn bot_wallet(&self) -> Result<Address, ConfigError> {
-        Ok(self.signer.address().await?)
-    }
-
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
         match &self.signer {
             SignerConfig::Local(_) => {
-                let resolved = self.signer.resolve()?;
+                let resolved = self.signer.resolve(self.chain_id)?;
                 let provider = ProviderBuilder::new()
                     .wallet(resolved.wallet)
                     .connect(self.rpc_url.as_str())
@@ -102,6 +101,14 @@ struct Env {
     )]
     rpc_url: Url,
 
+    #[arg(
+        long,
+        env = "CHAIN_ID",
+        default_value_t = DEFAULT_CHAIN_ID,
+        help = "Chain ID for signing transactions (default: Base mainnet)"
+    )]
+    chain_id: u64,
+
     #[clap(flatten)]
     signer: SignerEnv,
 
@@ -135,6 +142,7 @@ impl Env {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             rpc_url: self.rpc_url,
+            chain_id: self.chain_id,
             signer,
             vault: self.vault,
             auth: self.auth,
@@ -365,6 +373,6 @@ mod tests {
         // Private key 0x...01 derives to this well-known address
         let expected = address!("7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
 
-        assert_eq!(config.bot_wallet().await.unwrap(), expected);
+        assert_eq!(config.signer.address().await.unwrap(), expected);
     }
 }

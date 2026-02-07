@@ -17,7 +17,7 @@ pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use callback_manager::CallbackManager;
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
-pub(crate) use view::MintView;
+pub(crate) use view::{MintView, replay_mint_view};
 
 pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{

@@ -6,6 +6,7 @@ services:
     command: ["./server"]
     environment:
       - DATABASE_URL=sqlite:///data/issuance.db
+      - FIREBLOCKS_SECRET_PATH=/data/fireblocks_secret.issuance.key
     env_file:
       - .env
     ports:

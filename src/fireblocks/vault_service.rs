@@ -9,10 +9,11 @@ use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::debug;
 
-use super::config::{ChainAssetIds, FireblocksEnv};
+use super::config::{ChainAssetIds, Environment, FireblocksConfig};
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::vault::{
-    BurnResult, MintResult, ReceiptInformation, VaultError, VaultService,
+    BurnParams, BurnWithDustResult, MintResult, ReceiptInformation, VaultError,
+    VaultService,
 };
 
 /// Fireblocks-specific errors that can occur during vault operations.
@@ -87,25 +88,25 @@ pub enum FireblocksVaultError {
 /// It builds a temporary client, fetches the deposit address for the default asset,
 /// and returns the address.
 pub async fn fetch_vault_address(
-    env: &FireblocksEnv,
+    config: &FireblocksConfig,
 ) -> Result<Address, FireblocksVaultError> {
-    let secret = std::fs::read(&env.secret_path).map_err(|e| {
+    let secret = std::fs::read(&config.secret_path).map_err(|e| {
         FireblocksVaultError::ReadSecret {
-            path: env.secret_path.clone(),
+            path: config.secret_path.clone(),
             source: e,
         }
     })?;
 
-    let mut builder = ClientBuilder::new(&env.api_key, &secret);
-    if env.sandbox {
+    let mut builder = ClientBuilder::new(config.api_user_id.as_str(), &secret);
+    if config.environment == Environment::Sandbox {
         builder = builder.use_sandbox();
     }
     let client = builder.build().map_err(FireblocksVaultError::ClientBuild)?;
 
-    let default_asset_id = env.chain_asset_ids.default_asset_id();
+    let default_asset_id = config.chain_asset_ids.default_asset_id();
 
     let addresses = client
-        .addresses(&env.vault_account_id, default_asset_id)
+        .addresses(config.vault_account_id.as_str(), default_asset_id.as_str())
         .await
         .map_err(FireblocksVaultError::FetchAddresses)?;
 
@@ -113,8 +114,8 @@ pub async fn fetch_vault_address(
         .first()
         .and_then(|a| a.address.as_deref())
         .ok_or_else(|| FireblocksVaultError::NoAddress {
-            vault_id: env.vault_account_id.clone(),
-            asset_id: default_asset_id.to_string(),
+            vault_id: config.vault_account_id.as_str().to_string(),
+            asset_id: default_asset_id.as_str().to_string(),
         })?;
 
     address_str.parse::<Address>().map_err(|e| {
@@ -184,7 +185,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     ///
     /// # Arguments
     ///
-    /// * `env` - Fireblocks environment configuration
+    /// * `config` - Fireblocks configuration
     /// * `read_provider` - Read-only RPC provider for view calls and receipt fetching
     /// * `chain_id` - The chain ID for transaction routing
     ///
@@ -194,35 +195,36 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     /// - The Fireblocks secret key cannot be read
     /// - The Fireblocks client cannot be built
     pub fn new(
-        env: &FireblocksEnv,
+        config: &FireblocksConfig,
         read_provider: P,
         chain_id: u64,
     ) -> Result<Self, FireblocksVaultError> {
-        let secret = std::fs::read(&env.secret_path).map_err(|e| {
+        let secret = std::fs::read(&config.secret_path).map_err(|e| {
             FireblocksVaultError::ReadSecret {
-                path: env.secret_path.clone(),
+                path: config.secret_path.clone(),
                 source: e,
             }
         })?;
 
-        let mut builder = ClientBuilder::new(&env.api_key, &secret);
-        if env.sandbox {
+        let mut builder =
+            ClientBuilder::new(config.api_user_id.as_str(), &secret);
+        if config.environment == Environment::Sandbox {
             builder = builder.use_sandbox();
         }
         let client =
             builder.build().map_err(FireblocksVaultError::ClientBuild)?;
 
         debug!(
-            vault_account_id = %env.vault_account_id,
-            chain_asset_ids = ?env.chain_asset_ids,
+            vault_account_id = %config.vault_account_id.as_str(),
+            chain_asset_ids = ?config.chain_asset_ids,
             %chain_id,
             "Fireblocks vault service initialized"
         );
 
         Ok(Self {
             client,
-            vault_account_id: env.vault_account_id.clone(),
-            chain_asset_ids: env.chain_asset_ids.clone(),
+            vault_account_id: config.vault_account_id.as_str().to_string(),
+            chain_asset_ids: config.chain_asset_ids.clone(),
             read_provider,
             chain_id,
         })
@@ -277,7 +279,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         )?;
 
         let tx_request = build_contract_call_request(
-            asset_id,
+            asset_id.as_str(),
             &self.vault_account_id,
             contract_address,
             calldata,
@@ -554,41 +556,58 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         })
     }
 
-    async fn burn_tokens(
+    async fn burn_and_return_dust(
         &self,
-        vault: Address,
-        shares: U256,
-        receipt_id: U256,
-        owner: Address,
-        receiver: Address,
-        receipt_info: ReceiptInformation,
-    ) -> Result<BurnResult, VaultError> {
+        params: BurnParams,
+    ) -> Result<BurnWithDustResult, VaultError> {
         let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info).map_err(|e| {
-                VaultError::RpcError {
+            Bytes::from(serde_json::to_vec(&params.receipt_info).map_err(
+                |e| VaultError::RpcError {
                     message: format!(
                         "Failed to encode receipt information: {e}"
                     ),
-                }
-            })?);
+                },
+            )?);
 
         let vault_contract =
-            OffchainAssetReceiptVault::new(vault, &self.read_provider);
+            OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
-        // Encode redeem call
-        let redeem_calldata = vault_contract
-            .redeem(shares, receiver, owner, receipt_id, receipt_info_bytes)
+        // Build the redeem call for burning shares
+        let redeem_call = vault_contract
+            .redeem(
+                params.burn_shares,
+                params.owner,
+                params.owner,
+                params.receipt_id,
+                receipt_info_bytes,
+            )
             .calldata()
             .clone();
+
+        // Build multicall: redeem + optional transfer for dust
+        let calls = if params.dust_shares > U256::ZERO {
+            let transfer_call = vault_contract
+                .transfer(params.user, params.dust_shares)
+                .calldata()
+                .clone();
+            vec![redeem_call, transfer_call]
+        } else {
+            vec![redeem_call]
+        };
+
+        let multicall_calldata =
+            vault_contract.multicall(calls).calldata().clone();
 
         // Submit CONTRACT_CALL to Fireblocks
         let note = format!(
             "Burn {} shares from receipt {} (issuer_request_id: {})",
-            shares, receipt_id, receipt_info.issuer_request_id.0
+            params.burn_shares,
+            params.receipt_id,
+            params.receipt_info.issuer_request_id.0
         );
 
         let tx_id = self
-            .submit_contract_call(vault, &redeem_calldata, &note)
+            .submit_contract_call(params.vault, &multicall_calldata, &note)
             .await
             .map_err(|e| VaultError::TransactionFailed {
                 reason: e.to_string(),
@@ -626,10 +645,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(BurnResult {
+        Ok(BurnWithDustResult {
             tx_hash,
             receipt_id: parsed_receipt_id,
             shares_burned,
+            dust_returned: params.dust_shares,
             gas_used,
             block_number,
         })

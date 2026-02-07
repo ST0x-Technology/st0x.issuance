@@ -537,8 +537,7 @@ mod tests {
 
         let TestHarness { cqrs, store, pool, .. } = harness;
 
-        let blockchain_service_mock =
-            Arc::new(MockVaultService::new_failure("Network error: timeout"));
+        let blockchain_service_mock = Arc::new(MockVaultService::new_failure());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -577,8 +576,8 @@ mod tests {
         };
 
         assert!(
-            error.contains("Network error: timeout"),
-            "Expected error message to contain 'Network error: timeout', got: {error}"
+            error.contains("Invalid receipt"),
+            "Expected error message to contain 'Invalid receipt', got: {error}"
         );
     }
 
@@ -889,8 +888,7 @@ mod tests {
                 .unwrap();
         }
 
-        let blockchain_mock =
-            Arc::new(MockVaultService::new_failure("Network error"));
+        let blockchain_mock = Arc::new(MockVaultService::new_failure());
         let manager = MintManager::new(
             blockchain_mock.clone() as Arc<dyn VaultService>,
             mint_cqrs,

@@ -1,8 +1,11 @@
 use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 
 use super::{
     ClientId, IssuerRequestId, Mint, MintEvent, Network, Quantity, TokenSymbol,
@@ -16,6 +19,28 @@ pub(crate) enum MintViewError {
 
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+
+    #[error("Replay error: {0}")]
+    Replay(#[from] cqrs_es::AggregateError<super::MintError>),
+}
+
+/// Replays all `Mint` events through the `mint_view`.
+///
+/// Uses `QueryReplay` to re-project the view from existing events in the event store.
+/// This is used at startup to ensure the view is in sync with events after manual
+/// event store modifications or schema changes.
+pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
+    let view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+        pool.clone(),
+        "mint_view".to_string(),
+    ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

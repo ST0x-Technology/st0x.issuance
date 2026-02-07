@@ -164,6 +164,11 @@ time-travel debugging, and provide a single source of truth for all operations.
 - `sqlx migrate revert` - Revert last migration
 - `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
+- **Fixing "unable to open database file" errors** - If `cargo build` fails with
+  sqlx macro errors like
+  `error returned from database: (code: 14) unable to
+  open database file`, run
+  `sqlx db reset -y` to recreate the database
 
 ### Development Tools
 
@@ -350,6 +355,7 @@ instead.
 **Signing Backends (`src/fireblocks/`):**
 
 Two mutually exclusive signing backends, both implementing `VaultService` trait:
+
 - **Local**: `EVM_PRIVATE_KEY` → `RealBlockchainService` (dev/test)
 - **Fireblocks**: CONTRACT_CALL → `FireblocksVaultService` (prod, TAP policies)
 
@@ -387,9 +393,11 @@ Key files: `fireblocks/mod.rs` (SignerConfig), `fireblocks/vault_service.rs`
 ### Configuration
 
 See `.env.example` for full list. Key variables:
+
 - `DATABASE_URL`, `RPC_URL`, `VAULT_ADDRESS`
 - **Signing (choose ONE):** `EVM_PRIVATE_KEY` (local) OR Fireblocks vars
-  (`FIREBLOCKS_API_KEY`, `FIREBLOCKS_SECRET_PATH`, `FIREBLOCKS_VAULT_ACCOUNT_ID`)
+  (`FIREBLOCKS_API_KEY`, `FIREBLOCKS_SECRET_PATH`,
+  `FIREBLOCKS_VAULT_ACCOUNT_ID`)
 - Alpaca API credentials, `ISSUER_API_KEY`
 
 ### Code Quality & Best Practices
