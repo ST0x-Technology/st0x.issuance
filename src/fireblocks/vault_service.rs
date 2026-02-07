@@ -310,9 +310,9 @@ fn build_contract_call_request(
         }),
         destination: Some(models::DestinationTransferPeerPath {
             r#type: models::TransferPeerPathType::OneTimeAddress,
-            one_time_address: Some(models::OneTimeAddress::new(format!(
-                "{contract_address:?}"
-            ))),
+            one_time_address: Some(models::OneTimeAddress::new(
+                contract_address.to_string(),
+            )),
             sub_type: None,
             id: None,
             name: None,
@@ -567,6 +567,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
+
     use super::*;
 
     // ==================== Unit Tests for build_contract_call_request ====================
@@ -649,6 +651,31 @@ mod tests {
             one_time
                 .address
                 .contains("0x1234567890123456789012345678901234567890")
+        );
+    }
+
+    #[test]
+    fn build_contract_call_request_uses_eip55_checksummed_address() {
+        // Address with letters to verify EIP-55 mixed-case checksumming
+        let contract_address =
+            address!("0xdead000000000000000000000000000000000000");
+
+        let request = build_contract_call_request(
+            "ETH",
+            "0",
+            contract_address,
+            &Bytes::new(),
+            "test",
+            "test-id",
+        );
+
+        let dest = request.destination.unwrap();
+        let one_time = dest.one_time_address.unwrap();
+        // EIP-55 checksum produces mixed-case "0xdEad" not lowercase "0xdead"
+        assert!(
+            one_time.address.contains("0xdEad"),
+            "Expected EIP-55 checksummed address, got: {}",
+            one_time.address
         );
     }
 
