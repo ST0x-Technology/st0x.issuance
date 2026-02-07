@@ -180,6 +180,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     /// * `contract_address` - The target contract address
     /// * `calldata` - The encoded function calldata
     /// * `note` - A descriptive note for the transaction
+    /// * `external_tx_id` - Deterministic ID for idempotency across retries
     ///
     /// # Returns
     ///
@@ -189,6 +190,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         contract_address: Address,
         calldata: &Bytes,
         note: &str,
+        external_tx_id: &str,
     ) -> Result<String, FireblocksVaultError> {
         let asset_id = self.chain_asset_ids.get(self.chain_id).ok_or(
             FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
@@ -200,6 +202,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             contract_address,
             calldata,
             note,
+            external_tx_id,
         );
 
         let params = CreateTransactionParams::builder()
@@ -284,6 +287,7 @@ fn build_contract_call_request(
     contract_address: Address,
     calldata: &Bytes,
     note: &str,
+    external_tx_id: &str,
 ) -> models::TransactionRequest {
     let extra_parameters = models::ExtraParameters {
         contract_call_data: Some(alloy::hex::encode(calldata)),
@@ -318,7 +322,7 @@ fn build_contract_call_request(
         // Amount is "0" for contract calls that don't transfer value
         amount: Some(models::TransactionRequestAmount::String("0".to_string())),
         extra_parameters: Some(extra_parameters),
-        external_tx_id: Some(uuid::Uuid::new_v4().to_string()),
+        external_tx_id: Some(external_tx_id.to_string()),
         note: Some(note.to_string()),
         // Use default fee level (MEDIUM)
         fee_level: Some(models::transaction_request::FeeLevel::Medium),
@@ -408,8 +412,16 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             receipt_info.issuer_request_id.as_str()
         );
 
+        let external_tx_id =
+            format!("mint-{}", receipt_info.issuer_request_id.as_str());
+
         let tx_id = self
-            .submit_contract_call(vault, &multicall_calldata, &note)
+            .submit_contract_call(
+                vault,
+                &multicall_calldata,
+                &note,
+                &external_tx_id,
+            )
             .await?;
 
         // Wait for Fireblocks to complete the transaction
@@ -492,8 +504,16 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             params.receipt_info.issuer_request_id.as_str()
         );
 
+        let external_tx_id =
+            format!("burn-{}", params.receipt_info.issuer_request_id.as_str());
+
         let tx_id = self
-            .submit_contract_call(params.vault, &multicall_calldata, &note)
+            .submit_contract_call(
+                params.vault,
+                &multicall_calldata,
+                &note,
+                &external_tx_id,
+            )
             .await?;
 
         // Wait for Fireblocks to complete the transaction
@@ -565,6 +585,7 @@ mod tests {
             contract_address,
             &calldata,
             note,
+            "test-id",
         );
 
         assert_eq!(
@@ -601,6 +622,7 @@ mod tests {
             Address::ZERO,
             &calldata,
             "test",
+            "test-id",
         );
 
         let extra = request.extra_parameters.unwrap();
@@ -618,6 +640,7 @@ mod tests {
             contract_address,
             &Bytes::new(),
             "test",
+            "test-id",
         );
 
         let dest = request.destination.unwrap();
@@ -637,6 +660,7 @@ mod tests {
             Address::ZERO,
             &Bytes::new(),
             "test",
+            "test-id",
         );
 
         assert_eq!(
