@@ -284,11 +284,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         &self,
         issuer_request_id: &IssuerRequestId,
     ) -> Result<(), BurnManagerError> {
-        let context = self
-            .store
-            .load_aggregate(&issuer_request_id.0)
-            .await
-            .map_err(|e| BurnManagerError::EventStore(e.to_string()))?;
+        let context = self.store.load_aggregate(&issuer_request_id.0).await?;
 
         let aggregate = context.aggregate();
 
@@ -639,8 +635,6 @@ pub(crate) enum BurnManagerError {
     TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: String },
-    #[error("Event store error: {0}")]
-    EventStore(String),
     #[error("Arithmetic overflow when computing total shares needed")]
     SharesOverflow,
 }

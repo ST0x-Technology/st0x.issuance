@@ -1,10 +1,13 @@
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
+use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use fireblocks_sdk::apis::transactions_api::CreateTransactionParams;
+use fireblocks_sdk::apis::transactions_api::{
+    CreateTransactionError, CreateTransactionParams,
+};
 use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::debug;
@@ -25,61 +28,40 @@ pub enum FireblocksVaultError {
         #[source]
         source: std::io::Error,
     },
-
-    #[error("failed to build Fireblocks client")]
-    ClientBuild(#[source] fireblocks_sdk::FireblocksError),
-
-    #[error("failed to fetch vault deposit addresses")]
-    FetchAddresses(#[source] fireblocks_sdk::FireblocksError),
-
+    #[error("Fireblocks SDK error")]
+    Sdk(#[from] fireblocks_sdk::FireblocksError),
+    #[error("Fireblocks API error")]
+    Api(#[from] fireblocks_sdk::apis::Error<CreateTransactionError>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("no deposit address found for vault {vault_id}, asset {asset_id}")]
     NoAddress { vault_id: String, asset_id: String },
-
     #[error("invalid deposit address from Fireblocks: {address}")]
     InvalidAddress {
         address: String,
         #[source]
         source: alloy::hex::FromHexError,
     },
-
-    #[error("failed to create Fireblocks transaction: {0}")]
-    CreateTransaction(String),
-
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
-
-    #[error("failed to poll Fireblocks transaction {tx_id}")]
-    PollTransaction {
-        tx_id: String,
-        #[source]
-        source: fireblocks_sdk::FireblocksError,
-    },
-
     #[error(
         "Fireblocks transaction {tx_id} reached terminal status: {status:?}"
     )]
     TransactionFailed { tx_id: String, status: TransactionStatus },
-
     #[error(
         "Fireblocks transaction {tx_id} did not include a transaction hash"
     )]
     MissingTxHash { tx_id: String },
-
     #[error("invalid transaction hash from Fireblocks: {hash}")]
     InvalidTxHash {
         hash: String,
         #[source]
         source: alloy::hex::FromHexError,
     },
-
     #[error("no asset ID configured for chain {chain_id}")]
     UnknownChain { chain_id: u64 },
-
-    #[error("failed to fetch transaction receipt for {tx_hash}")]
-    ReceiptFetch { tx_hash: String },
-
     #[error("transaction {tx_hash} has no receipt after confirmation")]
-    MissingReceipt { tx_hash: String },
+    MissingReceipt { tx_hash: TxHash },
 }
 
 /// Fetches the vault account address from Fireblocks.
@@ -101,14 +83,13 @@ pub async fn fetch_vault_address(
     if config.environment == Environment::Sandbox {
         builder = builder.use_sandbox();
     }
-    let client = builder.build().map_err(FireblocksVaultError::ClientBuild)?;
+    let client = builder.build()?;
 
     let default_asset_id = config.chain_asset_ids.default_asset_id();
 
     let addresses = client
         .addresses(config.vault_account_id.as_str(), default_asset_id.as_str())
-        .await
-        .map_err(FireblocksVaultError::FetchAddresses)?;
+        .await?;
 
     let address_str = addresses
         .first()
@@ -174,8 +155,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         if config.environment == Environment::Sandbox {
             builder = builder.use_sandbox();
         }
-        let client =
-            builder.build().map_err(FireblocksVaultError::ClientBuild)?;
+        let client = builder.build()?;
 
         debug!(
             vault_account_id = %config.vault_account_id.as_str(),
@@ -226,14 +206,8 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .transaction_request(tx_request)
             .build();
 
-        let create_response = self
-            .client
-            .transactions_api()
-            .create_transaction(params)
-            .await
-            .map_err(|e| {
-                FireblocksVaultError::CreateTransaction(e.to_string())
-            })?;
+        let create_response =
+            self.client.transactions_api().create_transaction(params).await?;
 
         create_response.id.ok_or(FireblocksVaultError::MissingTransactionId)
     }
@@ -267,11 +241,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                     );
                 },
             )
-            .await
-            .map_err(|e| FireblocksVaultError::PollTransaction {
-                tx_id: tx_id.to_string(),
-                source: e,
-            })?;
+            .await?;
 
         if result.status != TransactionStatus::Completed {
             return Err(FireblocksVaultError::TransactionFailed {
@@ -302,13 +272,8 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     ) -> Result<TransactionReceipt, FireblocksVaultError> {
         self.read_provider
             .get_transaction_receipt(tx_hash)
-            .await
-            .map_err(|_| FireblocksVaultError::ReceiptFetch {
-                tx_hash: format!("{tx_hash:?}"),
-            })?
-            .ok_or_else(|| FireblocksVaultError::MissingReceipt {
-                tx_hash: format!("{tx_hash:?}"),
-            })
+            .await?
+            .ok_or(FireblocksVaultError::MissingReceipt { tx_hash })
     }
 }
 

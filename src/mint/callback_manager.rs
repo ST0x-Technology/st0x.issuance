@@ -240,8 +240,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
         client_id: ClientId,
     ) -> Result<AlpacaAccountNumber, CallbackManagerError> {
         let account_view = find_by_client_id(&self.pool, &client_id)
-            .await
-            .map_err(CallbackManagerError::AccountView)?
+            .await?
             .ok_or(CallbackManagerError::AccountNotFound { client_id })?;
 
         match account_view {
