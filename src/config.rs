@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use std::sync::Arc;
@@ -53,6 +53,15 @@ impl Config {
                     .wallet(resolved.wallet)
                     .connect(self.rpc_url.as_str())
                     .await?;
+
+                let rpc_chain_id = provider.get_chain_id().await?;
+                if rpc_chain_id != self.chain_id {
+                    return Err(ConfigError::ChainIdMismatch {
+                        configured: self.chain_id,
+                        from_rpc: rpc_chain_id,
+                    });
+                }
+
                 Ok(Arc::new(RealBlockchainService::new(provider)))
             }
 
@@ -60,6 +69,14 @@ impl Config {
                 let read_provider = ProviderBuilder::new()
                     .connect(self.rpc_url.as_str())
                     .await?;
+
+                let rpc_chain_id = read_provider.get_chain_id().await?;
+                if rpc_chain_id != self.chain_id {
+                    return Err(ConfigError::ChainIdMismatch {
+                        configured: self.chain_id,
+                        from_rpc: rpc_chain_id,
+                    });
+                }
 
                 let service = FireblocksVaultService::new(
                     env,
@@ -215,6 +232,10 @@ pub enum ConfigError {
     ParseError(#[from] clap::Error),
     #[error("Fireblocks vault service initialization failed")]
     FireblocksVault(#[from] FireblocksVaultError),
+    #[error(
+        "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
+    )]
+    ChainIdMismatch { configured: u64, from_rpc: u64 },
 }
 
 pub fn setup_tracing(log_level: &LogLevel) {

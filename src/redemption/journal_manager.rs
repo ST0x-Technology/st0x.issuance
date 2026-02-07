@@ -70,7 +70,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 .await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.0,
+                    issuer_request_id = %issuer_request_id.as_str(),
                     error = %e,
                     "Failed to recover AlpacaCalled redemption"
                 );
@@ -92,7 +92,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         } = view
         else {
             debug!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 "Redemption no longer in AlpacaCalled state, skipping"
             );
             return Ok(());
@@ -101,7 +101,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         let alpaca_account = self.lookup_account_for_recovery(wallet).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             "Recovering AlpacaCalled redemption - resuming polling"
         );
 
@@ -132,7 +132,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
     }
 
     #[tracing::instrument(skip(self), fields(
-        issuer_request_id = %issuer_request_id.0,
+        issuer_request_id = %issuer_request_id.as_str(),
         tokenization_request_id = %tokenization_request_id.0
     ))]
     pub(crate) async fn handle_alpaca_called(
@@ -141,12 +141,9 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
     ) -> Result<(), JournalManagerError> {
-        let IssuerRequestId(issuer_id_str) = &issuer_request_id;
-        let TokenizationRequestId(tok_id_str) = &tokenization_request_id;
-
         info!(
-            issuer_request_id = %issuer_id_str,
-            tokenization_request_id = %tok_id_str,
+            issuer_request_id = %issuer_request_id,
+            tokenization_request_id = %tokenization_request_id,
             "Starting journal polling for redemption"
         );
 
@@ -163,8 +160,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             }
 
             info!(
-                issuer_request_id = %issuer_id_str,
-                tokenization_request_id = %tok_id_str,
+                issuer_request_id = %issuer_request_id.as_str(),
+                tokenization_request_id = %tokenization_request_id.0,
                 poll_interval = ?poll_interval,
                 elapsed = ?start_time.elapsed(),
                 "Polling Alpaca for journal status"
@@ -202,9 +199,9 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         use cqrs_es::Aggregate;
 
         let events =
-            self.store.load_events(&issuer_request_id.0).await.map_err(
+            self.store.load_events(issuer_request_id.as_str()).await.map_err(
                 |e| JournalManagerError::ValidationFailed {
-                    issuer_request_id: issuer_request_id.0.clone(),
+                    issuer_request_id: issuer_request_id.as_str().to_string(),
                     reason: format!("Failed to load events: {e}"),
                 },
             )?;
@@ -216,7 +213,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         let Some(metadata) = aggregate.metadata() else {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Redemption not in expected state for validation: {aggregate:?}"
                 ),
@@ -225,17 +222,18 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         if request.issuer_request_id != metadata.issuer_request_id {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Issuer request ID mismatch: expected {}, got {}",
-                    metadata.issuer_request_id.0, request.issuer_request_id.0
+                    metadata.issuer_request_id.as_str(),
+                    request.issuer_request_id.as_str()
                 ),
             });
         }
 
         if request.underlying != metadata.underlying {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Underlying symbol mismatch: expected {}, got {}",
                     metadata.underlying.0, request.underlying.0
@@ -245,7 +243,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         if request.token != metadata.token {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Token symbol mismatch: expected {}, got {}",
                     metadata.token.0, request.token.0
@@ -255,7 +253,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         let Some(alpaca_quantity) = aggregate.alpaca_quantity() else {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Redemption not in AlpacaCalled state for validation: {aggregate:?}"
                 ),
@@ -264,7 +262,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         if &request.quantity != alpaca_quantity {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Quantity mismatch: expected {}, got {}",
                     alpaca_quantity.0, request.quantity.0
@@ -274,7 +272,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         if request.wallet != metadata.wallet {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Wallet mismatch: expected {}, got {}",
                     metadata.wallet, request.wallet
@@ -284,7 +282,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         if request.tx_hash != Some(metadata.detected_tx_hash) {
             return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.0.clone(),
+                issuer_request_id: issuer_request_id.as_str().to_string(),
                 reason: format!(
                     "Transaction hash mismatch: expected {}, got {:?}",
                     metadata.detected_tx_hash, request.tx_hash
@@ -300,10 +298,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         issuer_request_id: &IssuerRequestId,
         elapsed: Duration,
     ) -> Result<(), JournalManagerError> {
-        let IssuerRequestId(issuer_id_str) = issuer_request_id;
-
         warn!(
-            issuer_request_id = %issuer_id_str,
+            issuer_request_id = %issuer_request_id,
             elapsed = ?elapsed,
             max_duration = ?self.max_duration,
             "Polling timeout reached, marking redemption as failed"
@@ -311,7 +307,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         self.cqrs
             .execute(
-                issuer_id_str,
+                issuer_request_id.as_str(),
                 RedemptionCommand::MarkFailed {
                     issuer_request_id: issuer_request_id.clone(),
                     reason: format!(
@@ -323,7 +319,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             .await?;
 
         Err(JournalManagerError::Timeout {
-            issuer_request_id: issuer_id_str.clone(),
+            issuer_request_id: issuer_request_id.as_str().to_string(),
             elapsed,
         })
     }
@@ -336,9 +332,6 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         elapsed: Duration,
         poll_interval: Duration,
     ) -> Result<bool, JournalManagerError> {
-        let IssuerRequestId(issuer_id_str) = issuer_request_id;
-        let TokenizationRequestId(tok_id_str) = tokenization_request_id;
-
         match request_result {
             Ok(request) => {
                 self.validate_request_fields(&request, issuer_request_id)
@@ -347,15 +340,15 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 match request.status {
                     RedeemRequestStatus::Completed => {
                         info!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
                             elapsed = ?elapsed,
                             "Alpaca journal completed, confirming completion"
                         );
 
                         self.cqrs
                             .execute(
-                                issuer_id_str,
+                                issuer_request_id.as_str(),
                                 RedemptionCommand::ConfirmAlpacaComplete {
                                     issuer_request_id: issuer_request_id
                                         .clone(),
@@ -364,7 +357,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                             .await?;
 
                         info!(
-                            issuer_request_id = %issuer_id_str,
+                            issuer_request_id = %issuer_request_id,
                             "ConfirmAlpacaComplete command executed successfully"
                         );
 
@@ -372,14 +365,14 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                     }
                     RedeemRequestStatus::Rejected => {
                         warn!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
                             "Alpaca journal rejected, marking redemption as failed"
                         );
 
                         self.cqrs
                             .execute(
-                                issuer_id_str,
+                                issuer_request_id.as_str(),
                                 RedemptionCommand::MarkFailed {
                                     issuer_request_id: issuer_request_id
                                         .clone(),
@@ -390,13 +383,15 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                             .await?;
 
                         Err(JournalManagerError::Rejected {
-                            issuer_request_id: issuer_id_str.clone(),
+                            issuer_request_id: issuer_request_id
+                                .as_str()
+                                .to_string(),
                         })
                     }
                     RedeemRequestStatus::Pending => {
                         info!(
-                            issuer_request_id = %issuer_id_str,
-                            tokenization_request_id = %tok_id_str,
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
                             status = "pending",
                             next_poll_in = ?poll_interval,
                             "Journal still pending, will retry"
@@ -407,8 +402,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             }
             Err(e) => {
                 warn!(
-                    issuer_request_id = %issuer_id_str,
-                    tokenization_request_id = %tok_id_str,
+                    issuer_request_id = %issuer_request_id,
+                    tokenization_request_id = %tokenization_request_id,
                     error = %e,
                     next_poll_in = ?poll_interval,
                     "Polling error, will retry"
@@ -503,7 +498,7 @@ mod tests {
         tokenization_request_id: &TokenizationRequestId,
     ) {
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL"),
@@ -520,7 +515,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
@@ -744,7 +739,8 @@ mod tests {
             "Expected Rejected error, got {result:?}"
         );
 
-        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+        let events =
+            store.load_events(issuer_request_id.as_str()).await.unwrap();
         let mut aggregate = Redemption::default();
         for event in events {
             aggregate.apply(event.payload);
@@ -846,7 +842,8 @@ mod tests {
             "Expected Timeout error, got {result:?}"
         );
 
-        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+        let events =
+            store.load_events(issuer_request_id.as_str()).await.unwrap();
         let mut aggregate = Redemption::default();
         for event in events {
             aggregate.apply(event.payload);
@@ -1214,11 +1211,12 @@ mod tests {
             detected_at: chrono::Utc::now(),
             called_at: chrono::Utc::now(),
         };
-        insert_redemption_view(&pool, &issuer_request_id.0, &view).await;
+        insert_redemption_view(&pool, issuer_request_id.as_str(), &view).await;
 
         manager.recover_alpaca_called_redemptions().await;
 
-        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+        let events =
+            store.load_events(issuer_request_id.as_str()).await.unwrap();
         let mut aggregate = Redemption::default();
         for event in events {
             aggregate.apply(event.payload);

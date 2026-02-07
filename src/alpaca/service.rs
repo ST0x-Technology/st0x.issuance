@@ -622,7 +622,7 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.tokenization_request_id.0, "tok-456");
-        assert_eq!(response.issuer_request_id.0, "red-123");
+        assert_eq!(response.issuer_request_id.as_str(), "red-123");
         assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
         mock.assert();
@@ -1426,7 +1426,7 @@ mod tests {
 
         assert!(result.is_ok(), "Expected Ok, got: {result:?}");
         let request = result.unwrap();
-        assert_eq!(request.issuer_request_id.0, "red-842331fb");
+        assert_eq!(request.issuer_request_id.as_str(), "red-842331fb");
         assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();
     }

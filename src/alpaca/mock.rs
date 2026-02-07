@@ -308,7 +308,7 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.tokenization_request_id.0, "mock-tok-123");
-        assert_eq!(response.issuer_request_id.0, "red-123");
+        assert_eq!(response.issuer_request_id.as_str(), "red-123");
     }
 
     #[tokio::test]

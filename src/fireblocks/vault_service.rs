@@ -403,7 +403,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         // Submit CONTRACT_CALL to Fireblocks
         let note = format!(
             "Mint {} shares for {} (issuer_request_id: {})",
-            assets, user, receipt_info.issuer_request_id.0
+            assets,
+            user,
+            receipt_info.issuer_request_id.as_str()
         );
 
         let tx_id = self
@@ -487,7 +489,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             "Burn {} shares from receipt {} (issuer_request_id: {})",
             params.burn_shares,
             params.receipt_id,
-            params.receipt_info.issuer_request_id.0
+            params.receipt_info.issuer_request_id.as_str()
         );
 
         let tx_id = self
