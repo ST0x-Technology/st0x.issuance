@@ -205,10 +205,7 @@ pub(crate) enum VaultError {
     /// Failed to get transaction receipt
     #[error(transparent)]
     PendingTransaction(#[from] alloy::providers::PendingTransactionError),
-    /// RPC communication error
-    #[error("RPC error: {message}")]
-    RpcError { message: String },
-    /// Transaction submission or execution failed
-    #[error("Transaction failed: {reason}")]
-    TransactionFailed { reason: String },
+    /// Fireblocks vault service error
+    #[error(transparent)]
+    Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
 }

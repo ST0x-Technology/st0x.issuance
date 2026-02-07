@@ -408,13 +408,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
         let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info).map_err(|e| {
-                VaultError::RpcError {
-                    message: format!(
-                        "Failed to encode receipt information: {e}"
-                    ),
-                }
-            })?);
+            Bytes::from(serde_json::to_vec(&receipt_info)?);
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.read_provider);
@@ -449,21 +443,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         let tx_id = self
             .submit_contract_call(vault, &multicall_calldata, &note)
-            .await
-            .map_err(|e| VaultError::TransactionFailed {
-                reason: e.to_string(),
-            })?;
+            .await?;
 
         // Wait for Fireblocks to complete the transaction
-        let tx_hash = self.wait_for_completion(&tx_id).await.map_err(|e| {
-            VaultError::TransactionFailed { reason: e.to_string() }
-        })?;
+        let tx_hash = self.wait_for_completion(&tx_id).await?;
 
         // Fetch the receipt from our RPC provider to parse events
-        let receipt = self
-            .fetch_receipt(tx_hash)
-            .await
-            .map_err(|e| VaultError::RpcError { message: e.to_string() })?;
+        let receipt = self.fetch_receipt(tx_hash).await?;
 
         // Parse the Deposit event to get receipt_id and shares_minted
         let (receipt_id, shares_minted) = receipt
@@ -500,13 +486,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         params: BurnParams,
     ) -> Result<BurnWithDustResult, VaultError> {
         let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&params.receipt_info).map_err(
-                |e| VaultError::RpcError {
-                    message: format!(
-                        "Failed to encode receipt information: {e}"
-                    ),
-                },
-            )?);
+            Bytes::from(serde_json::to_vec(&params.receipt_info)?);
 
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
@@ -547,21 +527,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         let tx_id = self
             .submit_contract_call(params.vault, &multicall_calldata, &note)
-            .await
-            .map_err(|e| VaultError::TransactionFailed {
-                reason: e.to_string(),
-            })?;
+            .await?;
 
         // Wait for Fireblocks to complete the transaction
-        let tx_hash = self.wait_for_completion(&tx_id).await.map_err(|e| {
-            VaultError::TransactionFailed { reason: e.to_string() }
-        })?;
+        let tx_hash = self.wait_for_completion(&tx_id).await?;
 
         // Fetch the receipt from our RPC provider to parse events
-        let receipt = self
-            .fetch_receipt(tx_hash)
-            .await
-            .map_err(|e| VaultError::RpcError { message: e.to_string() })?;
+        let receipt = self.fetch_receipt(tx_hash).await?;
 
         // Parse the Withdraw event
         let (parsed_receipt_id, shares_burned) = receipt
