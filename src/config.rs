@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::ProviderBuilder;
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
 use std::sync::Arc;
@@ -57,16 +57,15 @@ impl Config {
             }
 
             SignerConfig::Fireblocks(env) => {
-                // Create a read-only provider for view calls and receipt fetching
                 let read_provider = ProviderBuilder::new()
                     .connect(self.rpc_url.as_str())
                     .await?;
 
-                // Get chain_id from the provider
-                let chain_id = read_provider.get_chain_id().await?;
-
-                let service =
-                    FireblocksVaultService::new(env, read_provider, chain_id)?;
+                let service = FireblocksVaultService::new(
+                    env,
+                    read_provider,
+                    self.chain_id,
+                )?;
 
                 Ok(Arc::new(service))
             }
