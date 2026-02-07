@@ -90,7 +90,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                 self.recover_single_burning(&issuer_request_id).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.0,
+                    issuer_request_id = %issuer_request_id.as_str(),
                     error = %e,
                     "Failed to recover Burning redemption"
                 );
@@ -134,7 +134,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
                 self.recover_single_burn_failed(&issuer_request_id, &view).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.0,
+                    issuer_request_id = %issuer_request_id.as_str(),
                     error = %e,
                     "Failed to recover BurnFailed redemption"
                 );
@@ -159,7 +159,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         } = view
         else {
             debug!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 "View not in BurnFailed state, skipping"
             );
             return Ok(());
@@ -190,7 +190,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         if on_chain_balance < total_shares {
             warn!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 on_chain_balance = %on_chain_balance,
                 burn_shares = %burn_shares,
                 dust_shares = %dust_shares,
@@ -221,7 +221,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         };
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
             "Retrying burn for BurnFailed redemption"
@@ -229,7 +229,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         self.cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 RedemptionCommand::RetryBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
@@ -244,7 +244,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
             .await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             "Successfully retried burn"
         );
 
@@ -284,11 +284,8 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         &self,
         issuer_request_id: &IssuerRequestId,
     ) -> Result<(), BurnManagerError> {
-        let context = self
-            .store
-            .load_aggregate(&issuer_request_id.0)
-            .await
-            .map_err(|e| BurnManagerError::EventStore(e.to_string()))?;
+        let context =
+            self.store.load_aggregate(issuer_request_id.as_str()).await?;
 
         let aggregate = context.aggregate();
 
@@ -300,7 +297,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         } = aggregate
         else {
             debug!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 "Redemption no longer in Burning state, skipping"
             );
             return Ok(());
@@ -334,7 +331,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         if on_chain_balance < total_shares_needed {
             warn!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 on_chain_balance = %on_chain_balance,
                 burn_shares = %burn_shares,
                 dust_shares = %dust_shares,
@@ -347,7 +344,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         }
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             "Recovering Burning redemption - resuming burn"
         );
 
@@ -419,7 +416,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
             self.cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     RedemptionCommand::RecordBurnFailure {
                         issuer_request_id: issuer_request_id.clone(),
                         error: error_msg,
@@ -527,7 +524,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
         self.cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error_msg.clone(),
@@ -558,7 +555,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
         let burn_result = self
             .cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
@@ -588,7 +585,7 @@ impl<ES: EventStore<Redemption>> BurnManager<ES> {
 
                 self.cqrs
                     .execute(
-                        &issuer_request_id.0,
+                        issuer_request_id.as_str(),
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: e.to_string(),
@@ -639,8 +636,6 @@ pub(crate) enum BurnManagerError {
     TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: String },
-    #[error("Event store error: {0}")]
-    EventStore(String),
     #[error("Arithmetic overflow when computing total shares needed")]
     SharesOverflow,
 }
@@ -814,7 +809,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -829,7 +824,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -841,7 +836,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::ConfirmAlpacaComplete {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -856,7 +851,8 @@ mod tests {
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Redemption {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -1051,7 +1047,7 @@ mod tests {
         let block_number = 54321;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -1180,7 +1176,7 @@ mod tests {
         let block_number = 22222;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
@@ -1195,7 +1191,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -1207,7 +1203,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::ConfirmAlpacaComplete {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -1544,7 +1540,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -1616,7 +1612,7 @@ mod tests {
 
         // Record burn failure to transition to Failed/BurnFailed
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "Initial burn failed".to_string(),
@@ -1695,7 +1691,7 @@ mod tests {
         .await;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "RPC timeout".to_string(),

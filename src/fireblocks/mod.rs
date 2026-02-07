@@ -1,5 +1,5 @@
 mod config;
-mod signer;
+pub(crate) mod vault_service;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
@@ -8,11 +8,16 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::{Args, Parser};
 
 pub(crate) use config::{
-    ChainAssetIds, Environment, FireblocksConfig, parse_chain_asset_ids,
+    ChainAssetIds, Environment, FireblocksConfig, FireblocksConfigError,
+    parse_chain_asset_ids,
 };
-pub(crate) use signer::{FireblocksError, FireblocksSigner};
+pub(crate) use vault_service::{
+    FireblocksVaultError, FireblocksVaultService, fetch_vault_address,
+};
 
-/// Resolved signer: an `EthereumWallet` ready for use.
+/// Resolved signer: an `EthereumWallet` and the corresponding address.
+///
+/// Only used for local signing. Fireblocks path uses `FireblocksVaultService` directly.
 pub(crate) struct ResolvedSigner {
     pub(crate) wallet: EthereumWallet,
 }
@@ -105,12 +110,14 @@ pub enum SignerConfigError {
         "FIREBLOCKS_SECRET_PATH is required when FIREBLOCKS_API_USER_ID is set"
     )]
     MissingSecretPath,
+    #[error(transparent)]
+    FireblocksConfig(#[from] FireblocksConfigError),
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SignerResolveError {
+pub(crate) enum SignerResolveError {
     #[error(transparent)]
-    Fireblocks(#[from] FireblocksError),
+    FireblocksVault(#[from] FireblocksVaultError),
     #[error("invalid EVM private key")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
 }
@@ -127,55 +134,43 @@ impl SignerEnv {
                     .secret_path
                     .ok_or(SignerConfigError::MissingSecretPath)?;
 
-                Ok(SignerConfig::Fireblocks(FireblocksConfig {
-                    api_user_id: api_user_id.into(),
-                    secret_path,
-                    vault_account_id: self.fireblocks.vault_account_id.into(),
-                    chain_asset_ids: self.fireblocks.chain_asset_ids,
-                    environment: self.fireblocks.environment,
-                }))
+                let config = FireblocksConfig::new(
+                    api_user_id.into(),
+                    &secret_path,
+                    self.fireblocks.vault_account_id.into(),
+                    self.fireblocks.chain_asset_ids,
+                    self.fireblocks.environment,
+                )?;
+
+                Ok(SignerConfig::Fireblocks(config))
             }
         }
     }
 }
 
+/// Resolve a local private key into a wallet.
+///
+/// The chain_id is set on the signer for transaction signing.
+pub(crate) fn resolve_local_signer(
+    key: &B256,
+    chain_id: u64,
+) -> Result<ResolvedSigner, SignerResolveError> {
+    let mut signer = PrivateKeySigner::from_bytes(key)?;
+    signer.set_chain_id(Some(chain_id));
+    let wallet = EthereumWallet::from(signer);
+    Ok(ResolvedSigner { wallet })
+}
+
 impl SignerConfig {
-    /// Resolve the signer config into a wallet.
-    ///
-    /// For Fireblocks, this makes an async API call to fetch the vault address.
-    /// For local keys, this is a synchronous derivation.
-    ///
-    /// The chain_id is required for Fireblocks to determine which asset ID to use
-    /// when signing transactions.
-    pub(crate) async fn resolve(
-        &self,
-        chain_id: u64,
-    ) -> Result<ResolvedSigner, SignerResolveError> {
-        let wallet = match self {
-            Self::Fireblocks(config) => {
-                let mut signer = FireblocksSigner::new(config).await?;
-                signer.set_chain_id(Some(chain_id));
-                EthereumWallet::from(signer)
-            }
-            Self::Local(key) => {
-                let mut signer = PrivateKeySigner::from_bytes(key)?;
-                signer.set_chain_id(Some(chain_id));
-                EthereumWallet::from(signer)
-            }
-        };
-
-        Ok(ResolvedSigner { wallet })
-    }
-
     /// Derive the address from the signer configuration.
     ///
     /// For local keys this is synchronous. For Fireblocks, this requires an
-    /// async API call to fetch the vault's deposit address.
+    /// async API call to fetch the vault address.
     pub(crate) async fn address(&self) -> Result<Address, SignerResolveError> {
         match self {
             Self::Fireblocks(config) => {
-                let signer = FireblocksSigner::new(config).await?;
-                Ok(signer.address())
+                let address = fetch_vault_address(config).await?;
+                Ok(address)
             }
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)?;

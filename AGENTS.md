@@ -164,6 +164,11 @@ time-travel debugging, and provide a single source of truth for all operations.
 - `sqlx migrate revert` - Revert last migration
 - `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
+- **Fixing "unable to open database file" errors** - If `cargo build` fails with
+  sqlx macro errors like
+  `error returned from database: (code: 14) unable to
+  open database file`, run
+  `sqlx db reset -y` to recreate the database
 
 ### Development Tools
 
@@ -347,6 +352,16 @@ instead.
 - Methods: `watch_transfers()`, `get_transfer_details()`
 - Uses a WebSocket subscription to detect redemption events
 
+**Signing Backends (`src/fireblocks/`):**
+
+Two mutually exclusive signing backends, both implementing `VaultService` trait:
+
+- **Local**: `EVM_PRIVATE_KEY` → `RealBlockchainService` (dev/test)
+- **Fireblocks**: CONTRACT_CALL → `FireblocksVaultService` (prod, TAP policies)
+
+Key files: `fireblocks/mod.rs` (SignerConfig), `fireblocks/vault_service.rs`
+(FireblocksVaultService), `config.rs` (backend selection)
+
 ### Core Flows
 
 **Mint Flow:**
@@ -377,17 +392,15 @@ instead.
 
 ### Configuration
 
-Environment variables (can be set via `.env` file):
+Environment variables are defined in multiple places across the deployment
+pipeline:
 
-- `DATABASE_URL`: SQLite database path
-- `WS_RPC_URL`: WebSocket RPC endpoint for blockchain monitoring
-- `CHAIN_ID`: Chain ID (e.g., 8453 for Base)
-- `VAULT_ADDRESS`: OffchainAssetReceiptVault contract address
-- `PRIVATE_KEY`: Bot's private key for signing blockchain transactions
-- `BOT_WALLET_ADDRESS`: Bot's wallet address (derived from private key)
-- `REDEMPTION_WALLET_ADDRESS`: Address where APs send tokens to redeem
-- Alpaca API credentials and endpoints
-- Server configuration (host, port, API key)
+- **`.env.example`**: Template for local development, lists all available env
+  vars
+- **`.github/workflows/deploy.yaml`**: GitHub Actions workflow that sets secrets
+  and populates the `.env` file during deployment
+- **`docker-compose.template.yaml`**: Container configuration template populated
+  by the deployment workflow
 
 ### Code Quality & Best Practices
 
@@ -410,6 +423,20 @@ Environment variables (can be set via `.env` file):
 - **Event-Driven Architecture**: Commands produce events which update views
 - **SQLite Persistence**: Event store and view repositories backed by SQLite
 - **Comprehensive Error Handling**: Custom error types with proper propagation
+- **CRITICAL: `#[from]` Variant Naming**: When using thiserror's `#[from]`
+  attribute, variant names must be generic (matching the source error type) and
+  MUST NOT claim what operation failed. The `?` operator auto-converts any
+  matching error type to the variant, so specific claims become false if another
+  operation can produce the same error type.
+  - **FORBIDDEN**: `ReadSecret(#[from] std::io::Error)` - claims secret reading
+    failed, but any `?` on io::Error will use this variant
+  - **CORRECT**: `Io(#[from] std::io::Error)` - generic, makes no false claims
+  - **FORBIDDEN**: `ParseConfig(#[from] serde_json::Error)` - claims config
+    parsing failed
+  - **CORRECT**: `Json(#[from] serde_json::Error)` - generic, truthful
+  - Rule: If `#[from]` is used, the variant name should mirror the error type,
+    not the operation. Use context from where the error is handled, not where
+    it's defined.
 - **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
   principle of type modeling in this codebase. Use algebraic data types (ADTs)
   and enums to encode business rules and state transitions directly in types

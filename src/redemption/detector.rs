@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol_types::SolEvent;
-use alloy::transports::RpcError;
+use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
@@ -266,10 +266,10 @@ where
             block_number,
         };
 
-        self.cqrs.execute(&issuer_request_id.0, command).await?;
+        self.cqrs.execute(issuer_request_id.as_str(), command).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             "Redemption detection recorded successfully"
         );
 
@@ -306,7 +306,7 @@ where
         network: Network,
     ) -> Result<(), RedemptionMonitorError> {
         let aggregate_ctx =
-            self.event_store.load_aggregate(&issuer_request_id.0).await?;
+            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
 
         if let Err(e) = self
             .redeem_call_manager
@@ -320,7 +320,7 @@ where
             .await
         {
             warn!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 error = ?e,
                 "handle_redemption_detected failed"
             );
@@ -328,7 +328,7 @@ where
         }
 
         let aggregate_ctx =
-            self.event_store.load_aggregate(&issuer_request_id.0).await?;
+            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
 
         let Redemption::AlpacaCalled { tokenization_request_id, .. } =
             aggregate_ctx.aggregate()
@@ -359,13 +359,13 @@ where
             }
 
             let aggregate_ctx = match event_store
-                .load_aggregate(&issuer_request_id_cloned.0)
+                .load_aggregate(issuer_request_id_cloned.as_str())
                 .await
             {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     warn!(
-                        issuer_request_id = %issuer_request_id_cloned.0,
+                        issuer_request_id = %issuer_request_id_cloned.as_str(),
                         error = ?e,
                         "Failed to load aggregate after journal completion"
                     );
@@ -382,7 +382,7 @@ where
                     .await
                 {
                     warn!(
-                        issuer_request_id = %issuer_request_id_cloned.0,
+                        issuer_request_id = %issuer_request_id_cloned.as_str(),
                         error = ?e,
                         "handle_burning_started failed"
                     );
@@ -396,8 +396,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionMonitorError {
-    #[error("WebSocket connection failed: {0}")]
-    Connection(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to decode Transfer event: {0}")]
     EventDecode(#[from] alloy::sol_types::Error),
     #[error("Failed to list assets: {0}")]
@@ -660,7 +660,8 @@ mod tests {
             &tx_hash.to_string()[2..10]
         ));
 
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         let aggregate = context.aggregate();
 
         assert!(
@@ -1027,7 +1028,8 @@ mod tests {
         // Verify no redemption was created
         let issuer_request_id =
             IssuerRequestId::new("red-abcdefab".to_string());
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         let aggregate = context.aggregate();
 
         assert!(

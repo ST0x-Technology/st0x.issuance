@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
-use alloy::transports::RpcError;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
 use std::sync::Arc;
 use tracing::Level;
@@ -9,7 +9,8 @@ use url::Url;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::fireblocks::{
-    SignerConfig, SignerConfigError, SignerEnv, SignerResolveError,
+    FireblocksVaultService, SignerConfig, SignerConfigError, SignerEnv,
+    resolve_local_signer,
 };
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
@@ -45,14 +46,49 @@ impl Config {
     pub(crate) async fn create_blockchain_service(
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        let resolved = self.signer.resolve(self.chain_id).await?;
+        match &self.signer {
+            SignerConfig::Local(key) => {
+                let resolved = resolve_local_signer(key, self.chain_id)
+                    .map_err(|e| ConfigError::SignerResolve(Box::new(e)))?;
+                let provider = ProviderBuilder::new()
+                    .wallet(resolved.wallet)
+                    .connect(self.rpc_url.as_str())
+                    .await?;
 
-        let provider = ProviderBuilder::new()
-            .wallet(resolved.wallet)
-            .connect(self.rpc_url.as_str())
-            .await?;
+                let rpc_chain_id = provider.get_chain_id().await?;
+                if rpc_chain_id != self.chain_id {
+                    return Err(ConfigError::ChainIdMismatch {
+                        configured: self.chain_id,
+                        from_rpc: rpc_chain_id,
+                    });
+                }
 
-        Ok(Arc::new(RealBlockchainService::new(provider)))
+                Ok(Arc::new(RealBlockchainService::new(provider)))
+            }
+
+            SignerConfig::Fireblocks(env) => {
+                let read_provider = ProviderBuilder::new()
+                    .connect(self.rpc_url.as_str())
+                    .await?;
+
+                let rpc_chain_id = read_provider.get_chain_id().await?;
+                if rpc_chain_id != self.chain_id {
+                    return Err(ConfigError::ChainIdMismatch {
+                        configured: self.chain_id,
+                        from_rpc: rpc_chain_id,
+                    });
+                }
+
+                let service = FireblocksVaultService::new(
+                    env,
+                    read_provider,
+                    self.chain_id,
+                )
+                .map_err(|e| ConfigError::FireblocksVault(Box::new(e)))?;
+
+                Ok(Arc::new(service))
+            }
+        }
     }
 }
 
@@ -190,12 +226,18 @@ impl HyperDxEnv {
 pub enum ConfigError {
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
-    #[error("Failed to resolve signer")]
-    SignerResolve(#[from] SignerResolveError),
-    #[error("Failed to connect to RPC endpoint")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("Failed to resolve signer: {0}")]
+    SignerResolve(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
+    #[error("Fireblocks vault service initialization failed: {0}")]
+    FireblocksVault(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error(
+        "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
+    )]
+    ChainIdMismatch { configured: u64, from_rpc: u64 },
 }
 
 pub fn setup_tracing(log_level: &LogLevel) {

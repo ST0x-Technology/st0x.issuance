@@ -66,7 +66,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     /// * `CallbackManagerError::Alpaca` - Alpaca API call failed
     /// * `CallbackManagerError::Cqrs` - Command execution failed
     #[tracing::instrument(skip(self, aggregate), fields(
-        issuer_request_id = %issuer_request_id.0
+        issuer_request_id = %issuer_request_id.as_str()
     ))]
     pub(crate) async fn handle_tokens_minted(
         &self,
@@ -88,10 +88,8 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             });
         };
 
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             tx_hash = %tx_hash,
             "Starting Alpaca callback process"
         );
@@ -107,13 +105,13 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
         match self.alpaca_service.send_mint_callback(callback_request).await {
             Ok(()) => {
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     "Alpaca callback succeeded"
                 );
 
                 self.cqrs
                     .execute(
-                        issuer_request_id_str,
+                        issuer_request_id.as_str(),
                         MintCommand::RecordCallback {
                             issuer_request_id: issuer_request_id.clone(),
                         },
@@ -121,7 +119,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                     .await?;
 
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     "RecordCallback command executed successfully"
                 );
 
@@ -129,7 +127,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             }
             Err(e) => {
                 warn!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     error = %e,
                     "Alpaca callback failed"
                 );
@@ -169,7 +167,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
         for (issuer_request_id, view) in stuck_mints {
             let MintView::CallbackPending { client_id, .. } = &view else {
                 error!(
-                    issuer_request_id = %issuer_request_id.0,
+                    issuer_request_id = %issuer_request_id.as_str(),
                     "Unexpected view state during CallbackPending recovery"
                 );
                 continue;
@@ -183,7 +181,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                 Ok(account) => account,
                 Err(e) => {
                     error!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         client_id = %client_id,
                         error = %e,
                         "Failed to lookup Alpaca account for recovery"
@@ -194,13 +192,13 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
 
             let aggregate = match self
                 .event_store
-                .load_aggregate(&issuer_request_id.0)
+                .load_aggregate(issuer_request_id.as_str())
                 .await
             {
                 Ok(context) => context.aggregate().clone(),
                 Err(e) => {
                     error!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         error = %e,
                         "Failed to load aggregate for recovery"
                     );
@@ -218,13 +216,13 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             {
                 Ok(()) => {
                     info!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         "Recovered CallbackPending mint"
                     );
                 }
                 Err(e) => {
                     error!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         error = %e,
                         "Failed to recover CallbackPending mint"
                     );
@@ -240,8 +238,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
         client_id: ClientId,
     ) -> Result<AlpacaAccountNumber, CallbackManagerError> {
         let account_view = find_by_client_id(&self.pool, &client_id)
-            .await
-            .map_err(CallbackManagerError::AccountView)?
+            .await?
             .ok_or(CallbackManagerError::AccountNotFound { client_id })?;
 
         match account_view {
@@ -328,7 +325,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::Initiate {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
@@ -344,7 +341,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::ConfirmJournal {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -353,7 +350,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::StartMinting {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -373,7 +370,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::RecordMintSuccess {
                 issuer_request_id: issuer_request_id.clone(),
                 tx_hash,
@@ -393,7 +390,8 @@ mod tests {
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Mint {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -508,7 +506,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::Initiate {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -640,7 +638,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::Initiate {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: TokenizationRequestId::new(
@@ -659,7 +657,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::ConfirmJournal {
                     issuer_request_id: issuer_request_id.clone(),
                 },
@@ -669,7 +667,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::StartMinting {
                     issuer_request_id: issuer_request_id.clone(),
                 },
@@ -679,7 +677,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::RecordMintSuccess {
                     issuer_request_id: issuer_request_id.clone(),
                     tx_hash: b256!(
@@ -755,7 +753,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::Initiate {
                         issuer_request_id: issuer_request_id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
@@ -774,7 +772,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::ConfirmJournal {
                         issuer_request_id: issuer_request_id.clone(),
                     },
@@ -784,7 +782,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::StartMinting {
                         issuer_request_id: issuer_request_id.clone(),
                     },
@@ -794,7 +792,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::RecordMintSuccess {
                         issuer_request_id: issuer_request_id.clone(),
                         tx_hash: b256!(
