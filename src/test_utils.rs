@@ -5,7 +5,7 @@ use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
-use alloy::transports::RpcError;
+use alloy::transports::{RpcError, TransportErrorKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
@@ -215,8 +215,8 @@ async fn seed_test_assets(
 pub enum LocalEvmError {
     #[error("Failed to parse private key: {0}")]
     InvalidPrivateKey(String),
-    #[error("Failed to connect to Anvil")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Contract deployment failed: {0}")]
     DeploymentFailed(String),
 }

@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol_types::SolEvent;
-use alloy::transports::RpcError;
+use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
@@ -396,8 +396,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionMonitorError {
-    #[error("WebSocket connection failed: {0}")]
-    Connection(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to decode Transfer event: {0}")]
     EventDecode(#[from] alloy::sol_types::Error),
     #[error("Failed to list assets: {0}")]

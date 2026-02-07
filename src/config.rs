@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::transports::RpcError;
+use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
 use std::sync::Arc;
 use tracing::Level;
@@ -228,8 +228,8 @@ pub enum ConfigError {
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to resolve signer: {0}")]
     SignerResolve(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Failed to connect to RPC endpoint")]
-    ConnectionFailed(#[from] RpcError<alloy::transports::TransportErrorKind>),
+    #[error("RPC error")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
     #[error("Fireblocks vault service initialization failed: {0}")]

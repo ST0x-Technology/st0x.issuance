@@ -423,6 +423,20 @@ pipeline:
 - **Event-Driven Architecture**: Commands produce events which update views
 - **SQLite Persistence**: Event store and view repositories backed by SQLite
 - **Comprehensive Error Handling**: Custom error types with proper propagation
+- **CRITICAL: `#[from]` Variant Naming**: When using thiserror's `#[from]`
+  attribute, variant names must be generic (matching the source error type) and
+  MUST NOT claim what operation failed. The `?` operator auto-converts any
+  matching error type to the variant, so specific claims become false if another
+  operation can produce the same error type.
+  - **FORBIDDEN**: `ReadSecret(#[from] std::io::Error)` - claims secret reading
+    failed, but any `?` on io::Error will use this variant
+  - **CORRECT**: `Io(#[from] std::io::Error)` - generic, makes no false claims
+  - **FORBIDDEN**: `ParseConfig(#[from] serde_json::Error)` - claims config
+    parsing failed
+  - **CORRECT**: `Json(#[from] serde_json::Error)` - generic, truthful
+  - Rule: If `#[from]` is used, the variant name should mirror the error type,
+    not the operation. Use context from where the error is handled, not where
+    it's defined.
 - **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
   principle of type modeling in this codebase. Use algebraic data types (ADTs)
   and enums to encode business rules and state transitions directly in types

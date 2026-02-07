@@ -199,9 +199,8 @@ pub(crate) enum VaultError {
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
-    /// Failed to serialize receipt information
-    #[error("Failed to serialize receipt information")]
-    ReceiptInfoSerialization(#[from] serde_json::Error),
+    #[error("JSON error")]
+    Json(#[from] serde_json::Error),
     /// Failed to get transaction receipt
     #[error(transparent)]
     PendingTransaction(#[from] alloy::providers::PendingTransactionError),
