@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::num::ParseIntError;
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 
 /// Fireblocks API User ID for authentication.
@@ -72,13 +72,51 @@ pub(crate) enum Environment {
 }
 
 /// Validated Fireblocks configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FireblocksConfig {
     pub(crate) api_user_id: ApiUserId,
-    pub(crate) secret_path: PathBuf,
+    pub(crate) secret: Vec<u8>,
     pub(crate) vault_account_id: VaultAccountId,
     pub(crate) chain_asset_ids: ChainAssetIds,
     pub(crate) environment: Environment,
+}
+
+impl std::fmt::Debug for FireblocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FireblocksConfig")
+            .field("api_user_id", &self.api_user_id)
+            .field("secret", &"[REDACTED]")
+            .field("vault_account_id", &self.vault_account_id)
+            .field("chain_asset_ids", &self.chain_asset_ids)
+            .field("environment", &self.environment)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FireblocksConfigError {
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+}
+
+impl FireblocksConfig {
+    pub(crate) fn new(
+        api_user_id: ApiUserId,
+        secret_path: &Path,
+        vault_account_id: VaultAccountId,
+        chain_asset_ids: ChainAssetIds,
+        environment: Environment,
+    ) -> Result<Self, FireblocksConfigError> {
+        let secret = std::fs::read(secret_path)?;
+
+        Ok(Self {
+            api_user_id,
+            secret,
+            vault_account_id,
+            chain_asset_ids,
+            environment,
+        })
+    }
 }
 
 /// Parsed chain ID to Fireblocks asset ID mapping.

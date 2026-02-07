@@ -8,7 +8,8 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::{Args, Parser};
 
 pub(crate) use config::{
-    ChainAssetIds, Environment, FireblocksConfig, parse_chain_asset_ids,
+    ChainAssetIds, Environment, FireblocksConfig, FireblocksConfigError,
+    parse_chain_asset_ids,
 };
 pub(crate) use vault_service::{
     FireblocksVaultError, FireblocksVaultService, fetch_vault_address,
@@ -109,6 +110,8 @@ pub enum SignerConfigError {
         "FIREBLOCKS_SECRET_PATH is required when FIREBLOCKS_API_USER_ID is set"
     )]
     MissingSecretPath,
+    #[error(transparent)]
+    FireblocksConfig(#[from] FireblocksConfigError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,13 +134,15 @@ impl SignerEnv {
                     .secret_path
                     .ok_or(SignerConfigError::MissingSecretPath)?;
 
-                Ok(SignerConfig::Fireblocks(FireblocksConfig {
-                    api_user_id: api_user_id.into(),
-                    secret_path,
-                    vault_account_id: self.fireblocks.vault_account_id.into(),
-                    chain_asset_ids: self.fireblocks.chain_asset_ids,
-                    environment: self.fireblocks.environment,
-                }))
+                let config = FireblocksConfig::new(
+                    api_user_id.into(),
+                    &secret_path,
+                    self.fireblocks.vault_account_id.into(),
+                    self.fireblocks.chain_asset_ids,
+                    self.fireblocks.environment,
+                )?;
+
+                Ok(SignerConfig::Fireblocks(config))
             }
         }
     }

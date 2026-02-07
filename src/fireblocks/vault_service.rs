@@ -22,12 +22,6 @@ use crate::vault::{
 /// Fireblocks-specific errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireblocksVaultError {
-    #[error("failed to read Fireblocks secret key from {path}")]
-    ReadSecret {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("Fireblocks SDK error")]
     Sdk(#[from] fireblocks_sdk::FireblocksError),
     #[error("Fireblocks API error")]
@@ -36,12 +30,8 @@ pub(crate) enum FireblocksVaultError {
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("no deposit address found for vault {vault_id}, asset {asset_id}")]
     NoAddress { vault_id: String, asset_id: String },
-    #[error("invalid deposit address from Fireblocks: {address}")]
-    InvalidAddress {
-        address: String,
-        #[source]
-        source: alloy::hex::FromHexError,
-    },
+    #[error("invalid address from Fireblocks")]
+    InvalidAddress(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
     #[error(
@@ -72,14 +62,8 @@ pub(crate) enum FireblocksVaultError {
 pub(crate) async fn fetch_vault_address(
     config: &FireblocksConfig,
 ) -> Result<Address, FireblocksVaultError> {
-    let secret = std::fs::read(&config.secret_path).map_err(|e| {
-        FireblocksVaultError::ReadSecret {
-            path: config.secret_path.clone(),
-            source: e,
-        }
-    })?;
-
-    let mut builder = ClientBuilder::new(config.api_user_id.as_str(), &secret);
+    let mut builder =
+        ClientBuilder::new(config.api_user_id.as_str(), &config.secret);
     if config.environment == Environment::Sandbox {
         builder = builder.use_sandbox();
     }
@@ -99,12 +83,7 @@ pub(crate) async fn fetch_vault_address(
             asset_id: default_asset_id.as_str().to_string(),
         })?;
 
-    address_str.parse::<Address>().map_err(|e| {
-        FireblocksVaultError::InvalidAddress {
-            address: address_str.to_string(),
-            source: e,
-        }
-    })
+    Ok(address_str.parse::<Address>()?)
 }
 
 /// Vault service implementation that uses Fireblocks CONTRACT_CALL operation.
@@ -129,29 +108,20 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     ///
     /// # Arguments
     ///
-    /// * `config` - Fireblocks configuration
+    /// * `config` - Fireblocks configuration (with secret already loaded)
     /// * `read_provider` - Read-only RPC provider for view calls and receipt fetching
     /// * `chain_id` - The chain ID for transaction routing
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The Fireblocks secret key cannot be read
-    /// - The Fireblocks client cannot be built
+    /// Returns an error if the Fireblocks client cannot be built.
     pub fn new(
         config: &FireblocksConfig,
         read_provider: P,
         chain_id: u64,
     ) -> Result<Self, FireblocksVaultError> {
-        let secret = std::fs::read(&config.secret_path).map_err(|e| {
-            FireblocksVaultError::ReadSecret {
-                path: config.secret_path.clone(),
-                source: e,
-            }
-        })?;
-
         let mut builder =
-            ClientBuilder::new(config.api_user_id.as_str(), &secret);
+            ClientBuilder::new(config.api_user_id.as_str(), &config.secret);
         if config.environment == Environment::Sandbox {
             builder = builder.use_sandbox();
         }
