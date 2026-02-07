@@ -143,35 +143,20 @@ impl SignerEnv {
     }
 }
 
-impl SignerConfig {
-    /// Resolve the local signer config into a wallet.
-    ///
-    /// Only valid for `SignerConfig::Local`. For Fireblocks, use
-    /// `FireblocksVaultService` directly which handles transaction submission.
-    ///
-    /// The chain_id is required to set on the signer for transaction signing.
-    pub(crate) fn resolve(
-        &self,
-        chain_id: u64,
-    ) -> Result<ResolvedSigner, SignerResolveError> {
-        match self {
-            Self::Fireblocks(_) => {
-                // Fireblocks path should use FireblocksVaultService directly.
-                // This method should not be called for Fireblocks config.
-                unreachable!(
-                    "resolve() should not be called for Fireblocks config; \
-                     use FireblocksVaultService directly"
-                )
-            }
-            Self::Local(key) => {
-                let mut signer = PrivateKeySigner::from_bytes(key)?;
-                signer.set_chain_id(Some(chain_id));
-                let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet })
-            }
-        }
-    }
+/// Resolve a local private key into a wallet.
+///
+/// The chain_id is set on the signer for transaction signing.
+pub(crate) fn resolve_local_signer(
+    key: &B256,
+    chain_id: u64,
+) -> Result<ResolvedSigner, SignerResolveError> {
+    let mut signer = PrivateKeySigner::from_bytes(key)?;
+    signer.set_chain_id(Some(chain_id));
+    let wallet = EthereumWallet::from(signer);
+    Ok(ResolvedSigner { wallet })
+}
 
+impl SignerConfig {
     /// Derive the address from the signer configuration.
     ///
     /// For local keys this is synchronous. For Fireblocks, this requires an

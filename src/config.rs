@@ -10,7 +10,7 @@ use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
 use crate::fireblocks::{
     FireblocksVaultError, FireblocksVaultService, SignerConfig,
-    SignerConfigError, SignerEnv, SignerResolveError,
+    SignerConfigError, SignerEnv, SignerResolveError, resolve_local_signer,
 };
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
@@ -47,8 +47,8 @@ impl Config {
         &self,
     ) -> Result<Arc<dyn VaultService>, ConfigError> {
         match &self.signer {
-            SignerConfig::Local(_) => {
-                let resolved = self.signer.resolve(self.chain_id)?;
+            SignerConfig::Local(key) => {
+                let resolved = resolve_local_signer(key, self.chain_id)?;
                 let provider = ProviderBuilder::new()
                     .wallet(resolved.wallet)
                     .connect(self.rpc_url.as_str())

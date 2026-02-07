@@ -392,13 +392,15 @@ Key files: `fireblocks/mod.rs` (SignerConfig), `fireblocks/vault_service.rs`
 
 ### Configuration
 
-See `.env.example` for full list. Key variables:
+Environment variables are defined in multiple places across the deployment
+pipeline:
 
-- `DATABASE_URL`, `RPC_URL`, `VAULT_ADDRESS`
-- **Signing (choose ONE):** `EVM_PRIVATE_KEY` (local) OR Fireblocks vars
-  (`FIREBLOCKS_API_KEY`, `FIREBLOCKS_SECRET_PATH`,
-  `FIREBLOCKS_VAULT_ACCOUNT_ID`)
-- Alpaca API credentials, `ISSUER_API_KEY`
+- **`.env.example`**: Template for local development, lists all available env
+  vars
+- **`.github/workflows/deploy.yaml`**: GitHub Actions workflow that sets secrets
+  and populates the `.env` file during deployment
+- **`docker-compose.template.yaml`**: Container configuration template populated
+  by the deployment workflow
 
 ### Code Quality & Best Practices
 

@@ -126,43 +126,6 @@ pub async fn fetch_vault_address(
     })
 }
 
-/// Fetches the vault account address from Fireblocks using a custom base URL.
-///
-/// This is primarily used for testing with a mock server.
-#[cfg(test)]
-pub(crate) async fn fetch_vault_address_with_url(
-    api_key: &str,
-    secret: &[u8],
-    base_url: &str,
-    vault_account_id: &str,
-    asset_id: &str,
-) -> Result<Address, FireblocksVaultError> {
-    let client = ClientBuilder::new(api_key, secret)
-        .with_url(base_url)
-        .build()
-        .map_err(FireblocksVaultError::ClientBuild)?;
-
-    let addresses = client
-        .addresses(vault_account_id, asset_id)
-        .await
-        .map_err(FireblocksVaultError::FetchAddresses)?;
-
-    let address_str = addresses
-        .first()
-        .and_then(|a| a.address.as_deref())
-        .ok_or_else(|| FireblocksVaultError::NoAddress {
-            vault_id: vault_account_id.to_string(),
-            asset_id: asset_id.to_string(),
-        })?;
-
-    address_str.parse::<Address>().map_err(|e| {
-        FireblocksVaultError::InvalidAddress {
-            address: address_str.to_string(),
-            source: e,
-        }
-    })
-}
-
 /// Vault service implementation that uses Fireblocks CONTRACT_CALL operation.
 ///
 /// Unlike the RAW signing approach (which only signs hashes), CONTRACT_CALL
@@ -225,33 +188,6 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             client,
             vault_account_id: config.vault_account_id.as_str().to_string(),
             chain_asset_ids: config.chain_asset_ids.clone(),
-            read_provider,
-            chain_id,
-        })
-    }
-
-    /// Creates a new Fireblocks vault service with a custom base URL.
-    ///
-    /// This is primarily used for testing with a mock server.
-    #[cfg(test)]
-    pub(crate) fn with_url(
-        api_key: &str,
-        secret: &[u8],
-        base_url: &str,
-        vault_account_id: String,
-        chain_asset_ids: ChainAssetIds,
-        read_provider: P,
-        chain_id: u64,
-    ) -> Result<Self, FireblocksVaultError> {
-        let client = ClientBuilder::new(api_key, secret)
-            .with_url(base_url)
-            .build()
-            .map_err(FireblocksVaultError::ClientBuild)?;
-
-        Ok(Self {
-            client,
-            vault_account_id,
-            chain_asset_ids,
             read_provider,
             chain_id,
         })
@@ -348,21 +284,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             FireblocksVaultError::MissingTxHash { tx_id: tx_id.to_string() }
         })?;
 
-        // Remove "0x" prefix if present and parse
-        let tx_hash_hex =
-            tx_hash_str.strip_prefix("0x").unwrap_or(&tx_hash_str);
-        let tx_hash_bytes: [u8; 32] = alloy::hex::decode(tx_hash_hex)
-            .map_err(|e| FireblocksVaultError::InvalidTxHash {
-                hash: tx_hash_str.clone(),
-                source: e,
-            })?
-            .try_into()
-            .map_err(|_| FireblocksVaultError::InvalidTxHash {
-                hash: tx_hash_str.clone(),
-                source: alloy::hex::FromHexError::InvalidStringLength,
-            })?;
-
-        Ok(B256::from(tx_hash_bytes))
+        parse_tx_hash(&tx_hash_str)
     }
 
     /// Fetches a transaction receipt from the RPC provider.
@@ -454,6 +376,23 @@ fn build_contract_call_request(
         cpu_staking: None,
         use_gasless: None,
     }
+}
+
+/// Parses a transaction hash string (with or without 0x prefix) into B256.
+fn parse_tx_hash(tx_hash_str: &str) -> Result<B256, FireblocksVaultError> {
+    let tx_hash_hex = tx_hash_str.strip_prefix("0x").unwrap_or(tx_hash_str);
+    let tx_hash_bytes: [u8; 32] = alloy::hex::decode(tx_hash_hex)
+        .map_err(|e| FireblocksVaultError::InvalidTxHash {
+            hash: tx_hash_str.to_string(),
+            source: e,
+        })?
+        .try_into()
+        .map_err(|_| FireblocksVaultError::InvalidTxHash {
+            hash: tx_hash_str.to_string(),
+            source: alloy::hex::FromHexError::InvalidStringLength,
+        })?;
+
+    Ok(B256::from(tx_hash_bytes))
 }
 
 #[async_trait]
@@ -670,7 +609,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fireblocks::config::parse_chain_asset_ids;
 
     // ==================== Unit Tests for build_contract_call_request ====================
 
@@ -768,117 +706,82 @@ mod tests {
         );
     }
 
-    // ==================== Sandbox Integration Tests (ignored by default) ====================
+    // ==================== Unit Tests for parse_tx_hash ====================
 
-    /// Mock provider for sandbox tests - only used for balance queries
-    #[derive(Clone)]
-    struct MockProvider;
+    #[test]
+    fn parse_tx_hash_with_0x_prefix() {
+        let hash_str = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let result = parse_tx_hash(hash_str).unwrap();
 
-    impl Provider for MockProvider {
-        fn root(&self) -> &alloy::providers::RootProvider {
-            unimplemented!("MockProvider doesn't support root()")
-        }
+        assert_eq!(
+            result,
+            B256::from([
+                0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd,
+                0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12,
+                0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56,
+                0x78, 0x90
+            ])
+        );
     }
 
-    /// Integration test using Fireblocks Sandbox.
-    ///
-    /// This test is ignored by default because it requires:
-    /// - FIREBLOCKS_API_KEY environment variable
-    /// - FIREBLOCKS_SECRET_PATH environment variable (path to RSA private key)
-    /// - FIREBLOCKS_VAULT_ACCOUNT_ID environment variable
-    /// - A valid Fireblocks sandbox account
-    ///
-    /// Run with: cargo test --package st0x-issuance sandbox_fetch_address -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn sandbox_fetch_vault_address() {
-        let api_key = std::env::var("FIREBLOCKS_API_KEY")
-            .expect("FIREBLOCKS_API_KEY not set");
-        let secret_path = std::env::var("FIREBLOCKS_SECRET_PATH")
-            .expect("FIREBLOCKS_SECRET_PATH not set");
-        let vault_account_id = std::env::var("FIREBLOCKS_VAULT_ACCOUNT_ID")
-            .expect("FIREBLOCKS_VAULT_ACCOUNT_ID not set");
+    #[test]
+    fn parse_tx_hash_without_0x_prefix() {
+        let hash_str =
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let result = parse_tx_hash(hash_str).unwrap();
 
-        let secret = std::fs::read(&secret_path).unwrap_or_else(|_| {
-            panic!("Failed to read secret from {secret_path}")
-        });
-
-        // Use sandbox URL
-        let result = fetch_vault_address_with_url(
-            &api_key,
-            &secret,
-            "https://sandbox-api.fireblocks.io/v1",
-            &vault_account_id,
-            "ETH_TEST3", // Sepolia testnet asset
-        )
-        .await;
-
-        match result {
-            Ok(address) => {
-                println!("Sandbox vault address: {address:?}");
-                assert!(!address.is_zero(), "Address should not be zero");
-            }
-            Err(e) => {
-                panic!("Failed to fetch sandbox vault address: {e}");
-            }
-        }
+        assert_eq!(
+            result,
+            B256::from([
+                0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd,
+                0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12,
+                0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56,
+                0x78, 0x90
+            ])
+        );
     }
 
-    /// Integration test for creating a transaction in Fireblocks Sandbox.
-    ///
-    /// This test is ignored by default because it requires sandbox credentials
-    /// and will create an actual transaction (auto-approved in sandbox).
-    ///
-    /// Run with: cargo test --package st0x-issuance sandbox_create_transaction -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn sandbox_create_transaction() {
-        let api_key = std::env::var("FIREBLOCKS_API_KEY")
-            .expect("FIREBLOCKS_API_KEY not set");
-        let secret_path = std::env::var("FIREBLOCKS_SECRET_PATH")
-            .expect("FIREBLOCKS_SECRET_PATH not set");
-        let vault_account_id = std::env::var("FIREBLOCKS_VAULT_ACCOUNT_ID")
-            .expect("FIREBLOCKS_VAULT_ACCOUNT_ID not set");
+    #[test]
+    fn parse_tx_hash_invalid_hex_characters() {
+        let hash_str = "0xGGGGGG1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let result = parse_tx_hash(hash_str);
 
-        let secret = std::fs::read(&secret_path).unwrap_or_else(|_| {
-            panic!("Failed to read secret from {secret_path}")
-        });
+        assert!(
+            matches!(result, Err(FireblocksVaultError::InvalidTxHash { .. })),
+            "Expected InvalidTxHash error, got {result:?}"
+        );
+    }
 
-        let chain_asset_ids =
-            parse_chain_asset_ids("11155111:ETH_TEST3").unwrap();
+    #[test]
+    fn parse_tx_hash_too_short() {
+        let hash_str = "0xabcdef";
+        let result = parse_tx_hash(hash_str);
 
-        let service = FireblocksVaultService::with_url(
-            &api_key,
-            &secret,
-            "https://sandbox-api.fireblocks.io/v1",
-            vault_account_id,
-            chain_asset_ids,
-            MockProvider,
-            11_155_111, // Sepolia
-        )
-        .unwrap();
+        assert!(
+            matches!(result, Err(FireblocksVaultError::InvalidTxHash { .. })),
+            "Expected InvalidTxHash error, got {result:?}"
+        );
+    }
 
-        // Create a simple contract call (this will fail on-chain but tests the API)
-        let result = service
-            .submit_contract_call(
-                Address::ZERO,
-                &Bytes::from(vec![0x00]),
-                "Sandbox test transaction",
-            )
-            .await;
+    #[test]
+    fn parse_tx_hash_too_long() {
+        // 33 bytes instead of 32
+        let hash_str = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890aa";
+        let result = parse_tx_hash(hash_str);
 
-        match result {
-            Ok(tx_id) => {
-                println!("Sandbox transaction created: {tx_id}");
-                assert!(
-                    !tx_id.is_empty(),
-                    "Transaction ID should not be empty"
-                );
-            }
-            Err(e) => {
-                // Some errors are expected (e.g., insufficient funds)
-                println!("Transaction creation result: {e}");
-            }
-        }
+        assert!(
+            matches!(result, Err(FireblocksVaultError::InvalidTxHash { .. })),
+            "Expected InvalidTxHash error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_tx_hash_empty_string() {
+        let result = parse_tx_hash("");
+
+        assert!(
+            matches!(result, Err(FireblocksVaultError::InvalidTxHash { .. })),
+            "Expected InvalidTxHash error, got {result:?}"
+        );
     }
 }
