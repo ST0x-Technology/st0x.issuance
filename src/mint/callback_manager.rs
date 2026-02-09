@@ -248,6 +248,15 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
             _ => Err(CallbackManagerError::AccountNotLinked { client_id }),
         }
     }
+
+    /// Recovers a single mint stuck in CallbackPending state.
+    pub(crate) async fn recover_single_callback_pending(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        view: &MintView,
+    ) -> Result<(), CallbackManagerError> {
+        todo!()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,6 +267,8 @@ pub(crate) enum CallbackManagerError {
     Cqrs(#[from] AggregateError<MintError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
+    #[error("Invalid view state: expected CallbackPending, got {current_state}")]
+    InvalidViewState { current_state: String },
     #[error("View error: {0}")]
     View(#[from] MintViewError),
     #[error("Account view error: {0}")]
@@ -280,6 +291,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
+    use crate::mint::view::find_callback_pending;
     use super::{CallbackManager, CallbackManagerError};
     use crate::account::{
         Account, AccountCommand, AccountView, AlpacaAccountNumber, Email,
@@ -709,7 +721,7 @@ mod tests {
         );
 
         let results =
-            crate::mint::view::find_callback_pending(&pool).await.unwrap();
+            find_callback_pending(&pool).await.unwrap();
         assert!(
             results.is_empty(),
             "Expected no CallbackPending mints after recovery"
@@ -822,6 +834,107 @@ mod tests {
             alpaca_mock.get_call_count(),
             2,
             "Expected both mints to be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_single_callback_pending_sends_callback() {
+        let (pool, mint_cqrs, mint_event_store, account_cqrs) =
+            setup_recovery_test_env().await;
+
+        let client_id = ClientId::new();
+        create_linked_account(&account_cqrs, client_id).await;
+
+        let issuer_request_id = IssuerRequestId::new("iss-single-cb-1");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let tx_hash = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new("tok-1"),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::StartMinting {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::CompleteMinting {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash,
+                    receipt_id: U256::from(1),
+                    shares_minted: U256::from(100),
+                    gas_used: 21000,
+                    block_number: 12345,
+                },
+            )
+            .await
+            .unwrap();
+
+        let view = find_callback_pending(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| id == &issuer_request_id)
+            .map(|(_, mint_view)| mint_view)
+            .unwrap();
+
+        let alpaca_mock = Arc::new(MockAlpacaService::new_success());
+        let manager = CallbackManager::new(
+            alpaca_mock.clone(),
+            mint_cqrs.clone(),
+            mint_event_store,
+            pool.clone(),
+        );
+
+        manager
+            .recover_single_callback_pending(&issuer_request_id, &view)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alpaca_mock.get_call_count(),
+            1,
+            "Expected callback to be sent once"
+        );
+
+        let results =
+            find_callback_pending(&pool).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "Expected no CallbackPending mints after recovery"
         );
     }
 }

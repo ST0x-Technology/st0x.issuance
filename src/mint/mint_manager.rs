@@ -371,6 +371,14 @@ where
         debug!("Completed recovery of JournalConfirmed mints");
     }
 
+    /// Recovers a single mint stuck in JournalConfirmed state.
+    pub(crate) async fn recover_single_journal_confirmed(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<(), MintManagerError> {
+        todo!()
+    }
+
     /// Recovers mints stuck in Minting or MintingFailed state after a restart.
     ///
     /// This method:
@@ -413,7 +421,7 @@ where
         debug!("Completed recovery of incomplete mints");
     }
 
-    async fn recover_single_incomplete_mint(
+    pub(crate) async fn recover_single_incomplete_mint(
         &self,
         issuer_request_id: &IssuerRequestId,
         view: &MintView,
@@ -667,6 +675,7 @@ mod tests {
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
+    use crate::mint::view::find_journal_confirmed;
     use super::{MintManager, MintManagerError};
 
     type TestMintCqrs = CqrsFramework<Mint, MemStore<Mint>>;
@@ -1248,7 +1257,7 @@ mod tests {
         );
 
         let results =
-            crate::mint::view::find_journal_confirmed(&pool).await.unwrap();
+            find_journal_confirmed(&pool).await.unwrap();
         assert!(
             results.is_empty(),
             "Expected no JournalConfirmed mints after recovery"
@@ -1368,6 +1377,94 @@ mod tests {
             blockchain_mock.get_call_count(),
             2,
             "Expected both mints to be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_single_journal_confirmed_starts_minting() {
+        let (
+            pool,
+            mint_cqrs,
+            mint_event_store,
+            asset_cqrs,
+            receipt_inventory_cqrs,
+            receipt_inventory_event_store,
+        ) = setup_recovery_test_env().await;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        asset_cqrs
+            .execute(
+                &underlying.0,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault,
+                },
+            )
+            .await
+            .unwrap();
+
+        let client_id = ClientId::new();
+        let issuer_request_id = IssuerRequestId::new("iss-single-recovery-1");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new("tok-1"),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        mint_cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let blockchain_mock = Arc::new(MockVaultService::new_success());
+        let manager = MintManager::new(
+            blockchain_mock.clone() as Arc<dyn VaultService>,
+            mint_cqrs.clone(),
+            mint_event_store,
+            pool.clone(),
+            bot,
+            receipt_inventory_cqrs,
+            receipt_inventory_event_store,
+        );
+
+        manager
+            .recover_single_journal_confirmed(&issuer_request_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            blockchain_mock.get_call_count(),
+            1,
+            "Expected blockchain service to be called once"
+        );
+
+        let results =
+            find_journal_confirmed(&pool).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "Expected no JournalConfirmed mints after recovery"
         );
     }
 }

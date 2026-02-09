@@ -25,40 +25,32 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerRequestId,
         reason: String,
     },
-    StartMinting {
-        issuer_request_id: IssuerRequestId,
-    },
-    CompleteMinting {
-        issuer_request_id: IssuerRequestId,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        gas_used: u64,
-        block_number: u64,
-    },
-    FailMinting {
-        issuer_request_id: IssuerRequestId,
-        error: String,
-    },
-    CompleteCallback {
-        issuer_request_id: IssuerRequestId,
-    },
-    /// Recovers a mint that already succeeded on-chain during recovery.
+
+    /// Executes the on-chain deposit (minting) operation.
     ///
-    /// Used when recovering from `Minting` or `MintingFailed` state and we find
-    /// that the mint actually succeeded on-chain (receipt exists in inventory).
-    RecoverExistingMint {
+    /// Calls the vault service to deposit, producing `MintingStarted`
+    /// followed by either `TokensMinted` or `MintingFailed`.
+    Deposit {
         issuer_request_id: IssuerRequestId,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        block_number: u64,
     },
-    /// Retries a mint that failed or was interrupted before completing on-chain.
+
+    /// Sends the callback to Alpaca to confirm mint completion.
     ///
-    /// Used during recovery when no receipt exists for a mint stuck in
-    /// `Minting` or `MintingFailed` state.
-    RetryMint {
+    /// Calls the Alpaca service, producing `MintCompleted` on success.
+    SendCallback {
+        issuer_request_id: IssuerRequestId,
+    },
+
+    /// Recovers a mint stuck in an incomplete state.
+    ///
+    /// For mints in `Minting` or `MintingFailed` state:
+    /// - Checks receipt inventory for existing receipt
+    /// - If found: records the existing mint (produces `ExistingMintRecovered`)
+    /// - If not found: retries the mint (produces `MintRetryStarted` then executes mint)
+    ///
+    /// For mints in `CallbackPending` state:
+    /// - Retries sending the callback
+    RecoverMint {
         issuer_request_id: IssuerRequestId,
     },
 }

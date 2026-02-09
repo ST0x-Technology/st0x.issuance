@@ -10,13 +10,14 @@ use sqlite_es::{
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, error, info};
 
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
+use crate::alpaca::AlpacaService;
 use crate::mint::{
-    CallbackManager, Mint, MintView, mint_manager::MintManager,
-    replay_mint_view,
+    CallbackManager, CqrsReceiptQuery, Mint, MintServices, MintView,
+    find_all_recoverable_mints, mint_manager::MintManager, replay_mint_view,
 };
 use crate::receipt_inventory::backfill::ReceiptBackfiller;
 use crate::receipt_inventory::{
@@ -252,26 +253,31 @@ pub async fn initialize_rocket(
     let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
 
     let blockchain_service = config.create_blockchain_service().await?;
+    let alpaca_service = config.alpaca.service()?;
+    let bot_wallet = config.signer.address().await?;
+    info!("Bot wallet address: {bot_wallet}");
 
     let AggregateCqrsSetup {
         mint,
         redemption_cqrs,
         redemption_event_store,
         receipt_inventory,
-    } = setup_aggregate_cqrs(&pool, blockchain_service.clone());
-
-    let bot_wallet = config.signer.address().await?;
-    info!("Bot wallet address: {bot_wallet}");
+    } = setup_aggregate_cqrs(
+        &pool,
+        blockchain_service.clone(),
+        alpaca_service.clone(),
+        bot_wallet,
+    );
 
     let MintManagers { mint: mint_manager, callback: callback_manager } =
         setup_mint_managers(
-            &config,
             blockchain_service.clone(),
+            alpaca_service.clone(),
             &mint,
             &receipt_inventory,
             &pool,
             bot_wallet,
-        )?;
+        );
 
     let managers = setup_redemption_managers(
         &config,
@@ -314,7 +320,7 @@ pub async fn initialize_rocket(
     );
 
     // Recovery runs AFTER reprojections and backfill so it can query accurate state
-    spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
+    spawn_mint_recovery(pool.clone(), mint_manager.clone(), callback_manager.clone());
     spawn_redemption_recovery(
         managers.redeem_call.clone(),
         managers.journal.clone(),
@@ -394,7 +400,29 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
 fn setup_aggregate_cqrs(
     pool: &Pool<Sqlite>,
     vault_service: Arc<dyn vault::VaultService>,
+    alpaca_service: Arc<dyn AlpacaService>,
+    bot_wallet: Address,
 ) -> AggregateCqrsSetup {
+    // Create receipt inventory first since MintServices depends on it
+    let receipt_inventory_cqrs =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+    let receipt_inventory_event_store =
+        Arc::new(PersistedEventStore::new_event_store(
+            SqliteEventRepository::new(pool.clone()),
+        ));
+
+    // Create MintServices with all dependencies
+    let receipt_query = Arc::new(CqrsReceiptQuery::new(
+        receipt_inventory_event_store.clone(),
+    ));
+    let mint_services = MintServices {
+        vault: vault_service.clone(),
+        alpaca: alpaca_service,
+        pool: pool.clone(),
+        bot: bot_wallet,
+        receipts: receipt_query,
+    };
+
     let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
         pool.clone(),
         "mint_view".to_string(),
@@ -412,7 +440,7 @@ fn setup_aggregate_cqrs(
     let mint_cqrs = Arc::new(sqlite_cqrs(
         pool.clone(),
         vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
-        (),
+        mint_services,
     ));
     let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
         SqliteEventRepository::new(pool.clone()),
@@ -447,14 +475,6 @@ fn setup_aggregate_cqrs(
         .with_upcasters(vec![create_tokens_burned_upcaster()]),
     );
 
-    let receipt_inventory_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-
-    let receipt_inventory_event_store =
-        Arc::new(PersistedEventStore::new_event_store(
-            SqliteEventRepository::new(pool.clone()),
-        ));
-
     AggregateCqrsSetup {
         mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
         redemption_cqrs,
@@ -467,13 +487,13 @@ fn setup_aggregate_cqrs(
 }
 
 fn setup_mint_managers(
-    config: &Config,
     blockchain_service: Arc<dyn vault::VaultService>,
+    alpaca_service: Arc<dyn AlpacaService>,
     mint: &MintDeps,
     receipt_inventory: &ReceiptInventoryDeps,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
-) -> Result<MintManagers, anyhow::Error> {
+) -> MintManagers {
     let mint_manager = Arc::new(MintManager::new(
         blockchain_service,
         mint.cqrs.clone(),
@@ -484,7 +504,6 @@ fn setup_mint_managers(
         receipt_inventory.event_store.clone(),
     ));
 
-    let alpaca_service = config.alpaca.service()?;
     let callback = Arc::new(CallbackManager::new(
         alpaca_service,
         mint.cqrs.clone(),
@@ -569,6 +588,7 @@ fn spawn_redemption_detector(
 }
 
 fn spawn_mint_recovery(
+    pool: Pool<Sqlite>,
     mint_manager: Arc<
         MintManager<
             PersistedEventStore<SqliteEventRepository, Mint>,
@@ -582,9 +602,23 @@ fn spawn_mint_recovery(
     info!("Spawning mint recovery task");
 
     tokio::spawn(async move {
-        mint_manager.recover_journal_confirmed_mints().await;
-        mint_manager.recover_incomplete_mints().await;
-        callback_manager.recover_callback_pending_mints().await;
+        let recoverable_mints = match find_all_recoverable_mints(&pool).await {
+            Ok(mints) => mints,
+            Err(err) => {
+                error!(error = %err, "Failed to query recoverable mints");
+                return;
+            }
+        };
+
+        if recoverable_mints.is_empty() {
+            debug!("No mints to recover");
+            return;
+        }
+
+        info!(count = recoverable_mints.len(), "Recovering mints");
+
+        for (issuer_request_id, view) in recoverable_mints {
+            let state = view.state_name();
     });
 }
 

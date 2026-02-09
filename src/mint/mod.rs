@@ -5,11 +5,18 @@ mod event;
 pub(crate) mod mint_manager;
 mod view;
 
+use std::sync::Arc;
+
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
+use tracing::{info, warn};
+
+use crate::alpaca::AlpacaService;
+use crate::vault::VaultService;
 
 pub use api::MintResponse;
 
@@ -17,7 +24,15 @@ pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use callback_manager::CallbackManager;
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
-pub(crate) use view::{MintView, replay_mint_view};
+pub(crate) use view::{MintView, find_all_recoverable_mints, replay_mint_view};
+
+/// Services required by the Mint aggregate for command handling.
+pub(crate) struct MintServices {
+    pub(crate) vault: Arc<dyn VaultService>,
+    pub(crate) alpaca: Arc<dyn AlpacaService>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) bot: Address,
+}
 
 pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{
@@ -396,6 +411,29 @@ impl Mint {
             block_number,
             recovered_at: now,
         }])
+    }
+
+    fn handle_retry_mint(
+        &self,
+        provided_id: IssuerRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(expected_id, &provided_id)?;
+                // Already in Minting state, no transition needed (idempotent)
+                Ok(vec![])
+            }
+            Self::MintingFailed { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(expected_id, &provided_id)?;
+                Ok(vec![MintEvent::MintRetryStarted {
+                    issuer_request_id: provided_id,
+                    started_at: Utc::now(),
+                }])
+            }
+            _ => Err(MintError::NotInMintingOrMintingFailedState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
     }
 
     fn apply_journal_confirmed(&mut self, confirmed_at: DateTime<Utc>) {

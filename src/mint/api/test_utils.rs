@@ -14,9 +14,10 @@ use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
+use crate::alpaca::mock::MockAlpacaService;
 use crate::mint::{
-    CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
-    mint_manager::MintManager,
+    CallbackManager, CqrsReceiptQuery, Mint, MintServices, MintView, Network,
+    TokenSymbol, UnderlyingSymbol, mint_manager::MintManager,
 };
 use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::{
@@ -137,15 +138,6 @@ impl TestHarness {
             (),
         );
 
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
         let receipt_inventory_cqrs =
             Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
@@ -153,6 +145,29 @@ impl TestHarness {
             let event_repo = SqliteEventRepository::new(pool.clone());
             Arc::new(PersistedEventStore::new_event_store(event_repo))
         };
+
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let mint_services = MintServices {
+            vault: Arc::new(MockVaultService::new_success()),
+            alpaca: Arc::new(MockAlpacaService::new_success()),
+            pool: pool.clone(),
+            bot,
+            receipts: Arc::new(CqrsReceiptQuery::new(
+                receipt_inventory_event_store.clone(),
+            )),
+        };
+
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
+        let mint_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(mint_query)],
+            mint_services,
+        ));
 
         Self {
             pool,

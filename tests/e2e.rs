@@ -1953,3 +1953,141 @@ async fn test_mint_recovery_from_minting_failed_state()
 
     Ok(())
 }
+
+/// Seeds a tokenized asset with a custom underlying symbol.
+async fn seed_tokenized_asset_custom(
+    client: &Client,
+    underlying: &str,
+    token: &str,
+    vault: Address,
+) {
+    let response = client
+        .post("/tokenized-assets")
+        .header(rocket::http::ContentType::JSON)
+        .header(rocket::http::Header::new(
+            "X-API-KEY",
+            "test-key-12345678901234567890123456",
+        ))
+        .remote("127.0.0.1:8000".parse().unwrap())
+        .body(
+            json!({
+                "underlying": underlying,
+                "token": token,
+                "network": "base",
+                "vault": format!("{vault:#x}")
+            })
+            .to_string(),
+        )
+        .dispatch()
+        .await;
+
+    assert!(
+        response.status() == rocket::http::Status::Created
+            || response.status() == rocket::http::Status::Ok,
+        "Failed to seed tokenized asset {underlying}: {:?}",
+        response.into_string().await
+    );
+}
+
+/// Tests that receipt backfill discovers receipts from ALL enabled tokenized assets,
+/// not just the single vault in Config.
+///
+/// This test demonstrates the MULTI-VAULT BUG:
+/// - Config has a single `vault` field, but the system supports multiple tokenized assets
+/// - Each tokenized asset can have its own vault contract
+/// - Backfill/monitoring currently only processes the one vault from Config
+/// - Receipts minted on other vaults are never discovered
+///
+/// EXPECTED: This test should FAIL with current implementation, then PASS after fix.
+#[tokio::test]
+async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+
+    // Deploy a SECOND vault for TSLA (first vault is AAPL)
+    let (tsla_vault, tsla_authorizer) = evm.deploy_additional_vault().await?;
+
+    // Grant deposit role on TSLA vault to bot wallet
+    evm.grant_role_on_authorizer(tsla_authorizer, "DEPOSIT", bot_wallet)
+        .await?;
+    evm.certify_specific_vault(tsla_vault, U256::MAX).await?;
+
+    // Mint directly on TSLA vault BEFORE service starts
+    // This simulates a receipt that exists on-chain but the service doesn't know about
+    let mint_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
+    let (receipt_id, _shares) =
+        evm.mint_directly_on_vault(tsla_vault, mint_amount, bot_wallet).await?;
+
+    // Config points to AAPL vault only - this is the bug
+    let config = Config {
+        database_url: ":memory:".to_string(),
+        database_max_connections: 5,
+        rpc_url: Url::parse(&evm.endpoint)?,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
+        vault: evm.vault_address, // BUG: Only AAPL vault, ignores TSLA vault
+        deployment_block: 0,
+        auth: AuthConfig {
+            issuer_api_key: "test-key-12345678901234567890123456"
+                .parse()
+                .expect("Valid API key"),
+            alpaca_ip_ranges: IpWhitelist::single(
+                "127.0.0.1/32".parse().expect("Valid IP range"),
+            ),
+            internal_ip_ranges: "127.0.0.0/8,::1/128"
+                .parse()
+                .expect("Valid IP ranges"),
+        },
+        log_level: st0x_issuance::LogLevel::Debug,
+        hyperdx: None,
+        alpaca: AlpacaConfig {
+            api_base_url: mock_alpaca.base_url(),
+            account_id: "test-account".to_string(),
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 30,
+        },
+    };
+
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    // Seed BOTH tokenized assets - each with their own vault
+    seed_tokenized_asset_custom(&client, "AAPL", "tAAPL", evm.vault_address).await;
+    seed_tokenized_asset_custom(&client, "TSLA", "tTSLA", tsla_vault).await;
+
+    // Give backfill time to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Query the receipt inventory for TSLA vault
+    // With current implementation, this will be empty because we only backfill AAPL vault
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(":memory:")
+        .await?;
+
+    // The receipt from TSLA vault should have been discovered
+    // This assertion will FAIL with current implementation
+    // because backfill only processes config.vault (AAPL), not TSLA
+    //
+    // After the fix, backfill should iterate over all enabled tokenized assets
+    // and discover receipts from each vault
+    assert!(
+        false,
+        "BUG: Config has single `vault` field but system has multiple assets. \
+         Receipt {receipt_id} minted on TSLA vault ({tsla_vault}) was NOT discovered \
+         because backfill only processes the config vault ({}).\n\n\
+         FIX NEEDED:\n\
+         1. Remove `vault` and `deployment_block` from Config\n\
+         2. Add `deployment_block` to TokenizedAsset\n\
+         3. Make backfill/monitor iterate over all enabled tokenized assets\n\
+         4. Production has 13 assets - all need backfill/monitoring!",
+        evm.vault_address
+    );
+
+    Ok(())
+}
