@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, ReceiptSource, Shares, determine_source,
+    ReceiptInventoryError, Shares, determine_source,
 };
 use crate::bindings::Receipt;
 
@@ -283,6 +283,7 @@ mod tests {
     use cqrs_es::{AggregateContext, CqrsFramework};
 
     use super::*;
+    use crate::receipt_inventory::ReceiptSource;
 
     type TestStore = MemStore<ReceiptInventory>;
     type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;

@@ -331,7 +331,7 @@ impl Aggregate for ReceiptInventory {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{TxHash, address, b256};
-    use cqrs_es::{CqrsFramework, mem_store::MemStore};
+    use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
     use std::sync::Arc;
 
     use super::*;
@@ -356,6 +356,22 @@ mod tests {
             block_number,
             tx_hash,
             source: ReceiptSource::External,
+        }
+    }
+
+    fn discover_itn_receipt_cmd(
+        receipt_id: ReceiptId,
+        balance: Shares,
+        block_number: u64,
+        tx_hash: TxHash,
+        issuer_request_id: IssuerRequestId,
+    ) -> ReceiptInventoryCommand {
+        ReceiptInventoryCommand::DiscoverReceipt {
+            receipt_id,
+            balance,
+            block_number,
+            tx_hash,
+            source: ReceiptSource::Itn { issuer_request_id },
         }
     }
 
@@ -734,6 +750,147 @@ mod tests {
             block_number: 750,
         });
         assert_eq!(aggregate.last_backfilled_block(), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_issuer_request_id_returns_receipt_when_itn_receipt_exists()
+     {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let issuer_request_id = IssuerRequestId::new("iss-123".to_string());
+
+        cqrs.execute(
+            &vault.to_string(),
+            discover_itn_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let found =
+            context.aggregate().find_by_issuer_request_id(&issuer_request_id);
+        assert_eq!(found, Some(make_receipt_id(42)));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_issuer_request_id_returns_none_when_not_exists() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let issuer_request_id =
+            IssuerRequestId::new("iss-nonexistent".to_string());
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let found =
+            context.aggregate().find_by_issuer_request_id(&issuer_request_id);
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_issuer_request_id_returns_none_for_external_receipts()
+    {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        // Discover an external receipt (no issuer_request_id)
+        cqrs.execute(
+            &vault.to_string(),
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let aggregate = context.aggregate();
+
+        // External receipts should not be indexed by issuer_request_id
+        let random_id = IssuerRequestId::new("iss-random".to_string());
+        assert_eq!(aggregate.find_by_issuer_request_id(&random_id), None);
+
+        // But the receipt itself should exist
+        assert_eq!(aggregate.receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_itn_receipt_is_indexed_in_itn_receipts_map() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let issuer_request_id = IssuerRequestId::new("iss-456".to_string());
+
+        cqrs.execute(
+            &vault.to_string(),
+            discover_itn_receipt_cmd(
+                make_receipt_id(99),
+                make_shares(500),
+                2000,
+                tx_hash,
+                issuer_request_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let aggregate = context.aggregate();
+
+        // Verify the receipt is in both maps
+        assert_eq!(aggregate.receipts.len(), 1);
+        assert_eq!(aggregate.itn_receipts.len(), 1);
+        assert_eq!(
+            aggregate.itn_receipts.get(&issuer_request_id),
+            Some(&make_receipt_id(99))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_receipt_not_in_itn_receipts_map() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        cqrs.execute(
+            &vault.to_string(),
+            discover_receipt_cmd(
+                make_receipt_id(77),
+                make_shares(300),
+                1500,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let aggregate = context.aggregate();
+
+        // Receipt exists but not in itn_receipts
+        assert_eq!(aggregate.receipts.len(), 1);
+        assert_eq!(aggregate.itn_receipts.len(), 0);
     }
 
     async fn setup_receipt_service_with_receipts(
