@@ -1,4 +1,5 @@
 use alloy::primitives::TxHash;
+use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{AggregateError, EventEnvelope, View};
@@ -8,7 +9,7 @@ use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 
-use super::{ReceiptId, ReceiptInventoryError, Shares};
+use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
 use crate::mint::IssuerRequestId;
 use crate::redemption::{
     BurnRecord, Redemption, RedemptionError, RedemptionEvent,
@@ -70,6 +71,8 @@ pub(crate) enum BurnTrackingError {
          remaining={remaining}, burn_from_receipt={burn_from_receipt}"
     )]
     AllocationOverflow { remaining: Shares, burn_from_receipt: Shares },
+    #[error(transparent)]
+    SharesOverflow(#[from] SharesOverflow),
 }
 
 /// Represents a receipt with its available balance for burn planning.
@@ -137,8 +140,10 @@ pub(crate) fn plan_burn(
         })
         .collect();
 
-    let total_available: Shares =
-        receipts.iter().map(|receipt| receipt.available_balance).sum();
+    let total_available: Shares = receipts
+        .iter()
+        .map(|receipt| receipt.available_balance)
+        .try_fold(Shares::new(U256::ZERO), |acc, balance| acc + balance)?;
 
     if total_available.inner() < total_burn.inner() {
         return Err(BurnTrackingError::InsufficientBalance {
@@ -624,8 +629,12 @@ mod tests {
         assert_eq!(plan.total_burn, burn_amount);
 
         // Total of all burn_amounts should equal burn_amount
-        let total_allocated: Shares =
-            plan.allocations.iter().map(|a| a.burn_amount).sum();
+        let total_allocated: Shares = plan
+            .allocations
+            .iter()
+            .map(|alloc| alloc.burn_amount)
+            .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+            .unwrap();
         assert_eq!(
             total_allocated, burn_amount,
             "Sum of allocations must equal burn amount"
@@ -766,8 +775,12 @@ mod tests {
         );
 
         // Total should equal requested burn amount
-        let total: Shares =
-            plan.allocations.iter().map(|a| a.burn_amount).sum();
+        let total: Shares = plan
+            .allocations
+            .iter()
+            .map(|alloc| alloc.burn_amount)
+            .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+            .unwrap();
         assert_eq!(
             total, burn_amount,
             "Total allocations must equal burn amount"
@@ -809,8 +822,12 @@ mod tests {
         assert_eq!(plan.allocations.len(), 2, "Should use 2 receipts");
 
         // Verify total matches burn amount
-        let total: Shares =
-            plan.allocations.iter().map(|a| a.burn_amount).sum();
+        let total: Shares = plan
+            .allocations
+            .iter()
+            .map(|alloc| alloc.burn_amount)
+            .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+            .unwrap();
         assert_eq!(total, burn_amount);
 
         // First receipt should be id=2 (50 available > 40 available)
@@ -939,8 +956,10 @@ mod tests {
 
                 let plan = plan_burn(receipts, burn_amount, dust).unwrap();
 
-                let allocated: Shares =
-                    plan.allocations.iter().map(|alloc| alloc.burn_amount).sum();
+                let allocated: Shares = plan.allocations.iter()
+                    .map(|alloc| alloc.burn_amount)
+                    .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+                    .unwrap();
                 prop_assert_eq!(allocated, burn_amount);
             }
         }

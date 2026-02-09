@@ -121,6 +121,19 @@ where
     ) -> Result<BackfillResult, BackfillError> {
         let current_block = self.provider.get_block_number().await?;
 
+        if from_block > current_block {
+            info!(
+                from_block,
+                current_block,
+                "Backfill skipped: from_block is ahead of current block"
+            );
+
+            return Ok(BackfillResult {
+                processed_count: 0,
+                skipped_zero_balance: 0,
+            });
+        }
+
         info!(
             receipt_contract = %self.receipt_contract,
             bot_wallet = %self.bot_wallet,

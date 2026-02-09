@@ -240,19 +240,21 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
-  success)
+  success). Payload contains `burns: Vec<BurnRecord>` where each `BurnRecord`
+  has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
+  single redemption spans multiple ERC-1155 receipts
 - `BurningFailed` - On-chain burn failed (terminal)
 
 **Command → Event Mappings:**
 
-| Command                 | Events                   | Notes             |
-| ----------------------- | ------------------------ | ----------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure  |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete  |
-| `RecordBurnSuccess`     | `TokensBurned`           | Terminal success  |
-| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure  |
+| Command                 | Events                   | Notes                                |
+| ----------------------- | ------------------------ | ------------------------------------ |
+| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                    |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                    |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                     |
+| `RecordBurnSuccess`     | `TokensBurned`           | Multi-receipt burn, terminal success |
+| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure                     |
 
 ### Account Aggregate
 
@@ -370,10 +372,23 @@ logic testable and isolated.
 
 **ReceiptService:**
 
-- Tracks on-chain receipts for burn planning and recovery
-- Methods: `register_minted_receipt()`, `for_burn()`,
-  `find_by_issuer_request_id()`
-- Indexes ITN receipts by `issuer_request_id` for recovery
+- Tracks on-chain ERC-1155 receipts across all vaults for burn planning and mint
+  recovery
+- Backfills historic receipts by scanning Deposit events from a configurable
+  start block
+- Monitors new receipts in real time via event subscription
+- Plans multi-receipt burns: selects receipts in descending balance order and
+  allocates burn amounts across them
+- Methods:
+  - `register_minted_receipt()` - Registers a newly minted receipt immediately
+    (avoids waiting for backfill/monitor)
+  - `for_burn(vault, shares_to_burn, dust) -> BurnPlan` - Plans a burn across
+    multiple receipts, returning allocations (receipt_id, burn_amount) per
+    receipt
+  - `find_by_issuer_request_id(vault, id) -> Option<RecoveredReceipt>` - Looks
+    up a receipt by ITN issuer_request_id for mint recovery
+- Indexes ITN receipts by `issuer_request_id` to detect whether a mint succeeded
+  on-chain during recovery
 
 These services are injected into aggregate command handlers, making aggregates
 testable with mock services.

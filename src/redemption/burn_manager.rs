@@ -378,7 +378,7 @@ where
     /// * `BurnManagerError::InsufficientBalance` - No receipt with sufficient balance found
     /// * `BurnManagerError::Vault` - Blockchain transaction failed
     /// * `BurnManagerError::Cqrs` - Command execution failed
-    /// * `BurnManagerError::Database` - Receipt query failed
+    /// * `BurnManagerError::Sqlx` - Receipt query failed
     pub(crate) async fn handle_burning_started(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -683,11 +683,11 @@ pub(crate) enum BurnManagerError {
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Sqlx(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-    #[error("Receipt inventory error: {0}")]
-    ReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
+    #[error("Receipt inventory aggregate error: {0}")]
+    AggregateReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]

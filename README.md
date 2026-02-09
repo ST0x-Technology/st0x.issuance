@@ -309,8 +309,8 @@ maintainability:
 Before submitting changes, always run in order:
 
 1. `cargo test -q` - Run all tests first
-2. `cargo clippy --all-targets --all-features -- -D clippy::all` - Fix all
-   linting issues
+2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
+   Fix all linting issues
 3. `cargo fmt` - Format code last
 
 For detailed architectural patterns and design decisions, see

@@ -5,8 +5,6 @@ mod event;
 pub(crate) mod monitor;
 pub(crate) mod view;
 
-pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
-
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
 use cqrs_es::{
@@ -25,6 +23,7 @@ pub(crate) use burn_tracking::{
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
+pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
 pub(crate) use view::ReceiptInventoryView;
 
 /// Receipt data recovered from the inventory for mint recovery.
@@ -114,17 +113,22 @@ impl std::fmt::Display for Shares {
     }
 }
 
-impl std::ops::Add for Shares {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
-    }
+/// Overflow error for Shares arithmetic.
+#[derive(Debug, thiserror::Error)]
+#[error("Shares overflow: {lhs} + {rhs} exceeds U256::MAX")]
+pub(crate) struct SharesOverflow {
+    pub(crate) lhs: Shares,
+    pub(crate) rhs: Shares,
 }
 
-impl std::iter::Sum for Shares {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Self(U256::ZERO), |acc, x| acc + x)
+impl std::ops::Add for Shares {
+    type Output = Result<Self, SharesOverflow>;
+
+    fn add(self, other: Self) -> Result<Self, SharesOverflow> {
+        self.0
+            .checked_add(other.0)
+            .map(Self)
+            .ok_or(SharesOverflow { lhs: self, rhs: other })
     }
 }
 
@@ -878,8 +882,11 @@ mod tests {
 
         assert_eq!(receipts.len(), 2);
 
-        let total: Shares =
-            receipts.iter().map(|receipt| receipt.available_balance).sum();
+        let total: Shares = receipts
+            .iter()
+            .map(|receipt| receipt.available_balance)
+            .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+            .unwrap();
         assert_eq!(total, make_shares(300));
     }
 

@@ -63,7 +63,7 @@ where
             return Ok(());
         }
 
-        if start.elapsed() > timeout {
+        if start.elapsed() >= timeout {
             return Err(format!(
                 "Timeout waiting for burn. Balance: {balance}"
             )

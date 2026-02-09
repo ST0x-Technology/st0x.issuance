@@ -26,7 +26,7 @@ use crate::vault::{
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireblocksVaultError {
     #[error("Fireblocks SDK error: {0}")]
-    Sdk(#[from] fireblocks_sdk::FireblocksError),
+    Fireblocks(#[from] fireblocks_sdk::FireblocksError),
     #[error("Fireblocks API error: {0}")]
     Api(#[from] fireblocks_sdk::apis::Error<CreateTransactionError>),
     #[error("RPC error: {0}")]
@@ -34,7 +34,7 @@ pub(crate) enum FireblocksVaultError {
     #[error("no deposit address found for vault {}, asset {}", vault_id.as_str(), asset_id.as_str())]
     NoAddress { vault_id: FireblocksVaultAccountId, asset_id: AssetId },
     #[error("invalid address from Fireblocks: {0}")]
-    Hex(#[from] alloy::hex::FromHexError),
+    FromHex(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
     #[error(

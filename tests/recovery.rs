@@ -232,9 +232,10 @@ async fn test_mint_recovery_after_view_deletion()
     // Close the pool before restarting
     query_pool.close().await;
 
-    // Restart service - recovery should find the JournalConfirmed mint
-    // BUG: Currently recovery runs BEFORE view reprojection, so it queries
-    // an empty view and misses the stuck mint.
+    // Restart service - recovery should find the JournalConfirmed mint.
+    // initialize_rocket replays views (replay_mint_view, replay_redemption_view,
+    // replay_receipt_burns_view) before spawning recovery, so the mint view
+    // is repopulated before recovery queries it.
     let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
