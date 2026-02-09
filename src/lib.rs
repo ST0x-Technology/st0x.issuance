@@ -97,7 +97,6 @@ struct MintDeps {
     event_store: MintEventStore,
 }
 
-
 struct RedemptionManagers {
     redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
     journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
@@ -243,7 +242,7 @@ pub async fn initialize_rocket(
 
     let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
 
-    let blockchain_service = config.create_blockchain_service().await?;
+    let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
     let bot_wallet = config.signer.address().await?;
     info!("Bot wallet address: {bot_wallet}");
@@ -255,14 +254,14 @@ pub async fn initialize_rocket(
         receipt_inventory,
     } = setup_aggregate_cqrs(
         &pool,
-        blockchain_service.clone(),
+        blockchain_setup.vault_service.clone(),
         alpaca_service.clone(),
         bot_wallet,
     );
 
     let managers = setup_redemption_managers(
         &config,
-        blockchain_service,
+        blockchain_setup.vault_service,
         &redemption_cqrs,
         &redemption_event_store,
         &receipt_inventory,
@@ -278,13 +277,11 @@ pub async fn initialize_rocket(
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 
-    let provider = config.create_provider().await?;
-
     // Receipt backfill must run before recovery so that recovery can check
     // receipt inventory to detect already-minted receipts (prevents double-mints).
     let vault_configs = run_all_receipt_backfills(
         &pool,
-        provider.clone(),
+        blockchain_setup.provider.clone(),
         &receipt_inventory.cqrs,
         &receipt_inventory.event_store,
         bot_wallet,
@@ -293,7 +290,7 @@ pub async fn initialize_rocket(
     .await?;
 
     spawn_all_receipt_monitors(
-        provider,
+        blockchain_setup.provider,
         vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
@@ -412,6 +409,7 @@ fn setup_aggregate_cqrs(
     // Create MintServices with all dependencies
     let receipt_service = Arc::new(CqrsReceiptService::new(
         receipt_inventory_event_store.clone(),
+        receipt_inventory_cqrs.clone(),
     ));
     let mint_services = MintServices {
         vault: vault_service.clone(),
@@ -509,6 +507,7 @@ fn setup_redemption_managers(
 
     let receipt_service = Arc::new(CqrsReceiptService::new(
         receipt_inventory.event_store.clone(),
+        receipt_inventory.cqrs.clone(),
     ));
 
     let burn = Arc::new(BurnManager::new(

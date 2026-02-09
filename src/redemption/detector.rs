@@ -496,7 +496,10 @@ mod tests {
             (),
         ));
         let receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(CqrsReceiptService::new(receipt_inventory_store));
+            Arc::new(CqrsReceiptService::new(
+                receipt_inventory_store,
+                receipt_inventory_cqrs.clone(),
+            ));
         (cqrs, store, receipt_service, receipt_inventory_cqrs)
     }
 

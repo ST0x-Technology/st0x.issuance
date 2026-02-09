@@ -50,7 +50,9 @@ pub(crate) enum MintCommand {
     ///
     /// For mints in `CallbackPending` state:
     /// - Retries sending the callback
-    RecoverMint {
+    Recover {
+        issuer_request_id: IssuerRequestId,
+    },
         issuer_request_id: IssuerRequestId,
     },
 }

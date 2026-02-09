@@ -16,12 +16,13 @@ use tracing::{info, warn};
 use crate::account::view::AccountViewError;
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::receipt_inventory::{
-    ReceiptLookupError, ReceiptService, view::ReceiptInventoryViewError,
+    ReceiptId, ReceiptLookupError, ReceiptService, Shares,
+    view::ReceiptInventoryViewError,
 };
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{ReceiptInformation, VaultService};
+use crate::vault::{MintResult, ReceiptInformation, VaultService};
 
 pub use api::MintResponse;
 
@@ -481,29 +482,14 @@ impl Mint {
             .await
         {
             Ok(result) => {
-                info!(
-                    issuer_request_id = %issuer_request_id,
-                    tx_hash = %result.tx_hash,
-                    receipt_id = %result.receipt_id,
-                    shares_minted = %result.shares_minted,
-                    "On-chain deposit succeeded"
-                );
-
-                Ok(vec![
-                    MintEvent::MintingStarted {
-                        issuer_request_id: issuer_request_id.clone(),
-                        started_at: now,
-                    },
-                    MintEvent::TokensMinted {
-                        issuer_request_id,
-                        tx_hash: result.tx_hash,
-                        receipt_id: result.receipt_id,
-                        shares_minted: result.shares_minted,
-                        gas_used: result.gas_used,
-                        block_number: result.block_number,
-                        minted_at: now,
-                    },
-                ])
+                Self::on_deposit_success(
+                    services,
+                    vault,
+                    &issuer_request_id,
+                    &result,
+                    now,
+                )
+                .await
             }
             Err(err) => {
                 warn!(
@@ -525,6 +511,58 @@ impl Mint {
                 ])
             }
         }
+    }
+
+    async fn on_deposit_success(
+        services: &MintServices,
+        vault: Address,
+        issuer_request_id: &IssuerRequestId,
+        result: &MintResult,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        info!(
+            issuer_request_id = %issuer_request_id,
+            tx_hash = %result.tx_hash,
+            receipt_id = %result.receipt_id,
+            shares_minted = %result.shares_minted,
+            "On-chain deposit succeeded"
+        );
+
+        if let Err(err) = services
+            .receipts
+            .register_minted_receipt(
+                vault,
+                ReceiptId::from(result.receipt_id),
+                Shares::from(result.shares_minted),
+                result.block_number,
+                result.tx_hash,
+                issuer_request_id.clone(),
+            )
+            .await
+        {
+            warn!(
+                issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to register minted receipt \
+                 (monitor/backfill will discover it)"
+            );
+        }
+
+        Ok(vec![
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: now,
+            },
+            MintEvent::TokensMinted {
+                issuer_request_id: issuer_request_id.clone(),
+                tx_hash: result.tx_hash,
+                receipt_id: result.receipt_id,
+                shares_minted: result.shares_minted,
+                gas_used: result.gas_used,
+                block_number: result.block_number,
+                minted_at: now,
+            },
+        ])
     }
 
     async fn handle_send_callback(
@@ -1301,17 +1339,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CallbackManager, ClientId, Mint, MintCommand, MintError, MintEvent,
-        MintServices, MintView, Network, Quantity, TokenSymbol,
-        TokenizationRequestId, UnderlyingSymbol, mint_manager::MintManager,
+        ClientId, Mint, MintCommand, MintError, MintEvent, MintServices,
+        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
+        UnderlyingSymbol,
     };
-    use crate::account::AlpacaAccountNumber;
-    use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::alpaca::mock::MockAlpacaService;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
     };
-    use crate::vault::{VaultService, mock::MockVaultService};
+    use crate::vault::mock::MockVaultService;
 
     type MintTestFramework = TestFramework<Mint>;
 
@@ -1330,19 +1367,20 @@ mod tests {
         });
 
         let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let receipt_cqrs =
+            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
         MintServices {
             vault: Arc::new(MockVaultService::new_success()),
             alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+            receipts: Arc::new(CqrsReceiptService::new(
+                receipt_store,
+                receipt_cqrs,
+            )),
             pool,
             bot,
         }
-    }
-
-    fn test_alpaca_account() -> AlpacaAccountNumber {
-        AlpacaAccountNumber("test-account".to_string())
     }
 
     #[test]
@@ -2761,10 +2799,8 @@ mod tests {
         }
     }
 
-    async fn setup_cqrs_integration_test() -> (
-        Arc<MemStore<Mint>>,
-        Arc<CqrsFramework<Mint, MemStore<Mint>>>,
-    ) {
+    async fn setup_cqrs_integration_test()
+    -> (Arc<MemStore<Mint>>, Arc<CqrsFramework<Mint, MemStore<Mint>>>) {
         use sqlx::sqlite::SqlitePoolOptions;
 
         let store = Arc::new(MemStore::<Mint>::default());
@@ -2776,13 +2812,18 @@ mod tests {
             .expect("Failed to create in-memory database");
 
         let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let receipt_cqrs =
+            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mint_services = MintServices {
             vault: Arc::new(MockVaultService::new_success()),
             alpaca: Arc::new(MockAlpacaService::new_success()),
             pool: pool.clone(),
             bot,
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+            receipts: Arc::new(CqrsReceiptService::new(
+                receipt_store,
+                receipt_cqrs,
+            )),
         };
 
         let cqrs = Arc::new(CqrsFramework::new(

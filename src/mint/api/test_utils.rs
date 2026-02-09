@@ -13,8 +13,10 @@ use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::{Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol};
-use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+use crate::mint::{
+    Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol,
+};
+use crate::receipt_inventory::CqrsReceiptService;
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
@@ -92,6 +94,8 @@ impl TestHarness {
             let event_repo = SqliteEventRepository::new(pool.clone());
             Arc::new(PersistedEventStore::new_event_store(event_repo))
         };
+        let receipt_inventory_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mint_services = MintServices {
@@ -100,7 +104,8 @@ impl TestHarness {
             pool: pool.clone(),
             bot,
             receipts: Arc::new(CqrsReceiptService::new(
-                receipt_inventory_event_store.clone(),
+                receipt_inventory_event_store,
+                receipt_inventory_cqrs,
             )),
         };
 

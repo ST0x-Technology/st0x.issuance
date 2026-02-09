@@ -582,6 +582,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
 
     use super::*;
@@ -610,13 +611,21 @@ mod tests {
 
             let receipt_store =
                 Arc::new(MemStore::<ReceiptInventory>::default());
+            let receipt_cqrs = Arc::new(CqrsFramework::new(
+                (*receipt_store).clone(),
+                vec![],
+                (),
+            ));
             let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
             let mint_services = MintServices {
                 vault: Arc::new(MockVaultService::new_success()),
                 alpaca: Arc::new(MockAlpacaService::new_success()),
                 pool: pool.clone(),
                 bot,
-                receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+                receipts: Arc::new(CqrsReceiptService::new(
+                    receipt_store,
+                    receipt_cqrs,
+                )),
             };
 
             let view_repo =

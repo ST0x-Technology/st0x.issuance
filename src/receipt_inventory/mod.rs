@@ -9,12 +9,16 @@ pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
-use cqrs_es::{Aggregate, AggregateContext, AggregateError, EventStore};
+use cqrs_es::{
+    Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::mint::IssuerRequestId;
+use crate::vault::ReceiptInformation;
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
@@ -22,9 +26,6 @@ pub(crate) use burn_tracking::{
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 pub(crate) use view::ReceiptInventoryView;
-
-use crate::mint::IssuerRequestId;
-use crate::vault::ReceiptInformation;
 
 /// Receipt data recovered from the inventory for mint recovery.
 #[derive(Debug, Clone)]
@@ -127,12 +128,28 @@ struct ReceiptMetadata {
     block_number: u64,
 }
 
-/// Provides the capability to query and plan burns against receipts.
+/// Provides receipt inventory capabilities for command handlers.
 ///
-/// This trait abstracts the receipt inventory query for use by command handlers.
+/// Abstracts receipt discovery, querying, and burn planning.
 /// Implementation uses the ReceiptInventory aggregate.
 #[async_trait]
 pub(crate) trait ReceiptService: Send + Sync {
+    /// Registers a newly minted receipt in the inventory.
+    ///
+    /// Called after a successful on-chain deposit to make the receipt
+    /// immediately available for burn planning. The monitor/backfill
+    /// will also discover it eventually, but explicit registration
+    /// avoids the timing gap.
+    async fn register_minted_receipt(
+        &self,
+        vault: Address,
+        receipt_id: ReceiptId,
+        shares: Shares,
+        block_number: u64,
+        tx_hash: B256,
+        issuer_request_id: IssuerRequestId,
+    ) -> Result<(), ReceiptRegistrationError>;
+
     /// Returns a burn plan: which receipts to burn and how much from each.
     ///
     /// The plan satisfies the required burn amount by selecting from available
@@ -155,20 +172,30 @@ pub(crate) trait ReceiptService: Send + Sync {
     ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>;
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ReceiptRegistrationError {
+    #[error(transparent)]
+    Aggregate(#[from] AggregateError<ReceiptInventoryError>),
+}
+
 /// Implementation of ReceiptService using the ReceiptInventory aggregate.
 pub(crate) struct CqrsReceiptService<ES>
 where
     ES: EventStore<ReceiptInventory>,
 {
     store: Arc<ES>,
+    cqrs: Arc<CqrsFramework<ReceiptInventory, ES>>,
 }
 
 impl<ES> CqrsReceiptService<ES>
 where
     ES: EventStore<ReceiptInventory>,
 {
-    pub(crate) const fn new(store: Arc<ES>) -> Self {
-        Self { store }
+    pub(crate) const fn new(
+        store: Arc<ES>,
+        cqrs: Arc<CqrsFramework<ReceiptInventory, ES>>,
+    ) -> Self {
+        Self { store, cqrs }
     }
 }
 
@@ -178,6 +205,31 @@ where
     ES: EventStore<ReceiptInventory> + Send + Sync,
     ES::AC: Send,
 {
+    async fn register_minted_receipt(
+        &self,
+        vault: Address,
+        receipt_id: ReceiptId,
+        shares: Shares,
+        block_number: u64,
+        tx_hash: B256,
+        issuer_request_id: IssuerRequestId,
+    ) -> Result<(), ReceiptRegistrationError> {
+        self.cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id,
+                    balance: shares,
+                    block_number,
+                    tx_hash,
+                    source: ReceiptSource::Itn { issuer_request_id },
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
     async fn for_burn(
         &self,
         vault: Address,
@@ -189,6 +241,18 @@ where
         let receipts = context.aggregate().receipts_with_balance();
         plan_burn(receipts, shares_to_burn, dust)
     }
+
+    async fn find_by_issuer_request_id(
+        &self,
+        vault: &Address,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
+        let receipt_inventory = self
+            .store
+            .load_aggregate(&vault.to_string())
+            .await?
+            .aggregate()
+            .clone();
 
         let Some(receipt_id) =
             receipt_inventory.find_by_issuer_request_id(issuer_request_id)
@@ -1032,7 +1096,7 @@ mod tests {
         receipts: Vec<(u64, u64)>,
     ) -> CqrsReceiptService<MemStore<ReceiptInventory>> {
         let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
@@ -1052,7 +1116,7 @@ mod tests {
             .unwrap();
         }
 
-        CqrsReceiptService::new(store)
+        CqrsReceiptService::new(store, cqrs)
     }
 
     #[tokio::test]
@@ -1277,5 +1341,106 @@ mod tests {
                 panic!("Expected Itn source, got External");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_register_minted_receipt_makes_receipt_available_for_burn() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        service
+            .register_minted_receipt(
+                vault,
+                make_receipt_id(1),
+                make_shares(100),
+                5000,
+                tx_hash,
+                IssuerRequestId::new("iss-test-1"),
+            )
+            .await
+            .expect("Registration should succeed");
+
+        let plan = service
+            .for_burn(vault, make_shares(50), make_shares(0))
+            .await
+            .expect("Burn planning should succeed with registered receipt");
+
+        assert_eq!(plan.total_burn, make_shares(50));
+        assert_eq!(plan.allocations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_minted_receipt_is_findable_by_issuer_request_id() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let issuer_request_id = IssuerRequestId::new("iss-findable");
+
+        service
+            .register_minted_receipt(
+                vault,
+                make_receipt_id(42),
+                make_shares(200),
+                6000,
+                tx_hash,
+                issuer_request_id.clone(),
+            )
+            .await
+            .expect("Registration should succeed");
+
+        let found = service
+            .find_by_issuer_request_id(&vault, &issuer_request_id)
+            .await
+            .expect("Lookup should succeed");
+
+        let receipt =
+            found.expect("Receipt should be found by issuer_request_id");
+        assert_eq!(receipt.receipt_id, U256::from(42));
+        assert_eq!(receipt.tx_hash, tx_hash);
+        assert_eq!(receipt.shares, U256::from(200));
+        assert_eq!(receipt.block_number, 6000);
+    }
+
+    #[tokio::test]
+    async fn test_register_minted_receipt_is_idempotent() {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+
+        for _ in 0..2 {
+            service
+                .register_minted_receipt(
+                    vault,
+                    make_receipt_id(7),
+                    make_shares(500),
+                    7000,
+                    tx_hash,
+                    IssuerRequestId::new("iss-idempotent"),
+                )
+                .await
+                .expect("Registration should succeed (idempotent)");
+        }
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let receipts = context.aggregate().receipts_with_balance();
+
+        assert_eq!(
+            receipts.len(),
+            1,
+            "Duplicate registration should not create duplicate receipts"
+        );
     }
 }

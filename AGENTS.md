@@ -52,8 +52,8 @@ Relevant docs:
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks
   - All tests SHOULD pass at the end of each task whenever possible
-  - Focused git diffs and passing tests make reviewing much easier sections or
-    verbose changelogs
+  - Focused git diffs and passing tests make reviewing much easier than
+    large changesets or verbose changelogs
 - The code diffs themselves should be self-explanatory and easy to review
 
 ### After completing a plan
@@ -996,10 +996,10 @@ reference chain. See `src/redemption/detector.rs` for an example.
 Code should be self-documenting. Comment only when adding context that code
 structure cannot express.
 
-** DO comment:** Complex business logic, algorithm rationale, external system
+**DO comment:** Complex business logic, algorithm rationale, external system
 behavior, non-obvious constraints, test data context, workarounds.
 
-** DON'T comment:** Self-explanatory code, restating what code does, obvious
+**DON'T comment:** Self-explanatory code, restating what code does, obvious
 assignments, test section markers, section dividers (e.g., `// ========`),
 references to tasks/issues (reviewers and future maintainers won't have access
 to transient planning artifacts).

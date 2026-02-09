@@ -812,8 +812,10 @@ mod tests {
             let receipt_inventory_cqrs =
                 Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
-            let receipt_service =
-                Arc::new(CqrsReceiptService::new(receipt_inventory_store));
+            let receipt_service = Arc::new(CqrsReceiptService::new(
+                receipt_inventory_store,
+                receipt_inventory_cqrs.clone(),
+            ));
 
             Self {
                 cqrs,
