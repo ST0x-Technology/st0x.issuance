@@ -285,9 +285,8 @@ async fn test_mint_recovery_after_view_deletion()
 /// 2. Roll back event store to `Minting` state (delete TokensMinted and later events)
 /// 3. Delete view
 /// 4. Restart service
-/// 5. Recovery should detect the receipt exists and record mint success (NOT re-mint)
-///
-/// This test should FAIL until mint recovery for `Minting` state is implemented.
+/// 5. Recovery detects the existing receipt via receipt inventory and records
+///    mint success without re-minting
 #[tokio::test]
 async fn test_mint_recovery_from_minting_state_when_receipt_exists()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -421,9 +420,7 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
 /// 1. Create mint events directly in event store up to `Minting` state
 /// 2. No on-chain mint happens (simulates crash before blockchain call)
 /// 3. Start service
-/// 4. Recovery should retry the mint and complete it
-///
-/// This test should FAIL until mint recovery for `Minting` state is implemented.
+/// 4. Recovery finds no receipt in inventory and retries the mint
 #[tokio::test]
 async fn test_mint_recovery_from_minting_state_when_no_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -510,9 +507,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
 /// 1. Manually mint on-chain with a specific issuer_request_id
 /// 2. Create mint events directly in event store with matching issuer_request_id
 /// 3. Start service
-/// 4. Recovery should find the receipt and NOT mint again
-///
-/// This test should FAIL until mint recovery for `Minting` state is implemented.
+/// 4. Recovery finds the existing receipt and records it without minting again
 #[tokio::test]
 async fn test_mint_recovery_prevents_double_mint()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -643,9 +638,7 @@ async fn test_mint_recovery_prevents_double_mint()
 /// Scenario:
 /// 1. Create mint events directly in event store up to `MintingFailed` state
 /// 2. Start service
-/// 3. Recovery should retry the mint and complete it
-///
-/// This test should FAIL until mint recovery for `MintingFailed` state is implemented.
+/// 3. Recovery retries the mint and completes it
 #[tokio::test]
 async fn test_mint_recovery_from_minting_failed_state()
 -> Result<(), Box<dyn std::error::Error>> {

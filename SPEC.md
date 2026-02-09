@@ -20,12 +20,12 @@ settlement layer between Authorized Participants (APs) and us.
 
 **Flow Summary:**
 
-- **Minting:** AP requests mint → Alpaca calls our endpoint → We validate →
-  Alpaca journals shares from AP to our custodian account → Alpaca confirms
-  journal → We mint tokens on-chain → We call Alpaca's callback
-- **Redeeming:** AP sends tokens to our redemption wallet → We detect redemption
-  → We call Alpaca's redeem endpoint → Alpaca journals shares from our account
-  to AP → We burn tokens on-chain
+- **Minting:** AP requests mint -> Alpaca calls our endpoint -> We validate ->
+  Alpaca journals shares from AP to our custodian account -> Alpaca confirms
+  journal -> We mint tokens on-chain -> We call Alpaca's callback
+- **Redeeming:** AP sends tokens to our redemption wallet -> We detect
+  redemption -> We call Alpaca's redeem endpoint -> Alpaca journals shares from
+  our account to AP -> We burn tokens on-chain
 
 **Use Cases:**
 
@@ -180,8 +180,15 @@ initial request through journal confirmation to on-chain minting and callback.
   operation via the vault service
 - `SendCallback { issuer_request_id }` - Send the callback to Alpaca confirming
   mint completion
-- `Recover { issuer_request_id }` - Recover a mint stuck in an incomplete state
-  (checks receipt inventory for existing receipts, retries if not found)
+- `Recover { issuer_request_id }` - Recover a mint stuck in an incomplete state.
+  Invoked at startup by the mint recovery process for any mint in
+  `JournalConfirmed`, `Minting`, `MintingFailed`, or `CallbackPending` state.
+  Queries the receipt inventory for a receipt matching the `issuer_request_id`.
+  If a matching receipt is found, the mint already succeeded on-chain, so
+  recovery records the existing mint (`ExistingMintRecovered`) and proceeds to
+  callback. If no receipt is found, recovery retries the on-chain deposit
+  (`MintRetryStarted`). This prevents double-minting after crashes while
+  ensuring stuck mints eventually complete
 
 **Events:**
 
@@ -196,16 +203,24 @@ initial request through journal confirmation to on-chain minting and callback.
   (carries tx details)
 - `MintRetryStarted` - Mint retry started during recovery
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
-| Command          | Events                    | Notes                    |
-| ---------------- | ------------------------- | ------------------------ |
-| `Initiate`       | `Initiated`               | Mint request created     |
-| `ConfirmJournal` | `JournalConfirmed`        | Journal confirmed        |
-| `RejectJournal`  | `JournalRejected`         | Terminal failure         |
-| `Deposit`        | `MintingStarted` + result | Calls vault service      |
-| `SendCallback`   | `MintCompleted`           | Calls Alpaca callback    |
-| `Recover`        | Recovery + mint events    | Checks receipt inventory |
+| Command          | Events             | Notes                    |
+| ---------------- | ------------------ | ------------------------ |
+| `Initiate`       | `Initiated`        | Mint request created     |
+| `ConfirmJournal` | `JournalConfirmed` | Journal confirmed        |
+| `RejectJournal`  | `JournalRejected`  | Terminal failure         |
+| `Deposit`        | See below          | Calls vault service      |
+| `SendCallback`   | `MintCompleted`    | Calls Alpaca callback    |
+| `Recover`        | See below          | Checks receipt inventory |
+
+`Deposit` emits `MintingStarted`, then either `TokensMinted` (success) or
+`MintingFailed` (failure).
+
+`Recover` checks the receipt inventory for a receipt matching the
+`issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found,
+emits `MintRetryStarted` then follows the same path as `Deposit`
+(`MintingStarted`, then `TokensMinted` or `MintingFailed`).
 
 ### Redemption Aggregate
 
@@ -245,7 +260,7 @@ on-chain transfer through calling Alpaca to burning tokens.
   single redemption spans multiple ERC-1155 receipts
 - `BurningFailed` - On-chain burn failed (terminal)
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
 | Command                 | Events                   | Notes                                |
 | ----------------------- | ------------------------ | ------------------------------------ |
@@ -294,7 +309,7 @@ system. The account lifecycle follows these steps:
 - `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
   minting and redemptions
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
 | Command           | Events Produced     | Notes                                |
 | ----------------- | ------------------- | ------------------------------------ |
@@ -343,7 +358,7 @@ tokenization.
 - `VaultAddressUpdated { underlying, vault_address, previous_address }` - Vault
   address changed
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
 | Command              | Events Produced       | Notes                                       |
 | -------------------- | --------------------- | ------------------------------------------- |
@@ -975,7 +990,7 @@ sequenceDiagram
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
 
-    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account → To: AP
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account -> To: AP
 
     loop Poll for completion
         Us->>Alpaca: GET /tokenization/requests
@@ -1435,7 +1450,7 @@ events.
 - Listens to: `MintEvent::Initiated` (captures underlying/token),
   `MintEvent::TokensMinted` (creates active receipt),
   `RedemptionEvent::TokensBurned` (decreases balance, transitions to Depleted)
-- State transitions: Unavailable → Pending → Active → Depleted
+- State transitions: Unavailable -> Pending -> Active -> Depleted
 - Updates: Accumulates data across event sequence to track each receipt's
   lifecycle from creation through complete depletion
 - Used for: Selecting which receipt to burn from during redemptions, inventory
