@@ -484,6 +484,10 @@ Environment variables (can be set via `.env` file):
   operator as if all required variants exist, then let the compiler tell you
   exactly which `From` impls are missing. Add `#[from]` variants only for errors
   the compiler complains about.
+  - **FORBIDDEN**: Verbose `.map_err()` calls - use `#[from]` instead
+  - **FORBIDDEN**: `.map_err(|e| SomeError::Variant(e.to_string()))` -
+    stringly-typed
+  - **CORRECT**: Add `#[from]` to error variant, use `?` directly
 - **CRITICAL: Make Invalid States Unrepresentable**: This is a fundamental
   principle of type modeling in this codebase. Use algebraic data types (ADTs)
   and enums to encode business rules and state transitions directly in types
@@ -824,14 +828,24 @@ fn test_validates_quantity() {
 
 ## Workflow Best Practices
 
-- **Type checking and tests are the primary feedback mechanism during
-  development** - Use `cargo build` and `cargo test --workspace` iteratively as
-  you write code. Do NOT run clippy until all tests pass.
-- **Clippy is for cleanup, not development** - Only run clippy after all tests
-  pass. Clippy warnings about unused code, unused imports, etc. are expected
-  during development when you're defining types before implementing logic (TTDD
-  pattern). Running clippy prematurely wastes time on warnings that will resolve
-  themselves once implementation is complete.
+**Workflow (TTDD - Type-driven TDD)**:
+
+TTDD sequence:
+
+1. **Types first**: Define types, traits, and method signatures that model the
+   domain
+2. **Failing tests**: Write tests that compile but fail (build errors don't
+   count as failing tests)
+3. **Implementation**: Write the logic to make tests pass
+
+While developing, continuously run `cargo check` and `cargo test` to verify
+types and behavior. Only after implementation is complete, run `cargo clippy`
+and fix all warnings. Finally, `cargo fmt` before committing.
+
+**CRITICAL: Never use `cargo build` for verification.** Use `cargo check`
+(faster) or `cargo test` (more useful). Only use `cargo build` when you need the
+binary.
+
 - **Before handing over a piece of work**, run checks in this order:
   1. `cargo test --workspace` - All tests must pass
   2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
