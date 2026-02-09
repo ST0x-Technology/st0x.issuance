@@ -271,8 +271,6 @@ pub async fn initialize_rocket(
             bot_wallet,
         )?;
 
-    spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
-
     let managers = setup_redemption_managers(
         &config,
         blockchain_service,
@@ -283,6 +281,9 @@ pub async fn initialize_rocket(
         bot_wallet,
     )?;
 
+    // Reprojections must complete BEFORE recovery runs, so recovery queries
+    // up-to-date views. Without this ordering, recovery might miss stuck
+    // operations if the view was deleted/corrupted.
     info!("Replaying views to ensure schema updates are applied");
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
@@ -291,6 +292,8 @@ pub async fn initialize_rocket(
     // Create a single provider for all receipt operations
     let provider = config.create_provider().await?;
 
+    // Receipt backfill must run before recovery so that recovery can check
+    // receipt inventory to detect already-minted receipts (prevents double-mints).
     let receipt_contract = run_receipt_backfill(
         &config,
         provider.clone(),
@@ -308,6 +311,8 @@ pub async fn initialize_rocket(
         bot_wallet,
     );
 
+    // Recovery runs AFTER reprojections and backfill so it can query accurate state
+    spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
     spawn_redemption_recovery(
         managers.redeem_call.clone(),
         managers.journal.clone(),
