@@ -368,7 +368,7 @@ where
     /// # Returns
     ///
     /// Returns `Ok(())` if burning succeeded and `RecordBurnSuccess` command was executed.
-    /// Returns `Err(BurnManagerError::Blockchain)` if burning failed (`RecordBurnFailure`
+    /// Returns `Err(BurnManagerError::Vault)` if burning failed (`RecordBurnFailure`
     /// command is still executed to record the failure).
     ///
     /// # Errors
@@ -376,7 +376,7 @@ where
     /// * `BurnManagerError::InvalidAggregateState` - Aggregate is not in `Burning` state
     /// * `BurnManagerError::QuantityConversion` - Quantity cannot be converted to U256
     /// * `BurnManagerError::InsufficientBalance` - No receipt with sufficient balance found
-    /// * `BurnManagerError::Blockchain` - Blockchain transaction failed
+    /// * `BurnManagerError::Vault` - Blockchain transaction failed
     /// * `BurnManagerError::Cqrs` - Command execution failed
     /// * `BurnManagerError::Database` - Receipt query failed
     pub(crate) async fn handle_burning_started(
@@ -603,7 +603,7 @@ where
 
                 Ok(())
             }
-            Err(AggregateError::UserError(RedemptionError::BurnFailed(
+            Err(AggregateError::UserError(RedemptionError::Vault(
                 err,
             ))) => {
                 warn!(
@@ -627,7 +627,7 @@ where
                     "RecordBurnFailure command recorded"
                 );
 
-                Err(BurnManagerError::Blockchain(err))
+                Err(BurnManagerError::Vault(err))
             }
             Err(err) => Err(err.into()),
         }
@@ -682,8 +682,8 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BurnManagerError {
-    #[error("Blockchain error: {0}")]
-    Blockchain(#[from] VaultError),
+    #[error("Vault error: {0}")]
+    Vault(#[from] VaultError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
@@ -1051,7 +1051,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(BurnManagerError::Blockchain(_))),
+            matches!(result, Err(BurnManagerError::Vault(_))),
             "Expected blockchain error, got {result:?}"
         );
 

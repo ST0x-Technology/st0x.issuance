@@ -45,7 +45,7 @@ pub(crate) enum ReceiptMonitorError {
     #[error("RPC transport error: {0}")]
     Transport(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to decode event: {0}")]
-    EventDecode(#[from] alloy::sol_types::Error),
+    SolTypes(#[from] alloy::sol_types::Error),
     #[error("Missing transaction hash in log")]
     MissingTxHash,
     #[error("Missing block number in log")]

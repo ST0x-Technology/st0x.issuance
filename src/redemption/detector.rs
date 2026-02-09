@@ -409,10 +409,10 @@ where
 pub(crate) enum RedemptionMonitorError {
     #[error("RPC error")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("Failed to decode Transfer event: {0}")]
-    EventDecode(#[from] alloy::sol_types::Error),
-    #[error("Failed to list assets: {0}")]
-    ListAssets(#[from] TokenizedAssetViewError),
+    #[error("Sol types error: {0}")]
+    SolTypes(#[from] alloy::sol_types::Error),
+    #[error("Tokenized asset view error: {0}")]
+    TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("No asset found for vault {vault}")]
     NoMatchingAsset { vault: Address },
     #[error("Missing transaction hash in log")]
@@ -421,10 +421,10 @@ pub(crate) enum RedemptionMonitorError {
     MissingBlockNumber,
     #[error("Failed to convert quantity: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
-    #[error("Failed to record redemption detection: {0}")]
-    CqrsExecution(#[from] cqrs_es::AggregateError<RedemptionError>),
-    #[error("Failed to query account: {0}")]
-    AccountQuery(#[from] AccountViewError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] cqrs_es::AggregateError<RedemptionError>),
+    #[error("Account view error: {0}")]
+    AccountView(#[from] AccountViewError),
     #[error("No account found for wallet {wallet}")]
     AccountNotFound { wallet: Address },
     #[error("Account not linked for wallet {wallet}")]
@@ -1000,7 +1000,7 @@ mod tests {
         assert!(
             matches!(
                 second_result,
-                Err(RedemptionMonitorError::CqrsExecution(_))
+                Err(RedemptionMonitorError::Aggregate(_))
             ),
             "Second detection should fail with CQRS error, got {second_result:?}"
         );

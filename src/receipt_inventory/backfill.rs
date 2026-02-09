@@ -62,7 +62,7 @@ pub(crate) enum BackfillError {
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to decode TransferSingle event: {0}")]
-    EventDecode(#[from] alloy::sol_types::Error),
+    SolTypes(#[from] alloy::sol_types::Error),
     #[error("Missing transaction hash in log")]
     MissingTxHash,
     #[error("Missing block number in log")]

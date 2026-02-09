@@ -34,7 +34,7 @@ pub(crate) enum FireblocksVaultError {
     #[error("no deposit address found for vault {}, asset {}", vault_id.as_str(), asset_id.as_str())]
     NoAddress { vault_id: FireblocksVaultAccountId, asset_id: AssetId },
     #[error("invalid address from Fireblocks: {0}")]
-    InvalidAddress(#[from] alloy::hex::FromHexError),
+    Hex(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
     #[error(

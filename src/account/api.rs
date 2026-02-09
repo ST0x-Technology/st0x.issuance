@@ -11,8 +11,8 @@ use tracing::error;
 use uuid::Uuid;
 
 use super::{
-    AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
-    view::find_by_client_id, view::find_by_email,
+    AccountCommand, AccountError, AccountView, AlpacaAccountNumber, ClientId,
+    Email, view::AccountViewError, view::find_by_client_id, view::find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
@@ -28,12 +28,10 @@ impl<'a> FromParam<'a> for ClientId {
 pub(crate) enum ApiError {
     #[error("Account not found")]
     AccountNotFound,
-
-    #[error("Database error: {0}")]
-    Database(#[from] super::view::AccountViewError),
-
-    #[error("Command execution failed: {0}")]
-    CommandFailed(#[from] cqrs_es::AggregateError<super::AccountError>),
+    #[error("Account view error: {0}")]
+    AccountView(#[from] AccountViewError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<AccountError>),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -43,7 +41,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
     ) -> rocket::response::Result<'static> {
         let status = match self {
             Self::AccountNotFound => Status::NotFound,
-            Self::Database(_) | Self::CommandFailed(_) => {
+            Self::AccountView(_) | Self::Aggregate(_) => {
                 Status::InternalServerError
             }
         };

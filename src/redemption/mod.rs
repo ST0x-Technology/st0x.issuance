@@ -18,6 +18,7 @@ use tracing::warn;
 
 use crate::Quantity;
 use crate::mint::{IssuerRequestId, TokenizationRequestId};
+use crate::vault::VaultError;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::{
     MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultService,
@@ -144,7 +145,7 @@ impl Redemption {
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(self, Self::Uninitialized) {
             return Err(RedemptionError::AlreadyDetected {
-                issuer_request_id: input.issuer_request_id.as_str().to_string(),
+                issuer_request_id: input.issuer_request_id,
             });
         }
 
@@ -414,13 +415,11 @@ impl Redemption {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionError {
     #[error("Redemption already detected for request: {issuer_request_id}")]
-    AlreadyDetected { issuer_request_id: String },
-
+    AlreadyDetected { issuer_request_id: IssuerRequestId },
     #[error("Invalid state for operation: expected {expected}, found {found}")]
     InvalidState { expected: String, found: String },
-
-    #[error("Burn operation failed: {0}")]
-    BurnFailed(#[from] crate::vault::VaultError),
+    #[error("Vault error: {0}")]
+    Vault(#[from] VaultError),
 }
 
 impl PartialEq for RedemptionError {
@@ -434,9 +433,7 @@ impl PartialEq for RedemptionError {
                 Self::InvalidState { expected: e1, found: f1 },
                 Self::InvalidState { expected: e2, found: f2 },
             ) => e1 == e2 && f1 == f2,
-            (Self::BurnFailed(a), Self::BurnFailed(b)) => {
-                a.to_string() == b.to_string()
-            }
+            (Self::Vault(a), Self::Vault(b)) => a.to_string() == b.to_string(),
             _ => false,
         }
     }
@@ -743,7 +740,7 @@ mod tests {
                 block_number,
             })
             .then_expect_error(RedemptionError::AlreadyDetected {
-                issuer_request_id: issuer_request_id.as_str().to_string(),
+                issuer_request_id: issuer_request_id.clone(),
             });
     }
 

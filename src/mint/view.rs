@@ -663,10 +663,10 @@ mod tests {
                 .expect("Failed to initiate mint");
         }
 
-        async fn initiate_mint_with_tok_id(
+        async fn initiate_mint_with_tokenization_request_id(
             &self,
             issuer_request_id: &IssuerRequestId,
-            tok_id: &str,
+            tokenization_request_id: &str,
         ) {
             let client_id = ClientId::new();
             let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -676,7 +676,7 @@ mod tests {
                     MintCommand::Initiate {
                         issuer_request_id: issuer_request_id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
-                            tok_id,
+                            tokenization_request_id,
                         ),
                         quantity: Quantity::new(Decimal::from(100)),
                         underlying: UnderlyingSymbol::new("AAPL"),
@@ -1618,36 +1618,36 @@ mod tests {
 
         // JournalConfirmed: Initiate -> ConfirmJournal
         let iss_jc = IssuerRequestId::new("iss-jc-1");
-        harness.initiate_mint_with_tok_id(&iss_jc, "alp-jc-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_jc, "alp-jc-1").await;
         harness.confirm_journal(&iss_jc).await;
 
         // Minting: Initiate -> ConfirmJournal -> StartMinting
         let iss_minting = IssuerRequestId::new("iss-minting-1");
-        harness.initiate_mint_with_tok_id(&iss_minting, "alp-minting-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_minting, "alp-minting-1").await;
         harness.confirm_journal(&iss_minting).await;
         harness.start_minting(&iss_minting).await;
 
         // MintingFailed: Initiate -> ConfirmJournal -> StartMinting -> FailMinting
         let iss_failed = IssuerRequestId::new("iss-failed-1");
-        harness.initiate_mint_with_tok_id(&iss_failed, "alp-failed-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_failed, "alp-failed-1").await;
         harness.confirm_journal(&iss_failed).await;
         harness.start_minting(&iss_failed).await;
         harness.fail_minting(&iss_failed, "Transaction reverted").await;
 
         // CallbackPending: Initiate -> ConfirmJournal -> StartMinting -> CompleteMinting
         let iss_cp = IssuerRequestId::new("iss-cp-1");
-        harness.initiate_mint_with_tok_id(&iss_cp, "alp-cp-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_cp, "alp-cp-1").await;
         harness.confirm_journal(&iss_cp).await;
         harness.start_minting(&iss_cp).await;
         harness.complete_minting(&iss_cp, uint!(1_U256), 1000).await;
 
         // Initiated (should NOT be recovered)
         let iss_init = IssuerRequestId::new("iss-init-1");
-        harness.initiate_mint_with_tok_id(&iss_init, "alp-init-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_init, "alp-init-1").await;
 
         // Completed (should NOT be recovered)
         let iss_done = IssuerRequestId::new("iss-done-1");
-        harness.initiate_mint_with_tok_id(&iss_done, "alp-done-1").await;
+        harness.initiate_mint_with_tokenization_request_id(&iss_done, "alp-done-1").await;
         harness.confirm_journal(&iss_done).await;
         harness.start_minting(&iss_done).await;
         harness.complete_minting(&iss_done, uint!(2_U256), 1001).await;
