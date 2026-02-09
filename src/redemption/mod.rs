@@ -740,7 +740,7 @@ mod tests {
                 block_number,
             })
             .then_expect_error(RedemptionError::AlreadyDetected {
-                issuer_request_id: issuer_request_id.clone(),
+                issuer_request_id,
             });
     }
 

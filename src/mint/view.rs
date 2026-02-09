@@ -663,45 +663,6 @@ mod tests {
                 .expect("Failed to initiate mint");
         }
 
-        async fn initiate_mint_with_tokenization_request_id(
-            &self,
-            issuer_request_id: &IssuerRequestId,
-            tokenization_request_id: &str,
-        ) {
-            let client_id = ClientId::new();
-            let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-            self.cqrs
-                .execute(
-                    &issuer_request_id.0,
-                    MintCommand::Initiate {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tokenization_request_id: TokenizationRequestId::new(
-                            tokenization_request_id,
-                        ),
-                        quantity: Quantity::new(Decimal::from(100)),
-                        underlying: UnderlyingSymbol::new("AAPL"),
-                        token: TokenSymbol::new("tAAPL"),
-                        network: Network::new("base"),
-                        client_id,
-                        wallet,
-                    },
-                )
-                .await
-                .unwrap();
-        }
-
-        async fn confirm_journal(&self, issuer_request_id: &IssuerRequestId) {
-            self.cqrs
-                .execute(
-                    &issuer_request_id.0,
-                    MintCommand::ConfirmJournal {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-        }
-
         async fn insert_view(
             &self,
             issuer_request_id: &IssuerRequestId,
@@ -1575,12 +1536,8 @@ mod tests {
         assert_eq!(view, original_view);
     }
 
-    #[tokio::test]
-    async fn test_find_all_recoverable_mints_returns_all_recoverable_states() {
-        let harness = TestHarness::new().await;
-        let now = Utc::now();
-
-        let mint_fields = |iss: &str| TestMintFields {
+    fn test_mint_fields(iss: &str) -> TestMintFields {
+        TestMintFields {
             issuer_request_id: IssuerRequestId::new(iss),
             tokenization_request_id: TokenizationRequestId::new("alp-1"),
             quantity: Quantity::new(Decimal::from(100)),
@@ -1589,11 +1546,14 @@ mod tests {
             network: Network::new("base"),
             client_id: ClientId::new(),
             wallet: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            initiated_at: now,
-        };
+            initiated_at: Utc::now(),
+        }
+    }
 
-        // JournalConfirmed
-        let fields = mint_fields("iss-jc-1");
+    async fn seed_recoverable_mint_views(harness: &TestHarness) {
+        let now = Utc::now();
+
+        let fields = test_mint_fields("iss-jc-1");
         harness
             .insert_view(
                 &fields.issuer_request_id,
@@ -1612,8 +1572,7 @@ mod tests {
             )
             .await;
 
-        // Minting (legacy state - only from historical events)
-        let fields = mint_fields("iss-minting-1");
+        let fields = test_mint_fields("iss-minting-1");
         harness
             .insert_view(
                 &fields.issuer_request_id,
@@ -1633,8 +1592,7 @@ mod tests {
             )
             .await;
 
-        // MintingFailed
-        let fields = mint_fields("iss-failed-1");
+        let fields = test_mint_fields("iss-failed-1");
         harness
             .insert_view(
                 &fields.issuer_request_id,
@@ -1655,8 +1613,7 @@ mod tests {
             )
             .await;
 
-        // CallbackPending
-        let fields = mint_fields("iss-cp-1");
+        let fields = test_mint_fields("iss-cp-1");
         harness.insert_view(&fields.issuer_request_id, &MintView::CallbackPending {
             issuer_request_id: fields.issuer_request_id.clone(),
             tokenization_request_id: fields.tokenization_request_id,
@@ -1675,9 +1632,12 @@ mod tests {
             block_number: 1000,
             minted_at: now,
         }).await;
+    }
 
-        // Initiated (should NOT be recovered)
-        let fields = mint_fields("iss-init-1");
+    async fn seed_non_recoverable_mint_views(harness: &TestHarness) {
+        let now = Utc::now();
+
+        let fields = test_mint_fields("iss-init-1");
         harness
             .insert_view(
                 &fields.issuer_request_id,
@@ -1695,8 +1655,7 @@ mod tests {
             )
             .await;
 
-        // Completed (should NOT be recovered)
-        let fields = mint_fields("iss-done-1");
+        let fields = test_mint_fields("iss-done-1");
         harness.insert_view(&fields.issuer_request_id, &MintView::Completed {
             issuer_request_id: fields.issuer_request_id.clone(),
             tokenization_request_id: fields.tokenization_request_id,
@@ -1716,6 +1675,13 @@ mod tests {
             minted_at: now,
             completed_at: now,
         }).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_all_recoverable_mints_returns_all_recoverable_states() {
+        let harness = TestHarness::new().await;
+        seed_recoverable_mint_views(&harness).await;
+        seed_non_recoverable_mint_views(&harness).await;
 
         let results = find_all_recoverable_mints(&harness.pool).await.unwrap();
 
