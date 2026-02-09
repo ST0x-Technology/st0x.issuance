@@ -1227,3 +1227,174 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
 
     Ok(())
 }
+
+/// Tests that mint recovery works even when the mint view needs reprojection.
+///
+/// This test reproduces a bug where:
+/// 1. Mint reaches JournalConfirmed state
+/// 2. Service "crashes"
+/// 3. Mint view is deleted (simulating schema migration or corruption)
+/// 4. Service restarts, but recovery runs BEFORE view reprojection
+/// 5. Recovery queries empty view, misses the stuck mint
+///
+/// The fix: Reprojections must run BEFORE recovery.
+///
+/// To create a mint stuck in JournalConfirmed state, we:
+/// 1. Complete a mint normally (all the way through)
+/// 2. Delete events after JournalConfirmed to roll back the aggregate state
+/// 3. Delete the view
+/// 4. Restart - recovery should find the JournalConfirmed mint
+#[tokio::test]
+async fn test_mint_recovery_after_view_deletion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    // Standard Anvil test account #2 (not a secret - these are well-known test keys)
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    // Use file-based database to persist across restarts
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_view_reprojection.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Setup mocks
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        setup_redemption_mocks(&mock_alpaca, user_wallet);
+
+    let config1 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    seed_tokenized_asset(&client1, evm.vault_address).await;
+    setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    // Setup account and complete a mint
+    let link_body = setup_account(&client1, user_wallet).await;
+    let issuer_request_id = perform_mint_and_confirm(
+        &client1,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-mint-view-test",
+        "50.0",
+    )
+    .await?;
+
+    // Wait for mint to complete
+    let user_wallet_instance = EthereumWallet::from(user_signer.clone());
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+    wait_for_shares(&vault, user_wallet).await?;
+
+    // "Crash" - drop the service
+    drop(client1);
+
+    // Connect to the database to manipulate state
+    let query_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await?;
+
+    // Roll back the mint to JournalConfirmed state by deleting events after sequence 2
+    // Event sequence: 1=MintInitiated, 2=JournalConfirmed, 3+=MintingStarted, TokensMinted, etc.
+    // The aggregate_id is just the issuer_request_id string
+    let aggregate_id = issuer_request_id.clone();
+    sqlx::query!(
+        r#"
+        DELETE FROM events
+        WHERE aggregate_type = 'Mint'
+          AND aggregate_id = ?
+          AND sequence > 2
+        "#,
+        aggregate_id
+    )
+    .execute(&query_pool)
+    .await?;
+
+    // Verify we have exactly 2 events (MintInitiated, JournalConfirmed)
+    let event_count = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!: i32"
+        FROM events
+        WHERE aggregate_type = 'Mint' AND aggregate_id = ?
+        "#,
+        aggregate_id
+    )
+    .fetch_one(&query_pool)
+    .await?;
+    assert_eq!(
+        event_count.count, 2,
+        "Expected exactly 2 events (MintInitiated, JournalConfirmed)"
+    );
+
+    // Delete the mint view to force reprojection
+    sqlx::query!("DELETE FROM mint_view").execute(&query_pool).await?;
+
+    // Verify view is empty
+    let view_count =
+        sqlx::query!(r#"SELECT COUNT(*) as "count!: i32" FROM mint_view"#)
+            .fetch_one(&query_pool)
+            .await?;
+    assert_eq!(view_count.count, 0, "Mint view should be empty after deletion");
+
+    // Close the pool before restarting
+    query_pool.close().await;
+
+    // Restart service - recovery should find the JournalConfirmed mint
+    // BUG: Currently recovery runs BEFORE view reprojection, so it queries
+    // an empty view and misses the stuck mint.
+    let config2 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    // If recovery worked, the mint should complete and user gets shares
+    // Note: The on-chain mint already happened, but we deleted the events,
+    // so recovery will attempt to mint again. This might fail due to
+    // duplicate mint, but that's a separate issue (Task 7-9 handles this).
+    // For now, we just want to verify recovery FINDS the stuck mint.
+
+    // Give recovery time to run
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Check if the mint progressed past JournalConfirmed
+    let query_pool2 = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await?;
+
+    let final_event_count = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!: i32"
+        FROM events
+        WHERE aggregate_type = 'Mint' AND aggregate_id = ?
+        "#,
+        aggregate_id
+    )
+    .fetch_one(&query_pool2)
+    .await?;
+
+    // If recovery worked, there should be more than 2 events
+    // (at minimum MintingStarted would be added)
+    assert!(
+        final_event_count.count > 2,
+        "Recovery should have processed the JournalConfirmed mint. \
+         Expected >2 events, found {}. This indicates recovery ran before \
+         view reprojection and missed the stuck mint.",
+        final_event_count.count
+    );
+
+    Ok(())
+}
