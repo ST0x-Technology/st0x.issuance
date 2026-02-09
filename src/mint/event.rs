@@ -52,6 +52,20 @@ pub(crate) enum MintEvent {
         issuer_request_id: IssuerRequestId,
         completed_at: DateTime<Utc>,
     },
+    /// Indicates that an existing on-chain mint was discovered during recovery.
+    ExistingMintRecovered {
+        issuer_request_id: IssuerRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        block_number: u64,
+        recovered_at: DateTime<Utc>,
+    },
+    /// Indicates that a mint retry has started during recovery.
+    MintRetryStarted {
+        issuer_request_id: IssuerRequestId,
+        started_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for MintEvent {
@@ -74,8 +88,8 @@ impl DomainEvent for MintEvent {
             Self::MintCompleted { .. } => {
                 "MintEvent::MintCompleted".to_string()
             }
-            Self::ExistingMintRecorded { .. } => {
-                "MintEvent::ExistingMintRecorded".to_string()
+            Self::ExistingMintRecovered { .. } => {
+                "MintEvent::ExistingMintRecovered".to_string()
             }
             Self::MintRetryStarted { .. } => {
                 "MintEvent::MintRetryStarted".to_string()

@@ -48,7 +48,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     /// 1. Validates the aggregate is in CallbackPending state
     /// 2. Builds MintCallbackRequest from aggregate data
     /// 3. Calls AlpacaService to send the callback (with retries for transient failures)
-    /// 4. Records success (RecordCallback) via command
+    /// 4. Records success (CompleteCallback) via command
     ///
     /// # Arguments
     ///
@@ -58,7 +58,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if callback succeeded and RecordCallback command was executed.
+    /// Returns `Ok(())` if callback succeeded and CompleteCallback command was executed.
     ///
     /// # Errors
     ///
@@ -112,7 +112,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
                 self.cqrs
                     .execute(
                         issuer_request_id.as_str(),
-                        MintCommand::RecordCallback {
+                        MintCommand::CompleteCallback {
                             issuer_request_id: issuer_request_id.clone(),
                         },
                     )
@@ -120,7 +120,7 @@ impl<ES: EventStore<Mint>> CallbackManager<ES> {
 
                 info!(
                     issuer_request_id = %issuer_request_id,
-                    "RecordCallback command executed successfully"
+                    "CompleteCallback command executed successfully"
                 );
 
                 Ok(())
@@ -371,7 +371,7 @@ mod tests {
 
         cqrs.execute(
             issuer_request_id.as_str(),
-            MintCommand::RecordMintSuccess {
+            MintCommand::CompleteMinting {
                 issuer_request_id: issuer_request_id.clone(),
                 tx_hash,
                 receipt_id,
@@ -678,7 +678,7 @@ mod tests {
         mint_cqrs
             .execute(
                 issuer_request_id.as_str(),
-                MintCommand::RecordMintSuccess {
+                MintCommand::CompleteMinting {
                     issuer_request_id: issuer_request_id.clone(),
                     tx_hash: b256!(
                         "0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -793,7 +793,7 @@ mod tests {
             mint_cqrs
                 .execute(
                     issuer_request_id.as_str(),
-                    MintCommand::RecordMintSuccess {
+                    MintCommand::CompleteMinting {
                         issuer_request_id: issuer_request_id.clone(),
                         tx_hash: b256!(
                             "0x2222222222222222222222222222222222222222222222222222222222222222"

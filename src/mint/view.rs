@@ -109,7 +109,7 @@ pub(crate) enum MintView {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
     },
@@ -141,7 +141,7 @@ pub(crate) enum MintView {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
@@ -155,6 +155,19 @@ impl Default for MintView {
 }
 
 impl MintView {
+    pub(crate) const fn state_name(&self) -> &'static str {
+        match self {
+            Self::NotFound => "NotFound",
+            Self::Initiated { .. } => "Initiated",
+            Self::JournalConfirmed { .. } => "JournalConfirmed",
+            Self::JournalRejected { .. } => "JournalRejected",
+            Self::Minting { .. } => "Minting",
+            Self::CallbackPending { .. } => "CallbackPending",
+            Self::MintingFailed { .. } => "MintingFailed",
+            Self::Completed { .. } => "Completed",
+        }
+    }
+
     fn handle_initiated(&mut self, event: &MintEvent) {
         let MintEvent::Initiated {
             issuer_request_id,
@@ -286,7 +299,7 @@ impl MintView {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
     ) {
@@ -408,6 +421,39 @@ impl MintView {
             completed_at,
         };
     }
+
+    fn handle_mint_retry_started(&mut self, started_at: DateTime<Utc>) {
+        let Self::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at: started_at,
+        };
+    }
 }
 
 impl View<Mint> for MintView {
@@ -438,7 +484,7 @@ impl View<Mint> for MintView {
                     *tx_hash,
                     *receipt_id,
                     *shares_minted,
-                    *gas_used,
+                    Some(*gas_used),
                     *block_number,
                     *minted_at,
                 );
@@ -448,6 +494,26 @@ impl View<Mint> for MintView {
             }
             MintEvent::MintCompleted { completed_at, .. } => {
                 self.handle_mint_completed(*completed_at);
+            }
+            MintEvent::ExistingMintRecovered {
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                block_number,
+                recovered_at,
+                ..
+            } => {
+                self.handle_tokens_minted(
+                    *tx_hash,
+                    *receipt_id,
+                    *shares_minted,
+                    None,
+                    *block_number,
+                    *recovered_at,
+                );
+            }
+            MintEvent::MintRetryStarted { started_at, .. } => {
+                self.handle_mint_retry_started(*started_at);
             }
         }
     }
@@ -487,6 +553,29 @@ pub(crate) async fn find_journal_confirmed(
         SELECT view_id as "view_id!: String", payload as "payload: String"
         FROM mint_view
         WHERE json_extract(payload, '$.JournalConfirmed') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let view: MintView = serde_json::from_str(&row.payload)?;
+            Ok((IssuerRequestId::new(row.view_id), view))
+        })
+        .collect()
+}
+
+/// Finds all mints in Minting or MintingFailed state (incomplete mints that need recovery).
+pub(crate) async fn find_incomplete_mints(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<(IssuerRequestId, MintView)>, MintViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT view_id as "view_id!: String", payload as "payload: String"
+        FROM mint_view
+        WHERE json_extract(payload, '$.Minting') IS NOT NULL
+           OR json_extract(payload, '$.MintingFailed') IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -903,7 +992,7 @@ mod tests {
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_receipt_id, receipt_id);
         assert_eq!(view_shares_minted, shares_minted);
-        assert_eq!(view_gas_used, gas_used);
+        assert_eq!(view_gas_used, Some(gas_used));
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_minted_at, minted_at);
     }
@@ -1085,7 +1174,7 @@ mod tests {
             tx_hash,
             receipt_id,
             shares_minted,
-            50000,
+            Some(50000),
             1000,
             Utc::now(),
         );
@@ -1128,7 +1217,7 @@ mod tests {
             tx_hash,
             receipt_id,
             shares_minted,
-            50000,
+            Some(50000),
             1000,
             Utc::now(),
         );
@@ -1211,7 +1300,7 @@ mod tests {
             tx_hash,
             receipt_id,
             shares_minted,
-            gas_used,
+            gas_used: Some(gas_used),
             block_number,
             minted_at,
         };
@@ -1251,7 +1340,7 @@ mod tests {
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_receipt_id, receipt_id);
         assert_eq!(view_shares_minted, shares_minted);
-        assert_eq!(view_gas_used, gas_used);
+        assert_eq!(view_gas_used, Some(gas_used));
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_minted_at, minted_at);
         assert_eq!(view_completed_at, completed_at);
@@ -1536,5 +1625,221 @@ mod tests {
         let results = find_journal_confirmed(&pool).await.unwrap();
 
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_find_incomplete_mints_returns_minting_and_minting_failed() {
+        let pool = setup_test_db().await;
+
+        let mint_view_repo =
+            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
+                pool.clone(),
+                "mint_view".to_string(),
+            ));
+        let mint_query = GenericQuery::new(mint_view_repo);
+        let mint_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+
+        let client_id = ClientId::new();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        // Create a mint in Minting state
+        let iss_minting = IssuerRequestId::new("iss-minting-1");
+        mint_cqrs
+            .execute(
+                &iss_minting.0,
+                MintCommand::Initiate {
+                    issuer_request_id: iss_minting.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-minting-1",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+        mint_cqrs
+            .execute(
+                &iss_minting.0,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: iss_minting.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        mint_cqrs
+            .execute(
+                &iss_minting.0,
+                MintCommand::StartMinting {
+                    issuer_request_id: iss_minting.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Create a mint in MintingFailed state
+        let iss_failed = IssuerRequestId::new("iss-failed-1");
+        mint_cqrs
+            .execute(
+                &iss_failed.0,
+                MintCommand::Initiate {
+                    issuer_request_id: iss_failed.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-failed-1",
+                    ),
+                    quantity: Quantity::new(Decimal::from(50)),
+                    underlying: UnderlyingSymbol::new("TSLA"),
+                    token: TokenSymbol::new("tTSLA"),
+                    network: Network::new("base"),
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+        mint_cqrs
+            .execute(
+                &iss_failed.0,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: iss_failed.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        mint_cqrs
+            .execute(
+                &iss_failed.0,
+                MintCommand::StartMinting {
+                    issuer_request_id: iss_failed.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        mint_cqrs
+            .execute(
+                &iss_failed.0,
+                MintCommand::FailMinting {
+                    issuer_request_id: iss_failed.clone(),
+                    error: "Transaction reverted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = find_incomplete_mints(&pool).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        let ids: Vec<_> = results.iter().map(|(id, _)| id.0.as_str()).collect();
+        assert!(ids.contains(&"iss-minting-1"));
+        assert!(ids.contains(&"iss-failed-1"));
+    }
+
+    #[tokio::test]
+    async fn test_find_incomplete_mints_returns_empty_when_none() {
+        let pool = setup_test_db().await;
+        let results = find_incomplete_mints(&pool).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_handle_mint_retry_started_transitions_minting_failed_to_minting() {
+        let issuer_request_id = IssuerRequestId::new("iss-retry-1");
+        let tokenization_request_id = TokenizationRequestId::new("alp-retry-1");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId::new();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let failed_at = Utc::now();
+
+        let mut view = MintView::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            error: "Previous failure".to_string(),
+            failed_at,
+        };
+
+        let retry_started_at = Utc::now();
+        view.handle_mint_retry_started(retry_started_at);
+
+        let MintView::Minting {
+            issuer_request_id: view_iss,
+            tokenization_request_id: view_tok,
+            quantity: view_qty,
+            underlying: view_und,
+            token: view_tok_sym,
+            network: view_net,
+            client_id: view_client,
+            wallet: view_wallet,
+            initiated_at: view_init,
+            journal_confirmed_at: view_jc,
+            minting_started_at,
+        } = view
+        else {
+            panic!("Expected Minting state, got {view:?}");
+        };
+
+        assert_eq!(view_iss, issuer_request_id);
+        assert_eq!(view_tok, tokenization_request_id);
+        assert_eq!(view_qty, quantity);
+        assert_eq!(view_und, underlying);
+        assert_eq!(view_tok_sym, token);
+        assert_eq!(view_net, network);
+        assert_eq!(view_client, client_id);
+        assert_eq!(view_wallet, wallet);
+        assert_eq!(view_init, initiated_at);
+        assert_eq!(view_jc, journal_confirmed_at);
+        assert_eq!(minting_started_at, retry_started_at);
+    }
+
+    #[test]
+    fn test_handle_mint_retry_started_from_minting_state_does_not_change() {
+        let issuer_request_id = IssuerRequestId::new("iss-retry-2");
+        let tokenization_request_id = TokenizationRequestId::new("alp-retry-2");
+        let quantity = Quantity::new(Decimal::from(100));
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId::new();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let initiated_at = Utc::now();
+        let journal_confirmed_at = Utc::now();
+        let minting_started_at = Utc::now();
+
+        let mut view = MintView::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+        };
+        let original_view = view.clone();
+
+        view.handle_mint_retry_started(Utc::now());
+
+        assert_eq!(view, original_view);
     }
 }

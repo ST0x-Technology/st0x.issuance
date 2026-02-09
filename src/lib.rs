@@ -83,8 +83,7 @@ pub(crate) type SqliteCallbackManager =
     Arc<CallbackManager<SqliteEventStore<Mint>>>;
 
 struct AggregateCqrsSetup {
-    mint_cqrs: MintCqrs,
-    mint_event_store: MintEventStore,
+    mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
     receipt_inventory: ReceiptInventoryDeps,
@@ -93,6 +92,11 @@ struct AggregateCqrsSetup {
 struct ReceiptInventoryDeps {
     cqrs: ReceiptInventoryCqrs,
     event_store: ReceiptInventoryEventStore,
+}
+
+struct MintDeps {
+    cqrs: MintCqrs,
+    event_store: MintEventStore,
 }
 
 struct MintManagers {
@@ -250,8 +254,7 @@ pub async fn initialize_rocket(
     let blockchain_service = config.create_blockchain_service().await?;
 
     let AggregateCqrsSetup {
-        mint_cqrs,
-        mint_event_store,
+        mint,
         redemption_cqrs,
         redemption_event_store,
         receipt_inventory,
@@ -264,10 +267,8 @@ pub async fn initialize_rocket(
         setup_mint_managers(
             &config,
             blockchain_service.clone(),
-            &mint_cqrs,
-            &mint_event_store,
-            &receipt_inventory.cqrs,
-            &receipt_inventory.event_store,
+            &mint,
+            &receipt_inventory,
             &pool,
             bot_wallet,
         )?;
@@ -345,8 +346,8 @@ pub async fn initialize_rocket(
         .manage(rate_limiter)
         .manage(account_cqrs)
         .manage(tokenized_asset_cqrs)
-        .manage(mint_cqrs)
-        .manage(mint_event_store)
+        .manage(mint.cqrs)
+        .manage(mint.event_store)
         .manage(mint_manager)
         .manage(callback_manager)
         .manage(redemption_cqrs)
@@ -455,8 +456,7 @@ fn setup_aggregate_cqrs(
         ));
 
     AggregateCqrsSetup {
-        mint_cqrs,
-        mint_event_store,
+        mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
         redemption_cqrs,
         redemption_event_store,
         receipt_inventory: ReceiptInventoryDeps {
@@ -469,32 +469,30 @@ fn setup_aggregate_cqrs(
 fn setup_mint_managers(
     config: &Config,
     blockchain_service: Arc<dyn vault::VaultService>,
-    mint_cqrs: &MintCqrs,
-    mint_event_store: &MintEventStore,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
+    mint: &MintDeps,
+    receipt_inventory: &ReceiptInventoryDeps,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
 ) -> Result<MintManagers, anyhow::Error> {
-    let mint = Arc::new(MintManager::new(
+    let mint_manager = Arc::new(MintManager::new(
         blockchain_service,
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
+        mint.cqrs.clone(),
+        mint.event_store.clone(),
         pool.clone(),
         bot_wallet,
-        receipt_inventory_cqrs.clone(),
-        receipt_inventory_event_store.clone(),
+        receipt_inventory.cqrs.clone(),
+        receipt_inventory.event_store.clone(),
     ));
 
     let alpaca_service = config.alpaca.service()?;
     let callback = Arc::new(CallbackManager::new(
         alpaca_service,
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
+        mint.cqrs.clone(),
+        mint.event_store.clone(),
         pool.clone(),
     ));
 
-    Ok(MintManagers { mint, callback })
+    Ok(MintManagers { mint: mint_manager, callback })
 }
 
 fn setup_redemption_managers(

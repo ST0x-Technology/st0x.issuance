@@ -127,7 +127,7 @@ pub(crate) enum Mint {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
     },
@@ -159,7 +159,7 @@ pub(crate) enum Mint {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
@@ -282,7 +282,7 @@ impl Mint {
         }])
     }
 
-    fn handle_record_mint_success(
+    fn handle_complete_minting(
         &self,
         provided_id: IssuerRequestId,
         tx_hash: B256,
@@ -312,7 +312,7 @@ impl Mint {
         }])
     }
 
-    fn handle_record_mint_failure(
+    fn handle_fail_minting(
         &self,
         provided_id: IssuerRequestId,
         error: String,
@@ -368,8 +368,35 @@ impl Mint {
         Ok(())
     }
 
+    fn handle_record_existing_mint(
+        &self,
+        provided_id: IssuerRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        block_number: u64,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let (Self::Minting { issuer_request_id: expected_id, .. }
+        | Self::MintingFailed { issuer_request_id: expected_id, .. }) = self
+        else {
+            return Err(MintError::NotInMintingOrMintingFailedState {
+                current_state: self.state_name().to_string(),
+            });
+        };
 
         Self::validate_issuer_request_id(expected_id, &provided_id)?;
+
+        let now = Utc::now();
+
+        Ok(vec![MintEvent::ExistingMintRecovered {
+            issuer_request_id: provided_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            block_number,
+            recovered_at: now,
+        }])
+    }
 
     fn apply_journal_confirmed(&mut self, confirmed_at: DateTime<Utc>) {
         let Self::Initiated {
@@ -473,7 +500,7 @@ impl Mint {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
+        gas_used: Option<u64>,
         block_number: u64,
         minted_at: DateTime<Utc>,
     ) {
@@ -601,7 +628,6 @@ impl Mint {
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
-        gas_used: u64,
         block_number: u64,
         recovered_at: DateTime<Utc>,
     ) {
@@ -649,7 +675,7 @@ impl Mint {
             tx_hash,
             receipt_id,
             shares_minted,
-            gas_used,
+            gas_used: None,
             block_number,
             minted_at: recovered_at,
         };
@@ -752,7 +778,7 @@ impl Aggregate for Mint {
                 shares_minted,
                 gas_used,
                 block_number,
-            } => self.handle_record_mint_success(
+            } => self.handle_complete_minting(
                 issuer_request_id,
                 tx_hash,
                 receipt_id,
@@ -761,7 +787,7 @@ impl Aggregate for Mint {
                 block_number,
             ),
             MintCommand::FailMinting { issuer_request_id, error } => {
-                self.handle_record_mint_failure(issuer_request_id, error)
+                self.handle_fail_minting(issuer_request_id, error)
             }
             MintCommand::CompleteCallback { issuer_request_id } => {
                 self.handle_record_callback(issuer_request_id)
@@ -771,14 +797,12 @@ impl Aggregate for Mint {
                 tx_hash,
                 receipt_id,
                 shares_minted,
-                gas_used,
                 block_number,
             } => self.handle_record_existing_mint(
                 issuer_request_id,
                 tx_hash,
                 receipt_id,
                 shares_minted,
-                gas_used,
                 block_number,
             ),
             MintCommand::RetryMint { issuer_request_id } => {
@@ -836,7 +860,7 @@ impl Aggregate for Mint {
                 tx_hash,
                 receipt_id,
                 shares_minted,
-                gas_used,
+                Some(gas_used),
                 block_number,
                 minted_at,
             ),
@@ -853,14 +877,12 @@ impl Aggregate for Mint {
                 tx_hash,
                 receipt_id,
                 shares_minted,
-                gas_used,
                 block_number,
                 recovered_at,
             } => self.apply_existing_mint_recorded(
                 tx_hash,
                 receipt_id,
                 shares_minted,
-                gas_used,
                 block_number,
                 recovered_at,
             ),
@@ -1579,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_success_from_minting_state() {
+    fn test_complete_minting_from_minting_state() {
         let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1653,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_success_from_wrong_state_fails() {
+    fn test_complete_minting_from_wrong_state_fails() {
         let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1692,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_failure_from_minting_state() {
+    fn test_fail_minting_from_minting_state() {
         let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1744,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_failure_from_wrong_state_fails() {
+    fn test_fail_minting_from_wrong_state_fails() {
         let issuer_request_id = super::IssuerRequestId::new("iss-123");
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1840,7 +1862,7 @@ mod tests {
         assert_eq!(state_tx_hash, tx_hash);
         assert_eq!(state_receipt_id, receipt_id);
         assert_eq!(state_shares_minted, shares_minted);
-        assert_eq!(state_gas_used, gas_used);
+        assert_eq!(state_gas_used, Some(gas_used));
         assert_eq!(state_block_number, block_number);
         assert_eq!(state_minted_at, minted_at);
     }
@@ -1898,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_success_with_mismatched_issuer_request_id_fails() {
+    fn test_complete_minting_with_mismatched_issuer_request_id_fails() {
         let correct_issuer_request_id =
             super::IssuerRequestId::new("iss-correct");
         let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
@@ -1947,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mint_failure_with_mismatched_issuer_request_id_fails() {
+    fn test_fail_minting_with_mismatched_issuer_request_id_fails() {
         let correct_issuer_request_id =
             super::IssuerRequestId::new("iss-correct");
         let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
@@ -2175,7 +2197,7 @@ mod tests {
             tx_hash,
             receipt_id,
             shares_minted,
-            gas_used,
+            gas_used: Some(gas_used),
             block_number,
             minted_at,
         };
@@ -2206,7 +2228,7 @@ mod tests {
         assert_eq!(state_tx_hash, tx_hash);
         assert_eq!(state_receipt_id, receipt_id);
         assert_eq!(state_shares_minted, shares_minted);
-        assert_eq!(state_gas_used, gas_used);
+        assert_eq!(state_gas_used, Some(gas_used));
         assert_eq!(state_block_number, block_number);
         assert_eq!(state_minted_at, minted_at);
         assert_eq!(state_completed_at, completed_at);
@@ -2569,5 +2591,109 @@ mod tests {
     fn test_tokenization_request_id_display() {
         let id = TokenizationRequestId::new("alp-456");
         assert_eq!(format!("{id}"), "alp-456");
+    }
+
+    #[test]
+    fn test_retry_mint_from_minting_failed_emits_mint_retry_started() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-retry-1");
+
+        let events = MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-retry-1",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id: ClientId::new(),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+                MintEvent::MintingStarted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    started_at: Utc::now(),
+                },
+                MintEvent::MintingFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Transaction reverted".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .inspect_result()
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], MintEvent::MintRetryStarted { .. }));
+    }
+
+    #[test]
+    fn test_retry_mint_from_minting_state_returns_empty_events() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-retry-2");
+
+        let events = MintTestFramework::with(())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "alp-retry-2",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id: ClientId::new(),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    initiated_at: Utc::now(),
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: Utc::now(),
+                },
+                MintEvent::MintingStarted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    started_at: Utc::now(),
+                },
+            ])
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .inspect_result()
+            .unwrap();
+
+        assert!(events.is_empty(), "Expected no events for idempotent retry");
+    }
+
+    #[test]
+    fn test_retry_mint_from_initiated_state_fails() {
+        let issuer_request_id = super::IssuerRequestId::new("iss-retry-3");
+
+        MintTestFramework::with(())
+            .given(vec![MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-retry-3",
+                ),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: Utc::now(),
+            }])
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .then_expect_error(MintError::NotInMintingOrMintingFailedState {
+                current_state: "Initiated".to_string(),
+            });
     }
 }

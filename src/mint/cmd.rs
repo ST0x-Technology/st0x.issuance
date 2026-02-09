@@ -28,7 +28,7 @@ pub(crate) enum MintCommand {
     StartMinting {
         issuer_request_id: IssuerRequestId,
     },
-    RecordMintSuccess {
+    CompleteMinting {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,
         receipt_id: U256,
@@ -36,11 +36,29 @@ pub(crate) enum MintCommand {
         gas_used: u64,
         block_number: u64,
     },
-    RecordMintFailure {
+    FailMinting {
         issuer_request_id: IssuerRequestId,
         error: String,
     },
-    RecordCallback {
+    CompleteCallback {
+        issuer_request_id: IssuerRequestId,
+    },
+    /// Recovers a mint that already succeeded on-chain during recovery.
+    ///
+    /// Used when recovering from `Minting` or `MintingFailed` state and we find
+    /// that the mint actually succeeded on-chain (receipt exists in inventory).
+    RecoverExistingMint {
+        issuer_request_id: IssuerRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        block_number: u64,
+    },
+    /// Retries a mint that failed or was interrupted before completing on-chain.
+    ///
+    /// Used during recovery when no receipt exists for a mint stuck in
+    /// `Minting` or `MintingFailed` state.
+    RetryMint {
         issuer_request_id: IssuerRequestId,
     },
 }

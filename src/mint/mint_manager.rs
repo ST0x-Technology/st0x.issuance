@@ -1,27 +1,25 @@
 use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, U256};
-use chrono::Utc;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use tracing::{debug, error, info, warn};
 
 use crate::receipt_inventory::{
-    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptInventoryError,
-    ReceiptSource, Shares,
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
+    ReceiptInventoryError, ReceiptSource, Shares,
 };
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{
-    MintResult, OperationType, ReceiptInformation, VaultError, VaultService,
-};
+use crate::vault::{MintResult, ReceiptInformation, VaultError, VaultService};
 
 use super::view::{
     MintView, MintViewError, find_incomplete_mints, find_journal_confirmed,
 };
 use super::{
-    IssuerRequestId, Mint, MintCommand, MintError, QuantityConversionError,
+    IssuerRequestId, Mint, MintCommand, MintError, Quantity,
+    QuantityConversionError,
 };
 
 /// Orchestrates the on-chain minting process in response to JournalConfirmed events.
@@ -42,11 +40,13 @@ where
     event_store: Arc<MintStore>,
     pool: Pool<Sqlite>,
     bot: Address,
-    receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    receipt_inventory_cqrs:
+        Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
     receipt_inventory_event_store: Arc<ReceiptInventoryStore>,
 }
 
-impl<MintStore, ReceiptInventoryStore> MintManager<MintStore, ReceiptInventoryStore>
+impl<MintStore, ReceiptInventoryStore>
+    MintManager<MintStore, ReceiptInventoryStore>
 where
     MintStore: EventStore<Mint>,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
@@ -68,7 +68,9 @@ where
         event_store: Arc<MintStore>,
         pool: Pool<Sqlite>,
         bot: Address,
-        receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        receipt_inventory_cqrs: Arc<
+            CqrsFramework<ReceiptInventory, ReceiptInventoryStore>,
+        >,
         receipt_inventory_event_store: Arc<ReceiptInventoryStore>,
     ) -> Self {
         Self {
@@ -120,6 +122,7 @@ where
             quantity,
             underlying,
             wallet,
+            journal_confirmed_at,
             ..
         } = aggregate
         else {
@@ -160,37 +163,26 @@ where
             "StartMinting command executed, proceeding with blockchain call"
         );
 
-        let assets = quantity.to_u256_with_18_decimals()?;
+        let receipt_info = ReceiptInformation::mint(
+            tokenization_request_id.clone(),
+            issuer_request_id.clone(),
+            underlying.clone(),
+            quantity.clone(),
+            *journal_confirmed_at,
+            None,
+        );
 
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: tokenization_request_id.clone(),
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            quantity: quantity.clone(),
-            operation_type: OperationType::Mint,
-            timestamp: Utc::now(),
-            notes: None,
-        };
-
-        match self
-            .blockchain_service
-            .mint_and_transfer_shares(
-                vault,
-                assets,
-                self.bot,
-                *wallet,
-                receipt_info,
-            )
-            .await
-        {
-            Ok(result) => {
-                self.record_mint_success(issuer_request_id, vault, result).await
-            }
-            Err(e) => self.record_mint_failure(issuer_request_id, e).await,
-        }
+        self.execute_mint(
+            issuer_request_id,
+            vault,
+            quantity,
+            *wallet,
+            receipt_info,
+        )
+        .await
     }
 
-    async fn record_mint_success(
+    async fn complete_minting(
         &self,
         issuer_request_id: &IssuerRequestId,
         vault: Address,
@@ -239,7 +231,7 @@ where
         Ok(())
     }
 
-    async fn record_mint_failure(
+    async fn fail_minting(
         &self,
         issuer_request_id: &IssuerRequestId,
         error: VaultError,
@@ -403,10 +395,7 @@ where
             return;
         }
 
-        info!(
-            count = incomplete_mints.len(),
-            "Recovering incomplete mints"
-        );
+        info!(count = incomplete_mints.len(), "Recovering incomplete mints");
 
         for (issuer_request_id, view) in incomplete_mints {
             if let Err(e) = self
@@ -432,11 +421,10 @@ where
         let (MintView::Minting { underlying, .. }
         | MintView::MintingFailed { underlying, .. }) = view
         else {
-            warn!(
-                issuer_request_id = %issuer_request_id.as_str(),
-                "View is not in Minting or MintingFailed state, skipping"
-            );
-            return Ok(());
+            return Err(MintManagerError::InvalidViewState {
+                issuer_request_id: issuer_request_id.clone(),
+                current_state: view.state_name().to_string(),
+            });
         };
 
         let vault = find_vault_by_underlying(&self.pool, underlying)
@@ -453,6 +441,13 @@ where
                 "Found existing receipt for incomplete mint, recording"
             );
 
+            self.recover_existing_mint_from_receipt(
+                issuer_request_id,
+                vault,
+                &receipt_inventory,
+                receipt_id,
+            )
+            .await
         } else {
             // No receipt found, need to retry the mint
             info!(
@@ -476,10 +471,42 @@ where
             .receipts_with_balance()
             .into_iter()
             .find(|candidate| candidate.receipt_id == receipt_id);
+
+        let Some(receipt) = receipt else {
+            return Err(MintManagerError::ReceiptInventoryInconsistent {
+                issuer_request_id: issuer_request_id.clone(),
+                receipt_id,
+            });
+        };
+
+        self.cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::RecoverExistingMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: receipt.tx_hash,
+                    receipt_id: receipt_id.inner(),
+                    shares_minted: receipt.available_balance.inner(),
+                    block_number: receipt.block_number,
+                },
+            )
+            .await?;
+
         info!(
             issuer_request_id = %issuer_request_id.as_str(),
             "RecoverExistingMint command executed"
         );
+
+        // Register the receipt if not already registered (idempotent)
+        self.register_receipt(
+            vault,
+            receipt_id.inner(),
+            receipt.available_balance.inner(),
+            receipt.block_number,
+            receipt.tx_hash,
+            issuer_request_id.clone(),
+        )
+        .await;
 
         Ok(())
     }
@@ -489,28 +516,27 @@ where
         issuer_request_id: &IssuerRequestId,
         view: &MintView,
     ) -> Result<(), MintManagerError> {
-        let (
+        let (MintView::Minting {
             tokenization_request_id,
             quantity,
             underlying,
             wallet,
-            is_minting_failed,
-        ) = match view {
-            MintView::Minting {
-                tokenization_request_id,
-                quantity,
-                underlying,
-                wallet,
-                ..
-            } => (tokenization_request_id, quantity, underlying, wallet, false),
-            MintView::MintingFailed {
-                tokenization_request_id,
-                quantity,
-                underlying,
-                wallet,
-                ..
-            } => (tokenization_request_id, quantity, underlying, wallet, true),
-            _ => return Ok(()),
+            journal_confirmed_at,
+            ..
+        }
+        | MintView::MintingFailed {
+            tokenization_request_id,
+            quantity,
+            underlying,
+            wallet,
+            journal_confirmed_at,
+            ..
+        }) = view
+        else {
+            return Err(MintManagerError::InvalidViewState {
+                issuer_request_id: issuer_request_id.clone(),
+                current_state: view.state_name().to_string(),
+            });
         };
 
         let vault = find_vault_by_underlying(&self.pool, underlying)
@@ -519,7 +545,48 @@ where
                 underlying: underlying.0.clone(),
             })?;
 
-        // Now attempt the blockchain mint
+        // Issue RetryMint - aggregate handles state validation (idempotent if already Minting)
+        self.cqrs
+            .execute(
+                issuer_request_id.as_str(),
+                MintCommand::RetryMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await?;
+
+        info!(
+            issuer_request_id = %issuer_request_id.as_str(),
+            "RetryMint command executed"
+        );
+
+        let receipt_info = ReceiptInformation::mint(
+            tokenization_request_id.clone(),
+            issuer_request_id.clone(),
+            underlying.clone(),
+            quantity.clone(),
+            *journal_confirmed_at,
+            Some("Recovery mint".to_string()),
+        );
+
+        self.execute_mint(
+            issuer_request_id,
+            vault,
+            quantity,
+            *wallet,
+            receipt_info,
+        )
+        .await
+    }
+
+    async fn execute_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        vault: Address,
+        quantity: &Quantity,
+        wallet: Address,
+        receipt_info: ReceiptInformation,
+    ) -> Result<(), MintManagerError> {
         let assets = quantity.to_u256_with_18_decimals()?;
 
         match self
@@ -528,11 +595,17 @@ where
                 vault,
                 assets,
                 self.bot,
-                *wallet,
+                wallet,
                 receipt_info,
             )
             .await
         {
+            Ok(result) => {
+                self.complete_minting(issuer_request_id, vault, result).await
+            }
+            Err(e) => self.fail_minting(issuer_request_id, e).await,
+        }
+    }
 }
 
 const fn aggregate_state_name(aggregate: &Mint) -> &'static str {

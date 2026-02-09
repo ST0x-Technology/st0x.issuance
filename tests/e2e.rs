@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, TxHash, U256, b256};
+use alloy::primitives::{Address, Bytes, TxHash, U256, b256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::{Mock, prelude::*};

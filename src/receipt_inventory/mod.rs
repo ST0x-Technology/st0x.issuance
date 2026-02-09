@@ -7,7 +7,7 @@ pub(crate) mod view;
 
 pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
 
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use async_trait::async_trait;
 use cqrs_es::{Aggregate, AggregateContext, EventStore};
 use serde::{Deserialize, Serialize};
@@ -97,6 +97,14 @@ impl std::iter::Sum for Shares {
     }
 }
 
+/// Metadata about a receipt stored in the inventory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ReceiptMetadata {
+    balance: Shares,
+    tx_hash: TxHash,
+    block_number: u64,
+}
+
 /// Provides the capability to find receipts for burning.
 ///
 /// This trait abstracts the receipt inventory query for use by command handlers.
@@ -158,7 +166,7 @@ where
 /// Receipts with zero balance are removed from state (events remain for audit).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReceiptInventory {
-    receipts: HashMap<ReceiptId, Shares>,
+    receipts: HashMap<ReceiptId, ReceiptMetadata>,
     /// Maps issuer_request_id to receipt_id for ITN mints.
     /// Used by mint recovery to check if a mint succeeded on-chain.
     itn_receipts: HashMap<IssuerRequestId, ReceiptId>,
@@ -169,9 +177,11 @@ impl ReceiptInventory {
     pub(crate) fn receipts_with_balance(&self) -> Vec<ReceiptWithBalance> {
         self.receipts
             .iter()
-            .map(|(receipt_id, balance)| ReceiptWithBalance {
+            .map(|(receipt_id, metadata)| ReceiptWithBalance {
                 receipt_id: *receipt_id,
-                available_balance: *balance,
+                available_balance: metadata.balance,
+                tx_hash: metadata.tx_hash,
+                block_number: metadata.block_number,
             })
             .collect()
     }
@@ -260,14 +270,15 @@ impl Aggregate for ReceiptInventory {
             }
 
             ReceiptInventoryCommand::BurnShares { receipt_id, amount } => {
-                let current_balance = self.receipts.get(&receipt_id).copied();
+                let metadata = self.receipts.get(&receipt_id).copied();
 
-                let Some(available) = current_balance else {
+                let Some(metadata) = metadata else {
                     return Err(ReceiptInventoryError::ReceiptNotFound {
                         receipt_id,
                     });
                 };
 
+                let available = metadata.balance;
                 if available.inner() < amount.inner() {
                     return Err(ReceiptInventoryError::InsufficientBalance {
                         receipt_id,
@@ -310,10 +321,14 @@ impl Aggregate for ReceiptInventory {
             ReceiptInventoryEvent::Discovered {
                 receipt_id,
                 balance,
+                block_number,
+                tx_hash,
                 source,
-                ..
             } => {
-                self.receipts.insert(receipt_id, balance);
+                self.receipts.insert(
+                    receipt_id,
+                    ReceiptMetadata { balance, tx_hash, block_number },
+                );
                 if let ReceiptSource::Itn { issuer_request_id } = source {
                     self.itn_receipts.insert(issuer_request_id, receipt_id);
                 }
@@ -324,8 +339,10 @@ impl Aggregate for ReceiptInventory {
             } => {
                 if new_balance.is_zero() {
                     self.receipts.remove(&receipt_id);
-                } else {
-                    self.receipts.insert(receipt_id, new_balance);
+                } else if let Some(metadata) =
+                    self.receipts.get_mut(&receipt_id)
+                {
+                    metadata.balance = new_balance;
                 }
             }
 
@@ -357,6 +374,14 @@ mod tests {
 
     fn make_shares(n: u64) -> Shares {
         Shares::new(U256::from(n))
+    }
+
+    fn make_metadata(balance: u64) -> ReceiptMetadata {
+        ReceiptMetadata {
+            balance: make_shares(balance),
+            tx_hash: TxHash::ZERO,
+            block_number: 0,
+        }
     }
 
     fn discover_receipt_cmd(
@@ -672,15 +697,15 @@ mod tests {
 
         assert_eq!(aggregate.receipts.len(), 1);
         assert_eq!(
-            aggregate.receipts.get(&make_receipt_id(42)),
-            Some(&make_shares(100))
+            aggregate.receipts.get(&make_receipt_id(42)).map(|m| m.balance),
+            Some(make_shares(100))
         );
     }
 
     #[test]
     fn test_apply_burned_updates_balance() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_shares(100));
+        aggregate.receipts.insert(make_receipt_id(42), make_metadata(100));
 
         aggregate.apply(ReceiptInventoryEvent::Burned {
             receipt_id: make_receipt_id(42),
@@ -689,15 +714,15 @@ mod tests {
         });
 
         assert_eq!(
-            aggregate.receipts.get(&make_receipt_id(42)),
-            Some(&make_shares(70))
+            aggregate.receipts.get(&make_receipt_id(42)).map(|m| m.balance),
+            Some(make_shares(70))
         );
     }
 
     #[test]
     fn test_apply_burned_with_zero_balance_removes_receipt() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_shares(100));
+        aggregate.receipts.insert(make_receipt_id(42), make_metadata(100));
 
         aggregate.apply(ReceiptInventoryEvent::Burned {
             receipt_id: make_receipt_id(42),
@@ -711,7 +736,7 @@ mod tests {
     #[test]
     fn test_apply_depleted_removes_receipt() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_shares(0));
+        aggregate.receipts.insert(make_receipt_id(42), make_metadata(0));
 
         aggregate.apply(ReceiptInventoryEvent::Depleted {
             receipt_id: make_receipt_id(42),
@@ -723,8 +748,8 @@ mod tests {
     #[test]
     fn test_receipts_with_balance_returns_all_receipts() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(1), make_shares(100));
-        aggregate.receipts.insert(make_receipt_id(2), make_shares(200));
+        aggregate.receipts.insert(make_receipt_id(1), make_metadata(100));
+        aggregate.receipts.insert(make_receipt_id(2), make_metadata(200));
 
         let receipts = aggregate.receipts_with_balance();
 

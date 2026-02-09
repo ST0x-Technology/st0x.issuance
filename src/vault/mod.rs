@@ -189,6 +189,26 @@ pub(crate) struct ReceiptInformation {
 }
 
 impl ReceiptInformation {
+    /// Creates receipt information for a mint operation.
+    pub(crate) const fn mint(
+        tokenization_request_id: TokenizationRequestId,
+        issuer_request_id: IssuerRequestId,
+        underlying: UnderlyingSymbol,
+        quantity: Quantity,
+        timestamp: DateTime<Utc>,
+        notes: Option<String>,
+    ) -> Self {
+        Self {
+            tokenization_request_id,
+            issuer_request_id,
+            underlying,
+            quantity,
+            operation_type: OperationType::Mint,
+            timestamp,
+            notes,
+        }
+    }
+
     /// Encodes the receipt information as JSON bytes for on-chain storage.
     pub(crate) fn encode(&self) -> Result<Bytes, serde_json::Error> {
         serde_json::to_vec(self).map(Bytes::from)

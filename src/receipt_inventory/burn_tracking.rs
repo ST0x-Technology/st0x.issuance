@@ -1,3 +1,4 @@
+use alloy::primitives::TxHash;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{AggregateError, EventEnvelope, View};
@@ -71,6 +72,8 @@ pub(crate) enum BurnTrackingError {
 pub(crate) struct ReceiptWithBalance {
     pub(crate) receipt_id: ReceiptId,
     pub(crate) available_balance: Shares,
+    pub(crate) tx_hash: TxHash,
+    pub(crate) block_number: u64,
 }
 
 /// A single allocation within a multi-receipt burn plan.
@@ -539,6 +542,8 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
+            tx_hash: TxHash::ZERO,
+            block_number: 0,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -570,18 +575,24 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
         ];
 
@@ -615,6 +626,8 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(50_000000000000000000_U256)),
+            tx_hash: TxHash::ZERO,
+            block_number: 0,
         }];
 
         let burn_amount = Shares::new(uint!(100_000000000000000000_U256));
@@ -641,18 +654,24 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     10_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
                 available_balance: Shares::new(uint!(
                     60_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
         ];
 
@@ -698,12 +717,16 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
         ];
 
@@ -750,12 +773,16 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
         ];
 
@@ -810,6 +837,8 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
+            tx_hash: TxHash::ZERO,
+            block_number: 0,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -829,12 +858,16 @@ mod tests {
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(U256::ZERO),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             },
         ];
 
@@ -863,6 +896,8 @@ mod tests {
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(U256::from(id)),
                 available_balance: Shares::new(U256::from(balance)),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
             }
         }
     }
