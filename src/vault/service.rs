@@ -37,8 +37,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info)?);
+        let receipt_info_bytes = receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
@@ -111,8 +110,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         &self,
         params: super::MultiBurnParams,
     ) -> Result<super::MultiBurnResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&params.receipt_info)?);
+        let receipt_info_bytes = params.receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
@@ -578,8 +576,7 @@ mod tests {
 
         let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
 
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
+        let receipt_info_bytes = receipt_info.encode().unwrap();
         let share_ratio = U256::from(10).pow(U256::from(18));
 
         let deposit_call = vault

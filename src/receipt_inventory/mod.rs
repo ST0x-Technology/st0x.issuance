@@ -7,7 +7,7 @@ pub(crate) mod view;
 
 pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use async_trait::async_trait;
 use cqrs_es::{Aggregate, AggregateContext, EventStore};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 pub(crate) use view::ReceiptInventoryView;
 
 use crate::mint::IssuerRequestId;
+use crate::vault::ReceiptInformation;
 
 /// Unique identifier for an ERC-1155 receipt within a vault.
 ///
@@ -183,9 +184,9 @@ impl ReceiptInventory {
     /// Returns None if no ITN receipt exists with this issuer_request_id.
     pub(crate) fn find_by_issuer_request_id(
         &self,
-        _issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRequestId,
     ) -> Option<ReceiptId> {
-        todo!()
+        self.itn_receipts.get(issuer_request_id).copied()
     }
 }
 
@@ -193,8 +194,16 @@ impl ReceiptInventory {
 ///
 /// If the receiptInformation contains a valid `issuer_request_id`, this returns
 /// `ReceiptSource::Itn`; otherwise `ReceiptSource::External`.
-pub(crate) fn determine_source(_receipt_id: ReceiptId) -> ReceiptSource {
-    todo!("Task 6: parse receiptInformation to determine source")
+pub(crate) fn determine_source(receipt_information: &Bytes) -> ReceiptSource {
+    if receipt_information.is_empty() {
+        return ReceiptSource::External;
+    }
+
+    serde_json::from_slice::<ReceiptInformation>(receipt_information)
+        .map(|info| ReceiptSource::Itn {
+            issuer_request_id: info.issuer_request_id,
+        })
+        .unwrap_or(ReceiptSource::External)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -299,9 +308,15 @@ impl Aggregate for ReceiptInventory {
     fn apply(&mut self, event: Self::Event) {
         match event {
             ReceiptInventoryEvent::Discovered {
-                receipt_id, balance, ..
+                receipt_id,
+                balance,
+                source,
+                ..
             } => {
                 self.receipts.insert(receipt_id, balance);
+                if let ReceiptSource::Itn { issuer_request_id } = source {
+                    self.itn_receipts.insert(issuer_request_id, receipt_id);
+                }
             }
 
             ReceiptInventoryEvent::Burned {
@@ -330,7 +345,7 @@ impl Aggregate for ReceiptInventory {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, address, b256};
+    use alloy::primitives::{Bytes, TxHash, address, b256};
     use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
     use std::sync::Arc;
 
@@ -893,6 +908,47 @@ mod tests {
         assert_eq!(aggregate.itn_receipts.len(), 0);
     }
 
+    #[test]
+    fn test_determine_source_returns_itn_when_receipt_info_has_issuer_request_id()
+     {
+        let receipt_info = serde_json::json!({
+            "tokenization_request_id": "tok-123",
+            "issuer_request_id": "iss-456",
+            "underlying": "AAPL",
+            "quantity": "100.0",
+            "operation_type": "Mint",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "notes": null
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
+
+        let source = determine_source(&bytes);
+
+        assert!(matches!(
+            source,
+            ReceiptSource::Itn { issuer_request_id } if issuer_request_id.as_str() == "iss-456"
+        ));
+    }
+
+    #[test]
+    fn test_determine_source_returns_external_when_receipt_info_is_empty() {
+        let bytes = Bytes::new();
+
+        let source = determine_source(&bytes);
+
+        assert!(matches!(source, ReceiptSource::External));
+    }
+
+    #[test]
+    fn test_determine_source_returns_external_when_receipt_info_is_invalid_json()
+     {
+        let bytes = Bytes::from(vec![0x00, 0x01, 0x02]);
+
+        let source = determine_source(&bytes);
+
+        assert!(matches!(source, ReceiptSource::External));
+    }
+
     async fn setup_receipt_service_with_receipts(
         receipts: Vec<(u64, u64)>,
     ) -> CqrsReceiptService<MemStore<ReceiptInventory>> {
@@ -1031,5 +1087,63 @@ mod tests {
 
         assert_eq!(plan.total_burn, make_shares(100));
         assert_eq!(plan.allocations.len(), 1);
+    }
+
+    use chrono::{TimeZone, Utc};
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
+
+    use crate::Quantity;
+    use crate::mint::TokenizationRequestId;
+    use crate::tokenized_asset::UnderlyingSymbol;
+    use crate::vault::{OperationType, ReceiptInformation};
+
+    prop_compose! {
+        fn arb_receipt_information()(
+            tok_id in "[a-zA-Z0-9_-]{1,64}",
+            iss_id in "[a-zA-Z0-9_-]{1,64}",
+            symbol in "[A-Z]{1,5}",
+            qty in 0i64..1_000_000_000i64,
+            is_mint in any::<bool>(),
+            timestamp_secs in 0i64..2_000_000_000i64,
+            notes in proptest::option::of("[a-zA-Z0-9 ]{0,100}"),
+        ) -> ReceiptInformation {
+            ReceiptInformation {
+                tokenization_request_id: TokenizationRequestId::new(tok_id),
+                issuer_request_id: IssuerRequestId::new(iss_id),
+                underlying: UnderlyingSymbol::new(symbol),
+                quantity: Quantity(Decimal::new(qty, 2)),
+                operation_type: if is_mint {
+                    OperationType::Mint
+                } else {
+                    OperationType::Redeem
+                },
+                timestamp: Utc.timestamp_opt(timestamp_secs, 0).unwrap(),
+                notes,
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn encode_then_determine_source_preserves_issuer_request_id(
+            receipt_info in arb_receipt_information()
+        ) {
+            let original_id = receipt_info.issuer_request_id.clone();
+            let encoded = receipt_info.encode().unwrap();
+            let source = determine_source(&encoded);
+
+            match source {
+                ReceiptSource::Itn { issuer_request_id } => {
+                    prop_assert_eq!(
+                        issuer_request_id.as_str(),
+                        original_id.as_str()
+                    );
+                }
+                ReceiptSource::External => {
+                    prop_assert!(false, "Expected Itn source, got External");
+                }
+            }
+        }
     }
 }

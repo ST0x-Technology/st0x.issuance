@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -7,6 +7,12 @@ use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
 use tracing::info;
+
+use super::{
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
+    ReceiptInventoryError, Shares, determine_source,
+};
+use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
@@ -28,12 +34,6 @@ fn block_ranges(
     })
     .map(move |start| (start, (start + chunk_size - 1).min(to)))
 }
-
-use super::{
-    ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares, determine_source,
-};
-use crate::bindings::Receipt;
 
 /// Backfills the ReceiptInventory aggregate by scanning historic ERC-1155
 /// TransferSingle/TransferBatch events where the bot wallet received receipts.
@@ -145,16 +145,15 @@ where
         .flatten()
         .collect();
 
-        let transfers = all_logs
+        let deposits = all_logs
             .iter()
             .map(Self::parse_log)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .flatten()
-            .unique_by(|transfer| transfer.receipt_id);
+            .unique_by(|deposit| deposit.receipt_id);
 
-        let results: Vec<_> = stream::iter(transfers)
-            .map(|transfer| self.process_transfer(transfer))
+        let results: Vec<_> = stream::iter(deposits)
+            .map(|deposit| self.process_deposit(deposit))
             .buffer_unordered(MAX_CONCURRENT_BALANCE_CHECKS)
             .collect()
             .await;
@@ -192,84 +191,57 @@ where
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<Log>, BackfillError> {
-        let receipt_contract =
-            Receipt::new(self.receipt_contract, &self.provider);
+        let vault_contract =
+            OffchainAssetReceiptVault::new(self.vault, &self.provider);
 
-        let single_filter = receipt_contract
-            .TransferSingle_filter()
-            .topic3(self.bot_wallet)
+        // Query Deposit events where owner (receiver) is the bot wallet.
+        // Deposit event: (sender, owner, assets, shares, id, receiptInformation)
+        // owner is not indexed, so we filter client-side after fetching.
+        let deposit_filter = vault_contract
+            .Deposit_filter()
             .from_block(from_block)
             .to_block(to_block)
             .filter;
 
-        let batch_filter = receipt_contract
-            .TransferBatch_filter()
-            .topic3(self.bot_wallet)
-            .from_block(from_block)
-            .to_block(to_block)
-            .filter;
+        let logs = self.provider.get_logs(&deposit_filter).await?;
 
-        let (single_logs, batch_logs) = futures::try_join!(
-            self.provider.get_logs(&single_filter),
-            self.provider.get_logs(&batch_filter),
-        )?;
+        // Filter to only deposits where owner == bot_wallet
+        let filtered: Vec<Log> = logs
+            .into_iter()
+            .filter(|log| {
+                OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)
+                    .map(|event| event.owner == self.bot_wallet)
+                    .unwrap_or(false)
+            })
+            .collect();
 
-        Ok(single_logs.into_iter().chain(batch_logs).collect())
+        Ok(filtered)
     }
 
-    fn parse_log(log: &Log) -> Result<Vec<TransferInfo>, BackfillError> {
-        // Try parsing as TransferSingle first, then TransferBatch
-        if let Ok(transfers) = Self::parse_transfer_single(log) {
-            return Ok(transfers);
-        }
-        Self::parse_transfer_batch(log)
-    }
-
-    fn parse_transfer_single(
-        log: &Log,
-    ) -> Result<Vec<TransferInfo>, BackfillError> {
-        let event = Receipt::TransferSingle::decode_log(&log.inner)?;
+    fn parse_log(log: &Log) -> Result<DepositInfo, BackfillError> {
+        let event = OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)?;
         let tx_hash =
             log.transaction_hash.ok_or(BackfillError::MissingTxHash)?;
         let block_number =
             log.block_number.ok_or(BackfillError::MissingBlockNumber)?;
 
-        Ok(vec![TransferInfo {
+        Ok(DepositInfo {
             receipt_id: ReceiptId::from(event.id),
             tx_hash,
             block_number,
-        }])
+            receipt_information: event.receiptInformation.clone(),
+        })
     }
 
-    fn parse_transfer_batch(
-        log: &Log,
-    ) -> Result<Vec<TransferInfo>, BackfillError> {
-        let event = Receipt::TransferBatch::decode_log(&log.inner)?;
-        let tx_hash =
-            log.transaction_hash.ok_or(BackfillError::MissingTxHash)?;
-        let block_number =
-            log.block_number.ok_or(BackfillError::MissingBlockNumber)?;
-
-        Ok(event
-            .ids
-            .iter()
-            .map(|&id| TransferInfo {
-                receipt_id: ReceiptId::from(id),
-                tx_hash,
-                block_number,
-            })
-            .collect())
-    }
-
-    async fn process_transfer(
+    async fn process_deposit(
         &self,
-        transfer: TransferInfo,
+        deposit: DepositInfo,
     ) -> Result<ProcessOutcome, BackfillError> {
         let receipt_contract =
             Receipt::new(self.receipt_contract, &self.provider);
 
         let current_balance = receipt_contract
-            .balanceOf(self.bot_wallet, transfer.receipt_id.inner())
+            .balanceOf(self.bot_wallet, deposit.receipt_id.inner())
             .call()
             .await?;
 
@@ -281,17 +253,17 @@ where
             .execute(
                 &self.vault.to_string(),
                 ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: transfer.receipt_id,
+                    receipt_id: deposit.receipt_id,
                     balance: Shares::from(current_balance),
-                    block_number: transfer.block_number,
-                    tx_hash: transfer.tx_hash,
-                    source: determine_source(transfer.receipt_id),
+                    block_number: deposit.block_number,
+                    tx_hash: deposit.tx_hash,
+                    source: determine_source(&deposit.receipt_information),
                 },
             )
             .await?;
 
         info!(
-            receipt_id = %transfer.receipt_id,
+            receipt_id = %deposit.receipt_id,
             balance = %current_balance,
             "Processed receipt"
         );
@@ -300,10 +272,11 @@ where
     }
 }
 
-struct TransferInfo {
+struct DepositInfo {
     receipt_id: ReceiptId,
     tx_hash: TxHash,
     block_number: u64,
+    receipt_information: Bytes,
 }
 
 enum ProcessOutcome {
@@ -314,7 +287,7 @@ enum ProcessOutcome {
 #[cfg(test)]
 mod tests {
     use alloy::network::EthereumWallet;
-    use alloy::primitives::{Address, B256, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bytes, U256, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::Log;
@@ -326,7 +299,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::ReceiptBackfiller;
-    use crate::bindings::Receipt;
+    use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::ReceiptInventory;
 
     type TestStore = MemStore<ReceiptInventory>;
@@ -339,67 +312,31 @@ mod tests {
         (receipt_contract, bot_wallet, vault)
     }
 
-    #[derive(Clone, Copy)]
-    struct TransferSingleLogParams {
-        receipt_contract: Address,
-        operator: Address,
-        from: Address,
-        to: Address,
+    struct DepositLogParams {
+        vault: Address,
+        sender: Address,
+        owner: Address,
+        assets: U256,
+        shares: U256,
         id: U256,
-        value: U256,
+        receipt_information: Bytes,
         tx_hash: B256,
         block_number: u64,
     }
 
-    fn create_transfer_single_log(params: TransferSingleLogParams) -> Log {
-        let event = Receipt::TransferSingle {
-            operator: params.operator,
-            from: params.from,
-            to: params.to,
+    fn create_deposit_log(params: DepositLogParams) -> Log {
+        let event = OffchainAssetReceiptVault::Deposit {
+            sender: params.sender,
+            owner: params.owner,
+            assets: params.assets,
+            shares: params.shares,
             id: params.id,
-            value: params.value,
+            receiptInformation: params.receipt_information,
         };
 
         Log {
             inner: alloy::primitives::Log {
-                address: params.receipt_contract,
-                data: event.encode_log_data(),
-            },
-            block_hash: Some(b256!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            )),
-            block_number: Some(params.block_number),
-            block_timestamp: None,
-            transaction_hash: Some(params.tx_hash),
-            transaction_index: Some(0),
-            log_index: Some(0),
-            removed: false,
-        }
-    }
-
-    struct TransferBatchLogParams<'a> {
-        receipt_contract: Address,
-        operator: Address,
-        from: Address,
-        to: Address,
-        ids: &'a [U256],
-        values: &'a [U256],
-        tx_hash: B256,
-        block_number: u64,
-    }
-
-    fn create_transfer_batch_log(params: &TransferBatchLogParams<'_>) -> Log {
-        let event = Receipt::TransferBatch {
-            operator: params.operator,
-            from: params.from,
-            to: params.to,
-            ids: params.ids.to_vec(),
-            values: params.values.to_vec(),
-        };
-
-        Log {
-            inner: alloy::primitives::Log {
-                address: params.receipt_contract,
+                address: params.vault,
                 data: event.encode_log_data(),
             },
             block_hash: Some(b256!(
@@ -426,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_discovers_receipt_from_historic_transfer_single() {
+    async fn backfill_discovers_receipt_from_historic_deposit() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let cqrs = setup_cqrs();
 
@@ -436,31 +373,26 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let transfer_log =
-            create_transfer_single_log(TransferSingleLogParams {
-                receipt_contract,
-                operator: Address::ZERO,
-                from: Address::ZERO,
-                to: bot_wallet,
-                id: receipt_id,
-                value: balance,
-                tx_hash,
-                block_number: 100,
-            });
+        let deposit_log = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: balance,
+            shares: balance,
+            id: receipt_id,
+            receipt_information: Bytes::new(),
+            tx_hash,
+            block_number: 100,
+        });
 
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber - called first to get current block
+        // eth_blockNumber
         asserter.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter.push_success(&vec![transfer_log]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian
+        // eth_getLogs (Deposit filter)
+        asserter.push_success(&vec![deposit_log]);
+        // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
         let provider = ProviderBuilder::new()
@@ -492,32 +424,27 @@ mod tests {
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
 
-        let transfer_log =
-            create_transfer_single_log(TransferSingleLogParams {
-                receipt_contract,
-                operator: Address::ZERO,
-                from: Address::ZERO,
-                to: bot_wallet,
-                id: receipt_id,
-                value: balance,
-                tx_hash,
-                block_number: 100,
-            });
+        let deposit_log = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: balance,
+            shares: balance,
+            id: receipt_id,
+            receipt_information: Bytes::new(),
+            tx_hash,
+            block_number: 100,
+        });
 
         // First run
         let asserter1 = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber - called first
+        // eth_blockNumber
         asserter1.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter1.push_success(&vec![transfer_log.clone()]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter1.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian
+        // eth_getLogs (Deposit filter)
+        asserter1.push_success(&vec![deposit_log.clone()]);
+        // eth_call (balanceOf)
         asserter1.push_success(&balance.to_be_bytes::<32>());
 
         let provider1 = ProviderBuilder::new()
@@ -535,19 +462,14 @@ mod tests {
         let result1 = backfiller1.backfill_receipts(0).await.unwrap();
         assert_eq!(result1.processed_count, 1);
 
-        // Second run - command is idempotent, succeeds without error
+        // Second run - command is idempotent
         let asserter2 = Asserter::new();
 
-        // eth_blockNumber - called first
+        // eth_blockNumber
         asserter2.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter2.push_success(&vec![transfer_log]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter2.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_call (balanceOf) - ABI-encoded 32-byte big-endian
+        // eth_getLogs (Deposit filter)
+        asserter2.push_success(&vec![deposit_log]);
+        // eth_call (balanceOf)
         asserter2.push_success(&balance.to_be_bytes::<32>());
 
         let provider2 = ProviderBuilder::new()
@@ -563,8 +485,6 @@ mod tests {
         );
 
         let result2 = backfiller2.backfill_receipts(0).await.unwrap();
-
-        // Command succeeds but emits no events (idempotent)
         assert_eq!(result2.processed_count, 1);
     }
 
@@ -574,36 +494,31 @@ mod tests {
         let cqrs = setup_cqrs();
 
         let receipt_id = U256::from(99);
-        let transfer_amount = U256::from(500);
+        let deposit_amount = U256::from(500);
         let tx_hash = b256!(
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
 
-        let transfer_log =
-            create_transfer_single_log(TransferSingleLogParams {
-                receipt_contract,
-                operator: Address::ZERO,
-                from: Address::ZERO,
-                to: bot_wallet,
-                id: receipt_id,
-                value: transfer_amount,
-                tx_hash,
-                block_number: 200,
-            });
+        let deposit_log = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: deposit_amount,
+            shares: deposit_amount,
+            id: receipt_id,
+            receipt_information: Bytes::new(),
+            tx_hash,
+            block_number: 200,
+        });
 
         let asserter = Asserter::new();
         let current_block = 300u64;
 
-        // eth_blockNumber - called first
+        // eth_blockNumber
         asserter.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter.push_success(&vec![transfer_log]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_call (balanceOf) - current balance is zero (receipt was fully burned)
+        // eth_getLogs (Deposit filter)
+        asserter.push_success(&vec![deposit_log]);
+        // eth_call (balanceOf) - zero because receipt was fully burned
         asserter.push_success(&U256::ZERO.to_be_bytes::<32>());
 
         let provider = ProviderBuilder::new()
@@ -625,43 +540,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_uses_current_onchain_balance_not_transfer_amount() {
+    async fn backfill_uses_current_onchain_balance_not_deposit_amount() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let (cqrs, store) = setup_cqrs_with_store();
 
         let receipt_id = U256::from(77);
-        let original_transfer_amount = U256::from(1000);
+        let original_deposit = U256::from(1000);
         let current_balance = U256::from(300); // Partially burned
         let tx_hash = b256!(
             "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
         );
 
-        let transfer_log =
-            create_transfer_single_log(TransferSingleLogParams {
-                receipt_contract,
-                operator: Address::ZERO,
-                from: Address::ZERO,
-                to: bot_wallet,
-                id: receipt_id,
-                value: original_transfer_amount,
-                tx_hash,
-                block_number: 300,
-            });
+        let deposit_log = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: original_deposit,
+            shares: original_deposit,
+            id: receipt_id,
+            receipt_information: Bytes::new(),
+            tx_hash,
+            block_number: 300,
+        });
 
         let asserter = Asserter::new();
         let checkpoint_block = 400u64;
 
-        // eth_blockNumber - called first
+        // eth_blockNumber
         asserter.push_success(&U256::from(checkpoint_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter.push_success(&vec![transfer_log]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_call (balanceOf) - returns current balance (300), not original
-        // transfer amount (1000). Must be ABI-encoded as 32-byte big-endian.
+        // eth_getLogs (Deposit filter)
+        asserter.push_success(&vec![deposit_log]);
+        // eth_call (balanceOf) - returns current balance, not original deposit
         asserter.push_success(&current_balance.to_be_bytes::<32>());
 
         let provider = ProviderBuilder::new()
@@ -680,7 +589,6 @@ mod tests {
 
         assert_eq!(result.processed_count, 1);
 
-        // Verify the aggregate has the current balance, not the transfer amount
         let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
 
@@ -689,44 +597,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_discovers_receipts_from_transfer_batch() {
+    async fn backfill_filters_deposits_by_owner() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, store) = setup_cqrs_with_store();
+        let cqrs = setup_cqrs();
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
 
-        let ids = [U256::from(1), U256::from(2), U256::from(3)];
-        let values = [U256::from(100), U256::from(200), U256::from(300)];
-        let balances = [U256::from(50), U256::from(200), U256::from(300)]; // First partially burned
-        let tx_hash = b256!(
-            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let balance = U256::from(1000);
 
-        let batch_log = create_transfer_batch_log(&TransferBatchLogParams {
-            receipt_contract,
-            operator: Address::ZERO,
-            from: Address::ZERO,
-            to: bot_wallet,
-            ids: &ids,
-            values: &values,
-            tx_hash,
-            block_number: 500,
+        // Deposit to bot_wallet (should be processed)
+        let deposit_for_bot = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: balance,
+            shares: balance,
+            id: U256::from(1),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 100,
+        });
+
+        // Deposit to other_wallet (should be filtered out)
+        let deposit_for_other = create_deposit_log(DepositLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: balance,
+            shares: balance,
+            id: U256::from(2),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            block_number: 101,
         });
 
         let asserter = Asserter::new();
-        let current_block = 600u64;
+        let current_block = 200u64;
 
-        // eth_blockNumber - called first
+        // eth_blockNumber
         asserter.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter) - returns empty
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
-        // eth_getLogs (TransferBatch filter) - returns the batch event
-        asserter.push_success(&vec![batch_log]);
-
-        // eth_call (balanceOf) for each receipt, in processing order
-        asserter.push_success(&balances[0].to_be_bytes::<32>());
-        asserter.push_success(&balances[1].to_be_bytes::<32>());
-        asserter.push_success(&balances[2].to_be_bytes::<32>());
+        // eth_getLogs (Deposit filter) - both deposits returned, filtered client-side
+        asserter.push_success(&vec![deposit_for_bot, deposit_for_other]);
+        // eth_call (balanceOf) - only called for bot's receipt
+        asserter.push_success(&balance.to_be_bytes::<32>());
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
@@ -742,13 +659,7 @@ mod tests {
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
 
-        assert_eq!(result.processed_count, 3);
-        assert_eq!(result.skipped_zero_balance, 0);
-
-        // Verify all receipts are in the aggregate with current balances
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = ctx.aggregate().receipts_with_balance();
-        assert_eq!(receipts.len(), 3);
+        assert_eq!(result.processed_count, 1);
     }
 
     #[tokio::test]
@@ -762,30 +673,25 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let transfer_log =
-            create_transfer_single_log(TransferSingleLogParams {
-                receipt_contract,
-                operator: Address::ZERO,
-                from: Address::ZERO,
-                to: bot_wallet,
-                id: receipt_id,
-                value: balance,
-                tx_hash,
-                block_number: 100,
-            });
+        let deposit_log = create_deposit_log(DepositLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: balance,
+            shares: balance,
+            id: receipt_id,
+            receipt_information: Bytes::new(),
+            tx_hash,
+            block_number: 100,
+        });
 
         let asserter = Asserter::new();
         let current_block = 150u64;
 
-        // eth_blockNumber - called first to get current block
+        // eth_blockNumber
         asserter.push_success(&U256::from(current_block));
-
-        // eth_getLogs (TransferSingle filter)
-        asserter.push_success(&vec![transfer_log]);
-
-        // eth_getLogs (TransferBatch filter)
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
-
+        // eth_getLogs (Deposit filter)
+        asserter.push_success(&vec![deposit_log]);
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -803,7 +709,6 @@ mod tests {
 
         backfiller.backfill_receipts(0).await.unwrap();
 
-        // Verify checkpoint was set to current block
         let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         assert_eq!(
             ctx.aggregate().last_backfilled_block(),

@@ -349,8 +349,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info)?);
+        let receipt_info_bytes = receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.read_provider);
@@ -435,8 +434,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         &self,
         params: MultiBurnParams,
     ) -> Result<MultiBurnResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&params.receipt_info)?);
+        let receipt_info_bytes = params.receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
