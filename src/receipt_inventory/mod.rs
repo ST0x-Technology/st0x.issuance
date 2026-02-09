@@ -19,8 +19,10 @@ pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
-pub(crate) use event::ReceiptInventoryEvent;
+pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 pub(crate) use view::ReceiptInventoryView;
+
+use crate::mint::IssuerRequestId;
 
 /// Unique identifier for an ERC-1155 receipt within a vault.
 ///
@@ -156,6 +158,9 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReceiptInventory {
     receipts: HashMap<ReceiptId, Shares>,
+    /// Maps issuer_request_id to receipt_id for ITN mints.
+    /// Used by mint recovery to check if a mint succeeded on-chain.
+    itn_receipts: HashMap<IssuerRequestId, ReceiptId>,
     last_backfilled_block: Option<u64>,
 }
 
@@ -173,6 +178,23 @@ impl ReceiptInventory {
     pub(crate) const fn last_backfilled_block(&self) -> Option<u64> {
         self.last_backfilled_block
     }
+
+    /// Finds a receipt by its issuer_request_id (for ITN mints only).
+    /// Returns None if no ITN receipt exists with this issuer_request_id.
+    pub(crate) fn find_by_issuer_request_id(
+        &self,
+        _issuer_request_id: &IssuerRequestId,
+    ) -> Option<ReceiptId> {
+        todo!()
+    }
+}
+
+/// Determines the source of a receipt by parsing the vault's receiptInformation.
+///
+/// If the receiptInformation contains a valid `issuer_request_id`, this returns
+/// `ReceiptSource::Itn`; otherwise `ReceiptSource::External`.
+pub(crate) fn determine_source(_receipt_id: ReceiptId) -> ReceiptSource {
+    todo!("Task 6: parse receiptInformation to determine source")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -213,6 +235,7 @@ impl Aggregate for ReceiptInventory {
                 balance,
                 block_number,
                 tx_hash,
+                source,
             } => {
                 if self.receipts.contains_key(&receipt_id) {
                     return Ok(vec![]);
@@ -223,6 +246,7 @@ impl Aggregate for ReceiptInventory {
                     balance,
                     block_number,
                     tx_hash,
+                    source,
                 }])
             }
 
@@ -306,7 +330,7 @@ impl Aggregate for ReceiptInventory {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{TxHash, address, b256};
     use cqrs_es::{CqrsFramework, mem_store::MemStore};
     use std::sync::Arc;
 
@@ -320,6 +344,21 @@ mod tests {
         Shares::new(U256::from(n))
     }
 
+    fn discover_receipt_cmd(
+        receipt_id: ReceiptId,
+        balance: Shares,
+        block_number: u64,
+        tx_hash: TxHash,
+    ) -> ReceiptInventoryCommand {
+        ReceiptInventoryCommand::DiscoverReceipt {
+            receipt_id,
+            balance,
+            block_number,
+            tx_hash,
+            source: ReceiptSource::External,
+        }
+    }
+
     #[tokio::test]
     async fn test_discover_receipt_emits_discovered_event() {
         let aggregate = ReceiptInventory::default();
@@ -329,12 +368,12 @@ mod tests {
 
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(100),
-                    block_number: 1000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -362,12 +401,12 @@ mod tests {
         // First discovery succeeds
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(100),
-                    block_number: 1000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -381,12 +420,12 @@ mod tests {
         // Second discovery is idempotent - returns Ok with no events
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(200),
-                    block_number: 2000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(200),
+                    2000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -405,12 +444,12 @@ mod tests {
         // Discover receipt first
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(100),
-                    block_number: 1000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -455,12 +494,12 @@ mod tests {
         // Discover receipt
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(100),
-                    block_number: 1000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -526,12 +565,12 @@ mod tests {
         // Discover receipt with 50 balance
         let events = aggregate
             .handle(
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(42),
-                    balance: make_shares(50),
-                    block_number: 1000,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(50),
+                    1000,
                     tx_hash,
-                },
+                ),
                 &(),
             )
             .await
@@ -597,6 +636,7 @@ mod tests {
             balance: make_shares(100),
             block_number: 1000,
             tx_hash,
+            source: ReceiptSource::External,
         });
 
         assert_eq!(aggregate.receipts.len(), 1);
@@ -709,12 +749,12 @@ mod tests {
             cqrs.execute(
                 &address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                     .to_string(),
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: make_receipt_id(id),
-                    balance: make_shares(balance),
-                    block_number: 1000 + i as u64,
+                discover_receipt_cmd(
+                    make_receipt_id(id),
+                    make_shares(balance),
+                    1000 + i as u64,
                     tx_hash,
-                },
+                ),
             )
             .await
             .unwrap();

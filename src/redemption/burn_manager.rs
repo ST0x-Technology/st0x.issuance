@@ -726,7 +726,7 @@ mod tests {
     };
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptService, Shares,
+        ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
     use crate::redemption::view::RedemptionView;
     use crate::tokenized_asset::view::TokenizedAssetView;
@@ -858,6 +858,7 @@ mod tests {
                         tx_hash: b256!(
                             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         ),
+                        source: ReceiptSource::External,
                     },
                 )
                 .await

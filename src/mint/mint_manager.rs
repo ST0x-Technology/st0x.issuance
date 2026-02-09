@@ -7,7 +7,7 @@ use sqlx::{Pool, Sqlite};
 use tracing::{debug, error, info, warn};
 
 use crate::receipt_inventory::{
-    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource, Shares,
 };
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
@@ -225,6 +225,7 @@ where
             result.shares_minted,
             result.block_number,
             result.tx_hash,
+            issuer_request_id.clone(),
         )
         .await;
 
@@ -272,6 +273,7 @@ where
         shares: U256,
         block_number: u64,
         tx_hash: B256,
+        issuer_request_id: IssuerRequestId,
     ) {
         if let Err(e) = self
             .receipt_inventory_cqrs
@@ -282,6 +284,7 @@ where
                     balance: Shares::from(shares),
                     block_number,
                     tx_hash,
+                    source: ReceiptSource::Itn { issuer_request_id },
                 },
             )
             .await

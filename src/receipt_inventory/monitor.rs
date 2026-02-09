@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares,
+    ReceiptInventoryError, ReceiptSource, Shares, determine_source,
 };
 use crate::bindings::Receipt;
 
@@ -259,6 +259,7 @@ where
                     balance: Shares::from(current_balance),
                     block_number,
                     tx_hash,
+                    source: determine_source(receipt_id),
                 },
             )
             .await
@@ -425,6 +426,7 @@ mod tests {
                 balance,
                 block_number,
                 tx_hash,
+                source: ReceiptSource::External,
             },
         )
         .await
@@ -462,6 +464,7 @@ mod tests {
                     balance,
                     block_number,
                     tx_hash,
+                    source: ReceiptSource::External,
                 },
             )
             .await

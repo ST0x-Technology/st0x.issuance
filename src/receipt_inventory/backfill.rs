@@ -31,7 +31,7 @@ fn block_ranges(
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares,
+    ReceiptInventoryError, Shares, determine_source,
 };
 use crate::bindings::Receipt;
 
@@ -285,6 +285,7 @@ where
                     balance: Shares::from(current_balance),
                     block_number: transfer.block_number,
                     tx_hash: transfer.tx_hash,
+                    source: determine_source(transfer.receipt_id),
                 },
             )
             .await?;
