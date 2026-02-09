@@ -14,13 +14,15 @@ use tracing::info;
 
 use crate::account::{Account, AccountView};
 use crate::auth::FailedAuthRateLimiter;
-use crate::config::ConfigError;
-use crate::mint::{CallbackManager, Mint, MintView, mint_manager::MintManager};
+use crate::mint::{
+    CallbackManager, Mint, MintView, mint_manager::MintManager,
+    replay_mint_view,
+};
 use crate::receipt_inventory::backfill::ReceiptBackfiller;
-use crate::receipt_inventory::burn_tracking::replay_receipt_burns_view;
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
+    burn_tracking::replay_receipt_burns_view,
 };
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -43,6 +45,7 @@ pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
+pub(crate) mod fireblocks;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
@@ -52,7 +55,9 @@ pub mod bindings;
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
 pub use config::{Config, LogLevel, setup_tracing};
+pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
+pub use test_utils::ANVIL_CHAIN_ID;
 
 pub(crate) type AccountCqrs = SqliteCqrs<Account>;
 pub(crate) type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
@@ -82,8 +87,12 @@ struct AggregateCqrsSetup {
     mint_event_store: MintEventStore,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
-    receipt_inventory_cqrs: ReceiptInventoryCqrs,
-    receipt_inventory_event_store: ReceiptInventoryEventStore,
+    receipt_inventory: ReceiptInventoryDeps,
+}
+
+struct ReceiptInventoryDeps {
+    cqrs: ReceiptInventoryCqrs,
+    event_store: ReceiptInventoryEventStore,
 }
 
 struct MintManagers {
@@ -245,9 +254,11 @@ pub async fn initialize_rocket(
         mint_event_store,
         redemption_cqrs,
         redemption_event_store,
-        receipt_inventory_cqrs,
-        receipt_inventory_event_store,
+        receipt_inventory,
     } = setup_aggregate_cqrs(&pool, blockchain_service.clone());
+
+    let bot_wallet = config.signer.address().await?;
+    info!("Bot wallet address: {bot_wallet}");
 
     let MintManagers { mint: mint_manager, callback: callback_manager } =
         setup_mint_managers(
@@ -255,24 +266,25 @@ pub async fn initialize_rocket(
             blockchain_service.clone(),
             &mint_cqrs,
             &mint_event_store,
-            &receipt_inventory_cqrs,
+            &receipt_inventory.cqrs,
             &pool,
+            bot_wallet,
         )?;
 
     spawn_mint_recovery(mint_manager.clone(), callback_manager.clone());
 
-    let RedemptionManagers { redeem_call, journal, burn } =
-        setup_redemption_managers(
-            &config,
-            blockchain_service,
-            &redemption_cqrs,
-            &redemption_event_store,
-            &receipt_inventory_event_store,
-            &receipt_inventory_cqrs,
-            &pool,
-        )?;
+    let managers = setup_redemption_managers(
+        &config,
+        blockchain_service,
+        &redemption_cqrs,
+        &redemption_event_store,
+        &receipt_inventory,
+        &pool,
+        bot_wallet,
+    )?;
 
     info!("Replaying views to ensure schema updates are applied");
+    replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 
@@ -282,8 +294,9 @@ pub async fn initialize_rocket(
     let receipt_contract = run_receipt_backfill(
         &config,
         provider.clone(),
-        &receipt_inventory_cqrs,
-        &receipt_inventory_event_store,
+        &receipt_inventory.cqrs,
+        &receipt_inventory.event_store,
+        bot_wallet,
     )
     .await?;
 
@@ -291,13 +304,14 @@ pub async fn initialize_rocket(
         provider,
         &config,
         receipt_contract,
-        receipt_inventory_cqrs.clone(),
-    )?;
+        receipt_inventory.cqrs.clone(),
+        bot_wallet,
+    );
 
     spawn_redemption_recovery(
-        redeem_call.clone(),
-        journal.clone(),
-        burn.clone(),
+        managers.redeem_call.clone(),
+        managers.journal.clone(),
+        managers.burn.clone(),
     );
 
     spawn_redemption_detector(
@@ -305,10 +319,9 @@ pub async fn initialize_rocket(
         redemption_cqrs.clone(),
         redemption_event_store,
         pool.clone(),
-        redeem_call,
-        journal,
-        burn,
-    )?;
+        managers,
+        bot_wallet,
+    );
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -440,8 +453,10 @@ fn setup_aggregate_cqrs(
         mint_event_store,
         redemption_cqrs,
         redemption_event_store,
-        receipt_inventory_cqrs,
-        receipt_inventory_event_store,
+        receipt_inventory: ReceiptInventoryDeps {
+            cqrs: receipt_inventory_cqrs,
+            event_store: receipt_inventory_event_store,
+        },
     }
 }
 
@@ -452,13 +467,14 @@ fn setup_mint_managers(
     mint_event_store: &MintEventStore,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     pool: &Pool<Sqlite>,
+    bot_wallet: Address,
 ) -> Result<MintManagers, anyhow::Error> {
     let mint = Arc::new(MintManager::new(
         blockchain_service,
         mint_cqrs.clone(),
         mint_event_store.clone(),
         pool.clone(),
-        config.bot_wallet()?,
+        bot_wallet,
         receipt_inventory_cqrs.clone(),
     ));
 
@@ -478,9 +494,9 @@ fn setup_redemption_managers(
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+    receipt_inventory: &ReceiptInventoryDeps,
     pool: &Pool<Sqlite>,
+    bot_wallet: Address,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
@@ -497,7 +513,7 @@ fn setup_redemption_managers(
     ));
 
     let receipt_service = Arc::new(CqrsReceiptService::new(
-        receipt_inventory_event_store.clone(),
+        receipt_inventory.event_store.clone(),
     ));
 
     let burn = Arc::new(BurnManager::new(
@@ -506,8 +522,8 @@ fn setup_redemption_managers(
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
         receipt_service,
-        receipt_inventory_cqrs.clone(),
-        config.bot_wallet()?,
+        receipt_inventory.cqrs.clone(),
+        bot_wallet,
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
@@ -520,23 +536,10 @@ fn spawn_redemption_detector(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     pool: Pool<Sqlite>,
-    redeem_call: Arc<
-        RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-        >,
-    >,
-    journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
-    burn: Arc<
-        BurnManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
-        >,
-    >,
-) -> Result<(), config::ConfigError> {
-    let bot_wallet = config.bot_wallet()?;
-    info!("WebSocket monitoring task spawned for bot wallet {bot_wallet}");
+    managers: RedemptionManagers,
+    bot_wallet: Address,
+) {
+    info!("Spawning WebSocket monitoring task for bot wallet {bot_wallet}");
 
     let detector_config = RedemptionDetectorConfig {
         rpc_url: config.rpc_url.clone(),
@@ -549,16 +552,14 @@ fn spawn_redemption_detector(
         redemption_cqrs,
         redemption_event_store,
         pool,
-        redeem_call,
-        journal,
-        burn,
+        managers.redeem_call,
+        managers.journal,
+        managers.burn,
     );
 
     tokio::spawn(async move {
         detector.run().await;
     });
-
-    Ok(())
 }
 
 fn spawn_mint_recovery(
@@ -613,9 +614,8 @@ async fn run_receipt_backfill<P: alloy::providers::Provider + Clone>(
     provider: P,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     receipt_inventory_event_store: &ReceiptInventoryEventStore,
+    bot_wallet: Address,
 ) -> Result<Address, anyhow::Error> {
-    let bot_wallet = config.bot_wallet()?;
-
     // Query the vault for its receipt contract address.
     // The vault uses a separate ERC-1155 contract for receipts which emits
     // the TransferSingle/TransferBatch events we need to discover.
@@ -666,12 +666,10 @@ fn spawn_receipt_monitor<P>(
     config: &Config,
     receipt_contract: Address,
     receipt_inventory_cqrs: ReceiptInventoryCqrs,
-) -> Result<(), ConfigError>
-where
+    bot_wallet: Address,
+) where
     P: Provider + Clone + Send + Sync + 'static,
 {
-    let bot_wallet = config.bot_wallet()?;
-
     info!(
         vault = %config.vault,
         receipt_contract = %receipt_contract,
@@ -691,8 +689,6 @@ where
     tokio::spawn(async move {
         monitor.run().await;
     });
-
-    Ok(())
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {

@@ -60,7 +60,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                 self.recover_single_detected(&issuer_request_id).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.0,
+                    issuer_request_id = %issuer_request_id.as_str(),
                     error = %e,
                     "Failed to recover Detected redemption"
                 );
@@ -75,13 +75,13 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         issuer_request_id: &IssuerRequestId,
     ) -> Result<(), RedeemCallManagerError> {
         let aggregate_ctx =
-            self.event_store.load_aggregate(&issuer_request_id.0).await?;
+            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
 
         let aggregate = aggregate_ctx.aggregate();
 
         let Redemption::Detected { metadata } = aggregate else {
             debug!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 "Redemption no longer in Detected state, skipping"
             );
             return Ok(());
@@ -94,7 +94,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             self.lookup_network_for_asset(&metadata.underlying).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id.as_str(),
             "Recovering Detected redemption - calling Alpaca"
         );
 
@@ -151,7 +151,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     }
 
     #[tracing::instrument(skip(self, aggregate), fields(
-        issuer_request_id = %issuer_request_id.0,
+        issuer_request_id = %issuer_request_id.as_str(),
         client_id = %client_id
     ))]
     pub(crate) async fn handle_redemption_detected(
@@ -168,16 +168,13 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             });
         };
 
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-        let UnderlyingSymbol(underlying_str) = &metadata.underlying;
-
         // Truncate to 9 decimals for Alpaca - they don't support 18 decimal precision
         let (alpaca_quantity, dust_quantity) =
             metadata.quantity.truncate_for_alpaca()?;
 
         info!(
-            issuer_request_id = %issuer_request_id_str,
-            underlying = %underlying_str,
+            issuer_request_id = %issuer_request_id,
+            underlying = %metadata.underlying,
             original_quantity = %metadata.quantity.0,
             alpaca_quantity = %alpaca_quantity.0,
             dust_quantity = %dust_quantity.0,
@@ -199,7 +196,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
                 info!(
-                    issuer_request_id = %response.issuer_request_id.0,
+                    issuer_request_id = %response.issuer_request_id.as_str(),
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
                     status = ?response.status,
@@ -217,7 +214,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
                 self.cqrs
                     .execute(
-                        issuer_request_id_str,
+                        issuer_request_id.as_str(),
                         RedemptionCommand::RecordAlpacaCall {
                             issuer_request_id: issuer_request_id.clone(),
                             tokenization_request_id: response
@@ -229,7 +226,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     .await?;
 
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     "RecordAlpacaCall command executed successfully"
                 );
 
@@ -237,14 +234,14 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             }
             Err(e) => {
                 warn!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     error = %e,
                     "Alpaca redeem API call failed"
                 );
 
                 self.cqrs
                     .execute(
-                        issuer_request_id_str,
+                        issuer_request_id.as_str(),
                         RedemptionCommand::RecordAlpacaFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: e.to_string(),
@@ -253,7 +250,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     .await?;
 
                 info!(
-                    issuer_request_id = %issuer_request_id_str,
+                    issuer_request_id = %issuer_request_id,
                     "RecordAlpacaFailure command executed successfully"
                 );
 
@@ -464,7 +461,7 @@ mod tests {
         ) {
             self.redemption_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     RedemptionCommand::Detect {
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
@@ -533,7 +530,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -554,7 +551,8 @@ mod tests {
         store: &TestStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Redemption {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -832,7 +830,7 @@ mod tests {
 
         let context = harness
             .redemption_store
-            .load_aggregate(&issuer_request_id.0)
+            .load_aggregate(issuer_request_id.as_str())
             .await
             .unwrap();
         let updated_aggregate = context.aggregate();

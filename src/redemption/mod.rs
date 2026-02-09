@@ -8,7 +8,7 @@ pub(crate) mod detector;
 pub(crate) mod journal_manager;
 pub(crate) mod redeem_call_manager;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -97,6 +97,16 @@ struct BurnInput {
     receipt_info: ReceiptInformation,
 }
 
+struct DetectInput {
+    issuer_request_id: IssuerRequestId,
+    underlying: UnderlyingSymbol,
+    token: TokenSymbol,
+    wallet: Address,
+    quantity: Quantity,
+    tx_hash: TxHash,
+    block_number: u64,
+}
+
 impl Redemption {
     pub(crate) const fn metadata(&self) -> Option<&RedemptionMetadata> {
         match self {
@@ -126,6 +136,28 @@ impl Redemption {
             Self::Completed { .. } => "Completed",
             Self::Failed { .. } => "Failed",
         }
+    }
+
+    fn handle_detect(
+        &self,
+        input: DetectInput,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::Uninitialized) {
+            return Err(RedemptionError::AlreadyDetected {
+                issuer_request_id: input.issuer_request_id.as_str().to_string(),
+            });
+        }
+
+        Ok(vec![RedemptionEvent::Detected {
+            issuer_request_id: input.issuer_request_id,
+            underlying: input.underlying,
+            token: input.token,
+            wallet: input.wallet,
+            quantity: input.quantity,
+            tx_hash: input.tx_hash,
+            block_number: input.block_number,
+            detected_at: Utc::now(),
+        }])
     }
 
     fn handle_record_alpaca_call(
@@ -331,7 +363,7 @@ impl Redemption {
     ) {
         let Self::Detected { metadata } = self else {
             warn!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 current_state = %self.state_name(),
                 "AlpacaCalled event received in wrong state, expected Detected"
             );
@@ -361,7 +393,7 @@ impl Redemption {
         } = self
         else {
             warn!(
-                issuer_request_id = %issuer_request_id.0,
+                issuer_request_id = %issuer_request_id.as_str(),
                 current_state = %self.state_name(),
                 "AlpacaJournalCompleted event received in wrong state, expected AlpacaCalled"
             );
@@ -435,24 +467,15 @@ impl Aggregate for Redemption {
                 quantity,
                 tx_hash,
                 block_number,
-            } => {
-                if !matches!(self, Self::Uninitialized) {
-                    return Err(RedemptionError::AlreadyDetected {
-                        issuer_request_id: issuer_request_id.0,
-                    });
-                }
-
-                Ok(vec![RedemptionEvent::Detected {
-                    issuer_request_id,
-                    underlying,
-                    token,
-                    wallet,
-                    quantity,
-                    tx_hash,
-                    block_number,
-                    detected_at: Utc::now(),
-                }])
-            }
+            } => self.handle_detect(DetectInput {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+            }),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id,
                 tokenization_request_id,
@@ -720,7 +743,7 @@ mod tests {
                 block_number,
             })
             .then_expect_error(RedemptionError::AlreadyDetected {
-                issuer_request_id: issuer_request_id.0,
+                issuer_request_id: issuer_request_id.as_str().to_string(),
             });
     }
 

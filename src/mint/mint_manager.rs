@@ -9,7 +9,6 @@ use tracing::{debug, error, info, warn};
 use crate::receipt_inventory::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares,
 };
-use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
@@ -102,7 +101,7 @@ where
     /// * `MintManagerError::Blockchain` - Blockchain transaction failed
     /// * `MintManagerError::Cqrs` - Command execution failed
     #[tracing::instrument(skip(self, aggregate), fields(
-        issuer_request_id = %issuer_request_id.0
+        issuer_request_id = %issuer_request_id.as_str()
     ))]
     pub(crate) async fn handle_journal_confirmed(
         &self,
@@ -122,18 +121,15 @@ where
             });
         };
 
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-        let UnderlyingSymbol(underlying_str) = underlying;
-
         let vault = find_vault_by_underlying(&self.pool, underlying)
             .await?
             .ok_or_else(|| MintManagerError::AssetNotFound {
-                underlying: underlying_str.clone(),
+                underlying: underlying.0.clone(),
             })?;
 
         info!(
-            issuer_request_id = %issuer_request_id_str,
-            underlying = %underlying_str,
+            issuer_request_id = %issuer_request_id,
+            underlying = %underlying,
             quantity = %quantity.0,
             wallet = %wallet,
             vault = %vault,
@@ -145,7 +141,7 @@ where
         // `find_journal_confirmed()` if we crash before completing.
         self.cqrs
             .execute(
-                issuer_request_id_str,
+                issuer_request_id.as_str(),
                 MintCommand::StartMinting {
                     issuer_request_id: issuer_request_id.clone(),
                 },
@@ -153,7 +149,7 @@ where
             .await?;
 
         debug!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             "StartMinting command executed, proceeding with blockchain call"
         );
 
@@ -193,10 +189,8 @@ where
         vault: Address,
         result: MintResult,
     ) -> Result<(), MintManagerError> {
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             tx_hash = %result.tx_hash,
             receipt_id = %result.receipt_id,
             shares_minted = %result.shares_minted,
@@ -207,7 +201,7 @@ where
 
         self.cqrs
             .execute(
-                issuer_request_id_str,
+                issuer_request_id.as_str(),
                 MintCommand::RecordMintSuccess {
                     issuer_request_id: issuer_request_id.clone(),
                     tx_hash: result.tx_hash,
@@ -220,7 +214,7 @@ where
             .await?;
 
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             "RecordMintSuccess command executed successfully"
         );
 
@@ -242,17 +236,15 @@ where
         issuer_request_id: &IssuerRequestId,
         error: VaultError,
     ) -> Result<(), MintManagerError> {
-        let IssuerRequestId(issuer_request_id_str) = issuer_request_id;
-
         warn!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             error = %error,
             "On-chain minting failed"
         );
 
         self.cqrs
             .execute(
-                issuer_request_id_str,
+                issuer_request_id.as_str(),
                 MintCommand::RecordMintFailure {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error.to_string(),
@@ -261,7 +253,7 @@ where
             .await?;
 
         info!(
-            issuer_request_id = %issuer_request_id_str,
+            issuer_request_id = %issuer_request_id,
             "RecordMintFailure command executed successfully"
         );
 
@@ -340,13 +332,13 @@ where
         for (issuer_request_id, _view) in stuck_mints {
             let aggregate = match self
                 .event_store
-                .load_aggregate(&issuer_request_id.0)
+                .load_aggregate(issuer_request_id.as_str())
                 .await
             {
                 Ok(context) => context.aggregate().clone(),
                 Err(e) => {
                     error!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         error = %e,
                         "Failed to load aggregate for recovery"
                     );
@@ -360,13 +352,13 @@ where
             {
                 Ok(()) => {
                     info!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         "Successfully recovered JournalConfirmed mint"
                     );
                 }
                 Err(e) => {
                     error!(
-                        issuer_request_id = %issuer_request_id.0,
+                        issuer_request_id = %issuer_request_id.as_str(),
                         error = %e,
                         "Failed to recover JournalConfirmed mint"
                     );
@@ -536,7 +528,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::Initiate {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: tokenization_request_id.clone(),
@@ -552,7 +544,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::ConfirmJournal {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -567,7 +559,8 @@ mod tests {
         store: &TestMintStore,
         issuer_request_id: &IssuerRequestId,
     ) -> Mint {
-        let context = store.load_aggregate(&issuer_request_id.0).await.unwrap();
+        let context =
+            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -766,7 +759,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         cqrs.execute(
-            &issuer_request_id.0,
+            issuer_request_id.as_str(),
             MintCommand::Initiate {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -933,7 +926,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::Initiate {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: TokenizationRequestId::new(
@@ -952,7 +945,7 @@ mod tests {
 
         mint_cqrs
             .execute(
-                &issuer_request_id.0,
+                issuer_request_id.as_str(),
                 MintCommand::ConfirmJournal {
                     issuer_request_id: issuer_request_id.clone(),
                 },
@@ -1051,7 +1044,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::Initiate {
                         issuer_request_id: issuer_request_id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
@@ -1070,7 +1063,7 @@ mod tests {
 
             mint_cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    issuer_request_id.as_str(),
                     MintCommand::ConfirmJournal {
                         issuer_request_id: issuer_request_id.clone(),
                     },

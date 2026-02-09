@@ -332,6 +332,7 @@ mod tests {
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::config::LogLevel;
+    use crate::fireblocks::SignerConfig;
 
     #[rocket::get("/issuer-test")]
     fn issuer_endpoint(_auth: IssuerAuth) -> &'static str {
@@ -348,7 +349,8 @@ mod tests {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-            private_key: B256::ZERO,
+            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+            signer: SignerConfig::Local(B256::ZERO),
             vault: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 0,
             auth: test_auth_config().unwrap(),

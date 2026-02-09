@@ -397,7 +397,8 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         deployment_block: 0,
         auth: AuthConfig {
@@ -478,7 +479,8 @@ fn create_config_with_db(
         database_url: db_path.to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
+        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
+        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
         deployment_block: 0,
         auth: AuthConfig {
@@ -530,8 +532,8 @@ fn setup_redemption_mocks_with_shared_state(
             move |req: &httpmock::HttpMockRequest| {
                 let body: serde_json::Value =
                     serde_json::from_slice(req.body().as_ref()).unwrap();
-                let issuer_request_id = IssuerRequestId(
-                    body["issuer_request_id"].as_str().unwrap().to_string(),
+                let issuer_request_id = IssuerRequestId::new(
+                    body["issuer_request_id"].as_str().unwrap(),
                 );
                 let tx_hash: TxHash =
                     body["tx_hash"].as_str().unwrap().parse().unwrap();
@@ -650,6 +652,7 @@ async fn test_mint_burn_mint_nonce_synchronization()
         setup_redemption_mocks(&mock_alpaca, user_wallet);
 
     let config = create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 

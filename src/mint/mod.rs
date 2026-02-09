@@ -17,7 +17,7 @@ pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use callback_manager::CallbackManager;
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
-pub(crate) use view::MintView;
+pub(crate) use view::{MintView, replay_mint_view};
 
 pub(crate) use crate::account::ClientId;
 pub(crate) use crate::tokenized_asset::{
@@ -42,11 +42,16 @@ impl TokenizationRequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssuerRequestId(pub String);
+pub struct IssuerRequestId(String);
 
 impl IssuerRequestId {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

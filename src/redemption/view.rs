@@ -633,7 +633,7 @@ mod tests {
         let detected_at = Utc::now();
 
         let event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -692,7 +692,7 @@ mod tests {
         let called_at = Utc::now();
 
         let detected_event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -710,7 +710,7 @@ mod tests {
         view.update(&detected_event);
 
         let alpaca_called_event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
@@ -776,7 +776,7 @@ mod tests {
         let alpaca_journal_completed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -792,7 +792,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
@@ -805,7 +805,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 3,
             payload: RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: issuer_request_id.clone(),
@@ -869,7 +869,7 @@ mod tests {
         let failed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -885,7 +885,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 2,
             payload: RedemptionEvent::RedemptionFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -927,7 +927,7 @@ mod tests {
         let failed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -943,7 +943,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.as_str().to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1015,7 +1015,7 @@ mod tests {
         let result = find_detected(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.0, detected_id);
+        assert_eq!(result[0].0.as_str(), detected_id);
         assert!(matches!(result[0].1, RedemptionView::Detected { .. }));
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
         let result = find_alpaca_called(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.0, alpaca_called_id);
+        assert_eq!(result[0].0.as_str(), alpaca_called_id);
         assert!(matches!(result[0].1, RedemptionView::AlpacaCalled { .. }));
     }
 
@@ -1203,7 +1203,7 @@ mod tests {
         let result = find_burning(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.0, burning_id);
+        assert_eq!(result[0].0.as_str(), burning_id);
         assert!(matches!(result[0].1, RedemptionView::Burning { .. }));
     }
 
@@ -1426,7 +1426,7 @@ mod tests {
         let result = find_burn_failed(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.0, burn_failed_id);
+        assert_eq!(result[0].0.as_str(), burn_failed_id);
         assert!(matches!(result[0].1, RedemptionView::BurnFailed { .. }));
     }
 
@@ -1523,7 +1523,7 @@ mod tests {
             panic!("Expected AlpacaCalled view, got {view:?}");
         };
 
-        assert_eq!(view_id.0, id);
+        assert_eq!(view_id.as_str(), id);
         assert_eq!(view_alpaca_qty, quantity);
         assert_eq!(view_dust_qty, Quantity::new(Decimal::ZERO));
     }
