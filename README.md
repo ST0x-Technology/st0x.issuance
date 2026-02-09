@@ -147,9 +147,10 @@ sqlx migrate reset -y    # Drop DB and re-run all migrations
 ### Code Quality
 
 ```bash
-cargo fmt                                                                                  # Format code
-cargo fmt --all -- --check                                                                 # Check formatting
-cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings        # Run linting
+cargo fmt                                                   # Format code
+cargo fmt --all -- --check                                  # Check formatting
+cargo clippy --workspace --all-targets --all-features \
+  -- -D clippy::all -D warnings                             # Run linting
 ```
 
 ## Project Structure

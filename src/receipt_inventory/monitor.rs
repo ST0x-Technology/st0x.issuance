@@ -25,9 +25,12 @@ pub(crate) struct ReceiptMonitorConfig {
 /// Monitors for Deposit events on the vault in real-time.
 ///
 /// This complements the backfiller by detecting deposits while the
-/// service is running (e.g., manual operations from another wallet).
+/// service is running (e.g., manual operations).
 /// When a deposit to the bot wallet is detected, it emits a `DiscoverReceipt`
 /// command to register the receipt in the ReceiptInventory aggregate.
+///
+/// See `ReceiptBackfiller` for the assumption about all mints using
+/// the bot wallet as depositor.
 pub(crate) struct ReceiptMonitor<ProviderType, ReceiptInventoryStore>
 where
     ProviderType: Provider,

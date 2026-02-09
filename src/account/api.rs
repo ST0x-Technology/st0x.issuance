@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use super::{
     AccountCommand, AccountError, AccountView, AlpacaAccountNumber, ClientId,
-    Email, view::AccountViewError, view::find_by_client_id, view::find_by_email,
+    Email, view::AccountViewError, view::find_by_client_id,
+    view::find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 

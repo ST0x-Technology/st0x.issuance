@@ -92,6 +92,14 @@ impl Shares {
     pub(crate) fn is_zero(&self) -> bool {
         self.0.is_zero()
     }
+
+    pub(crate) fn checked_sub(self, other: Self) -> Option<Self> {
+        self.0.checked_sub(other.0).map(Self)
+    }
+
+    pub(crate) fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
 }
 
 impl From<U256> for Shares {
@@ -397,16 +405,13 @@ impl Aggregate for ReceiptInventory {
                 };
 
                 let available = metadata.balance;
-                if available.inner() < amount.inner() {
-                    return Err(ReceiptInventoryError::InsufficientBalance {
+                let new_balance = available.checked_sub(amount).ok_or(
+                    ReceiptInventoryError::InsufficientBalance {
                         receipt_id,
                         available,
                         requested: amount,
-                    });
-                }
-
-                let new_balance =
-                    Shares::new(available.inner() - amount.inner());
+                    },
+                )?;
 
                 if new_balance.is_zero() {
                     Ok(vec![

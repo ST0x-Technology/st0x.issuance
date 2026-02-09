@@ -65,6 +65,11 @@ pub(crate) enum BurnTrackingError {
         "Insufficient balance for burn: required={required}, available={available}"
     )]
     InsufficientBalance { required: Shares, available: Shares },
+    #[error(
+        "Arithmetic overflow during burn allocation: \
+         remaining={remaining}, burn_from_receipt={burn_from_receipt}"
+    )]
+    AllocationOverflow { remaining: Shares, burn_from_receipt: Shares },
 }
 
 /// Represents a receipt with its available balance for burn planning.
@@ -144,21 +149,28 @@ pub(crate) fn plan_burn(
 
     let allocations: Vec<BurnAllocation> = receipts
         .into_iter()
-        .scan(total_burn.inner(), |remaining, receipt| {
+        .scan(total_burn, |remaining, receipt| {
             if remaining.is_zero() {
                 return None;
             }
 
-            let burn_from_this =
-                (*remaining).min(receipt.available_balance.inner());
-            *remaining -= burn_from_this;
+            let burn_from_this = remaining.min(receipt.available_balance);
 
-            Some(BurnAllocation {
-                receipt,
-                burn_amount: Shares::new(burn_from_this),
-            })
+            match remaining.checked_sub(burn_from_this) {
+                Some(new_remaining) => {
+                    *remaining = new_remaining;
+                    Some(Ok(BurnAllocation {
+                        receipt,
+                        burn_amount: burn_from_this,
+                    }))
+                }
+                None => Some(Err(BurnTrackingError::AllocationOverflow {
+                    remaining: *remaining,
+                    burn_from_receipt: burn_from_this,
+                })),
+            }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(BurnPlan { allocations, total_burn, dust })
 }

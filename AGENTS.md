@@ -52,8 +52,8 @@ Relevant docs:
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks
   - All tests SHOULD pass at the end of each task whenever possible
-  - Focused git diffs and passing tests make reviewing much easier than
-    large changesets or verbose changelogs
+  - Focused git diffs and passing tests make reviewing much easier than large
+    changesets or verbose changelogs
 - The code diffs themselves should be self-explanatory and easy to review
 
 ### After completing a plan

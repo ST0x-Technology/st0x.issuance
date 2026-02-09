@@ -603,9 +603,7 @@ where
 
                 Ok(())
             }
-            Err(AggregateError::UserError(RedemptionError::Vault(
-                err,
-            ))) => {
+            Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
                 warn!(
                     issuer_request_id = %issuer_request_id,
                     error = %err,

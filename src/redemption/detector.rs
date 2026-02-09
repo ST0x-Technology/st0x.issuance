@@ -998,10 +998,7 @@ mod tests {
 
         let second_result = detector.process_transfer_log(&log).await;
         assert!(
-            matches!(
-                second_result,
-                Err(RedemptionMonitorError::Aggregate(_))
-            ),
+            matches!(second_result, Err(RedemptionMonitorError::Aggregate(_))),
             "Second detection should fail with CQRS error, got {second_result:?}"
         );
     }

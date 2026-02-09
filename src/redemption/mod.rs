@@ -18,8 +18,8 @@ use tracing::warn;
 
 use crate::Quantity;
 use crate::mint::{IssuerRequestId, TokenizationRequestId};
-use crate::vault::VaultError;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::VaultError;
 use crate::vault::{
     MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultService,
 };

@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -51,8 +51,6 @@ pub(crate) enum MintCommand {
     /// For mints in `CallbackPending` state:
     /// - Retries sending the callback
     Recover {
-        issuer_request_id: IssuerRequestId,
-    },
         issuer_request_id: IssuerRequestId,
     },
 }

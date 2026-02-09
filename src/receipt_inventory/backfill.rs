@@ -35,11 +35,17 @@ fn block_ranges(
     .map(move |start| (start, (start + chunk_size - 1).min(to)))
 }
 
-/// Backfills the ReceiptInventory aggregate by scanning historic ERC-1155
-/// TransferSingle/TransferBatch events where the bot wallet received receipts.
+/// Backfills the ReceiptInventory aggregate by scanning historic Deposit
+/// events where the bot wallet received receipts.
 ///
 /// This handles receipts minted outside our system (e.g., manual operations)
 /// that the service needs to know about for burn planning.
+///
+/// **Assumption:** All mints (including manual/external ones) are performed
+/// via the bot wallet as the depositor. This allows us to discover all
+/// receipts by monitoring Deposit events alone. Without this assumption,
+/// we would also need to track TransferSingle and TransferBatch events to
+/// catch receipts transferred to the bot wallet from other depositors.
 pub(crate) struct ReceiptBackfiller<ProviderType, ReceiptInventoryStore>
 where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
@@ -95,8 +101,7 @@ where
     ProviderType: alloy::providers::Provider + Clone + Send + Sync,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
-    /// Scans historic TransferSingle and TransferBatch events to discover
-    /// receipts the bot owns.
+    /// Scans historic Deposit events to discover receipts the bot owns.
     ///
     /// For each receipt discovered:
     /// 1. Checks current on-chain balance (not just transfer amount, since
@@ -205,15 +210,19 @@ where
 
         let logs = self.provider.get_logs(&deposit_filter).await?;
 
-        // Filter to only deposits where owner == bot_wallet
         let filtered: Vec<Log> = logs
             .into_iter()
-            .filter(|log| {
-                OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)
-                    .map(|event| event.owner == self.bot_wallet)
-                    .unwrap_or(false)
+            .filter_map(|log| {
+                match OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)
+                {
+                    Ok(event) if event.owner == self.bot_wallet => {
+                        Some(Ok(log))
+                    }
+                    Ok(_) => None,
+                    Err(err) => Some(Err(err)),
+                }
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(filtered)
     }
