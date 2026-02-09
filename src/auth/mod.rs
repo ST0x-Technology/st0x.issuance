@@ -352,7 +352,7 @@ mod tests {
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
             vault: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 0,
+            backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

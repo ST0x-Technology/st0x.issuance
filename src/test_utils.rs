@@ -26,9 +26,8 @@ use crate::bindings::{
 };
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::mint_manager::MintManager;
-use crate::mint::{CallbackManager, Mint, MintView};
-use crate::receipt_inventory::ReceiptInventory;
+use crate::mint::{Mint, MintServices, MintView};
+use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
@@ -60,7 +59,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         hyperdx: None,
@@ -115,6 +114,26 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
+    // Setup ReceiptInventory event store (needed by MintServices for receipt lookups)
+    let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
+        SqliteEventRepository,
+        ReceiptInventory,
+    >::new_event_store(
+        SqliteEventRepository::new(pool.clone()),
+    ));
+
+    // Create mock services for Mint aggregate
+    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let mint_services = MintServices {
+        vault: Arc::new(MockVaultService::new_success()),
+        alpaca: Arc::new(MockAlpacaService::new_success()),
+        pool: pool.clone(),
+        bot,
+        receipts: Arc::new(CqrsReceiptService::new(
+            receipt_inventory_event_store.clone(),
+        )),
+    };
+
     // Setup Mint CQRS
     let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
         pool.clone(),
@@ -122,9 +141,11 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     ));
 
     let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs_raw =
-        sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
-    let mint_cqrs = Arc::new(mint_cqrs_raw);
+    let mint_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(mint_query)],
+        mint_services,
+    ));
 
     let mint_event_repo = SqliteEventRepository::new(pool.clone());
     let mint_event_store = Arc::new(PersistedEventStore::<
@@ -132,38 +153,8 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         Mint,
     >::new_event_store(mint_event_repo));
 
-    // Setup ReceiptInventory CQRS and event store
-    let receipt_inventory_cqrs =
-        Arc::new(sqlite_cqrs::<ReceiptInventory>(pool.clone(), vec![], ()));
-    let receipt_inventory_event_repo = SqliteEventRepository::new(pool.clone());
-    let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
-        SqliteEventRepository,
-        ReceiptInventory,
-    >::new_event_store(
-        receipt_inventory_event_repo,
-    ));
-
     // Seed initial assets
     seed_test_assets(&tokenized_asset_cqrs).await?;
-
-    // Create managers with mock services
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let mint_manager = Arc::new(MintManager::new(
-        Arc::new(MockVaultService::new_success()),
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
-        pool.clone(),
-        bot,
-        receipt_inventory_cqrs,
-        receipt_inventory_event_store,
-    ));
-
-    let callback_manager = Arc::new(CallbackManager::new(
-        Arc::new(MockAlpacaService::new_success()),
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
-        pool.clone(),
-    ));
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -174,8 +165,6 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
         .manage(mint_event_store)
-        .manage(mint_manager)
-        .manage(callback_manager)
         .manage(rate_limiter)
         .manage(pool)
         .mount(
@@ -217,8 +206,8 @@ async fn seed_test_assets(
 
         match cqrs.execute(underlying, command).await {
             Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
-            Err(e) => {
-                return Err(e.into());
+            Err(err) => {
+                return Err(err.into());
             }
         }
     }
@@ -640,5 +629,134 @@ impl LocalEvm {
                 )
             })
             .ok_or(LocalEvmError::EventNotFound)
+    }
+
+    /// Deploys an additional vault instance on the same Anvil instance.
+    ///
+    /// This is useful for testing multi-vault scenarios where different
+    /// tokenized assets use different vaults.
+    ///
+    /// Returns (vault_address, authorizer_address) for the new vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if contract deployment fails.
+    pub async fn deploy_additional_vault(
+        &self,
+    ) -> Result<(Address, Address), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        Self::deploy_vault(&provider, self.wallet_address).await
+    }
+
+    /// Mints shares directly on a specific vault (not necessarily this LocalEvm's vault).
+    ///
+    /// This is useful for testing multi-vault scenarios.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, the deposit
+    /// transaction fails, or the Deposit event is not found in the receipt.
+    pub async fn mint_directly_on_vault(
+        &self,
+        vault_address: Address,
+        amount: U256,
+        to: Address,
+    ) -> Result<(U256, U256), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+        let share_ratio = U256::from(10).pow(U256::from(18));
+
+        let receipt = vault
+            .deposit(amount, to, share_ratio, Bytes::new())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
+                    |decoded| {
+                        let event_data = decoded.data();
+                        (event_data.id, event_data.shares)
+                    },
+                )
+            })
+            .ok_or(LocalEvmError::EventNotFound)
+    }
+
+    /// Grants a role on a specific authorizer (not necessarily this LocalEvm's authorizer).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the role granting transaction fails.
+    pub async fn grant_role_on_authorizer(
+        &self,
+        authorizer_address: Address,
+        role_name: &str,
+        to: Address,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let authorizer = OffchainAssetReceiptVaultAuthorizerV1::new(
+            authorizer_address,
+            &provider,
+        );
+        let role = keccak256(role_name);
+        authorizer.grantRole(role, to).send().await?.get_receipt().await?;
+
+        Ok(())
+    }
+
+    /// Certifies a specific vault (not necessarily this LocalEvm's vault).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certify transaction fails.
+    pub async fn certify_specific_vault(
+        &self,
+        vault_address: Address,
+        until: U256,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+        vault
+            .certify(until, false, Bytes::new())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(())
     }
 }

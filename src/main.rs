@@ -8,8 +8,8 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
         match hyperdx.setup_telemetry() {
             Ok(guard) => Some(guard),
-            Err(e) => {
-                eprintln!("Failed to setup telemetry: {e}");
+            Err(err) => {
+                eprintln!("Failed to setup telemetry: {err}");
                 setup_tracing(&config.log_level);
                 None
             }

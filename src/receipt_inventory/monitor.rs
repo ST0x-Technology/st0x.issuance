@@ -93,8 +93,8 @@ where
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         loop {
-            if let Err(e) = self.monitor_once().await {
-                warn!("Receipt monitor error: {e}. Retrying in 5s...");
+            if let Err(err) = self.monitor_once().await {
+                warn!("Receipt monitor error: {err}. Retrying in 5s...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
@@ -123,8 +123,8 @@ where
         loop {
             tokio::select! {
                 Some(log) = deposit_stream.next() => {
-                    if let Err(e) = self.process_deposit(&log).await {
-                        error!("Failed to process Deposit: {e}");
+                    if let Err(err) = self.process_deposit(&log).await {
+                        error!("Failed to process Deposit: {err}");
                     }
                 }
                 else => {

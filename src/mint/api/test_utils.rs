@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
-use sqlx::Sqlite;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
@@ -9,26 +8,18 @@ use url::Url;
 use crate::account::{
     Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
 };
-use crate::alpaca::AlpacaService;
+use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::alpaca::mock::MockAlpacaService;
-use crate::mint::{
-    CallbackManager, CqrsReceiptQuery, Mint, MintServices, MintView, Network,
-    TokenSymbol, UnderlyingSymbol, mint_manager::MintManager,
-};
-use crate::receipt_inventory::ReceiptInventory;
+use crate::mint::{Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol};
+use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
-use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
-use crate::{
-    AccountCqrs, MintCqrs, MintEventStore, ReceiptInventoryCqrs,
-    ReceiptInventoryEventStore, SqliteEventStore, TokenizedAssetCqrs,
-};
+use crate::{AccountCqrs, MintCqrs, TokenizedAssetCqrs};
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -38,51 +29,12 @@ pub(crate) fn test_config() -> Config {
         chain_id: crate::test_utils::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: test_auth_config().unwrap(),
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
     }
-}
-
-pub(crate) fn create_test_mint_manager(
-    mint_cqrs: MintCqrs,
-    event_store: MintEventStore,
-    pool: sqlx::Pool<Sqlite>,
-    receipt_inventory_cqrs: ReceiptInventoryCqrs,
-    receipt_inventory_event_store: ReceiptInventoryEventStore,
-) -> Arc<
-    MintManager<
-        PersistedEventStore<SqliteEventRepository, Mint>,
-        SqliteEventStore<ReceiptInventory>,
-    >,
-> {
-    let blockchain_service =
-        Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-
-    Arc::new(MintManager::new(
-        blockchain_service,
-        mint_cqrs,
-        event_store,
-        pool,
-        bot,
-        receipt_inventory_cqrs,
-        receipt_inventory_event_store,
-    ))
-}
-
-pub(crate) fn create_test_callback_manager(
-    mint_cqrs: crate::MintCqrs,
-    event_store: crate::MintEventStore,
-    pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
-    let alpaca_service =
-        Arc::new(crate::alpaca::mock::MockAlpacaService::new_success())
-            as Arc<dyn AlpacaService>;
-
-    Arc::new(CallbackManager::new(alpaca_service, mint_cqrs, event_store, pool))
 }
 
 pub(crate) fn create_test_event_store(
@@ -97,8 +49,6 @@ pub(crate) struct TestHarness {
     pub(crate) account_cqrs: AccountCqrs,
     pub(crate) asset_cqrs: TokenizedAssetCqrs,
     pub(crate) mint_cqrs: MintCqrs,
-    pub(crate) receipt_inventory_cqrs: ReceiptInventoryCqrs,
-    pub(crate) receipt_inventory_event_store: ReceiptInventoryEventStore,
 }
 
 impl TestHarness {
@@ -138,9 +88,6 @@ impl TestHarness {
             (),
         );
 
-        let receipt_inventory_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-
         let receipt_inventory_event_store = {
             let event_repo = SqliteEventRepository::new(pool.clone());
             Arc::new(PersistedEventStore::new_event_store(event_repo))
@@ -152,7 +99,7 @@ impl TestHarness {
             alpaca: Arc::new(MockAlpacaService::new_success()),
             pool: pool.clone(),
             bot,
-            receipts: Arc::new(CqrsReceiptQuery::new(
+            receipts: Arc::new(CqrsReceiptService::new(
                 receipt_inventory_event_store.clone(),
             )),
         };
@@ -169,14 +116,7 @@ impl TestHarness {
             mint_services,
         ));
 
-        Self {
-            pool,
-            account_cqrs,
-            asset_cqrs,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-        }
+        Self { pool, account_cqrs, asset_cqrs, mint_cqrs }
     }
 }
 

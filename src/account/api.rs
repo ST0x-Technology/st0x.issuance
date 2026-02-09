@@ -94,8 +94,8 @@ pub(crate) async fn register_account(
         AccountCommand::Register { client_id, email: request.email.clone() };
 
     let aggregate_id = client_id.to_string();
-    if let Err(e) = cqrs.execute(&aggregate_id, register_command).await {
-        return Err(map_cqrs_error_to_status(&e));
+    if let Err(err) = cqrs.execute(&aggregate_id, register_command).await {
+        return Err(map_cqrs_error_to_status(&err));
     }
 
     Ok(Json(RegisterAccountResponse { client_id }))
@@ -232,7 +232,7 @@ mod tests {
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
             vault: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 0,
+            backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

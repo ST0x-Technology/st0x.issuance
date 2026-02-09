@@ -111,7 +111,7 @@ async fn seed_tokenized_asset(client: &Client, vault: Address) {
                 "underlying": "AAPL",
                 "token": "tAAPL",
                 "network": "base",
-                "vault": format!("{vault:#x}")
+                "vault": vault
             })
             .to_string(),
         )
@@ -401,7 +401,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -483,7 +483,7 @@ fn create_config_with_db(
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -1136,12 +1136,17 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     let (_redeem_mock, _poll_mock) =
         setup_redemption_mocks(&mock_alpaca, user_wallet);
 
+    // Preseed asset before starting service so backfill can discover receipts
+    let pool =
+        SqlitePoolOptions::new().max_connections(5).connect(&db_url).await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
+    pool.close().await;
+
     // Step 2: Start service - backfill should discover the historic receipt
     let config1 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
-
-    seed_tokenized_asset(&client1, evm.vault_address).await;
 
     // Give backfill and monitor time to fully start
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1954,51 +1959,46 @@ async fn test_mint_recovery_from_minting_failed_state()
     Ok(())
 }
 
-/// Seeds a tokenized asset with a custom underlying symbol.
-async fn seed_tokenized_asset_custom(
-    client: &Client,
+/// Seeds a tokenized asset directly in the database BEFORE rocket starts.
+/// This is used to test startup behavior with pre-configured assets.
+async fn preseed_tokenized_asset(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
     underlying: &str,
     token: &str,
     vault: Address,
 ) {
-    let response = client
-        .post("/tokenized-assets")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "underlying": underlying,
-                "token": token,
-                "network": "base",
-                "vault": format!("{vault:#x}")
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
+    let view_id = underlying;
+    let payload = json!({
+        "Asset": {
+            "underlying": underlying,
+            "token": token,
+            "network": "base",
+            "vault": vault,
+            "enabled": true,
+            "added_at": "2024-01-01T00:00:00Z"
+        }
+    });
 
-    assert!(
-        response.status() == rocket::http::Status::Created
-            || response.status() == rocket::http::Status::Ok,
-        "Failed to seed tokenized asset {underlying}: {:?}",
-        response.into_string().await
-    );
+    sqlx::query!(
+        r#"
+        INSERT INTO tokenized_asset_view (view_id, version, payload)
+        VALUES (?, 1, ?)
+        "#,
+        view_id,
+        payload
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Tests that receipt backfill discovers receipts from ALL enabled tokenized assets,
 /// not just the single vault in Config.
 ///
-/// This test demonstrates the MULTI-VAULT BUG:
-/// - Config has a single `vault` field, but the system supports multiple tokenized assets
-/// - Each tokenized asset can have its own vault contract
-/// - Backfill/monitoring currently only processes the one vault from Config
-/// - Receipts minted on other vaults are never discovered
-///
-/// EXPECTED: This test should FAIL with current implementation, then PASS after fix.
+/// This test verifies multi-vault support:
+/// - Each tokenized asset has its own vault contract
+/// - Backfill processes all enabled tokenized assets
+/// - Receipts minted on any vault are discovered
 #[tokio::test]
 async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2010,8 +2010,10 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     // Deploy a SECOND vault for TSLA (first vault is AAPL)
     let (tsla_vault, tsla_authorizer) = evm.deploy_additional_vault().await?;
 
-    // Grant deposit role on TSLA vault to bot wallet
+    // Grant roles on TSLA vault to bot wallet
     evm.grant_role_on_authorizer(tsla_authorizer, "DEPOSIT", bot_wallet)
+        .await?;
+    evm.grant_role_on_authorizer(tsla_authorizer, "CERTIFY", bot_wallet)
         .await?;
     evm.certify_specific_vault(tsla_vault, U256::MAX).await?;
 
@@ -2021,15 +2023,35 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     let (receipt_id, _shares) =
         evm.mint_directly_on_vault(tsla_vault, mint_amount, bot_wallet).await?;
 
-    // Config points to AAPL vault only - this is the bug
+    // Create a temp file database so we can preseed assets before rocket starts
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test.db");
+    let database_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Create and migrate the database, then preseed assets
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    // Preseed BOTH tokenized assets BEFORE rocket starts
+    // This simulates production where assets are configured before the service runs
+    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
+    preseed_tokenized_asset(&pool, "TSLA", "tTSLA", tsla_vault).await;
+
+    // Close the pool so rocket can open it
+    pool.close().await;
+
     let config = Config {
-        database_url: ":memory:".to_string(),
+        database_url,
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
-        vault: evm.vault_address, // BUG: Only AAPL vault, ignores TSLA vault
-        deployment_block: 0,
+        vault: evm.vault_address,
+        backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -2053,40 +2075,38 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         },
     };
 
-    let rocket = initialize_rocket(config).await?;
-    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    // Seed BOTH tokenized assets - each with their own vault
-    seed_tokenized_asset_custom(&client, "AAPL", "tAAPL", evm.vault_address).await;
-    seed_tokenized_asset_custom(&client, "TSLA", "tTSLA", tsla_vault).await;
+    // Start rocket - backfill should run and discover the TSLA receipt
+    initialize_rocket(config).await?;
 
     // Give backfill time to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // Query the receipt inventory for TSLA vault
-    // With current implementation, this will be empty because we only backfill AAPL vault
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    // Reconnect to verify receipt was discovered
+    let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect(":memory:")
+        .connect(&format!("sqlite:{}", db_path.display()))
         .await?;
 
-    // The receipt from TSLA vault should have been discovered
-    // This assertion will FAIL with current implementation
-    // because backfill only processes config.vault (AAPL), not TSLA
-    //
-    // After the fix, backfill should iterate over all enabled tokenized assets
-    // and discover receipts from each vault
+    // Query events table to verify the TSLA receipt was discovered by backfill.
+    // Backfill stores ReceiptInventoryEvent::Discovered events in the events table.
+    let tsla_vault_str = tsla_vault.to_string();
+    let receipt_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) as "count: i64"
+        FROM events
+        WHERE aggregate_type = 'ReceiptInventory'
+          AND aggregate_id = ?
+          AND event_type = 'ReceiptInventoryEvent::Discovered'
+        "#,
+        tsla_vault_str
+    )
+    .fetch_one(&pool)
+    .await?;
+
     assert!(
-        false,
-        "BUG: Config has single `vault` field but system has multiple assets. \
-         Receipt {receipt_id} minted on TSLA vault ({tsla_vault}) was NOT discovered \
-         because backfill only processes the config vault ({}).\n\n\
-         FIX NEEDED:\n\
-         1. Remove `vault` and `deployment_block` from Config\n\
-         2. Add `deployment_block` to TokenizedAsset\n\
-         3. Make backfill/monitor iterate over all enabled tokenized assets\n\
-         4. Production has 13 assets - all need backfill/monitoring!",
-        evm.vault_address
+        receipt_count > 0,
+        "Receipt {receipt_id} from TSLA vault ({tsla_vault}) should have been discovered by backfill. \
+         Found {receipt_count} Discovered events for vault."
     );
 
     Ok(())

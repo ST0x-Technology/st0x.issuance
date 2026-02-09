@@ -1,16 +1,11 @@
 use cqrs_es::{AggregateContext, EventStore};
 use rocket::{State, post, serde::json::Json};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use tracing::{error, info};
 
-use crate::account::{
-    AccountView, AlpacaAccountNumber, ClientId,
-    view::{AccountViewError, find_by_client_id},
-};
 use crate::auth::IssuerAuth;
-use crate::mint::{IssuerRequestId, Mint, MintCommand, TokenizationRequestId};
-use crate::{MintEventStore, SqliteCallbackManager, SqliteMintManager};
+use crate::mint::{IssuerRequestId, MintCommand, TokenizationRequestId};
+use crate::{MintCqrs, MintEventStore};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -27,7 +22,7 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, event_store, mint_manager, callback_manager, pool), fields(
+#[tracing::instrument(skip(_auth, cqrs, event_store), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id.0,
     status = ?request.status
@@ -35,11 +30,8 @@ pub(crate) enum JournalStatus {
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
-    cqrs: &State<crate::MintCqrs>,
+    cqrs: &State<MintCqrs>,
     event_store: &State<MintEventStore>,
-    mint_manager: &State<SqliteMintManager>,
-    callback_manager: &State<SqliteCallbackManager>,
-    pool: &State<SqlitePool>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
     let JournalConfirmationRequest {
@@ -58,10 +50,10 @@ pub(crate) async fn confirm_journal(
     let mint_ctx = match event_store.load_aggregate(&issuer_request_id.0).await
     {
         Ok(ctx) => ctx,
-        Err(e) => {
+        Err(err) => {
             error!(
                 "Failed to load mint aggregate for issuer_request_id={}: {}",
-                issuer_request_id.0, e
+                issuer_request_id, err
             );
             return rocket::http::Status::InternalServerError;
         }
@@ -91,11 +83,12 @@ pub(crate) async fn confirm_journal(
                 }),
             };
 
-            if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
+            if let Err(err) = cqrs.execute(&issuer_request_id.0, command).await
+            {
                 error!(
                     "Failed to execute journal rejection command for \
                      issuer_request_id={}: {}",
-                    issuer_request_id.0, e
+                    issuer_request_id, err
                 );
                 return rocket::http::Status::InternalServerError;
             }
@@ -106,20 +99,19 @@ pub(crate) async fn confirm_journal(
                 issuer_request_id: issuer_request_id.clone(),
             };
 
-            if let Err(e) = cqrs.execute(&issuer_request_id.0, command).await {
+            if let Err(err) = cqrs.execute(&issuer_request_id.0, command).await
+            {
                 error!(
                     "Failed to execute journal confirmation command for \
                      issuer_request_id={}: {}",
-                    issuer_request_id.0, e
+                    issuer_request_id, err
                 );
                 return rocket::http::Status::InternalServerError;
             }
 
+            let cqrs = cqrs.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
-                event_store.inner().clone(),
-                mint_manager.inner().clone(),
-                callback_manager.inner().clone(),
-                pool.inner().clone(),
+                cqrs,
                 issuer_request_id,
             ));
         }
@@ -128,118 +120,43 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AlpacaAccountLookupError {
-    #[error("Account not found for client_id {client_id}")]
-    NotFound { client_id: ClientId },
-    #[error("Account {client_id} not linked to Alpaca")]
-    NotLinked { client_id: ClientId },
-    #[error("Database error: {0}")]
-    Database(#[from] AccountViewError),
-}
-
-pub(crate) async fn lookup_alpaca_account(
-    pool: &SqlitePool,
-    client_id: &ClientId,
-) -> Result<AlpacaAccountNumber, AlpacaAccountLookupError> {
-    match find_by_client_id(pool, client_id).await? {
-        Some(AccountView::LinkedToAlpaca { alpaca_account, .. }) => {
-            Ok(alpaca_account)
-        }
-        Some(_) => {
-            Err(AlpacaAccountLookupError::NotLinked { client_id: *client_id })
-        }
-        None => {
-            Err(AlpacaAccountLookupError::NotFound { client_id: *client_id })
-        }
-    }
-}
-
-#[tracing::instrument(skip(event_store, mint_manager, callback_manager, pool), fields(
+#[tracing::instrument(skip(cqrs), fields(
     issuer_request_id = %issuer_request_id.0
 ))]
 async fn process_journal_completion(
-    event_store: MintEventStore,
-    mint_manager: SqliteMintManager,
-    callback_manager: SqliteCallbackManager,
-    pool: SqlitePool,
+    cqrs: MintCqrs,
     issuer_request_id: IssuerRequestId,
 ) {
-    let mint_ctx = match event_store.load_aggregate(&issuer_request_id.0).await
-    {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            error!(
-                issuer_request_id = %issuer_request_id.0,
-                error = ?e,
-                "Failed to load mint aggregate for mint manager"
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = mint_manager
-        .handle_journal_confirmed(&issuer_request_id, mint_ctx.aggregate())
-        .await
-    {
-        error!(
-            issuer_request_id = %issuer_request_id.0,
-            error = ?e,
-            "handle_journal_confirmed failed"
-        );
-        return;
-    }
-
-    let mint_ctx = match event_store.load_aggregate(&issuer_request_id.0).await
-    {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            error!(
-                issuer_request_id = %issuer_request_id.0,
-                error = ?e,
-                "Failed to reload mint aggregate for callback manager"
-            );
-            return;
-        }
-    };
-
-    let Mint::CallbackPending { .. } = mint_ctx.aggregate() else {
-        return;
-    };
-
-    let Some(client_id) = mint_ctx.aggregate().client_id() else {
-        error!(
-            issuer_request_id = %issuer_request_id.0,
-            "Mint in CallbackPending state has no client_id"
-        );
-        return;
-    };
-
-    let alpaca_account = match lookup_alpaca_account(&pool, client_id).await {
-        Ok(account) => account,
-        Err(e) => {
-            error!(
-                issuer_request_id = %issuer_request_id.0,
-                client_id = %client_id,
-                error = %e,
-                "Failed to look up Alpaca account"
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = callback_manager
-        .handle_tokens_minted(
-            &alpaca_account,
-            &issuer_request_id,
-            mint_ctx.aggregate(),
+    if let Err(err) = cqrs
+        .execute(
+            issuer_request_id.as_str(),
+            MintCommand::Deposit {
+                issuer_request_id: issuer_request_id.clone(),
+            },
         )
         .await
     {
         error!(
             issuer_request_id = %issuer_request_id.0,
-            error = ?e,
-            "handle_tokens_minted failed"
+            error = ?err,
+            "Deposit command failed"
+        );
+        return;
+    }
+
+    if let Err(err) = cqrs
+        .execute(
+            issuer_request_id.as_str(),
+            MintCommand::SendCallback {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await
+    {
+        error!(
+            issuer_request_id = %issuer_request_id.0,
+            error = ?err,
+            "SendCallback command failed"
         );
     }
 }
@@ -251,16 +168,10 @@ mod tests {
     use rocket::routes;
     use rust_decimal::Decimal;
 
-    use super::{
-        AlpacaAccountLookupError, confirm_journal, lookup_alpaca_account,
-    };
-    use crate::account::{
-        AccountCommand, AlpacaAccountNumber, ClientId, Email,
-    };
+    use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        TestAccountAndAsset, TestHarness, create_test_callback_manager,
-        create_test_event_store, create_test_mint_manager, test_config,
+        TestAccountAndAsset, TestHarness, create_test_event_store, test_config,
     };
     use crate::mint::{
         IssuerRequestId, MintCommand, MintView, Quantity,
@@ -274,13 +185,7 @@ mod tests {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
 
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-ok-test");
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -302,26 +207,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -356,13 +247,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
         let tokenization_request_id =
@@ -385,26 +270,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -440,13 +311,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-complete-123");
         let tokenization_request_id =
@@ -469,26 +334,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -540,13 +391,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-view-123");
         let tokenization_request_id =
@@ -569,26 +414,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -643,13 +474,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-123");
         let tokenization_request_id =
@@ -672,26 +497,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -743,13 +554,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
         let tokenization_request_id =
@@ -772,26 +577,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -848,13 +639,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = harness;
+        let TestHarness { pool, mint_cqrs, .. } = harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
         let correct_tokenization_request_id =
@@ -879,26 +664,12 @@ mod tests {
             .expect("Failed to initiate mint");
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -930,35 +701,15 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = TestHarness::new().await;
+        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -989,35 +740,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let TestHarness {
-            pool,
-            mint_cqrs,
-            receipt_inventory_cqrs,
-            receipt_inventory_event_store,
-            ..
-        } = TestHarness::new().await;
+        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
-        let mint_manager = create_test_mint_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-            receipt_inventory_cqrs.clone(),
-            receipt_inventory_event_store,
-        );
-        let callback_manager = create_test_callback_manager(
-            mint_cqrs.clone(),
-            event_store.clone(),
-            pool.clone(),
-        );
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
             .manage(event_store)
-            .manage(mint_manager)
-            .manage(callback_manager)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -1039,76 +770,5 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[tokio::test]
-    async fn test_lookup_alpaca_account_returns_account_when_linked() {
-        let harness = TestHarness::new().await;
-        let TestHarness { pool, account_cqrs, .. } = &harness;
-
-        let client_id = ClientId::new();
-        let expected_account = AlpacaAccountNumber("ALPACA-12345".to_string());
-        let email = Email::new("test@example.com".to_string()).unwrap();
-
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::Register { client_id, email },
-            )
-            .await
-            .expect("Failed to register account");
-
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::LinkToAlpaca {
-                    alpaca_account: expected_account.clone(),
-                },
-            )
-            .await
-            .expect("Failed to link to Alpaca");
-
-        let result = lookup_alpaca_account(pool, &client_id).await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_account);
-    }
-
-    #[tokio::test]
-    async fn test_lookup_alpaca_account_returns_not_linked_when_only_registered()
-     {
-        let harness = TestHarness::new().await;
-        let TestHarness { pool, account_cqrs, .. } = &harness;
-
-        let client_id = ClientId::new();
-        let email = Email::new("test@example.com".to_string()).unwrap();
-
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::Register { client_id, email },
-            )
-            .await
-            .expect("Failed to register account");
-
-        let result = lookup_alpaca_account(pool, &client_id).await;
-
-        assert!(
-            matches!(result, Err(AlpacaAccountLookupError::NotLinked { .. })),
-            "Expected NotLinked error, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_lookup_alpaca_account_returns_not_found_when_no_account() {
-        let harness = TestHarness::new().await;
-        let client_id = ClientId::new();
-
-        let result = lookup_alpaca_account(&harness.pool, &client_id).await;
-
-        assert!(
-            matches!(result, Err(AlpacaAccountLookupError::NotFound { .. })),
-            "Expected NotFound error, got {result:?}"
-        );
     }
 }

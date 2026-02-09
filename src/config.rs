@@ -26,7 +26,7 @@ pub struct Config {
     pub chain_id: u64,
     pub signer: SignerConfig,
     pub vault: Address,
-    pub deployment_block: u64,
+    pub backfill_start_block: u64,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
@@ -156,11 +156,11 @@ struct Env {
 
     #[arg(
         long,
-        env = "DEPLOYMENT_BLOCK",
+        env = "BACKFILL_START_BLOCK",
         default_value = "40588950",
-        help = "Block number when the vault was deployed (for receipt backfilling)"
+        help = "Block number from which to start backfilling receipts"
     )]
-    deployment_block: u64,
+    backfill_start_block: u64,
 
     #[clap(flatten)]
     auth: AuthConfig,
@@ -188,7 +188,7 @@ impl Env {
             chain_id: self.chain_id,
             signer,
             vault: self.vault,
-            deployment_block: self.deployment_block,
+            backfill_start_block: self.backfill_start_block,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,
@@ -295,7 +295,7 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
-            "--deployment-block",
+            "--backfill-start-block",
             "12345678",
             "--issuer-api-key",
             "test-key-that-is-at-least-32-chars-long",
@@ -399,7 +399,7 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
-            "--deployment-block",
+            "--backfill-start-block",
             "12345678",
             "--issuer-api-key",
             "short-key", // Less than 32 characters

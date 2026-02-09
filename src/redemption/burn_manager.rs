@@ -94,8 +94,8 @@ where
 
         let stuck_redemptions = match find_burning(&self.view_pool).await {
             Ok(redemptions) => redemptions,
-            Err(e) => {
-                error!(error = %e, "Failed to query for stuck Burning redemptions");
+            Err(err) => {
+                error!(error = %err, "Failed to query for stuck Burning redemptions");
                 return;
             }
         };
@@ -111,12 +111,12 @@ where
         );
 
         for (issuer_request_id, _view) in stuck_redemptions {
-            if let Err(e) =
+            if let Err(err) =
                 self.recover_single_burning(&issuer_request_id).await
             {
                 warn!(
                     issuer_request_id = %issuer_request_id.as_str(),
-                    error = %e,
+                    error = %err,
                     "Failed to recover Burning redemption"
                 );
             }
@@ -134,8 +134,8 @@ where
 
         let failed_redemptions = match find_burn_failed(&self.view_pool).await {
             Ok(redemptions) => redemptions,
-            Err(e) => {
-                error!(error = %e, "Failed to query for BurnFailed redemptions");
+            Err(err) => {
+                error!(error = %err, "Failed to query for BurnFailed redemptions");
                 return;
             }
         };
@@ -151,12 +151,12 @@ where
         );
 
         for (issuer_request_id, view) in failed_redemptions {
-            if let Err(e) =
+            if let Err(err) =
                 self.recover_single_burn_failed(&issuer_request_id, &view).await
             {
                 warn!(
                     issuer_request_id = %issuer_request_id.as_str(),
-                    error = %e,
+                    error = %err,
                     "Failed to recover BurnFailed redemption"
                 );
             }
@@ -508,7 +508,7 @@ where
                 )
                 .await
             }
-            Err(e) => Err(e.into()),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -603,10 +603,12 @@ where
 
                 Ok(())
             }
-            Err(AggregateError::UserError(RedemptionError::BurnFailed(e))) => {
+            Err(AggregateError::UserError(RedemptionError::BurnFailed(
+                err,
+            ))) => {
                 warn!(
                     issuer_request_id = %issuer_request_id,
-                    error = %e,
+                    error = %err,
                     "On-chain burning failed"
                 );
 
@@ -615,7 +617,7 @@ where
                         issuer_request_id.as_str(),
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
-                            error: e.to_string(),
+                            error: err.to_string(),
                         },
                     )
                     .await?;
@@ -625,9 +627,9 @@ where
                     "RecordBurnFailure command recorded"
                 );
 
-                Err(BurnManagerError::Blockchain(e))
+                Err(BurnManagerError::Blockchain(err))
             }
-            Err(e) => Err(e.into()),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -644,7 +646,7 @@ where
         let aggregate_id = vault.to_string();
 
         for (receipt_id, amount) in burns {
-            if let Err(e) = self
+            if let Err(err) = self
                 .receipt_inventory_cqrs
                 .execute(
                     &aggregate_id,
@@ -659,7 +661,7 @@ where
                     vault = %vault,
                     receipt_id = %receipt_id,
                     amount = %amount,
-                    error = %e,
+                    error = %err,
                     "Failed to update ReceiptInventory after burn"
                 );
             }

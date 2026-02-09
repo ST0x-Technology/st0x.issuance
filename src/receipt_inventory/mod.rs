@@ -7,12 +7,13 @@ pub(crate) mod view;
 
 pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
 
-use alloy::primitives::{Address, Bytes, TxHash, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
-use cqrs_es::{Aggregate, AggregateContext, EventStore};
+use cqrs_es::{Aggregate, AggregateContext, AggregateError, EventStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use thiserror::Error;
 
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
@@ -24,6 +25,27 @@ pub(crate) use view::ReceiptInventoryView;
 
 use crate::mint::IssuerRequestId;
 use crate::vault::ReceiptInformation;
+
+/// Receipt data recovered from the inventory for mint recovery.
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveredReceipt {
+    pub(crate) receipt_id: U256,
+    pub(crate) tx_hash: B256,
+    pub(crate) shares: U256,
+    pub(crate) block_number: u64,
+}
+
+/// Errors that can occur when looking up a receipt.
+#[derive(Debug, Error)]
+pub(crate) enum ReceiptLookupError {
+    #[error(transparent)]
+    Aggregate(#[from] AggregateError<ReceiptInventoryError>),
+    #[error(
+        "Receipt inventory inconsistent: index contains issuer_request_id {issuer_request_id} \
+         -> receipt {receipt_id}, but receipt not found in receipts list"
+    )]
+    Inconsistent { issuer_request_id: IssuerRequestId, receipt_id: ReceiptId },
+}
 
 /// Unique identifier for an ERC-1155 receipt within a vault.
 ///
@@ -105,11 +127,10 @@ struct ReceiptMetadata {
     block_number: u64,
 }
 
-/// Provides the capability to find receipts for burning.
+/// Provides the capability to query and plan burns against receipts.
 ///
 /// This trait abstracts the receipt inventory query for use by command handlers.
-/// Implementation uses the ReceiptInventory aggregate to determine which
-/// receipts can satisfy a burn request.
+/// Implementation uses the ReceiptInventory aggregate.
 #[async_trait]
 pub(crate) trait ReceiptService: Send + Sync {
     /// Returns a burn plan: which receipts to burn and how much from each.
@@ -122,6 +143,16 @@ pub(crate) trait ReceiptService: Send + Sync {
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError>;
+
+    /// Finds a receipt by its issuer_request_id (for ITN mints only).
+    ///
+    /// Used by mint recovery to check if a mint succeeded on-chain.
+    /// Returns None if no receipt exists with this issuer_request_id.
+    async fn find_by_issuer_request_id(
+        &self,
+        vault: &Address,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError>;
 }
 
 /// Implementation of ReceiptService using the ReceiptInventory aggregate.
@@ -157,6 +188,29 @@ where
 
         let receipts = context.aggregate().receipts_with_balance();
         plan_burn(receipts, shares_to_burn, dust)
+    }
+
+        let Some(receipt_id) =
+            receipt_inventory.find_by_issuer_request_id(issuer_request_id)
+        else {
+            return Ok(None);
+        };
+
+        let receipt = receipt_inventory
+            .receipts_with_balance()
+            .into_iter()
+            .find(|r| r.receipt_id == receipt_id)
+            .ok_or(ReceiptLookupError::Inconsistent {
+                issuer_request_id: issuer_request_id.clone(),
+                receipt_id,
+            })?;
+
+        Ok(Some(RecoveredReceipt {
+            receipt_id: receipt_id.inner(),
+            tx_hash: receipt.tx_hash,
+            shares: receipt.available_balance.inner(),
+            block_number: receipt.block_number,
+        }))
     }
 }
 

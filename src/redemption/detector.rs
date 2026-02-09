@@ -104,8 +104,10 @@ where
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         loop {
-            if let Err(e) = self.monitor_once().await {
-                warn!("WebSocket monitoring error: {e}. Reconnecting in 5s...");
+            if let Err(err) = self.monitor_once().await {
+                warn!(
+                    "WebSocket monitoring error: {err}. Reconnecting in 5s..."
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
@@ -137,8 +139,8 @@ where
         info!("WebSocket subscription active, monitoring for redemptions");
 
         while let Some(log) = stream.next().await {
-            if let Err(e) = self.process_transfer_log(&log).await {
-                error!("Failed to process transfer log: {e}");
+            if let Err(err) = self.process_transfer_log(&log).await {
+                error!("Failed to process transfer log: {err}");
             }
         }
 
@@ -317,7 +319,7 @@ where
         let aggregate_ctx =
             self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
 
-        if let Err(e) = self
+        if let Err(err) = self
             .redeem_call_manager
             .handle_redemption_detected(
                 &alpaca_account,
@@ -330,7 +332,7 @@ where
         {
             warn!(
                 issuer_request_id = %issuer_request_id.as_str(),
-                error = ?e,
+                error = ?err,
                 "handle_redemption_detected failed"
             );
             return Ok(());
@@ -352,7 +354,7 @@ where
         let tokenization_request_id_cloned = tokenization_request_id.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = journal_manager
+            if let Err(err) = journal_manager
                 .handle_alpaca_called(
                     &alpaca_account,
                     issuer_request_id_cloned.clone(),
@@ -361,7 +363,7 @@ where
                 .await
             {
                 warn!(
-                    error = ?e,
+                    error = ?err,
                     "handle_alpaca_called (journal polling) failed"
                 );
                 return;
@@ -372,10 +374,10 @@ where
                 .await
             {
                 Ok(ctx) => ctx,
-                Err(e) => {
+                Err(err) => {
                     warn!(
                         issuer_request_id = %issuer_request_id_cloned.as_str(),
-                        error = ?e,
+                        error = ?err,
                         "Failed to load aggregate after journal completion"
                     );
                     return;
@@ -383,7 +385,7 @@ where
             };
 
             if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
-                if let Err(e) = burn_manager
+                if let Err(err) = burn_manager
                     .handle_burning_started(
                         &issuer_request_id_cloned,
                         aggregate_ctx.aggregate(),
@@ -392,7 +394,7 @@ where
                 {
                     warn!(
                         issuer_request_id = %issuer_request_id_cloned.as_str(),
-                        error = ?e,
+                        error = ?err,
                         "handle_burning_started failed"
                     );
                 }

@@ -39,8 +39,8 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
         let stuck_redemptions = match find_detected(&self.pool).await {
             Ok(redemptions) => redemptions,
-            Err(e) => {
-                error!(error = %e, "Failed to query for stuck Detected redemptions");
+            Err(err) => {
+                error!(error = %err, "Failed to query for stuck Detected redemptions");
                 return;
             }
         };
@@ -56,12 +56,12 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         );
 
         for (issuer_request_id, _view) in stuck_redemptions {
-            if let Err(e) =
+            if let Err(err) =
                 self.recover_single_detected(&issuer_request_id).await
             {
                 warn!(
                     issuer_request_id = %issuer_request_id.as_str(),
-                    error = %e,
+                    error = %err,
                     "Failed to recover Detected redemption"
                 );
             }
@@ -232,10 +232,10 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
                 Ok(())
             }
-            Err(e) => {
+            Err(err) => {
                 warn!(
                     issuer_request_id = %issuer_request_id,
-                    error = %e,
+                    error = %err,
                     "Alpaca redeem API call failed"
                 );
 
@@ -244,7 +244,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                         issuer_request_id.as_str(),
                         RedemptionCommand::RecordAlpacaFailure {
                             issuer_request_id: issuer_request_id.clone(),
-                            error: e.to_string(),
+                            error: err.to_string(),
                         },
                     )
                     .await?;
@@ -254,7 +254,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     "RecordAlpacaFailure command executed successfully"
                 );
 
-                Err(RedeemCallManagerError::Alpaca(e))
+                Err(RedeemCallManagerError::Alpaca(err))
             }
         }
     }

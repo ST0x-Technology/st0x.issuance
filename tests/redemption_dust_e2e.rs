@@ -114,7 +114,7 @@ async fn seed_tokenized_asset(client: &Client, vault: Address) {
                 "underlying": "AAPL",
                 "token": "tAAPL",
                 "network": "base",
-                "vault": format!("{vault:#x}")
+                "vault": vault
             })
             .to_string(),
         )
@@ -430,7 +430,7 @@ async fn test_redemption_returns_dust_to_user()
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -566,7 +566,7 @@ async fn test_redemption_no_dust_when_9_decimals()
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         vault: evm.vault_address,
-        deployment_block: 0,
+        backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()

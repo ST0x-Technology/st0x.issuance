@@ -41,18 +41,13 @@ Relevant docs:
 
 ### While implementing
 
-- **CRITICAL: Complete tasks one at a time and wait for review**
-  - When asked to complete a task from a plan, complete ONLY that task
-  - Do NOT proceed to the next task until the user reviews and approves your
-    changes
+- **Work until done:** Don't stop until all tasks are complete or you need user
+  input. Keep working through the task list autonomously.
   - The user manually reviews all git diffs, so changes must be minimal and
     focused
   - **Any diff not required to complete the task is a guideline violation** - no
     drive-by improvements, refactorings, or style changes unless explicitly
     included in the scope of the task or requested by the user
-  - Exception: If the user explicitly asks you to "complete the whole plan" or
-    "complete the GitHub issue", you may work through multiple tasks
-  - By default, always work one task at a time
 - **CRITICAL: Tasks must be ordered correctly in plans**
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks

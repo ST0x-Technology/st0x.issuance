@@ -104,8 +104,8 @@ where
     /// 2. If balance > 0 and not already tracked, emits DiscoverReceipt command
     ///
     /// `from_block` is the block to start scanning from. On first run, pass
-    /// the configured deployment block. On subsequent runs, pass
-    /// `aggregate.last_backfilled_block().unwrap_or(deployment_block)`.
+    /// the configured backfill start block. On subsequent runs, pass
+    /// `aggregate.last_backfilled_block().unwrap_or(backfill_start_block)`.
     ///
     /// Queries are chunked to avoid RPC response size limits.
     ///

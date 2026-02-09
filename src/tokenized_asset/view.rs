@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::ViewRepository;
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteViewRepository;
 use sqlx::{Pool, Sqlite};
 
 use super::{
@@ -12,9 +14,10 @@ use super::{
 pub(crate) enum TokenizedAssetViewError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] cqrs_es::persist::PersistenceError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,27 +91,18 @@ pub(crate) async fn find_vault_by_underlying(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
 ) -> Result<Option<Address>, TokenizedAssetViewError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM tokenized_asset_view
-        WHERE view_id = ?
-          AND json_extract(payload, '$.Asset.enabled') = 1
-        "#,
-        underlying.0
-    )
-    .fetch_optional(pool)
-    .await?;
+    let repo = SqliteViewRepository::<TokenizedAssetView, TokenizedAsset>::new(
+        pool.clone(),
+        "tokenized_asset_view".to_string(),
+    );
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let view: TokenizedAssetView = serde_json::from_str(&row.payload)?;
+    let view = repo.load(&underlying.0).await?;
 
     match view {
-        TokenizedAssetView::Asset { vault, .. } => Ok(Some(vault)),
-        TokenizedAssetView::Unavailable => Ok(None),
+        Some(TokenizedAssetView::Asset { vault, enabled: true, .. }) => {
+            Ok(Some(vault))
+        }
+        _ => Ok(None),
     }
 }
 

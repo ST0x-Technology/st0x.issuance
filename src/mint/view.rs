@@ -544,73 +544,6 @@ pub(crate) async fn find_by_issuer_request_id(
     Ok(Some(view))
 }
 
-/// Finds all mints in JournalConfirmed state (stuck after journal confirmation but before minting).
-pub(crate) async fn find_journal_confirmed(
-    pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, MintView)>, MintViewError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT view_id as "view_id!: String", payload as "payload: String"
-        FROM mint_view
-        WHERE json_extract(payload, '$.JournalConfirmed') IS NOT NULL
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            let view: MintView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(row.view_id), view))
-        })
-        .collect()
-}
-
-/// Finds all mints in Minting or MintingFailed state (incomplete mints that need recovery).
-pub(crate) async fn find_incomplete_mints(
-    pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, MintView)>, MintViewError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT view_id as "view_id!: String", payload as "payload: String"
-        FROM mint_view
-        WHERE json_extract(payload, '$.Minting') IS NOT NULL
-           OR json_extract(payload, '$.MintingFailed') IS NOT NULL
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            let view: MintView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(row.view_id), view))
-        })
-        .collect()
-}
-
-/// Finds all mints in CallbackPending state (stuck after minting but before callback).
-pub(crate) async fn find_callback_pending(
-    pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, MintView)>, MintViewError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT view_id as "view_id!: String", payload as "payload: String"
-        FROM mint_view
-        WHERE json_extract(payload, '$.CallbackPending') IS NOT NULL
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            let view: MintView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(row.view_id), view))
-        })
-        .collect()
-}
-
 /// Finds all mints that need recovery (not in terminal states).
 ///
 /// Returns mints in JournalConfirmed, Minting, MintingFailed, or CallbackPending states.
@@ -649,8 +582,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use cqrs_es::mem_store::MemStore;
+
     use super::*;
-    use crate::mint::{Mint, MintCommand, MintEvent};
+    use crate::alpaca::mock::MockAlpacaService;
+    use crate::mint::{Mint, MintCommand, MintEvent, MintServices};
+    use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+    use crate::vault::mock::MockVaultService;
 
     struct TestHarness {
         pool: Pool<Sqlite>,
@@ -670,13 +608,25 @@ mod tests {
                 .await
                 .expect("Failed to run migrations");
 
+            let receipt_store =
+                Arc::new(MemStore::<ReceiptInventory>::default());
+            let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            let mint_services = MintServices {
+                vault: Arc::new(MockVaultService::new_success()),
+                alpaca: Arc::new(MockAlpacaService::new_success()),
+                pool: pool.clone(),
+                bot,
+                receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+            };
+
             let view_repo =
                 Arc::new(SqliteViewRepository::<MintView, Mint>::new(
                     pool.clone(),
                     "mint_view".to_string(),
                 ));
             let query = GenericQuery::new(view_repo);
-            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+            let cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(query)], mint_services);
 
             Self { pool, cqrs }
         }
@@ -702,6 +652,111 @@ mod tests {
                 )
                 .await
                 .expect("Failed to initiate mint");
+        }
+
+        async fn initiate_mint_with_tok_id(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            tok_id: &str,
+        ) {
+            let client_id = ClientId::new();
+            let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::Initiate {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tokenization_request_id: TokenizationRequestId::new(
+                            tok_id,
+                        ),
+                        quantity: Quantity::new(Decimal::from(100)),
+                        underlying: UnderlyingSymbol::new("AAPL"),
+                        token: TokenSymbol::new("tAAPL"),
+                        network: Network::new("base"),
+                        client_id,
+                        wallet,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn confirm_journal(&self, issuer_request_id: &IssuerRequestId) {
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::ConfirmJournal {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn start_minting(&self, issuer_request_id: &IssuerRequestId) {
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::StartMinting {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn complete_minting(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            receipt_id: alloy::primitives::U256,
+            block_number: u64,
+        ) {
+            let tx_hash = b256!(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            );
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::CompleteMinting {
+                        issuer_request_id: issuer_request_id.clone(),
+                        tx_hash,
+                        receipt_id,
+                        shares_minted: uint!(100_000000000000000000_U256),
+                        gas_used: 50000,
+                        block_number,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn fail_minting(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            error: &str,
+        ) {
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::FailMinting {
+                        issuer_request_id: issuer_request_id.clone(),
+                        error: error.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn complete_callback(&self, issuer_request_id: &IssuerRequestId) {
+            self.cqrs
+                .execute(
+                    &issuer_request_id.0,
+                    MintCommand::CompleteCallback {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
         }
     }
 
@@ -1452,328 +1507,6 @@ mod tests {
         assert_eq!(view, original_view);
     }
 
-    #[tokio::test]
-    async fn test_find_journal_confirmed_returns_matching_mints() {
-        let pool = setup_test_db().await;
-
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
-        let client_id = ClientId::new();
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let iss_1 = IssuerRequestId::new("iss-jc-1");
-        let iss_2 = IssuerRequestId::new("iss-jc-2");
-
-        let init_cmd_1 = MintCommand::Initiate {
-            issuer_request_id: iss_1.clone(),
-            tokenization_request_id: TokenizationRequestId::new("alp-jc-1"),
-            quantity: Quantity::new(Decimal::from(100)),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            client_id,
-            wallet,
-        };
-
-        mint_cqrs.execute(&iss_1.0, init_cmd_1).await.unwrap();
-
-        let confirm_cmd =
-            MintCommand::ConfirmJournal { issuer_request_id: iss_1.clone() };
-
-        mint_cqrs.execute(&iss_1.0, confirm_cmd).await.unwrap();
-
-        let init_cmd_2 = MintCommand::Initiate {
-            issuer_request_id: iss_2.clone(),
-            tokenization_request_id: TokenizationRequestId::new("alp-jc-2"),
-            quantity: Quantity::new(Decimal::from(50)),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            network: Network::new("base"),
-            client_id,
-            wallet,
-        };
-
-        mint_cqrs.execute(&iss_2.0, init_cmd_2).await.unwrap();
-
-        let results = find_journal_confirmed(&pool).await.unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.0, "iss-jc-1");
-        assert!(matches!(results[0].1, MintView::JournalConfirmed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_find_journal_confirmed_returns_empty_when_none() {
-        let pool = setup_test_db().await;
-
-        let results = find_journal_confirmed(&pool).await.unwrap();
-
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_find_callback_pending_returns_matching_mints() {
-        let pool = setup_test_db().await;
-
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
-        let client_id = ClientId::new();
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let tx_hash = b256!(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-        );
-
-        let iss_1 = IssuerRequestId::new("iss-cp-1");
-        let iss_2 = IssuerRequestId::new("iss-cp-2");
-
-        let init_cmd_1 = MintCommand::Initiate {
-            issuer_request_id: iss_1.clone(),
-            tokenization_request_id: TokenizationRequestId::new("alp-cp-1"),
-            quantity: Quantity::new(Decimal::from(100)),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            client_id,
-            wallet,
-        };
-
-        mint_cqrs.execute(&iss_1.0, init_cmd_1).await.unwrap();
-
-        let confirm_cmd =
-            MintCommand::ConfirmJournal { issuer_request_id: iss_1.clone() };
-
-        mint_cqrs.execute(&iss_1.0, confirm_cmd).await.unwrap();
-
-        let start_minting_cmd =
-            MintCommand::StartMinting { issuer_request_id: iss_1.clone() };
-
-        mint_cqrs.execute(&iss_1.0, start_minting_cmd).await.unwrap();
-
-        let mint_success_cmd = MintCommand::CompleteMinting {
-            issuer_request_id: iss_1.clone(),
-            tx_hash,
-            receipt_id: uint!(1_U256),
-            shares_minted: uint!(100_000000000000000000_U256),
-            gas_used: 50000,
-            block_number: 1000,
-        };
-
-        mint_cqrs.execute(&iss_1.0, mint_success_cmd).await.unwrap();
-
-        let init_cmd_2 = MintCommand::Initiate {
-            issuer_request_id: iss_2.clone(),
-            tokenization_request_id: TokenizationRequestId::new("alp-cp-2"),
-            quantity: Quantity::new(Decimal::from(50)),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            token: TokenSymbol::new("tTSLA"),
-            network: Network::new("base"),
-            client_id,
-            wallet,
-        };
-
-        mint_cqrs.execute(&iss_2.0, init_cmd_2).await.unwrap();
-
-        let confirm_cmd_2 =
-            MintCommand::ConfirmJournal { issuer_request_id: iss_2.clone() };
-
-        mint_cqrs.execute(&iss_2.0, confirm_cmd_2).await.unwrap();
-
-        let results = find_callback_pending(&pool).await.unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.0, "iss-cp-1");
-        assert!(matches!(results[0].1, MintView::CallbackPending { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_find_callback_pending_returns_empty_when_none() {
-        let pool = setup_test_db().await;
-
-        let results = find_callback_pending(&pool).await.unwrap();
-
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_find_journal_confirmed_returns_multiple_when_multiple_stuck()
-    {
-        let pool = setup_test_db().await;
-
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
-        let client_id = ClientId::new();
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        for i in 1..=3 {
-            let iss = IssuerRequestId::new(format!("iss-multi-{i}"));
-
-            let init_cmd = MintCommand::Initiate {
-                issuer_request_id: iss.clone(),
-                tokenization_request_id: TokenizationRequestId::new(format!(
-                    "alp-multi-{i}"
-                )),
-                quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
-                token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
-                client_id,
-                wallet,
-            };
-
-            mint_cqrs.execute(&iss.0, init_cmd).await.unwrap();
-
-            let confirm_cmd =
-                MintCommand::ConfirmJournal { issuer_request_id: iss.clone() };
-
-            mint_cqrs.execute(&iss.0, confirm_cmd).await.unwrap();
-        }
-
-        let results = find_journal_confirmed(&pool).await.unwrap();
-
-        assert_eq!(results.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_find_incomplete_mints_returns_minting_and_minting_failed() {
-        let pool = setup_test_db().await;
-
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
-
-        let client_id = ClientId::new();
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        // Create a mint in Minting state
-        let iss_minting = IssuerRequestId::new("iss-minting-1");
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_minting.clone(),
-                    tokenization_request_id: TokenizationRequestId::new(
-                        "alp-minting-1",
-                    ),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::ConfirmJournal {
-                    issuer_request_id: iss_minting.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::StartMinting {
-                    issuer_request_id: iss_minting.clone(),
-                },
-            )
-            .await
-            .unwrap();
-
-        // Create a mint in MintingFailed state
-        let iss_failed = IssuerRequestId::new("iss-failed-1");
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_failed.clone(),
-                    tokenization_request_id: TokenizationRequestId::new(
-                        "alp-failed-1",
-                    ),
-                    quantity: Quantity::new(Decimal::from(50)),
-                    underlying: UnderlyingSymbol::new("TSLA"),
-                    token: TokenSymbol::new("tTSLA"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::ConfirmJournal {
-                    issuer_request_id: iss_failed.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::StartMinting {
-                    issuer_request_id: iss_failed.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::FailMinting {
-                    issuer_request_id: iss_failed.clone(),
-                    error: "Transaction reverted".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let results = find_incomplete_mints(&pool).await.unwrap();
-
-        assert_eq!(results.len(), 2);
-
-        let ids: Vec<_> = results.iter().map(|(id, _)| id.0.as_str()).collect();
-        assert!(ids.contains(&"iss-minting-1"));
-        assert!(ids.contains(&"iss-failed-1"));
-    }
-
-    #[tokio::test]
-    async fn test_find_incomplete_mints_returns_empty_when_none() {
-        let pool = setup_test_db().await;
-        let results = find_incomplete_mints(&pool).await.unwrap();
-        assert!(results.is_empty());
-    }
-
     #[test]
     fn test_handle_mint_retry_started_transitions_minting_failed_to_minting() {
         let issuer_request_id = IssuerRequestId::new("iss-retry-1");
@@ -1873,238 +1606,45 @@ mod tests {
     #[tokio::test]
     async fn test_find_all_recoverable_mints_returns_all_recoverable_states() {
         let harness = TestHarness::new().await;
-        let pool = &harness.pool;
-        let mint_cqrs = &harness.cqrs;
 
-        let client_id = ClientId::new();
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let tx_hash = b256!(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-        );
-
-        // Create mint in JournalConfirmed state
+        // JournalConfirmed: Initiate -> ConfirmJournal
         let iss_jc = IssuerRequestId::new("iss-jc-1");
-        mint_cqrs
-            .execute(
-                &iss_jc.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_jc.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-jc-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_jc.0,
-                MintCommand::ConfirmJournal { issuer_request_id: iss_jc.clone() },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_jc, "alp-jc-1").await;
+        harness.confirm_journal(&iss_jc).await;
 
-        // Create mint in Minting state
+        // Minting: Initiate -> ConfirmJournal -> StartMinting
         let iss_minting = IssuerRequestId::new("iss-minting-1");
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_minting.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-minting-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::ConfirmJournal { issuer_request_id: iss_minting.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_minting.0,
-                MintCommand::StartMinting { issuer_request_id: iss_minting.clone() },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_minting, "alp-minting-1").await;
+        harness.confirm_journal(&iss_minting).await;
+        harness.start_minting(&iss_minting).await;
 
-        // Create mint in MintingFailed state
+        // MintingFailed: Initiate -> ConfirmJournal -> StartMinting -> FailMinting
         let iss_failed = IssuerRequestId::new("iss-failed-1");
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_failed.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-failed-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::ConfirmJournal { issuer_request_id: iss_failed.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::StartMinting { issuer_request_id: iss_failed.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_failed.0,
-                MintCommand::FailMinting {
-                    issuer_request_id: iss_failed.clone(),
-                    error: "Transaction reverted".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_failed, "alp-failed-1").await;
+        harness.confirm_journal(&iss_failed).await;
+        harness.start_minting(&iss_failed).await;
+        harness.fail_minting(&iss_failed, "Transaction reverted").await;
 
-        // Create mint in CallbackPending state
+        // CallbackPending: Initiate -> ConfirmJournal -> StartMinting -> CompleteMinting
         let iss_cp = IssuerRequestId::new("iss-cp-1");
-        mint_cqrs
-            .execute(
-                &iss_cp.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_cp.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-cp-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_cp.0,
-                MintCommand::ConfirmJournal { issuer_request_id: iss_cp.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_cp.0,
-                MintCommand::StartMinting { issuer_request_id: iss_cp.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_cp.0,
-                MintCommand::CompleteMinting {
-                    issuer_request_id: iss_cp.clone(),
-                    tx_hash,
-                    receipt_id: uint!(1_U256),
-                    shares_minted: uint!(100_000000000000000000_U256),
-                    gas_used: 50000,
-                    block_number: 1000,
-                },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_cp, "alp-cp-1").await;
+        harness.confirm_journal(&iss_cp).await;
+        harness.start_minting(&iss_cp).await;
+        harness.complete_minting(&iss_cp, uint!(1_U256), 1000).await;
 
-        // Create mint in Initiated state (should NOT be recovered)
+        // Initiated (should NOT be recovered)
         let iss_init = IssuerRequestId::new("iss-init-1");
-        mint_cqrs
-            .execute(
-                &iss_init.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_init.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-init-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_init, "alp-init-1").await;
 
-        // Create mint in Completed state (should NOT be recovered)
+        // Completed (should NOT be recovered)
         let iss_done = IssuerRequestId::new("iss-done-1");
-        mint_cqrs
-            .execute(
-                &iss_done.0,
-                MintCommand::Initiate {
-                    issuer_request_id: iss_done.clone(),
-                    tokenization_request_id: TokenizationRequestId::new("alp-done-1"),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    client_id,
-                    wallet,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_done.0,
-                MintCommand::ConfirmJournal { issuer_request_id: iss_done.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_done.0,
-                MintCommand::StartMinting { issuer_request_id: iss_done.clone() },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_done.0,
-                MintCommand::CompleteMinting {
-                    issuer_request_id: iss_done.clone(),
-                    tx_hash,
-                    receipt_id: uint!(2_U256),
-                    shares_minted: uint!(100_000000000000000000_U256),
-                    gas_used: 50000,
-                    block_number: 1001,
-                },
-            )
-            .await
-            .unwrap();
-        mint_cqrs
-            .execute(
-                &iss_done.0,
-                MintCommand::CompleteCallback { issuer_request_id: iss_done.clone() },
-            )
-            .await
-            .unwrap();
+        harness.initiate_mint_with_tok_id(&iss_done, "alp-done-1").await;
+        harness.confirm_journal(&iss_done).await;
+        harness.start_minting(&iss_done).await;
+        harness.complete_minting(&iss_done, uint!(2_U256), 1001).await;
+        harness.complete_callback(&iss_done).await;
 
-        let results = find_all_recoverable_mints(pool).await.unwrap();
+        let results = find_all_recoverable_mints(&harness.pool).await.unwrap();
 
         assert_eq!(results.len(), 4, "Expected 4 recoverable mints");
 
