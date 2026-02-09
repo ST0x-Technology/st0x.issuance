@@ -3,7 +3,6 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
-use futures::future::join_all;
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
@@ -12,6 +11,10 @@ use tracing::info;
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
 const BLOCK_CHUNK_SIZE: u64 = 2000;
+
+/// Maximum concurrent RPC calls for balance checks.
+/// Limits parallelism to avoid overwhelming the RPC provider.
+const MAX_CONCURRENT_BALANCE_CHECKS: usize = 4;
 
 /// Generates inclusive block ranges of at most `chunk_size` blocks.
 fn block_ranges(
@@ -150,9 +153,11 @@ where
             .flatten()
             .unique_by(|transfer| transfer.receipt_id);
 
-        let results =
-            join_all(transfers.map(|transfer| self.process_transfer(transfer)))
-                .await;
+        let results: Vec<_> = stream::iter(transfers)
+            .map(|transfer| self.process_transfer(transfer))
+            .buffer_unordered(MAX_CONCURRENT_BALANCE_CHECKS)
+            .collect()
+            .await;
 
         let (processed_count, skipped_zero_balance) = results
             .into_iter()
@@ -586,6 +591,10 @@ mod tests {
             });
 
         let asserter = Asserter::new();
+        let current_block = 300u64;
+
+        // eth_blockNumber - called first
+        asserter.push_success(&U256::from(current_block));
 
         // eth_getLogs (TransferSingle filter)
         asserter.push_success(&vec![transfer_log]);
@@ -593,12 +602,8 @@ mod tests {
         // eth_getLogs (TransferBatch filter)
         asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
 
-        // eth_call (balanceOf) - current balance is zero (receipt was fully burned).
-        // Must be ABI-encoded as 32-byte big-endian, not JSON hex.
+        // eth_call (balanceOf) - current balance is zero (receipt was fully burned)
         asserter.push_success(&U256::ZERO.to_be_bytes::<32>());
-
-        // eth_blockNumber - for checkpoint
-        asserter.push_success(&U256::from(300u64));
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
@@ -643,6 +648,10 @@ mod tests {
             });
 
         let asserter = Asserter::new();
+        let checkpoint_block = 400u64;
+
+        // eth_blockNumber - called first
+        asserter.push_success(&U256::from(checkpoint_block));
 
         // eth_getLogs (TransferSingle filter)
         asserter.push_success(&vec![transfer_log]);
@@ -653,9 +662,6 @@ mod tests {
         // eth_call (balanceOf) - returns current balance (300), not original
         // transfer amount (1000). Must be ABI-encoded as 32-byte big-endian.
         asserter.push_success(&current_balance.to_be_bytes::<32>());
-
-        // eth_blockNumber - for checkpoint
-        asserter.push_success(&U256::from(400u64));
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
@@ -705,6 +711,10 @@ mod tests {
         });
 
         let asserter = Asserter::new();
+        let current_block = 600u64;
+
+        // eth_blockNumber - called first
+        asserter.push_success(&U256::from(current_block));
 
         // eth_getLogs (TransferSingle filter) - returns empty
         asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
@@ -712,14 +722,10 @@ mod tests {
         // eth_getLogs (TransferBatch filter) - returns the batch event
         asserter.push_success(&vec![batch_log]);
 
-        // eth_call (balanceOf) for each receipt, in processing order.
-        // Must be ABI-encoded as 32-byte big-endian, not JSON hex.
+        // eth_call (balanceOf) for each receipt, in processing order
         asserter.push_success(&balances[0].to_be_bytes::<32>());
         asserter.push_success(&balances[1].to_be_bytes::<32>());
         asserter.push_success(&balances[2].to_be_bytes::<32>());
-
-        // eth_blockNumber - for checkpoint
-        asserter.push_success(&U256::from(600u64));
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
@@ -770,6 +776,9 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 150u64;
 
+        // eth_blockNumber - called first to get current block
+        asserter.push_success(&U256::from(current_block));
+
         // eth_getLogs (TransferSingle filter)
         asserter.push_success(&vec![transfer_log]);
 
@@ -778,9 +787,6 @@ mod tests {
 
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
-
-        // eth_blockNumber - called after processing to get checkpoint block
-        asserter.push_success(&U256::from(current_block));
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))

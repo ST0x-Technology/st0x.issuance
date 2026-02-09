@@ -116,6 +116,7 @@ struct Env {
     #[arg(
         long,
         env = "DEPLOYMENT_BLOCK",
+        default_value = "40588950",
         help = "Block number when the vault was deployed (for receipt backfilling)"
     )]
     deployment_block: u64,
