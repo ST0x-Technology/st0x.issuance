@@ -160,38 +160,22 @@ st0x.issuance/
 ├── src/
 │   ├── lib.rs               # Library entry point with rocket setup
 │   ├── main.rs              # Binary entry point (minimal)
+│   ├── config.rs            # Configuration types
 │   ├── test_utils.rs        # Shared test utilities
 │   ├── account/             # Account aggregate and endpoints
-│   │   ├── mod.rs           # Aggregate, commands, events
-│   │   ├── api.rs           # HTTP endpoints
-│   │   └── view.rs          # Read model projections
 │   ├── mint/                # Mint aggregate and endpoints
-│   │   ├── mod.rs           # Aggregate, commands, events
-│   │   ├── cmd.rs           # Command definitions
-│   │   ├── event.rs         # Event definitions
-│   │   ├── api/             # HTTP endpoints
-│   │   └── view.rs          # Read model projections
-│   ├── tokenized_asset/     # TokenizedAsset aggregate and endpoints
-│   │   └── ...              # Similar structure to above
+│   ├── redemption/          # Redemption aggregate and managers
+│   ├── tokenized_asset/     # TokenizedAsset aggregate
+│   ├── receipt_inventory/   # Receipt tracking aggregate
 │   ├── alpaca/              # Alpaca API service
-│   │   ├── mod.rs           # Service trait and types
-│   │   ├── service.rs       # Real HTTP implementation
-│   │   └── mock.rs          # Mock implementation for testing
-│   └── blockchain/          # Blockchain service and types
-│       ├── mod.rs           # Service trait and types
-│       ├── service.rs       # Real Alloy implementation
-│       └── mock.rs          # Mock implementation for testing
-├── tests/                   # End-to-end integration tests
-│   ├── e2e_mint_flow.rs     # Complete mint flow with Anvil
-│   └── e2e_redemption_flow.rs  # Redemption flow with Anvil
+│   ├── vault/               # On-chain vault service
+│   ├── fireblocks/          # Fireblocks signing backend
+│   └── auth/                # API key auth and IP whitelisting
+├── tests/                   # End-to-end tests (Anvil + mocks)
 ├── crates/
 │   └── sqlite-es/           # SQLite event store implementation
 ├── migrations/              # Database migrations
-├── AGENTS.md                # AI agent development guidelines
-├── CLAUDE.md                # Claude Code instructions
-├── SPEC.md                  # Detailed specification
-├── ROADMAP.md               # Development roadmap
-└── README.md                # This file
+└── docs/                    # Developer documentation
 ```
 
 **Note**: This project uses **package by feature** organization, not package by

@@ -239,20 +239,20 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
-- `TokensBurned` - On-chain burn succeeded, redemption
-  complete (terminal success)
+- `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
+  success)
 - `BurningFailed` - On-chain burn failed (terminal)
 
 **Command → Event Mappings:**
 
-| Command | Events | Notes |
-| --- | --- | --- |
-| `DetectRedemption` | `RedemptionDetected` | Transfer detected |
-| `RecordAlpacaCall` | `AlpacaCalled` | Alpaca API called |
-| `RecordAlpacaFailure` | `AlpacaCallFailed` | Terminal failure |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete |
-| `RecordBurnSuccess` | `TokensBurned` | Terminal success |
-| `RecordBurnFailure` | `BurningFailed` | Terminal failure |
+| Command                 | Events                   | Notes             |
+| ----------------------- | ------------------------ | ----------------- |
+| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure  |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete  |
+| `RecordBurnSuccess`     | `TokensBurned`           | Terminal success  |
+| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure  |
 
 ### Account Aggregate
 
@@ -362,18 +362,18 @@ logic testable and isolated.
   `poll_request_status()`
 - Handles authentication, retries, and error mapping
 
-**BlockchainService:**
+**VaultService:**
 
-- RPC client for blockchain interaction
-- Methods: `mint_tokens()`, `burn_tokens()`, `estimate_gas()`,
-  `get_receipt_balance()`
-- Manages transaction signing, gas estimation, and receipt parsing
+- RPC client for on-chain vault interaction
+- Methods: `deposit()`, `withdraw()`
+- Two implementations: local key signing and Fireblocks
 
-**MonitorService:**
+**ReceiptService:**
 
-- Watches redemption wallet for incoming transfers
-- Methods: `watch_transfers()`, `get_transfer_details()`
-- Uses a WebSocket subscription to detect redemption events
+- Tracks on-chain receipts for burn planning and recovery
+- Methods: `register_minted_receipt()`, `for_burn()`,
+  `find_by_issuer_request_id()`
+- Indexes ITN receipts by `issuer_request_id` for recovery
 
 These services are injected into aggregate command handlers, making aggregates
 testable with mock services.
@@ -909,7 +909,6 @@ stateDiagram-v2
     Minting --> CallbackPending: Recover (ExistingMintRecovered)
     CallbackPending --> Completed: SendCallback
     JournalRejected --> [*]
-    MintingFailed --> [*]
     Completed --> [*]
 ```
 
