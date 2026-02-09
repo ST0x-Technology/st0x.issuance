@@ -575,6 +575,26 @@ impl LocalEvm {
         amount: U256,
         to: Address,
     ) -> Result<(U256, U256), LocalEvmError> {
+        let (id, shares, _) =
+            self.mint_directly_with_info(amount, to, Bytes::new()).await?;
+        Ok((id, shares))
+    }
+
+    /// Mints shares directly on-chain with custom receipt information.
+    ///
+    /// Like `mint_directly`, but allows specifying the `receiptInformation` bytes
+    /// that will be stored on-chain with the Deposit event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, the deposit
+    /// transaction fails, or the Deposit event is not found in the receipt.
+    pub async fn mint_directly_with_info(
+        &self,
+        amount: U256,
+        to: Address,
+        receipt_information: Bytes,
+    ) -> Result<(U256, U256, Bytes), LocalEvmError> {
         let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
         let wallet = EthereumWallet::from(signer);
 
@@ -589,7 +609,7 @@ impl LocalEvm {
         let share_ratio = U256::from(10).pow(U256::from(18));
 
         let receipt = vault
-            .deposit(amount, to, share_ratio, Bytes::new())
+            .deposit(amount, to, share_ratio, receipt_information)
             .send()
             .await?
             .get_receipt()
@@ -603,7 +623,11 @@ impl LocalEvm {
                 log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
                     |decoded| {
                         let event_data = decoded.data();
-                        (event_data.id, event_data.shares)
+                        (
+                            event_data.id,
+                            event_data.shares,
+                            event_data.receiptInformation.clone(),
+                        )
                     },
                 )
             })

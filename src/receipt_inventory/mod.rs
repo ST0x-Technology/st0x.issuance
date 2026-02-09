@@ -1095,6 +1095,7 @@ mod tests {
 
     use crate::Quantity;
     use crate::mint::TokenizationRequestId;
+    use crate::test_utils::LocalEvm;
     use crate::tokenized_asset::UnderlyingSymbol;
     use crate::vault::{OperationType, ReceiptInformation};
 
@@ -1143,6 +1144,59 @@ mod tests {
                 ReceiptSource::External => {
                     prop_assert!(false, "Expected Itn source, got External");
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_then_determine_source_roundtrips_through_anvil() {
+        let evm = LocalEvm::new().await.unwrap();
+
+        evm.grant_deposit_role(evm.wallet_address).await.unwrap();
+        evm.grant_certify_role(evm.wallet_address).await.unwrap();
+        evm.certify_vault(U256::MAX).await.unwrap();
+
+        let original_issuer_request_id = IssuerRequestId::new("iss-anvil-test");
+        let receipt_info = ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new(
+                "tok-anvil-test",
+            ),
+            issuer_request_id: original_issuer_request_id.clone(),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity(rust_decimal::Decimal::new(10050, 2)),
+            operation_type: OperationType::Mint,
+            timestamp: chrono::Utc::now(),
+            notes: Some("Anvil integration test".to_string()),
+        };
+
+        let encoded = receipt_info.encode().unwrap();
+        let amount = U256::from(100) * U256::from(10).pow(U256::from(18));
+
+        let (_receipt_id, _shares, returned_info) = evm
+            .mint_directly_with_info(
+                amount,
+                evm.wallet_address,
+                encoded.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            returned_info, encoded,
+            "Returned receiptInformation should match what was sent"
+        );
+
+        let source = determine_source(&returned_info);
+        match source {
+            ReceiptSource::Itn { issuer_request_id } => {
+                assert_eq!(
+                    issuer_request_id.as_str(),
+                    original_issuer_request_id.as_str(),
+                    "Extracted issuer_request_id should match original"
+                );
+            }
+            ReceiptSource::External => {
+                panic!("Expected Itn source, got External");
             }
         }
     }

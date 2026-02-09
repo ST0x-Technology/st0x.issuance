@@ -188,6 +188,13 @@ pub(crate) struct ReceiptInformation {
     pub(crate) notes: Option<String>,
 }
 
+impl ReceiptInformation {
+    /// Encodes the receipt information as JSON bytes for on-chain storage.
+    pub(crate) fn encode(&self) -> Result<Bytes, serde_json::Error> {
+        serde_json::to_vec(self).map(Bytes::from)
+    }
+}
+
 /// Type of tokenization operation being performed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OperationType {
@@ -217,4 +224,75 @@ pub(crate) enum VaultError {
     /// Fireblocks vault service error
     #[error(transparent)]
     Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+
+    fn sample_receipt_information() -> ReceiptInformation {
+        ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            issuer_request_id: IssuerRequestId::new("iss-456"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity::new(dec!(100.5)),
+            operation_type: OperationType::Mint,
+            timestamp: Utc::now(),
+            notes: Some("test mint".to_string()),
+        }
+    }
+
+    #[test]
+    fn encode_produces_valid_json() {
+        let info = sample_receipt_information();
+
+        let encoded = info.encode().unwrap();
+
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            decoded["tokenization_request_id"].as_str(),
+            Some("tok-123")
+        );
+        assert_eq!(decoded["issuer_request_id"].as_str(), Some("iss-456"));
+        assert_eq!(decoded["underlying"].as_str(), Some("AAPL"));
+        assert_eq!(decoded["quantity"].as_str(), Some("100.5"));
+        assert_eq!(decoded["operation_type"].as_str(), Some("Mint"));
+        assert_eq!(decoded["notes"].as_str(), Some("test mint"));
+    }
+
+    #[test]
+    fn encode_roundtrips_through_deserialize() {
+        let original = sample_receipt_information();
+
+        let encoded = original.encode().unwrap();
+        let decoded: ReceiptInformation =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.tokenization_request_id,
+            original.tokenization_request_id
+        );
+        assert_eq!(decoded.issuer_request_id, original.issuer_request_id);
+        assert_eq!(decoded.underlying, original.underlying);
+        assert_eq!(decoded.quantity, original.quantity);
+        assert_eq!(decoded.notes, original.notes);
+    }
+
+    #[test]
+    fn encode_handles_none_notes() {
+        let info =
+            ReceiptInformation { notes: None, ..sample_receipt_information() };
+
+        let encoded = info.encode().unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert!(decoded["notes"].is_null());
+    }
 }
