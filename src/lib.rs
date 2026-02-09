@@ -624,14 +624,14 @@ async fn run_receipt_backfill<P: alloy::providers::Provider + Clone>(
     let receipt_contract =
         Address::from(vault_contract.receipt().call().await?.0);
 
-    // Load aggregate to get last discovered block
+    // Load aggregate to get last backfilled block
     let aggregate_context = receipt_inventory_event_store
         .load_aggregate(&config.vault.to_string())
         .await?;
 
     let from_block = aggregate_context
         .aggregate()
-        .last_discovered_block()
+        .last_backfilled_block()
         .unwrap_or(config.deployment_block);
 
     info!(

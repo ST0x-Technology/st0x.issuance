@@ -2,13 +2,34 @@ use alloy::primitives::{Address, TxHash};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{CqrsFramework, EventStore};
+use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::future::join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
 use tracing::info;
 
-use super::{ReceiptId, ReceiptInventory, ReceiptInventoryCommand, Shares};
+/// Maximum number of blocks to query in a single get_logs call.
+/// RPCs typically limit response sizes, so we chunk large ranges.
+const BLOCK_CHUNK_SIZE: u64 = 2000;
+
+/// Generates inclusive block ranges of at most `chunk_size` blocks.
+fn block_ranges(
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    std::iter::successors(Some(from), move |&start| {
+        let next = start + chunk_size;
+        if next <= to { Some(next) } else { None }
+    })
+    .map(move |start| (start, (start + chunk_size - 1).min(to)))
+}
+
+use super::{
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
+    ReceiptInventoryError, Shares,
+};
 use crate::bindings::Receipt;
 
 /// Backfills the ReceiptInventory aggregate by scanning historic ERC-1155
@@ -37,21 +58,16 @@ pub(crate) struct BackfillResult {
 pub(crate) enum BackfillError {
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-
     #[error("Failed to decode TransferSingle event: {0}")]
     EventDecode(#[from] alloy::sol_types::Error),
-
     #[error("Missing transaction hash in log")]
     MissingTxHash,
-
     #[error("Missing block number in log")]
     MissingBlockNumber,
-
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
-
     #[error("CQRS error: {0}")]
-    Cqrs(cqrs_es::AggregateError<super::ReceiptInventoryError>),
+    Aggregate(#[from] AggregateError<ReceiptInventoryError>),
 }
 
 impl<ProviderType, ReceiptInventoryStore>
@@ -86,46 +102,49 @@ where
     ///
     /// `from_block` is the block to start scanning from. On first run, pass
     /// the configured deployment block. On subsequent runs, pass
-    /// `aggregate.last_discovered_block().unwrap_or(deployment_block)`.
+    /// `aggregate.last_backfilled_block().unwrap_or(deployment_block)`.
+    ///
+    /// Queries are chunked to avoid RPC response size limits.
     ///
     /// This is idempotent - running multiple times produces the same result.
     pub(crate) async fn backfill_receipts(
         &self,
         from_block: u64,
     ) -> Result<BackfillResult, BackfillError> {
-        let start_block = from_block;
+        let current_block = self.provider.get_block_number().await?;
 
         info!(
             receipt_contract = %self.receipt_contract,
             bot_wallet = %self.bot_wallet,
-            from_block = start_block,
+            from_block,
+            to_block = current_block,
             "Starting receipt backfill"
         );
 
-        let receipt_contract =
-            Receipt::new(self.receipt_contract, &self.provider);
+        let all_logs: Vec<Log> = stream::iter(block_ranges(
+            from_block,
+            current_block,
+            BLOCK_CHUNK_SIZE,
+        ))
+        .then(|(chunk_from, chunk_to)| async move {
+            let logs = self.fetch_logs_for_range(chunk_from, chunk_to).await?;
+            info!(
+                chunk_from,
+                chunk_to,
+                logs_found = logs.len(),
+                "Processed block range"
+            );
+            Ok::<_, BackfillError>(logs)
+        })
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
 
-        let single_filter = receipt_contract
-            .TransferSingle_filter()
-            .topic3(self.bot_wallet)
-            .from_block(start_block)
-            .filter;
-
-        let batch_filter = receipt_contract
-            .TransferBatch_filter()
-            .topic3(self.bot_wallet)
-            .from_block(start_block)
-            .filter;
-
-        let (single_logs, batch_logs) = futures::try_join!(
-            self.provider.get_logs(&single_filter),
-            self.provider.get_logs(&batch_filter),
-        )?;
-
-        let transfers = single_logs
+        let transfers = all_logs
             .iter()
-            .map(Self::parse_transfer_single)
-            .chain(batch_logs.iter().map(Self::parse_transfer_batch))
+            .map(Self::parse_log)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
@@ -144,12 +163,61 @@ where
                 })
             })?;
 
+        self.cqrs
+            .execute(
+                &self.vault.to_string(),
+                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                    block_number: current_block,
+                },
+            )
+            .await?;
+
         info!(
             processed_count,
-            skipped_zero_balance, "Receipt backfill complete"
+            skipped_zero_balance,
+            checkpoint_block = current_block,
+            "Receipt backfill complete"
         );
 
         Ok(BackfillResult { processed_count, skipped_zero_balance })
+    }
+
+    async fn fetch_logs_for_range(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>, BackfillError> {
+        let receipt_contract =
+            Receipt::new(self.receipt_contract, &self.provider);
+
+        let single_filter = receipt_contract
+            .TransferSingle_filter()
+            .topic3(self.bot_wallet)
+            .from_block(from_block)
+            .to_block(to_block)
+            .filter;
+
+        let batch_filter = receipt_contract
+            .TransferBatch_filter()
+            .topic3(self.bot_wallet)
+            .from_block(from_block)
+            .to_block(to_block)
+            .filter;
+
+        let (single_logs, batch_logs) = futures::try_join!(
+            self.provider.get_logs(&single_filter),
+            self.provider.get_logs(&batch_filter),
+        )?;
+
+        Ok(single_logs.into_iter().chain(batch_logs).collect())
+    }
+
+    fn parse_log(log: &Log) -> Result<Vec<TransferInfo>, BackfillError> {
+        // Try parsing as TransferSingle first, then TransferBatch
+        if let Ok(transfers) = Self::parse_transfer_single(log) {
+            return Ok(transfers);
+        }
+        Self::parse_transfer_batch(log)
     }
 
     fn parse_transfer_single(
@@ -214,8 +282,7 @@ where
                     tx_hash: transfer.tx_hash,
                 },
             )
-            .await
-            .map_err(BackfillError::Cqrs)?;
+            .await?;
 
         info!(
             receipt_id = %transfer.receipt_id,
@@ -376,6 +443,10 @@ mod tests {
             });
 
         let asserter = Asserter::new();
+        let current_block = 200u64;
+
+        // eth_blockNumber - called first to get current block
+        asserter.push_success(&U256::from(current_block));
 
         // eth_getLogs (TransferSingle filter)
         asserter.push_success(&vec![transfer_log]);
@@ -383,9 +454,7 @@ mod tests {
         // eth_getLogs (TransferBatch filter)
         asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
 
-        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian.
-        // push_success accepts U256 but serializes it as JSON hex string ("0x3e8"),
-        // not as ABI-encoded bytes that eth_call returns.
+        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian
         asserter.push_success(&balance.to_be_bytes::<32>());
 
         let provider = ProviderBuilder::new()
@@ -431,6 +500,10 @@ mod tests {
 
         // First run
         let asserter1 = Asserter::new();
+        let current_block = 200u64;
+
+        // eth_blockNumber - called first
+        asserter1.push_success(&U256::from(current_block));
 
         // eth_getLogs (TransferSingle filter)
         asserter1.push_success(&vec![transfer_log.clone()]);
@@ -438,9 +511,7 @@ mod tests {
         // eth_getLogs (TransferBatch filter)
         asserter1.push_success(&Vec::<alloy::rpc::types::Log>::new());
 
-        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian.
-        // push_success accepts U256 but serializes it as JSON hex string ("0x3e8"),
-        // not as ABI-encoded bytes that eth_call returns.
+        // eth_call (balanceOf) - must be ABI-encoded as 32-byte big-endian
         asserter1.push_success(&balance.to_be_bytes::<32>());
 
         let provider1 = ProviderBuilder::new()
@@ -460,6 +531,9 @@ mod tests {
 
         // Second run - command is idempotent, succeeds without error
         let asserter2 = Asserter::new();
+
+        // eth_blockNumber - called first
+        asserter2.push_success(&U256::from(current_block));
 
         // eth_getLogs (TransferSingle filter)
         asserter2.push_success(&vec![transfer_log]);
@@ -523,6 +597,9 @@ mod tests {
         // Must be ABI-encoded as 32-byte big-endian, not JSON hex.
         asserter.push_success(&U256::ZERO.to_be_bytes::<32>());
 
+        // eth_blockNumber - for checkpoint
+        asserter.push_success(&U256::from(300u64));
+
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
@@ -576,6 +653,9 @@ mod tests {
         // eth_call (balanceOf) - returns current balance (300), not original
         // transfer amount (1000). Must be ABI-encoded as 32-byte big-endian.
         asserter.push_success(&current_balance.to_be_bytes::<32>());
+
+        // eth_blockNumber - for checkpoint
+        asserter.push_success(&U256::from(400u64));
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
@@ -638,6 +718,9 @@ mod tests {
         asserter.push_success(&balances[1].to_be_bytes::<32>());
         asserter.push_success(&balances[2].to_be_bytes::<32>());
 
+        // eth_blockNumber - for checkpoint
+        asserter.push_success(&U256::from(600u64));
+
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
@@ -659,5 +742,96 @@ mod tests {
         let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
         assert_eq!(receipts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn backfill_emits_checkpoint_after_processing() {
+        let (receipt_contract, bot_wallet, vault) = test_addresses();
+        let (cqrs, store) = setup_cqrs_with_store();
+
+        let receipt_id = U256::from(42);
+        let balance = U256::from(1000);
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let transfer_log =
+            create_transfer_single_log(TransferSingleLogParams {
+                receipt_contract,
+                operator: Address::ZERO,
+                from: Address::ZERO,
+                to: bot_wallet,
+                id: receipt_id,
+                value: balance,
+                tx_hash,
+                block_number: 100,
+            });
+
+        let asserter = Asserter::new();
+        let current_block = 150u64;
+
+        // eth_getLogs (TransferSingle filter)
+        asserter.push_success(&vec![transfer_log]);
+
+        // eth_getLogs (TransferBatch filter)
+        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new());
+
+        // eth_call (balanceOf)
+        asserter.push_success(&balance.to_be_bytes::<32>());
+
+        // eth_blockNumber - called after processing to get checkpoint block
+        asserter.push_success(&U256::from(current_block));
+
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::random()))
+            .connect_mocked_client(asserter);
+
+        let backfiller = ReceiptBackfiller::new(
+            provider,
+            receipt_contract,
+            bot_wallet,
+            vault,
+            cqrs,
+        );
+
+        backfiller.backfill_receipts(0).await.unwrap();
+
+        // Verify checkpoint was set to current block
+        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert_eq!(
+            ctx.aggregate().last_backfilled_block(),
+            Some(current_block),
+            "Backfill should checkpoint to current block after processing"
+        );
+    }
+
+    #[test]
+    fn block_ranges_single_chunk() {
+        let ranges: Vec<_> = super::block_ranges(0, 100, 2000).collect();
+        assert_eq!(ranges, vec![(0, 100)]);
+    }
+
+    #[test]
+    fn block_ranges_exact_multiple() {
+        let ranges: Vec<_> = super::block_ranges(0, 3999, 2000).collect();
+        assert_eq!(ranges, vec![(0, 1999), (2000, 3999)]);
+    }
+
+    #[test]
+    fn block_ranges_with_remainder() {
+        let ranges: Vec<_> = super::block_ranges(0, 5000, 2000).collect();
+        assert_eq!(ranges, vec![(0, 1999), (2000, 3999), (4000, 5000)]);
+    }
+
+    #[test]
+    fn block_ranges_from_nonzero() {
+        let ranges: Vec<_> = super::block_ranges(1000, 4500, 2000).collect();
+        assert_eq!(ranges, vec![(1000, 2999), (3000, 4500)]);
+    }
+
+    #[test]
+    fn block_ranges_empty_when_from_equals_to() {
+        let ranges: Vec<_> = super::block_ranges(100, 100, 2000).collect();
+        assert_eq!(ranges, vec![(100, 100)]);
     }
 }

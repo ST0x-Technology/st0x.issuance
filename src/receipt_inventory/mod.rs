@@ -156,7 +156,7 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReceiptInventory {
     receipts: HashMap<ReceiptId, Shares>,
-    last_discovered_block: Option<u64>,
+    last_backfilled_block: Option<u64>,
 }
 
 impl ReceiptInventory {
@@ -170,8 +170,8 @@ impl ReceiptInventory {
             .collect()
     }
 
-    pub(crate) const fn last_discovered_block(&self) -> Option<u64> {
-        self.last_discovered_block
+    pub(crate) const fn last_backfilled_block(&self) -> Option<u64> {
+        self.last_backfilled_block
     }
 }
 
@@ -263,22 +263,21 @@ impl Aggregate for ReceiptInventory {
                     }])
                 }
             }
+
+            ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                block_number,
+            } => Ok(vec![ReceiptInventoryEvent::BackfillCheckpoint {
+                block_number,
+            }]),
         }
     }
 
     fn apply(&mut self, event: Self::Event) {
         match event {
             ReceiptInventoryEvent::Discovered {
-                receipt_id,
-                balance,
-                block_number,
-                ..
+                receipt_id, balance, ..
             } => {
                 self.receipts.insert(receipt_id, balance);
-                self.last_discovered_block = Some(
-                    self.last_discovered_block
-                        .map_or(block_number, |last| last.max(block_number)),
-                );
             }
 
             ReceiptInventoryEvent::Burned {
@@ -293,6 +292,13 @@ impl Aggregate for ReceiptInventory {
 
             ReceiptInventoryEvent::Depleted { receipt_id } => {
                 self.receipts.remove(&receipt_id);
+            }
+
+            ReceiptInventoryEvent::BackfillCheckpoint { block_number } => {
+                self.last_backfilled_block = Some(
+                    self.last_backfilled_block
+                        .map_or(block_number, |last| last.max(block_number)),
+                );
             }
         }
     }
@@ -558,6 +564,27 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_advance_backfill_checkpoint_emits_event() {
+        let aggregate = ReceiptInventory::default();
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                    block_number: 100,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ReceiptInventoryEvent::BackfillCheckpoint { block_number: 100 }
+        ));
+    }
+
     #[test]
     fn test_apply_discovered_adds_to_state() {
         let mut aggregate = ReceiptInventory::default();
@@ -647,38 +674,26 @@ mod tests {
     }
 
     #[test]
-    fn test_last_discovered_block_tracks_max_block_number() {
+    fn test_backfill_checkpoint_tracks_max_block_number() {
         let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
 
-        assert_eq!(aggregate.last_discovered_block(), None);
+        assert_eq!(aggregate.last_backfilled_block(), None);
 
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(1),
-            balance: make_shares(100),
+        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
             block_number: 500,
-            tx_hash,
         });
-        assert_eq!(aggregate.last_discovered_block(), Some(500));
+        assert_eq!(aggregate.last_backfilled_block(), Some(500));
 
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(2),
-            balance: make_shares(200),
+        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
             block_number: 1000,
-            tx_hash,
         });
-        assert_eq!(aggregate.last_discovered_block(), Some(1000));
+        assert_eq!(aggregate.last_backfilled_block(), Some(1000));
 
         // Earlier block doesn't decrease the max
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(3),
-            balance: make_shares(300),
+        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
             block_number: 750,
-            tx_hash,
         });
-        assert_eq!(aggregate.last_discovered_block(), Some(1000));
+        assert_eq!(aggregate.last_backfilled_block(), Some(1000));
     }
 
     async fn setup_receipt_service_with_receipts(

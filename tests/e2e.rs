@@ -1082,3 +1082,145 @@ async fn test_redemption_recovery_after_restart()
 
     Ok(())
 }
+
+/// Tests that receipt backfill checkpoint is independent from live monitor discoveries.
+///
+/// This test verifies the fix for a bug where:
+/// 1. Monitor discovers a receipt at block N
+/// 2. Service restarts
+/// 3. Backfill would incorrectly start from block N (missing blocks 0..N)
+///
+/// The fix separates `last_backfilled_block` from receipt discovery events.
+/// Only `BackfillCheckpoint` events (emitted after backfill completes) advance
+/// the checkpoint, not `Discovered` events from the monitor.
+///
+/// Test scenario:
+/// 1. Mint receipt directly before service starts (simulates historic receipt)
+/// 2. Start service - backfill discovers the receipt, checkpoints to current block
+/// 3. Mint another receipt while service running - monitor detects it
+/// 4. Restart service
+/// 5. Verify both receipts are usable (backfill didn't skip the early one)
+#[tokio::test]
+async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    // Use file-based database to persist across restarts
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_backfill_checkpoint.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Setup roles before any minting
+    evm.grant_deposit_role(bot_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Step 1: Mint a receipt BEFORE the service starts (simulates historic receipt)
+    let historic_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
+    let (historic_receipt_id, _historic_shares) =
+        evm.mint_directly(historic_amount, bot_wallet).await?;
+
+    // Setup mocks
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        setup_redemption_mocks(&mock_alpaca, user_wallet);
+
+    // Step 2: Start service - backfill should discover the historic receipt
+    let config1 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    seed_tokenized_asset(&client1, evm.vault_address).await;
+
+    // Give backfill and monitor time to fully start
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Step 3: Mint another receipt while service is running (monitor should detect)
+    let live_amount = U256::from(50) * U256::from(10).pow(U256::from(18));
+    let (live_receipt_id, _live_shares) =
+        evm.mint_directly(live_amount, bot_wallet).await?;
+
+    // Give monitor time to detect the new receipt
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Step 4: "Crash" - drop the first service instance
+    drop(client1);
+
+    // Step 5: Restart service - backfill should use checkpoint, not monitor's block
+    let config2 = create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    // Give backfill time to process
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Step 6: Verify both receipts are tracked by querying all events
+    let query_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await?;
+
+    // Query ALL events for the ReceiptInventory aggregate to debug
+    let all_events: Vec<(String, String, String)> = sqlx::query_as(
+        r"
+        SELECT aggregate_type, event_type, payload
+        FROM events
+        WHERE aggregate_type = 'ReceiptInventory'
+        ORDER BY sequence
+        ",
+    )
+    .fetch_all(&query_pool)
+    .await?;
+
+    // Find Discovered events (the event_type might include the full path)
+    let discovered_events: Vec<&(String, String, String)> = all_events
+        .iter()
+        .filter(|(_, event_type, _)| event_type.contains("Discovered"))
+        .collect();
+
+    assert!(
+        discovered_events.len() >= 2,
+        "Expected at least 2 discovered receipts, found {}. \
+         All events: {:?}",
+        discovered_events.len(),
+        all_events.iter().map(|(_, t, _)| t.as_str()).collect::<Vec<_>>()
+    );
+
+    // Verify the specific receipt IDs are present
+    let receipt_ids: Vec<String> = discovered_events
+        .iter()
+        .filter_map(|(_, _, payload)| {
+            let json: serde_json::Value = serde_json::from_str(payload).ok()?;
+            // Handle both possible JSON structures
+            json["receipt_id"]
+                .as_str()
+                .or_else(|| json["Discovered"]["receipt_id"].as_str())
+                .map(ToString::to_string)
+        })
+        .collect();
+
+    let historic_id_hex = format!("{historic_receipt_id:#x}");
+    let live_id_hex = format!("{live_receipt_id:#x}");
+
+    assert!(
+        receipt_ids.iter().any(|id| id == &historic_id_hex),
+        "Historic receipt {historic_id_hex} not found in discovered receipts: {receipt_ids:?}"
+    );
+
+    assert!(
+        receipt_ids.iter().any(|id| id == &live_id_hex),
+        "Live receipt {live_id_hex} not found in discovered receipts: {receipt_ids:?}"
+    );
+
+    Ok(())
+}
