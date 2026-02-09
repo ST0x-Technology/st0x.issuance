@@ -16,12 +16,16 @@ use crate::mint::{
     CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
     mint_manager::MintManager,
 };
+use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
-use crate::{AccountCqrs, MintCqrs, TokenizedAssetCqrs};
+use crate::{
+    AccountCqrs, MintCqrs, ReceiptInventoryCqrs, SqliteEventStore,
+    TokenizedAssetCqrs,
+};
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -30,6 +34,7 @@ pub(crate) fn test_config() -> Config {
         rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
         private_key: B256::ZERO,
         vault: address!("0x1111111111111111111111111111111111111111"),
+        deployment_block: 0,
         auth: test_auth_config().unwrap(),
         log_level: LogLevel::Debug,
         hyperdx: None,
@@ -41,7 +46,13 @@ pub(crate) fn create_test_mint_manager(
     mint_cqrs: crate::MintCqrs,
     event_store: crate::MintEventStore,
     pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
+    receipt_inventory_cqrs: ReceiptInventoryCqrs,
+) -> Arc<
+    MintManager<
+        PersistedEventStore<SqliteEventRepository, Mint>,
+        SqliteEventStore<ReceiptInventory>,
+    >,
+> {
     let blockchain_service =
         Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -52,6 +63,7 @@ pub(crate) fn create_test_mint_manager(
         event_store,
         pool,
         bot,
+        receipt_inventory_cqrs,
     ))
 }
 
@@ -79,6 +91,7 @@ pub(crate) struct TestHarness {
     pub(crate) account_cqrs: AccountCqrs,
     pub(crate) asset_cqrs: TokenizedAssetCqrs,
     pub(crate) mint_cqrs: MintCqrs,
+    pub(crate) receipt_inventory_cqrs: ReceiptInventoryCqrs,
 }
 
 impl TestHarness {
@@ -127,7 +140,16 @@ impl TestHarness {
         let mint_cqrs =
             Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
 
-        Self { pool, account_cqrs, asset_cqrs, mint_cqrs }
+        let receipt_inventory_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+        Self {
+            pool,
+            account_cqrs,
+            asset_cqrs,
+            mint_cqrs,
+            receipt_inventory_cqrs,
+        }
     }
 }
 

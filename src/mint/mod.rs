@@ -783,6 +783,7 @@ mod tests {
     };
     use crate::account::AlpacaAccountNumber;
     use crate::alpaca::{AlpacaService, mock::MockAlpacaService};
+    use crate::receipt_inventory::ReceiptInventory;
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
     };
@@ -2164,12 +2165,22 @@ mod tests {
         cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
         store: Arc<MemStore<Mint>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
-    ) -> MintManager<MemStore<Mint>> {
+        receipt_inventory_cqrs: Arc<
+            CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>,
+        >,
+    ) -> MintManager<MemStore<Mint>, MemStore<ReceiptInventory>> {
         let blockchain_service =
             Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-        MintManager::new(blockchain_service, cqrs, store, pool, bot)
+        MintManager::new(
+            blockchain_service,
+            cqrs,
+            store,
+            pool,
+            bot,
+            receipt_inventory_cqrs,
+        )
     }
 
     fn create_test_callback_manager(
@@ -2216,7 +2227,7 @@ mod tests {
     async fn setup_managers_test() -> (
         Arc<MemStore<Mint>>,
         Arc<CqrsFramework<Mint, MemStore<Mint>>>,
-        MintManager<MemStore<Mint>>,
+        MintManager<MemStore<Mint>, MemStore<ReceiptInventory>>,
         CallbackManager<MemStore<Mint>>,
     ) {
         use sqlx::sqlite::SqlitePoolOptions;
@@ -2262,8 +2273,20 @@ mod tests {
             .await
             .expect("Failed to add tokenized asset");
 
-        let mint_manager =
-            create_test_mint_manager(cqrs.clone(), store.clone(), pool.clone());
+        let receipt_inventory_store =
+            Arc::new(MemStore::<ReceiptInventory>::default());
+        let receipt_inventory_cqrs = Arc::new(CqrsFramework::new(
+            (*receipt_inventory_store).clone(),
+            vec![],
+            (),
+        ));
+
+        let mint_manager = create_test_mint_manager(
+            cqrs.clone(),
+            store.clone(),
+            pool.clone(),
+            receipt_inventory_cqrs,
+        );
         let callback_manager =
             create_test_callback_manager(cqrs.clone(), store.clone(), pool);
 

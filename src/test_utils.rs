@@ -27,6 +27,7 @@ use crate::bindings::{
 use crate::config::{Config, LogLevel};
 use crate::mint::mint_manager::MintManager;
 use crate::mint::{CallbackManager, Mint, MintView};
+use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
@@ -54,6 +55,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         rpc_url: Url::parse("wss://localhost:8545")?,
         private_key: B256::ZERO,
         vault: address!("0x1111111111111111111111111111111111111111"),
+        deployment_block: 0,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         hyperdx: None,
@@ -125,6 +127,10 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         Mint,
     >::new_event_store(mint_event_repo));
 
+    // Setup ReceiptInventory CQRS
+    let receipt_inventory_cqrs =
+        Arc::new(sqlite_cqrs::<ReceiptInventory>(pool.clone(), vec![], ()));
+
     // Seed initial assets
     seed_test_assets(&tokenized_asset_cqrs).await?;
 
@@ -136,6 +142,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         mint_event_store.clone(),
         pool.clone(),
         bot,
+        receipt_inventory_cqrs,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(

@@ -1,4 +1,4 @@
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ pub(crate) enum ReceiptInventoryEvent {
         receipt_id: ReceiptId,
         balance: Shares,
         block_number: u64,
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     Burned {
         receipt_id: ReceiptId,

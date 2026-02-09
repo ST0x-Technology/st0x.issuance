@@ -1,6 +1,6 @@
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::RpcError;
 use clap::{Args, Parser};
@@ -20,6 +20,7 @@ pub struct Config {
     pub rpc_url: Url,
     pub private_key: B256,
     pub vault: Address,
+    pub deployment_block: u64,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
@@ -54,6 +55,20 @@ impl Config {
             .await?;
 
         Ok(Arc::new(RealBlockchainService::new(provider)))
+    }
+
+    pub(crate) async fn create_provider(
+        &self,
+    ) -> Result<impl Provider + Clone + use<>, ConfigError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(self.rpc_url.as_str())
+            .await?;
+
+        Ok(provider)
     }
 }
 
@@ -98,6 +113,13 @@ struct Env {
     )]
     vault: Address,
 
+    #[arg(
+        long,
+        env = "DEPLOYMENT_BLOCK",
+        help = "Block number when the vault was deployed (for receipt backfilling)"
+    )]
+    deployment_block: u64,
+
     #[clap(flatten)]
     auth: AuthConfig,
 
@@ -122,6 +144,7 @@ impl Env {
             rpc_url: self.rpc_url,
             private_key: self.private_key,
             vault: self.vault,
+            deployment_block: self.deployment_block,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,
@@ -222,6 +245,8 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
+            "--deployment-block",
+            "12345678",
             "--issuer-api-key",
             "test-key-that-is-at-least-32-chars-long",
             "--alpaca-account-id",
@@ -324,6 +349,8 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
+            "--deployment-block",
+            "12345678",
             "--issuer-api-key",
             "short-key", // Less than 32 characters
             "--alpaca-account-id",

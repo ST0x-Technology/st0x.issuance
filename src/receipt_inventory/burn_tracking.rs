@@ -7,7 +7,7 @@ use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 
-use super::{ReceiptId, Shares};
+use super::{ReceiptId, ReceiptInventoryError, Shares};
 use crate::mint::IssuerRequestId;
 use crate::redemption::{
     BurnRecord, Redemption, RedemptionError, RedemptionEvent,
@@ -58,6 +58,8 @@ pub(crate) enum BurnTrackingError {
     Database(#[from] sqlx::Error),
     #[error("Replay error: {0}")]
     Replay(#[from] AggregateError<RedemptionError>),
+    #[error("ReceiptInventory aggregate error: {0}")]
+    ReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error(
         "Insufficient balance for burn: required={required}, available={available}"
     )]

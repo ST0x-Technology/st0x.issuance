@@ -457,7 +457,9 @@ mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
-    use crate::receipt_inventory::ReceiptInventory;
+    use crate::receipt_inventory::{
+        CqrsReceiptService, ReceiptInventory, ReceiptService,
+    };
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -467,12 +469,18 @@ mod tests {
 
     type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
-    type TestReceiptInventoryStore = MemStore<ReceiptInventory>;
+    type TestReceiptInventoryCqrs =
+        CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>;
 
-    fn setup_test_cqrs()
-    -> (Arc<TestCqrs>, Arc<TestStore>, Arc<TestReceiptInventoryStore>) {
+    fn setup_test_cqrs() -> (
+        Arc<TestCqrs>,
+        Arc<TestStore>,
+        Arc<dyn ReceiptService>,
+        Arc<TestReceiptInventoryCqrs>,
+    ) {
         let store = Arc::new(MemStore::default());
-        let receipt_inventory_store = Arc::new(MemStore::default());
+        let receipt_inventory_store: Arc<MemStore<ReceiptInventory>> =
+            Arc::new(MemStore::default());
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
         let cqrs = Arc::new(CqrsFramework::new(
@@ -480,7 +488,14 @@ mod tests {
             vec![],
             vault_service,
         ));
-        (cqrs, store, receipt_inventory_store)
+        let receipt_inventory_cqrs = Arc::new(CqrsFramework::new(
+            (*receipt_inventory_store).clone(),
+            vec![],
+            (),
+        ));
+        let receipt_service: Arc<dyn ReceiptService> =
+            Arc::new(CqrsReceiptService::new(receipt_inventory_store));
+        (cqrs, store, receipt_service, receipt_inventory_cqrs)
     }
 
     async fn setup_test_db_with_asset(
@@ -606,7 +621,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -631,7 +647,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -688,7 +705,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -713,7 +731,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -758,7 +777,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -783,7 +803,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -830,7 +851,8 @@ mod tests {
             address!("0x9876543210fedcba9876543210fedcba98765432");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(wrong_vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -855,7 +877,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -902,7 +925,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -927,7 +951,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -980,7 +1005,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -1005,7 +1031,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -1062,7 +1089,8 @@ mod tests {
         let unknown_wallet =
             address!("0x1111111111111111111111111111111111111111");
 
-        let (cqrs, store, receipt_inventory_store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -1087,7 +1115,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
-            receipt_inventory_store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 

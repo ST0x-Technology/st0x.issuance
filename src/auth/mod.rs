@@ -350,6 +350,7 @@ mod tests {
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
             private_key: B256::ZERO,
             vault: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

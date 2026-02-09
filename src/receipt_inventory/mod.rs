@@ -2,17 +2,21 @@ pub(crate) mod backfill;
 pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
+pub(crate) mod monitor;
 pub(crate) mod view;
 
-use alloy::primitives::U256;
+pub(crate) use monitor::{ReceiptMonitor, ReceiptMonitorConfig};
+
+use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use cqrs_es::Aggregate;
+use cqrs_es::{Aggregate, AggregateContext, EventStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
-    plan_burn,
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::ReceiptInventoryEvent;
@@ -90,6 +94,61 @@ impl std::iter::Sum for Shares {
     }
 }
 
+/// Provides the capability to find receipts for burning.
+///
+/// This trait abstracts the receipt inventory query for use by command handlers.
+/// Implementation uses the ReceiptInventory aggregate to determine which
+/// receipts can satisfy a burn request.
+#[async_trait]
+pub(crate) trait ReceiptService: Send + Sync {
+    /// Returns a burn plan: which receipts to burn and how much from each.
+    ///
+    /// The plan satisfies the required burn amount by selecting from available
+    /// receipts in descending order of balance.
+    async fn for_burn(
+        &self,
+        vault: Address,
+        shares_to_burn: Shares,
+        dust: Shares,
+    ) -> Result<BurnPlan, BurnTrackingError>;
+}
+
+/// Implementation of ReceiptService using the ReceiptInventory aggregate.
+pub(crate) struct CqrsReceiptService<ES>
+where
+    ES: EventStore<ReceiptInventory>,
+{
+    store: Arc<ES>,
+}
+
+impl<ES> CqrsReceiptService<ES>
+where
+    ES: EventStore<ReceiptInventory>,
+{
+    pub(crate) const fn new(store: Arc<ES>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<ES> ReceiptService for CqrsReceiptService<ES>
+where
+    ES: EventStore<ReceiptInventory> + Send + Sync,
+    ES::AC: Send,
+{
+    async fn for_burn(
+        &self,
+        vault: Address,
+        shares_to_burn: Shares,
+        dust: Shares,
+    ) -> Result<BurnPlan, BurnTrackingError> {
+        let context = self.store.load_aggregate(&vault.to_string()).await?;
+
+        let receipts = context.aggregate().receipts_with_balance();
+        plan_burn(receipts, shares_to_burn, dust)
+    }
+}
+
 /// Tracks all receipts with available balance for a vault.
 ///
 /// This aggregate maintains a map of receipt IDs to their available balances.
@@ -97,6 +156,7 @@ impl std::iter::Sum for Shares {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ReceiptInventory {
     receipts: HashMap<ReceiptId, Shares>,
+    last_discovered_block: Option<u64>,
 }
 
 impl ReceiptInventory {
@@ -109,13 +169,14 @@ impl ReceiptInventory {
             })
             .collect()
     }
+
+    pub(crate) const fn last_discovered_block(&self) -> Option<u64> {
+        self.last_discovered_block
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReceiptInventoryError {
-    #[error("Receipt {receipt_id} already discovered")]
-    ReceiptAlreadyDiscovered { receipt_id: ReceiptId },
-
     #[error("Receipt {receipt_id} not found")]
     ReceiptNotFound { receipt_id: ReceiptId },
 
@@ -154,11 +215,7 @@ impl Aggregate for ReceiptInventory {
                 tx_hash,
             } => {
                 if self.receipts.contains_key(&receipt_id) {
-                    return Err(
-                        ReceiptInventoryError::ReceiptAlreadyDiscovered {
-                            receipt_id,
-                        },
-                    );
+                    return Ok(vec![]);
                 }
 
                 Ok(vec![ReceiptInventoryEvent::Discovered {
@@ -212,9 +269,16 @@ impl Aggregate for ReceiptInventory {
     fn apply(&mut self, event: Self::Event) {
         match event {
             ReceiptInventoryEvent::Discovered {
-                receipt_id, balance, ..
+                receipt_id,
+                balance,
+                block_number,
+                ..
             } => {
                 self.receipts.insert(receipt_id, balance);
+                self.last_discovered_block = Some(
+                    self.last_discovered_block
+                        .map_or(block_number, |last| last.max(block_number)),
+                );
             }
 
             ReceiptInventoryEvent::Burned {
@@ -236,7 +300,9 @@ impl Aggregate for ReceiptInventory {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::b256;
+    use alloy::primitives::{address, b256};
+    use cqrs_es::{CqrsFramework, mem_store::MemStore};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -281,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_already_discovered_receipt_returns_error() {
+    async fn test_discover_already_discovered_is_idempotent() {
         let mut aggregate = ReceiptInventory::default();
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -301,12 +367,13 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(events.len(), 1);
         for event in events {
             aggregate.apply(event);
         }
 
-        // Second discovery fails
-        let result = aggregate
+        // Second discovery is idempotent - returns Ok with no events
+        let events = aggregate
             .handle(
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: make_receipt_id(42),
@@ -316,13 +383,10 @@ mod tests {
                 },
                 &(),
             )
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(ReceiptInventoryError::ReceiptAlreadyDiscovered { receipt_id })
-            if receipt_id == make_receipt_id(42)
-        ));
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -580,5 +644,180 @@ mod tests {
         let receipts = aggregate.receipts_with_balance();
 
         assert!(receipts.is_empty());
+    }
+
+    #[test]
+    fn test_last_discovered_block_tracks_max_block_number() {
+        let mut aggregate = ReceiptInventory::default();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        assert_eq!(aggregate.last_discovered_block(), None);
+
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(1),
+            balance: make_shares(100),
+            block_number: 500,
+            tx_hash,
+        });
+        assert_eq!(aggregate.last_discovered_block(), Some(500));
+
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(2),
+            balance: make_shares(200),
+            block_number: 1000,
+            tx_hash,
+        });
+        assert_eq!(aggregate.last_discovered_block(), Some(1000));
+
+        // Earlier block doesn't decrease the max
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(3),
+            balance: make_shares(300),
+            block_number: 750,
+            tx_hash,
+        });
+        assert_eq!(aggregate.last_discovered_block(), Some(1000));
+    }
+
+    async fn setup_receipt_service_with_receipts(
+        receipts: Vec<(u64, u64)>,
+    ) -> CqrsReceiptService<MemStore<ReceiptInventory>> {
+        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        for (i, (id, balance)) in receipts.into_iter().enumerate() {
+            cqrs.execute(
+                &address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .to_string(),
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: make_receipt_id(id),
+                    balance: make_shares(balance),
+                    block_number: 1000 + i as u64,
+                    tx_hash,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        CqrsReceiptService::new(store)
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_returns_plan_when_sufficient_balance()
+     {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 100), (2, 200)]).await;
+
+        let plan = service
+            .for_burn(
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                make_shares(150),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.total_burn, make_shares(150));
+        assert!(!plan.allocations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_includes_dust_in_plan() {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 100), (2, 200)]).await;
+
+        let plan = service
+            .for_burn(
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                make_shares(100),
+                make_shares(10),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.total_burn, make_shares(100));
+        assert_eq!(plan.dust, make_shares(10));
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_returns_error_when_insufficient_balance()
+     {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 50), (2, 30)]).await;
+
+        let result = service
+            .for_burn(
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(BurnTrackingError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_with_empty_inventory_returns_error()
+     {
+        let service = setup_receipt_service_with_receipts(vec![]).await;
+
+        let result = service
+            .for_burn(
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(BurnTrackingError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_with_unknown_vault_returns_error()
+     {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+
+        let result = service
+            .for_burn(
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                make_shares(50),
+                make_shares(0),
+            )
+            .await;
+
+        // Unknown vault has no receipts, so insufficient balance
+        assert!(matches!(
+            result,
+            Err(BurnTrackingError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cqrs_receipt_service_for_burn_exactly_available_succeeds() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+
+        let plan = service
+            .for_burn(
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.total_burn, make_shares(100));
+        assert_eq!(plan.allocations.len(), 1);
     }
 }

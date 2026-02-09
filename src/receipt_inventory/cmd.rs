@@ -1,4 +1,4 @@
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use serde::{Deserialize, Serialize};
 
 use super::{ReceiptId, Shares};
@@ -9,7 +9,7 @@ pub(crate) enum ReceiptInventoryCommand {
         receipt_id: ReceiptId,
         balance: Shares,
         block_number: u64,
-        tx_hash: B256,
+        tx_hash: TxHash,
     },
     BurnShares {
         receipt_id: ReceiptId,

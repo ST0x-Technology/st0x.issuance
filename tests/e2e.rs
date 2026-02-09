@@ -399,6 +399,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
+        deployment_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -479,6 +480,7 @@ fn create_config_with_db(
         rpc_url: Url::parse(&evm.endpoint)?,
         private_key: evm.private_key,
         vault: evm.vault_address,
+        deployment_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()
@@ -627,11 +629,10 @@ fn setup_redemption_mocks_with_shared_state(
 ///    MintManager's provider still has its old cached nonce
 /// 4. The next mint fails with "nonce too low"
 ///
-/// The test performs: mint → burn → mint
+/// The test performs: mint -> burn -> mint
 /// With the bug present, the second mint fails.
 /// After the fix (shared provider), all operations succeed.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_mint_burn_mint_nonce_synchronization()
 -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
@@ -648,47 +649,13 @@ async fn test_mint_burn_mint_nonce_synchronization()
     let (_redeem_mock, _poll_mock) =
         setup_redemption_mocks(&mock_alpaca, user_wallet);
 
-    let config = Config {
-        database_url: ":memory:".to_string(),
-        database_max_connections: 5,
-        rpc_url: Url::parse(&evm.endpoint)?,
-        private_key: evm.private_key,
-        vault: evm.vault_address,
-        auth: AuthConfig {
-            issuer_api_key: "test-key-12345678901234567890123456"
-                .parse()
-                .expect("Valid API key"),
-            alpaca_ip_ranges: IpWhitelist::single(
-                "127.0.0.1/32".parse().expect("Valid IP range"),
-            ),
-            internal_ip_ranges: "127.0.0.0/8,::1/128"
-                .parse()
-                .expect("Valid IP ranges"),
-        },
-        log_level: st0x_issuance::LogLevel::Debug,
-        hyperdx: None,
-        alpaca: AlpacaConfig {
-            api_base_url: mock_alpaca.base_url(),
-            account_id: "test-account".to_string(),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-        },
-    };
-
+    let config = create_config_with_db(":memory:", &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
     seed_tokenized_asset(&client, evm.vault_address).await;
+    setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    // Setup roles
-    evm.grant_deposit_role(user_wallet).await?;
-    evm.grant_withdraw_role(bot_wallet).await?;
-    evm.grant_certify_role(evm.wallet_address).await?;
-    evm.certify_vault(U256::MAX).await?;
-
-    // Setup user provider for transfers
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
         .wallet(user_wallet_instance)
@@ -699,139 +666,47 @@ async fn test_mint_burn_mint_nonce_synchronization()
         &user_provider,
     );
 
-    // === STEP 1: First mint (uses Provider #1) ===
+    // Step 1: First mint
     let link_body = setup_account(&client, user_wallet).await;
+    let client_id = link_body.client_id.to_string();
 
-    let mint1_response = client
-        .post("/inkind/issuance")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-1",
-                "qty": "50.0",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "network": "base",
-                "client_id": link_body.client_id,
-                "wallet_address": user_wallet
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    assert_eq!(mint1_response.status(), rocket::http::Status::Ok);
-    let mint1_body: MintResponse = mint1_response.into_json().await.unwrap();
-
-    let confirm1_response = client
-        .post("/inkind/issuance/confirm")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-1",
-                "issuer_request_id": mint1_body.issuer_request_id,
-                "status": "completed"
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    assert_eq!(
-        confirm1_response.status(),
-        rocket::http::Status::Ok,
-        "First mint should succeed"
-    );
-
+    perform_mint_and_confirm(
+        &client,
+        user_wallet,
+        &client_id,
+        "alp-mint-1",
+        "50.0",
+    )
+    .await?;
     let shares_minted = wait_for_shares(&vault, user_wallet).await?;
     assert!(
         shares_minted > U256::ZERO,
         "User should have shares after first mint"
     );
 
-    // === STEP 2: Burn (uses Provider #2, advances on-chain nonce) ===
+    // Step 2: Burn (advances on-chain nonce)
     vault
         .transfer(bot_wallet, shares_minted)
         .send()
         .await?
         .get_receipt()
         .await?;
-
-    // Wait for burn to complete
     wait_for_burn(&vault, bot_wallet).await?;
-
-    // Verify user has no shares after burn
     assert_eq!(
         vault.balanceOf(user_wallet).call().await?,
         U256::ZERO,
         "User should have no shares after burn"
     );
 
-    // === STEP 3: Second mint (should fail with stale nonce if bug is present) ===
-    let mint2_response = client
-        .post("/inkind/issuance")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-2",
-                "qty": "25.0",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "network": "base",
-                "client_id": link_body.client_id,
-                "wallet_address": user_wallet
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    assert_eq!(mint2_response.status(), rocket::http::Status::Ok);
-    let mint2_body: MintResponse = mint2_response.into_json().await.unwrap();
-
-    let confirm2_response = client
-        .post("/inkind/issuance/confirm")
-        .header(rocket::http::ContentType::JSON)
-        .header(rocket::http::Header::new(
-            "X-API-KEY",
-            "test-key-12345678901234567890123456",
-        ))
-        .remote("127.0.0.1:8000".parse().unwrap())
-        .body(
-            json!({
-                "tokenization_request_id": "alp-mint-2",
-                "issuer_request_id": mint2_body.issuer_request_id,
-                "status": "completed"
-            })
-            .to_string(),
-        )
-        .dispatch()
-        .await;
-
-    // With the bug: this would fail because MintManager's provider has stale nonce
-    // After the fix: this should succeed
-    assert_eq!(
-        confirm2_response.status(),
-        rocket::http::Status::Ok,
-        "Second mint should succeed (if nonce is synchronized)"
-    );
-
-    // Verify second mint completed by checking user has shares again
+    // Step 3: Second mint (fails with stale nonce if bug is present)
+    perform_mint_and_confirm(
+        &client,
+        user_wallet,
+        &client_id,
+        "alp-mint-2",
+        "25.0",
+    )
+    .await?;
     let final_balance = wait_for_shares(&vault, user_wallet).await?;
     assert!(
         final_balance > U256::ZERO,
@@ -841,10 +716,24 @@ async fn test_mint_burn_mint_nonce_synchronization()
     Ok(())
 }
 
+async fn setup_roles(
+    evm: &LocalEvm,
+    user_wallet: Address,
+    bot_wallet: Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+    Ok(())
+}
+
 async fn perform_mint_and_confirm(
     client: &Client,
     wallet: Address,
     client_id: &str,
+    tokenization_request_id: &str,
+    quantity: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mint_response = client
         .post("/inkind/issuance")
@@ -856,8 +745,8 @@ async fn perform_mint_and_confirm(
         .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({
-                "tokenization_request_id": "alp-mint-inventory",
-                "qty": "50.0",
+                "tokenization_request_id": tokenization_request_id,
+                "qty": quantity,
                 "underlying_symbol": "AAPL",
                 "token_symbol": "tAAPL",
                 "network": "base",
@@ -883,7 +772,7 @@ async fn perform_mint_and_confirm(
         .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({
-                "tokenization_request_id": "alp-mint-inventory",
+                "tokenization_request_id": tokenization_request_id,
                 "issuer_request_id": mint_body.issuer_request_id,
                 "status": "completed"
             })
@@ -1004,6 +893,8 @@ async fn test_burn_tracking_computes_available_balance_correctly()
         &client,
         user_wallet,
         &link_body.client_id.to_string(),
+        "alp-mint-inventory",
+        "50.0",
     )
     .await?;
 

@@ -1,21 +1,16 @@
-use cqrs_es::{AggregateContext, EventStore, persist::PersistedEventStore};
+use cqrs_es::{AggregateContext, EventStore};
 use rocket::{State, post, serde::json::Json};
 use serde::Deserialize;
-use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
-use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::MintEventStore;
 use crate::account::{
     AccountView, AlpacaAccountNumber, ClientId,
     view::{AccountViewError, find_by_client_id},
 };
 use crate::auth::IssuerAuth;
-use crate::mint::{
-    CallbackManager, IssuerRequestId, Mint, MintCommand, TokenizationRequestId,
-    mint_manager::MintManager,
-};
+use crate::mint::{IssuerRequestId, Mint, MintCommand, TokenizationRequestId};
+use crate::{MintEventStore, SqliteCallbackManager, SqliteMintManager};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -42,12 +37,8 @@ pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
     cqrs: &State<crate::MintCqrs>,
     event_store: &State<MintEventStore>,
-    mint_manager: &State<
-        Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
-    >,
-    callback_manager: &State<
-        Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>>,
-    >,
+    mint_manager: &State<SqliteMintManager>,
+    callback_manager: &State<SqliteCallbackManager>,
     pool: &State<SqlitePool>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
@@ -169,12 +160,8 @@ pub(crate) async fn lookup_alpaca_account(
 ))]
 async fn process_journal_completion(
     event_store: MintEventStore,
-    mint_manager: Arc<
-        MintManager<PersistedEventStore<SqliteEventRepository, Mint>>,
-    >,
-    callback_manager: Arc<
-        CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>,
-    >,
+    mint_manager: SqliteMintManager,
+    callback_manager: SqliteCallbackManager,
     pool: SqlitePool,
     issuer_request_id: IssuerRequestId,
 ) {
@@ -287,7 +274,8 @@ mod tests {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
 
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-ok-test");
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -313,6 +301,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -361,7 +350,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
         let tokenization_request_id =
@@ -388,6 +378,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -437,7 +428,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-complete-123");
         let tokenization_request_id =
@@ -464,6 +456,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -529,7 +522,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-view-123");
         let tokenization_request_id =
@@ -556,6 +550,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -624,7 +619,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-123");
         let tokenization_request_id =
@@ -651,6 +647,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -716,7 +713,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
         let tokenization_request_id =
@@ -743,6 +741,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -813,7 +812,8 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            harness;
 
         let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
         let correct_tokenization_request_id =
@@ -842,6 +842,7 @@ mod tests {
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -887,13 +888,15 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
@@ -938,13 +941,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
+        let TestHarness { pool, mint_cqrs, receipt_inventory_cqrs, .. } =
+            TestHarness::new().await;
 
         let event_store = create_test_event_store(&pool);
         let mint_manager = create_test_mint_manager(
             mint_cqrs.clone(),
             event_store.clone(),
             pool.clone(),
+            receipt_inventory_cqrs.clone(),
         );
         let callback_manager = create_test_callback_manager(
             mint_cqrs.clone(),
