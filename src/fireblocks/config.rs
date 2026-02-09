@@ -21,15 +21,15 @@ impl From<String> for ApiUserId {
 
 /// Fireblocks vault account identifier.
 #[derive(Debug, Clone)]
-pub(crate) struct VaultAccountId(String);
+pub(crate) struct FireblocksVaultAccountId(String);
 
-impl VaultAccountId {
+impl FireblocksVaultAccountId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl From<String> for VaultAccountId {
+impl From<String> for FireblocksVaultAccountId {
     fn from(s: String) -> Self {
         Self(s)
     }
@@ -76,7 +76,7 @@ pub(crate) enum Environment {
 pub struct FireblocksConfig {
     pub(crate) api_user_id: ApiUserId,
     pub(crate) secret: Vec<u8>,
-    pub(crate) vault_account_id: VaultAccountId,
+    pub(crate) vault_account_id: FireblocksVaultAccountId,
     pub(crate) chain_asset_ids: ChainAssetIds,
     pub(crate) environment: Environment,
 }
@@ -103,7 +103,7 @@ impl FireblocksConfig {
     pub(crate) fn new(
         api_user_id: ApiUserId,
         secret_path: &Path,
-        vault_account_id: VaultAccountId,
+        vault_account_id: FireblocksVaultAccountId,
         chain_asset_ids: ChainAssetIds,
         environment: Environment,
     ) -> Result<Self, FireblocksConfigError> {

@@ -12,7 +12,10 @@ use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::debug;
 
-use super::config::{ChainAssetIds, Environment, FireblocksConfig};
+use super::config::{
+    AssetId, ChainAssetIds, Environment, FireblocksConfig,
+    FireblocksVaultAccountId,
+};
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
@@ -22,15 +25,15 @@ use crate::vault::{
 /// Fireblocks-specific errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireblocksVaultError {
-    #[error("Fireblocks SDK error")]
+    #[error("Fireblocks SDK error: {0}")]
     Sdk(#[from] fireblocks_sdk::FireblocksError),
-    #[error("Fireblocks API error")]
+    #[error("Fireblocks API error: {0}")]
     Api(#[from] fireblocks_sdk::apis::Error<CreateTransactionError>),
-    #[error("RPC error")]
+    #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("no deposit address found for vault {vault_id}, asset {asset_id}")]
-    NoAddress { vault_id: String, asset_id: String },
-    #[error("invalid address from Fireblocks")]
+    #[error("no deposit address found for vault {}, asset {}", vault_id.as_str(), asset_id.as_str())]
+    NoAddress { vault_id: FireblocksVaultAccountId, asset_id: AssetId },
+    #[error("invalid address from Fireblocks: {0}")]
     InvalidAddress(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
@@ -79,8 +82,8 @@ pub(crate) async fn fetch_vault_address(
         .first()
         .and_then(|a| a.address.as_deref())
         .ok_or_else(|| FireblocksVaultError::NoAddress {
-            vault_id: config.vault_account_id.as_str().to_string(),
-            asset_id: default_asset_id.as_str().to_string(),
+            vault_id: config.vault_account_id.clone(),
+            asset_id: default_asset_id.clone(),
         })?;
 
     Ok(address_str.parse::<Address>()?)
