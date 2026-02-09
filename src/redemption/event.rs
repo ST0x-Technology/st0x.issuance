@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
+/// A single burn operation within a multi-receipt burn.
+///
+/// Each burn targets a specific ERC-1155 receipt and burns a portion
+/// (or all) of the shares associated with that receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct BurnRecord {
+    /// The ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of shares burned from this receipt
+    pub(crate) shares_burned: U256,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum RedemptionEvent {
     Detected {
@@ -48,8 +60,10 @@ pub(crate) enum RedemptionEvent {
     TokensBurned {
         issuer_request_id: IssuerRequestId,
         tx_hash: B256,
-        receipt_id: U256,
-        shares_burned: U256,
+        /// All receipt burns performed in this transaction.
+        /// v2.0 format: multiple burns in a single atomic transaction.
+        /// v1.0 events are upcasted to this format via SemanticVersionEventUpcaster.
+        burns: Vec<BurnRecord>,
         /// Amount of dust returned to user (with 18 decimals).
         /// Dust recipient is always `metadata.wallet` from the `Detected` event.
         /// For events prior to dust handling feature: defaults to zero.
@@ -92,7 +106,10 @@ impl DomainEvent for RedemptionEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        match self {
+            Self::TokensBurned { .. } => "2.0".to_string(),
+            _ => "1.0".to_string(),
+        }
     }
 }
 
@@ -123,8 +140,10 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            receipt_id: uint!(42_U256),
-            shares_burned: uint!(100_000000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 50000,
             block_number: 1000,
@@ -132,7 +151,7 @@ mod tests {
         };
 
         assert_eq!(event.event_type(), "RedemptionEvent::TokensBurned");
-        assert_eq!(event.event_version(), "1.0");
+        assert_eq!(event.event_version(), "2.0");
     }
 
     #[test]
@@ -142,8 +161,10 @@ mod tests {
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
-            receipt_id: uint!(7_U256),
-            shares_burned: uint!(250_500000000000000000_U256),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(7_U256),
+                shares_burned: uint!(250_500000000000000000_U256),
+            }],
             dust_returned: U256::ZERO,
             gas_used: 75000,
             block_number: 2000,
@@ -209,14 +230,14 @@ mod tests {
         assert_eq!(dust_quantity, Quantity::default());
     }
 
+    /// Tests that v2.0 TokensBurned events without dust_returned field default to zero.
     #[test]
-    fn test_backwards_compat_tokens_burned_without_dust_fields() {
+    fn test_backwards_compat_tokens_burned_v2_without_dust_fields() {
         let json = r#"{
             "TokensBurned": {
                 "issuer_request_id": "red-old-456",
                 "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "receipt_id": "0x42",
-                "shares_burned": "0x56bc75e2d63100000",
+                "burns": [{"receipt_id": "0x42", "shares_burned": "0x56bc75e2d63100000"}],
                 "gas_used": 50000,
                 "block_number": 1000,
                 "burned_at": "2025-01-01T00:00:00Z"
@@ -225,10 +246,13 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::TokensBurned { dust_returned, .. } = event else {
+        let RedemptionEvent::TokensBurned { dust_returned, burns, .. } = event
+        else {
             panic!("Expected TokensBurned variant");
         };
 
         assert_eq!(dust_returned, U256::ZERO);
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0].receipt_id, uint!(0x42_U256));
     }
 }

@@ -12,26 +12,29 @@ use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::debug;
 
-use super::config::{ChainAssetIds, Environment, FireblocksConfig};
+use super::config::{
+    AssetId, ChainAssetIds, Environment, FireblocksConfig,
+    FireblocksVaultAccountId,
+};
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::vault::{
-    BurnParams, BurnWithDustResult, MintResult, ReceiptInformation, VaultError,
-    VaultService,
+    MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
+    ReceiptInformation, VaultError, VaultService,
 };
 
 /// Fireblocks-specific errors that can occur during vault operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireblocksVaultError {
-    #[error("Fireblocks SDK error")]
-    Sdk(#[from] fireblocks_sdk::FireblocksError),
-    #[error("Fireblocks API error")]
+    #[error("Fireblocks SDK error: {0}")]
+    Fireblocks(#[from] fireblocks_sdk::FireblocksError),
+    #[error("Fireblocks API error: {0}")]
     Api(#[from] fireblocks_sdk::apis::Error<CreateTransactionError>),
-    #[error("RPC error")]
+    #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("no deposit address found for vault {vault_id}, asset {asset_id}")]
-    NoAddress { vault_id: String, asset_id: String },
-    #[error("invalid address from Fireblocks")]
-    InvalidAddress(#[from] alloy::hex::FromHexError),
+    #[error("no deposit address found for vault {}, asset {}", vault_id.as_str(), asset_id.as_str())]
+    NoAddress { vault_id: FireblocksVaultAccountId, asset_id: AssetId },
+    #[error("invalid address from Fireblocks: {0}")]
+    FromHex(#[from] alloy::hex::FromHexError),
     #[error("Fireblocks response did not return a transaction ID")]
     MissingTransactionId,
     #[error(
@@ -79,8 +82,8 @@ pub(crate) async fn fetch_vault_address(
         .first()
         .and_then(|a| a.address.as_deref())
         .ok_or_else(|| FireblocksVaultError::NoAddress {
-            vault_id: config.vault_account_id.as_str().to_string(),
-            asset_id: default_asset_id.as_str().to_string(),
+            vault_id: config.vault_account_id.clone(),
+            asset_id: default_asset_id.clone(),
         })?;
 
     Ok(address_str.parse::<Address>()?)
@@ -346,8 +349,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&receipt_info)?);
+        let receipt_info_bytes = receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.read_provider);
@@ -413,9 +415,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                     },
                 )
             })
-            .ok_or_else(|| VaultError::EventNotFound {
-                tx_hash: format!("{tx_hash:?}"),
-            })?;
+            .ok_or_else(|| VaultError::EventNotFound { tx_hash })?;
 
         let gas_used = receipt.gas_used;
         let block_number =
@@ -430,47 +430,56 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         })
     }
 
-    async fn burn_and_return_dust(
+    async fn burn_multiple_receipts(
         &self,
-        params: BurnParams,
-    ) -> Result<BurnWithDustResult, VaultError> {
-        let receipt_info_bytes =
-            Bytes::from(serde_json::to_vec(&params.receipt_info)?);
+        params: MultiBurnParams,
+    ) -> Result<MultiBurnResult, VaultError> {
+        let receipt_info_bytes = params.receipt_info.encode()?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
-        // Build the redeem call for burning shares
-        let redeem_call = vault_contract
-            .redeem(
-                params.burn_shares,
-                params.owner,
-                params.owner,
-                params.receipt_id,
-                receipt_info_bytes,
-            )
-            .calldata()
-            .clone();
+        // Build redeem calls for each burn
+        let redeem_calls: Vec<Bytes> = params
+            .burns
+            .iter()
+            .map(|burn| {
+                vault_contract
+                    .redeem(
+                        burn.burn_shares,
+                        params.user,
+                        params.owner,
+                        burn.receipt_id,
+                        receipt_info_bytes.clone(),
+                    )
+                    .calldata()
+                    .clone()
+            })
+            .collect();
 
-        // Build multicall: redeem + optional transfer for dust
-        let calls = if params.dust_shares > U256::ZERO {
+        // Build multicall: all redeems, plus optional dust transfer
+        let calls: Vec<Bytes> = if params.dust_shares > U256::ZERO {
             let transfer_call = vault_contract
                 .transfer(params.user, params.dust_shares)
                 .calldata()
                 .clone();
-            vec![redeem_call, transfer_call]
+            redeem_calls
+                .into_iter()
+                .chain(std::iter::once(transfer_call))
+                .collect()
         } else {
-            vec![redeem_call]
+            redeem_calls
         };
 
         let multicall_calldata =
             vault_contract.multicall(calls).calldata().clone();
 
         // Submit CONTRACT_CALL to Fireblocks
+        let total_burn: U256 = params.burns.iter().map(|b| b.burn_shares).sum();
         let note = format!(
-            "Burn {} shares from receipt {} (issuer_request_id: {})",
-            params.burn_shares,
-            params.receipt_id,
+            "Burn {} shares from {} receipts (issuer_request_id: {})",
+            total_burn,
+            params.burns.len(),
             params.receipt_info.issuer_request_id.as_str()
         );
 
@@ -492,31 +501,35 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         // Fetch the receipt from our RPC provider to parse events
         let receipt = self.fetch_receipt(tx_hash).await?;
 
-        // Parse the Withdraw event
-        let (parsed_receipt_id, shares_burned) = receipt
+        // Parse all Withdraw events from the receipt
+        let burns: Vec<MultiBurnResultEntry> = receipt
             .inner
             .logs()
             .iter()
-            .find_map(|log| {
+            .filter_map(|log| {
                 log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
                     .ok()
                     .map(|decoded| {
                         let event_data = decoded.data();
-                        (event_data.id, event_data.shares)
+                        MultiBurnResultEntry {
+                            receipt_id: event_data.id,
+                            shares_burned: event_data.shares,
+                        }
                     })
             })
-            .ok_or_else(|| VaultError::EventNotFound {
-                tx_hash: format!("{tx_hash:?}"),
-            })?;
+            .collect();
+
+        if burns.is_empty() {
+            return Err(VaultError::EventNotFound { tx_hash });
+        }
 
         let gas_used = receipt.gas_used;
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(BurnWithDustResult {
+        Ok(MultiBurnResult {
             tx_hash,
-            receipt_id: parsed_receipt_id,
-            shares_burned,
+            burns,
             dust_returned: params.dust_shares,
             gas_used,
             block_number,

@@ -20,12 +20,12 @@ settlement layer between Authorized Participants (APs) and us.
 
 **Flow Summary:**
 
-- **Minting:** AP requests mint → Alpaca calls our endpoint → We validate →
-  Alpaca journals shares from AP to our custodian account → Alpaca confirms
-  journal → We mint tokens on-chain → We call Alpaca's callback
-- **Redeeming:** AP sends tokens to our redemption wallet → We detect redemption
-  → We call Alpaca's redeem endpoint → Alpaca journals shares from our account
-  to AP → We burn tokens on-chain
+- **Minting:** AP requests mint -> Alpaca calls our endpoint -> We validate ->
+  Alpaca journals shares from AP to our custodian account -> Alpaca confirms
+  journal -> We mint tokens on-chain -> We call Alpaca's callback
+- **Redeeming:** AP sends tokens to our redemption wallet -> We detect
+  redemption -> We call Alpaca's redeem endpoint -> Alpaca journals shares from
+  our account to AP -> We burn tokens on-chain
 
 **Use Cases:**
 
@@ -82,9 +82,9 @@ time-travel debugging, and provide a single source of truth for all operations.
 - **Aggregates**: Business entities that encapsulate state and business logic
   (e.g., `Mint`, `Redemption`, `Account`, `TokenizedAsset`)
 - **Commands**: Requests to perform actions, representing user or system intent
-  (e.g., `InitiateMint`, `ConfirmJournal`)
+  (e.g., `Initiate`, `ConfirmJournal`, `Deposit`)
 - **Events**: Immutable facts about what happened, always in past tense (e.g.,
-  `MintInitiated`, `JournalConfirmed`)
+  `Initiated`, `JournalConfirmed`, `TokensMinted`)
 - **Event Store**: Single source of truth - an append-only log of all domain
   events stored in SQLite
 - **Views**: Read-optimized projections built from events for efficient querying
@@ -170,47 +170,57 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Commands:**
 
-- `InitiateMint { tokenization_request_id, quantity, underlying, token, network, client_id, wallet }` -
+- `Initiate { tokenization_request_id, quantity, underlying, token, network, client_id, wallet }` -
   Create a new mint request from Alpaca
 - `ConfirmJournal { issuer_request_id }` - Alpaca confirmed shares journal
   transfer
 - `RejectJournal { issuer_request_id, reason }` - Alpaca rejected shares journal
   transfer
-- `RecordMintSuccess { issuer_request_id, tx_hash, receipt_id, shares_minted, gas_used, block_number }` -
-  On-chain mint transaction succeeded
-- `RecordMintFailure { issuer_request_id, error }` - On-chain mint transaction
-  failed
-- `RecordCallback { issuer_request_id }` - Alpaca callback sent successfully
-- `MarkFailed { issuer_request_id, reason }` - Mark the mint as failed for any
-  reason
+- `Deposit { issuer_request_id }` - Execute the on-chain deposit (minting)
+  operation via the vault service
+- `SendCallback { issuer_request_id }` - Send the callback to Alpaca confirming
+  mint completion
+- `Recover { issuer_request_id }` - Recover a mint stuck in an incomplete state.
+  Invoked at startup by the mint recovery process for any mint in
+  `JournalConfirmed`, `Minting`, `MintingFailed`, or `CallbackPending` state.
+  Queries the receipt inventory for a receipt matching the `issuer_request_id`.
+  If a matching receipt is found, the mint already succeeded on-chain, so
+  recovery records the existing mint (`ExistingMintRecovered`) and proceeds to
+  callback. If no receipt is found, recovery retries the on-chain deposit
+  (`MintRetryStarted`). This prevents double-minting after crashes while
+  ensuring stuck mints eventually complete
 
 **Events:**
 
-- `MintInitiated { issuer_request_id, tokenization_request_id, quantity, underlying, token, network, client_id, wallet }` -
-  Mint request created
-- `JournalConfirmed { issuer_request_id }` - Alpaca journal transfer confirmed
-- `JournalRejected { issuer_request_id, reason }` - Alpaca journal transfer
-  rejected (terminal failure state)
-- `TokensMinted { issuer_request_id, tx_hash, receipt_id, shares_minted, gas_used, block_number }` -
-  On-chain mint succeeded
-- `MintingFailed { issuer_request_id, error }` - On-chain mint failed (terminal
-  failure state)
-- `MintCompleted { issuer_request_id }` - Alpaca callback sent and entire mint
-  flow completed successfully (terminal success state)
+- `Initiated` - Mint request created (carries all request details)
+- `JournalConfirmed` - Alpaca journal transfer confirmed
+- `JournalRejected` - Alpaca journal transfer rejected (terminal)
+- `MintingStarted` - On-chain minting operation started
+- `TokensMinted` - On-chain mint succeeded (carries tx details)
+- `MintingFailed` - On-chain mint failed
+- `MintCompleted` - Alpaca callback sent, mint fully completed (terminal)
+- `ExistingMintRecovered` - Existing on-chain mint discovered during recovery
+  (carries tx details)
+- `MintRetryStarted` - Mint retry started during recovery
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
-| Command             | Events Produced    | Notes                                                                    |
-| ------------------- | ------------------ | ------------------------------------------------------------------------ |
-| `InitiateMint`      | `MintInitiated`    | Single event - mint request created                                      |
-| `ConfirmJournal`    | `JournalConfirmed` | Single event - journal transfer confirmed                                |
-| `RejectJournal`     | `JournalRejected`  | Single event - journal rejected (terminal failure)                       |
-| `RecordMintSuccess` | `TokensMinted`     | Single event - on-chain mint succeeded                                   |
-| `RecordMintFailure` | `MintingFailed`    | Single event - on-chain mint failed (terminal failure)                   |
-| `RecordCallback`    | `MintCompleted`    | Single event - callback sent and mint fully completed (terminal success) |
+| Command          | Events             | Notes                    |
+| ---------------- | ------------------ | ------------------------ |
+| `Initiate`       | `Initiated`        | Mint request created     |
+| `ConfirmJournal` | `JournalConfirmed` | Journal confirmed        |
+| `RejectJournal`  | `JournalRejected`  | Terminal failure         |
+| `Deposit`        | See below          | Calls vault service      |
+| `SendCallback`   | `MintCompleted`    | Calls Alpaca callback    |
+| `Recover`        | See below          | Checks receipt inventory |
 
-Note: Most commands produce a single event. Some commands produce multiple
-events when one action has several state consequences.
+`Deposit` emits `MintingStarted`, then either `TokensMinted` (success) or
+`MintingFailed` (failure).
+
+`Recover` checks the receipt inventory for a receipt matching the
+`issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found,
+emits `MintRetryStarted` then follows the same path as `Deposit`
+(`MintingStarted`, then `TokensMinted` or `MintingFailed`).
 
 ### Redemption Aggregate
 
@@ -230,45 +240,36 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Commands:**
 
-- `DetectRedemption { underlying, token, wallet, quantity, tx_hash, block_number }` -
-  Transfer to redemption wallet detected
-- `RecordAlpacaCall { issuer_request_id, tokenization_request_id }` - Alpaca
-  redeem API called successfully
-- `RecordAlpacaFailure { issuer_request_id, error }` - Alpaca redeem API call
-  failed
-- `ConfirmAlpacaComplete { issuer_request_id }` - Alpaca journal transfer
-  completed
-- `RecordBurnSuccess { issuer_request_id, burn_tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
-  On-chain burn succeeded
-- `RecordBurnFailure { issuer_request_id, error }` - On-chain burn failed
-- `MarkFailed { issuer_request_id, reason }` - Mark redemption as failed
+- `DetectRedemption` - Transfer to redemption wallet detected
+- `RecordAlpacaCall` - Alpaca redeem API called successfully
+- `RecordAlpacaFailure` - Alpaca redeem API call failed
+- `ConfirmAlpacaComplete` - Alpaca journal transfer completed
+- `RecordBurnSuccess` - On-chain burn succeeded
+- `RecordBurnFailure` - On-chain burn failed
+- `MarkFailed` - Mark redemption as failed
 
 **Events:**
 
-- `RedemptionDetected { issuer_request_id, underlying, token, wallet, quantity, tx_hash, block_number }` -
-  Transfer to redemption wallet detected
-- `AlpacaCalled { issuer_request_id, tokenization_request_id }` - Alpaca redeem
-  endpoint called
-- `AlpacaCallFailed { issuer_request_id, error }` - Alpaca API call failed
-  (terminal failure state)
-- `AlpacaJournalCompleted { issuer_request_id }` - Alpaca confirmed journal
-  transfer
-- `TokensBurned { issuer_request_id, tx_hash, receipt_id, shares_burned, gas_used, block_number }` -
-  On-chain burn succeeded and entire redemption flow completed (terminal success
-  state)
-- `BurningFailed { issuer_request_id, error }` - On-chain burn failed (terminal
-  failure state)
+- `RedemptionDetected` - Transfer to redemption wallet detected
+- `AlpacaCalled` - Alpaca redeem endpoint called
+- `AlpacaCallFailed` - Alpaca API call failed (terminal)
+- `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
+- `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
+  success). Payload contains `burns: Vec<BurnRecord>` where each `BurnRecord`
+  has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
+  single redemption spans multiple ERC-1155 receipts
+- `BurningFailed` - On-chain burn failed (terminal)
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
-| Command                 | Events Produced          | Notes                                                                 |
-| ----------------------- | ------------------------ | --------------------------------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Single event - transfer to redemption wallet detected                 |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Single event - Alpaca redeem API called                               |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Single event - API call failed (terminal failure)                     |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Single event - journal complete, transitions aggregate to Burning     |
-| `RecordBurnSuccess`     | `TokensBurned`           | Single event - burn succeeded, redemption complete (terminal success) |
-| `RecordBurnFailure`     | `BurningFailed`          | Single event - burn failed (terminal failure)                         |
+| Command                 | Events                   | Notes                                |
+| ----------------------- | ------------------------ | ------------------------------------ |
+| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                    |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                    |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                     |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                     |
+| `RecordBurnSuccess`     | `TokensBurned`           | Multi-receipt burn, terminal success |
+| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure                     |
 
 ### Account Aggregate
 
@@ -308,7 +309,7 @@ system. The account lifecycle follows these steps:
 - `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
   minting and redemptions
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
 | Command           | Events Produced     | Notes                                |
 | ----------------- | ------------------- | ------------------------------------ |
@@ -357,7 +358,7 @@ tokenization.
 - `VaultAddressUpdated { underlying, vault_address, previous_address }` - Vault
   address changed
 
-**Command → Event Mappings:**
+**Command -> Event Mappings:**
 
 | Command              | Events Produced       | Notes                                       |
 | -------------------- | --------------------- | ------------------------------------------- |
@@ -378,18 +379,31 @@ logic testable and isolated.
   `poll_request_status()`
 - Handles authentication, retries, and error mapping
 
-**BlockchainService:**
+**VaultService:**
 
-- RPC client for blockchain interaction
-- Methods: `mint_tokens()`, `burn_tokens()`, `estimate_gas()`,
-  `get_receipt_balance()`
-- Manages transaction signing, gas estimation, and receipt parsing
+- RPC client for on-chain vault interaction
+- Methods: `deposit()`, `withdraw()`
+- Two implementations: local key signing and Fireblocks
 
-**MonitorService:**
+**ReceiptService:**
 
-- Watches redemption wallet for incoming transfers
-- Methods: `watch_transfers()`, `get_transfer_details()`
-- Uses a WebSocket subscription to detect redemption events
+- Tracks on-chain ERC-1155 receipts across all vaults for burn planning and mint
+  recovery
+- Backfills historic receipts by scanning Deposit events from a configurable
+  start block
+- Monitors new receipts in real time via event subscription
+- Plans multi-receipt burns: selects receipts in descending balance order and
+  allocates burn amounts across them
+- Methods:
+  - `register_minted_receipt()` - Registers a newly minted receipt immediately
+    (avoids waiting for backfill/monitor)
+  - `for_burn(vault, shares_to_burn, dust) -> BurnPlan` - Plans a burn across
+    multiple receipts, returning allocations (receipt_id, burn_amount) per
+    receipt
+  - `find_by_issuer_request_id(vault, id) -> Option<RecoveredReceipt>` - Looks
+    up a receipt by ITN issuer_request_id for mint recovery
+- Indexes ITN receipts by `issuer_request_id` to detect whether a mint succeeded
+  on-chain during recovery
 
 These services are injected into aggregate command handlers, making aggregates
 testable with mock services.
@@ -627,7 +641,7 @@ sequenceDiagram
     AP->>Alpaca: Mint request (10 AAPL)
     Alpaca->>Alpaca: Validate AP account & authorization
     Alpaca->>Us: POST /inkind/issuance
-    Note right of Us: InitiateMint command<br/>Event: MintInitiated<br/>Status: pending_journal
+    Note right of Us: Initiate command<br/>Event: Initiated<br/>Status: pending_journal
     Us->>Alpaca: {issuer_request_id, status: "created"}
 
     Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP -> To: Issuer account
@@ -642,10 +656,10 @@ sequenceDiagram
         Note right of Blockchain: Bot transfers shares to AP<br/>(keeps receipts)
     end
     Blockchain->>Us: Transaction confirmed (both steps succeeded)
-    Note right of Us: RecordMintSuccess command<br/>Event: TokensMinted<br/>(AP has shares, bot has receipts)
+    Note right of Us: Deposit command<br/>Events: MintingStarted,<br/>TokensMinted
 
     Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
-    Note right of Us: RecordCallback command<br/>Event: MintCompleted<br/>Status: completed
+    Note right of Us: SendCallback command<br/>Event: MintCompleted<br/>Status: completed
 
     Alpaca->>AP: Mint completed ✓
     Note left of AP: AP now has 10 AAPL0x<br/>share tokens in their wallet<br/>(Bot holds receipts)
@@ -915,16 +929,16 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PendingJournal: InitiateMint
-    PendingJournal --> JournalCompleted: ConfirmJournal
-    PendingJournal --> Failed: RejectJournal
-    JournalCompleted --> Minting: MintingStarted
-    JournalCompleted --> Failed: Error
-    Minting --> CallbackPending: RecordMintSuccess
-    Minting --> Failed: RecordMintFailure
-    CallbackPending --> Completed: RecordCallback
-    CallbackPending --> Failed: Error
-    Failed --> [*]
+    [*] --> PendingJournal: Initiate
+    PendingJournal --> JournalConfirmed: ConfirmJournal
+    PendingJournal --> JournalRejected: RejectJournal
+    JournalConfirmed --> Minting: Deposit (MintingStarted)
+    Minting --> CallbackPending: Deposit (TokensMinted)
+    Minting --> MintingFailed: Deposit (MintingFailed)
+    MintingFailed --> Minting: Recover (MintRetryStarted)
+    Minting --> CallbackPending: Recover (ExistingMintRecovered)
+    CallbackPending --> Completed: SendCallback
+    JournalRejected --> [*]
     Completed --> [*]
 ```
 
@@ -976,14 +990,14 @@ sequenceDiagram
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
 
-    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account → To: AP
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account -> To: AP
 
     loop Poll for completion
         Us->>Alpaca: GET /tokenization/requests
         Alpaca->>Us: {status: "pending" | "completed"}
     end
 
-    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted<br/>Status: burning
+    Note right of Us: ConfirmAlpacaComplete command<br/>AlpacaJournalCompleted<br/>Status: burning
 
     Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)<br/>owner=bot_wallet
     Note right of Us: Bot burns using<br/>shares + receipts<br/>it now holds
@@ -1389,82 +1403,13 @@ store alone.
 
 ### View Tables
 
-These tables are read-optimized projections built from events. They can be
-rebuilt at any time by replaying events.
+All view tables follow the same pattern: `view_id` (primary key), `version`
+(last event sequence applied), and `payload` (JSON containing the view state).
+Views implement the `View` trait and are automatically updated by `GenericQuery`
+processors when events are committed. If a view becomes corrupted or a new
+projection is needed, simply drop the table and replay all events to rebuild it.
 
-```sql
--- Mint view: current state of mint operations
-CREATE TABLE mint_view (
-    view_id TEXT PRIMARY KEY,         -- issuer_request_id
-    version BIGINT NOT NULL,          -- Last event sequence applied to this view
-    payload JSON NOT NULL             -- Current mint state as JSON
-);
-
-CREATE INDEX idx_mint_view_payload ON mint_view(json_extract(payload, '$.status'));
-CREATE INDEX idx_mint_view_client ON mint_view(json_extract(payload, '$.client_id'));
-CREATE INDEX idx_mint_view_symbol ON mint_view(json_extract(payload, '$.underlying'));
-
--- Redemption view: current state of redemption operations
-CREATE TABLE redemption_view (
-    view_id TEXT PRIMARY KEY,         -- issuer_request_id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL
-);
-
-CREATE INDEX idx_redemption_view_payload ON redemption_view(json_extract(payload, '$.status'));
-CREATE INDEX idx_redemption_view_symbol ON redemption_view(json_extract(payload, '$.underlying'));
-
--- Account view: current account state
-CREATE TABLE account_view (
-    view_id TEXT PRIMARY KEY,         -- client_id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {email, alpaca_account, whitelisted_wallets, status, timestamps}
-);
-
-CREATE INDEX idx_account_view_email ON account_view(json_extract(payload, '$.email'));
-CREATE INDEX idx_account_view_alpaca ON account_view(json_extract(payload, '$.alpaca_account'));
-CREATE INDEX idx_account_view_status ON account_view(json_extract(payload, '$.status'));
-
--- Tokenized asset view: current supported assets
-CREATE TABLE tokenized_asset_view (
-    view_id TEXT PRIMARY KEY,         -- underlying symbol
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {token, network, vault_address, enabled, timestamps}
-);
-
-CREATE INDEX idx_asset_view_enabled ON tokenized_asset_view(json_extract(payload, '$.enabled'));
-
--- Receipt inventory view: tracks receipt state transitions (cross-aggregate listening to Mint and Redemption)
-CREATE TABLE receipt_inventory_view (
-    view_id TEXT PRIMARY KEY,         -- issuer_request_id
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- State enum: Unavailable | Pending{underlying,token} | Active{receipt_id,underlying,token,initial_amount,current_balance,minted_at} | Depleted{receipt_id,underlying,token,initial_amount,depleted_at}
-);
-
--- Indexes for both Pending and Active states
-CREATE INDEX idx_receipt_pending_underlying ON receipt_inventory_view(json_extract(payload, '$.Pending.underlying'));
-CREATE INDEX idx_receipt_pending_token ON receipt_inventory_view(json_extract(payload, '$.Pending.token'));
-CREATE INDEX idx_receipt_active_underlying ON receipt_inventory_view(json_extract(payload, '$.Active.underlying'));
-CREATE INDEX idx_receipt_active_token ON receipt_inventory_view(json_extract(payload, '$.Active.token'));
-CREATE INDEX idx_receipt_current_balance ON receipt_inventory_view(json_extract(payload, '$.Active.current_balance'));
-
--- Inventory snapshot view: periodic inventory metrics for Grafana
-CREATE TABLE inventory_snapshot_view (
-    view_id TEXT PRIMARY KEY,         -- symbol:timestamp
-    version BIGINT NOT NULL,
-    payload JSON NOT NULL             -- {symbol, onchain_balance, offchain_balance, total_balance, onchain_ratio, timestamp}
-);
-
-CREATE INDEX idx_snapshot_symbol ON inventory_snapshot_view(json_extract(payload, '$.symbol'));
-CREATE INDEX idx_snapshot_timestamp ON inventory_snapshot_view(json_extract(payload, '$.timestamp'));
-```
-
-**Note on Views**: All view tables follow the same pattern - `view_id` (primary
-key), `version` (last event sequence applied), and `payload` (JSON containing
-the view state). Views implement the `View` trait and are automatically updated
-by `GenericQuery` processors when events are committed. If a view becomes
-corrupted or a new projection is needed, simply drop the table and replay all
-events to rebuild it.
+See `migrations/` for exact table definitions and indexes.
 
 ## Views and Queries
 
@@ -1487,8 +1432,9 @@ events.
 
 **MintView** - Maintains current state of mint operations:
 
-- Listens to: `MintInitiated`, `JournalConfirmed`, `TokensMinted`,
-  `MintCompleted`, `MintingFailed`, `JournalRejected`
+- Listens to: `Initiated`, `JournalConfirmed`, `MintingStarted`, `TokensMinted`,
+  `MintingFailed`, `MintCompleted`, `JournalRejected`, `ExistingMintRecovered`,
+  `MintRetryStarted`
 - Updates: Status, timestamps, transaction details
 - Used for: Querying current mint status, operational dashboards, API responses
 
@@ -1504,7 +1450,7 @@ events.
 - Listens to: `MintEvent::Initiated` (captures underlying/token),
   `MintEvent::TokensMinted` (creates active receipt),
   `RedemptionEvent::TokensBurned` (decreases balance, transitions to Depleted)
-- State transitions: Unavailable → Pending → Active → Depleted
+- State transitions: Unavailable -> Pending -> Active -> Depleted
 - Updates: Accumulates data across event sequence to track each receipt's
   lifecycle from creation through complete depletion
 - Used for: Selecting which receipt to burn from during redemptions, inventory
@@ -1581,10 +1527,10 @@ graph TB
     CQRS --> ISV[InventorySnapshotView]
 
     subgraph "Command Execution Flow"
-        CMD[InitiateMint] --> FW[Framework]
+        CMD[Initiate] --> FW[Framework]
         FW --> LOAD[Load Aggregate]
         LOAD --> HANDLE[handle]
-        HANDLE --> EVENTS[MintInitiated]
+        HANDLE --> EVENTS[Initiated]
         EVENTS --> PERSIST[Persist Events]
         PERSIST --> APPLY[Apply to Aggregate]
         APPLY --> UPDATE[Update Views]
@@ -1610,13 +1556,13 @@ pattern.
 fn test_initiate_mint() {
     MintTestFramework::with(mock_services)
         .given_no_previous_events()
-        .when(InitiateMint {
+        .when(Initiate {
             tokenization_request_id: "alp-123",
             quantity: Decimal::from(100),
             // ...
         })
         .then_expect_events(vec![
-            MintInitiated { /* ... */ }
+            Initiated { /* ... */ }
         ]);
 }
 
@@ -1625,7 +1571,7 @@ fn test_initiate_mint() {
 fn test_journal_confirmed() {
     MintTestFramework::with(mock_services)
         .given(vec![
-            MintInitiated { issuer_request_id: "iss-456", /* ... */ }
+            Initiated { issuer_request_id: "iss-456", /* ... */ }
         ])
         .when(ConfirmJournal { issuer_request_id: "iss-456" })
         .then_expect_events(vec![
@@ -1638,7 +1584,7 @@ fn test_journal_confirmed() {
 fn test_journal_rejected() {
     MintTestFramework::with(mock_services)
         .given(vec![
-            MintInitiated { issuer_request_id: "iss-789", /* ... */ }
+            Initiated { issuer_request_id: "iss-789", /* ... */ }
         ])
         .when(RejectJournal {
             issuer_request_id: "iss-789",

@@ -15,6 +15,11 @@ use crate::fireblocks::{
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
+pub(crate) struct BlockchainSetup<P> {
+    pub(crate) vault_service: Arc<dyn VaultService>,
+    pub(crate) provider: P,
+}
+
 /// Default chain ID (Base mainnet)
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
 
@@ -26,6 +31,7 @@ pub struct Config {
     pub chain_id: u64,
     pub signer: SignerConfig,
     pub vault: Address,
+    pub backfill_start_block: u64,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
@@ -43,52 +49,53 @@ impl Config {
         env.into_config()
     }
 
-    pub(crate) async fn create_blockchain_service(
+    /// Creates the blockchain provider and vault service.
+    ///
+    /// Initializes a single provider connection and builds the appropriate
+    /// VaultService (local signer or Fireblocks). The provider is returned
+    /// for reuse by other components (backfill, monitor) to avoid multiple
+    /// connections to the same RPC endpoint.
+    pub(crate) async fn create_blockchain_setup(
         &self,
-    ) -> Result<Arc<dyn VaultService>, ConfigError> {
-        match &self.signer {
+    ) -> Result<BlockchainSetup<impl Provider + Clone + use<>>, ConfigError>
+    {
+        let provider =
+            ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
+
+        let rpc_chain_id = provider.get_chain_id().await?;
+        if rpc_chain_id != self.chain_id {
+            return Err(ConfigError::ChainIdMismatch {
+                configured: self.chain_id,
+                from_rpc: rpc_chain_id,
+            });
+        }
+
+        let vault_service: Arc<dyn VaultService> = match &self.signer {
             SignerConfig::Local(key) => {
                 let resolved = resolve_local_signer(key, self.chain_id)
-                    .map_err(|e| ConfigError::SignerResolve(Box::new(e)))?;
-                let provider = ProviderBuilder::new()
+                    .map_err(|err| ConfigError::SignerResolve(Box::new(err)))?;
+
+                let signing_provider = ProviderBuilder::new()
                     .wallet(resolved.wallet)
                     .connect(self.rpc_url.as_str())
                     .await?;
 
-                let rpc_chain_id = provider.get_chain_id().await?;
-                if rpc_chain_id != self.chain_id {
-                    return Err(ConfigError::ChainIdMismatch {
-                        configured: self.chain_id,
-                        from_rpc: rpc_chain_id,
-                    });
-                }
-
-                Ok(Arc::new(RealBlockchainService::new(provider)))
+                Arc::new(RealBlockchainService::new(signing_provider))
             }
 
             SignerConfig::Fireblocks(env) => {
-                let read_provider = ProviderBuilder::new()
-                    .connect(self.rpc_url.as_str())
-                    .await?;
-
-                let rpc_chain_id = read_provider.get_chain_id().await?;
-                if rpc_chain_id != self.chain_id {
-                    return Err(ConfigError::ChainIdMismatch {
-                        configured: self.chain_id,
-                        from_rpc: rpc_chain_id,
-                    });
-                }
-
                 let service = FireblocksVaultService::new(
                     env,
-                    read_provider,
+                    provider.clone(),
                     self.chain_id,
                 )
-                .map_err(|e| ConfigError::FireblocksVault(Box::new(e)))?;
+                .map_err(|err| ConfigError::FireblocksVault(Box::new(err)))?;
 
-                Ok(Arc::new(service))
+                Arc::new(service)
             }
-        }
+        };
+
+        Ok(BlockchainSetup { vault_service, provider })
     }
 }
 
@@ -137,6 +144,14 @@ struct Env {
     )]
     vault: Address,
 
+    #[arg(
+        long,
+        env = "BACKFILL_START_BLOCK",
+        default_value = "40588950",
+        help = "Block number from which to start backfilling receipts"
+    )]
+    backfill_start_block: u64,
+
     #[clap(flatten)]
     auth: AuthConfig,
 
@@ -163,6 +178,7 @@ impl Env {
             chain_id: self.chain_id,
             signer,
             vault: self.vault,
+            backfill_start_block: self.backfill_start_block,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,
@@ -269,6 +285,8 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
+            "--backfill-start-block",
+            "12345678",
             "--issuer-api-key",
             "test-key-that-is-at-least-32-chars-long",
             "--alpaca-account-id",
@@ -371,6 +389,8 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000001",
             "--vault",
             "0x1111111111111111111111111111111111111111",
+            "--backfill-start-block",
+            "12345678",
             "--issuer-api-key",
             "short-key", // Less than 32 characters
             "--alpaca-account-id",

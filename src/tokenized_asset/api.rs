@@ -88,12 +88,12 @@ pub(crate) async fn add_tokenized_asset(
 
     cqrs.execute(&request.underlying.0, command)
         .await
-        .or_else(|e| match e {
+        .or_else(|err| match err {
             AggregateError::AggregateConflict => Ok(()),
-            _ => Err(e),
+            _ => Err(err),
         })
-        .map_err(|e| {
-            error!("Failed to add tokenized asset: {e}");
+        .map_err(|err| {
+            error!("Failed to add tokenized asset: {err}");
             Status::InternalServerError
         })?;
 
@@ -133,6 +133,7 @@ mod tests {
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
             vault: address!("0x1111111111111111111111111111111111111111"),
+            backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

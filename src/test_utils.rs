@@ -2,7 +2,7 @@ use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{PendingTransactionError, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -26,8 +26,8 @@ use crate::bindings::{
 };
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::mint_manager::MintManager;
-use crate::mint::{CallbackManager, Mint, MintView};
+use crate::mint::{Mint, MintServices, MintView};
+use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     TokenizedAssetView, UnderlyingSymbol,
@@ -59,6 +59,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
+        backfill_start_block: 0,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         hyperdx: None,
@@ -113,6 +114,29 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
+    // Setup ReceiptInventory (needed by MintServices for receipt lookups and registration)
+    let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
+        SqliteEventRepository,
+        ReceiptInventory,
+    >::new_event_store(
+        SqliteEventRepository::new(pool.clone()),
+    ));
+    let receipt_inventory_cqrs =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+    // Create mock services for Mint aggregate
+    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let mint_services = MintServices {
+        vault: Arc::new(MockVaultService::new_success()),
+        alpaca: Arc::new(MockAlpacaService::new_success()),
+        pool: pool.clone(),
+        bot,
+        receipts: Arc::new(CqrsReceiptService::new(
+            receipt_inventory_event_store.clone(),
+            receipt_inventory_cqrs,
+        )),
+    };
+
     // Setup Mint CQRS
     let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
         pool.clone(),
@@ -120,9 +144,11 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     ));
 
     let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs_raw =
-        sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ());
-    let mint_cqrs = Arc::new(mint_cqrs_raw);
+    let mint_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(mint_query)],
+        mint_services,
+    ));
 
     let mint_event_repo = SqliteEventRepository::new(pool.clone());
     let mint_event_store = Arc::new(PersistedEventStore::<
@@ -133,23 +159,6 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     // Seed initial assets
     seed_test_assets(&tokenized_asset_cqrs).await?;
 
-    // Create managers with mock services
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let mint_manager = Arc::new(MintManager::new(
-        Arc::new(MockVaultService::new_success()),
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
-        pool.clone(),
-        bot,
-    ));
-
-    let callback_manager = Arc::new(CallbackManager::new(
-        Arc::new(MockAlpacaService::new_success()),
-        mint_cqrs.clone(),
-        mint_event_store.clone(),
-        pool.clone(),
-    ));
-
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
     // Build rocket
@@ -159,8 +168,6 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
         .manage(mint_event_store)
-        .manage(mint_manager)
-        .manage(callback_manager)
         .manage(rate_limiter)
         .manage(pool)
         .mount(
@@ -202,8 +209,8 @@ async fn seed_test_assets(
 
         match cqrs.execute(underlying, command).await {
             Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
-            Err(e) => {
-                return Err(e.into());
+            Err(err) => {
+                return Err(err.into());
             }
         }
     }
@@ -213,12 +220,16 @@ async fn seed_test_assets(
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocalEvmError {
-    #[error("Failed to parse private key: {0}")]
-    InvalidPrivateKey(String),
-    #[error("RPC error")]
+    #[error("Signer error: {0}")]
+    Signer(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("Contract deployment failed: {0}")]
-    DeploymentFailed(String),
+    #[error("Contract error: {0}")]
+    Contract(#[from] alloy::contract::Error),
+    #[error("Pending transaction error: {0}")]
+    PendingTransaction(#[from] PendingTransactionError),
+    #[error("Event not found in logs")]
+    EventNotFound,
 }
 
 /// Local EVM instance for end-to-end testing with deployed contracts.
@@ -256,8 +267,7 @@ impl LocalEvm {
         let endpoint = anvil.ws_endpoint();
 
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
-        let signer = PrivateKeySigner::from_bytes(&private_key)
-            .map_err(|e| LocalEvmError::InvalidPrivateKey(e.to_string()))?;
+        let signer = PrivateKeySigner::from_bytes(&private_key)?;
         let wallet_address = signer.address();
         let wallet = EthereumWallet::from(signer);
 
@@ -289,13 +299,7 @@ impl LocalEvm {
             };
 
         let vault_impl_deploy =
-            OffchainAssetReceiptVault::deploy(provider, vault_config)
-                .await
-                .map_err(|e| {
-                    LocalEvmError::DeploymentFailed(format!(
-                        "OffchainAssetReceiptVault implementation: {e}"
-                    ))
-                })?;
+            OffchainAssetReceiptVault::deploy(provider, vault_config).await?;
 
         Ok(*vault_impl_deploy.address())
     }
@@ -304,13 +308,7 @@ impl LocalEvm {
         provider: &impl Provider,
     ) -> Result<Address, LocalEvmError> {
         let authorizer_impl_deploy =
-            OffchainAssetReceiptVaultAuthorizerV1::deploy(provider)
-                .await
-                .map_err(|e| {
-                    LocalEvmError::DeploymentFailed(format!(
-                        "OffchainAssetReceiptVaultAuthorizerV1 implementation: {e}"
-                    ))
-                })?;
+            OffchainAssetReceiptVaultAuthorizerV1::deploy(provider).await?;
 
         Ok(*authorizer_impl_deploy.address())
     }
@@ -331,17 +329,9 @@ impl LocalEvm {
         let clone_receipt = factory
             .clone(vault_impl_address, vault_clone_data.into())
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!("Vault clone: {e}"))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Vault clone receipt: {e}"
-                ))
-            })?;
+            .await?;
 
         clone_receipt
             .inner
@@ -352,11 +342,7 @@ impl LocalEvm {
                     .ok()
                     .map(|decoded| decoded.data().clone)
             })
-            .ok_or_else(|| {
-                LocalEvmError::DeploymentFailed(
-                    "Vault clone address not found in logs".to_string(),
-                )
-            })
+            .ok_or(LocalEvmError::EventNotFound)
     }
 
     async fn clone_authorizer_instance(
@@ -371,19 +357,9 @@ impl LocalEvm {
         let authorizer_clone_receipt = factory
             .clone(authorizer_impl_address, authorizer_clone_data.into())
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Authorizer clone: {e}"
-                ))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Authorizer clone receipt: {e}"
-                ))
-            })?;
+            .await?;
 
         authorizer_clone_receipt
             .inner
@@ -394,11 +370,7 @@ impl LocalEvm {
                     .ok()
                     .map(|decoded| decoded.data().clone)
             })
-            .ok_or_else(|| {
-                LocalEvmError::DeploymentFailed(
-                    "Authorizer clone address not found in logs".to_string(),
-                )
-            })
+            .ok_or(LocalEvmError::EventNotFound)
     }
 
     async fn set_vault_authorizer(
@@ -410,17 +382,9 @@ impl LocalEvm {
         vault
             .setAuthorizer(authorizer_address)
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!("Set authorizer: {e}"))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Set authorizer receipt: {e}"
-                ))
-            })?;
+            .await?;
 
         Ok(())
     }
@@ -438,42 +402,21 @@ impl LocalEvm {
         authorizer
             .grantRole(deposit_role, initial_admin)
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Grant DEPOSIT role: {e}"
-                ))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Grant DEPOSIT role receipt: {e}"
-                ))
-            })?;
+            .await?;
 
         Ok(())
     }
 
-    /// Deploys the vault infrastructure including Receipt, CloneFactory, vault
-    /// implementation, authorizer implementation, and cloned instances.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any deployment or initialization step fails.
     async fn deploy_vault(
         provider: &impl Provider,
         initial_admin: Address,
     ) -> Result<(Address, Address), LocalEvmError> {
-        let receipt_deploy = Receipt::deploy(provider).await.map_err(|e| {
-            LocalEvmError::DeploymentFailed(format!("Receipt: {e}"))
-        })?;
+        let receipt_deploy = Receipt::deploy(provider).await?;
         let receipt_address = *receipt_deploy.address();
 
-        let factory_deploy =
-            CloneFactory::deploy(provider).await.map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!("CloneFactory: {e}"))
-            })?;
+        let factory_deploy = CloneFactory::deploy(provider).await?;
         let factory_address = *factory_deploy.address();
 
         let vault_impl_address = Self::deploy_vault_implementation(
@@ -565,20 +508,17 @@ impl LocalEvm {
         self.grant_role("CERTIFY", to).await
     }
 
-    /// Certifies the vault until a specific timestamp.
+    /// Certifies the vault to enable deposits/withdrawals.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Signer creation fails
-    /// - Provider connection fails
-    /// - Certification transaction fails
+    /// Returns an error if signer creation, provider connection, or the
+    /// certify transaction fails.
     pub async fn certify_vault(
         &self,
         until: U256,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)
-            .map_err(|e| LocalEvmError::InvalidPrivateKey(e.to_string()))?;
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
@@ -591,17 +531,9 @@ impl LocalEvm {
         vault
             .certify(until, false, Bytes::new())
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!("Certify vault: {e}"))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Certify vault receipt: {e}"
-                ))
-            })?;
+            .await?;
 
         Ok(())
     }
@@ -611,8 +543,7 @@ impl LocalEvm {
         role_name: &str,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)
-            .map_err(|e| LocalEvmError::InvalidPrivateKey(e.to_string()))?;
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
@@ -625,22 +556,209 @@ impl LocalEvm {
             &provider,
         );
         let role = keccak256(role_name);
-        authorizer
-            .grantRole(role, to)
+        authorizer.grantRole(role, to).send().await?.get_receipt().await?;
+
+        Ok(())
+    }
+
+    /// Mints shares directly on-chain to a specified address.
+    ///
+    /// This bypasses the issuance API and mints directly via the vault contract.
+    /// Useful for simulating historic mints that occurred before the service started.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, the deposit
+    /// transaction fails, or the Deposit event is not found in the receipt.
+    pub async fn mint_directly(
+        &self,
+        amount: U256,
+        to: Address,
+    ) -> Result<(U256, U256), LocalEvmError> {
+        let (id, shares, _) =
+            self.mint_directly_with_info(amount, to, Bytes::new()).await?;
+        Ok((id, shares))
+    }
+
+    /// Mints shares directly on-chain with custom receipt information.
+    ///
+    /// Like `mint_directly`, but allows specifying the `receiptInformation` bytes
+    /// that will be stored on-chain with the Deposit event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, the deposit
+    /// transaction fails, or the Deposit event is not found in the receipt.
+    pub async fn mint_directly_with_info(
+        &self,
+        amount: U256,
+        to: Address,
+        receipt_information: Bytes,
+    ) -> Result<(U256, U256, Bytes), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault =
+            OffchainAssetReceiptVault::new(self.vault_address, &provider);
+
+        let share_ratio = U256::from(10).pow(U256::from(18));
+
+        let receipt = vault
+            .deposit(amount, to, share_ratio, receipt_information)
             .send()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Grant {role_name} role: {e}"
-                ))
-            })?
+            .await?
             .get_receipt()
-            .await
-            .map_err(|e| {
-                LocalEvmError::DeploymentFailed(format!(
-                    "Grant {role_name} role receipt: {e}"
-                ))
-            })?;
+            .await?;
+
+        receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
+                    |decoded| {
+                        let event_data = decoded.data();
+                        (
+                            event_data.id,
+                            event_data.shares,
+                            event_data.receiptInformation.clone(),
+                        )
+                    },
+                )
+            })
+            .ok_or(LocalEvmError::EventNotFound)
+    }
+
+    /// Deploys an additional vault instance on the same Anvil instance.
+    ///
+    /// This is useful for testing multi-vault scenarios where different
+    /// tokenized assets use different vaults.
+    ///
+    /// Returns (vault_address, authorizer_address) for the new vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if contract deployment fails.
+    pub async fn deploy_additional_vault(
+        &self,
+    ) -> Result<(Address, Address), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        Self::deploy_vault(&provider, self.wallet_address).await
+    }
+
+    /// Mints shares directly on a specific vault (not necessarily this LocalEvm's vault).
+    ///
+    /// This is useful for testing multi-vault scenarios.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, the deposit
+    /// transaction fails, or the Deposit event is not found in the receipt.
+    pub async fn mint_directly_on_vault(
+        &self,
+        vault_address: Address,
+        amount: U256,
+        to: Address,
+    ) -> Result<(U256, U256), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+        let share_ratio = U256::from(10).pow(U256::from(18));
+
+        let receipt = vault
+            .deposit(amount, to, share_ratio, Bytes::new())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
+                    |decoded| {
+                        let event_data = decoded.data();
+                        (event_data.id, event_data.shares)
+                    },
+                )
+            })
+            .ok_or(LocalEvmError::EventNotFound)
+    }
+
+    /// Grants a role on a specific authorizer (not necessarily this LocalEvm's authorizer).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the role granting transaction fails.
+    pub async fn grant_role_on_authorizer(
+        &self,
+        authorizer_address: Address,
+        role_name: &str,
+        to: Address,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let authorizer = OffchainAssetReceiptVaultAuthorizerV1::new(
+            authorizer_address,
+            &provider,
+        );
+        let role = keccak256(role_name);
+        authorizer.grantRole(role, to).send().await?.get_receipt().await?;
+
+        Ok(())
+    }
+
+    /// Certifies a specific vault (not necessarily this LocalEvm's vault).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certify transaction fails.
+    pub async fn certify_specific_vault(
+        &self,
+        vault_address: Address,
+        until: U256,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
+        vault
+            .certify(until, false, Bytes::new())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
 
         Ok(())
     }

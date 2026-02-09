@@ -8,19 +8,18 @@ use url::Url;
 use crate::account::{
     Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
 };
-use crate::alpaca::AlpacaService;
+use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
 use crate::mint::{
-    CallbackManager, Mint, MintView, Network, TokenSymbol, UnderlyingSymbol,
-    mint_manager::MintManager,
+    Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol,
 };
+use crate::receipt_inventory::CqrsReceiptService;
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
-use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 use crate::{AccountCqrs, MintCqrs, TokenizedAssetCqrs};
 
@@ -32,41 +31,12 @@ pub(crate) fn test_config() -> Config {
         chain_id: crate::test_utils::ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         vault: address!("0x1111111111111111111111111111111111111111"),
+        backfill_start_block: 0,
         auth: test_auth_config().unwrap(),
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
     }
-}
-
-pub(crate) fn create_test_mint_manager(
-    mint_cqrs: crate::MintCqrs,
-    event_store: crate::MintEventStore,
-    pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Arc<MintManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
-    let blockchain_service =
-        Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-
-    Arc::new(MintManager::new(
-        blockchain_service,
-        mint_cqrs,
-        event_store,
-        pool,
-        bot,
-    ))
-}
-
-pub(crate) fn create_test_callback_manager(
-    mint_cqrs: crate::MintCqrs,
-    event_store: crate::MintEventStore,
-    pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Arc<CallbackManager<PersistedEventStore<SqliteEventRepository, Mint>>> {
-    let alpaca_service =
-        Arc::new(crate::alpaca::mock::MockAlpacaService::new_success())
-            as Arc<dyn AlpacaService>;
-
-    Arc::new(CallbackManager::new(alpaca_service, mint_cqrs, event_store, pool))
 }
 
 pub(crate) fn create_test_event_store(
@@ -120,14 +90,36 @@ impl TestHarness {
             (),
         );
 
+        let receipt_inventory_event_store = {
+            let event_repo = SqliteEventRepository::new(pool.clone());
+            Arc::new(PersistedEventStore::new_event_store(event_repo))
+        };
+        let receipt_inventory_cqrs =
+            Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let mint_services = MintServices {
+            vault: Arc::new(MockVaultService::new_success()),
+            alpaca: Arc::new(MockAlpacaService::new_success()),
+            pool: pool.clone(),
+            bot,
+            receipts: Arc::new(CqrsReceiptService::new(
+                receipt_inventory_event_store,
+                receipt_inventory_cqrs,
+            )),
+        };
+
         let mint_view_repo =
             Arc::new(SqliteViewRepository::<MintView, Mint>::new(
                 pool.clone(),
                 "mint_view".to_string(),
             ));
         let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![Box::new(mint_query)], ()));
+        let mint_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(mint_query)],
+            mint_services,
+        ));
 
         Self { pool, account_cqrs, asset_cqrs, mint_cqrs }
     }

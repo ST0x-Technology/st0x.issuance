@@ -19,6 +19,7 @@ use crate::account::{
 };
 use crate::bindings;
 use crate::mint::IssuerRequestId;
+use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
@@ -39,21 +40,29 @@ pub(crate) struct RedemptionDetectorConfig {
 /// The detector subscribes to Transfer events on the vault contract, filtering for
 /// transfers to the redemption wallet. When a transfer is detected, it creates a
 /// RedemptionCommand::Detect to record the redemption in the aggregate.
-pub(crate) struct RedemptionDetector<ES: EventStore<Redemption>> {
+pub(crate) struct RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+where
+    RedemptionStore: EventStore<Redemption>,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
+{
     rpc_url: Url,
     vault: Address,
     bot_wallet: Address,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
-    event_store: Arc<ES>,
+    cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+    event_store: Arc<RedemptionStore>,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<RedeemCallManager<ES>>,
-    journal_manager: Arc<JournalManager<ES>>,
-    burn_manager: Arc<BurnManager<ES>>,
+    redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
+    journal_manager: Arc<JournalManager<RedemptionStore>>,
+    burn_manager: Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
 }
 
-impl<ES: EventStore<Redemption> + 'static> RedemptionDetector<ES>
+impl<RedemptionStore, ReceiptInventoryStore>
+    RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
 where
-    ES::AC: Send,
+    RedemptionStore: EventStore<Redemption> + 'static,
+    ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
+    RedemptionStore::AC: Send,
+    ReceiptInventoryStore::AC: Send,
 {
     /// Creates a new redemption detector.
     ///
@@ -68,12 +77,12 @@ where
     /// * `burn_manager` - Manager for handling token burning after Alpaca journal completes
     pub(crate) fn new(
         config: RedemptionDetectorConfig,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
-        event_store: Arc<ES>,
+        cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+        event_store: Arc<RedemptionStore>,
         pool: Pool<Sqlite>,
-        redeem_call_manager: Arc<RedeemCallManager<ES>>,
-        journal_manager: Arc<JournalManager<ES>>,
-        burn_manager: Arc<BurnManager<ES>>,
+        redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
+        journal_manager: Arc<JournalManager<RedemptionStore>>,
+        burn_manager: Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
     ) -> Self {
         Self {
             rpc_url: config.rpc_url,
@@ -95,8 +104,10 @@ where
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         loop {
-            if let Err(e) = self.monitor_once().await {
-                warn!("WebSocket monitoring error: {e}. Reconnecting in 5s...");
+            if let Err(err) = self.monitor_once().await {
+                warn!(
+                    "WebSocket monitoring error: {err}. Reconnecting in 5s..."
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
@@ -128,8 +139,8 @@ where
         info!("WebSocket subscription active, monitoring for redemptions");
 
         while let Some(log) = stream.next().await {
-            if let Err(e) = self.process_transfer_log(&log).await {
-                error!("Failed to process transfer log: {e}");
+            if let Err(err) = self.process_transfer_log(&log).await {
+                error!("Failed to process transfer log: {err}");
             }
         }
 
@@ -308,7 +319,7 @@ where
         let aggregate_ctx =
             self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
 
-        if let Err(e) = self
+        if let Err(err) = self
             .redeem_call_manager
             .handle_redemption_detected(
                 &alpaca_account,
@@ -321,7 +332,7 @@ where
         {
             warn!(
                 issuer_request_id = %issuer_request_id.as_str(),
-                error = ?e,
+                error = ?err,
                 "handle_redemption_detected failed"
             );
             return Ok(());
@@ -343,7 +354,7 @@ where
         let tokenization_request_id_cloned = tokenization_request_id.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = journal_manager
+            if let Err(err) = journal_manager
                 .handle_alpaca_called(
                     &alpaca_account,
                     issuer_request_id_cloned.clone(),
@@ -352,7 +363,7 @@ where
                 .await
             {
                 warn!(
-                    error = ?e,
+                    error = ?err,
                     "handle_alpaca_called (journal polling) failed"
                 );
                 return;
@@ -363,10 +374,10 @@ where
                 .await
             {
                 Ok(ctx) => ctx,
-                Err(e) => {
+                Err(err) => {
                     warn!(
                         issuer_request_id = %issuer_request_id_cloned.as_str(),
-                        error = ?e,
+                        error = ?err,
                         "Failed to load aggregate after journal completion"
                     );
                     return;
@@ -374,7 +385,7 @@ where
             };
 
             if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
-                if let Err(e) = burn_manager
+                if let Err(err) = burn_manager
                     .handle_burning_started(
                         &issuer_request_id_cloned,
                         aggregate_ctx.aggregate(),
@@ -383,7 +394,7 @@ where
                 {
                     warn!(
                         issuer_request_id = %issuer_request_id_cloned.as_str(),
-                        error = ?e,
+                        error = ?err,
                         "handle_burning_started failed"
                     );
                 }
@@ -398,10 +409,10 @@ where
 pub(crate) enum RedemptionMonitorError {
     #[error("RPC error")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("Failed to decode Transfer event: {0}")]
-    EventDecode(#[from] alloy::sol_types::Error),
-    #[error("Failed to list assets: {0}")]
-    ListAssets(#[from] TokenizedAssetViewError),
+    #[error("Sol types error: {0}")]
+    SolTypes(#[from] alloy::sol_types::Error),
+    #[error("Tokenized asset view error: {0}")]
+    TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("No asset found for vault {vault}")]
     NoMatchingAsset { vault: Address },
     #[error("Missing transaction hash in log")]
@@ -410,10 +421,10 @@ pub(crate) enum RedemptionMonitorError {
     MissingBlockNumber,
     #[error("Failed to convert quantity: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
-    #[error("Failed to record redemption detection: {0}")]
-    CqrsExecution(#[from] cqrs_es::AggregateError<RedemptionError>),
-    #[error("Failed to query account: {0}")]
-    AccountQuery(#[from] AccountViewError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] cqrs_es::AggregateError<RedemptionError>),
+    #[error("Account view error: {0}")]
+    AccountView(#[from] AccountViewError),
     #[error("No account found for wallet {wallet}")]
     AccountNotFound { wallet: Address },
     #[error("Account not linked for wallet {wallet}")]
@@ -448,6 +459,9 @@ mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::IssuerRequestId;
+    use crate::receipt_inventory::{
+        CqrsReceiptService, ReceiptInventory, ReceiptService,
+    };
     use crate::redemption::Redemption;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -457,9 +471,18 @@ mod tests {
 
     type TestCqrs = CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+    type TestReceiptInventoryCqrs =
+        CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>;
 
-    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
+    fn setup_test_cqrs() -> (
+        Arc<TestCqrs>,
+        Arc<TestStore>,
+        Arc<dyn ReceiptService>,
+        Arc<TestReceiptInventoryCqrs>,
+    ) {
         let store = Arc::new(MemStore::default());
+        let receipt_inventory_store: Arc<MemStore<ReceiptInventory>> =
+            Arc::new(MemStore::default());
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
         let cqrs = Arc::new(CqrsFramework::new(
@@ -467,7 +490,17 @@ mod tests {
             vec![],
             vault_service,
         ));
-        (cqrs, store)
+        let receipt_inventory_cqrs = Arc::new(CqrsFramework::new(
+            (*receipt_inventory_store).clone(),
+            vec![],
+            (),
+        ));
+        let receipt_service: Arc<dyn ReceiptService> =
+            Arc::new(CqrsReceiptService::new(
+                receipt_inventory_store,
+                receipt_inventory_cqrs.clone(),
+            ));
+        (cqrs, store, receipt_service, receipt_inventory_cqrs)
     }
 
     async fn setup_test_db_with_asset(
@@ -593,7 +626,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -618,6 +652,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -675,7 +711,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -700,6 +737,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -744,7 +783,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -769,6 +809,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -815,7 +857,8 @@ mod tests {
             address!("0x9876543210fedcba9876543210fedcba98765432");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(wrong_vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -840,6 +883,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -886,7 +931,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -911,6 +957,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -950,10 +998,7 @@ mod tests {
 
         let second_result = detector.process_transfer_log(&log).await;
         assert!(
-            matches!(
-                second_result,
-                Err(RedemptionMonitorError::CqrsExecution(_))
-            ),
+            matches!(second_result, Err(RedemptionMonitorError::Aggregate(_))),
             "Second detection should fail with CQRS error, got {second_result:?}"
         );
     }
@@ -963,7 +1008,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -988,6 +1034,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 
@@ -1045,7 +1093,8 @@ mod tests {
         let unknown_wallet =
             address!("0x1111111111111111111111111111111111111111");
 
-        let (cqrs, store) = setup_test_cqrs();
+        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
+            setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -1070,6 +1119,8 @@ mod tests {
             pool.clone(),
             cqrs.clone(),
             store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
             bot_wallet,
         ));
 

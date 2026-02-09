@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -25,22 +25,32 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerRequestId,
         reason: String,
     },
-    StartMinting {
+
+    /// Executes the on-chain deposit (minting) operation.
+    ///
+    /// Calls the vault service to deposit, producing `MintingStarted`
+    /// followed by either `TokensMinted` or `MintingFailed`.
+    Deposit {
         issuer_request_id: IssuerRequestId,
     },
-    RecordMintSuccess {
+
+    /// Sends the callback to Alpaca to confirm mint completion.
+    ///
+    /// Calls the Alpaca service, producing `MintCompleted` on success.
+    SendCallback {
         issuer_request_id: IssuerRequestId,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        gas_used: u64,
-        block_number: u64,
     },
-    RecordMintFailure {
-        issuer_request_id: IssuerRequestId,
-        error: String,
-    },
-    RecordCallback {
+
+    /// Recovers a mint stuck in an incomplete state.
+    ///
+    /// For mints in `Minting` or `MintingFailed` state:
+    /// - Checks receipt inventory for existing receipt
+    /// - If found: records the existing mint (produces `ExistingMintRecovered`)
+    /// - If not found: retries the mint (produces `MintRetryStarted` then executes mint)
+    ///
+    /// For mints in `CallbackPending` state:
+    /// - Retries sending the callback
+    Recover {
         issuer_request_id: IssuerRequestId,
     },
 }

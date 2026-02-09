@@ -448,7 +448,7 @@ mod tests {
     use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{OperationType, ReceiptInformation};
+    use crate::vault::{MultiBurnEntry, OperationType, ReceiptInformation};
 
     fn make_detected_envelope(
         aggregate_id: &str,
@@ -585,9 +585,11 @@ mod tests {
                         vault: address!(
                             "0xcccccccccccccccccccccccccccccccccccccccc"
                         ),
-                        burn_shares: U256::from(100),
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(1),
+                            burn_shares: U256::from(100),
+                        }],
                         dust_shares: U256::ZERO,
-                        receipt_id: U256::from(1),
                         owner: address!(
                             "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
                         ),

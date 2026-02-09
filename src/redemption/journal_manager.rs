@@ -48,8 +48,8 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         let stuck_redemptions = match find_alpaca_called(&self.pool).await {
             Ok(redemptions) => redemptions,
-            Err(e) => {
-                error!(error = %e, "Failed to query for stuck AlpacaCalled redemptions");
+            Err(err) => {
+                error!(error = %err, "Failed to query for stuck AlpacaCalled redemptions");
                 return;
             }
         };
@@ -65,13 +65,13 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         );
 
         for (issuer_request_id, view) in stuck_redemptions {
-            if let Err(e) = self
+            if let Err(err) = self
                 .recover_single_alpaca_called(&issuer_request_id, &view)
                 .await
             {
                 warn!(
                     issuer_request_id = %issuer_request_id.as_str(),
-                    error = %e,
+                    error = %err,
                     "Failed to recover AlpacaCalled redemption"
                 );
             }
@@ -400,11 +400,11 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                     }
                 }
             }
-            Err(e) => {
+            Err(err) => {
                 warn!(
                     issuer_request_id = %issuer_request_id,
                     tokenization_request_id = %tokenization_request_id,
-                    error = %e,
+                    error = %err,
                     next_poll_in = ?poll_interval,
                     "Polling error, will retry"
                 );

@@ -11,8 +11,9 @@ use tracing::error;
 use uuid::Uuid;
 
 use super::{
-    AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
-    view::find_by_client_id, view::find_by_email,
+    AccountCommand, AccountError, AccountView, AlpacaAccountNumber, ClientId,
+    Email, view::AccountViewError, view::find_by_client_id,
+    view::find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
@@ -28,12 +29,10 @@ impl<'a> FromParam<'a> for ClientId {
 pub(crate) enum ApiError {
     #[error("Account not found")]
     AccountNotFound,
-
-    #[error("Database error: {0}")]
-    Database(#[from] super::view::AccountViewError),
-
-    #[error("Command execution failed: {0}")]
-    CommandFailed(#[from] cqrs_es::AggregateError<super::AccountError>),
+    #[error("Account view error: {0}")]
+    AccountView(#[from] AccountViewError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<AccountError>),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -43,7 +42,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
     ) -> rocket::response::Result<'static> {
         let status = match self {
             Self::AccountNotFound => Status::NotFound,
-            Self::Database(_) | Self::CommandFailed(_) => {
+            Self::AccountView(_) | Self::Aggregate(_) => {
                 Status::InternalServerError
             }
         };
@@ -94,8 +93,8 @@ pub(crate) async fn register_account(
         AccountCommand::Register { client_id, email: request.email.clone() };
 
     let aggregate_id = client_id.to_string();
-    if let Err(e) = cqrs.execute(&aggregate_id, register_command).await {
-        return Err(map_cqrs_error_to_status(&e));
+    if let Err(err) = cqrs.execute(&aggregate_id, register_command).await {
+        return Err(map_cqrs_error_to_status(&err));
     }
 
     Ok(Json(RegisterAccountResponse { client_id }))
@@ -232,6 +231,7 @@ mod tests {
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
             vault: address!("0x1111111111111111111111111111111111111111"),
+            backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
             hyperdx: None,

@@ -124,6 +124,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = TestHarness::new().await;
 
         let email = Email::new("test@placeholder.com".to_string())
@@ -226,6 +227,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = TestHarness::new().await;
 
         let email = Email::new("test@placeholder.com".to_string())
@@ -305,6 +307,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = TestHarness::new().await;
 
         let client_id = ClientId::new();
@@ -364,6 +367,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = TestHarness::new().await;
 
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -443,6 +447,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = harness;
 
         let rocket = rocket::build()
@@ -530,6 +535,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = harness;
 
         let rocket = rocket::build()
@@ -621,6 +627,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = harness;
 
         let rocket = rocket::build()
@@ -671,6 +678,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = harness;
 
         let rocket = rocket::build()
@@ -802,6 +810,7 @@ mod tests {
             account_cqrs,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
+            ..
         } = harness;
 
         let rocket = rocket::build()

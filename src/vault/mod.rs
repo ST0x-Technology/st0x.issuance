@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -76,44 +76,23 @@ pub(crate) trait VaultService: Send + Sync {
         owner: Address,
     ) -> Result<U256, VaultError>;
 
-    /// Atomically burns tokens and returns dust to user using multicall.
+    /// Atomically burns tokens from multiple receipts and returns dust using multicall.
     ///
-    /// This method implements the dust handling pattern for redemptions where the
-    /// on-chain quantity (18 decimals) exceeds Alpaca's precision (9 decimals).
-    /// It uses multicall to atomically:
-    /// 1. Burn the truncated amount (what Alpaca processed)
-    /// 2. Transfer the dust back to the user's wallet
+    /// This method handles redemptions that require burning from multiple receipts
+    /// when no single receipt has sufficient balance. It uses multicall to atomically:
+    /// 1. Execute N redeem() calls, one for each receipt
+    /// 2. Transfer the dust back to the user's wallet (if dust > 0)
     ///
-    /// Both operations succeed or fail atomically in a single transaction.
-    /// If dust is zero, only the burn is executed.
+    /// All operations succeed or fail atomically in a single transaction.
     ///
     /// # Returns
     ///
-    /// On success, returns [`BurnWithDustResult`] containing transaction details
-    /// and the amount of dust returned.
-    async fn burn_and_return_dust(
+    /// On success, returns [`MultiBurnResult`] containing transaction details
+    /// and per-receipt burn amounts.
+    async fn burn_multiple_receipts(
         &self,
-        params: BurnParams,
-    ) -> Result<BurnWithDustResult, VaultError>;
-}
-
-/// Result of a successful burn-with-dust operation.
-///
-/// Contains all transaction details and the dust returned to the user.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BurnWithDustResult {
-    /// Transaction hash of the multicall transaction
-    pub(crate) tx_hash: B256,
-    /// ERC-1155 receipt ID that was burned from
-    pub(crate) receipt_id: U256,
-    /// Number of ERC-20 shares burned (with 18 decimals)
-    pub(crate) shares_burned: U256,
-    /// Amount of dust returned to user (with 18 decimals)
-    pub(crate) dust_returned: U256,
-    /// Gas consumed by the transaction
-    pub(crate) gas_used: u64,
-    /// Block number where the transaction was included
-    pub(crate) block_number: u64,
+        params: MultiBurnParams,
+    ) -> Result<MultiBurnResult, VaultError>;
 }
 
 /// Result of a successful on-chain minting operation.
@@ -134,25 +113,56 @@ pub(crate) struct MintResult {
     pub(crate) block_number: u64,
 }
 
-/// Parameters for a burn-with-dust operation.
-///
-/// Groups all inputs needed to atomically burn tokens and return dust to the user.
+/// A single burn within a multi-receipt burn operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BurnParams {
-    /// Address of the vault contract
-    pub(crate) vault: Address,
-    /// Amount of shares to burn (truncated to 9 decimals)
-    pub(crate) burn_shares: U256,
-    /// Amount of dust to return to user (can be zero)
-    pub(crate) dust_shares: U256,
+pub(crate) struct MultiBurnEntry {
     /// ERC-1155 receipt ID to burn from
     pub(crate) receipt_id: U256,
+    /// Amount of shares to burn from this receipt
+    pub(crate) burn_shares: U256,
+}
+
+/// Parameters for a multi-receipt burn operation.
+///
+/// Atomically burns shares from multiple receipts in a single transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MultiBurnParams {
+    /// Address of the vault contract
+    pub(crate) vault: Address,
+    /// List of burns to perform (receipt_id, burn_amount)
+    pub(crate) burns: Vec<MultiBurnEntry>,
+    /// Amount of dust to return to user (can be zero)
+    pub(crate) dust_shares: U256,
     /// Address that owns the shares being burned (typically bot wallet)
     pub(crate) owner: Address,
     /// User's address that will receive the dust
     pub(crate) user: Address,
     /// Metadata about the operation for on-chain audit trail
     pub(crate) receipt_info: ReceiptInformation,
+}
+
+/// Result of a single burn within a multi-receipt burn operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MultiBurnResultEntry {
+    /// ERC-1155 receipt ID that was burned from
+    pub(crate) receipt_id: U256,
+    /// Number of ERC-20 shares burned from this receipt
+    pub(crate) shares_burned: U256,
+}
+
+/// Result of a successful multi-receipt burn operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MultiBurnResult {
+    /// Transaction hash of the multicall transaction
+    pub(crate) tx_hash: B256,
+    /// Per-receipt burn results
+    pub(crate) burns: Vec<MultiBurnResultEntry>,
+    /// Amount of dust returned to user (with 18 decimals)
+    pub(crate) dust_returned: U256,
+    /// Gas consumed by the transaction
+    pub(crate) gas_used: u64,
+    /// Block number where the transaction was included
+    pub(crate) block_number: u64,
 }
 
 /// On-chain metadata stored with each vault deposit or withdrawal.
@@ -178,6 +188,33 @@ pub(crate) struct ReceiptInformation {
     pub(crate) notes: Option<String>,
 }
 
+impl ReceiptInformation {
+    /// Creates receipt information for a mint operation.
+    pub(crate) const fn mint(
+        tokenization_request_id: TokenizationRequestId,
+        issuer_request_id: IssuerRequestId,
+        underlying: UnderlyingSymbol,
+        quantity: Quantity,
+        timestamp: DateTime<Utc>,
+        notes: Option<String>,
+    ) -> Self {
+        Self {
+            tokenization_request_id,
+            issuer_request_id,
+            underlying,
+            quantity,
+            operation_type: OperationType::Mint,
+            timestamp,
+            notes,
+        }
+    }
+
+    /// Encodes the receipt information as JSON bytes for on-chain storage.
+    pub(crate) fn encode(&self) -> Result<Bytes, serde_json::Error> {
+        serde_json::to_vec(self).map(Bytes::from)
+    }
+}
+
 /// Type of tokenization operation being performed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OperationType {
@@ -194,8 +231,8 @@ pub(crate) enum VaultError {
     #[error("Invalid receipt")]
     InvalidReceipt,
     /// Expected event (e.g., Deposit) not found in transaction logs
-    #[error("Event not found in transaction: {tx_hash}")]
-    EventNotFound { tx_hash: String },
+    #[error("Event not found in transaction: {tx_hash:?}")]
+    EventNotFound { tx_hash: B256 },
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
@@ -207,4 +244,75 @@ pub(crate) enum VaultError {
     /// Fireblocks vault service error
     #[error(transparent)]
     Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+
+    fn sample_receipt_information() -> ReceiptInformation {
+        ReceiptInformation {
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            issuer_request_id: IssuerRequestId::new("iss-456"),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            quantity: Quantity::new(dec!(100.5)),
+            operation_type: OperationType::Mint,
+            timestamp: Utc::now(),
+            notes: Some("test mint".to_string()),
+        }
+    }
+
+    #[test]
+    fn encode_produces_valid_json() {
+        let info = sample_receipt_information();
+
+        let encoded = info.encode().unwrap();
+
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            decoded["tokenization_request_id"].as_str(),
+            Some("tok-123")
+        );
+        assert_eq!(decoded["issuer_request_id"].as_str(), Some("iss-456"));
+        assert_eq!(decoded["underlying"].as_str(), Some("AAPL"));
+        assert_eq!(decoded["quantity"].as_str(), Some("100.5"));
+        assert_eq!(decoded["operation_type"].as_str(), Some("Mint"));
+        assert_eq!(decoded["notes"].as_str(), Some("test mint"));
+    }
+
+    #[test]
+    fn encode_roundtrips_through_deserialize() {
+        let original = sample_receipt_information();
+
+        let encoded = original.encode().unwrap();
+        let decoded: ReceiptInformation =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.tokenization_request_id,
+            original.tokenization_request_id
+        );
+        assert_eq!(decoded.issuer_request_id, original.issuer_request_id);
+        assert_eq!(decoded.underlying, original.underlying);
+        assert_eq!(decoded.quantity, original.quantity);
+        assert_eq!(decoded.notes, original.notes);
+    }
+
+    #[test]
+    fn encode_handles_none_notes() {
+        let info =
+            ReceiptInformation { notes: None, ..sample_receipt_information() };
+
+        let encoded = info.encode().unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&encoded).unwrap();
+
+        assert!(decoded["notes"].is_null());
+    }
 }
