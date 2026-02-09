@@ -132,9 +132,16 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         Mint,
     >::new_event_store(mint_event_repo));
 
-    // Setup ReceiptInventory CQRS
+    // Setup ReceiptInventory CQRS and event store
     let receipt_inventory_cqrs =
         Arc::new(sqlite_cqrs::<ReceiptInventory>(pool.clone(), vec![], ()));
+    let receipt_inventory_event_repo = SqliteEventRepository::new(pool.clone());
+    let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
+        SqliteEventRepository,
+        ReceiptInventory,
+    >::new_event_store(
+        receipt_inventory_event_repo,
+    ));
 
     // Seed initial assets
     seed_test_assets(&tokenized_asset_cqrs).await?;
@@ -148,6 +155,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         pool.clone(),
         bot,
         receipt_inventory_cqrs,
+        receipt_inventory_event_store,
     ));
 
     let callback_manager = Arc::new(CallbackManager::new(

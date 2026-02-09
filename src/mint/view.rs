@@ -1447,7 +1447,7 @@ mod tests {
 
         mint_cqrs.execute(&iss_1.0, start_minting_cmd).await.unwrap();
 
-        let mint_success_cmd = MintCommand::RecordMintSuccess {
+        let mint_success_cmd = MintCommand::CompleteMinting {
             issuer_request_id: iss_1.clone(),
             tx_hash,
             receipt_id: uint!(1_U256),

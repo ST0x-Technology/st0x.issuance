@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
+use sqlx::Sqlite;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
@@ -24,8 +25,8 @@ use crate::tokenized_asset::{
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 use crate::{
-    AccountCqrs, MintCqrs, ReceiptInventoryCqrs, SqliteEventStore,
-    TokenizedAssetCqrs,
+    AccountCqrs, MintCqrs, MintEventStore, ReceiptInventoryCqrs,
+    ReceiptInventoryEventStore, SqliteEventStore, TokenizedAssetCqrs,
 };
 
 pub(crate) fn test_config() -> Config {
@@ -45,10 +46,11 @@ pub(crate) fn test_config() -> Config {
 }
 
 pub(crate) fn create_test_mint_manager(
-    mint_cqrs: crate::MintCqrs,
-    event_store: crate::MintEventStore,
-    pool: sqlx::Pool<sqlx::Sqlite>,
+    mint_cqrs: MintCqrs,
+    event_store: MintEventStore,
+    pool: sqlx::Pool<Sqlite>,
     receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    receipt_inventory_event_store: ReceiptInventoryEventStore,
 ) -> Arc<
     MintManager<
         PersistedEventStore<SqliteEventRepository, Mint>,
@@ -66,6 +68,7 @@ pub(crate) fn create_test_mint_manager(
         pool,
         bot,
         receipt_inventory_cqrs,
+        receipt_inventory_event_store,
     ))
 }
 
@@ -94,6 +97,7 @@ pub(crate) struct TestHarness {
     pub(crate) asset_cqrs: TokenizedAssetCqrs,
     pub(crate) mint_cqrs: MintCqrs,
     pub(crate) receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    pub(crate) receipt_inventory_event_store: ReceiptInventoryEventStore,
 }
 
 impl TestHarness {
@@ -145,12 +149,18 @@ impl TestHarness {
         let receipt_inventory_cqrs =
             Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
+        let receipt_inventory_event_store = {
+            let event_repo = SqliteEventRepository::new(pool.clone());
+            Arc::new(PersistedEventStore::new_event_store(event_repo))
+        };
+
         Self {
             pool,
             account_cqrs,
             asset_cqrs,
             mint_cqrs,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         }
     }
 }

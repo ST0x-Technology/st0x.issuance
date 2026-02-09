@@ -7,7 +7,8 @@ use sqlx::{Pool, Sqlite};
 use tracing::{debug, error, info, warn};
 
 use crate::receipt_inventory::{
-    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource, Shares,
+    ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptInventoryError,
+    ReceiptSource, Shares,
 };
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
@@ -16,7 +17,9 @@ use crate::vault::{
     MintResult, OperationType, ReceiptInformation, VaultError, VaultService,
 };
 
-use super::view::{MintViewError, find_journal_confirmed};
+use super::view::{
+    MintView, MintViewError, find_incomplete_mints, find_journal_confirmed,
+};
 use super::{
     IssuerRequestId, Mint, MintCommand, MintError, QuantityConversionError,
 };
@@ -29,23 +32,24 @@ use super::{
 ///
 /// This pattern keeps aggregates pure (no side effects in command handlers) while enabling
 /// integration with external systems.
-pub(crate) struct MintManager<ES, RIS>
+pub(crate) struct MintManager<MintStore, ReceiptInventoryStore>
 where
-    ES: EventStore<Mint>,
-    RIS: EventStore<ReceiptInventory>,
+    MintStore: EventStore<Mint>,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     blockchain_service: Arc<dyn VaultService>,
-    cqrs: Arc<CqrsFramework<Mint, ES>>,
-    event_store: Arc<ES>,
+    cqrs: Arc<CqrsFramework<Mint, MintStore>>,
+    event_store: Arc<MintStore>,
     pool: Pool<Sqlite>,
     bot: Address,
-    receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, RIS>>,
+    receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    receipt_inventory_event_store: Arc<ReceiptInventoryStore>,
 }
 
-impl<ES, RIS> MintManager<ES, RIS>
+impl<MintStore, ReceiptInventoryStore> MintManager<MintStore, ReceiptInventoryStore>
 where
-    ES: EventStore<Mint>,
-    RIS: EventStore<ReceiptInventory>,
+    MintStore: EventStore<Mint>,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Creates a new mint manager.
     ///
@@ -57,13 +61,15 @@ where
     /// * `pool` - Database pool for querying views
     /// * `bot` - Bot's address that receives ERC1155 receipts
     /// * `receipt_inventory_cqrs` - CQRS framework for registering receipts in ReceiptInventory
+    /// * `receipt_inventory_event_store` - Event store for loading ReceiptInventory aggregates
     pub(crate) fn new(
         blockchain_service: Arc<dyn VaultService>,
-        cqrs: Arc<CqrsFramework<Mint, ES>>,
-        event_store: Arc<ES>,
+        cqrs: Arc<CqrsFramework<Mint, MintStore>>,
+        event_store: Arc<MintStore>,
         pool: Pool<Sqlite>,
         bot: Address,
-        receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, RIS>>,
+        receipt_inventory_cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        receipt_inventory_event_store: Arc<ReceiptInventoryStore>,
     ) -> Self {
         Self {
             blockchain_service,
@@ -72,6 +78,7 @@ where
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         }
     }
 
@@ -81,7 +88,7 @@ where
     /// 1. Validates the aggregate is in JournalConfirmed state
     /// 2. Converts quantity to U256 with 18 decimals
     /// 3. Calls blockchain service to mint tokens
-    /// 4. Records success (RecordMintSuccess) or failure (RecordMintFailure) via commands
+    /// 4. Records success (CompleteMinting) or failure (FailMinting) via commands
     ///
     /// # Arguments
     ///
@@ -90,8 +97,8 @@ where
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if minting succeeded and RecordMintSuccess command was executed.
-    /// Returns `Err(MintManagerError::Blockchain)` if minting failed (RecordMintFailure
+    /// Returns `Ok(())` if minting succeeded and CompleteMinting command was executed.
+    /// Returns `Err(MintManagerError::Blockchain)` if minting failed (FailMinting
     /// command is still executed to record the failure).
     ///
     /// # Errors
@@ -202,7 +209,7 @@ where
         self.cqrs
             .execute(
                 issuer_request_id.as_str(),
-                MintCommand::RecordMintSuccess {
+                MintCommand::CompleteMinting {
                     issuer_request_id: issuer_request_id.clone(),
                     tx_hash: result.tx_hash,
                     receipt_id: result.receipt_id,
@@ -215,7 +222,7 @@ where
 
         info!(
             issuer_request_id = %issuer_request_id,
-            "RecordMintSuccess command executed successfully"
+            "CompleteMinting command executed successfully"
         );
 
         // Register the receipt in ReceiptInventory for burn planning
@@ -246,7 +253,7 @@ where
         self.cqrs
             .execute(
                 issuer_request_id.as_str(),
-                MintCommand::RecordMintFailure {
+                MintCommand::FailMinting {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error.to_string(),
                 },
@@ -255,7 +262,7 @@ where
 
         info!(
             issuer_request_id = %issuer_request_id,
-            "RecordMintFailure command executed successfully"
+            "FailMinting command executed successfully"
         );
 
         Err(MintManagerError::Blockchain(error))
@@ -371,6 +378,161 @@ where
 
         debug!("Completed recovery of JournalConfirmed mints");
     }
+
+    /// Recovers mints stuck in Minting or MintingFailed state after a restart.
+    ///
+    /// This method:
+    /// 1. Queries for all mints in Minting or MintingFailed state
+    /// 2. For each, checks receipt inventory for a receipt with matching issuer_request_id
+    /// 3. If receipt found: issues RecoverExistingMint (mint succeeded on-chain)
+    /// 4. If no receipt: issues RetryMint and attempts blockchain mint
+    #[tracing::instrument(skip(self))]
+    pub(crate) async fn recover_incomplete_mints(&self) {
+        debug!("Starting recovery of incomplete mints (Minting/MintingFailed)");
+
+        let incomplete_mints = match find_incomplete_mints(&self.pool).await {
+            Ok(mints) => mints,
+            Err(e) => {
+                error!(error = %e, "Failed to query for incomplete mints");
+                return;
+            }
+        };
+
+        if incomplete_mints.is_empty() {
+            debug!("No incomplete mints to recover");
+            return;
+        }
+
+        info!(
+            count = incomplete_mints.len(),
+            "Recovering incomplete mints"
+        );
+
+        for (issuer_request_id, view) in incomplete_mints {
+            if let Err(e) = self
+                .recover_single_incomplete_mint(&issuer_request_id, &view)
+                .await
+            {
+                error!(
+                    issuer_request_id = %issuer_request_id.as_str(),
+                    error = %e,
+                    "Failed to recover incomplete mint"
+                );
+            }
+        }
+
+        debug!("Completed recovery of incomplete mints");
+    }
+
+    async fn recover_single_incomplete_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        view: &MintView,
+    ) -> Result<(), MintManagerError> {
+        let (MintView::Minting { underlying, .. }
+        | MintView::MintingFailed { underlying, .. }) = view
+        else {
+            warn!(
+                issuer_request_id = %issuer_request_id.as_str(),
+                "View is not in Minting or MintingFailed state, skipping"
+            );
+            return Ok(());
+        };
+
+        let vault = find_vault_by_underlying(&self.pool, underlying)
+            .await?
+            .ok_or_else(|| MintManagerError::AssetNotFound {
+                underlying: underlying.0.clone(),
+            })?;
+
+        if let Some(receipt_id) = receipt_inventory.find_by_issuer_request_id(issuer_request_id) {
+            // Mint succeeded on-chain, record it
+            info!(
+                issuer_request_id = %issuer_request_id.as_str(),
+                receipt_id = %receipt_id.inner(),
+                "Found existing receipt for incomplete mint, recording"
+            );
+
+        } else {
+            // No receipt found, need to retry the mint
+            info!(
+                issuer_request_id = %issuer_request_id.as_str(),
+                "No receipt found for incomplete mint, retrying"
+            );
+
+            self.retry_incomplete_mint(issuer_request_id, view).await
+        }
+    }
+
+    async fn recover_existing_mint_from_receipt(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        vault: Address,
+        receipt_inventory: &ReceiptInventory,
+        receipt_id: ReceiptId,
+    ) -> Result<(), MintManagerError> {
+        // Get receipt details from inventory
+        let receipt = receipt_inventory
+            .receipts_with_balance()
+            .into_iter()
+            .find(|candidate| candidate.receipt_id == receipt_id);
+        info!(
+            issuer_request_id = %issuer_request_id.as_str(),
+            "RecoverExistingMint command executed"
+        );
+
+        Ok(())
+    }
+
+    async fn retry_incomplete_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        view: &MintView,
+    ) -> Result<(), MintManagerError> {
+        let (
+            tokenization_request_id,
+            quantity,
+            underlying,
+            wallet,
+            is_minting_failed,
+        ) = match view {
+            MintView::Minting {
+                tokenization_request_id,
+                quantity,
+                underlying,
+                wallet,
+                ..
+            } => (tokenization_request_id, quantity, underlying, wallet, false),
+            MintView::MintingFailed {
+                tokenization_request_id,
+                quantity,
+                underlying,
+                wallet,
+                ..
+            } => (tokenization_request_id, quantity, underlying, wallet, true),
+            _ => return Ok(()),
+        };
+
+        let vault = find_vault_by_underlying(&self.pool, underlying)
+            .await?
+            .ok_or_else(|| MintManagerError::AssetNotFound {
+                underlying: underlying.0.clone(),
+            })?;
+
+        // Now attempt the blockchain mint
+        let assets = quantity.to_u256_with_18_decimals()?;
+
+        match self
+            .blockchain_service
+            .mint_and_transfer_shares(
+                vault,
+                assets,
+                self.bot,
+                *wallet,
+                receipt_info,
+            )
+            .await
+        {
 }
 
 const fn aggregate_state_name(aggregate: &Mint) -> &'static str {
@@ -392,6 +554,8 @@ pub(crate) enum MintManagerError {
     Blockchain(#[from] VaultError),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<MintError>),
+    #[error("Receipt inventory CQRS error: {0}")]
+    ReceiptInventoryCqrs(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]
@@ -574,8 +738,14 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         harness.add_asset(&underlying, vault).await;
 
-        let TestHarness { cqrs, store, pool, receipt_inventory_cqrs, .. } =
-            harness;
+        let TestHarness {
+            cqrs,
+            store,
+            pool,
+            receipt_inventory_cqrs,
+            receipt_inventory_store,
+            ..
+        } = harness;
 
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
@@ -588,6 +758,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_store,
         );
 
         let issuer_request_id = IssuerRequestId::new("iss-success-123");
@@ -646,6 +817,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_store.clone(),
         );
 
         let issuer_request_id = IssuerRequestId::new("iss-receipt-reg-123");
@@ -686,8 +858,14 @@ mod tests {
         let underlying = UnderlyingSymbol::new("AAPL");
         harness.add_asset(&underlying, vault).await;
 
-        let TestHarness { cqrs, store, pool, receipt_inventory_cqrs, .. } =
-            harness;
+        let TestHarness {
+            cqrs,
+            store,
+            pool,
+            receipt_inventory_cqrs,
+            receipt_inventory_store,
+            ..
+        } = harness;
 
         let blockchain_service_mock = Arc::new(MockVaultService::new_failure());
         let blockchain_service = blockchain_service_mock.clone()
@@ -700,6 +878,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_store,
         );
 
         let issuer_request_id = IssuerRequestId::new("iss-failure-456");
@@ -737,8 +916,14 @@ mod tests {
     #[tokio::test]
     async fn test_handle_journal_confirmed_with_wrong_state_fails() {
         let harness = TestHarness::new().await;
-        let TestHarness { cqrs, store, pool, receipt_inventory_cqrs, .. } =
-            &harness;
+        let TestHarness {
+            cqrs,
+            store,
+            pool,
+            receipt_inventory_cqrs,
+            receipt_inventory_store,
+            ..
+        } = &harness;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
@@ -750,6 +935,7 @@ mod tests {
             pool.clone(),
             bot,
             receipt_inventory_cqrs.clone(),
+            receipt_inventory_store.clone(),
         );
 
         let issuer_request_id = IssuerRequestId::new("iss-wrong-state-789");
@@ -829,6 +1015,8 @@ mod tests {
         ReceiptInventory,
         PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
     >;
+    type SqliteReceiptInventoryEventStore =
+        Arc<PersistedEventStore<SqliteEventRepository, ReceiptInventory>>;
 
     async fn setup_recovery_test_env() -> (
         sqlx::Pool<sqlx::Sqlite>,
@@ -841,6 +1029,7 @@ mod tests {
         Arc<PersistedEventStore<SqliteEventRepository, Mint>>,
         SqliteCqrs<TokenizedAsset>,
         Arc<SqliteReceiptInventoryCqrs>,
+        SqliteReceiptInventoryEventStore,
     ) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -887,6 +1076,14 @@ mod tests {
 
         let receipt_inventory_cqrs =
             Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let receipt_inventory_event_repo =
+            SqliteEventRepository::new(pool.clone());
+        let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
+            SqliteEventRepository,
+            ReceiptInventory,
+        >::new_event_store(
+            receipt_inventory_event_repo,
+        ));
 
         (
             pool,
@@ -894,6 +1091,7 @@ mod tests {
             mint_event_store,
             tokenized_asset_cqrs,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         )
     }
 
@@ -905,6 +1103,7 @@ mod tests {
             mint_event_store,
             asset_cqrs,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         ) = setup_recovery_test_env().await;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -964,6 +1163,7 @@ mod tests {
             pool.clone(),
             bot,
             receipt_inventory_cqrs.clone(),
+            receipt_inventory_event_store,
         );
 
         manager.recover_journal_confirmed_mints().await;
@@ -990,6 +1190,7 @@ mod tests {
             mint_event_store,
             _asset_cqrs,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         ) = setup_recovery_test_env().await;
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -1001,6 +1202,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         );
 
         manager.recover_journal_confirmed_mints().await;
@@ -1020,6 +1222,7 @@ mod tests {
             mint_event_store,
             asset_cqrs,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         ) = setup_recovery_test_env().await;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -1083,6 +1286,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_event_store,
         );
 
         manager.recover_journal_confirmed_mints().await;

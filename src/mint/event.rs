@@ -74,6 +74,12 @@ impl DomainEvent for MintEvent {
             Self::MintCompleted { .. } => {
                 "MintEvent::MintCompleted".to_string()
             }
+            Self::ExistingMintRecorded { .. } => {
+                "MintEvent::ExistingMintRecorded".to_string()
+            }
+            Self::MintRetryStarted { .. } => {
+                "MintEvent::MintRetryStarted".to_string()
+            }
         }
     }
 

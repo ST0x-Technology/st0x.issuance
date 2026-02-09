@@ -1130,7 +1130,6 @@ mod tests {
         fn encode_then_determine_source_preserves_issuer_request_id(
             receipt_info in arb_receipt_information()
         ) {
-            let original_id = receipt_info.issuer_request_id.clone();
             let encoded = receipt_info.encode().unwrap();
             let source = determine_source(&encoded);
 
@@ -1138,7 +1137,7 @@ mod tests {
                 ReceiptSource::Itn { issuer_request_id } => {
                     prop_assert_eq!(
                         issuer_request_id.as_str(),
-                        original_id.as_str()
+                        receipt_info.issuer_request_id.as_str()
                     );
                 }
                 ReceiptSource::External => {

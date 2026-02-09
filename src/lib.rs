@@ -267,6 +267,7 @@ pub async fn initialize_rocket(
             &mint_cqrs,
             &mint_event_store,
             &receipt_inventory.cqrs,
+            &receipt_inventory.event_store,
             &pool,
             bot_wallet,
         )?;
@@ -471,6 +472,7 @@ fn setup_mint_managers(
     mint_cqrs: &MintCqrs,
     mint_event_store: &MintEventStore,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+    receipt_inventory_event_store: &ReceiptInventoryEventStore,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
 ) -> Result<MintManagers, anyhow::Error> {
@@ -481,6 +483,7 @@ fn setup_mint_managers(
         pool.clone(),
         bot_wallet,
         receipt_inventory_cqrs.clone(),
+        receipt_inventory_event_store.clone(),
     ));
 
     let alpaca_service = config.alpaca.service()?;
@@ -582,6 +585,7 @@ fn spawn_mint_recovery(
 
     tokio::spawn(async move {
         mint_manager.recover_journal_confirmed_mints().await;
+        mint_manager.recover_incomplete_mints().await;
         callback_manager.recover_callback_pending_mints().await;
     });
 }

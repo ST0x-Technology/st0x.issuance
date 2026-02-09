@@ -368,6 +368,9 @@ impl Mint {
         Ok(())
     }
 
+
+        Self::validate_issuer_request_id(expected_id, &provided_id)?;
+
     fn apply_journal_confirmed(&mut self, confirmed_at: DateTime<Utc>) {
         let Self::Initiated {
             issuer_request_id,
@@ -592,6 +595,98 @@ impl Mint {
             completed_at,
         };
     }
+
+    fn apply_existing_mint_recorded(
+        &mut self,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+        recovered_at: DateTime<Utc>,
+    ) {
+        let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
+        | Self::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }) = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::CallbackPending {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at: recovered_at,
+        };
+    }
+
+    fn apply_mint_retry_started(&mut self, started_at: DateTime<Utc>) {
+        let Self::MintingFailed {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at: started_at,
+        };
+    }
 }
 
 #[async_trait]
@@ -650,7 +745,7 @@ impl Aggregate for Mint {
             MintCommand::StartMinting { issuer_request_id } => {
                 self.handle_start_minting(issuer_request_id)
             }
-            MintCommand::RecordMintSuccess {
+            MintCommand::CompleteMinting {
                 issuer_request_id,
                 tx_hash,
                 receipt_id,
@@ -665,11 +760,29 @@ impl Aggregate for Mint {
                 gas_used,
                 block_number,
             ),
-            MintCommand::RecordMintFailure { issuer_request_id, error } => {
+            MintCommand::FailMinting { issuer_request_id, error } => {
                 self.handle_record_mint_failure(issuer_request_id, error)
             }
-            MintCommand::RecordCallback { issuer_request_id } => {
+            MintCommand::CompleteCallback { issuer_request_id } => {
                 self.handle_record_callback(issuer_request_id)
+            }
+            MintCommand::RecoverExistingMint {
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+            } => self.handle_record_existing_mint(
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+            ),
+            MintCommand::RetryMint { issuer_request_id } => {
+                self.handle_retry_mint(issuer_request_id)
             }
         }
     }
@@ -735,6 +848,28 @@ impl Aggregate for Mint {
             MintEvent::MintCompleted { issuer_request_id: _, completed_at } => {
                 self.apply_mint_completed(completed_at);
             }
+            MintEvent::ExistingMintRecovered {
+                issuer_request_id: _,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+                recovered_at,
+            } => self.apply_existing_mint_recorded(
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+                recovered_at,
+            ),
+            MintEvent::MintRetryStarted {
+                issuer_request_id: _,
+                started_at,
+            } => {
+                self.apply_mint_retry_started(started_at);
+            }
         }
     }
 }
@@ -766,6 +901,11 @@ pub(crate) enum MintError {
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
     )]
     IssuerRequestIdMismatch { expected: String, provided: String },
+
+    #[error(
+        "Mint not in Minting or MintingFailed state. Current state: {current_state}"
+    )]
+    NotInMintingOrMintingFailedState { current_state: String },
 }
 
 #[cfg(test)]
@@ -860,7 +1000,9 @@ mod tests {
                     | MintEvent::MintingStarted { .. }
                     | MintEvent::TokensMinted { .. }
                     | MintEvent::MintingFailed { .. }
-                    | MintEvent::MintCompleted { .. } => {
+                    | MintEvent::MintCompleted { .. }
+                    | MintEvent::ExistingMintRecovered { .. }
+                    | MintEvent::MintRetryStarted { .. } => {
                         panic!(
                             "Expected MintInitiated event, got {:?}",
                             &events[0]
@@ -1476,7 +1618,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordMintSuccess {
+            .when(MintCommand::CompleteMinting {
                 issuer_request_id,
                 tx_hash,
                 receipt_id,
@@ -1536,7 +1678,7 @@ mod tests {
                 wallet,
                 initiated_at: Utc::now(),
             }])
-            .when(MintCommand::RecordMintSuccess {
+            .when(MintCommand::CompleteMinting {
                 issuer_request_id,
                 tx_hash,
                 receipt_id: uint!(1_U256),
@@ -1583,7 +1725,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordMintFailure {
+            .when(MintCommand::FailMinting {
                 issuer_request_id,
                 error: error_message.to_string(),
             });
@@ -1624,7 +1766,7 @@ mod tests {
                 wallet,
                 initiated_at: Utc::now(),
             }])
-            .when(MintCommand::RecordMintFailure {
+            .when(MintCommand::FailMinting {
                 issuer_request_id,
                 error: "Transaction failed".to_string(),
             })
@@ -1790,7 +1932,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordMintSuccess {
+            .when(MintCommand::CompleteMinting {
                 issuer_request_id: wrong_issuer_request_id,
                 tx_hash: b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
                 receipt_id: uint!(1_U256),
@@ -1839,7 +1981,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordMintFailure {
+            .when(MintCommand::FailMinting {
                 issuer_request_id: wrong_issuer_request_id,
                 error: "Transaction failed".to_string(),
             })
@@ -1894,7 +2036,7 @@ mod tests {
                     minted_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordCallback { issuer_request_id });
+            .when(MintCommand::CompleteCallback { issuer_request_id });
 
         let events = validator.inspect_result().unwrap();
 
@@ -1936,7 +2078,7 @@ mod tests {
                     confirmed_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordCallback { issuer_request_id })
+            .when(MintCommand::CompleteCallback { issuer_request_id })
             .then_expect_error(MintError::NotInCallbackPendingState {
                 current_state: "JournalConfirmed".to_string(),
             });
@@ -1989,7 +2131,7 @@ mod tests {
                     minted_at: Utc::now(),
                 },
             ])
-            .when(MintCommand::RecordCallback {
+            .when(MintCommand::CompleteCallback {
                 issuer_request_id: wrong_issuer_request_id,
             })
             .then_expect_error(MintError::IssuerRequestIdMismatch {
@@ -2173,6 +2315,7 @@ mod tests {
         receipt_inventory_cqrs: Arc<
             CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>,
         >,
+        receipt_inventory_store: Arc<MemStore<ReceiptInventory>>,
     ) -> MintManager<MemStore<Mint>, MemStore<ReceiptInventory>> {
         let blockchain_service =
             Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
@@ -2185,6 +2328,7 @@ mod tests {
             pool,
             bot,
             receipt_inventory_cqrs,
+            receipt_inventory_store,
         )
     }
 
@@ -2291,6 +2435,7 @@ mod tests {
             store.clone(),
             pool.clone(),
             receipt_inventory_cqrs,
+            receipt_inventory_store,
         );
         let callback_manager =
             create_test_callback_manager(cqrs.clone(), store.clone(), pool);
