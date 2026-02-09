@@ -191,8 +191,8 @@ Segregation (CQRS)** patterns as its architectural foundation.
 **Key Flow:**
 
 ```
-Command → Aggregate.handle() → Validate & Produce Events → Persist Events
-  → Apply to Aggregate → Update Views
+Command -> Aggregate.handle() -> Validate & Produce Events -> Persist Events
+  -> Apply to Aggregate -> Update Views
 ```
 
 **Critical Methods:**
@@ -229,6 +229,57 @@ Command → Aggregate.handle() → Validate & Produce Events → Persist Events
 - Ask yourself: "Do I need this event for a feature I'm implementing right now?"
   If not, don't add it yet
 - YAGNI (You Aren't Gonna Need It) applies especially to events
+
+### Services and Trait Design in CQRS/ES
+
+**Services represent business capabilities**, not implementation details. A
+well-designed service trait:
+
+- **Models domain capabilities**: The trait methods should describe what the
+  system can DO in domain terms, not how it's implemented. What counts as
+  "domain" depends on context - in this financial infrastructure, burning tokens
+  is a domain concern because 1:1 backing is the value proposition. In a video
+  game, token burning might be an implementation detail.
+- **Plugs into command handlers**: Aggregates use services to fulfill commands.
+  When a command says "do X", the service provides the capability to actually do
+  X. Events are then produced based on what the service did.
+- **Decouples aggregates from external systems**: Services abstract external
+  integrations (blockchain, APIs, other aggregates) behind domain-meaningful
+  interfaces. This allows swapping implementations without changing aggregates.
+- **Enables clean testing**: Mock the trait to test aggregate logic without real
+  external systems. Tests verify business behavior, not integration details.
+
+**Commands vs Events vs Services:**
+
+```
+Command: "I want the system to do X"
+   v
+Command Handler: Uses services to actually do X
+   v
+Event: "X happened" (captures the fact, including service responses)
+```
+
+The command expresses intent. The service executes. The event records what
+occurred. This separation keeps aggregates focused on business logic while
+services handle execution.
+
+**Anti-patterns to avoid:**
+
+- Single-method traits that just wrap CQRS commands (no domain logic added)
+- Trait methods named after implementation ("record", "persist", "save")
+- Inconsistent patterns (some aggregates use traits, others use CQRS directly)
+- Traits that don't represent a coherent business capability
+- External managers orchestrating complex sequences of commands across multiple
+  aggregates - commands should invoke business actions directly, using services
+  to fulfill them, rather than just recording what external orchestrators did
+
+**This system's domain context:**
+
+This is financial infrastructure where tokens derive value from 1:1 backing.
+Partners and integrators care that minting creates backed tokens and burning
+redeems them. Internal mechanics (how we track receipts, plan burns, etc.) are
+implementation details - the domain concern is that tokens are properly backed
+and redeemable.
 
 ### Aggregates
 
@@ -362,11 +413,11 @@ sqlx::query!(r#"SELECT json_extract(payload, '$.field') FROM view"#)
 
 **Mint Flow:**
 
-1. AP requests mint → Alpaca calls our `/inkind/issuance` endpoint
+1. AP requests mint -> Alpaca calls our `/inkind/issuance` endpoint
 2. We validate and respond with `issuer_request_id` (Command: `InitiateMint`,
    Event: `MintInitiated`)
 3. Alpaca journals shares from AP to our custodian account
-4. Alpaca confirms journal → we receive `/inkind/issuance/confirm` (Command:
+4. Alpaca confirms journal -> we receive `/inkind/issuance/confirm` (Command:
    `ConfirmJournal`, Events: `JournalConfirmed`, `MintingStarted`)
 5. We mint tokens on-chain via `vault.multicall()` which atomically executes:
    - `deposit()` - Mints receipts + shares to bot's wallet
@@ -377,7 +428,7 @@ sqlx::query!(r#"SELECT json_extract(payload, '$.field') FROM view"#)
 
 **Redemption Flow:**
 
-1. AP sends tokens to our redemption wallet → we detect transfer (Command:
+1. AP sends tokens to our redemption wallet -> we detect transfer (Command:
    `DetectRedemption`, Event: `RedemptionDetected`)
 2. We call Alpaca's redeem endpoint (Command: `RecordAlpacaCall`, Event:
    `AlpacaCalled`)
@@ -707,8 +758,8 @@ unit tests cover the edge cases in each component.
 
 ### Given-When-Then Aggregate Testing
 
-ES/CQRS enables testable business logic: **Given** previous events → **When**
-command → **Then** expect events (or error).
+ES/CQRS enables testable business logic: **Given** previous events -> **When**
+command -> **Then** expect events (or error).
 
 ```rust
 #[test]
@@ -895,8 +946,8 @@ This is a zero-tolerance policy. Speculation presented as fact is unacceptable.
 // FORBIDDEN: "ERC-20 minting emits Transfer from zero address"
 
 // REQUIRED: "Let me check..." [reads files] "Found it:
-// 1. deposit() → ReceiptVault._deposit() (lib/.../ReceiptVault.sol:559)
-// 2. _deposit() → _mint() (lib/.../ReceiptVault.sol:587)
+// 1. deposit() -> ReceiptVault._deposit() (lib/.../ReceiptVault.sol:559)
+// 2. _deposit() -> _mint() (lib/.../ReceiptVault.sol:587)
 // 3. ReceiptVault inherits ERC20Upgradeable (lib/.../ReceiptVault.sol:5)
 // 4. _mint() emits Transfer(0, to, amt) (lib/.../ERC20Upgradeable.sol:266)"
 ```
@@ -935,7 +986,7 @@ Use `///` doc comments for public APIs. Keep comments focused on "why" not
 
 ### Module Organization
 
-Order by visibility: **public API first** → **impl blocks after types** →
+Order by visibility: **public API first** -> **impl blocks after types** ->
 **private helpers last**. This makes public interface immediately visible.
 
 ```rust
