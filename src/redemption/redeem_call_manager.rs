@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRequestId, Redemption, RedemptionCommand, RedemptionError,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionViewError, find_detected,
 };
 use crate::QuantityConversionError;
@@ -72,7 +72,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
     async fn recover_single_detected(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), RedeemCallManagerError> {
         let aggregate_ctx = self
             .event_store
@@ -159,7 +159,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     pub(crate) async fn handle_redemption_detected(
         &self,
         alpaca_account: &AlpacaAccountNumber,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
         client_id: ClientId,
         network: Network,
@@ -288,7 +288,7 @@ pub(crate) enum RedeemCallManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256};
+    use alloy::primitives::{Address, TxHash, address, b256};
     use cqrs_es::persist::{GenericQuery, PersistedEventStore};
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
@@ -299,6 +299,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
@@ -306,9 +307,10 @@ mod tests {
         Email,
     };
     use crate::alpaca::mock::MockAlpacaService;
-    use crate::mint::{IssuerRequestId, Quantity};
+    use crate::mint::Quantity;
     use crate::redemption::{
-        Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
+        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionView, UnderlyingSymbol,
     };
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -316,7 +318,6 @@ mod tests {
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
-    use uuid::Uuid;
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -458,7 +459,7 @@ mod tests {
 
         async fn detect_redemption(
             &self,
-            issuer_request_id: &IssuerRequestId,
+            issuer_request_id: &IssuerRedemptionRequestId,
             underlying: &UnderlyingSymbol,
             wallet: Address,
         ) {
@@ -521,7 +522,7 @@ mod tests {
     async fn create_test_redemption_in_detected_state(
         cqrs: &TestCqrs,
         store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -552,7 +553,7 @@ mod tests {
 
     async fn load_aggregate(
         store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let context =
             store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
@@ -572,7 +573,7 @@ mod tests {
             pool,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let aggregate = create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -620,7 +621,7 @@ mod tests {
             pool,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let aggregate = create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -669,7 +670,7 @@ mod tests {
         let manager =
             RedeemCallManager::new(alpaca_service, cqrs.clone(), store, pool);
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let aggregate = Redemption::Uninitialized;
 
         let client_id = ClientId::new();
@@ -818,7 +819,7 @@ mod tests {
             .await;
         harness.add_asset(&underlying, &network).await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         harness
             .detect_redemption(&issuer_request_id, &underlying, wallet)
             .await;
@@ -856,7 +857,7 @@ mod tests {
             pool.clone(),
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -897,7 +898,7 @@ mod tests {
             )
             .await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         harness
             .detect_redemption(&issuer_request_id, &underlying, wallet)
             .await;

@@ -271,6 +271,9 @@ where
             return Ok(ProcessOutcome::ZeroBalance);
         }
 
+        let (source, receipt_info) =
+            determine_source(&deposit.receipt_information);
+
         self.cqrs
             .execute(
                 &self.vault.to_string(),
@@ -279,7 +282,8 @@ where
                     balance: Shares::from(current_balance),
                     block_number: deposit.block_number,
                     tx_hash: deposit.tx_hash,
-                    source: determine_source(&deposit.receipt_information),
+                    source,
+                    receipt_info,
                 },
             )
             .await?;

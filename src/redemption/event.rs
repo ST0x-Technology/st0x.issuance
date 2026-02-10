@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use super::IssuerRedemptionRequestId;
+use crate::mint::{Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 /// A single burn operation within a multi-receipt burn.
@@ -21,7 +22,7 @@ pub(crate) struct BurnRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum RedemptionEvent {
     Detected {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         wallet: Address,
@@ -31,7 +32,7 @@ pub(crate) enum RedemptionEvent {
         detected_at: DateTime<Utc>,
     },
     AlpacaCalled {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         /// Quantity sent to Alpaca (truncated to 9 decimals).
         /// For events prior to dust handling feature: defaults to zero.
@@ -44,21 +45,21 @@ pub(crate) enum RedemptionEvent {
         called_at: DateTime<Utc>,
     },
     AlpacaCallFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         failed_at: DateTime<Utc>,
     },
     AlpacaJournalCompleted {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         alpaca_journal_completed_at: DateTime<Utc>,
     },
     RedemptionFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         failed_at: DateTime<Utc>,
     },
     TokensBurned {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tx_hash: B256,
         /// All receipt burns performed in this transaction.
         /// v2.0 format: multiple burns in a single atomic transaction.
@@ -74,7 +75,7 @@ pub(crate) enum RedemptionEvent {
         burned_at: DateTime<Utc>,
     },
     BurningFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         failed_at: DateTime<Utc>,
     },
@@ -117,14 +118,19 @@ impl DomainEvent for RedemptionEvent {
 mod tests {
     use alloy::primitives::{U256, b256, uint};
     use chrono::Utc;
-    use uuid::Uuid;
 
     use super::*;
+
+    fn test_redemption_id() -> IssuerRedemptionRequestId {
+        IssuerRedemptionRequestId::new(b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ))
+    }
 
     #[test]
     fn test_alpaca_journal_completed_event_type() {
         let event = RedemptionEvent::AlpacaJournalCompleted {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: test_redemption_id(),
             alpaca_journal_completed_at: Utc::now(),
         };
 
@@ -137,7 +143,7 @@ mod tests {
     #[test]
     fn test_tokens_burned_event_type() {
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: test_redemption_id(),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -158,7 +164,7 @@ mod tests {
     #[test]
     fn test_tokens_burned_serialization() {
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: test_redemption_id(),
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
@@ -182,7 +188,7 @@ mod tests {
     #[test]
     fn test_burning_failed_event_type() {
         let event = RedemptionEvent::BurningFailed {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: test_redemption_id(),
             error: "Blockchain error: timeout".to_string(),
             failed_at: Utc::now(),
         };
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn test_burning_failed_serialization() {
         let event = RedemptionEvent::BurningFailed {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: test_redemption_id(),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
         };
@@ -210,7 +216,7 @@ mod tests {
     fn test_backwards_compat_alpaca_called_without_dust_fields() {
         let json = r#"{
             "AlpacaCalled": {
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdef12",
                 "tokenization_request_id": "tok-old-123",
                 "called_at": "2025-01-01T00:00:00Z"
             }
@@ -236,7 +242,7 @@ mod tests {
     fn test_backwards_compat_tokens_burned_v2_without_dust_fields() {
         let json = r#"{
             "TokensBurned": {
-                "issuer_request_id": "00000000-0000-0000-0000-000000000456",
+                "issuer_request_id": "red-abcdef12",
                 "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                 "burns": [{"receipt_id": "0x42", "shares_burned": "0x56bc75e2d63100000"}],
                 "gas_used": 50000,

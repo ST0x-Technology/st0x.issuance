@@ -110,28 +110,32 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         &self,
         params: super::MultiBurnParams,
     ) -> Result<super::MultiBurnResult, VaultError> {
-        let receipt_info_bytes = params.receipt_info.encode()?;
-
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
 
-        // Build redeem calls for each burn
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
             .map(|burn| {
-                vault_contract
+                let receipt_info_bytes = burn
+                    .receipt_info
+                    .as_ref()
+                    .map(|info| info.encode())
+                    .transpose()?
+                    .unwrap_or_default();
+
+                Ok(vault_contract
                     .redeem(
                         burn.burn_shares,
                         params.user,
                         params.owner,
                         burn.receipt_id,
-                        receipt_info_bytes.clone(),
+                        receipt_info_bytes,
                     )
                     .calldata()
-                    .clone()
+                    .clone())
             })
-            .collect();
+            .collect::<Result<Vec<_>, VaultError>>()?;
 
         // Build multicall: all redeems, plus optional dust transfer
         let calls = if params.dust_shares > U256::ZERO {
@@ -209,23 +213,27 @@ mod tests {
     use super::RealBlockchainService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::{
-        IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
+        IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, OperationType, ReceiptInformation,
-        VaultError, VaultService,
+        MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
+        VaultService,
     };
 
     fn test_receipt_info() -> ReceiptInformation {
-        ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            quantity: Quantity::new(Decimal::from(100)),
-            operation_type: OperationType::Mint,
-            timestamp: Utc::now(),
-            notes: None,
-        }
+        ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::new(Uuid::new_v4()),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::from(100)),
+            Utc::now(),
+            None,
+        )
+    }
+
+    fn test_issuer_redemption_id() -> IssuerRedemptionRequestId {
+        IssuerRedemptionRequestId::new(B256::from([0xAB; 32]))
     }
 
     fn test_receiver() -> Address {
@@ -560,15 +568,14 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc);
 
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            quantity: Quantity::new(Decimal::from(100)),
-            operation_type: OperationType::Mint,
-            timestamp: fixed_timestamp,
-            notes: None,
-        };
+        let receipt_info = ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::new(Uuid::new_v4()),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::from(100)),
+            fixed_timestamp,
+            None,
+        );
 
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
@@ -691,8 +698,6 @@ mod tests {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x3333333333333333333333333333333333333333");
-        let mut receipt_info = test_receipt_info();
-        receipt_info.operation_type = OperationType::Redeem;
 
         let tx_hash = fixed_bytes!(
             "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
@@ -724,12 +729,13 @@ mod tests {
                     .map(|(receipt_id, burn_shares)| MultiBurnEntry {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
+                        receipt_info: None,
                     })
                     .collect(),
                 dust_shares: U256::ZERO,
                 owner,
                 user,
-                receipt_info,
+                issuer_request_id: test_issuer_redemption_id(),
             })
             .await;
 
@@ -752,8 +758,6 @@ mod tests {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x4444444444444444444444444444444444444444");
-        let mut receipt_info = test_receipt_info();
-        receipt_info.operation_type = OperationType::Redeem;
 
         let tx_hash = fixed_bytes!(
             "0xfeedface feedface feedface feedface feedface feedface feedface feedface"
@@ -783,12 +787,13 @@ mod tests {
                     .map(|(receipt_id, burn_shares)| MultiBurnEntry {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
+                        receipt_info: None,
                     })
                     .collect(),
                 dust_shares,
                 owner,
                 user,
-                receipt_info,
+                issuer_request_id: test_issuer_redemption_id(),
             })
             .await;
 
@@ -807,8 +812,6 @@ mod tests {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x5555555555555555555555555555555555555555");
-        let mut receipt_info = test_receipt_info();
-        receipt_info.operation_type = OperationType::Redeem;
 
         let tx_hash = fixed_bytes!(
             "0xaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
@@ -841,12 +844,13 @@ mod tests {
                     .map(|(receipt_id, burn_shares)| MultiBurnEntry {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
+                        receipt_info: None,
                     })
                     .collect(),
                 dust_shares: U256::ZERO,
                 owner,
                 user,
-                receipt_info,
+                issuer_request_id: test_issuer_redemption_id(),
             })
             .await;
 
@@ -877,8 +881,6 @@ mod tests {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x6666666666666666666666666666666666666666");
-        let mut receipt_info = test_receipt_info();
-        receipt_info.operation_type = OperationType::Redeem;
 
         let tx_hash = fixed_bytes!(
             "0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
@@ -899,16 +901,18 @@ mod tests {
                     MultiBurnEntry {
                         receipt_id: U256::from(1),
                         burn_shares: U256::from(100),
+                        receipt_info: None,
                     },
                     MultiBurnEntry {
                         receipt_id: U256::from(2),
                         burn_shares: U256::from(200),
+                        receipt_info: None,
                     },
                 ],
                 dust_shares: U256::ZERO,
                 owner,
                 user,
-                receipt_info,
+                issuer_request_id: test_issuer_redemption_id(),
             })
             .await;
 

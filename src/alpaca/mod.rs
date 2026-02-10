@@ -5,7 +5,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::account::ClientId;
-use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use crate::mint::{Quantity, TokenizationRequestId};
+use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 pub(crate) mod mock;
@@ -94,7 +95,7 @@ pub(crate) struct MintCallbackRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RedeemRequest {
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     #[serde(rename = "underlying_symbol")]
     pub(crate) underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
@@ -111,7 +112,7 @@ pub(crate) struct RedeemRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RedeemResponse {
     pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     pub(crate) created_at: DateTime<Utc>,
     #[serde(rename = "type")]
     pub(crate) r#type: TokenizationRequestType,
@@ -233,10 +234,10 @@ mod tests {
     use alloy::primitives::{address, b256};
     use rust_decimal::Decimal;
     use serde_json::json;
-    use uuid::uuid;
 
     use crate::account::ClientId;
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     use super::{MintCallbackRequest, RedeemRequest};
@@ -285,28 +286,24 @@ mod tests {
     #[test]
     fn test_redeem_request_serialization() {
         let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
 
         let request = RedeemRequest {
-            issuer_request_id: IssuerRequestId::new(uuid!(
-                "00000000-0000-0000-0000-00000abc0123"
-            )),
+            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id,
             quantity: Quantity::new(Decimal::new(10050, 2)),
             network: Network::new("base"),
             wallet: address!("0x9999999999999999999999999999999999999999"),
-            tx_hash: b256!(
-                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            ),
+            tx_hash,
         };
 
         let serialized = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(
-            serialized["issuer_request_id"],
-            json!("00000000-0000-0000-0000-00000abc0123")
-        );
+        assert_eq!(serialized["issuer_request_id"], json!("red-12345678"));
         assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
         assert_eq!(serialized["token_symbol"], json!("tAAPL"));
         assert_eq!(

@@ -202,30 +202,30 @@ impl VaultService for MockVaultService {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address};
+    use alloy::primitives::{Address, B256, U256, address};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
     use super::MockVaultService;
     use crate::mint::{
-        IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
+        IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, OperationType, ReceiptInformation,
-        VaultError, VaultService,
+        MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
+        VaultService,
     };
 
     fn test_receipt_info() -> ReceiptInformation {
-        ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            quantity: Quantity::new(Decimal::from(100)),
-            operation_type: OperationType::Mint,
-            timestamp: Utc::now(),
-            notes: None,
-        }
+        ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::new(Uuid::new_v4()),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::from(100)),
+            Utc::now(),
+            None,
+        )
     }
 
     fn test_receiver() -> Address {
@@ -352,8 +352,8 @@ mod tests {
         assert_eq!(call.assets, assets);
         assert_eq!(call.receiver, bot_wallet);
         assert_eq!(
-            call.receipt_info.tokenization_request_id.0,
-            receipt_info.tokenization_request_id.0
+            call.receipt_info.issuer_request_id,
+            receipt_info.issuer_request_id
         );
     }
 
@@ -427,6 +427,7 @@ mod tests {
             burns: vec![MultiBurnEntry {
                 receipt_id: U256::from(42),
                 burn_shares: U256::from(500),
+                receipt_info: Some(test_receipt_info()),
             }],
             dust_shares: U256::from(10),
             owner: test_receiver(),

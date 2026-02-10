@@ -4,14 +4,14 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use uuid::Uuid;
 
 use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
     RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     TokenizationRequestType,
 };
-use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use crate::mint::{Quantity, TokenizationRequestId};
+use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 /// Mock Alpaca service for testing.
@@ -159,7 +159,9 @@ impl AlpacaService for MockAlpacaService {
             if self.should_succeed {
                 Ok(super::TokenizationRequest {
                     id: tokenization_request_id.clone(),
-                    issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                    issuer_request_id: IssuerRedemptionRequestId::new(b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    )),
                     r#type: TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
@@ -182,7 +184,9 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(not(test))]
         Ok(super::TokenizationRequest {
             id: tokenization_request_id.clone(),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerRedemptionRequestId::new(b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            )),
             r#type: TokenizationRequestType::Redeem,
             status: RedeemRequestStatus::Completed,
             underlying: UnderlyingSymbol::new("AAPL"),
@@ -200,14 +204,14 @@ impl AlpacaService for MockAlpacaService {
 mod tests {
     use alloy::primitives::{address, b256};
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::MockAlpacaService;
     use crate::account::ClientId;
     use crate::alpaca::{
         AlpacaService, MintCallbackRequest, RedeemRequest, RedeemRequestStatus,
     };
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     #[tokio::test]
@@ -284,8 +288,11 @@ mod tests {
     }
 
     fn create_redeem_request() -> RedeemRequest {
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
         RedeemRequest {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId::new(),

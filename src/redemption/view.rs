@@ -7,9 +7,9 @@ use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use thiserror::Error;
-use uuid::Uuid;
 
-use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use super::IssuerRedemptionRequestId;
+use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
@@ -17,7 +17,7 @@ use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 pub(crate) enum RedemptionView {
     Unavailable,
     Detected {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
         wallet: Address,
@@ -27,7 +27,7 @@ pub(crate) enum RedemptionView {
         detected_at: DateTime<Utc>,
     },
     AlpacaCalled {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
@@ -41,7 +41,7 @@ pub(crate) enum RedemptionView {
         called_at: DateTime<Utc>,
     },
     Burning {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
@@ -56,18 +56,18 @@ pub(crate) enum RedemptionView {
         alpaca_journal_completed_at: DateTime<Utc>,
     },
     Completed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         block_number: u64,
         completed_at: DateTime<Utc>,
     },
     Failed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         failed_at: DateTime<Utc>,
     },
     BurnFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
@@ -94,7 +94,7 @@ impl Default for RedemptionView {
 impl RedemptionView {
     fn update_alpaca_called(
         &mut self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         alpaca_quantity: Quantity,
         dust_quantity: Quantity,
@@ -132,7 +132,7 @@ impl RedemptionView {
 
     fn update_alpaca_journal_completed(
         &mut self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         alpaca_journal_completed_at: DateTime<Utc>,
     ) {
         let Self::AlpacaCalled {
@@ -303,10 +303,10 @@ pub(crate) enum RedemptionViewError {
     Database(#[from] sqlx::Error),
     #[error("JSON deserialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    IssuerRequestIdParse(#[from] super::IssuerRedemptionRequestIdParseError),
     #[error("Replay error: {0}")]
     Replay(#[from] AggregateError<RedemptionError>),
-    #[error("UUID parse error: {0}")]
-    Uuid(#[from] uuid::Error),
 }
 
 /// Replays all `Redemption` events through the `redemption_view`.
@@ -337,7 +337,8 @@ pub async fn replay_redemption_view(
 /// Alpaca redeem API hasn't been called yet (or the call failed).
 pub(crate) async fn find_detected(
     pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
     let rows = sqlx::query!(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload!: String"
@@ -351,8 +352,8 @@ pub(crate) async fn find_detected(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            let id = Uuid::parse_str(&row.view_id)?;
-            Ok((IssuerRequestId::new(id), view))
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
         })
         .collect()
 }
@@ -363,7 +364,8 @@ pub(crate) async fn find_detected(
 /// journal hasn't completed yet.
 pub(crate) async fn find_alpaca_called(
     pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
     let rows = sqlx::query!(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload!: String"
@@ -377,8 +379,8 @@ pub(crate) async fn find_alpaca_called(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            let id = Uuid::parse_str(&row.view_id)?;
-            Ok((IssuerRequestId::new(id), view))
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
         })
         .collect()
 }
@@ -389,7 +391,8 @@ pub(crate) async fn find_alpaca_called(
 /// burn hasn't been executed yet.
 pub(crate) async fn find_burning(
     pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
     let rows = sqlx::query!(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload!: String"
@@ -403,8 +406,8 @@ pub(crate) async fn find_burning(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            let id = Uuid::parse_str(&row.view_id)?;
-            Ok((IssuerRequestId::new(id), view))
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
         })
         .collect()
 }
@@ -415,7 +418,8 @@ pub(crate) async fn find_burning(
 /// burn failed. They need recovery - the burn should be retried.
 pub(crate) async fn find_burn_failed(
     pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, RedemptionView)>, RedemptionViewError> {
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
     let rows = sqlx::query!(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload!: String"
@@ -429,15 +433,15 @@ pub(crate) async fn find_burn_failed(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            let id = Uuid::parse_str(&row.view_id)?;
-            Ok((IssuerRequestId::new(id), view))
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address, b256};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, b256};
     use chrono::Utc;
     use cqrs_es::persist::GenericQuery;
     use cqrs_es::{EventEnvelope, View};
@@ -452,11 +456,21 @@ mod tests {
         RedemptionView, find_alpaca_called, find_burn_failed, find_burning,
         find_detected,
     };
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-    use crate::redemption::{Redemption, RedemptionCommand, RedemptionEvent};
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::{
+        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionEvent,
+    };
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{MultiBurnEntry, OperationType, ReceiptInformation};
+    use crate::vault::MultiBurnEntry;
+
+    fn new_redemption_id() -> IssuerRedemptionRequestId {
+        let uuid = Uuid::new_v4();
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(uuid.as_bytes());
+        IssuerRedemptionRequestId::new(TxHash::from(bytes))
+    }
 
     fn make_detected_envelope(
         aggregate_id: &str,
@@ -531,7 +545,7 @@ mod tests {
 
         async fn detect_redemption(
             &self,
-            id: &IssuerRequestId,
+            id: &IssuerRedemptionRequestId,
             underlying: &str,
             wallet: Address,
             quantity: u64,
@@ -557,7 +571,7 @@ mod tests {
 
         async fn call_alpaca(
             &self,
-            id: &IssuerRequestId,
+            id: &IssuerRedemptionRequestId,
             tokenization_request_id: &str,
         ) {
             self.cqrs
@@ -576,7 +590,10 @@ mod tests {
                 .expect("Failed to record alpaca call");
         }
 
-        async fn confirm_alpaca_complete(&self, id: &IssuerRequestId) {
+        async fn confirm_alpaca_complete(
+            &self,
+            id: &IssuerRedemptionRequestId,
+        ) {
             self.cqrs
                 .execute(
                     &id.to_string(),
@@ -588,7 +605,7 @@ mod tests {
                 .expect("Failed to confirm alpaca complete");
         }
 
-        async fn burn_tokens(&self, id: &IssuerRequestId) {
+        async fn burn_tokens(&self, id: &IssuerRedemptionRequestId) {
             self.cqrs
                 .execute(
                     &id.to_string(),
@@ -600,22 +617,12 @@ mod tests {
                         burns: vec![MultiBurnEntry {
                             receipt_id: U256::from(1),
                             burn_shares: U256::from(100),
+                            receipt_info: None,
                         }],
                         dust_shares: U256::ZERO,
                         owner: address!(
                             "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
                         ),
-                        receipt_info: ReceiptInformation {
-                            tokenization_request_id: TokenizationRequestId::new(
-                                "tok-test",
-                            ),
-                            issuer_request_id: id.clone(),
-                            underlying: UnderlyingSymbol::new("AAPL"),
-                            quantity: Quantity::new(Decimal::from(100)),
-                            operation_type: OperationType::Redeem,
-                            timestamp: Utc::now(),
-                            notes: None,
-                        },
                     },
                 )
                 .await
@@ -633,7 +640,7 @@ mod tests {
     fn test_view_updates_on_detected_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -690,7 +697,7 @@ mod tests {
     fn test_view_updates_on_alpaca_called_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
@@ -772,7 +779,7 @@ mod tests {
     fn test_view_updates_on_alpaca_journal_completed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("NVDA");
@@ -867,7 +874,7 @@ mod tests {
     fn test_view_updates_on_redemption_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let underlying = UnderlyingSymbol::new("META");
         let token = TokenSymbol::new("tMETA");
         let wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -925,7 +932,7 @@ mod tests {
     fn test_view_updates_on_alpaca_call_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let underlying = UnderlyingSymbol::new("GOOGL");
         let token = TokenSymbol::new("tGOOGL");
         let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -984,7 +991,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = IssuerRequestId::new(Uuid::new_v4());
+        let detected_id = new_redemption_id();
         harness
             .detect_redemption(
                 &detected_id,
@@ -996,7 +1003,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
+        let alpaca_called_id = new_redemption_id();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1009,7 +1016,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-1").await;
 
-        let completed_id = IssuerRequestId::new(Uuid::new_v4());
+        let completed_id = new_redemption_id();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1036,7 +1043,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = IssuerRequestId::new(Uuid::new_v4());
+        let completed_id = new_redemption_id();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1062,7 +1069,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=3 {
-            let id = IssuerRequestId::new(Uuid::new_v4());
+            let id = new_redemption_id();
             harness
                 .detect_redemption(
                     &id,
@@ -1085,7 +1092,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = IssuerRequestId::new(Uuid::new_v4());
+        let detected_id = new_redemption_id();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1097,7 +1104,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
+        let alpaca_called_id = new_redemption_id();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1110,7 +1117,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-query").await;
 
-        let burning_id = IssuerRequestId::new(Uuid::new_v4());
+        let burning_id = new_redemption_id();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1136,7 +1143,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = IssuerRequestId::new(Uuid::new_v4());
+        let detected_id = new_redemption_id();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1158,7 +1165,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = IssuerRequestId::new(Uuid::new_v4());
+        let detected_id = new_redemption_id();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1170,7 +1177,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
+        let alpaca_called_id = new_redemption_id();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1183,7 +1190,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-2").await;
 
-        let burning_id = IssuerRequestId::new(Uuid::new_v4());
+        let burning_id = new_redemption_id();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1197,7 +1204,7 @@ mod tests {
         harness.call_alpaca(&burning_id, "tok-burn-query").await;
         harness.confirm_alpaca_complete(&burning_id).await;
 
-        let completed_id = IssuerRequestId::new(Uuid::new_v4());
+        let completed_id = new_redemption_id();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1224,7 +1231,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = IssuerRequestId::new(Uuid::new_v4());
+        let completed_id = new_redemption_id();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1250,7 +1257,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=2 {
-            let id = IssuerRequestId::new(Uuid::new_v4());
+            let id = new_redemption_id();
             harness
                 .detect_redemption(
                     &id,
@@ -1273,7 +1280,7 @@ mod tests {
     #[test]
     fn test_view_updates_on_burning_failed_event() {
         let mut view = RedemptionView::default();
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let id = issuer_request_id.to_string();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-failed-456");
@@ -1376,7 +1383,7 @@ mod tests {
         let TestHarness { pool, cqrs } = &harness;
 
         // Create a redemption in Detected state
-        let detected_id = IssuerRequestId::new(Uuid::new_v4());
+        let detected_id = new_redemption_id();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1391,7 +1398,7 @@ mod tests {
             .await;
 
         // Create a redemption in Burning state
-        let burning_id = IssuerRequestId::new(Uuid::new_v4());
+        let burning_id = new_redemption_id();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1408,7 +1415,7 @@ mod tests {
         harness.confirm_alpaca_complete(&burning_id).await;
 
         // Create a redemption in BurnFailed state
-        let burn_failed_id = IssuerRequestId::new(Uuid::new_v4());
+        let burn_failed_id = new_redemption_id();
         harness
             .detect_redemption(
                 &burn_failed_id,
@@ -1455,7 +1462,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = new_redemption_id();
         let id = issuer_request_id.to_string();
         let quantity = Quantity::new(Decimal::from(100));
 

@@ -320,14 +320,13 @@ impl AlpacaService for RealAlpacaService {
 
 #[cfg(test)]
 mod tests {
+    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use alloy::primitives::{address, b256};
     use httpmock::prelude::*;
     use serde_json::json;
-    use uuid::uuid;
-
-    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
-    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     use super::{
         AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
@@ -567,10 +566,11 @@ mod tests {
     fn create_redeem_request() -> RedeemRequest {
         let client_id = "00000000-0000-0000-0000-000000000456".parse().unwrap();
 
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
         RedeemRequest {
-            issuer_request_id: IssuerRequestId::new(uuid!(
-                "00000000-0000-0000-0000-000000000123"
-            )),
+            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id,
@@ -595,7 +595,7 @@ mod tests {
                 .header("APCA-API-SECRET-KEY", "test-secret");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdefab",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -628,7 +628,9 @@ mod tests {
         assert_eq!(response.tokenization_request_id.0, "tok-456");
         assert_eq!(
             response.issuer_request_id,
-            IssuerRequestId::new(uuid!("00000000-0000-0000-0000-000000000123")),
+            IssuerRedemptionRequestId::new(b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            )),
         );
         assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
@@ -861,7 +863,7 @@ mod tests {
                 .path("/v1/accounts/test-account/tokenization/redeem")
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                    "issuer_request_id": "red-abcdefab",
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
                     "client_id": "00000000-0000-0000-0000-000000000456",
@@ -872,7 +874,7 @@ mod tests {
                 }));
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-002",
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdefab",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -1602,7 +1604,9 @@ mod tests {
         let request = result.unwrap();
         assert_eq!(
             request.issuer_request_id,
-            IssuerRequestId::new(uuid!("842331fb-0000-0000-0000-000000000000")),
+            IssuerRedemptionRequestId::new(b256!(
+                "0x842331fb00000000000000000000000000000000000000000000000000000000"
+            )),
         );
         assert!(matches!(request.status, RedeemRequestStatus::Completed));
         mock.assert();

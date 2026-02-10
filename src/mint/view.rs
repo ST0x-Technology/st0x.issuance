@@ -9,8 +9,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{
-    ClientId, IssuerRequestId, Mint, MintEvent, Network, Quantity, TokenSymbol,
-    TokenizationRequestId, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Mint, MintEvent, Network, Quantity,
+    TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -48,7 +48,7 @@ pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
 pub(crate) enum MintView {
     NotFound,
     Initiated {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -59,7 +59,7 @@ pub(crate) enum MintView {
         initiated_at: DateTime<Utc>,
     },
     JournalConfirmed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -71,7 +71,7 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
     },
     JournalRejected {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -84,7 +84,7 @@ pub(crate) enum MintView {
         rejected_at: DateTime<Utc>,
     },
     Minting {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -97,7 +97,7 @@ pub(crate) enum MintView {
         minting_started_at: DateTime<Utc>,
     },
     CallbackPending {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -115,7 +115,7 @@ pub(crate) enum MintView {
         minted_at: DateTime<Utc>,
     },
     MintingFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -129,7 +129,7 @@ pub(crate) enum MintView {
         failed_at: DateTime<Utc>,
     },
     Completed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -522,7 +522,7 @@ impl View<Mint> for MintView {
 
 pub(crate) async fn find_by_issuer_request_id(
     pool: &Pool<Sqlite>,
-    issuer_request_id: &IssuerRequestId,
+    issuer_request_id: &IssuerMintRequestId,
 ) -> Result<Option<MintView>, MintViewError> {
     let issuer_request_id_str = issuer_request_id.to_string();
     let row = sqlx::query!(
@@ -550,7 +550,7 @@ pub(crate) async fn find_by_issuer_request_id(
 /// Returns mints in JournalConfirmed, Minting, MintingFailed, or CallbackPending states.
 pub(crate) async fn find_all_recoverable_mints(
     pool: &Pool<Sqlite>,
-) -> Result<Vec<(IssuerRequestId, MintView)>, MintViewError> {
+) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
     let rows = sqlx::query!(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload: String"
@@ -568,7 +568,7 @@ pub(crate) async fn find_all_recoverable_mints(
         .map(|row| {
             let view: MintView = serde_json::from_str(&row.payload)?;
             let id = Uuid::parse_str(&row.view_id)?;
-            Ok((IssuerRequestId::new(id), view))
+            Ok((IssuerMintRequestId::new(id), view))
         })
         .collect()
 }
@@ -642,7 +642,7 @@ mod tests {
             Self { pool, cqrs }
         }
 
-        async fn initiate_mint(&self, issuer_request_id: &IssuerRequestId) {
+        async fn initiate_mint(&self, issuer_request_id: &IssuerMintRequestId) {
             self.cqrs
                 .execute(
                     &issuer_request_id.to_string(),
@@ -667,7 +667,7 @@ mod tests {
 
         async fn insert_view(
             &self,
-            issuer_request_id: &IssuerRequestId,
+            issuer_request_id: &IssuerMintRequestId,
             view: &MintView,
         ) {
             let view_id = issuer_request_id.to_string();
@@ -684,7 +684,7 @@ mod tests {
     }
 
     struct TestMintFields {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_mint_initiated_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -778,7 +778,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
 
         harness.initiate_mint(&issuer_request_id).await;
 
@@ -816,7 +816,7 @@ mod tests {
     async fn test_find_by_issuer_request_id_returns_none_when_not_found() {
         let pool = setup_test_db().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
 
         let result = find_by_issuer_request_id(&pool, &issuer_request_id)
             .await
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_journal_confirmed_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_journal_rejected_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_tokens_minted_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_minting_failed_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1081,7 +1081,7 @@ mod tests {
         let original_view = view.clone();
 
         let wrong_event = MintEvent::JournalConfirmed {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::new(Uuid::new_v4()),
             confirmed_at: Utc::now(),
         };
 
@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn test_handle_journal_confirmed_from_journal_confirmed_state_does_not_change()
      {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn test_handle_journal_rejected_from_journal_confirmed_state_does_not_change()
      {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_handle_tokens_minted_from_initiated_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn test_handle_minting_failed_from_initiated_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_mint_completed_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1376,7 +1376,7 @@ mod tests {
     #[test]
     fn test_handle_mint_completed_from_journal_confirmed_state_does_not_change()
     {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_completed_from_minting_failed_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_retry_started_transitions_minting_failed_to_minting() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-retry-1");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_retry_started_from_minting_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-retry-2");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1540,7 +1540,7 @@ mod tests {
 
     fn test_mint_fields() -> TestMintFields {
         TestMintFields {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::new(Uuid::new_v4()),
             tokenization_request_id: TokenizationRequestId::new("alp-1"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: UnderlyingSymbol::new("AAPL"),
@@ -1554,7 +1554,7 @@ mod tests {
 
     async fn seed_recoverable_mint_views(
         harness: &TestHarness,
-    ) -> Vec<IssuerRequestId> {
+    ) -> Vec<IssuerMintRequestId> {
         let now = Utc::now();
         let fields: Vec<_> = (0..4).map(|_| test_mint_fields()).collect();
 

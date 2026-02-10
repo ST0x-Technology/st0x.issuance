@@ -2,14 +2,14 @@ use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ClientId, IssuerRequestId, Network, Quantity, TokenSymbol,
+    ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
     TokenizationRequestId, UnderlyingSymbol,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MintCommand {
     Initiate {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -19,10 +19,10 @@ pub(crate) enum MintCommand {
         wallet: Address,
     },
     ConfirmJournal {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     },
     RejectJournal {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         reason: String,
     },
 
@@ -31,14 +31,14 @@ pub(crate) enum MintCommand {
     /// Calls the vault service to deposit, producing `MintingStarted`
     /// followed by either `TokensMinted` or `MintingFailed`.
     Deposit {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     },
 
     /// Sends the callback to Alpaca to confirm mint completion.
     ///
     /// Calls the Alpaca service, producing `MintCompleted` on success.
     SendCallback {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     },
 
     /// Recovers a mint stuck in an incomplete state.
@@ -51,6 +51,6 @@ pub(crate) enum MintCommand {
     /// For mints in `CallbackPending` state:
     /// - Retries sending the callback
     Recover {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     },
 }
