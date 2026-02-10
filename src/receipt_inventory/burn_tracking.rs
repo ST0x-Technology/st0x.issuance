@@ -10,10 +10,11 @@ use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 
 use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
-use crate::mint::IssuerRequestId;
+use crate::redemption::IssuerRedemptionRequestId;
 use crate::redemption::{
     BurnRecord, Redemption, RedemptionError, RedemptionEvent,
 };
+use crate::vault::ReceiptInformation;
 
 /// Tracks burn operations for a redemption.
 ///
@@ -28,7 +29,7 @@ pub(crate) enum ReceiptBurnsView {
     Unavailable,
     Burned {
         /// The redemption's issuer_request_id
-        redemption_issuer_request_id: IssuerRequestId,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
         /// All burns performed in this redemption (may span multiple receipts)
         burns: Vec<BurnRecord>,
         /// When the burn occurred
@@ -82,6 +83,7 @@ pub(crate) struct ReceiptWithBalance {
     pub(crate) available_balance: Shares,
     pub(crate) tx_hash: TxHash,
     pub(crate) block_number: u64,
+    pub(crate) receipt_info: Option<ReceiptInformation>,
 }
 
 /// A single allocation within a multi-receipt burn plan.
@@ -213,11 +215,10 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
-    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{Quantity, TokenizationRequestId};
-    use crate::redemption::BurnRecord;
+    use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
     async fn setup_test_db() -> Pool<Sqlite> {
@@ -240,7 +241,7 @@ mod tests {
         let mut view = ReceiptBurnsView::default();
         assert!(matches!(view, ReceiptBurnsView::Unavailable));
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let event = RedemptionEvent::TokensBurned {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: b256!(
@@ -284,7 +285,7 @@ mod tests {
     fn test_view_ignores_other_events() {
         let mut view = ReceiptBurnsView::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let events = vec![
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -342,7 +343,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerRedemptionRequestId::random(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -418,7 +419,7 @@ mod tests {
         for i in 1_u64..=3 {
             let aggregate_id = format!("red-multi-{i}");
             let event = RedemptionEvent::TokensBurned {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerRedemptionRequestId::random(),
                 tx_hash: b256!(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ),
@@ -486,7 +487,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerRedemptionRequestId::random(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -559,6 +560,7 @@ mod tests {
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
             tx_hash: TxHash::ZERO,
             block_number: 0,
+            receipt_info: None,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -592,6 +594,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -600,6 +603,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
@@ -608,6 +612,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
         ];
 
@@ -647,6 +652,7 @@ mod tests {
             available_balance: Shares::new(uint!(50_000000000000000000_U256)),
             tx_hash: TxHash::ZERO,
             block_number: 0,
+            receipt_info: None,
         }];
 
         let burn_amount = Shares::new(uint!(100_000000000000000000_U256));
@@ -675,6 +681,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -683,6 +690,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
@@ -691,6 +699,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
         ];
 
@@ -738,6 +747,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -746,6 +756,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
         ];
 
@@ -798,6 +809,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -806,6 +818,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
         ];
 
@@ -866,6 +879,7 @@ mod tests {
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
             tx_hash: TxHash::ZERO,
             block_number: 0,
+            receipt_info: None,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -887,6 +901,7 @@ mod tests {
                 available_balance: Shares::new(U256::ZERO),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -895,6 +910,7 @@ mod tests {
                 )),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             },
         ];
 
@@ -925,6 +941,7 @@ mod tests {
                 available_balance: Shares::new(U256::from(balance)),
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
+                receipt_info: None,
             }
         }
     }

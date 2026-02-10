@@ -7,12 +7,14 @@ use tokio::time::{Instant, sleep};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRequestId, Redemption, RedemptionCommand, RedemptionError,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
     RedemptionView, find_alpaca_called,
 };
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber};
-use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
+use crate::alpaca::{
+    AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+};
 use crate::mint::TokenizationRequestId;
 
 pub(crate) struct JournalManager<ES: EventStore<Redemption>> {
@@ -82,7 +84,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
     async fn recover_single_alpaca_called(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         view: &RedemptionView,
     ) -> Result<(), JournalManagerError> {
         let RedemptionView::AlpacaCalled {
@@ -138,7 +140,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
     pub(crate) async fn handle_alpaca_called(
         &self,
         alpaca_account: &AlpacaAccountNumber,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
     ) -> Result<(), JournalManagerError> {
         info!(
@@ -193,9 +195,91 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
     async fn validate_request_fields(
         &self,
-        request: &crate::alpaca::TokenizationRequest,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Result<(), JournalManagerError> {
+        request: &TokenizationRequest,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<RedeemRequestStatus, JournalManagerError> {
+        let TokenizationRequest::Redeem {
+            issuer_request_id: req_issuer_id,
+            underlying: req_underlying,
+            token: req_token,
+            quantity: req_quantity,
+            wallet: req_wallet,
+            tx_hash: req_tx_hash,
+            status,
+            ..
+        } = request
+        else {
+            return Err(JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "Expected Redeem entry, got Mint".to_string(),
+            });
+        };
+
+        let aggregate = self.load_aggregate(issuer_request_id).await?;
+
+        let metadata = aggregate.metadata().ok_or_else(|| {
+            JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: format!(
+                    "Redemption not in expected state for validation: {aggregate:?}"
+                ),
+            }
+        })?;
+
+        let alpaca_quantity =
+            aggregate.alpaca_quantity().ok_or_else(|| {
+                JournalManagerError::ValidationFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: format!(
+                        "Redemption not in AlpacaCalled state for validation: {aggregate:?}"
+                    ),
+                }
+            })?;
+
+        Self::check_field_match(
+            issuer_request_id,
+            "Issuer request ID",
+            &metadata.issuer_request_id,
+            req_issuer_id,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Underlying symbol",
+            &metadata.underlying,
+            req_underlying,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Token symbol",
+            &metadata.token,
+            req_token,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Quantity",
+            alpaca_quantity,
+            req_quantity,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Wallet",
+            &metadata.wallet,
+            req_wallet,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Transaction hash",
+            &Some(metadata.detected_tx_hash),
+            req_tx_hash,
+        )?;
+
+        Ok(status.clone())
+    }
+
+    async fn load_aggregate(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<Redemption, JournalManagerError> {
         let aggregate_id = issuer_request_id.to_string();
         let events =
             self.store.load_events(&aggregate_id).await.map_err(|error| {
@@ -210,90 +294,29 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             aggregate.apply(event.payload);
         }
 
-        let Some(metadata) = aggregate.metadata() else {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Redemption not in expected state for validation: {aggregate:?}"
-                ),
-            });
-        };
+        Ok(aggregate)
+    }
 
-        if request.issuer_request_id != metadata.issuer_request_id {
+    fn check_field_match<T: PartialEq + std::fmt::Debug>(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        field_name: &str,
+        expected: &T,
+        actual: &T,
+    ) -> Result<(), JournalManagerError> {
+        if *expected != *actual {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
-                    "Issuer request ID mismatch: expected {}, got {}",
-                    metadata.issuer_request_id, request.issuer_request_id
-                ),
-            });
-        }
-
-        if request.underlying != metadata.underlying {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Underlying symbol mismatch: expected {}, got {}",
-                    metadata.underlying.0, request.underlying.0
+                    "{field_name} mismatch: expected {expected:?}, got {actual:?}"
                 ),
             });
         }
-
-        if request.token != metadata.token {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Token symbol mismatch: expected {}, got {}",
-                    metadata.token.0, request.token.0
-                ),
-            });
-        }
-
-        let Some(alpaca_quantity) = aggregate.alpaca_quantity() else {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Redemption not in AlpacaCalled state for validation: {aggregate:?}"
-                ),
-            });
-        };
-
-        if &request.quantity != alpaca_quantity {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Quantity mismatch: expected {}, got {}",
-                    alpaca_quantity.0, request.quantity.0
-                ),
-            });
-        }
-
-        if request.wallet != metadata.wallet {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Wallet mismatch: expected {}, got {}",
-                    metadata.wallet, request.wallet
-                ),
-            });
-        }
-
-        if request.tx_hash != Some(metadata.detected_tx_hash) {
-            return Err(JournalManagerError::ValidationFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                reason: format!(
-                    "Transaction hash mismatch: expected {}, got {:?}",
-                    metadata.detected_tx_hash, request.tx_hash
-                ),
-            });
-        }
-
         Ok(())
     }
 
     async fn handle_timeout(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         elapsed: Duration,
     ) -> Result<(), JournalManagerError> {
         warn!(
@@ -325,18 +348,19 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
     async fn handle_poll_result(
         &self,
-        request_result: Result<crate::alpaca::TokenizationRequest, AlpacaError>,
-        issuer_request_id: &IssuerRequestId,
+        request_result: Result<TokenizationRequest, AlpacaError>,
+        issuer_request_id: &IssuerRedemptionRequestId,
         tokenization_request_id: &TokenizationRequestId,
         elapsed: Duration,
         poll_interval: Duration,
     ) -> Result<bool, JournalManagerError> {
         match request_result {
             Ok(request) => {
-                self.validate_request_fields(&request, issuer_request_id)
+                let status = self
+                    .validate_request_fields(&request, issuer_request_id)
                     .await?;
 
-                match request.status {
+                match status {
                     RedeemRequestStatus::Completed => {
                         info!(
                             issuer_request_id = %issuer_request_id,
@@ -420,11 +444,14 @@ pub(crate) enum JournalManagerError {
     #[error(
         "Polling timeout for redemption {issuer_request_id} after {elapsed:?}"
     )]
-    Timeout { issuer_request_id: IssuerRequestId, elapsed: Duration },
+    Timeout { issuer_request_id: IssuerRedemptionRequestId, elapsed: Duration },
     #[error("Alpaca journal rejected for redemption {issuer_request_id}")]
-    Rejected { issuer_request_id: IssuerRequestId },
+    Rejected { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Validation failed for redemption {issuer_request_id}: {reason}")]
-    ValidationFailed { issuer_request_id: IssuerRequestId, reason: String },
+    ValidationFailed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        reason: String,
+    },
     #[error("View error: {0}")]
     View(#[from] super::RedemptionViewError),
     #[error("Account view error: {0}")]
@@ -447,12 +474,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tracing_test::traced_test;
-    use uuid::Uuid;
 
     use super::{JournalManager, JournalManagerError};
     use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
-    use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::alpaca::{
+        AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+    };
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::{
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
@@ -494,7 +523,7 @@ mod tests {
 
     async fn create_test_redemption_in_alpaca_called_state(
         cqrs: &TestCqrs,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         tokenization_request_id: &TokenizationRequestId,
     ) {
         cqrs.execute(
@@ -535,26 +564,24 @@ mod tests {
     struct StatefulMockAlpacaService {
         call_count: Mutex<usize>,
         responses: Vec<MockResponse>,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
     }
 
     impl StatefulMockAlpacaService {
         fn new(
             responses: Vec<MockResponse>,
-            issuer_request_id: IssuerRequestId,
+            issuer_request_id: IssuerRedemptionRequestId,
         ) -> Self {
             Self { call_count: Mutex::new(0), responses, issuer_request_id }
         }
 
         fn create_mock_request(
             &self,
-            tokenization_request_id: &TokenizationRequestId,
             status: RedeemRequestStatus,
-        ) -> crate::alpaca::TokenizationRequest {
-            crate::alpaca::TokenizationRequest {
-                id: tokenization_request_id.clone(),
+        ) -> TokenizationRequest {
+            TokenizationRequest::Redeem {
+                id: TokenizationRequestId::new("mock-tok"),
                 issuer_request_id: self.issuer_request_id.clone(),
-                r#type: crate::alpaca::TokenizationRequestType::Redeem,
                 status,
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
@@ -585,8 +612,8 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            tokenization_request_id: &TokenizationRequestId,
-        ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError> {
+            _tokenization_request_id: &TokenizationRequestId,
+        ) -> Result<TokenizationRequest, AlpacaError> {
             let index = {
                 let mut count = self.call_count.lock().unwrap();
                 let index = *count;
@@ -601,10 +628,9 @@ mod tests {
             };
 
             match response {
-                MockResponse::Success(status) => Ok(self.create_mock_request(
-                    tokenization_request_id,
-                    status.clone(),
-                )),
+                MockResponse::Success(status) => {
+                    Ok(self.create_mock_request(status.clone()))
+                }
                 MockResponse::Error { status_code, body } => {
                     Err(AlpacaError::Api {
                         status_code: *status_code,
@@ -619,7 +645,7 @@ mod tests {
     async fn test_poll_completes_successfully() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-poll-success-456");
 
@@ -658,7 +684,7 @@ mod tests {
     async fn test_poll_pending_then_completed() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-pending-456");
 
@@ -722,7 +748,7 @@ mod tests {
     async fn test_poll_rejected_marks_as_failed() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-rejected-456");
 
@@ -777,7 +803,7 @@ mod tests {
     async fn test_poll_error_retries() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-error-retry-456");
 
@@ -825,7 +851,7 @@ mod tests {
     async fn test_poll_timeout_marks_as_failed() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-timeout-456");
 
@@ -880,13 +906,13 @@ mod tests {
     async fn test_validation_fails_on_issuer_request_id_mismatch() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-validation-1");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![MockResponse::Success(RedeemRequestStatus::Completed)],
-            IssuerRequestId::new(Uuid::new_v4()),
+            IssuerRedemptionRequestId::random(),
         ));
 
         let manager = JournalManager::new(
@@ -930,12 +956,12 @@ mod tests {
     async fn test_validation_fails_on_quantity_mismatch() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-validation-2");
 
         struct QuantityMismatchMock {
-            issuer_request_id: IssuerRequestId,
+            issuer_request_id: IssuerRedemptionRequestId,
         }
 
         #[async_trait]
@@ -957,13 +983,11 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                tokenization_request_id: &TokenizationRequestId,
-            ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError>
-            {
-                Ok(crate::alpaca::TokenizationRequest {
-                    id: tokenization_request_id.clone(),
+                _tokenization_request_id: &TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                Ok(TokenizationRequest::Redeem {
+                    id: TokenizationRequestId::new("mock-tok"),
                     issuer_request_id: self.issuer_request_id.clone(),
-                    r#type: crate::alpaca::TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -1023,7 +1047,7 @@ mod tests {
     async fn test_exponential_backoff_intervals() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-backoff-456");
 
@@ -1126,7 +1150,7 @@ mod tests {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![MockResponse::Success(RedeemRequestStatus::Completed)],
-            IssuerRequestId::new(Uuid::new_v4()),
+            IssuerRedemptionRequestId::random(),
         ));
         let manager = JournalManager::new(
             mock as Arc<dyn AlpacaService>,
@@ -1151,7 +1175,7 @@ mod tests {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![MockResponse::Success(RedeemRequestStatus::Completed)],
-            IssuerRequestId::new(Uuid::new_v4()),
+            IssuerRedemptionRequestId::random(),
         ));
         let manager = JournalManager::new(
             mock as Arc<dyn AlpacaService>,
@@ -1175,7 +1199,7 @@ mod tests {
         let (cqrs, store, pool) = setup_test_cqrs().await;
         let mock = Arc::new(StatefulMockAlpacaService::new(
             vec![MockResponse::Success(RedeemRequestStatus::Completed)],
-            IssuerRequestId::new(Uuid::new_v4()),
+            IssuerRedemptionRequestId::random(),
         ));
         let manager = JournalManager::new(
             mock as Arc<dyn AlpacaService>,
@@ -1195,7 +1219,7 @@ mod tests {
         let alpaca_account = AlpacaAccountNumber("acc-recovery".to_string());
         insert_account_view(&pool, wallet, &alpaca_account).await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("tok-recover");
 
         let mock = Arc::new(StatefulMockAlpacaService::new(
@@ -1254,7 +1278,7 @@ mod tests {
     async fn test_recover_single_alpaca_called_missing_account() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("tok-no-account");
 

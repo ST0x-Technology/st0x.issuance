@@ -5,7 +5,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::account::ClientId;
-use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+use crate::mint::{Quantity, TokenizationRequestId};
+use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 pub(crate) mod mock;
@@ -49,28 +50,11 @@ pub(crate) trait AlpacaService: Send + Sync {
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
 
-    /// Polls Alpaca's request list endpoint to retrieve a tokenization request.
+    /// Polls Alpaca's request list endpoint to find a matching redeem entry.
     ///
-    /// # Arguments
-    ///
-    /// * `tokenization_request_id` - ID of the tokenization request to poll
-    ///
-    /// # Returns
-    ///
-    /// Returns the full [`TokenizationRequest`] containing:
-    /// - Request ID and issuer request ID
-    /// - Request type (mint or redeem) and status (pending, completed, or rejected)
-    /// - Asset details (underlying symbol, token symbol, quantity)
-    /// - Transaction details (wallet address, transaction hash)
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AlpacaError`] if:
-    /// - HTTP request fails (network error, timeout, etc.)
-    /// - Authentication fails (401/403 response)
-    /// - Request is not found in Alpaca's list
-    /// - Alpaca returns an error response
-    /// - Response deserialization or parsing fails
+    /// Deserializes all entries as [`TokenizationRequest`] (an enum of Mint
+    /// and Redeem variants), then finds the `Redeem` variant matching the
+    /// given `tokenization_request_id`.
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
@@ -94,7 +78,7 @@ pub(crate) struct MintCallbackRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RedeemRequest {
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     #[serde(rename = "underlying_symbol")]
     pub(crate) underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
@@ -111,7 +95,7 @@ pub(crate) struct RedeemRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RedeemResponse {
     pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     pub(crate) created_at: DateTime<Utc>,
     #[serde(rename = "type")]
     pub(crate) r#type: TokenizationRequestType,
@@ -148,33 +132,35 @@ pub(crate) enum RedeemRequestStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Fees(pub(crate) Decimal);
 
-/// Individual tokenization request from the list endpoint.
+/// Entry from Alpaca's tokenization request list endpoint.
 ///
-/// This struct represents both mint and redeem requests returned by Alpaca's
-/// request list endpoint. We validate all fields match to ensure we're processing
-/// the correct request.
+/// The endpoint returns both mint and redeem entries. This enum deserializes
+/// both variants via `#[serde(tag = "type")]`, with each variant carrying
+/// the appropriate `issuer_request_id` type.
 #[derive(Debug, Clone, Deserialize)]
-pub struct TokenizationRequest {
-    #[serde(rename = "tokenization_request_id")]
-    pub id: TokenizationRequestId,
-    #[serde(rename = "issuer_request_id")]
-    pub issuer_request_id: IssuerRequestId,
-    #[serde(rename = "type")]
-    pub r#type: TokenizationRequestType,
-    pub status: RedeemRequestStatus,
-    #[serde(rename = "underlying_symbol")]
-    pub underlying: UnderlyingSymbol,
-    #[serde(rename = "token_symbol")]
-    pub token: TokenSymbol,
-    #[serde(rename = "qty")]
-    pub quantity: Quantity,
-    #[serde(rename = "wallet_address")]
-    pub wallet: Address,
-    #[serde(
-        rename = "tx_hash",
-        deserialize_with = "deserialize_optional_b256"
-    )]
-    pub tx_hash: Option<B256>,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum TokenizationRequest {
+    Mint {},
+    Redeem {
+        #[serde(rename = "tokenization_request_id")]
+        id: TokenizationRequestId,
+        #[serde(rename = "issuer_request_id")]
+        issuer_request_id: IssuerRedemptionRequestId,
+        status: RedeemRequestStatus,
+        #[serde(rename = "underlying_symbol")]
+        underlying: UnderlyingSymbol,
+        #[serde(rename = "token_symbol")]
+        token: TokenSymbol,
+        #[serde(rename = "qty")]
+        quantity: Quantity,
+        #[serde(rename = "wallet_address")]
+        wallet: Address,
+        #[serde(
+            rename = "tx_hash",
+            deserialize_with = "deserialize_optional_b256"
+        )]
+        tx_hash: Option<B256>,
+    },
 }
 
 fn deserialize_optional_b256<'de, D>(
@@ -183,7 +169,7 @@ fn deserialize_optional_b256<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let s: &str = serde::Deserialize::deserialize(deserializer)?;
+    let s: String = serde::Deserialize::deserialize(deserializer)?;
     if s.is_empty() {
         Ok(None)
     } else {
@@ -233,13 +219,13 @@ mod tests {
     use alloy::primitives::{address, b256};
     use rust_decimal::Decimal;
     use serde_json::json;
-    use uuid::uuid;
 
     use crate::account::ClientId;
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
-    use super::{MintCallbackRequest, RedeemRequest};
+    use super::{MintCallbackRequest, RedeemRequest, TokenizationRequest};
 
     #[test]
     fn test_mint_callback_request_serialization() {
@@ -285,28 +271,24 @@ mod tests {
     #[test]
     fn test_redeem_request_serialization() {
         let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+        let tx_hash = b256!(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
 
         let request = RedeemRequest {
-            issuer_request_id: IssuerRequestId::new(uuid!(
-                "00000000-0000-0000-0000-00000abc0123"
-            )),
+            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id,
             quantity: Quantity::new(Decimal::new(10050, 2)),
             network: Network::new("base"),
             wallet: address!("0x9999999999999999999999999999999999999999"),
-            tx_hash: b256!(
-                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            ),
+            tx_hash,
         };
 
         let serialized = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(
-            serialized["issuer_request_id"],
-            json!("00000000-0000-0000-0000-00000abc0123")
-        );
+        assert_eq!(serialized["issuer_request_id"], json!("red-12345678"));
         assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
         assert_eq!(serialized["token_symbol"], json!("tAAPL"));
         assert_eq!(
@@ -347,5 +329,77 @@ mod tests {
             json.contains("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")
         );
         assert!(json.contains("\"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\""));
+    }
+
+    #[test]
+    fn test_tokenization_request_deserializes_mint_variant() {
+        let json = json!({
+            "type": "mint",
+            "tokenization_request_id": "tok-123",
+            "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "100.00",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        });
+
+        let request: TokenizationRequest =
+            serde_json::from_value(json).unwrap();
+        assert!(matches!(request, TokenizationRequest::Mint { .. }));
+    }
+
+    #[test]
+    fn test_tokenization_request_deserializes_redeem_variant() {
+        let json = json!({
+            "type": "redeem",
+            "tokenization_request_id": "tok-456",
+            "issuer_request_id": "red-574378e0",
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "50.00",
+            "wallet_address": "0x9999999999999999999999999999999999999999",
+            "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        });
+
+        let request: TokenizationRequest =
+            serde_json::from_value(json).unwrap();
+        assert!(matches!(request, TokenizationRequest::Redeem { .. }));
+    }
+
+    #[test]
+    fn test_tokenization_request_list_deserializes_mixed_types() {
+        let json = json!([
+            {
+                "type": "mint",
+                "tokenization_request_id": "tok-mint-1",
+                "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "status": "completed",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "100.00",
+                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            },
+            {
+                "type": "redeem",
+                "tokenization_request_id": "tok-red-2",
+                "issuer_request_id": "red-574378e0",
+                "status": "pending",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "50.00",
+                "wallet_address": "0x9999999999999999999999999999999999999999",
+                "tx_hash": ""
+            }
+        ]);
+
+        let requests: Vec<TokenizationRequest> =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(requests[0], TokenizationRequest::Mint { .. }));
+        assert!(matches!(requests[1], TokenizationRequest::Redeem { .. }));
     }
 }

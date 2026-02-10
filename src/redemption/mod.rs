@@ -8,7 +8,8 @@ pub(crate) mod detector;
 pub(crate) mod journal_manager;
 pub(crate) mod redeem_call_manager;
 
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::hex;
+use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -17,12 +18,76 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::Quantity;
-use crate::mint::{IssuerRequestId, TokenizationRequestId};
+use crate::mint::TokenizationRequestId;
+
+/// Issuer request ID for redemption operations.
+///
+/// Derived from the triggering transaction hash — the first 4 bytes are
+/// extracted and serialized as `"red-{hex}"` (e.g., `"red-574378e0"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct IssuerRedemptionRequestId(FixedBytes<4>);
+
+impl IssuerRedemptionRequestId {
+    #[must_use]
+    pub(crate) fn new(tx_hash: TxHash) -> Self {
+        Self(FixedBytes::<4>::from_slice(&tx_hash[..4]))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn random() -> Self {
+        Self::new(B256::random())
+    }
+}
+
+impl std::fmt::Display for IssuerRedemptionRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "red-{}", hex::encode(self.0))
+    }
+}
+
+impl std::str::FromStr for IssuerRedemptionRequestId {
+    type Err = IssuerRedemptionRequestIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let hex_str = s
+            .strip_prefix("red-")
+            .ok_or(IssuerRedemptionRequestIdParseError::Format)?;
+
+        let bytes = hex::decode(hex_str)?;
+        Ok(Self(FixedBytes::<4>::try_from(bytes.as_slice())?))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IssuerRedemptionRequestIdParseError {
+    #[error("invalid hex: {0}")]
+    Hex(#[from] hex::FromHexError),
+    #[error(transparent)]
+    Slice(#[from] std::array::TryFromSliceError),
+    #[error("expected 'red-' prefix")]
+    Format,
+}
+
+impl Serialize for IssuerRedemptionRequestId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
-use crate::vault::{
-    MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultService,
-};
+use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
 
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent};
@@ -33,7 +98,7 @@ pub(crate) use view::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RedemptionMetadata {
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
     pub(crate) wallet: Address,
@@ -69,12 +134,12 @@ pub(crate) enum Redemption {
         alpaca_journal_completed_at: DateTime<Utc>,
     },
     Completed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         completed_at: DateTime<Utc>,
     },
     Failed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -95,11 +160,10 @@ struct BurnInput {
     burns: Vec<MultiBurnEntry>,
     dust_shares: U256,
     owner: Address,
-    receipt_info: ReceiptInformation,
 }
 
 struct DetectInput {
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
     wallet: Address,
@@ -163,7 +227,7 @@ impl Redemption {
 
     fn handle_record_alpaca_call(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         alpaca_quantity: Quantity,
         dust_quantity: Quantity,
@@ -186,7 +250,7 @@ impl Redemption {
 
     fn handle_record_alpaca_failure(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         error: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(self, Self::Detected { .. }) {
@@ -205,7 +269,7 @@ impl Redemption {
 
     fn handle_mark_failed(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(
@@ -230,7 +294,7 @@ impl Redemption {
     async fn handle_burn_tokens(
         &self,
         services: &Arc<dyn VaultService>,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         input: BurnInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let Self::Burning { metadata, .. } = self else {
@@ -249,7 +313,7 @@ impl Redemption {
                 dust_shares: input.dust_shares,
                 owner: input.owner,
                 user: user_wallet,
-                receipt_info: input.receipt_info,
+                issuer_request_id: issuer_request_id.clone(),
             })
             .await?;
 
@@ -275,7 +339,7 @@ impl Redemption {
 
     fn handle_record_burn_failure(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         error: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(self, Self::Burning { .. }) {
@@ -295,7 +359,7 @@ impl Redemption {
     async fn handle_retry_burn(
         &self,
         services: &Arc<dyn VaultService>,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         input: BurnInput,
         user_wallet: Address,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
@@ -313,7 +377,7 @@ impl Redemption {
                 dust_shares: input.dust_shares,
                 owner: input.owner,
                 user: user_wallet,
-                receipt_info: input.receipt_info,
+                issuer_request_id: issuer_request_id.clone(),
             })
             .await?;
 
@@ -339,7 +403,7 @@ impl Redemption {
 
     fn handle_confirm_alpaca_complete(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(self, Self::AlpacaCalled { .. }) {
             return Err(RedemptionError::InvalidState {
@@ -356,7 +420,7 @@ impl Redemption {
 
     fn apply_alpaca_called(
         &mut self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
         alpaca_quantity: Quantity,
         dust_quantity: Quantity,
@@ -382,7 +446,7 @@ impl Redemption {
 
     fn apply_alpaca_journal_completed(
         &mut self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         alpaca_journal_completed_at: DateTime<Utc>,
     ) {
         let Self::AlpacaCalled {
@@ -415,7 +479,7 @@ impl Redemption {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionError {
     #[error("Redemption already detected for request: {issuer_request_id}")]
-    AlreadyDetected { issuer_request_id: IssuerRequestId },
+    AlreadyDetected { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Invalid state for operation: expected {expected}, found {found}")]
     InvalidState { expected: String, found: String },
     #[error("Vault error: {0}")]
@@ -500,18 +564,11 @@ impl Aggregate for Redemption {
                 burns,
                 dust_shares,
                 owner,
-                receipt_info,
             } => {
                 self.handle_burn_tokens(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                        receipt_info,
-                    },
+                    BurnInput { vault, burns, dust_shares, owner },
                 )
                 .await
             }
@@ -525,19 +582,12 @@ impl Aggregate for Redemption {
                 burns,
                 dust_shares,
                 owner,
-                receipt_info,
                 user_wallet,
             } => {
                 self.handle_retry_burn(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                        receipt_info,
-                    },
+                    BurnInput { vault, burns, dust_shares, owner },
                     user_wallet,
                 )
                 .await
@@ -633,23 +683,21 @@ impl Aggregate for Redemption {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, address, b256, uint};
+    use alloy::primitives::{TxHash, U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{
-        BurnRecord, Redemption, RedemptionCommand, RedemptionError,
-        RedemptionEvent, RedemptionMetadata,
+        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionError, RedemptionEvent, RedemptionMetadata,
     };
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{
-        MultiBurnEntry, OperationType, ReceiptInformation, VaultService,
-    };
+    use crate::vault::{MultiBurnEntry, VaultService};
 
     type RedemptionTestFramework = TestFramework<Redemption>;
 
@@ -659,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_detect_redemption_creates_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -710,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_detect_redemption_when_already_detected_returns_error() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
@@ -751,7 +799,7 @@ mod tests {
 
         assert!(matches!(redemption, Redemption::Uninitialized));
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("NVDA");
         let token = TokenSymbol::new("tNVDA");
         let wallet = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
@@ -792,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_call_from_detected_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -837,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_call_from_wrong_state_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-789");
 
         RedemptionTestFramework::with(mock_services())
@@ -856,7 +904,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_failure_from_detected_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let error = "API timeout".to_string();
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -898,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_failure_from_wrong_state_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -914,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_from_alpaca_called_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
 
@@ -966,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_from_wrong_state_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -983,7 +1031,7 @@ mod tests {
     fn test_apply_alpaca_journal_completed_transitions_to_burning() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("TSLA");
@@ -1049,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_emits_one_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-one-event-456");
 
@@ -1101,23 +1149,13 @@ mod tests {
 
     #[test]
     fn test_burn_tokens_from_burning_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let receipt_id = uint!(42_U256);
         let burn_shares = uint!(100_000000000000000000_U256);
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let owner = address!("0x1111111111111111111111111111111111111111");
         let user_wallet =
             address!("0x9876543210fedcba9876543210fedcba98765432");
-
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("alp-burn-456"),
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: UnderlyingSymbol::new("TSLA"),
-            quantity: Quantity::new(Decimal::from(100)),
-            operation_type: OperationType::Redeem,
-            timestamp: Utc::now(),
-            notes: None,
-        };
 
         let validator = RedemptionTestFramework::with(mock_services())
             .given(vec![
@@ -1151,10 +1189,10 @@ mod tests {
                 burns: vec![MultiBurnEntry {
                     receipt_id,
                     burn_shares,
+                    receipt_info: None,
                 }],
                 dust_shares: U256::ZERO,
                 owner,
-                receipt_info,
             });
 
         let events = validator.inspect_result().unwrap();
@@ -1179,17 +1217,7 @@ mod tests {
 
     #[test]
     fn test_burn_tokens_from_wrong_state_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
-
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("alp-123"),
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: UnderlyingSymbol::new("NVDA"),
-            quantity: Quantity::new(Decimal::from(25)),
-            operation_type: OperationType::Redeem,
-            timestamp: Utc::now(),
-            notes: None,
-        };
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
@@ -1212,10 +1240,10 @@ mod tests {
                 burns: vec![MultiBurnEntry {
                     receipt_id: uint!(1_U256),
                     burn_shares: uint!(25_000000000000000000_U256),
+                    receipt_info: None,
                 }],
                 dust_shares: U256::ZERO,
                 owner: address!("0x1111111111111111111111111111111111111111"),
-                receipt_info,
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
@@ -1225,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_record_burn_failure_from_burning_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let error = "Insufficient gas".to_string();
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -1280,7 +1308,7 @@ mod tests {
 
     #[test]
     fn test_record_burn_failure_from_wrong_state_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -1298,7 +1326,7 @@ mod tests {
     fn test_apply_tokens_burned_transitions_to_completed() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
         let underlying = UnderlyingSymbol::new("AMZN");
@@ -1367,7 +1395,7 @@ mod tests {
     fn test_apply_burning_failed_transitions_to_failed() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-failed-456");
         let underlying = UnderlyingSymbol::new("NFLX");
@@ -1418,5 +1446,151 @@ mod tests {
             redemption,
             Redemption::Failed { issuer_request_id, reason: error, failed_at }
         );
+    }
+
+    // --- IssuerRedemptionRequestId tests ---
+
+    prop_compose! {
+        pub(crate) fn arb_issuer_redemption_request_id()(bytes in any::<[u8; 32]>()) -> IssuerRedemptionRequestId {
+            IssuerRedemptionRequestId::new(TxHash::from(bytes))
+        }
+    }
+
+    #[test]
+    fn test_new_extracts_first_4_bytes_of_tx_hash() {
+        let tx_hash = b256!(
+            "574378e000000000000000000000000000000000000000000000000000000000"
+        );
+
+        let id = IssuerRedemptionRequestId::new(tx_hash);
+
+        assert_eq!(id.to_string(), "red-574378e0");
+    }
+
+    #[test]
+    fn test_display_format_is_red_dash_hex() {
+        let tx_hash = b256!(
+            "deadbeef00000000000000000000000000000000000000000000000000000000"
+        );
+
+        let id = IssuerRedemptionRequestId::new(tx_hash);
+
+        let display = id.to_string();
+        assert!(
+            display.starts_with("red-"),
+            "expected 'red-' prefix, got: {display}"
+        );
+        assert_eq!(
+            display.len(),
+            12,
+            "expected 12 chars (red- + 8 hex), got: {display}"
+        );
+        assert_eq!(display, "red-deadbeef");
+    }
+
+    #[test]
+    fn test_same_tx_hash_produces_equal_ids() {
+        let tx_hash = b256!(
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+
+        let id1 = IssuerRedemptionRequestId::new(tx_hash);
+        let id2 = IssuerRedemptionRequestId::new(tx_hash);
+
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_different_tx_hashes_produce_different_ids() {
+        let hash1 = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let hash2 = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+
+        let id1 = IssuerRedemptionRequestId::new(hash1);
+        let id2 = IssuerRedemptionRequestId::new(hash2);
+
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_serialize_produces_red_hex_string() {
+        let tx_hash = b256!(
+            "574378e000000000000000000000000000000000000000000000000000000000"
+        );
+
+        let id = IssuerRedemptionRequestId::new(tx_hash);
+        let json = serde_json::to_string(&id).unwrap();
+
+        assert_eq!(json, "\"red-574378e0\"");
+    }
+
+    #[test]
+    fn test_deserialize_red_hex_string() {
+        let json = "\"red-574378e0\"";
+
+        let id: IssuerRedemptionRequestId = serde_json::from_str(json).unwrap();
+
+        assert_eq!(id.to_string(), "red-574378e0");
+    }
+
+    #[test]
+    fn test_serde_roundtrip() {
+        let tx_hash = b256!(
+            "deadbeefcafebabe1234567890abcdef1234567890abcdef1234567890abcdef"
+        );
+
+        let id = IssuerRedemptionRequestId::new(tx_hash);
+        let json = serde_json::to_string(&id).unwrap();
+        let deserialized: IssuerRedemptionRequestId =
+            serde_json::from_str(&json).unwrap();
+
+        assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn test_from_str_rejects_missing_prefix() {
+        let result = "574378e0".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Format
+        ));
+    }
+
+    #[test]
+    fn test_from_str_rejects_invalid_hex() {
+        let result = "red-GGGGGGGG".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Hex(_)
+        ));
+    }
+
+    #[test]
+    fn test_from_str_rejects_wrong_length() {
+        let result = "red-5743".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Slice(_)
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn test_serde_roundtrip_proptest(id in arb_issuer_redemption_request_id()) {
+            let json = serde_json::to_string(&id).unwrap();
+            let deserialized: IssuerRedemptionRequestId =
+                serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(&id, &deserialized);
+        }
+
+        #[test]
+        fn test_display_always_starts_with_red_prefix(id in arb_issuer_redemption_request_id()) {
+            let display = id.to_string();
+            prop_assert!(display.starts_with("red-"));
+            prop_assert_eq!(display.len(), 12);
+        }
     }
 }

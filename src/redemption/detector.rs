@@ -8,18 +8,17 @@ use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{info, warn};
 use url::Url;
-use uuid::Uuid;
 
 use super::{
-    Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
-    journal_manager::JournalManager, redeem_call_manager::RedeemCallManager,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+    burn_manager::BurnManager, journal_manager::JournalManager,
+    redeem_call_manager::RedeemCallManager,
 };
 use crate::account::{
     AccountView, AlpacaAccountNumber, ClientId,
     view::{AccountViewError, find_by_wallet},
 };
 use crate::bindings;
-use crate::mint::IssuerRequestId;
 use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
@@ -159,7 +158,7 @@ where
     async fn process_transfer_log(
         &self,
         log: &alloy::rpc::types::Log,
-    ) -> Result<Option<IssuerRequestId>, RedemptionMonitorError> {
+    ) -> Result<Option<IssuerRedemptionRequestId>, RedemptionMonitorError> {
         let transfer_event =
             bindings::OffchainAssetReceiptVault::Transfer::decode_log(
                 &log.inner,
@@ -251,12 +250,12 @@ where
         log: &alloy::rpc::types::Log,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
-    ) -> Result<IssuerRequestId, RedemptionMonitorError> {
+    ) -> Result<IssuerRedemptionRequestId, RedemptionMonitorError> {
         let tx_hash = log
             .transaction_hash
             .ok_or(RedemptionMonitorError::MissingTxHash)?;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
 
         let quantity =
             Quantity::from_u256_with_18_decimals(transfer_event.value)?;
@@ -309,7 +308,7 @@ where
 
     async fn handle_alpaca_and_polling(
         &self,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRedemptionRequestId,
         client_id: ClientId,
         alpaca_account: AlpacaAccountNumber,
         network: Network,
@@ -994,10 +993,12 @@ mod tests {
             "First detection should succeed, got {first_result:?}"
         );
 
+        // With deterministic IDs derived from tx_hash, duplicate detection
+        // of the same transfer is correctly rejected as AlreadyDetected.
         let second_result = detector.process_transfer_log(&log).await;
         assert!(
-            second_result.is_ok(),
-            "Second detection creates a separate redemption with a new UUID, got {second_result:?}"
+            second_result.is_err(),
+            "Second detection of the same transfer should be rejected, got {second_result:?}"
         );
     }
 

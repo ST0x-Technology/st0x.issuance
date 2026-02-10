@@ -17,7 +17,6 @@ use super::config::{
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
-use crate::mint::IssuerRequestId;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
     ReceiptInformation, VaultError, VaultService,
@@ -361,7 +360,10 @@ impl VaultOperation {
     /// Each call produces a unique ID (via timestamp), avoiding Fireblocks'
     /// permanent `externalTxId` rejection on retries. The operation prefix
     /// and issuer_request_id make the ID searchable in the Fireblocks dashboard.
-    fn external_tx_id(&self, issuer_request_id: &IssuerRequestId) -> String {
+    fn external_tx_id(
+        &self,
+        issuer_request_id: &(impl std::fmt::Display + ?Sized),
+    ) -> String {
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         format!("{timestamp}-{self}-{issuer_request_id}")
     }
@@ -425,8 +427,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // Submit CONTRACT_CALL to Fireblocks
         let note = format!(
-            "Mint {} shares for {} (issuer_request_id: {})",
-            assets, user, receipt_info.issuer_request_id
+            "Mint {assets} shares for {user} (issuer_request_id: {})",
+            receipt_info.issuer_request_id,
         );
 
         let external_tx_id = VaultOperation::Mint
@@ -479,28 +481,32 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         &self,
         params: MultiBurnParams,
     ) -> Result<MultiBurnResult, VaultError> {
-        let receipt_info_bytes = params.receipt_info.encode()?;
-
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
-        // Build redeem calls for each burn
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
             .map(|burn| {
-                vault_contract
+                let receipt_info_bytes = burn
+                    .receipt_info
+                    .as_ref()
+                    .map(ReceiptInformation::encode)
+                    .transpose()?
+                    .unwrap_or_default();
+
+                Ok(vault_contract
                     .redeem(
                         burn.burn_shares,
                         params.user,
                         params.owner,
                         burn.receipt_id,
-                        receipt_info_bytes.clone(),
+                        receipt_info_bytes,
                     )
                     .calldata()
-                    .clone()
+                    .clone())
             })
-            .collect();
+            .collect::<Result<Vec<_>, VaultError>>()?;
 
         // Build multicall: all redeems, plus optional dust transfer
         let calls: Vec<Bytes> = if params.dust_shares > U256::ZERO {
@@ -521,15 +527,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // Submit CONTRACT_CALL to Fireblocks
         let total_burn: U256 = params.burns.iter().map(|b| b.burn_shares).sum();
+
         let note = format!(
-            "Burn {} shares from {} receipts (issuer_request_id: {})",
-            total_burn,
+            "Burn {total_burn} shares from {} receipts (issuer_request_id: {})",
             params.burns.len(),
-            params.receipt_info.issuer_request_id
+            params.issuer_request_id,
         );
 
-        let external_tx_id = VaultOperation::Burn
-            .external_tx_id(&params.receipt_info.issuer_request_id);
+        let external_tx_id =
+            VaultOperation::Burn.external_tx_id(&params.issuer_request_id);
 
         let tx_id = self
             .submit_contract_call(
@@ -596,7 +602,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use uuid::{Uuid, uuid};
+    use uuid::Uuid;
 
     use super::*;
 
@@ -806,9 +812,8 @@ mod tests {
 
     #[test]
     fn external_tx_id_contains_operation_and_issuer_request_id() {
-        let id = VaultOperation::Mint.external_tx_id(&IssuerRequestId::new(
-            uuid!("5960be2e-a556-42e7-8def-ed3a354b66e6"),
-        ));
+        let id = VaultOperation::Mint
+            .external_tx_id("5960be2e-a556-42e7-8def-ed3a354b66e6");
         assert!(
             id.contains("mint-5960be2e-a556-42e7-8def-ed3a354b66e6"),
             "Expected operation-issuer_request_id suffix, got {id}"
@@ -817,8 +822,8 @@ mod tests {
 
     #[test]
     fn external_tx_id_starts_with_iso8601_timestamp() {
-        let id = VaultOperation::Burn
-            .external_tx_id(&IssuerRequestId::new(Uuid::new_v4()));
+        let id =
+            VaultOperation::Burn.external_tx_id(&Uuid::new_v4().to_string());
         assert!(
             id.contains('T') && id.contains('Z'),
             "Expected ISO 8601 compact timestamp, got {id}"
@@ -832,7 +837,7 @@ mod tests {
 
     #[test]
     fn external_tx_id_is_unique_across_calls() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = Uuid::new_v4().to_string();
         let id1 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
         std::thread::sleep(std::time::Duration::from_secs(1));
         let id2 = VaultOperation::Mint.external_tx_id(&issuer_request_id);

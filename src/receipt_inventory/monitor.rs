@@ -194,6 +194,8 @@ where
             return Ok(());
         }
 
+        let (source, receipt_info) = determine_source(&receipt_information);
+
         self.cqrs
             .execute(
                 &self.vault.to_string(),
@@ -202,7 +204,8 @@ where
                     balance: Shares::from(current_balance),
                     block_number,
                     tx_hash,
-                    source: determine_source(&receipt_information),
+                    source,
+                    receipt_info,
                 },
             )
             .await
@@ -390,6 +393,7 @@ mod tests {
                 block_number,
                 tx_hash,
                 source: ReceiptSource::External,
+                receipt_info: None,
             },
         )
         .await
@@ -423,6 +427,7 @@ mod tests {
                     block_number,
                     tx_hash,
                     source: ReceiptSource::External,
+                    receipt_info: None,
                 },
             )
             .await

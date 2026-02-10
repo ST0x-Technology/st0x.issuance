@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use super::{
-    ClientId, IssuerRequestId, Network, TokenSymbol, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Network, TokenSymbol, UnderlyingSymbol,
 };
 use crate::account::{AccountView, view::find_by_client_id};
 
@@ -21,7 +21,7 @@ pub(crate) use initiate::initiate_mint;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MintResponse {
-    pub issuer_request_id: IssuerRequestId,
+    pub issuer_request_id: IssuerMintRequestId,
     pub status: String,
 }
 

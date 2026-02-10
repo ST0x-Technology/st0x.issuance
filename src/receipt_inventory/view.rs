@@ -129,11 +129,10 @@ mod tests {
     use cqrs_es::EventEnvelope;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
-    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{
-        ClientId, IssuerRequestId, Mint, MintEvent, Network, Quantity,
+        ClientId, IssuerMintRequestId, Mint, MintEvent, Network, Quantity,
         TokenizationRequestId,
     };
 
@@ -143,7 +142,7 @@ mod tests {
         let token = TokenSymbol::new("tAAPL");
 
         let event = MintEvent::Initiated {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new("alp-456"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: underlying.clone(),
@@ -193,7 +192,7 @@ mod tests {
         };
 
         let event = MintEvent::TokensMinted {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -239,7 +238,7 @@ mod tests {
         let token = TokenSymbol::new("tNVDA");
 
         let event = MintEvent::Initiated {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new("alp-999"),
             quantity: Quantity::new(Decimal::from(50)),
             underlying: underlying.clone(),
@@ -287,7 +286,7 @@ mod tests {
         let minted_at = Utc::now();
 
         let event = MintEvent::TokensMinted {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tx_hash: b256!(
                 "0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
             ),
@@ -339,7 +338,7 @@ mod tests {
         let mut tsla_view = ReceiptInventoryView::default();
 
         let aapl_initiated = MintEvent::Initiated {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new("alp-aapl"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: aapl_underlying.clone(),
@@ -351,7 +350,7 @@ mod tests {
         };
 
         let tsla_initiated = MintEvent::Initiated {
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+            issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new("alp-tsla"),
             quantity: Quantity::new(Decimal::from(50)),
             underlying: tsla_underlying.clone(),
@@ -398,21 +397,21 @@ mod tests {
 
         let events = vec![
             MintEvent::JournalConfirmed {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerMintRequestId::random(),
                 confirmed_at: Utc::now(),
             },
             MintEvent::JournalRejected {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerMintRequestId::random(),
                 reason: "test".to_string(),
                 rejected_at: Utc::now(),
             },
             MintEvent::MintingFailed {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerMintRequestId::random(),
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
             },
             MintEvent::MintCompleted {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerMintRequestId::random(),
                 completed_at: Utc::now(),
             },
         ];

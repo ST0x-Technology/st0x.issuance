@@ -4,13 +4,13 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::auth::IssuerAuth;
-use crate::mint::{IssuerRequestId, MintCommand, TokenizationRequestId};
+use crate::mint::{IssuerMintRequestId, MintCommand, TokenizationRequestId};
 use crate::{MintCqrs, MintEventStore};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
     pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) issuer_request_id: IssuerRequestId,
+    pub(crate) issuer_request_id: IssuerMintRequestId,
     pub(crate) status: JournalStatus,
     pub(crate) reason: Option<String>,
 }
@@ -129,7 +129,7 @@ pub(crate) async fn confirm_journal(
 ))]
 async fn process_journal_completion(
     cqrs: MintCqrs,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
 ) {
     if let Err(err) = cqrs
         .execute(
@@ -171,7 +171,6 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
@@ -179,7 +178,7 @@ mod tests {
         TestAccountAndAsset, TestHarness, create_test_event_store, test_config,
     };
     use crate::mint::{
-        IssuerRequestId, MintCommand, MintView, Quantity,
+        IssuerMintRequestId, MintCommand, MintView, Quantity,
         TokenizationRequestId, view::find_by_issuer_request_id,
     };
 
@@ -192,7 +191,7 @@ mod tests {
 
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
 
         let initiate_cmd = MintCommand::Initiate {
@@ -254,7 +253,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-ok-test");
 
@@ -318,7 +317,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-123");
 
@@ -399,7 +398,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-view-123");
 
@@ -482,7 +481,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-123");
 
@@ -563,7 +562,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-view-123");
 
@@ -648,7 +647,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let correct_tokenization_request_id =
             TokenizationRequestId::new("alp-correct");
         let wrong_tokenization_request_id =

@@ -64,16 +64,21 @@ impl TokenizationRequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct IssuerRequestId(Uuid);
+pub struct IssuerMintRequestId(Uuid);
 
-impl IssuerRequestId {
+impl IssuerMintRequestId {
     #[must_use]
     pub const fn new(value: Uuid) -> Self {
         Self(value)
     }
+
+    #[must_use]
+    pub(crate) fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
-impl std::fmt::Display for IssuerRequestId {
+impl std::fmt::Display for IssuerMintRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -83,7 +88,7 @@ impl std::fmt::Display for IssuerRequestId {
 pub(crate) enum Mint {
     Uninitialized,
     Initiated {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -94,7 +99,7 @@ pub(crate) enum Mint {
         initiated_at: DateTime<Utc>,
     },
     JournalConfirmed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -106,7 +111,7 @@ pub(crate) enum Mint {
         journal_confirmed_at: DateTime<Utc>,
     },
     JournalRejected {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -119,7 +124,7 @@ pub(crate) enum Mint {
         rejected_at: DateTime<Utc>,
     },
     Minting {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -132,7 +137,7 @@ pub(crate) enum Mint {
         minting_started_at: DateTime<Utc>,
     },
     CallbackPending {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -150,7 +155,7 @@ pub(crate) enum Mint {
         minted_at: DateTime<Utc>,
     },
     MintingFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -164,7 +169,7 @@ pub(crate) enum Mint {
         failed_at: DateTime<Utc>,
     },
     Completed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -223,7 +228,7 @@ impl Mint {
 
     fn handle_confirm_journal(
         &self,
-        provided_id: IssuerRequestId,
+        provided_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
         let Self::Initiated { issuer_request_id: expected_id, .. } = self
         else {
@@ -244,7 +249,7 @@ impl Mint {
 
     fn handle_reject_journal(
         &self,
-        provided_id: IssuerRequestId,
+        provided_id: IssuerMintRequestId,
         reason: String,
     ) -> Result<Vec<MintEvent>, MintError> {
         let Self::Initiated { issuer_request_id: expected_id, .. } = self
@@ -266,11 +271,11 @@ impl Mint {
     }
 
     fn validate_issuer_request_id(
-        expected: &IssuerRequestId,
-        provided: &IssuerRequestId,
+        expected: &IssuerMintRequestId,
+        provided: &IssuerMintRequestId,
     ) -> Result<(), MintError> {
         if provided != expected {
-            return Err(MintError::IssuerRequestIdMismatch {
+            return Err(MintError::IssuerMintRequestIdMismatch {
                 expected: expected.clone(),
                 provided: provided.clone(),
             });
@@ -281,7 +286,7 @@ impl Mint {
     async fn handle_deposit(
         &self,
         services: &MintServices,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
         let Self::JournalConfirmed {
             issuer_request_id: expected_id,
@@ -308,7 +313,7 @@ impl Mint {
 
         let assets = quantity.to_u256_with_18_decimals()?;
 
-        let receipt_info = ReceiptInformation::mint(
+        let receipt_info = ReceiptInformation::new(
             tokenization_request_id.clone(),
             issuer_request_id.clone(),
             underlying.clone(),
@@ -326,7 +331,7 @@ impl Mint {
                 assets,
                 services.bot,
                 *wallet,
-                receipt_info,
+                receipt_info.clone(),
             )
             .await
         {
@@ -336,6 +341,7 @@ impl Mint {
                     vault,
                     &issuer_request_id,
                     &result,
+                    receipt_info,
                     now,
                 )
                 .await
@@ -365,8 +371,9 @@ impl Mint {
     async fn on_deposit_success(
         services: &MintServices,
         vault: Address,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerMintRequestId,
         result: &MintResult,
+        receipt_info: ReceiptInformation,
         now: DateTime<Utc>,
     ) -> Result<Vec<MintEvent>, MintError> {
         info!(
@@ -385,7 +392,7 @@ impl Mint {
                 Shares::from(result.shares_minted),
                 result.block_number,
                 result.tx_hash,
-                issuer_request_id.clone(),
+                receipt_info,
             )
             .await
         {
@@ -417,7 +424,7 @@ impl Mint {
     async fn handle_send_callback(
         &self,
         services: &MintServices,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
         let Self::CallbackPending {
             issuer_request_id: expected_id,
@@ -460,7 +467,7 @@ impl Mint {
     async fn handle_recover(
         &self,
         services: &MintServices,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::JournalConfirmed { .. } => {
@@ -482,7 +489,7 @@ impl Mint {
     async fn handle_recover_incomplete(
         &self,
         services: &MintServices,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
         let (Self::Minting {
             issuer_request_id: expected_id,
@@ -526,7 +533,7 @@ impl Mint {
             return Ok(events);
         }
 
-        let receipt_info = ReceiptInformation::mint(
+        let receipt_info = ReceiptInformation::new(
             tokenization_request_id.clone(),
             issuer_request_id.clone(),
             underlying.clone(),
@@ -595,7 +602,7 @@ impl Mint {
     async fn recover_from_existing_receipt(
         services: &MintServices,
         vault: &Address,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<Vec<MintEvent>>, MintError> {
         let Some(receipt) = services
             .receipts
@@ -1108,9 +1115,9 @@ pub(crate) enum MintError {
     #[error(
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
     )]
-    IssuerRequestIdMismatch {
-        expected: IssuerRequestId,
-        provided: IssuerRequestId,
+    IssuerMintRequestIdMismatch {
+        expected: IssuerMintRequestId,
+        provided: IssuerMintRequestId,
     },
     #[error(
         "Mint not in Minting or MintingFailed state. Current state: {current_state}"
@@ -1151,7 +1158,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::{
-        ClientId, IssuerRequestId, Mint, MintCommand, MintError, MintEvent,
+        ClientId, IssuerMintRequestId, Mint, MintCommand, MintError, MintEvent,
         MintServices, MintView, Network, Quantity, TokenSymbol,
         TokenizationRequestId, UnderlyingSymbol,
     };
@@ -1163,8 +1170,8 @@ pub(crate) mod tests {
     use crate::vault::mock::MockVaultService;
 
     prop_compose! {
-        pub(crate) fn arb_issuer_request_id()(bytes in any::<[u8; 16]>()) -> IssuerRequestId {
-            IssuerRequestId::new(Uuid::from_bytes(bytes))
+        pub(crate) fn arb_issuer_request_id()(bytes in any::<[u8; 16]>()) -> IssuerMintRequestId {
+            IssuerMintRequestId::new(Uuid::from_bytes(bytes))
         }
     }
 
@@ -1203,7 +1210,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initiate_mint_creates_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1277,7 +1284,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initiate_mint_when_already_initiated_returns_error() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1322,7 +1329,7 @@ pub(crate) mod tests {
 
         assert!(matches!(mint, Mint::Uninitialized));
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(50));
         let underlying = UnderlyingSymbol::new("TSLA");
@@ -1372,7 +1379,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_apply_journal_confirmed_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1416,7 +1423,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_apply_journal_rejected_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1464,7 +1471,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_confirm_journal_produces_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1495,7 +1502,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_confirm_journal_for_uninitialized_mint_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         let validator = MintTestFramework::with(test_mint_services())
             .given_no_previous_events()
@@ -1508,7 +1515,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_confirm_journal_for_already_confirmed_mint_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1544,7 +1551,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reject_journal_produces_event() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1586,7 +1593,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reject_journal_for_uninitialized_mint_fails() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         let validator = MintTestFramework::with(test_mint_services())
             .given_no_previous_events()
@@ -1602,8 +1609,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_confirm_journal_with_mismatched_issuer_request_id_fails() {
-        let correct_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
-        let wrong_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let correct_issuer_request_id = IssuerMintRequestId::random();
+        let wrong_issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1630,15 +1637,18 @@ pub(crate) mod tests {
             .inspect_result();
 
         assert!(
-            matches!(result, Err(MintError::IssuerRequestIdMismatch { .. })),
-            "Expected IssuerRequestIdMismatch error, got {result:?}"
+            matches!(
+                result,
+                Err(MintError::IssuerMintRequestIdMismatch { .. })
+            ),
+            "Expected IssuerMintRequestIdMismatch error, got {result:?}"
         );
     }
 
     #[test]
     fn test_reject_journal_with_mismatched_issuer_request_id_fails() {
-        let correct_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
-        let wrong_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let correct_issuer_request_id = IssuerMintRequestId::random();
+        let wrong_issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1665,14 +1675,17 @@ pub(crate) mod tests {
             })
             .inspect_result();
         assert!(
-            matches!(result, Err(MintError::IssuerRequestIdMismatch { .. })),
-            "Expected IssuerRequestIdMismatch error, got {result:?}"
+            matches!(
+                result,
+                Err(MintError::IssuerMintRequestIdMismatch { .. })
+            ),
+            "Expected IssuerMintRequestIdMismatch error, got {result:?}"
         );
     }
 
     #[test]
     fn test_apply_minting_started_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1734,7 +1747,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_apply_tokens_minted_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1804,7 +1817,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_apply_minting_failed_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1856,7 +1869,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_apply_mint_completed_event_updates_state() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1928,7 +1941,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_full_mint_flow_to_completed() {
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-flow-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -2023,7 +2036,7 @@ pub(crate) mod tests {
     }
 
     struct TestMintData {
-        issuer_request_id: super::IssuerRequestId,
+        issuer_request_id: super::IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -2036,7 +2049,7 @@ pub(crate) mod tests {
     impl TestMintData {
         fn new() -> Self {
             Self {
-                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
+                issuer_request_id: IssuerMintRequestId::random(),
                 tokenization_request_id: TokenizationRequestId::new(
                     "alp-integration-456",
                 ),
@@ -2235,7 +2248,7 @@ pub(crate) mod tests {
     #[test]
     fn test_issuer_request_id_display() {
         let uuid = Uuid::new_v4();
-        let id = IssuerRequestId::new(uuid);
+        let id = IssuerMintRequestId::new(uuid);
         assert_eq!(format!("{id}"), uuid.to_string());
     }
 

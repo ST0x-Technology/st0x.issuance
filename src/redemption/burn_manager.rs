@@ -1,5 +1,4 @@
 use alloy::primitives::{Address, U256};
-use chrono::Utc;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -8,7 +7,9 @@ use tracing::{debug, error, info, warn};
 use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
-use super::{IssuerRequestId, Redemption, RedemptionCommand, RedemptionError};
+use super::{
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+};
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptId, ReceiptInventory,
@@ -18,9 +19,7 @@ use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{
-    MultiBurnEntry, OperationType, ReceiptInformation, VaultError, VaultService,
-};
+use crate::vault::{MultiBurnEntry, VaultError, VaultService};
 
 /// Orchestrates the on-chain burning process in response to `AlpacaJournalCompleted` events.
 ///
@@ -167,13 +166,12 @@ where
 
     async fn recover_single_burn_failed(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         view: &RedemptionView,
     ) -> Result<(), BurnManagerError> {
         let RedemptionView::BurnFailed {
             underlying,
             wallet,
-            tokenization_request_id,
             alpaca_quantity,
             dust_quantity,
             ..
@@ -238,18 +236,9 @@ where
             .map(|allocation| MultiBurnEntry {
                 receipt_id: allocation.receipt.receipt_id.inner(),
                 burn_shares: allocation.burn_amount.inner(),
+                receipt_info: allocation.receipt.receipt_info,
             })
             .collect();
-
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: tokenization_request_id.clone(),
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: underlying.clone(),
-            quantity: alpaca_quantity.clone(),
-            operation_type: OperationType::Redeem,
-            timestamp: Utc::now(),
-            notes: Some("Retry after burn failure".to_string()),
-        };
 
         info!(
             issuer_request_id = %issuer_request_id,
@@ -268,7 +257,6 @@ where
                     burns,
                     dust_shares: plan.dust.inner(),
                     owner: self.bot_wallet,
-                    receipt_info,
                     user_wallet: *wallet,
                 },
             )
@@ -284,7 +272,7 @@ where
 
     async fn recover_single_burning(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
         let context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
@@ -381,12 +369,11 @@ where
     /// * `BurnManagerError::Sqlx` - Receipt query failed
     pub(crate) async fn handle_burning_started(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         aggregate: &Redemption,
     ) -> Result<(), BurnManagerError> {
         let Redemption::Burning {
             metadata,
-            tokenization_request_id,
             alpaca_quantity,
             dust_quantity,
             ..
@@ -453,28 +440,13 @@ where
             )
             .await?;
 
-        let receipt_info = ReceiptInformation {
-            tokenization_request_id: tokenization_request_id.clone(),
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: metadata.underlying.clone(),
-            quantity: alpaca_quantity.clone(),
-            operation_type: OperationType::Redeem,
-            timestamp: Utc::now(),
-            notes: None,
-        };
-
-        self.execute_burn_and_record_result(
-            issuer_request_id,
-            vault,
-            plan,
-            receipt_info,
-        )
-        .await
+        self.execute_burn_and_record_result(issuer_request_id, vault, plan)
+            .await
     }
 
     async fn plan_burn(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
         underlying: &UnderlyingSymbol,
         burn_shares: U256,
@@ -514,7 +486,7 @@ where
 
     async fn handle_insufficient_balance(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         underlying: &UnderlyingSymbol,
         required: Shares,
         available: Shares,
@@ -551,12 +523,10 @@ where
 
     async fn execute_burn_and_record_result(
         &self,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
         plan: BurnPlan,
-        receipt_info: ReceiptInformation,
     ) -> Result<(), BurnManagerError> {
-        // Save burn info for inventory updates before consuming plan
         let inventory_updates: Vec<(ReceiptId, Shares)> = plan
             .allocations
             .iter()
@@ -569,6 +539,7 @@ where
             .map(|alloc| MultiBurnEntry {
                 receipt_id: alloc.receipt.receipt_id.inner(),
                 burn_shares: alloc.burn_amount.inner(),
+                receipt_info: alloc.receipt.receipt_info,
             })
             .collect();
 
@@ -582,7 +553,6 @@ where
                     burns,
                     dust_shares: plan.dust.inner(),
                     owner: self.bot_wallet,
-                    receipt_info,
                 },
             )
             .await;
@@ -709,6 +679,7 @@ pub(crate) enum BurnManagerError {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address, b256, uint};
+    use chrono::Utc;
     use cqrs_es::{
         AggregateContext, EventStore,
         persist::{GenericQuery, PersistedEventStore},
@@ -719,21 +690,21 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
-    use crate::mint::{
-        IssuerRequestId, Network, Quantity, TokenizationRequestId,
-    };
+    use crate::mint::IssuerMintRequestId;
+    use crate::mint::{Network, Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionView;
     use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
     };
+    use crate::vault::ReceiptInformation;
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
@@ -862,6 +833,7 @@ mod tests {
                             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         ),
                         source: ReceiptSource::External,
+                        receipt_info: None,
                     },
                 )
                 .await
@@ -876,7 +848,7 @@ mod tests {
     async fn create_test_redemption_in_burning_state(
         cqrs: &TestCqrs,
         store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-456");
@@ -930,7 +902,7 @@ mod tests {
 
     async fn load_aggregate(
         store: &TestStore,
-        issuer_request_id: &IssuerRequestId,
+        issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let context =
             store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
@@ -966,7 +938,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1000,6 +972,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_burn_preserves_receipt_info_in_multi_burn_entry() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness {
+            cqrs,
+            store,
+            receipt_service,
+            receipt_inventory_cqrs,
+            pool,
+            ..
+        } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
+            TEST_WALLET,
+        );
+
+        let receipt_info = ReceiptInformation::new(
+            TokenizationRequestId::new("tok-mint-99"),
+            IssuerMintRequestId::random(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::new(10000, 2)),
+            Utc::now(),
+            None,
+        );
+
+        receipt_inventory_cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(uint!(99_U256)),
+                    balance: Shares::from(
+                        uint!(100_000000000000000000_U256),
+                    ),
+                    block_number: 1,
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    source: ReceiptSource::Itn {
+                        issuer_request_id: IssuerMintRequestId::random(),
+                    },
+                    receipt_info: Some(receipt_info.clone()),
+                },
+            )
+            .await
+            .expect("Failed to discover receipt with receipt_info");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let aggregate = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        let params = vault_mock
+            .get_last_multi_burn_params()
+            .expect("Expected multi_burn to have been called");
+
+        assert_eq!(params.burns.len(), 1);
+        assert_eq!(
+            params.burns[0].receipt_info.as_ref(),
+            Some(&receipt_info),
+            "MultiBurnEntry should preserve the original receipt_info"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_burning_started_with_blockchain_failure() {
         let vault_mock = Arc::new(MockVaultService::new_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
@@ -1028,7 +1086,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1096,7 +1154,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         let aggregate = create_test_redemption_in_burning_state(
             cqrs,
@@ -1149,7 +1207,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
@@ -1218,7 +1276,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1279,7 +1337,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1380,7 +1438,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1439,7 +1497,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let receipt_id = uint!(99_U256);
         let initial_balance = uint!(200_000000000000000000_U256);
 
@@ -1509,7 +1567,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1576,7 +1634,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         let aggregate = create_test_redemption_in_burning_state(
             cqrs,
@@ -1661,7 +1719,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1723,7 +1781,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         // Create a redemption in Burning state (needs 100 shares)
         create_test_redemption_in_burning_state(
@@ -1776,7 +1834,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -1846,7 +1904,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(
@@ -1933,7 +1991,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         harness
             .discover_receipt(

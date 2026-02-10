@@ -137,7 +137,16 @@ use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
 
 struct TokenizationRequestId(String);
-struct IssuerRequestId(String);
+
+/// Mint operations use a UUID-based issuer request ID.
+/// Serializes as a UUID string, e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+struct IssuerMintRequestId(Uuid);
+
+/// Redemption operations derive their issuer request ID from the first 4 bytes
+/// of the on-chain tx_hash that triggered the redemption.
+/// Serializes as "red-{hex}", e.g. "red-574378e0"
+struct IssuerRedemptionRequestId(FixedBytes<4>);
+
 struct ClientId(String);
 struct AlpacaAccountNumber(String);
 struct UnderlyingSymbol(String);
@@ -160,7 +169,7 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Aggregate State:**
 
-- `issuer_request_id`: Our unique identifier for this mint
+- `issuer_request_id: IssuerMintRequestId`: Our unique identifier for this mint
 - `tokenization_request_id`: Alpaca's identifier
 - `quantity`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
   details
@@ -229,7 +238,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Aggregate State:**
 
-- `issuer_request_id`: Our unique identifier for this redemption
+- `issuer_request_id: IssuerRedemptionRequestId`: Our unique identifier for this
+  redemption
 - `tokenization_request_id`: Alpaca's identifier (received after calling their
   API)
 - `underlying`, `token`, `wallet`, `quantity`: Redemption details
@@ -616,18 +626,43 @@ struct TokenizedAsset {
 
 ### 3. Token Minting (Alpaca ITN Flow)
 
+#### Receipts and Backing
+
+ERC-1155 receipts are the on-chain proof that tokenized shares are backed by
+real underlying shares held in a traditional brokerage account. Each receipt
+tracks a specific deposit (mint) — how many shares were deposited, when, and by
+whom.
+
+- **Receipts are created during mints** — when underlying shares are deposited
+  into the vault, the contract mints both ERC-20 shares (fungible, transferable
+  to the user) and ERC-1155 receipts (non-fungible proof of the deposit).
+- **Receipts are burned during redemptions** — when shares are redeemed, the
+  vault burns the receipt alongside the shares, removing the proof of backing
+  because the underlying shares are being returned to the brokerage account.
+- **`ReceiptInformation`** is metadata about the receipt (the deposit that
+  created it). It is serialized to JSON bytes and passed to the vault's
+  `deposit()` call, which emits it as an on-chain event. This metadata links the
+  on-chain receipt to the off-chain Alpaca tokenization request.
+
+The vault's `withdraw()` also accepts a `receiptInformation` bytes parameter
+(emitted as an event). When burning, we pass the original mint's
+`ReceiptInformation` — the metadata that was recorded when the receipt was
+created — because it identifies the receipt being burned.
+
 #### Receipt Custody Model
 
-**IMPORTANT:** The bot's wallet retains custody of all ERC1155 receipts while
-users hold ERC20 shares. This design:
+**IMPORTANT:** The bot's wallet retains custody of all ERC-1155 receipts while
+users hold ERC-20 shares. This design:
 
 - Allows the bot to manage burns while only receiving a share transfer (it holds
   both shares and receipts during redemption)
 - Maintains a clear audit trail (all receipts remain with the issuer)
 
 **Mint Flow:** Bot receives shares + receipts -> Bot transfers shares to user ->
-Bot keeps receipts **Redemption Flow:** User sends shares to bot -> Bot has both
-shares + receipts -> Bot burns
+Bot keeps receipts
+
+**Redemption Flow:** User sends shares to bot -> Bot has both shares + receipts
+-> Bot burns
 
 #### Complete Mint Flow
 
@@ -704,7 +739,7 @@ in Step 2, we'll find out in Step 3.
 
 ```json
 {
-  "issuer_request_id": "123-456-ABCD-7890",
+  "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "created"
 }
 ```
@@ -738,7 +773,7 @@ struct AlpacaMintRequest {
 }
 
 struct MintRequestResponse {
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     status: String,  // "created"
 }
 ```
@@ -759,7 +794,7 @@ account into our designated tokenization account at Alpaca.
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "ABC-123-DEF-456",
+  "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "completed"
 }
 ```
@@ -788,7 +823,7 @@ enum AlpacaConfirmationStatus {
 
 struct AlpacaJournalConfirmation {
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     status: AlpacaConfirmationStatus,
 }
 ```
@@ -831,29 +866,22 @@ and receipts once the AP sends shares back).
 
 ```rust
 struct ReceiptInformation {
-    alpaca_tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
-    #[serde(rename = "underlying_symbol")]
+    tokenization_request_id: TokenizationRequestId,
+    issuer_request_id: IssuerMintRequestId,
     underlying: UnderlyingSymbol,
     quantity: Quantity,
-    operation_type: OperationType,
-    timestamp: chrono::DateTime<Utc>,
+    timestamp: DateTime<Utc>,
     notes: Option<String>,
-}
-
-enum OperationType {
-    Mint,
-    Redeem,
 }
 ```
 
-**Metadata for this mint:**
+**Metadata for this mint (stored on-chain with the receipt):**
 
 - Alpaca `tokenization_request_id`
-- Our `issuer_request_id`
+- Our `issuer_request_id` (typed as `IssuerMintRequestId` since receipts are
+  only created during mints)
 - Symbol and quantity
 - Timestamp
-- Operation type: "mint"
 
 **Authorization Check:** Before attempting to mint, verify that our operator
 address is authorized for the `DEPOSIT` permission on the vault. The
@@ -948,7 +976,7 @@ stateDiagram-v2
 struct StoredMintRequest {
     id: i64,
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     quantity: Quantity,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
@@ -1058,7 +1086,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 ```json
 {
-  "issuer_request_id": "ABC-123-DEF-456",
+  "issuer_request_id": "red-574378e0",
   "underlying_symbol": "AAPL",
   "token_symbol": "AAPL0x",
   "client_id": "5505-1234-ABC-4G45",
@@ -1074,7 +1102,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "ABCDEF123",
+  "issuer_request_id": "red-574378e0",
   "created_at": "2025-09-12T17:28:48.642437-04:00",
   "type": "redeem",
   "status": "pending",
@@ -1109,7 +1137,7 @@ client IDs from the account linking process.
 
 ```rust
 struct AlpacaRedeemRequest {
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
@@ -1138,7 +1166,7 @@ struct Fees(Decimal);
 
 struct AlpacaRedeemResponse {
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     created_at: DateTime<Utc>,
     #[serde(rename = "type")]
     r#type: TokenizationRequestType,
@@ -1194,7 +1222,8 @@ Once Alpaca confirms the journal is completed, we burn the tokens on-chain.
 - `owner`: Bot's wallet (owns both the shares AND receipts - received during
   mint, shares returned during redemption)
 - `id`: Receipt ID to burn from (need to track which receipt to use)
-- `receiptInformation`: Metadata bytes (similar structure to mint)
+- `receiptInformation`: The original mint's `ReceiptInformation` for the receipt
+  being burned
 
 **Key Design Point:** The burn succeeds because the bot's wallet holds both:
 
@@ -1261,7 +1290,7 @@ stateDiagram-v2
 ```rust
 struct StoredRedemption {
     id: i64,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     tokenization_request_id: Option<TokenizationRequestId>,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,

@@ -11,7 +11,8 @@ Relevant docs:
 - README.md
 - ROADMAP.md
 - SPEC.md
-- docs/alloy.md - Alloy patterns (mocks, encoding, type aliases)
+- docs/alloy.md - **MUST READ before any alloy work** (FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros)
 - docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
 - docs/fireblocks.md - Fireblocks integration (externalTxId, SDK error handling)
 
@@ -19,16 +20,20 @@ Relevant docs:
 
 ### Before starting work
 
-- **CRITICAL: Review SPEC.md and the codebase before planning** - The spec is
-  the source of truth. Always check the current specification and existing code
-  before creating a plan:
+- **CRITICAL: SPEC.md is the source of truth for what this service should be.**
+  Always check the spec before planning, during implementation, and when making
+  design decisions. If you're unsure about the purpose of a concept (e.g.,
+  receipts, backing, custody model), the answer is in the spec — not in your
+  assumptions.
   - What has already been implemented vs what the spec describes
   - Existing patterns, types, and conventions in use
   - How your changes will integrate with the current architecture
-  - **If the spec needs updating, update it FIRST** - Implementation is
+  - **If the spec needs updating, update it FIRST** — implementation is
     downstream from the plan, and the plan is downstream from the spec. Never
     start planning implementation until the spec accurately reflects what should
     be built.
+  - **If your change contradicts the spec, you're wrong** — either update the
+    spec first (with user approval) or change your approach to match the spec.
 - Write a comprehensive step-by-step plan with each task having a corresponding
   section and a list of subtasks as checkboxes inside of it
 - The task sections should follow the format `## Task N. <TASK NAME>`
@@ -137,10 +142,10 @@ time-travel debugging, and provide a single source of truth for all operations.
     `20251017000000_create_account_view.sql`)
   - After the file is created, edit it to add the SQL
 - **CRITICAL: Fix migrations in place during development** - When working on a
-  feature tracked in PLAN.md, if you discover a migration you added is
-  incorrect, fix the original migration file directly. NEVER add a new migration
-  to fix another migration added as part of the same task/feature. Only add fix
-  migrations for issues in migrations that have already been merged to main.
+  feature, if you discover a migration you added is incorrect, fix the original
+  migration file directly. NEVER add a new migration to fix another migration
+  added as part of the same task/feature. Only add fix migrations for issues in
+  migrations that have already been merged to main.
 - `sqlx db create` - Create the database
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration
@@ -343,7 +348,7 @@ pub(crate) type MintViewQuery = GenericQuery<
     SqliteViewRepository<MintView, Mint>, MintView, Mint,
 >;
 
-pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerRequestId) -> Option<MintView> {
+pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerMintRequestId) -> Option<MintView> {
     query.load(&Mint::aggregate_id(id)).await
 }
 

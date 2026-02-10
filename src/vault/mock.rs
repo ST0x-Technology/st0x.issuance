@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, U256, b256};
 use async_trait::async_trait;
 use std::sync::Arc;
 #[cfg(test)]
@@ -46,6 +46,8 @@ pub(crate) struct MockVaultService {
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
     #[cfg(test)]
     share_balance: Arc<Mutex<U256>>,
+    #[cfg(test)]
+    last_multi_burn_params: Arc<Mutex<Option<MultiBurnParams>>>,
 }
 
 impl MockVaultService {
@@ -60,6 +62,8 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             share_balance: Arc::new(Mutex::new(U256::MAX)),
+            #[cfg(test)]
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -72,6 +76,7 @@ impl MockVaultService {
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -95,6 +100,11 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn get_multi_burn_call_count(&self) -> usize {
         self.multi_burn_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_last_multi_burn_params(&self) -> Option<MultiBurnParams> {
+        self.last_multi_burn_params.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -143,7 +153,9 @@ impl VaultService for MockVaultService {
 
         match &self.behavior {
             MockBehavior::Success => Ok(MintResult {
-                tx_hash: B256::from([0x42; 32]),
+                tx_hash: b256!(
+                    "0x4242424242424242424242424242424242424242424242424242424242424242"
+                ),
                 receipt_id: U256::from(1),
                 shares_minted: assets,
                 gas_used: 21000,
@@ -175,6 +187,11 @@ impl VaultService for MockVaultService {
     ) -> Result<MultiBurnResult, VaultError> {
         self.multi_burn_call_count.fetch_add(1, Ordering::Relaxed);
 
+        #[cfg(test)]
+        {
+            *self.last_multi_burn_params.lock().unwrap() = Some(params.clone());
+        }
+
         match &self.behavior {
             MockBehavior::Success => {
                 let burns = params
@@ -187,7 +204,9 @@ impl VaultService for MockVaultService {
                     .collect();
 
                 Ok(MultiBurnResult {
-                    tx_hash: B256::from([0x45; 32]),
+                    tx_hash: b256!(
+                        "0x4545454545454545454545454545454545454545454545454545454545454545"
+                    ),
                     burns,
                     dust_returned: params.dust_shares,
                     gas_used: 50000,
@@ -202,30 +221,29 @@ impl VaultService for MockVaultService {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address};
+    use alloy::primitives::{Address, U256, address, b256};
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::MockVaultService;
     use crate::mint::{
-        IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
+        IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, OperationType, ReceiptInformation,
-        VaultError, VaultService,
+        MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
+        VaultService,
     };
 
     fn test_receipt_info() -> ReceiptInformation {
-        ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            quantity: Quantity::new(Decimal::from(100)),
-            operation_type: OperationType::Mint,
-            timestamp: Utc::now(),
-            notes: None,
-        }
+        ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::random(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::from(100)),
+            Utc::now(),
+            None,
+        )
     }
 
     fn test_receiver() -> Address {
@@ -352,8 +370,8 @@ mod tests {
         assert_eq!(call.assets, assets);
         assert_eq!(call.receiver, bot_wallet);
         assert_eq!(
-            call.receipt_info.tokenization_request_id.0,
-            receipt_info.tokenization_request_id.0
+            call.receipt_info.issuer_request_id,
+            receipt_info.issuer_request_id
         );
     }
 
@@ -427,11 +445,14 @@ mod tests {
             burns: vec![MultiBurnEntry {
                 receipt_id: U256::from(42),
                 burn_shares: U256::from(500),
+                receipt_info: Some(test_receipt_info()),
             }],
             dust_shares: U256::from(10),
             owner: test_receiver(),
             user: address!("0x2222222222222222222222222222222222222222"),
-            receipt_info: test_receipt_info(),
+            issuer_request_id: IssuerRedemptionRequestId::new(b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            )),
         }
     }
 

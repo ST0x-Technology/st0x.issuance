@@ -4,14 +4,14 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ClientId, IssuerRequestId, Network, Quantity, TokenSymbol,
+    ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
     TokenizationRequestId, UnderlyingSymbol,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum MintEvent {
     Initiated {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
         underlying: UnderlyingSymbol,
@@ -22,20 +22,20 @@ pub(crate) enum MintEvent {
         initiated_at: DateTime<Utc>,
     },
     JournalConfirmed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         confirmed_at: DateTime<Utc>,
     },
     JournalRejected {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         reason: String,
         rejected_at: DateTime<Utc>,
     },
     MintingStarted {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         started_at: DateTime<Utc>,
     },
     TokensMinted {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
@@ -44,17 +44,17 @@ pub(crate) enum MintEvent {
         minted_at: DateTime<Utc>,
     },
     MintingFailed {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         error: String,
         failed_at: DateTime<Utc>,
     },
     MintCompleted {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         completed_at: DateTime<Utc>,
     },
     /// Indicates that an existing on-chain mint was discovered during recovery.
     ExistingMintRecovered {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,
@@ -63,7 +63,7 @@ pub(crate) enum MintEvent {
     },
     /// Indicates that a mint retry has started during recovery.
     MintRetryStarted {
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         started_at: DateTime<Utc>,
     },
 }

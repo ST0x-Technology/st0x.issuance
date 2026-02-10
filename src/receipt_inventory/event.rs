@@ -3,14 +3,15 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use super::{ReceiptId, Shares};
-use crate::mint::IssuerRequestId;
+use crate::mint::IssuerMintRequestId;
+use crate::vault::ReceiptInformation;
 
 /// Identifies how a receipt was created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum ReceiptSource {
     /// Receipt from Alpaca Instant Tokenization Network (ITN).
     /// The issuer_request_id links this receipt to the mint operation that created it.
-    Itn { issuer_request_id: IssuerRequestId },
+    Itn { issuer_request_id: IssuerMintRequestId },
     /// External receipt for mints not performed by this service
     External,
 }
@@ -23,6 +24,8 @@ pub(crate) enum ReceiptInventoryEvent {
         block_number: u64,
         tx_hash: TxHash,
         source: ReceiptSource,
+        #[serde(default)]
+        receipt_info: Option<ReceiptInformation>,
     },
     Burned {
         receipt_id: ReceiptId,

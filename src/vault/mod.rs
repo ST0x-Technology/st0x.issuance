@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::mint::{
-    IssuerRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
+    IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
+use crate::redemption::IssuerRedemptionRequestId;
 
 pub(crate) mod mock;
 pub(crate) mod service;
@@ -120,6 +121,9 @@ pub(crate) struct MultiBurnEntry {
     pub(crate) receipt_id: U256,
     /// Amount of shares to burn from this receipt
     pub(crate) burn_shares: U256,
+    /// Original mint's receipt information (for on-chain audit trail).
+    /// `None` for external receipts or receipts minted before this feature.
+    pub(crate) receipt_info: Option<ReceiptInformation>,
 }
 
 /// Parameters for a multi-receipt burn operation.
@@ -129,7 +133,7 @@ pub(crate) struct MultiBurnEntry {
 pub(crate) struct MultiBurnParams {
     /// Address of the vault contract
     pub(crate) vault: Address,
-    /// List of burns to perform (receipt_id, burn_amount)
+    /// List of burns to perform (receipt_id, burn_amount, per-entry receipt info)
     pub(crate) burns: Vec<MultiBurnEntry>,
     /// Amount of dust to return to user (can be zero)
     pub(crate) dust_shares: U256,
@@ -137,8 +141,8 @@ pub(crate) struct MultiBurnParams {
     pub(crate) owner: Address,
     /// User's address that will receive the dust
     pub(crate) user: Address,
-    /// Metadata about the operation for on-chain audit trail
-    pub(crate) receipt_info: ReceiptInformation,
+    /// Redemption's issuer request ID (for Fireblocks notes/externalTxId)
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
 }
 
 /// Result of a single burn within a multi-receipt burn operation.
@@ -165,34 +169,29 @@ pub(crate) struct MultiBurnResult {
     pub(crate) block_number: u64,
 }
 
-/// On-chain metadata stored with each vault deposit or withdrawal.
+/// Metadata emitted on-chain with each vault deposit and withdrawal.
 ///
-/// This struct is serialized to JSON and stored as bytes in the vault's receiptInformation
-/// field. It provides a complete audit trail linking on-chain receipts to off-chain
+/// Serialized to JSON bytes and passed as the `receiptInformation` parameter
+/// to `deposit()` and `redeem()`. The contract emits this data in events,
+/// providing an on-chain audit trail linking receipts to off-chain
 /// tokenization requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Only constructed for mints (deposits). When burning (withdrawing),
+/// the original mint's `ReceiptInformation` is passed back to the contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReceiptInformation {
-    /// Alpaca's tokenization request identifier
     pub(crate) tokenization_request_id: TokenizationRequestId,
-    /// Our internal issuer request identifier
-    pub(crate) issuer_request_id: IssuerRequestId,
-    /// Underlying asset symbol (e.g., "AAPL")
+    pub(crate) issuer_request_id: IssuerMintRequestId,
     pub(crate) underlying: UnderlyingSymbol,
-    /// Quantity of underlying assets
     pub(crate) quantity: Quantity,
-    /// Type of operation (Mint or Redeem)
-    pub(crate) operation_type: OperationType,
-    /// Timestamp when the operation was initiated
     pub(crate) timestamp: DateTime<Utc>,
-    /// Optional notes for additional context
     pub(crate) notes: Option<String>,
 }
 
 impl ReceiptInformation {
-    /// Creates receipt information for a mint operation.
-    pub(crate) const fn mint(
+    pub(crate) const fn new(
         tokenization_request_id: TokenizationRequestId,
-        issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerMintRequestId,
         underlying: UnderlyingSymbol,
         quantity: Quantity,
         timestamp: DateTime<Utc>,
@@ -203,7 +202,6 @@ impl ReceiptInformation {
             issuer_request_id,
             underlying,
             quantity,
-            operation_type: OperationType::Mint,
             timestamp,
             notes,
         }
@@ -213,15 +211,6 @@ impl ReceiptInformation {
     pub(crate) fn encode(&self) -> Result<Bytes, serde_json::Error> {
         serde_json::to_vec(self).map(Bytes::from)
     }
-}
-
-/// Type of tokenization operation being performed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum OperationType {
-    /// Minting new tokenized shares (deposit to vault)
-    Mint,
-    /// Redeeming tokenized shares for underlying assets (withdrawal from vault)
-    Redeem,
 }
 
 /// Errors that can occur during vault operations.
@@ -250,28 +239,24 @@ pub(crate) enum VaultError {
 mod tests {
     use chrono::Utc;
     use rust_decimal_macros::dec;
-    use uuid::Uuid;
 
     use super::*;
-    use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
+    use crate::mint::{IssuerMintRequestId, Quantity, TokenizationRequestId};
 
     fn sample_receipt_information() -> ReceiptInformation {
-        ReceiptInformation {
-            tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            quantity: Quantity::new(dec!(100.5)),
-            operation_type: OperationType::Mint,
-            timestamp: Utc::now(),
-            notes: Some("test mint".to_string()),
-        }
+        ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::random(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(dec!(100.5)),
+            Utc::now(),
+            Some("test mint".to_string()),
+        )
     }
 
     #[test]
     fn encode_produces_valid_json() {
         let info = sample_receipt_information();
-        let expected_issuer_id = info.issuer_request_id.to_string();
-
         let encoded = info.encode().unwrap();
 
         let decoded: serde_json::Value =
@@ -283,11 +268,10 @@ mod tests {
         );
         assert_eq!(
             decoded["issuer_request_id"].as_str(),
-            Some(expected_issuer_id.as_str())
+            Some(info.issuer_request_id.to_string().as_str())
         );
         assert_eq!(decoded["underlying"].as_str(), Some("AAPL"));
         assert_eq!(decoded["quantity"].as_str(), Some("100.5"));
-        assert_eq!(decoded["operation_type"].as_str(), Some("Mint"));
         assert_eq!(decoded["notes"].as_str(), Some("test mint"));
     }
 
@@ -299,20 +283,19 @@ mod tests {
         let decoded: ReceiptInformation =
             serde_json::from_slice(&encoded).unwrap();
 
-        assert_eq!(
-            decoded.tokenization_request_id,
-            original.tokenization_request_id
-        );
         assert_eq!(decoded.issuer_request_id, original.issuer_request_id);
-        assert_eq!(decoded.underlying, original.underlying);
-        assert_eq!(decoded.quantity, original.quantity);
-        assert_eq!(decoded.notes, original.notes);
     }
 
     #[test]
     fn encode_handles_none_notes() {
-        let info =
-            ReceiptInformation { notes: None, ..sample_receipt_information() };
+        let info = ReceiptInformation::new(
+            TokenizationRequestId::new("tok-123"),
+            IssuerMintRequestId::random(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(dec!(100.5)),
+            Utc::now(),
+            None,
+        );
 
         let encoded = info.encode().unwrap();
         let decoded: serde_json::Value =

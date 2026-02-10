@@ -228,34 +228,90 @@ Comprehensive documentation for APIs, operations, and incident response.
 
 Bug fixes and improvements that don't fit into the original phases.
 
-### Issues
+### Backlog
 
-- [x] [#67](https://github.com/ST0x-Technology/st0x.issuance/issues/67) - Create
-      an AP wallet whitelisting endpoint
-  - **PR:** [#68](https://github.com/ST0x-Technology/st0x.issuance/pull/68)
-- [x] [#70](https://github.com/ST0x-Technology/st0x.issuance/issues/70) - Fix
-      /tokenized-assets response format
-  - **PR:** [#69](https://github.com/ST0x-Technology/st0x.issuance/pull/69)
-- [x] [#72](https://github.com/ST0x-Technology/st0x.issuance/issues/72) - Switch
-      auth header to X-API-KEY
-  - **PR:** [#71](https://github.com/ST0x-Technology/st0x.issuance/pull/71)
+#### Features
+
+- [ ] [#65](https://github.com/ST0x-Technology/st0x.issuance/issues/65) - Allow
+      linking more than one wallet to an account
+- [ ] [#96](https://github.com/ST0x-Technology/st0x.issuance/issues/96) - Create
+      a sandbox environment for Alpaca to test integrations against
+
+#### Reliability
+
+- [ ] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
+      automatic recovery for burns detected as already completed on-chain
+- [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
+      IssuerRedemptionRequestId has 4-byte ID space with collision risk at scale
+
+### Completed
+
+#### Recovery & Resilience
+
+- [x] [#107](https://github.com/ST0x-Technology/st0x.issuance/issues/107) - Mint
+      auto recovery fails due to used fireblocks external tx id
+  - **PR:** [#102](https://github.com/ST0x-Technology/st0x.issuance/pull/102)
+- [x] [#85](https://github.com/ST0x-Technology/st0x.issuance/issues/85) -
+      Implement redemption recovery system
+  - **PR:** [#104](https://github.com/ST0x-Technology/st0x.issuance/pull/104)
+- [x] [#84](https://github.com/ST0x-Technology/st0x.issuance/issues/84) -
+      Implement mint recovery system
+  - **PR:** [#104](https://github.com/ST0x-Technology/st0x.issuance/pull/104)
+- [x] [#83](https://github.com/ST0x-Technology/st0x.issuance/issues/83) - Add
+      retry policy for Alpaca API calls
+  - **PR:** [#98](https://github.com/ST0x-Technology/st0x.issuance/pull/98)
+
+#### Bug Fixes
+
+- [x] [#108](https://github.com/ST0x-Technology/st0x.issuance/issues/108) -
+      IssuerRequestId conflates mint and redemption ID formats
+- [x] [#87](https://github.com/ST0x-Technology/st0x.issuance/issues/87) - Fix
+      Alpaca authentication and improve logging
+  - **PR:** [#106](https://github.com/ST0x-Technology/st0x.issuance/pull/106)
+- [x] [#86](https://github.com/ST0x-Technology/st0x.issuance/issues/86) - Fix
+      mints being detected as redemptions
+  - **PR:** [#79](https://github.com/ST0x-Technology/st0x.issuance/pull/79)
+- [x] [#82](https://github.com/ST0x-Technology/st0x.issuance/issues/82) - Fix
+      nonce conflicts in concurrent operations
+  - **PR:** [#97](https://github.com/ST0x-Technology/st0x.issuance/pull/97)
+- [x] [#81](https://github.com/ST0x-Technology/st0x.issuance/issues/81) - Fix
+      Alpaca account ID handling
+  - **PR:** [#79](https://github.com/ST0x-Technology/st0x.issuance/pull/79)
+- [x] [#78](https://github.com/ST0x-Technology/st0x.issuance/issues/78) - Fix
+      internal IP whitelisting
+  - **PR:** [#77](https://github.com/ST0x-Technology/st0x.issuance/pull/77)
 - [x] [#74](https://github.com/ST0x-Technology/st0x.issuance/issues/74) - Fix IP
       whitelisting and tokenized assets response format issues
   - **PR:** [#73](https://github.com/ST0x-Technology/st0x.issuance/pull/73)
-- [x] [#76](https://github.com/ST0x-Technology/st0x.issuance/issues/76) - Split
-      account creation into Registration and Alpaca Linking
-  - **PR:** [#75](https://github.com/ST0x-Technology/st0x.issuance/pull/75)
-- [x] [#91](https://github.com/ST0x-Technology/st0x.issuance/issues/91) -
-      Hardcoded tokenized asset seeding instead of admin endpoint
-  - **PR:** [#92](https://github.com/ST0x-Technology/st0x.issuance/pull/92)
+- [x] [#70](https://github.com/ST0x-Technology/st0x.issuance/issues/70) - Fix
+      /tokenized-assets response format
+  - **PR:** [#69](https://github.com/ST0x-Technology/st0x.issuance/pull/69)
+
+#### Configuration
+
 - [x] [#93](https://github.com/ST0x-Technology/st0x.issuance/issues/93) -
       ALPACA_IP_RANGES not passed through during deployment
   - **PR:** [#94](https://github.com/ST0x-Technology/st0x.issuance/pull/94)
+- [x] [#91](https://github.com/ST0x-Technology/st0x.issuance/issues/91) -
+      Hardcoded tokenized asset seeding instead of admin endpoint
+  - **PR:** [#92](https://github.com/ST0x-Technology/st0x.issuance/pull/92)
+- [x] [#90](https://github.com/ST0x-Technology/st0x.issuance/issues/90) -
+      BOT_WALLET should be derived from PRIVATE_KEY instead of separate config
+  - **PR:** [#95](https://github.com/ST0x-Technology/st0x.issuance/pull/95)
 - [x] [#89](https://github.com/ST0x-Technology/st0x.issuance/issues/89) -
       VaultService uses global config vault address instead of per-asset vault
   - **PR:** [#95](https://github.com/ST0x-Technology/st0x.issuance/pull/95)
-- [x] [#90](https://github.com/ST0x-Technology/st0x.issuance/issues/90) -
-      BOT_WALLET should be derived from PRIVATE_KEY instead of separate config;
-      removed `Config.bot` field, now using `bot_wallet()` to derive from
-      private key
-  - **PR:** [#95](https://github.com/ST0x-Technology/st0x.issuance/pull/95)
+
+#### API & Integration
+
+- [x] [#76](https://github.com/ST0x-Technology/st0x.issuance/issues/76) - Split
+      account creation into Registration and Alpaca Linking
+  - **PR:** [#75](https://github.com/ST0x-Technology/st0x.issuance/pull/75)
+- [x] [#72](https://github.com/ST0x-Technology/st0x.issuance/issues/72) - Switch
+      auth header to X-API-KEY
+  - **PR:** [#71](https://github.com/ST0x-Technology/st0x.issuance/pull/71)
+- [x] [#67](https://github.com/ST0x-Technology/st0x.issuance/issues/67) - Create
+      an AP wallet whitelisting endpoint
+  - **PR:** [#68](https://github.com/ST0x-Technology/st0x.issuance/pull/68)
+- [x] [#52](https://github.com/ST0x-Technology/st0x.issuance/issues/52) - Create
+      Rust client library for issuance bot

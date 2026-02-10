@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
-use st0x_issuance::mint::{IssuerRequestId, MintResponse};
+use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 
 async fn perform_mint_flow(
@@ -95,7 +95,7 @@ async fn perform_mint_flow(
 fn setup_redemption_mocks_with_shared_state(
     mock_alpaca: &MockServer,
     user_wallet: Address,
-    shared_issuer_id: Arc<Mutex<Option<IssuerRequestId>>>,
+    shared_issuer_id: Arc<Mutex<Option<String>>>,
     shared_tx_hash: Arc<Mutex<Option<TxHash>>>,
     poll_should_succeed: Arc<AtomicBool>,
 ) -> (Mock, Mock) {
@@ -115,13 +115,8 @@ fn setup_redemption_mocks_with_shared_state(
             move |req: &httpmock::HttpMockRequest| {
                 let body: serde_json::Value =
                     serde_json::from_slice(req.body().as_ref()).unwrap();
-                let issuer_request_id = IssuerRequestId::new(
-                    body["issuer_request_id"]
-                        .as_str()
-                        .unwrap()
-                        .parse()
-                        .unwrap(),
-                );
+                let issuer_request_id =
+                    body["issuer_request_id"].as_str().unwrap().to_string();
                 let tx_hash: TxHash =
                     body["tx_hash"].as_str().unwrap().parse().unwrap();
 
@@ -131,7 +126,7 @@ fn setup_redemption_mocks_with_shared_state(
 
                 let response_body = serde_json::to_string(&serde_json::json!({
                     "tokenization_request_id": "tok-redeem-recovery",
-                    "issuer_request_id": issuer_request_id.to_string(),
+                    "issuer_request_id": &issuer_request_id,
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
@@ -183,7 +178,7 @@ fn setup_redemption_mocks_with_shared_state(
                 let response_body =
                     serde_json::to_string(&serde_json::json!([{
                         "tokenization_request_id": "tok-redeem-recovery",
-                        "issuer_request_id": issuer_request_id.to_string(),
+                        "issuer_request_id": &issuer_request_id,
                         "created_at": "2025-09-12T17:28:48.642437-04:00",
                         "type": "redeem",
                         "status": status,
@@ -413,7 +408,7 @@ async fn test_redemption_recovery_after_restart()
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     // Shared state across mock instances - None until populated by the redeem mock
-    let shared_issuer_id: Arc<Mutex<Option<IssuerRequestId>>> =
+    let shared_issuer_id: Arc<Mutex<Option<String>>> =
         Arc::new(Mutex::new(None));
     let shared_tx_hash: Arc<Mutex<Option<TxHash>>> = Arc::new(Mutex::new(None));
     let poll_should_succeed = Arc::new(AtomicBool::new(false));
