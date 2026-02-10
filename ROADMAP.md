@@ -241,6 +241,8 @@ Bug fixes and improvements that don't fit into the original phases.
 
 - [ ] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
       automatic recovery for burns detected as already completed on-chain
+- [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
+      IssuerRedemptionRequestId has 4-byte ID space with collision risk at scale
 
 ### Completed
 

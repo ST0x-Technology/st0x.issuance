@@ -171,7 +171,6 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
@@ -192,7 +191,7 @@ mod tests {
 
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
 
         let initiate_cmd = MintCommand::Initiate {
@@ -254,7 +253,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-ok-test");
 
@@ -318,7 +317,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-123");
 
@@ -399,7 +398,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-view-123");
 
@@ -482,7 +481,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-123");
 
@@ -563,7 +562,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-view-123");
 
@@ -648,7 +647,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let correct_tokenization_request_id =
             TokenizationRequestId::new("alp-correct");
         let wrong_tokenization_request_id =

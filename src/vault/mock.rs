@@ -46,6 +46,8 @@ pub(crate) struct MockVaultService {
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
     #[cfg(test)]
     share_balance: Arc<Mutex<U256>>,
+    #[cfg(test)]
+    last_multi_burn_params: Arc<Mutex<Option<MultiBurnParams>>>,
 }
 
 impl MockVaultService {
@@ -60,6 +62,8 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             share_balance: Arc::new(Mutex::new(U256::MAX)),
+            #[cfg(test)]
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -72,6 +76,7 @@ impl MockVaultService {
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -95,6 +100,11 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn get_multi_burn_call_count(&self) -> usize {
         self.multi_burn_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_last_multi_burn_params(&self) -> Option<MultiBurnParams> {
+        self.last_multi_burn_params.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -177,6 +187,11 @@ impl VaultService for MockVaultService {
     ) -> Result<MultiBurnResult, VaultError> {
         self.multi_burn_call_count.fetch_add(1, Ordering::Relaxed);
 
+        #[cfg(test)]
+        {
+            *self.last_multi_burn_params.lock().unwrap() = Some(params.clone());
+        }
+
         match &self.behavior {
             MockBehavior::Success => {
                 let burns = params
@@ -209,7 +224,6 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256};
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::MockVaultService;
     use crate::mint::{
@@ -224,7 +238,7 @@ mod tests {
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::new(Uuid::new_v4()),
+            IssuerMintRequestId::random(),
             UnderlyingSymbol::new("AAPL"),
             Quantity::new(Decimal::from(100)),
             Utc::now(),

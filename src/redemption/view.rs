@@ -464,10 +464,6 @@ mod tests {
     use crate::vault::MultiBurnEntry;
     use crate::vault::mock::MockVaultService;
 
-    fn new_redemption_id() -> IssuerRedemptionRequestId {
-        IssuerRedemptionRequestId::new(B256::random())
-    }
-
     fn make_detected_envelope(
         aggregate_id: &str,
         sequence: usize,
@@ -636,7 +632,7 @@ mod tests {
     fn test_view_updates_on_detected_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -693,7 +689,7 @@ mod tests {
     fn test_view_updates_on_alpaca_called_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
@@ -775,7 +771,7 @@ mod tests {
     fn test_view_updates_on_alpaca_journal_completed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("NVDA");
@@ -870,7 +866,7 @@ mod tests {
     fn test_view_updates_on_redemption_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("META");
         let token = TokenSymbol::new("tMETA");
         let wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -928,7 +924,7 @@ mod tests {
     fn test_view_updates_on_alpaca_call_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("GOOGL");
         let token = TokenSymbol::new("tGOOGL");
         let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -987,7 +983,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = new_redemption_id();
+        let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &detected_id,
@@ -999,7 +995,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = new_redemption_id();
+        let alpaca_called_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1012,7 +1008,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-1").await;
 
-        let completed_id = new_redemption_id();
+        let completed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1039,7 +1035,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = new_redemption_id();
+        let completed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1065,7 +1061,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=3 {
-            let id = new_redemption_id();
+            let id = IssuerRedemptionRequestId::random();
             harness
                 .detect_redemption(
                     &id,
@@ -1088,7 +1084,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = new_redemption_id();
+        let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1100,7 +1096,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = new_redemption_id();
+        let alpaca_called_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1113,7 +1109,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-query").await;
 
-        let burning_id = new_redemption_id();
+        let burning_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1139,7 +1135,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = new_redemption_id();
+        let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1161,7 +1157,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = new_redemption_id();
+        let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1173,7 +1169,7 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = new_redemption_id();
+        let alpaca_called_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &alpaca_called_id,
@@ -1186,7 +1182,7 @@ mod tests {
             .await;
         harness.call_alpaca(&alpaca_called_id, "tok-2").await;
 
-        let burning_id = new_redemption_id();
+        let burning_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1200,7 +1196,7 @@ mod tests {
         harness.call_alpaca(&burning_id, "tok-burn-query").await;
         harness.confirm_alpaca_complete(&burning_id).await;
 
-        let completed_id = new_redemption_id();
+        let completed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1227,7 +1223,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = new_redemption_id();
+        let completed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &completed_id,
@@ -1253,7 +1249,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=2 {
-            let id = new_redemption_id();
+            let id = IssuerRedemptionRequestId::random();
             harness
                 .detect_redemption(
                     &id,
@@ -1276,7 +1272,7 @@ mod tests {
     #[test]
     fn test_view_updates_on_burning_failed_event() {
         let mut view = RedemptionView::default();
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let id = issuer_request_id.to_string();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-failed-456");
@@ -1379,7 +1375,7 @@ mod tests {
         let TestHarness { pool, cqrs } = &harness;
 
         // Create a redemption in Detected state
-        let detected_id = new_redemption_id();
+        let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &detected_id,
@@ -1394,7 +1390,7 @@ mod tests {
             .await;
 
         // Create a redemption in Burning state
-        let burning_id = new_redemption_id();
+        let burning_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &burning_id,
@@ -1411,7 +1407,7 @@ mod tests {
         harness.confirm_alpaca_complete(&burning_id).await;
 
         // Create a redemption in BurnFailed state
-        let burn_failed_id = new_redemption_id();
+        let burn_failed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
                 &burn_failed_id,
@@ -1458,7 +1454,7 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let id = issuer_request_id.to_string();
         let quantity = Quantity::new(Decimal::from(100));
 

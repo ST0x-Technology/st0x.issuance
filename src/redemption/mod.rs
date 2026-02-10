@@ -32,6 +32,11 @@ impl IssuerRedemptionRequestId {
     pub(crate) fn new(tx_hash: TxHash) -> Self {
         Self(FixedBytes::<4>::from_slice(&tx_hash[..4]))
     }
+
+    #[cfg(test)]
+    pub(crate) fn random() -> Self {
+        Self::new(B256::random())
+    }
 }
 
 impl std::fmt::Display for IssuerRedemptionRequestId {
@@ -678,7 +683,7 @@ impl Aggregate for Redemption {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, TxHash, U256, address, b256, uint};
+    use alloy::primitives::{TxHash, U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{Aggregate, test::TestFramework};
     use proptest::prelude::*;
@@ -696,17 +701,13 @@ mod tests {
 
     type RedemptionTestFramework = TestFramework<Redemption>;
 
-    fn new_redemption_id() -> IssuerRedemptionRequestId {
-        IssuerRedemptionRequestId::new(B256::random())
-    }
-
     fn mock_services() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
     }
 
     #[test]
     fn test_detect_redemption_creates_event() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -757,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_detect_redemption_when_already_detected_returns_error() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
@@ -798,7 +799,7 @@ mod tests {
 
         assert!(matches!(redemption, Redemption::Uninitialized));
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let underlying = UnderlyingSymbol::new("NVDA");
         let token = TokenSymbol::new("tNVDA");
         let wallet = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
@@ -839,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_call_from_detected_state() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -884,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_call_from_wrong_state_fails() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-789");
 
         RedemptionTestFramework::with(mock_services())
@@ -903,7 +904,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_failure_from_detected_state() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let error = "API timeout".to_string();
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -945,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_record_alpaca_failure_from_wrong_state_fails() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -961,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_from_alpaca_called_state() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
 
@@ -1013,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_from_wrong_state_fails() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -1030,7 +1031,7 @@ mod tests {
     fn test_apply_alpaca_journal_completed_transitions_to_burning() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("TSLA");
@@ -1096,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_confirm_alpaca_complete_emits_one_event() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-one-event-456");
 
@@ -1148,7 +1149,7 @@ mod tests {
 
     #[test]
     fn test_burn_tokens_from_burning_state() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let receipt_id = uint!(42_U256);
         let burn_shares = uint!(100_000000000000000000_U256);
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -1216,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_burn_tokens_from_wrong_state_fails() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
@@ -1252,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_record_burn_failure_from_burning_state() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let error = "Insufficient gas".to_string();
 
         let validator = RedemptionTestFramework::with(mock_services())
@@ -1307,7 +1308,7 @@ mod tests {
 
     #[test]
     fn test_record_burn_failure_from_wrong_state_fails() {
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
 
         RedemptionTestFramework::with(mock_services())
             .given_no_previous_events()
@@ -1325,7 +1326,7 @@ mod tests {
     fn test_apply_tokens_burned_transitions_to_completed() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
         let underlying = UnderlyingSymbol::new("AMZN");
@@ -1394,7 +1395,7 @@ mod tests {
     fn test_apply_burning_failed_transitions_to_failed() {
         let mut redemption = Redemption::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-failed-456");
         let underlying = UnderlyingSymbol::new("NFLX");

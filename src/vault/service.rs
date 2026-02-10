@@ -208,7 +208,6 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use uuid::Uuid;
 
     use super::RealBlockchainService;
     use crate::bindings::OffchainAssetReceiptVault;
@@ -224,7 +223,7 @@ mod tests {
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::new(Uuid::new_v4()),
+            IssuerMintRequestId::random(),
             UnderlyingSymbol::new("AAPL"),
             Quantity::new(Decimal::from(100)),
             Utc::now(),
@@ -572,7 +571,7 @@ mod tests {
 
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::new(Uuid::new_v4()),
+            IssuerMintRequestId::random(),
             UnderlyingSymbol::new("AAPL"),
             Quantity::new(Decimal::from(100)),
             fixed_timestamp,

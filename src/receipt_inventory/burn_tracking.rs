@@ -209,7 +209,7 @@ pub(crate) async fn replay_receipt_burns_view(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, U256, address, b256, uint};
+    use alloy::primitives::{U256, address, b256, uint};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -220,10 +220,6 @@ mod tests {
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-
-    fn new_redemption_id() -> IssuerRedemptionRequestId {
-        IssuerRedemptionRequestId::new(B256::random())
-    }
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -245,7 +241,7 @@ mod tests {
         let mut view = ReceiptBurnsView::default();
         assert!(matches!(view, ReceiptBurnsView::Unavailable));
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let event = RedemptionEvent::TokensBurned {
             issuer_request_id: issuer_request_id.clone(),
             tx_hash: b256!(
@@ -289,7 +285,7 @@ mod tests {
     fn test_view_ignores_other_events() {
         let mut view = ReceiptBurnsView::default();
 
-        let issuer_request_id = new_redemption_id();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
         let events = vec![
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -347,7 +343,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: new_redemption_id(),
+            issuer_request_id: IssuerRedemptionRequestId::random(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -423,7 +419,7 @@ mod tests {
         for i in 1_u64..=3 {
             let aggregate_id = format!("red-multi-{i}");
             let event = RedemptionEvent::TokensBurned {
-                issuer_request_id: new_redemption_id(),
+                issuer_request_id: IssuerRedemptionRequestId::random(),
                 tx_hash: b256!(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ),
@@ -491,7 +487,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: new_redemption_id(),
+            issuer_request_id: IssuerRedemptionRequestId::random(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),

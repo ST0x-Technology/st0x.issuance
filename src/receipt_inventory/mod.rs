@@ -515,7 +515,6 @@ mod tests {
     use alloy::primitives::{Bytes, TxHash, address, b256};
     use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::*;
 
@@ -863,7 +862,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-test"),
             issuer_request_id.clone(),
@@ -895,7 +894,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-roundtrip"),
             issuer_request_id.clone(),
@@ -1031,7 +1030,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         cqrs.execute(
             &vault.to_string(),
@@ -1056,7 +1055,7 @@ mod tests {
     async fn test_find_by_issuer_request_id_returns_none_when_not_exists() {
         let store = Arc::new(MemStore::<ReceiptInventory>::default());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         let context = store.load_aggregate(&vault.to_string()).await.unwrap();
         let found =
@@ -1091,7 +1090,7 @@ mod tests {
         let aggregate = context.aggregate();
 
         // External receipts should not be indexed by issuer_request_id
-        let random_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let random_id = IssuerMintRequestId::random();
         assert_eq!(aggregate.find_by_issuer_request_id(&random_id), None);
 
         // But the receipt itself should exist
@@ -1106,7 +1105,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         cqrs.execute(
             &vault.to_string(),
@@ -1165,7 +1164,7 @@ mod tests {
     #[test]
     fn test_determine_source_returns_itn_when_receipt_info_has_issuer_request_id()
      {
-        let expected_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let expected_id = IssuerMintRequestId::random();
         let receipt_info = serde_json::json!({
             "tokenization_request_id": "tok-123",
             "issuer_request_id": expected_id.to_string(),
@@ -1399,11 +1398,11 @@ mod tests {
             let encoded = receipt_info.encode().unwrap();
             let (source, parsed_info) = determine_source(&encoded);
 
-            let ReceiptSource::Itn { issuer_request_id } = &source else {
-                prop_assert!(false, "Expected Itn source, got {:?}", source);
-                unreachable!();
-            };
-            prop_assert_eq!(issuer_request_id, &receipt_info.issuer_request_id);
+            prop_assert!(
+                matches!(&source, ReceiptSource::Itn { issuer_request_id }
+                    if issuer_request_id == &receipt_info.issuer_request_id),
+                "Expected Itn source with matching issuer_request_id, got {:?}", source
+            );
             prop_assert!(parsed_info.is_some());
         }
     }
@@ -1416,8 +1415,7 @@ mod tests {
         evm.grant_certify_role(evm.wallet_address).await.unwrap();
         evm.certify_vault(U256::MAX).await.unwrap();
 
-        let original_issuer_request_id =
-            IssuerMintRequestId::new(Uuid::new_v4());
+        let original_issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-anvil-test"),
             original_issuer_request_id.clone(),
@@ -1470,7 +1468,7 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         service
             .register_minted_receipt(
@@ -1502,7 +1500,7 @@ mod tests {
         let tx_hash = b256!(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
 
         service
             .register_minted_receipt(
@@ -1540,7 +1538,7 @@ mod tests {
         );
 
         for _ in 0..2 {
-            let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+            let issuer_request_id = IssuerMintRequestId::random();
 
             service
                 .register_minted_receipt(
@@ -1574,7 +1572,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = make_receipt_info(&issuer_request_id);
 
         service

@@ -239,7 +239,6 @@ pub(crate) enum VaultError {
 mod tests {
     use chrono::Utc;
     use rust_decimal_macros::dec;
-    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{IssuerMintRequestId, Quantity, TokenizationRequestId};
@@ -247,7 +246,7 @@ mod tests {
     fn sample_receipt_information() -> ReceiptInformation {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::new(Uuid::new_v4()),
+            IssuerMintRequestId::random(),
             UnderlyingSymbol::new("AAPL"),
             Quantity::new(dec!(100.5)),
             Utc::now(),
@@ -291,7 +290,7 @@ mod tests {
     fn encode_handles_none_notes() {
         let info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::new(Uuid::new_v4()),
+            IssuerMintRequestId::random(),
             UnderlyingSymbol::new("AAPL"),
             Quantity::new(dec!(100.5)),
             Utc::now(),

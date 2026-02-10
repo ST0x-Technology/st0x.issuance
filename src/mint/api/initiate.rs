@@ -4,7 +4,6 @@ use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::error;
-use uuid::Uuid;
 
 use super::{
     MintApiError, MintResponse, validate_asset_exists, validate_client_eligible,
@@ -61,7 +60,7 @@ pub(crate) async fn initiate_mint(
     validate_client_eligible(pool.inner(), &request.client_id, &request.wallet)
         .await?;
 
-    let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+    let issuer_request_id = IssuerMintRequestId::random();
 
     let command = MintCommand::Initiate {
         issuer_request_id: issuer_request_id.clone(),
@@ -103,7 +102,6 @@ mod tests {
     use rocket::routes;
     use rust_decimal::Decimal;
     use std::str::FromStr;
-    use uuid::Uuid;
 
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
@@ -728,7 +726,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerMintRequestId::new(Uuid::new_v4());
+        let issuer_request_id = IssuerMintRequestId::random();
         let aggregate_id = issuer_request_id.to_string();
 
         let command = MintCommand::Initiate {
