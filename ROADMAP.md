@@ -228,11 +228,6 @@ Comprehensive documentation for APIs, operations, and incident response.
 
 Bug fixes and improvements that don't fit into the original phases.
 
-### In Progress
-
-- [ ] [#108](https://github.com/ST0x-Technology/st0x.issuance/issues/108) -
-      IssuerRequestId conflates mint and redemption ID formats
-
 ### Backlog
 
 #### Features
@@ -266,6 +261,8 @@ Bug fixes and improvements that don't fit into the original phases.
 
 #### Bug Fixes
 
+- [x] [#108](https://github.com/ST0x-Technology/st0x.issuance/issues/108) -
+      IssuerRequestId conflates mint and redemption ID formats
 - [x] [#87](https://github.com/ST0x-Technology/st0x.issuance/issues/87) - Fix
       Alpaca authentication and improve logging
   - **PR:** [#106](https://github.com/ST0x-Technology/st0x.issuance/pull/106)

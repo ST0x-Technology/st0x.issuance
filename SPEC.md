@@ -626,18 +626,43 @@ struct TokenizedAsset {
 
 ### 3. Token Minting (Alpaca ITN Flow)
 
+#### Receipts and Backing
+
+ERC-1155 receipts are the on-chain proof that tokenized shares are backed by
+real underlying shares held in a traditional brokerage account. Each receipt
+tracks a specific deposit (mint) — how many shares were deposited, when, and by
+whom.
+
+- **Receipts are created during mints** — when underlying shares are deposited
+  into the vault, the contract mints both ERC-20 shares (fungible, transferable
+  to the user) and ERC-1155 receipts (non-fungible proof of the deposit).
+- **Receipts are burned during redemptions** — when shares are redeemed, the
+  vault burns the receipt alongside the shares, removing the proof of backing
+  because the underlying shares are being returned to the brokerage account.
+- **`ReceiptInformation`** is metadata about the receipt (the deposit that
+  created it). It is serialized to JSON bytes and passed to the vault's
+  `deposit()` call, which emits it as an on-chain event. This metadata links the
+  on-chain receipt to the off-chain Alpaca tokenization request.
+
+The vault's `withdraw()` also accepts a `receiptInformation` bytes parameter
+(emitted as an event). When burning, we pass the original mint's
+`ReceiptInformation` — the metadata that was recorded when the receipt was
+created — because it identifies the receipt being burned.
+
 #### Receipt Custody Model
 
-**IMPORTANT:** The bot's wallet retains custody of all ERC1155 receipts while
-users hold ERC20 shares. This design:
+**IMPORTANT:** The bot's wallet retains custody of all ERC-1155 receipts while
+users hold ERC-20 shares. This design:
 
 - Allows the bot to manage burns while only receiving a share transfer (it holds
   both shares and receipts during redemption)
 - Maintains a clear audit trail (all receipts remain with the issuer)
 
 **Mint Flow:** Bot receives shares + receipts -> Bot transfers shares to user ->
-Bot keeps receipts **Redemption Flow:** User sends shares to bot -> Bot has both
-shares + receipts -> Bot burns
+Bot keeps receipts
+
+**Redemption Flow:** User sends shares to bot -> Bot has both shares + receipts
+-> Bot burns
 
 #### Complete Mint Flow
 
@@ -841,29 +866,22 @@ and receipts once the AP sends shares back).
 
 ```rust
 struct ReceiptInformation {
-    alpaca_tokenization_request_id: TokenizationRequestId,
+    tokenization_request_id: TokenizationRequestId,
     issuer_request_id: IssuerMintRequestId,
-    #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     quantity: Quantity,
-    operation_type: OperationType,
-    timestamp: chrono::DateTime<Utc>,
+    timestamp: DateTime<Utc>,
     notes: Option<String>,
-}
-
-enum OperationType {
-    Mint,
-    Redeem,
 }
 ```
 
-**Metadata for this mint:**
+**Metadata for this mint (stored on-chain with the receipt):**
 
 - Alpaca `tokenization_request_id`
-- Our `issuer_request_id`
+- Our `issuer_request_id` (typed as `IssuerMintRequestId` since receipts are
+  only created during mints)
 - Symbol and quantity
 - Timestamp
-- Operation type: "mint"
 
 **Authorization Check:** Before attempting to mint, verify that our operator
 address is authorized for the `DEPOSIT` permission on the vault. The
@@ -1204,7 +1222,8 @@ Once Alpaca confirms the journal is completed, we burn the tokens on-chain.
 - `owner`: Bot's wallet (owns both the shares AND receipts - received during
   mint, shares returned during redemption)
 - `id`: Receipt ID to burn from (need to track which receipt to use)
-- `receiptInformation`: Metadata bytes (similar structure to mint)
+- `receiptInformation`: The original mint's `ReceiptInformation` for the receipt
+  being burned
 
 **Key Design Point:** The burn succeeds because the bot's wallet holds both:
 

@@ -19,16 +19,20 @@ Relevant docs:
 
 ### Before starting work
 
-- **CRITICAL: Review SPEC.md and the codebase before planning** - The spec is
-  the source of truth. Always check the current specification and existing code
-  before creating a plan:
+- **CRITICAL: SPEC.md is the source of truth for what this service should be.**
+  Always check the spec before planning, during implementation, and when making
+  design decisions. If you're unsure about the purpose of a concept (e.g.,
+  receipts, backing, custody model), the answer is in the spec — not in your
+  assumptions.
   - What has already been implemented vs what the spec describes
   - Existing patterns, types, and conventions in use
   - How your changes will integrate with the current architecture
-  - **If the spec needs updating, update it FIRST** - Implementation is
+  - **If the spec needs updating, update it FIRST** — implementation is
     downstream from the plan, and the plan is downstream from the spec. Never
     start planning implementation until the spec accurately reflects what should
     be built.
+  - **If your change contradicts the spec, you're wrong** — either update the
+    spec first (with user approval) or change your approach to match the spec.
 - Write a comprehensive step-by-step plan with each task having a corresponding
   section and a list of subtasks as checkboxes inside of it
 - The task sections should follow the format `## Task N. <TASK NAME>`
