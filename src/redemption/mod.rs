@@ -8,7 +8,8 @@ pub(crate) mod detector;
 pub(crate) mod journal_manager;
 pub(crate) mod redeem_call_manager;
 
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::hex;
+use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -17,7 +18,59 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::Quantity;
-use crate::mint::{IssuerRequestId, TokenizationRequestId};
+use crate::mint::TokenizationRequestId;
+
+/// Issuer request ID for redemption operations.
+///
+/// Derived from the triggering transaction hash — the first 4 bytes are
+/// extracted and serialized as `"red-{hex}"` (e.g., `"red-574378e0"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct IssuerRedemptionRequestId(FixedBytes<4>);
+
+impl IssuerRedemptionRequestId {
+    #[must_use]
+    pub(crate) fn new(tx_hash: TxHash) -> Self {
+        Self(FixedBytes::<4>::from_slice(&tx_hash[..4]))
+    }
+}
+
+impl std::fmt::Display for IssuerRedemptionRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "red-{}", hex::encode(self.0))
+    }
+}
+
+impl Serialize for IssuerRedemptionRequestId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(hex_str) = s.strip_prefix("red-") {
+            let bytes =
+                hex::decode(hex_str).map_err(serde::de::Error::custom)?;
+            FixedBytes::<4>::try_from(bytes.as_slice()).map(Self).map_err(
+                |_| serde::de::Error::custom("expected exactly 4 bytes"),
+            )
+        } else if let Ok(uuid) = uuid::Uuid::parse_str(&s) {
+            // Legacy format: old events stored issuer_request_id as UUID strings.
+            // Extract the first 4 bytes for backward-compatible replay.
+            Ok(Self(FixedBytes::<4>::from_slice(&uuid.as_bytes()[..4])))
+        } else {
+            Err(serde::de::Error::custom(
+                "expected 'red-' prefix or valid UUID",
+            ))
+        }
+    }
+}
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
 use crate::vault::{
