@@ -13,6 +13,7 @@ Relevant docs:
 - SPEC.md
 - docs/alloy.md - Alloy patterns (mocks, encoding, type aliases)
 - docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
+- docs/fireblocks.md - Fireblocks integration (externalTxId, SDK error handling)
 
 ## Plan & Review
 
@@ -459,6 +460,23 @@ pipeline:
 - **`docker-compose.template.yaml`**: Container configuration template populated
   by the deployment workflow
 
+### Logging Guidelines
+
+- **Log levels**: ERROR = system cannot recover without intervention, WARN =
+  degraded but continuing, INFO = significant business events and state
+  transitions, DEBUG = diagnostic detail for troubleshooting, TRACE =
+  fine-grained internal steps
+- **Structured logging**: Always use structured key-value fields
+  (`info!(key = %value, "message")`) not string interpolation in messages
+- **Loop body logs must be DEBUG or TRACE**: Any log inside a loop or per-item
+  iteration must not be INFO or higher - only the summary before/after the loop
+- **Actionable context**: Include enough structured fields to investigate
+  without needing to reproduce (IDs, counts, addresses)
+- **No secrets in logs**: Never log API keys, private keys, or authentication
+  credentials. Request/response bodies are generally fine to log for debugging
+  (this is infrastructure, not a user-facing app), but exercise judgement -
+  avoid logging payloads that contain credentials or tokens
+
 ### Code Quality & Best Practices
 
 - **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
@@ -831,8 +849,29 @@ only, with real blockchain (Anvil).
 
 ### Testing Guidelines
 
+- Write tests before changing logic. When writing tests for existing code, don't
+  assume current behavior is correct - it may have bugs.
 - Add context to failing `assert!` macros instead of temporary `println!`
 - Never test language features - test business logic
+- **Tests must verify both behavior and observability.** Every test that
+  exercises business logic must also assert on expected log output (via
+  `tracing-test`). Observability is not optional - if code should log something,
+  the test must verify it does. Don't create separate test cases for logging;
+  add log assertions alongside behavioral assertions in the same test.
+- **Use `logs_contain_at` for log assertions.** The helper
+  `logs_contain_at(level, &["snippet1", "snippet2"])` checks that a single log
+  line at the given level contains all specified snippets. This ensures you're
+  testing that the right information appears together in one log entry:
+
+```rust
+#[traced_test]
+#[test]
+fn ingestion_logs_progress() {
+    // ... trigger ingestion ...
+    assert!(logs_contain_at(Level::DEBUG, &["fetching", "BTC"]));
+    assert!(logs_contain_at(Level::DEBUG, &["fetched", "1"]));
+}
+```
 
 ```rust
 // Bad: Tests struct assignment, not our code
