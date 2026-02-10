@@ -10,7 +10,7 @@ use fireblocks_sdk::apis::transactions_api::{
 };
 use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::config::{
     AssetId, ChainAssetIds, Environment, FireblocksConfig,
@@ -182,8 +182,24 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .transaction_request(tx_request)
             .build();
 
-        let create_response =
-            self.client.transactions_api().create_transaction(params).await?;
+        let create_response = self
+            .client
+            .transactions_api()
+            .create_transaction(params)
+            .await
+            .map_err(|err| {
+                // The SDK's Display impl only shows the status code, discarding
+                // the response body which contains the actual error message and
+                // code. Debug preserves the full ResponseContent including the
+                // body and typed error entity.
+                warn!(
+                    error = ?err,
+                    %contract_address,
+                    %external_tx_id,
+                    "Fireblocks create_transaction failed"
+                );
+                err
+            })?;
 
         create_response.id.ok_or(FireblocksVaultError::MissingTransactionId)
     }

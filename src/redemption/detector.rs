@@ -6,7 +6,7 @@ use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use url::Url;
 
 use super::{
@@ -140,7 +140,7 @@ where
 
         while let Some(log) = stream.next().await {
             if let Err(err) = self.process_transfer_log(&log).await {
-                error!("Failed to process transfer log: {err}");
+                warn!("Failed to process transfer log: {err}");
             }
         }
 

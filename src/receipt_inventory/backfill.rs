@@ -6,7 +6,7 @@ use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -149,7 +149,7 @@ where
         ))
         .then(|(chunk_from, chunk_to)| async move {
             let logs = self.fetch_logs_for_range(chunk_from, chunk_to).await?;
-            info!(
+            debug!(
                 chunk_from,
                 chunk_to,
                 logs_found = logs.len(),
@@ -319,10 +319,12 @@ mod tests {
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
     };
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::ReceiptBackfiller;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::ReceiptInventory;
+    use crate::test_utils::logs_contain_at;
 
     type TestStore = MemStore<ReceiptInventory>;
 
@@ -385,6 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn backfill_discovers_receipt_from_historic_deposit() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let cqrs = setup_cqrs();
@@ -433,6 +436,27 @@ mod tests {
 
         assert_eq!(result.processed_count, 1);
         assert_eq!(result.skipped_zero_balance, 0);
+
+        assert!(
+            logs_contain_at(
+                tracing::Level::DEBUG,
+                &[
+                    "backfill_discovers_receipt_from_historic_deposit",
+                    "Processed block range",
+                ]
+            ),
+            "Expected DEBUG log for block range processing"
+        );
+        assert!(
+            logs_contain_at(
+                tracing::Level::INFO,
+                &[
+                    "backfill_discovers_receipt_from_historic_deposit",
+                    "Processed receipt",
+                ]
+            ),
+            "Expected INFO log for processed receipt"
+        );
     }
 
     #[tokio::test]
@@ -511,6 +535,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn backfill_skips_zero_balance_receipts() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let cqrs = setup_cqrs();
@@ -559,6 +584,24 @@ mod tests {
 
         assert_eq!(result.processed_count, 0);
         assert_eq!(result.skipped_zero_balance, 1);
+
+        assert!(
+            logs_contain_at(
+                tracing::Level::DEBUG,
+                &[
+                    "backfill_skips_zero_balance_receipts",
+                    "Processed block range",
+                ]
+            ),
+            "Expected DEBUG log for block range processing"
+        );
+        assert!(
+            !logs_contain_at(
+                tracing::Level::INFO,
+                &["backfill_skips_zero_balance_receipts", "Processed receipt",]
+            ),
+            "Should NOT log processed receipt when all receipts have zero balance"
+        );
     }
 
     #[tokio::test]
@@ -685,6 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn backfill_emits_checkpoint_after_processing() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let (cqrs, store) = setup_cqrs_with_store();
@@ -736,6 +780,17 @@ mod tests {
             ctx.aggregate().last_backfilled_block(),
             Some(current_block),
             "Backfill should checkpoint to current block after processing"
+        );
+
+        assert!(
+            logs_contain_at(
+                tracing::Level::INFO,
+                &[
+                    "backfill_emits_checkpoint_after_processing",
+                    "Receipt backfill complete",
+                ]
+            ),
+            "Expected INFO log for backfill completion"
         );
     }
 

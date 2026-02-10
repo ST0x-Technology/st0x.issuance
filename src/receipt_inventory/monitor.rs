@@ -6,7 +6,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -127,7 +127,7 @@ where
             tokio::select! {
                 Some(log) = deposit_stream.next() => {
                     if let Err(err) = self.process_deposit(&log).await {
-                        error!("Failed to process Deposit: {err}");
+                        warn!("Failed to process Deposit: {err}");
                     }
                 }
                 else => {

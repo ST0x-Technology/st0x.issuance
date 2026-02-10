@@ -159,7 +159,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                     .await;
             }
 
-            info!(
+            debug!(
                 issuer_request_id = %issuer_request_id.as_str(),
                 tokenization_request_id = %tokenization_request_id.0,
                 poll_interval = ?poll_interval,
@@ -449,6 +449,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use tracing_test::traced_test;
 
     use super::{JournalManager, JournalManagerError};
     use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
@@ -457,6 +458,7 @@ mod tests {
     use crate::redemption::{
         Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
     };
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::TokenSymbol;
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
@@ -654,6 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_poll_pending_then_completed() {
         let (cqrs, store, pool) = setup_test_cqrs().await;
 
@@ -694,6 +697,27 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
+
+        assert!(
+            logs_contain_at(
+                tracing::Level::DEBUG,
+                &[
+                    "test_poll_pending_then_completed",
+                    "Polling Alpaca for journal status",
+                ]
+            ),
+            "Polling log should be at DEBUG level, not INFO"
+        );
+        assert!(
+            !logs_contain_at(
+                tracing::Level::INFO,
+                &[
+                    "test_poll_pending_then_completed",
+                    "Polling Alpaca for journal status",
+                ]
+            ),
+            "Polling log must not appear at INFO level (loop body noise)"
+        );
     }
 
     #[tokio::test]
