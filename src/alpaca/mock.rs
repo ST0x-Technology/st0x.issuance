@@ -181,7 +181,7 @@ impl AlpacaService for MockAlpacaService {
         }
 
         #[cfg(not(test))]
-        Ok(super::TokenizationRequest::Redeem {
+        Ok(TokenizationRequest::Redeem {
             id: tokenization_request_id.clone(),
             issuer_request_id: IssuerRedemptionRequestId::new(b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
