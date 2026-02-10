@@ -115,7 +115,7 @@ where
                 self.recover_single_burning(&issuer_request_id).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.as_str(),
+                    issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover Burning redemption"
                 );
@@ -155,7 +155,7 @@ where
                 self.recover_single_burn_failed(&issuer_request_id, &view).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.as_str(),
+                    issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover BurnFailed redemption"
                 );
@@ -180,7 +180,7 @@ where
         } = view
         else {
             debug!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                issuer_request_id = %issuer_request_id,
                 "View not in BurnFailed state, skipping"
             );
             return Ok(());
@@ -210,7 +210,7 @@ where
 
         if on_chain_balance < total_shares {
             warn!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
                 burn_shares = %burn_shares,
                 dust_shares = %dust_shares,
@@ -252,7 +252,7 @@ where
         };
 
         info!(
-            issuer_request_id = %issuer_request_id.as_str(),
+            issuer_request_id = %issuer_request_id,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
             num_receipts = burns.len(),
@@ -261,7 +261,7 @@ where
 
         self.cqrs
             .execute(
-                issuer_request_id.as_str(),
+                &issuer_request_id.to_string(),
                 RedemptionCommand::RetryBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
@@ -275,7 +275,7 @@ where
             .await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.as_str(),
+            issuer_request_id = %issuer_request_id,
             "Successfully retried burn"
         );
 
@@ -287,7 +287,7 @@ where
         issuer_request_id: &IssuerRequestId,
     ) -> Result<(), BurnManagerError> {
         let context =
-            self.store.load_aggregate(issuer_request_id.as_str()).await?;
+            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         let aggregate = context.aggregate();
 
@@ -299,7 +299,7 @@ where
         } = aggregate
         else {
             debug!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                issuer_request_id = %issuer_request_id,
                 "Redemption no longer in Burning state, skipping"
             );
             return Ok(());
@@ -331,7 +331,7 @@ where
 
         if on_chain_balance < total_shares_needed {
             warn!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
                 burn_shares = %burn_shares,
                 dust_shares = %dust_shares,
@@ -344,7 +344,7 @@ where
         }
 
         info!(
-            issuer_request_id = %issuer_request_id.as_str(),
+            issuer_request_id = %issuer_request_id,
             "Recovering Burning redemption - resuming burn"
         );
 
@@ -414,7 +414,7 @@ where
 
             self.cqrs
                 .execute(
-                    issuer_request_id.as_str(),
+                    &issuer_request_id.to_string(),
                     RedemptionCommand::RecordBurnFailure {
                         issuer_request_id: issuer_request_id.clone(),
                         error: error_msg,
@@ -533,7 +533,7 @@ where
 
         self.cqrs
             .execute(
-                issuer_request_id.as_str(),
+                &issuer_request_id.to_string(),
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error_msg.clone(),
@@ -575,7 +575,7 @@ where
         let burn_result = self
             .cqrs
             .execute(
-                issuer_request_id.as_str(),
+                &issuer_request_id.to_string(),
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
@@ -612,7 +612,7 @@ where
 
                 self.cqrs
                     .execute(
-                        issuer_request_id.as_str(),
+                        &issuer_request_id.to_string(),
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: err.to_string(),
@@ -719,6 +719,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
     use crate::mint::{
@@ -889,7 +890,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -904,7 +905,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -916,7 +917,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::ConfirmAlpacaComplete {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -932,7 +933,7 @@ mod tests {
         issuer_request_id: &IssuerRequestId,
     ) -> Redemption {
         let context =
-            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
+            store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -965,7 +966,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-burn-success-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1027,7 +1028,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-burn-failure-456");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1095,7 +1096,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-insufficient-789");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let aggregate = create_test_redemption_in_burning_state(
             cqrs,
@@ -1148,7 +1149,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-wrong-state-999");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
@@ -1159,7 +1160,7 @@ mod tests {
         let block_number = 54321;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -1217,7 +1218,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-complete-001");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1278,7 +1279,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-partial-002");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1300,7 +1301,7 @@ mod tests {
         let block_number = 22222;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
@@ -1315,7 +1316,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::RecordAlpacaCall {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id,
@@ -1327,7 +1328,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::ConfirmAlpacaComplete {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -1379,7 +1380,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-depletes-003");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1438,7 +1439,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-inv-update-001");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let receipt_id = uint!(99_U256);
         let initial_balance = uint!(200_000000000000000000_U256);
 
@@ -1508,7 +1509,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-multiple-004");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1575,7 +1576,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-insufficient-005");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let aggregate = create_test_redemption_in_burning_state(
             cqrs,
@@ -1660,7 +1661,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-recovery-001");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1722,8 +1723,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id =
-            IssuerRequestId::new("red-recovery-insufficient-balance");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         // Create a redemption in Burning state (needs 100 shares)
         create_test_redemption_in_burning_state(
@@ -1776,7 +1776,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-recovery-skip-001");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
@@ -1788,7 +1788,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -1846,8 +1846,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id =
-            IssuerRequestId::new("red-burn-failed-recovery");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1867,7 +1866,7 @@ mod tests {
 
         // Record burn failure to transition to Failed/BurnFailed
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "Initial burn failed".to_string(),
@@ -1934,8 +1933,7 @@ mod tests {
             TEST_WALLET,
         );
 
-        let issuer_request_id =
-            IssuerRequestId::new("red-burn-failed-insufficient");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness
             .discover_receipt(
@@ -1953,7 +1951,7 @@ mod tests {
         .await;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "RPC timeout".to_string(),

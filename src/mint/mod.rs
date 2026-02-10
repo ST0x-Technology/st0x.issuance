@@ -12,6 +12,7 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::account::view::AccountViewError;
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
@@ -63,16 +64,12 @@ impl TokenizationRequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct IssuerRequestId(String);
+pub struct IssuerRequestId(Uuid);
 
 impl IssuerRequestId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn new(value: Uuid) -> Self {
+        Self(value)
     }
 }
 
@@ -274,8 +271,8 @@ impl Mint {
     ) -> Result<(), MintError> {
         if provided != expected {
             return Err(MintError::IssuerRequestIdMismatch {
-                expected: expected.0.clone(),
-                provided: provided.0.clone(),
+                expected: expected.clone(),
+                provided: provided.clone(),
             });
         }
         Ok(())
@@ -1111,7 +1108,10 @@ pub(crate) enum MintError {
     #[error(
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
     )]
-    IssuerRequestIdMismatch { expected: String, provided: String },
+    IssuerRequestIdMismatch {
+        expected: IssuerRequestId,
+        provided: IssuerRequestId,
+    },
     #[error(
         "Mint not in Minting or MintingFailed state. Current state: {current_state}"
     )]
@@ -1135,22 +1135,25 @@ pub(crate) enum MintError {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloy::primitives::{address, b256, uint};
+pub(crate) mod tests {
+    use alloy::primitives::{Address, B256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
         mem_store::MemStore, persist::GenericQuery, test::TestFramework,
     };
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::{
-        ClientId, Mint, MintCommand, MintError, MintEvent, MintServices,
-        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
-        UnderlyingSymbol,
+        ClientId, IssuerRequestId, Mint, MintCommand, MintError, MintEvent,
+        MintServices, MintView, Network, Quantity, TokenSymbol,
+        TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
@@ -1158,6 +1161,12 @@ mod tests {
         TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
     };
     use crate::vault::mock::MockVaultService;
+
+    prop_compose! {
+        pub(crate) fn arb_issuer_request_id()(bytes in any::<[u8; 16]>()) -> IssuerRequestId {
+            IssuerRequestId::new(Uuid::from_bytes(bytes))
+        }
+    }
 
     type MintTestFramework = TestFramework<Mint>;
 
@@ -1168,7 +1177,7 @@ mod tests {
             .expect("Failed to create runtime");
 
         let pool = rt.block_on(async {
-            sqlx::sqlite::SqlitePoolOptions::new()
+            SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect(":memory:")
                 .await
@@ -1194,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_initiate_mint_creates_event() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1268,7 +1277,7 @@ mod tests {
 
     #[test]
     fn test_initiate_mint_when_already_initiated_returns_error() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-789");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1313,7 +1322,7 @@ mod tests {
 
         assert!(matches!(mint, Mint::Uninitialized));
 
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(50));
         let underlying = UnderlyingSymbol::new("TSLA");
@@ -1363,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_apply_journal_confirmed_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1407,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_apply_journal_rejected_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1455,7 +1464,7 @@ mod tests {
 
     #[test]
     fn test_confirm_journal_produces_event() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1486,7 +1495,7 @@ mod tests {
 
     #[test]
     fn test_confirm_journal_for_uninitialized_mint_fails() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-999");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let validator = MintTestFramework::with(test_mint_services())
             .given_no_previous_events()
@@ -1499,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_confirm_journal_for_already_confirmed_mint_fails() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1535,7 +1544,7 @@ mod tests {
 
     #[test]
     fn test_reject_journal_produces_event() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1577,7 +1586,7 @@ mod tests {
 
     #[test]
     fn test_reject_journal_for_uninitialized_mint_fails() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-999");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let validator = MintTestFramework::with(test_mint_services())
             .given_no_previous_events()
@@ -1593,9 +1602,8 @@ mod tests {
 
     #[test]
     fn test_confirm_journal_with_mismatched_issuer_request_id_fails() {
-        let correct_issuer_request_id =
-            super::IssuerRequestId::new("iss-correct");
-        let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
+        let correct_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let wrong_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1629,9 +1637,8 @@ mod tests {
 
     #[test]
     fn test_reject_journal_with_mismatched_issuer_request_id_fails() {
-        let correct_issuer_request_id =
-            super::IssuerRequestId::new("iss-correct");
-        let wrong_issuer_request_id = super::IssuerRequestId::new("iss-wrong");
+        let correct_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let wrong_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1665,7 +1672,7 @@ mod tests {
 
     #[test]
     fn test_apply_minting_started_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1727,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_apply_tokens_minted_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1797,7 +1804,7 @@ mod tests {
 
     #[test]
     fn test_apply_minting_failed_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1849,7 +1856,7 @@ mod tests {
 
     #[test]
     fn test_apply_mint_completed_event_updates_state() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1921,7 +1928,7 @@ mod tests {
 
     #[test]
     fn test_full_mint_flow_to_completed() {
-        let issuer_request_id = super::IssuerRequestId::new("iss-flow-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-flow-456");
         let quantity = Quantity::new(Decimal::from(100));
@@ -2023,15 +2030,13 @@ mod tests {
         token: TokenSymbol,
         network: Network,
         client_id: ClientId,
-        wallet: alloy::primitives::Address,
+        wallet: Address,
     }
 
     impl TestMintData {
         fn new() -> Self {
             Self {
-                issuer_request_id: super::IssuerRequestId::new(
-                    "iss-integration-123",
-                ),
+                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
                 tokenization_request_id: TokenizationRequestId::new(
                     "alp-integration-456",
                 ),
@@ -2047,8 +2052,6 @@ mod tests {
 
     async fn setup_cqrs_integration_test()
     -> (Arc<MemStore<Mint>>, Arc<CqrsFramework<Mint, MemStore<Mint>>>) {
-        use sqlx::sqlite::SqlitePoolOptions;
-
         let store = Arc::new(MemStore::<Mint>::default());
 
         let pool = SqlitePoolOptions::new()
@@ -2119,7 +2122,7 @@ mod tests {
         let data = TestMintData::new();
 
         cqrs.execute(
-            &data.issuer_request_id.0,
+            &data.issuer_request_id.to_string(),
             MintCommand::Initiate {
                 issuer_request_id: data.issuer_request_id.clone(),
                 tokenization_request_id: data.tokenization_request_id.clone(),
@@ -2135,7 +2138,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &data.issuer_request_id.0,
+            &data.issuer_request_id.to_string(),
             MintCommand::ConfirmJournal {
                 issuer_request_id: data.issuer_request_id.clone(),
             },
@@ -2144,7 +2147,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &data.issuer_request_id.0,
+            &data.issuer_request_id.to_string(),
             MintCommand::Deposit {
                 issuer_request_id: data.issuer_request_id.clone(),
             },
@@ -2153,7 +2156,7 @@ mod tests {
         .unwrap();
 
         cqrs.execute(
-            &data.issuer_request_id.0,
+            &data.issuer_request_id.to_string(),
             MintCommand::SendCallback {
                 issuer_request_id: data.issuer_request_id.clone(),
             },
@@ -2161,8 +2164,10 @@ mod tests {
         .await
         .unwrap();
 
-        let context =
-            store.load_aggregate(&data.issuer_request_id.0).await.unwrap();
+        let context = store
+            .load_aggregate(&data.issuer_request_id.to_string())
+            .await
+            .unwrap();
 
         assert!(
             matches!(context.aggregate(), Mint::Completed { .. }),
@@ -2170,8 +2175,10 @@ mod tests {
             context.aggregate()
         );
 
-        let events =
-            store.load_events(&data.issuer_request_id.0).await.unwrap();
+        let events = store
+            .load_events(&data.issuer_request_id.to_string())
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 5, "Expected 5 events in the flow");
 
@@ -2215,7 +2222,7 @@ mod tests {
         };
 
         assert_eq!(view_issuer_id, data.issuer_request_id);
-        assert!(view_tx_hash != alloy::primitives::B256::ZERO);
+        assert!(view_tx_hash != B256::ZERO);
         assert!(view_initiated_at.timestamp() > 0);
         assert!(view_journal_confirmed_at.timestamp() > 0);
         assert!(view_minted_at.timestamp() > 0);
@@ -2227,8 +2234,9 @@ mod tests {
 
     #[test]
     fn test_issuer_request_id_display() {
-        let id = super::IssuerRequestId::new("iss-123");
-        assert_eq!(format!("{id}"), "iss-123");
+        let uuid = Uuid::new_v4();
+        let id = IssuerRequestId::new(uuid);
+        assert_eq!(format!("{id}"), uuid.to_string());
     }
 
     #[test]

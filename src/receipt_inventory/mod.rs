@@ -492,6 +492,7 @@ mod tests {
     use alloy::primitives::{Bytes, TxHash, address, b256};
     use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -931,7 +932,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerRequestId::new("iss-123".to_string());
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         cqrs.execute(
             &vault.to_string(),
@@ -956,8 +957,7 @@ mod tests {
     async fn test_find_by_issuer_request_id_returns_none_when_not_exists() {
         let store = Arc::new(MemStore::<ReceiptInventory>::default());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let issuer_request_id =
-            IssuerRequestId::new("iss-nonexistent".to_string());
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let context = store.load_aggregate(&vault.to_string()).await.unwrap();
         let found =
@@ -992,7 +992,7 @@ mod tests {
         let aggregate = context.aggregate();
 
         // External receipts should not be indexed by issuer_request_id
-        let random_id = IssuerRequestId::new("iss-random".to_string());
+        let random_id = IssuerRequestId::new(Uuid::new_v4());
         assert_eq!(aggregate.find_by_issuer_request_id(&random_id), None);
 
         // But the receipt itself should exist
@@ -1007,7 +1007,7 @@ mod tests {
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        let issuer_request_id = IssuerRequestId::new("iss-456".to_string());
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         cqrs.execute(
             &vault.to_string(),
@@ -1066,22 +1066,23 @@ mod tests {
     #[test]
     fn test_determine_source_returns_itn_when_receipt_info_has_issuer_request_id()
      {
+        let expected_id = IssuerRequestId::new(Uuid::new_v4());
         let receipt_info = serde_json::json!({
             "tokenization_request_id": "tok-123",
-            "issuer_request_id": "iss-456",
+            "issuer_request_id": expected_id.to_string(),
             "underlying": "AAPL",
             "quantity": "100.0",
             "operation_type": "Mint",
             "timestamp": "2024-01-01T00:00:00Z",
             "notes": null
         });
-        let bytes = Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
 
+        let bytes = Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
         let source = determine_source(&bytes);
 
         assert!(matches!(
             source,
-            ReceiptSource::Itn { issuer_request_id } if issuer_request_id.as_str() == "iss-456"
+            ReceiptSource::Itn { issuer_request_id } if issuer_request_id == expected_id
         ));
     }
 
@@ -1250,6 +1251,7 @@ mod tests {
 
     use crate::Quantity;
     use crate::mint::TokenizationRequestId;
+    use crate::mint::tests::arb_issuer_request_id;
     use crate::test_utils::LocalEvm;
     use crate::tokenized_asset::UnderlyingSymbol;
     use crate::vault::{OperationType, ReceiptInformation};
@@ -1257,7 +1259,7 @@ mod tests {
     prop_compose! {
         fn arb_receipt_information()(
             tok_id in "[a-zA-Z0-9_-]{1,64}",
-            iss_id in "[a-zA-Z0-9_-]{1,64}",
+            issuer_request_id in arb_issuer_request_id(),
             symbol in "[A-Z]{1,5}",
             qty in 0i64..1_000_000_000i64,
             is_mint in any::<bool>(),
@@ -1266,7 +1268,7 @@ mod tests {
         ) -> ReceiptInformation {
             ReceiptInformation {
                 tokenization_request_id: TokenizationRequestId::new(tok_id),
-                issuer_request_id: IssuerRequestId::new(iss_id),
+                issuer_request_id,
                 underlying: UnderlyingSymbol::new(symbol),
                 quantity: Quantity(Decimal::new(qty, 2)),
                 operation_type: if is_mint {
@@ -1291,8 +1293,8 @@ mod tests {
             match source {
                 ReceiptSource::Itn { issuer_request_id } => {
                     prop_assert_eq!(
-                        issuer_request_id.as_str(),
-                        receipt_info.issuer_request_id.as_str()
+                        issuer_request_id,
+                        receipt_info.issuer_request_id
                     );
                 }
                 ReceiptSource::External => {
@@ -1310,7 +1312,7 @@ mod tests {
         evm.grant_certify_role(evm.wallet_address).await.unwrap();
         evm.certify_vault(U256::MAX).await.unwrap();
 
-        let original_issuer_request_id = IssuerRequestId::new("iss-anvil-test");
+        let original_issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let receipt_info = ReceiptInformation {
             tokenization_request_id: TokenizationRequestId::new(
                 "tok-anvil-test",
@@ -1344,8 +1346,8 @@ mod tests {
         match source {
             ReceiptSource::Itn { issuer_request_id } => {
                 assert_eq!(
-                    issuer_request_id.as_str(),
-                    original_issuer_request_id.as_str(),
+                    issuer_request_id.to_string(),
+                    original_issuer_request_id.to_string(),
                     "Extracted issuer_request_id should match original"
                 );
             }
@@ -1372,7 +1374,7 @@ mod tests {
                 make_shares(100),
                 5000,
                 tx_hash,
-                IssuerRequestId::new("iss-test-1"),
+                IssuerRequestId::new(Uuid::new_v4()),
             )
             .await
             .expect("Registration should succeed");
@@ -1395,7 +1397,7 @@ mod tests {
         let tx_hash = b256!(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
-        let issuer_request_id = IssuerRequestId::new("iss-findable");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         service
             .register_minted_receipt(
@@ -1440,7 +1442,7 @@ mod tests {
                     make_shares(500),
                     7000,
                     tx_hash,
-                    IssuerRequestId::new("iss-idempotent"),
+                    IssuerRequestId::new(Uuid::new_v4()),
                 )
                 .await
                 .expect("Registration should succeed (idempotent)");

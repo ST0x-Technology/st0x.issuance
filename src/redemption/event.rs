@@ -117,13 +117,14 @@ impl DomainEvent for RedemptionEvent {
 mod tests {
     use alloy::primitives::{U256, b256, uint};
     use chrono::Utc;
+    use uuid::Uuid;
 
     use super::*;
 
     #[test]
     fn test_alpaca_journal_completed_event_type() {
         let event = RedemptionEvent::AlpacaJournalCompleted {
-            issuer_request_id: IssuerRequestId::new("red-test-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             alpaca_journal_completed_at: Utc::now(),
         };
 
@@ -136,7 +137,7 @@ mod tests {
     #[test]
     fn test_tokens_burned_event_type() {
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("red-burned-456"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -157,7 +158,7 @@ mod tests {
     #[test]
     fn test_tokens_burned_serialization() {
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("red-ser-456"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
@@ -181,7 +182,7 @@ mod tests {
     #[test]
     fn test_burning_failed_event_type() {
         let event = RedemptionEvent::BurningFailed {
-            issuer_request_id: IssuerRequestId::new("red-fail-789"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             error: "Blockchain error: timeout".to_string(),
             failed_at: Utc::now(),
         };
@@ -193,7 +194,7 @@ mod tests {
     #[test]
     fn test_burning_failed_serialization() {
         let event = RedemptionEvent::BurningFailed {
-            issuer_request_id: IssuerRequestId::new("red-ser-789"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
         };
@@ -209,7 +210,7 @@ mod tests {
     fn test_backwards_compat_alpaca_called_without_dust_fields() {
         let json = r#"{
             "AlpacaCalled": {
-                "issuer_request_id": "red-old-123",
+                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
                 "tokenization_request_id": "tok-old-123",
                 "called_at": "2025-01-01T00:00:00Z"
             }
@@ -235,7 +236,7 @@ mod tests {
     fn test_backwards_compat_tokens_burned_v2_without_dust_fields() {
         let json = r#"{
             "TokensBurned": {
-                "issuer_request_id": "red-old-456",
+                "issuer_request_id": "00000000-0000-0000-0000-000000000456",
                 "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                 "burns": [{"receipt_id": "0x42", "shares_burned": "0x56bc75e2d63100000"}],
                 "gas_used": 50000,

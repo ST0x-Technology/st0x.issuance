@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use super::{
     ClientId, IssuerRequestId, Mint, MintEvent, Network, Quantity, TokenSymbol,
@@ -16,12 +17,12 @@ use super::{
 pub(crate) enum MintViewError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
-
     #[error("Replay error: {0}")]
     Replay(#[from] cqrs_es::AggregateError<super::MintError>),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 /// Replays all `Mint` events through the `mint_view`.
@@ -523,7 +524,7 @@ pub(crate) async fn find_by_issuer_request_id(
     pool: &Pool<Sqlite>,
     issuer_request_id: &IssuerRequestId,
 ) -> Result<Option<MintView>, MintViewError> {
-    let issuer_request_id_str = &issuer_request_id.0;
+    let issuer_request_id_str = issuer_request_id.to_string();
     let row = sqlx::query!(
         r#"
         SELECT payload as "payload: String"
@@ -566,7 +567,8 @@ pub(crate) async fn find_all_recoverable_mints(
     rows.into_iter()
         .map(|row| {
             let view: MintView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(row.view_id), view))
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerRequestId::new(id), view))
         })
         .collect()
 }
@@ -643,7 +645,7 @@ mod tests {
         async fn initiate_mint(&self, issuer_request_id: &IssuerRequestId) {
             self.cqrs
                 .execute(
-                    &issuer_request_id.0,
+                    &issuer_request_id.to_string(),
                     MintCommand::Initiate {
                         issuer_request_id: issuer_request_id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
@@ -668,7 +670,7 @@ mod tests {
             issuer_request_id: &IssuerRequestId,
             view: &MintView,
         ) {
-            let view_id = &issuer_request_id.0;
+            let view_id = issuer_request_id.to_string();
             let payload = serde_json::to_string(view).unwrap();
             sqlx::query!(
                 "INSERT INTO mint_view (view_id, version, payload) VALUES (?, 1, ?)",
@@ -710,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_mint_initiated_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -733,7 +735,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: event,
             metadata: HashMap::new(),
@@ -776,7 +778,7 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-999");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         harness.initiate_mint(&issuer_request_id).await;
 
@@ -814,7 +816,7 @@ mod tests {
     async fn test_find_by_issuer_request_id_returns_none_when_not_found() {
         let pool = setup_test_db().await;
 
-        let issuer_request_id = IssuerRequestId::new("nonexistent-id");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let result = find_by_issuer_request_id(&pool, &issuer_request_id)
             .await
@@ -825,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_journal_confirmed_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -855,7 +857,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: event,
             metadata: HashMap::new(),
@@ -878,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_journal_rejected_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -910,7 +912,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: event,
             metadata: HashMap::new(),
@@ -935,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_tokens_minted_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -981,7 +983,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 3,
             payload: event,
             metadata: HashMap::new(),
@@ -1014,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_minting_failed_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1050,7 +1052,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 3,
             payload: event,
             metadata: HashMap::new(),
@@ -1079,7 +1081,7 @@ mod tests {
         let original_view = view.clone();
 
         let wrong_event = MintEvent::JournalConfirmed {
-            issuer_request_id: IssuerRequestId::new("iss-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             confirmed_at: Utc::now(),
         };
 
@@ -1101,7 +1103,7 @@ mod tests {
     #[test]
     fn test_handle_journal_confirmed_from_journal_confirmed_state_does_not_change()
      {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1144,7 +1146,7 @@ mod tests {
     #[test]
     fn test_handle_journal_rejected_from_journal_confirmed_state_does_not_change()
      {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1199,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_handle_tokens_minted_from_initiated_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1252,7 +1254,7 @@ mod tests {
 
     #[test]
     fn test_handle_minting_failed_from_initiated_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1282,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_view_update_from_mint_completed_event() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1328,7 +1330,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: issuer_request_id.0.clone(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 4,
             payload: event,
             metadata: HashMap::new(),
@@ -1374,7 +1376,7 @@ mod tests {
     #[test]
     fn test_handle_mint_completed_from_journal_confirmed_state_does_not_change()
     {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1406,7 +1408,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_completed_from_minting_failed_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new("iss-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1442,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_retry_started_transitions_minting_failed_to_minting() {
-        let issuer_request_id = IssuerRequestId::new("iss-retry-1");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-retry-1");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1504,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_handle_mint_retry_started_from_minting_state_does_not_change() {
-        let issuer_request_id = IssuerRequestId::new("iss-retry-2");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-retry-2");
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1536,9 +1538,9 @@ mod tests {
         assert_eq!(view, original_view);
     }
 
-    fn test_mint_fields(iss: &str) -> TestMintFields {
+    fn test_mint_fields() -> TestMintFields {
         TestMintFields {
-            issuer_request_id: IssuerRequestId::new(iss),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             tokenization_request_id: TokenizationRequestId::new("alp-1"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: UnderlyingSymbol::new("AAPL"),
@@ -1550,94 +1552,93 @@ mod tests {
         }
     }
 
-    async fn seed_recoverable_mint_views(harness: &TestHarness) {
+    async fn seed_recoverable_mint_views(
+        harness: &TestHarness,
+    ) -> Vec<IssuerRequestId> {
         let now = Utc::now();
+        let fields: Vec<_> = (0..4).map(|_| test_mint_fields()).collect();
 
-        let fields = test_mint_fields("iss-jc-1");
-        harness
-            .insert_view(
-                &fields.issuer_request_id,
-                &MintView::JournalConfirmed {
-                    issuer_request_id: fields.issuer_request_id.clone(),
-                    tokenization_request_id: fields.tokenization_request_id,
-                    quantity: fields.quantity,
-                    underlying: fields.underlying,
-                    token: fields.token,
-                    network: fields.network,
-                    client_id: fields.client_id,
-                    wallet: fields.wallet,
-                    initiated_at: fields.initiated_at,
-                    journal_confirmed_at: now,
-                },
-            )
-            .await;
+        let views: Vec<MintView> = vec![
+            MintView::JournalConfirmed {
+                issuer_request_id: fields[0].issuer_request_id.clone(),
+                tokenization_request_id: fields[0]
+                    .tokenization_request_id
+                    .clone(),
+                quantity: fields[0].quantity.clone(),
+                underlying: fields[0].underlying.clone(),
+                token: fields[0].token.clone(),
+                network: fields[0].network.clone(),
+                client_id: fields[0].client_id,
+                wallet: fields[0].wallet,
+                initiated_at: fields[0].initiated_at,
+                journal_confirmed_at: now,
+            },
+            MintView::Minting {
+                issuer_request_id: fields[1].issuer_request_id.clone(),
+                tokenization_request_id: fields[1]
+                    .tokenization_request_id
+                    .clone(),
+                quantity: fields[1].quantity.clone(),
+                underlying: fields[1].underlying.clone(),
+                token: fields[1].token.clone(),
+                network: fields[1].network.clone(),
+                client_id: fields[1].client_id,
+                wallet: fields[1].wallet,
+                initiated_at: fields[1].initiated_at,
+                journal_confirmed_at: now,
+                minting_started_at: now,
+            },
+            MintView::MintingFailed {
+                issuer_request_id: fields[2].issuer_request_id.clone(),
+                tokenization_request_id: fields[2]
+                    .tokenization_request_id
+                    .clone(),
+                quantity: fields[2].quantity.clone(),
+                underlying: fields[2].underlying.clone(),
+                token: fields[2].token.clone(),
+                network: fields[2].network.clone(),
+                client_id: fields[2].client_id,
+                wallet: fields[2].wallet,
+                initiated_at: fields[2].initiated_at,
+                journal_confirmed_at: now,
+                error: "Transaction reverted".to_string(),
+                failed_at: now,
+            },
+            MintView::CallbackPending {
+                issuer_request_id: fields[3].issuer_request_id.clone(),
+                tokenization_request_id: fields[3]
+                    .tokenization_request_id
+                    .clone(),
+                quantity: fields[3].quantity.clone(),
+                underlying: fields[3].underlying.clone(),
+                token: fields[3].token.clone(),
+                network: fields[3].network.clone(),
+                client_id: fields[3].client_id,
+                wallet: fields[3].wallet,
+                initiated_at: fields[3].initiated_at,
+                journal_confirmed_at: now,
+                tx_hash: b256!(
+                    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                ),
+                receipt_id: uint!(1_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: Some(50000),
+                block_number: 1000,
+                minted_at: now,
+            },
+        ];
 
-        let fields = test_mint_fields("iss-minting-1");
-        harness
-            .insert_view(
-                &fields.issuer_request_id,
-                &MintView::Minting {
-                    issuer_request_id: fields.issuer_request_id.clone(),
-                    tokenization_request_id: fields.tokenization_request_id,
-                    quantity: fields.quantity,
-                    underlying: fields.underlying,
-                    token: fields.token,
-                    network: fields.network,
-                    client_id: fields.client_id,
-                    wallet: fields.wallet,
-                    initiated_at: fields.initiated_at,
-                    journal_confirmed_at: now,
-                    minting_started_at: now,
-                },
-            )
-            .await;
+        for (f, view) in fields.iter().zip(&views) {
+            harness.insert_view(&f.issuer_request_id, view).await;
+        }
 
-        let fields = test_mint_fields("iss-failed-1");
-        harness
-            .insert_view(
-                &fields.issuer_request_id,
-                &MintView::MintingFailed {
-                    issuer_request_id: fields.issuer_request_id.clone(),
-                    tokenization_request_id: fields.tokenization_request_id,
-                    quantity: fields.quantity,
-                    underlying: fields.underlying,
-                    token: fields.token,
-                    network: fields.network,
-                    client_id: fields.client_id,
-                    wallet: fields.wallet,
-                    initiated_at: fields.initiated_at,
-                    journal_confirmed_at: now,
-                    error: "Transaction reverted".to_string(),
-                    failed_at: now,
-                },
-            )
-            .await;
-
-        let fields = test_mint_fields("iss-cp-1");
-        harness.insert_view(&fields.issuer_request_id, &MintView::CallbackPending {
-            issuer_request_id: fields.issuer_request_id.clone(),
-            tokenization_request_id: fields.tokenization_request_id,
-            quantity: fields.quantity,
-            underlying: fields.underlying,
-            token: fields.token,
-            network: fields.network,
-            client_id: fields.client_id,
-            wallet: fields.wallet,
-            initiated_at: fields.initiated_at,
-            journal_confirmed_at: now,
-            tx_hash: b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
-            receipt_id: uint!(1_U256),
-            shares_minted: uint!(100_000000000000000000_U256),
-            gas_used: Some(50000),
-            block_number: 1000,
-            minted_at: now,
-        }).await;
+        fields.into_iter().map(|f| f.issuer_request_id).collect()
     }
 
     async fn seed_non_recoverable_mint_views(harness: &TestHarness) {
         let now = Utc::now();
 
-        let fields = test_mint_fields("iss-init-1");
+        let fields = test_mint_fields();
         harness
             .insert_view(
                 &fields.issuer_request_id,
@@ -1655,7 +1656,7 @@ mod tests {
             )
             .await;
 
-        let fields = test_mint_fields("iss-done-1");
+        let fields = test_mint_fields();
         harness.insert_view(&fields.issuer_request_id, &MintView::Completed {
             issuer_request_id: fields.issuer_request_id.clone(),
             tokenization_request_id: fields.tokenization_request_id,
@@ -1680,20 +1681,28 @@ mod tests {
     #[tokio::test]
     async fn test_find_all_recoverable_mints_returns_all_recoverable_states() {
         let harness = TestHarness::new().await;
-        seed_recoverable_mint_views(&harness).await;
+        let recoverable_ids = seed_recoverable_mint_views(&harness).await;
         seed_non_recoverable_mint_views(&harness).await;
 
         let results = find_all_recoverable_mints(&harness.pool).await.unwrap();
 
         assert_eq!(results.len(), 4, "Expected 4 recoverable mints");
 
-        let ids: Vec<_> = results.iter().map(|(id, _)| id.0.as_str()).collect();
-        assert!(ids.contains(&"iss-jc-1"), "Should include JournalConfirmed");
-        assert!(ids.contains(&"iss-minting-1"), "Should include Minting");
-        assert!(ids.contains(&"iss-failed-1"), "Should include MintingFailed");
-        assert!(ids.contains(&"iss-cp-1"), "Should include CallbackPending");
-        assert!(!ids.contains(&"iss-init-1"), "Should NOT include Initiated");
-        assert!(!ids.contains(&"iss-done-1"), "Should NOT include Completed");
+        let result_ids: Vec<_> =
+            results.iter().map(|(id, _)| id.clone()).collect();
+        for id in &recoverable_ids {
+            assert!(
+                result_ids.contains(id),
+                "Should include recoverable mint {id}"
+            );
+        }
+
+        let state_names: Vec<_> =
+            results.iter().map(|(_, view)| view.state_name()).collect();
+        assert!(state_names.contains(&"JournalConfirmed"));
+        assert!(state_names.contains(&"Minting"));
+        assert!(state_names.contains(&"MintingFailed"));
+        assert!(state_names.contains(&"CallbackPending"));
     }
 
     #[tokio::test]

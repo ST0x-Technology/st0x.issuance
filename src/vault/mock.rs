@@ -205,6 +205,7 @@ mod tests {
     use alloy::primitives::{Address, U256, address};
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use uuid::Uuid;
 
     use super::MockVaultService;
     use crate::mint::{
@@ -218,7 +219,7 @@ mod tests {
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation {
             tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new("iss-456"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             underlying: UnderlyingSymbol::new("AAPL"),
             quantity: Quantity::new(Decimal::from(100)),
             operation_type: OperationType::Mint,

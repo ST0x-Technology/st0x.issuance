@@ -4,6 +4,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use uuid::Uuid;
 
 use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
@@ -158,7 +159,7 @@ impl AlpacaService for MockAlpacaService {
             if self.should_succeed {
                 Ok(super::TokenizationRequest {
                     id: tokenization_request_id.clone(),
-                    issuer_request_id: IssuerRequestId::new("mock-issuer-123"),
+                    issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
                     r#type: TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
@@ -181,7 +182,7 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(not(test))]
         Ok(super::TokenizationRequest {
             id: tokenization_request_id.clone(),
-            issuer_request_id: IssuerRequestId::new("mock-issuer-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             r#type: TokenizationRequestType::Redeem,
             status: RedeemRequestStatus::Completed,
             underlying: UnderlyingSymbol::new("AAPL"),
@@ -199,6 +200,7 @@ impl AlpacaService for MockAlpacaService {
 mod tests {
     use alloy::primitives::{address, b256};
     use rust_decimal::Decimal;
+    use uuid::Uuid;
 
     use super::MockAlpacaService;
     use crate::account::ClientId;
@@ -283,7 +285,7 @@ mod tests {
 
     fn create_redeem_request() -> RedeemRequest {
         RedeemRequest {
-            issuer_request_id: IssuerRequestId::new("red-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId::new(),
@@ -301,14 +303,12 @@ mod tests {
         let mock = MockAlpacaService::new_success();
 
         let request = create_redeem_request();
-        let result = mock.call_redeem_endpoint(request).await;
+        let expected_issuer_request_id = request.issuer_request_id.clone();
+        let response = mock.call_redeem_endpoint(request).await.unwrap();
 
-        assert!(result.is_ok(), "Expected Ok, got {result:?}");
         assert_eq!(mock.get_call_count(), 1);
-
-        let response = result.unwrap();
         assert_eq!(response.tokenization_request_id.0, "mock-tok-123");
-        assert_eq!(response.issuer_request_id.as_str(), "red-123");
+        assert_eq!(response.issuer_request_id, expected_issuer_request_id);
     }
 
     #[tokio::test]

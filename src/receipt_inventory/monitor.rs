@@ -285,7 +285,7 @@ mod tests {
 
         let receipt_info = serde_json::json!({
             "tokenization_request_id": "tok-123",
-            "issuer_request_id": "iss-456",
+            "issuer_request_id": "00000000-0000-0000-0000-000000000456",
             "underlying": "AAPL",
             "quantity": "100.0",
             "operation_type": "Mint",

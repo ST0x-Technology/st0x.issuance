@@ -60,7 +60,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                 self.recover_single_detected(&issuer_request_id).await
             {
                 warn!(
-                    issuer_request_id = %issuer_request_id.as_str(),
+                    issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover Detected redemption"
                 );
@@ -74,14 +74,16 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         &self,
         issuer_request_id: &IssuerRequestId,
     ) -> Result<(), RedeemCallManagerError> {
-        let aggregate_ctx =
-            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
+        let aggregate_ctx = self
+            .event_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await?;
 
         let aggregate = aggregate_ctx.aggregate();
 
         let Redemption::Detected { metadata } = aggregate else {
             debug!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                issuer_request_id = %issuer_request_id,
                 "Redemption no longer in Detected state, skipping"
             );
             return Ok(());
@@ -94,7 +96,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             self.lookup_network_for_asset(&metadata.underlying).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.as_str(),
+            issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
         );
 
@@ -151,7 +153,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     }
 
     #[tracing::instrument(skip(self, aggregate), fields(
-        issuer_request_id = %issuer_request_id.as_str(),
+        issuer_request_id = %issuer_request_id,
         client_id = %client_id
     ))]
     pub(crate) async fn handle_redemption_detected(
@@ -196,7 +198,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
                 info!(
-                    issuer_request_id = %response.issuer_request_id.as_str(),
+                    issuer_request_id = %response.issuer_request_id,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
                     status = ?response.status,
@@ -214,7 +216,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
                 self.cqrs
                     .execute(
-                        issuer_request_id.as_str(),
+                        &issuer_request_id.to_string(),
                         RedemptionCommand::RecordAlpacaCall {
                             issuer_request_id: issuer_request_id.clone(),
                             tokenization_request_id: response
@@ -241,7 +243,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
                 self.cqrs
                     .execute(
-                        issuer_request_id.as_str(),
+                        &issuer_request_id.to_string(),
                         RedemptionCommand::RecordAlpacaFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: err.to_string(),
@@ -314,6 +316,7 @@ mod tests {
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
+    use uuid::Uuid;
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
@@ -461,7 +464,7 @@ mod tests {
         ) {
             self.redemption_cqrs
                 .execute(
-                    issuer_request_id.as_str(),
+                    &issuer_request_id.to_string(),
                     RedemptionCommand::Detect {
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
@@ -530,7 +533,7 @@ mod tests {
         let block_number = 12345;
 
         cqrs.execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             RedemptionCommand::Detect {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
@@ -552,7 +555,7 @@ mod tests {
         issuer_request_id: &IssuerRequestId,
     ) -> Redemption {
         let context =
-            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
+            store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
         context.aggregate().clone()
     }
 
@@ -569,7 +572,7 @@ mod tests {
             pool,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-success-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let aggregate = create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -617,7 +620,7 @@ mod tests {
             pool,
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-failure-456");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let aggregate = create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -666,7 +669,7 @@ mod tests {
         let manager =
             RedeemCallManager::new(alpaca_service, cqrs.clone(), store, pool);
 
-        let issuer_request_id = IssuerRequestId::new("red-wrong-state-789");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let aggregate = Redemption::Uninitialized;
 
         let client_id = ClientId::new();
@@ -815,7 +818,7 @@ mod tests {
             .await;
         harness.add_asset(&underlying, &network).await;
 
-        let issuer_request_id = IssuerRequestId::new("red-recovery-1");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(&issuer_request_id, &underlying, wallet)
             .await;
@@ -830,7 +833,7 @@ mod tests {
 
         let context = harness
             .redemption_store
-            .load_aggregate(issuer_request_id.as_str())
+            .load_aggregate(&issuer_request_id.to_string())
             .await
             .unwrap();
         let updated_aggregate = context.aggregate();
@@ -853,7 +856,7 @@ mod tests {
             pool.clone(),
         );
 
-        let issuer_request_id = IssuerRequestId::new("red-no-account");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         create_test_redemption_in_detected_state(
             &cqrs,
             &store,
@@ -894,7 +897,7 @@ mod tests {
             )
             .await;
 
-        let issuer_request_id = IssuerRequestId::new("red-no-asset");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(&issuer_request_id, &underlying, wallet)
             .await;

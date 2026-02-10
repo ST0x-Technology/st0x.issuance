@@ -73,6 +73,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::mint::tests::arb_issuer_request_id;
 
     /// Generates a hex string for U256 values (0x prefixed)
     fn u256_hex_string() -> impl Strategy<Value = String> {
@@ -85,15 +86,6 @@ mod tests {
             Just("0x8ac7230489e80000".to_string()), // 10e18
             Just("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()), // max U256
             "[0-9a-f]{1,64}".prop_map(|s| format!("0x{s}")),
-        ]
-    }
-
-    /// Generates an issuer request ID
-    fn issuer_request_id() -> impl Strategy<Value = String> {
-        prop_oneof![
-            Just("red-123".to_string()),
-            Just("red-test-abc".to_string()),
-            "[a-z]{3}-[a-z0-9]{1,20}".prop_map(|s| s),
         ]
     }
 
@@ -121,7 +113,7 @@ mod tests {
     prop_compose! {
         /// Generates a valid v1.0 TokensBurned payload
         fn v1_payload_strategy()(
-            issuer_id in issuer_request_id(),
+            issuer_id in arb_issuer_request_id(),
             tx_hash in tx_hash_string(),
             receipt_id in u256_hex_string(),
             shares_burned in u256_hex_string(),
@@ -148,7 +140,7 @@ mod tests {
     prop_compose! {
         /// Generates a valid v1.0 payload without dust_returned (older events)
         fn v1_payload_without_dust_strategy()(
-            issuer_id in issuer_request_id(),
+            issuer_id in arb_issuer_request_id(),
             tx_hash in tx_hash_string(),
             receipt_id in u256_hex_string(),
             shares_burned in u256_hex_string(),

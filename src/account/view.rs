@@ -165,6 +165,7 @@ mod tests {
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::*;
     use crate::account::{Account, AccountCommand};
@@ -362,7 +363,7 @@ mod tests {
     async fn test_find_by_client_id_returns_none_when_not_found() {
         let pool = setup_test_db().await;
 
-        let client_id = ClientId(uuid::Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
 
         let result = find_by_client_id(&pool, &client_id)
             .await
@@ -446,7 +447,7 @@ mod tests {
     #[test]
     fn test_view_update_from_wallet_whitelisted_event() {
         let mut view = AccountView::LinkedToAlpaca {
-            client_id: ClientId(uuid::Uuid::new_v4()),
+            client_id: ClientId(Uuid::new_v4()),
             email: Email("user@example.com".to_string()),
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
             whitelisted_wallets: Vec::new(),
