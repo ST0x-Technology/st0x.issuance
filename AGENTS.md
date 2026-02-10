@@ -899,6 +899,10 @@ TTDD sequence:
    count as failing tests)
 3. **Implementation**: Write the logic to make tests pass
 
+**`todo!()` macro:** Encouraged during TTDD types-first stage to stub
+signatures. Must be removed before completion - any `todo!()` in final code is
+unacceptable.
+
 While developing, continuously run `cargo check` and `cargo test` to verify
 types and behavior. Only after implementation is complete, run `cargo clippy`
 and fix all warnings. Finally, `cargo fmt` before committing.

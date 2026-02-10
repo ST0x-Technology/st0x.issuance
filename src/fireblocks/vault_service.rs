@@ -17,6 +17,7 @@ use super::config::{
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::mint::IssuerRequestId;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
     ReceiptInformation, VaultError, VaultService,
@@ -336,6 +337,34 @@ fn build_contract_call_request(
     }
 }
 
+/// The type of vault operation, used to tag `externalTxId` for Fireblocks.
+enum VaultOperation {
+    Mint,
+    Burn,
+}
+
+impl VaultOperation {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mint => "mint",
+            Self::Burn => "burn",
+        }
+    }
+
+    /// Generates a unique `externalTxId` for Fireblocks transactions.
+    ///
+    /// Format: `{ISO8601_compact}-{operation}-{issuer_request_id}`
+    /// e.g., `20260210T083800Z-mint-5960be2e-a556-42e7-8def-ed3a354b66e6`
+    ///
+    /// Each call produces a unique ID (via timestamp), avoiding Fireblocks'
+    /// permanent `externalTxId` rejection on retries. The operation prefix
+    /// and issuer_request_id make the ID searchable in the Fireblocks dashboard.
+    fn external_tx_id(&self, issuer_request_id: &IssuerRequestId) -> String {
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        format!("{timestamp}-{}-{}", self.as_str(), issuer_request_id.as_str())
+    }
+}
+
 /// Parses a transaction hash string (with or without 0x prefix) into B256.
 fn parse_tx_hash(tx_hash_str: &str) -> Result<B256, FireblocksVaultError> {
     let tx_hash_hex = tx_hash_str.strip_prefix("0x").unwrap_or(tx_hash_str);
@@ -400,8 +429,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             receipt_info.issuer_request_id.as_str()
         );
 
-        let external_tx_id =
-            format!("mint-{}", receipt_info.issuer_request_id.as_str());
+        let external_tx_id = VaultOperation::Mint
+            .external_tx_id(&receipt_info.issuer_request_id);
 
         let tx_id = self
             .submit_contract_call(
@@ -499,8 +528,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             params.receipt_info.issuer_request_id.as_str()
         );
 
-        let external_tx_id =
-            format!("burn-{}", params.receipt_info.issuer_request_id.as_str());
+        let external_tx_id = VaultOperation::Burn
+            .external_tx_id(&params.receipt_info.issuer_request_id);
 
         let tx_id = self
             .submit_contract_call(
@@ -772,5 +801,39 @@ mod tests {
             matches!(result, Err(FireblocksVaultError::InvalidTxHash { .. })),
             "Expected InvalidTxHash error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn external_tx_id_contains_operation_and_issuer_request_id() {
+        let id = VaultOperation::Mint
+            .external_tx_id(&IssuerRequestId::new("5960be2e-a556-42e7"));
+        assert!(
+            id.contains("mint-5960be2e-a556-42e7"),
+            "Expected operation-issuer_request_id suffix, got {id}"
+        );
+    }
+
+    #[test]
+    fn external_tx_id_starts_with_iso8601_timestamp() {
+        let id = VaultOperation::Burn
+            .external_tx_id(&IssuerRequestId::new("abc-123"));
+        assert!(
+            id.contains('T') && id.contains('Z'),
+            "Expected ISO 8601 compact timestamp, got {id}"
+        );
+        let timestamp_part = id.split('-').next().unwrap();
+        assert!(
+            timestamp_part.ends_with('Z'),
+            "Timestamp should end with Z, got {timestamp_part}"
+        );
+    }
+
+    #[test]
+    fn external_tx_id_is_unique_across_calls() {
+        let issuer_request_id = IssuerRequestId::new("same-id");
+        let id1 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let id2 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
+        assert_ne!(id1, id2, "Consecutive calls should produce unique IDs");
     }
 }
