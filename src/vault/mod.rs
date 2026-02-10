@@ -284,10 +284,7 @@ mod tests {
         let decoded: ReceiptInformation =
             serde_json::from_slice(&encoded).unwrap();
 
-        assert_eq!(
-            decoded.issuer_request_id,
-            original.issuer_request_id
-        );
+        assert_eq!(decoded.issuer_request_id, original.issuer_request_id);
     }
 
     #[test]

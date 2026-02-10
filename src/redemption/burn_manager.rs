@@ -440,12 +440,8 @@ where
             )
             .await?;
 
-        self.execute_burn_and_record_result(
-            issuer_request_id,
-            vault,
-            plan,
-        )
-        .await
+        self.execute_burn_and_record_result(issuer_request_id, vault, plan)
+            .await
     }
 
     async fn plan_burn(
@@ -682,7 +678,7 @@ pub(crate) enum BurnManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256, address, b256, uint};
+    use alloy::primitives::{Address, B256, U256, address, b256, uint};
     use cqrs_es::{
         AggregateContext, EventStore,
         persist::{GenericQuery, PersistedEventStore},
@@ -693,7 +689,6 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
     use crate::mint::{Network, Quantity, TokenizationRequestId};
@@ -712,6 +707,10 @@ mod tests {
 
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+    fn new_redemption_id() -> IssuerRedemptionRequestId {
+        IssuerRedemptionRequestId::new(B256::random())
+    }
 
     type TestCqrs = SqliteCqrs<Redemption>;
     type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;

@@ -473,7 +473,12 @@ impl Aggregate for ReceiptInventory {
             } => {
                 self.receipts.insert(
                     receipt_id,
-                    ReceiptMetadata { balance, tx_hash, block_number, receipt_info },
+                    ReceiptMetadata {
+                        balance,
+                        tx_hash,
+                        block_number,
+                        receipt_info,
+                    },
                 );
                 if let ReceiptSource::Itn { issuer_request_id } = source {
                     self.itn_receipts.insert(issuer_request_id, receipt_id);

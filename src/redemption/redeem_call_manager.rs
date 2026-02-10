@@ -288,7 +288,7 @@ pub(crate) enum RedeemCallManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, address, b256};
+    use alloy::primitives::{Address, B256, address, b256};
     use cqrs_es::persist::{GenericQuery, PersistedEventStore};
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
@@ -299,7 +299,6 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
@@ -321,6 +320,10 @@ mod tests {
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+
+    fn new_redemption_id() -> IssuerRedemptionRequestId {
+        IssuerRedemptionRequestId::new(B256::random())
+    }
 
     fn test_alpaca_account() -> AlpacaAccountNumber {
         AlpacaAccountNumber("test-account".to_string())

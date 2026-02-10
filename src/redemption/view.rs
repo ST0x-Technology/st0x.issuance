@@ -441,7 +441,7 @@ pub(crate) async fn find_burn_failed(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use cqrs_es::persist::GenericQuery;
     use cqrs_es::{EventEnvelope, View};
@@ -450,7 +450,6 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{
         RedemptionView, find_alpaca_called, find_burn_failed, find_burning,
@@ -462,14 +461,11 @@ mod tests {
         RedemptionEvent,
     };
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-    use crate::vault::mock::MockVaultService;
     use crate::vault::MultiBurnEntry;
+    use crate::vault::mock::MockVaultService;
 
     fn new_redemption_id() -> IssuerRedemptionRequestId {
-        let uuid = Uuid::new_v4();
-        let mut bytes = [0u8; 32];
-        bytes[..16].copy_from_slice(uuid.as_bytes());
-        IssuerRedemptionRequestId::new(TxHash::from(bytes))
+        IssuerRedemptionRequestId::new(B256::random())
     }
 
     fn make_detected_envelope(

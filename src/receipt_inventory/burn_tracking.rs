@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
 use crate::redemption::IssuerRedemptionRequestId;
-use crate::vault::ReceiptInformation;
 use crate::redemption::{
     BurnRecord, Redemption, RedemptionError, RedemptionEvent,
 };
+use crate::vault::ReceiptInformation;
 
 /// Tracks burn operations for a redemption.
 ///
@@ -209,13 +209,12 @@ pub(crate) async fn replay_receipt_burns_view(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, U256, address, b256, uint};
+    use alloy::primitives::{B256, U256, address, b256, uint};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
-    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{Quantity, TokenizationRequestId};
@@ -223,10 +222,7 @@ mod tests {
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
     fn new_redemption_id() -> IssuerRedemptionRequestId {
-        let uuid = Uuid::new_v4();
-        let mut bytes = [0u8; 32];
-        bytes[..16].copy_from_slice(uuid.as_bytes());
-        IssuerRedemptionRequestId::new(TxHash::from(bytes))
+        IssuerRedemptionRequestId::new(B256::random())
     }
 
     async fn setup_test_db() -> Pool<Sqlite> {

@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, U256, b256};
 use async_trait::async_trait;
 use std::sync::Arc;
 #[cfg(test)]
@@ -143,7 +143,9 @@ impl VaultService for MockVaultService {
 
         match &self.behavior {
             MockBehavior::Success => Ok(MintResult {
-                tx_hash: B256::from([0x42; 32]),
+                tx_hash: b256!(
+                    "0x4242424242424242424242424242424242424242424242424242424242424242"
+                ),
                 receipt_id: U256::from(1),
                 shares_minted: assets,
                 gas_used: 21000,
@@ -187,7 +189,9 @@ impl VaultService for MockVaultService {
                     .collect();
 
                 Ok(MultiBurnResult {
-                    tx_hash: B256::from([0x45; 32]),
+                    tx_hash: b256!(
+                        "0x4545454545454545454545454545454545454545454545454545454545454545"
+                    ),
                     burns,
                     dust_returned: params.dust_shares,
                     gas_used: 50000,
@@ -432,7 +436,9 @@ mod tests {
             dust_shares: U256::from(10),
             owner: test_receiver(),
             user: address!("0x2222222222222222222222222222222222222222"),
-            receipt_info: test_receipt_info(),
+            issuer_request_id: IssuerRedemptionRequestId::new(b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            )),
         }
     }
 

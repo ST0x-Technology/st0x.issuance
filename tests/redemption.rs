@@ -115,10 +115,8 @@ fn setup_redemption_mocks_with_shared_state(
             move |req: &httpmock::HttpMockRequest| {
                 let body: serde_json::Value =
                     serde_json::from_slice(req.body().as_ref()).unwrap();
-                let issuer_request_id = body["issuer_request_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
+                let issuer_request_id =
+                    body["issuer_request_id"].as_str().unwrap().to_string();
                 let tx_hash: TxHash =
                     body["tx_hash"].as_str().unwrap().parse().unwrap();
 

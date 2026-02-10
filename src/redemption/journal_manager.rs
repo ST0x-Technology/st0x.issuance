@@ -440,7 +440,7 @@ pub(crate) enum JournalManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, address, b256};
+    use alloy::primitives::{Address, B256, address, b256};
     use async_trait::async_trait;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{Aggregate, EventStore};
@@ -450,7 +450,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tracing_test::traced_test;
-    use uuid::Uuid;
 
     use super::{JournalManager, JournalManagerError};
     use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
@@ -467,6 +466,10 @@ mod tests {
 
     type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
     type TestStore = MemStore<Redemption>;
+
+    fn new_redemption_id() -> IssuerRedemptionRequestId {
+        IssuerRedemptionRequestId::new(B256::random())
+    }
 
     fn test_alpaca_account() -> AlpacaAccountNumber {
         AlpacaAccountNumber("test-account".to_string())

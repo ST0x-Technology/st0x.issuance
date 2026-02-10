@@ -88,9 +88,7 @@ impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
 }
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
-use crate::vault::{
-    MultiBurnEntry, MultiBurnParams, VaultService,
-};
+use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
 
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent};
@@ -571,12 +569,7 @@ impl Aggregate for Redemption {
                 self.handle_burn_tokens(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                    },
+                    BurnInput { vault, burns, dust_shares, owner },
                 )
                 .await
             }
@@ -595,12 +588,7 @@ impl Aggregate for Redemption {
                 self.handle_retry_burn(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                    },
+                    BurnInput { vault, burns, dust_shares, owner },
                     user_wallet,
                 )
                 .await
@@ -696,13 +684,12 @@ impl Aggregate for Redemption {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, U256, address, b256, uint};
+    use alloy::primitives::{B256, TxHash, U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{Aggregate, test::TestFramework};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use std::sync::Arc;
-    use uuid::Uuid;
 
     use super::{
         BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
@@ -716,10 +703,7 @@ mod tests {
     type RedemptionTestFramework = TestFramework<Redemption>;
 
     fn new_redemption_id() -> IssuerRedemptionRequestId {
-        let uuid = Uuid::new_v4();
-        let mut bytes = [0u8; 32];
-        bytes[..16].copy_from_slice(uuid.as_bytes());
-        IssuerRedemptionRequestId::new(TxHash::from(bytes))
+        IssuerRedemptionRequestId::new(B256::random())
     }
 
     fn mock_services() -> Arc<dyn VaultService> {

@@ -194,8 +194,7 @@ where
             return Ok(());
         }
 
-        let (source, receipt_info) =
-            determine_source(&receipt_information);
+        let (source, receipt_info) = determine_source(&receipt_information);
 
         self.cqrs
             .execute(

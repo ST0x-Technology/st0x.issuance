@@ -360,7 +360,10 @@ impl VaultOperation {
     /// Each call produces a unique ID (via timestamp), avoiding Fireblocks'
     /// permanent `externalTxId` rejection on retries. The operation prefix
     /// and issuer_request_id make the ID searchable in the Fireblocks dashboard.
-    fn external_tx_id(&self, issuer_request_id: &(impl std::fmt::Display + ?Sized)) -> String {
+    fn external_tx_id(
+        &self,
+        issuer_request_id: &(impl std::fmt::Display + ?Sized),
+    ) -> String {
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         format!("{timestamp}-{self}-{issuer_request_id}")
     }
@@ -428,8 +431,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             receipt_info.issuer_request_id,
         );
 
-        let external_tx_id =
-            VaultOperation::Mint.external_tx_id(&receipt_info.issuer_request_id);
+        let external_tx_id = VaultOperation::Mint
+            .external_tx_id(&receipt_info.issuer_request_id);
 
         let tx_id = self
             .submit_contract_call(
@@ -819,8 +822,8 @@ mod tests {
 
     #[test]
     fn external_tx_id_starts_with_iso8601_timestamp() {
-        let id = VaultOperation::Burn
-            .external_tx_id(&Uuid::new_v4().to_string());
+        let id =
+            VaultOperation::Burn.external_tx_id(&Uuid::new_v4().to_string());
         assert!(
             id.contains('T') && id.contains('Z'),
             "Expected ISO 8601 compact timestamp, got {id}"

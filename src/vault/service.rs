@@ -233,7 +233,9 @@ mod tests {
     }
 
     fn test_issuer_redemption_id() -> IssuerRedemptionRequestId {
-        IssuerRedemptionRequestId::new(B256::from([0xAB; 32]))
+        IssuerRedemptionRequestId::new(b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        ))
     }
 
     fn test_receiver() -> Address {
