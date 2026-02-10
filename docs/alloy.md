@@ -19,6 +19,30 @@ use alloy::primitives::{Address, TxHash, U256, B256, Bytes};
 All of these are just type aliases over `FixedBytes<N>`, but using the semantic
 name makes code clearer.
 
+## FixedBytes Aliases and `::random()`
+
+All common alloy types are aliases for `FixedBytes<N>`:
+
+- `Address` = `FixedBytes<20>`
+- `B256` / `TxHash` / `BlockHash` = `FixedBytes<32>`
+- `FixedBytes<4>` for function selectors, short IDs, etc.
+
+Because they share the same underlying type, all methods available on
+`FixedBytes` work on every alias. In particular, with the `rand` feature enabled
+on alloy:
+
+```rust
+use alloy::primitives::{Address, B256, TxHash};
+
+let random_addr = Address::random();
+let random_hash = B256::random();
+let random_tx = TxHash::random();  // same as B256::random()
+```
+
+Use `::random()` in tests instead of constructing bytes manually.
+`FixedBytes::right_padding_from`, `FixedBytes::from([0xAB; 32])`, or similar
+manual constructions are unnecessary when you just need a unique value.
+
 ## Compile-Time Macros
 
 Use macros for compile-time checked literals:
@@ -33,6 +57,10 @@ let bytes = fixed_bytes!("0x1234");
 
 **Never construct these manually with `from_slice` or string parsing at
 runtime** when the value is known at compile time.
+
+**In tests**, prefer `address!()`, `b256!()`, and `fixed_bytes!()` for
+deterministic fixture values. Use `::random()` when you just need a unique value
+and don't care about the specific bytes.
 
 ## Mock Providers for Testing
 

@@ -189,7 +189,7 @@ pub(crate) struct ReceiptInformation {
 }
 
 impl ReceiptInformation {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         tokenization_request_id: TokenizationRequestId,
         issuer_request_id: IssuerMintRequestId,
         underlying: UnderlyingSymbol,

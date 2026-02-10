@@ -120,7 +120,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 let receipt_info_bytes = burn
                     .receipt_info
                     .as_ref()
-                    .map(|info| info.encode())
+                    .map(ReceiptInformation::encode)
                     .transpose()?
                     .unwrap_or_default();
 

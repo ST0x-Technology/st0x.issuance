@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256, b256};
+use alloy::primitives::{Address, U256, b256};
 use async_trait::async_trait;
 use std::sync::Arc;
 #[cfg(test)]
@@ -206,7 +206,7 @@ impl VaultService for MockVaultService {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address};
+    use alloy::primitives::{Address, U256, address, b256};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use uuid::Uuid;

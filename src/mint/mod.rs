@@ -387,7 +387,6 @@ impl Mint {
                 Shares::from(result.shares_minted),
                 result.block_number,
                 result.tx_hash,
-                issuer_request_id.clone(),
                 receipt_info,
             )
             .await

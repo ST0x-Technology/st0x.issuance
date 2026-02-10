@@ -243,7 +243,7 @@ impl AlpacaService for RealAlpacaService {
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<super::TokenizationRequest, AlpacaError> {
+    ) -> Result<TokenizationRequest, AlpacaError> {
         let url = format!(
             "{}/v1/accounts/{}/tokenization/requests",
             self.base_url.trim_end_matches('/'),
@@ -277,17 +277,16 @@ impl AlpacaService for RealAlpacaService {
                             AlpacaError::Parse { body: body.clone(), source: e }
                         })?;
 
-                    let request = requests
+                    requests
                         .into_iter()
-                        .find(|req| {
-                            &req.id == tokenization_request_id
-                                && req.r#type == super::TokenizationRequestType::Redeem
-                        })
+                        .find(|request| matches!(
+                            request,
+                            TokenizationRequest::Redeem { id, .. }
+                                if id == tokenization_request_id
+                        ))
                         .ok_or_else(|| {
                             AlpacaError::RequestNotFound(tokenization_request_id.clone())
-                        })?;
-
-                    Ok(request)
+                        })
                 }
                 reqwest::StatusCode::UNAUTHORIZED
                 | reqwest::StatusCode::FORBIDDEN => {
@@ -330,7 +329,7 @@ mod tests {
 
     use super::{
         AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
-        RedeemRequest,
+        RedeemRequest, TokenizationRequest,
     };
 
     fn create_test_request() -> MintCallbackRequest {
@@ -646,7 +645,7 @@ mod tests {
                 .path("/v1/accounts/test-account/tokenization/redeem");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdefab",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "rejected",
@@ -777,7 +776,7 @@ mod tests {
                 .path("/v1/accounts/my-special-account/tokenization/redeem");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-789",
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdefab",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -822,7 +821,7 @@ mod tests {
                 .header("APCA-API-SECRET-KEY", "mysecret");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-001",
-                "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                "issuer_request_id": "red-abcdefab",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -919,7 +918,7 @@ mod tests {
             then.status(200).json_body(serde_json::json!([
                 {
                     "tokenization_request_id": "tok-123",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000456",
+                    "issuer_request_id": "red-11223344",
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "completed",
@@ -949,9 +948,14 @@ mod tests {
         let result =
             service.poll_request_status(&tokenization_request_id).await;
 
-        assert!(result.is_ok());
         let request = result.unwrap();
-        assert!(matches!(request.status, RedeemRequestStatus::Completed));
+        assert!(matches!(
+            request,
+            TokenizationRequest::Redeem {
+                status: RedeemRequestStatus::Completed,
+                ..
+            }
+        ));
         mock.assert();
     }
 
@@ -964,8 +968,23 @@ mod tests {
                 .path("/v1/accounts/test-account/tokenization/requests");
             then.status(200).json_body(serde_json::json!([
                 {
+                    "tokenization_request_id": "tok-mint-1",
+                    "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "created_at": "2025-09-12T17:25:00.000000-04:00",
+                    "type": "mint",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "200",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "fees": "0.0"
+                },
+                {
                     "tokenization_request_id": "tok-111",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000001",
+                    "issuer_request_id": "red-aa110001",
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
@@ -980,7 +999,7 @@ mod tests {
                 },
                 {
                     "tokenization_request_id": "tok-222",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000002",
+                    "issuer_request_id": "red-bb220002",
                     "created_at": "2025-09-12T17:30:00.000000-04:00",
                     "type": "redeem",
                     "status": "completed",
@@ -991,21 +1010,6 @@ mod tests {
                     "network": "base",
                     "wallet_address": "0x9876543210fedcba9876543210fedcba98765432",
                     "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                    "fees": "0.0"
-                },
-                {
-                    "tokenization_request_id": "tok-333",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000003",
-                    "created_at": "2025-09-12T17:31:00.000000-04:00",
-                    "type": "redeem",
-                    "status": "rejected",
-                    "underlying_symbol": "NVDA",
-                    "token_symbol": "tNVDA",
-                    "qty": "25",
-                    "issuer": "test-issuer",
-                    "network": "base",
-                    "wallet_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                     "fees": "0.0"
                 }
             ]));
@@ -1025,9 +1029,14 @@ mod tests {
             .poll_request_status(&TokenizationRequestId::new("tok-222"))
             .await;
 
-        assert!(result.is_ok());
         let request = result.unwrap();
-        assert!(matches!(request.status, RedeemRequestStatus::Completed));
+        assert!(matches!(
+            request,
+            TokenizationRequest::Redeem {
+                status: RedeemRequestStatus::Completed,
+                ..
+            }
+        ));
         mock.assert();
     }
 
@@ -1041,7 +1050,7 @@ mod tests {
             then.status(200).json_body(serde_json::json!([
                 {
                     "tokenization_request_id": "tok-999",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000999",
+                    "issuer_request_id": "red-dd440999",
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
@@ -1187,7 +1196,7 @@ mod tests {
             then.status(200).json_body(serde_json::json!([
                 {
                     "tokenization_request_id": "tok-auth-test",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000123",
+                    "issuer_request_id": "red-abcdefab",
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
@@ -1273,7 +1282,7 @@ mod tests {
                 },
                 {
                     "tokenization_request_id": "tok-redeem-valid",
-                    "issuer_request_id": "00000000-0000-0000-0000-000000000456",
+                    "issuer_request_id": "red-11223344",
                     "created_at": "2025-09-12T17:30:00.000000-04:00",
                     "type": "redeem",
                     "status": "pending",
@@ -1438,7 +1447,7 @@ mod tests {
             },
             {
                 "tokenization_request_id": "f2354b82-89a1-41e7-86c8-75df9312d6fd",
-                "issuer_request_id": "008ab414-0000-0000-0000-000000000000",
+                "issuer_request_id": "red-008ab414",
                 "type": "redeem", "status": "completed",
                 "underlying_symbol": "RKLB", "token_symbol": "tRKLB", "qty": "1",
                 "account": "1481094OM",
@@ -1477,7 +1486,7 @@ mod tests {
             },
             {
                 "tokenization_request_id": "f2280c35-3a82-4460-8c0a-9c51a5526859",
-                "issuer_request_id": "942e171e-0000-0000-0000-000000000000",
+                "issuer_request_id": "red-942e171e",
                 "type": "redeem", "status": "completed",
                 "underlying_symbol": "RKLB", "token_symbol": "tRKLB", "qty": "1",
                 "account": "1481094OM",
@@ -1490,7 +1499,7 @@ mod tests {
             },
             {
                 "tokenization_request_id": "0bdf6745-b513-469a-8ddd-874f5192cee8",
-                "issuer_request_id": "22e66b2d-0000-0000-0000-000000000000",
+                "issuer_request_id": "red-22e66b2d",
                 "type": "redeem", "status": "rejected",
                 "underlying_symbol": "RKLB", "token_symbol": "tRKLB",
                 "qty": "0.450574852280275235",
@@ -1545,7 +1554,7 @@ mod tests {
             },
             {
                 "tokenization_request_id": "8e085fe9-933e-400e-9f7e-6f985c331be0",
-                "issuer_request_id": "842331fb-0000-0000-0000-000000000000",
+                "issuer_request_id": "red-842331fb",
                 "type": "redeem", "status": "completed",
                 "underlying_symbol": "RKLB", "token_symbol": "tRKLB",
                 "qty": "4.764333351",
@@ -1559,7 +1568,7 @@ mod tests {
             },
             {
                 "tokenization_request_id": "8cd6c568-3de2-417a-8cea-312852e4a31c",
-                "issuer_request_id": "7ba33782-0000-0000-0000-000000000000",
+                "issuer_request_id": "red-7ba33782",
                 "type": "redeem", "status": "completed",
                 "underlying_symbol": "RKLB", "token_symbol": "tRKLB", "qty": "3",
                 "account": "1481094OM",
@@ -1600,15 +1609,23 @@ mod tests {
             ))
             .await;
 
-        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
         let request = result.unwrap();
-        assert_eq!(
-            request.issuer_request_id,
-            IssuerRedemptionRequestId::new(b256!(
-                "0x842331fb00000000000000000000000000000000000000000000000000000000"
-            )),
-        );
-        assert!(matches!(request.status, RedeemRequestStatus::Completed));
+        match &request {
+            TokenizationRequest::Redeem {
+                issuer_request_id, status, ..
+            } => {
+                assert_eq!(
+                    *issuer_request_id,
+                    IssuerRedemptionRequestId::new(b256!(
+                        "0x842331fb00000000000000000000000000000000000000000000000000000000"
+                    )),
+                );
+                assert!(matches!(status, RedeemRequestStatus::Completed));
+            }
+            other @ TokenizationRequest::Mint { .. } => {
+                panic!("Expected Redeem variant, got {other:?}")
+            }
+        }
         mock.assert();
     }
 

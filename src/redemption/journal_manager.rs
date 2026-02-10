@@ -12,7 +12,9 @@ use super::{
 };
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber};
-use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
+use crate::alpaca::{
+    AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+};
 use crate::mint::TokenizationRequestId;
 
 pub(crate) struct JournalManager<ES: EventStore<Redemption>> {
@@ -193,9 +195,25 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
     async fn validate_request_fields(
         &self,
-        request: &crate::alpaca::TokenizationRequest,
+        request: &TokenizationRequest,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), JournalManagerError> {
+        let TokenizationRequest::Redeem {
+            issuer_request_id: req_issuer_id,
+            underlying: req_underlying,
+            token: req_token,
+            quantity: req_quantity,
+            wallet: req_wallet,
+            tx_hash: req_tx_hash,
+            ..
+        } = request
+        else {
+            return Err(JournalManagerError::ValidationFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: "Expected Redeem entry, got Mint".to_string(),
+            });
+        };
+
         let aggregate_id = issuer_request_id.to_string();
         let events =
             self.store.load_events(&aggregate_id).await.map_err(|error| {
@@ -219,32 +237,32 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         };
 
-        if request.issuer_request_id != metadata.issuer_request_id {
+        if *req_issuer_id != metadata.issuer_request_id {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Issuer request ID mismatch: expected {}, got {}",
-                    metadata.issuer_request_id, request.issuer_request_id
+                    metadata.issuer_request_id, req_issuer_id
                 ),
             });
         }
 
-        if request.underlying != metadata.underlying {
+        if *req_underlying != metadata.underlying {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Underlying symbol mismatch: expected {}, got {}",
-                    metadata.underlying.0, request.underlying.0
+                    metadata.underlying.0, req_underlying.0
                 ),
             });
         }
 
-        if request.token != metadata.token {
+        if *req_token != metadata.token {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Token symbol mismatch: expected {}, got {}",
-                    metadata.token.0, request.token.0
+                    metadata.token.0, req_token.0
                 ),
             });
         }
@@ -258,32 +276,32 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             });
         };
 
-        if &request.quantity != alpaca_quantity {
+        if req_quantity != alpaca_quantity {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Quantity mismatch: expected {}, got {}",
-                    alpaca_quantity.0, request.quantity.0
+                    alpaca_quantity.0, req_quantity.0
                 ),
             });
         }
 
-        if request.wallet != metadata.wallet {
+        if *req_wallet != metadata.wallet {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Wallet mismatch: expected {}, got {}",
-                    metadata.wallet, request.wallet
+                    metadata.wallet, req_wallet
                 ),
             });
         }
 
-        if request.tx_hash != Some(metadata.detected_tx_hash) {
+        if *req_tx_hash != Some(metadata.detected_tx_hash) {
             return Err(JournalManagerError::ValidationFailed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: format!(
                     "Transaction hash mismatch: expected {}, got {:?}",
-                    metadata.detected_tx_hash, request.tx_hash
+                    metadata.detected_tx_hash, req_tx_hash
                 ),
             });
         }
@@ -325,7 +343,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
     async fn handle_poll_result(
         &self,
-        request_result: Result<crate::alpaca::TokenizationRequest, AlpacaError>,
+        request_result: Result<TokenizationRequest, AlpacaError>,
         issuer_request_id: &IssuerRedemptionRequestId,
         tokenization_request_id: &TokenizationRequestId,
         elapsed: Duration,
@@ -336,7 +354,18 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 self.validate_request_fields(&request, issuer_request_id)
                     .await?;
 
-                match request.status {
+                let status = match &request {
+                    TokenizationRequest::Redeem { status, .. } => status,
+                    TokenizationRequest::Mint { .. } => {
+                        return Err(JournalManagerError::ValidationFailed {
+                            issuer_request_id: issuer_request_id.clone(),
+                            reason: "Expected Redeem entry, got Mint"
+                                .to_string(),
+                        });
+                    }
+                };
+
+                match status {
                     RedeemRequestStatus::Completed => {
                         info!(
                             issuer_request_id = %issuer_request_id,
@@ -453,7 +482,9 @@ mod tests {
 
     use super::{JournalManager, JournalManagerError};
     use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
-    use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequestStatus};
+    use crate::alpaca::{
+        AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+    };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::{
@@ -555,13 +586,11 @@ mod tests {
 
         fn create_mock_request(
             &self,
-            tokenization_request_id: &TokenizationRequestId,
             status: RedeemRequestStatus,
-        ) -> crate::alpaca::TokenizationRequest {
-            crate::alpaca::TokenizationRequest {
-                id: tokenization_request_id.clone(),
+        ) -> TokenizationRequest {
+            TokenizationRequest::Redeem {
+                id: TokenizationRequestId::new("mock-tok"),
                 issuer_request_id: self.issuer_request_id.clone(),
-                r#type: crate::alpaca::TokenizationRequestType::Redeem,
                 status,
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
@@ -592,8 +621,8 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            tokenization_request_id: &TokenizationRequestId,
-        ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError> {
+            _tokenization_request_id: &TokenizationRequestId,
+        ) -> Result<TokenizationRequest, AlpacaError> {
             let index = {
                 let mut count = self.call_count.lock().unwrap();
                 let index = *count;
@@ -608,10 +637,9 @@ mod tests {
             };
 
             match response {
-                MockResponse::Success(status) => Ok(self.create_mock_request(
-                    tokenization_request_id,
-                    status.clone(),
-                )),
+                MockResponse::Success(status) => {
+                    Ok(self.create_mock_request(status.clone()))
+                }
                 MockResponse::Error { status_code, body } => {
                     Err(AlpacaError::Api {
                         status_code: *status_code,
@@ -964,13 +992,11 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                tokenization_request_id: &TokenizationRequestId,
-            ) -> Result<crate::alpaca::TokenizationRequest, AlpacaError>
-            {
-                Ok(crate::alpaca::TokenizationRequest {
-                    id: tokenization_request_id.clone(),
+                _tokenization_request_id: &TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                Ok(TokenizationRequest::Redeem {
+                    id: TokenizationRequestId::new("mock-tok"),
                     issuer_request_id: self.issuer_request_id.clone(),
-                    r#type: crate::alpaca::TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),

@@ -157,12 +157,11 @@ impl AlpacaService for MockAlpacaService {
         #[cfg(test)]
         {
             if self.should_succeed {
-                Ok(super::TokenizationRequest {
+                Ok(TokenizationRequest::Redeem {
                     id: tokenization_request_id.clone(),
                     issuer_request_id: IssuerRedemptionRequestId::new(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                     )),
-                    r#type: TokenizationRequestType::Redeem,
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -182,12 +181,11 @@ impl AlpacaService for MockAlpacaService {
         }
 
         #[cfg(not(test))]
-        Ok(super::TokenizationRequest {
+        Ok(super::TokenizationRequest::Redeem {
             id: tokenization_request_id.clone(),
             issuer_request_id: IssuerRedemptionRequestId::new(b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             )),
-            r#type: TokenizationRequestType::Redeem,
             status: RedeemRequestStatus::Completed,
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
@@ -209,6 +207,7 @@ mod tests {
     use crate::account::ClientId;
     use crate::alpaca::{
         AlpacaService, MintCallbackRequest, RedeemRequest, RedeemRequestStatus,
+        TokenizationRequest,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
@@ -381,7 +380,13 @@ mod tests {
 
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
         let request = result.unwrap();
-        assert!(matches!(request.status, RedeemRequestStatus::Completed));
+        assert!(matches!(
+            request,
+            TokenizationRequest::Redeem {
+                status: RedeemRequestStatus::Completed,
+                ..
+            }
+        ));
         assert_eq!(mock.get_call_count(), 1);
     }
 

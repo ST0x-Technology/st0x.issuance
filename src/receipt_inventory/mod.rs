@@ -164,7 +164,6 @@ pub(crate) trait ReceiptService: Send + Sync {
         shares: Shares,
         block_number: u64,
         tx_hash: B256,
-        issuer_request_id: IssuerMintRequestId,
         receipt_info: ReceiptInformation,
     ) -> Result<(), ReceiptRegistrationError>;
 
@@ -230,9 +229,10 @@ where
         shares: Shares,
         block_number: u64,
         tx_hash: B256,
-        issuer_request_id: IssuerMintRequestId,
         receipt_info: ReceiptInformation,
     ) -> Result<(), ReceiptRegistrationError> {
+        let issuer_request_id = receipt_info.issuer_request_id.clone();
+
         self.cqrs
             .execute(
                 &vault.to_string(),
@@ -353,13 +353,12 @@ pub(crate) fn determine_source(
 
     serde_json::from_slice::<ReceiptInformation>(receipt_information)
         .ok()
-        .map(|info| {
+        .map_or((ReceiptSource::External, None), |info| {
             let source = ReceiptSource::Itn {
                 issuer_request_id: info.issuer_request_id.clone(),
             };
             (source, Some(info))
         })
-        .unwrap_or((ReceiptSource::External, None))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1480,7 +1479,6 @@ mod tests {
                 make_shares(100),
                 5000,
                 tx_hash,
-                issuer_request_id.clone(),
                 make_receipt_info(&issuer_request_id),
             )
             .await
@@ -1513,7 +1511,6 @@ mod tests {
                 make_shares(200),
                 6000,
                 tx_hash,
-                issuer_request_id.clone(),
                 make_receipt_info(&issuer_request_id),
             )
             .await
@@ -1552,7 +1549,6 @@ mod tests {
                     make_shares(500),
                     7000,
                     tx_hash,
-                    issuer_request_id.clone(),
                     make_receipt_info(&issuer_request_id),
                 )
                 .await
@@ -1588,7 +1584,6 @@ mod tests {
                 make_shares(100),
                 5000,
                 tx_hash,
-                issuer_request_id,
                 receipt_info.clone(),
             )
             .await

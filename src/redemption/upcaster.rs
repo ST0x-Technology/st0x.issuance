@@ -73,7 +73,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::mint::tests::arb_issuer_request_id;
+
+    fn arb_redemption_request_id() -> impl Strategy<Value = String> {
+        "[0-9a-f]{8}".prop_map(|hex| format!("red-{hex}"))
+    }
 
     /// Generates a hex string for U256 values (0x prefixed)
     fn u256_hex_string() -> impl Strategy<Value = String> {
@@ -113,7 +116,7 @@ mod tests {
     prop_compose! {
         /// Generates a valid v1.0 TokensBurned payload
         fn v1_payload_strategy()(
-            issuer_id in arb_issuer_request_id(),
+            issuer_id in arb_redemption_request_id(),
             tx_hash in tx_hash_string(),
             receipt_id in u256_hex_string(),
             shares_burned in u256_hex_string(),
@@ -140,7 +143,7 @@ mod tests {
     prop_compose! {
         /// Generates a valid v1.0 payload without dust_returned (older events)
         fn v1_payload_without_dust_strategy()(
-            issuer_id in arb_issuer_request_id(),
+            issuer_id in arb_redemption_request_id(),
             tx_hash in tx_hash_string(),
             receipt_id in u256_hex_string(),
             shares_burned in u256_hex_string(),

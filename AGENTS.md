@@ -11,7 +11,8 @@ Relevant docs:
 - README.md
 - ROADMAP.md
 - SPEC.md
-- docs/alloy.md - Alloy patterns (mocks, encoding, type aliases)
+- docs/alloy.md - **MUST READ before any alloy work** (FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros)
 - docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
 - docs/fireblocks.md - Fireblocks integration (externalTxId, SDK error handling)
 
@@ -347,7 +348,7 @@ pub(crate) type MintViewQuery = GenericQuery<
     SqliteViewRepository<MintView, Mint>, MintView, Mint,
 >;
 
-pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerRequestId) -> Option<MintView> {
+pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerMintRequestId) -> Option<MintView> {
     query.load(&Mint::aggregate_id(id)).await
 }
 

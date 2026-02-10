@@ -44,18 +44,12 @@ impl std::str::FromStr for IssuerRedemptionRequestId {
     type Err = IssuerRedemptionRequestIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(hex_str) = s.strip_prefix("red-") {
-            let bytes = hex::decode(hex_str)?;
-            FixedBytes::<4>::try_from(bytes.as_slice())
-                .map(Self)
-                .map_err(|_| IssuerRedemptionRequestIdParseError::Length)
-        } else if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-            // Legacy format: old events stored issuer_request_id as UUID strings.
-            // Extract the first 4 bytes for backward-compatible replay.
-            Ok(Self(FixedBytes::<4>::from_slice(&uuid.as_bytes()[..4])))
-        } else {
-            Err(IssuerRedemptionRequestIdParseError::Format)
-        }
+        let hex_str = s
+            .strip_prefix("red-")
+            .ok_or(IssuerRedemptionRequestIdParseError::Format)?;
+
+        let bytes = hex::decode(hex_str)?;
+        Ok(Self(FixedBytes::<4>::try_from(bytes.as_slice())?))
     }
 }
 
@@ -63,9 +57,9 @@ impl std::str::FromStr for IssuerRedemptionRequestId {
 pub(crate) enum IssuerRedemptionRequestIdParseError {
     #[error("invalid hex: {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("expected exactly 4 bytes")]
-    Length,
-    #[error("expected 'red-' prefix or valid UUID")]
+    #[error(transparent)]
+    Slice(#[from] std::array::TryFromSliceError),
+    #[error("expected 'red-' prefix")]
     Format,
 }
 
@@ -1553,6 +1547,33 @@ mod tests {
             serde_json::from_str(&json).unwrap();
 
         assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn test_from_str_rejects_missing_prefix() {
+        let result = "574378e0".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Format
+        ));
+    }
+
+    #[test]
+    fn test_from_str_rejects_invalid_hex() {
+        let result = "red-GGGGGGGG".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Hex(_)
+        ));
+    }
+
+    #[test]
+    fn test_from_str_rejects_wrong_length() {
+        let result = "red-5743".parse::<IssuerRedemptionRequestId>();
+        assert!(matches!(
+            result.unwrap_err(),
+            super::IssuerRedemptionRequestIdParseError::Slice(_)
+        ));
     }
 
     proptest! {

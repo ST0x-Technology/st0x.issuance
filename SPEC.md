@@ -739,7 +739,7 @@ in Step 2, we'll find out in Step 3.
 
 ```json
 {
-  "issuer_request_id": "123-456-ABCD-7890",
+  "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "created"
 }
 ```
@@ -794,7 +794,7 @@ account into our designated tokenization account at Alpaca.
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "123-456-ABCD-7890",
+  "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "completed"
 }
 ```
