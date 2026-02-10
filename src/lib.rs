@@ -580,7 +580,7 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
 
             let result = mint_cqrs
                 .execute(
-                    issuer_request_id.as_str(),
+                    &issuer_request_id.to_string(),
                     MintCommand::Recover {
                         issuer_request_id: issuer_request_id.clone(),
                     },
@@ -589,12 +589,12 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
 
             match result {
                 Ok(()) => info!(
-                    issuer_request_id = %issuer_request_id.as_str(),
+                    issuer_request_id = %issuer_request_id,
                     state,
                     "Recovered mint"
                 ),
                 Err(err) => error!(
-                    issuer_request_id = %issuer_request_id.as_str(),
+                    issuer_request_id = %issuer_request_id,
                     state,
                     error = %err,
                     "Failed to recover mint"

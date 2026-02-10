@@ -24,7 +24,7 @@ pub(crate) enum JournalStatus {
 
 #[tracing::instrument(skip(_auth, cqrs, event_store), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
-    issuer_request_id = %request.issuer_request_id.0,
+    issuer_request_id = %request.issuer_request_id,
     status = ?request.status
 ))]
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
@@ -44,10 +44,12 @@ pub(crate) async fn confirm_journal(
     info!(
         "Received journal confirmation for issuer_request_id={}, \
          tokenization_request_id={}, status={:?}",
-        issuer_request_id.0, tokenization_request_id.0, status
+        issuer_request_id, tokenization_request_id.0, status
     );
 
-    let mint_ctx = match event_store.load_aggregate(&issuer_request_id.0).await
+    let mint_ctx = match event_store
+        .load_aggregate(&issuer_request_id.to_string())
+        .await
     {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -66,7 +68,7 @@ pub(crate) async fn confirm_journal(
             error!(
                 "Tokenization request ID mismatch for issuer_request_id={}. \
                  Expected: {}, provided: {}",
-                issuer_request_id.0,
+                issuer_request_id,
                 expected_tokenization_id.0,
                 tokenization_request_id.0
             );
@@ -83,7 +85,8 @@ pub(crate) async fn confirm_journal(
                 }),
             };
 
-            if let Err(err) = cqrs.execute(&issuer_request_id.0, command).await
+            if let Err(err) =
+                cqrs.execute(&issuer_request_id.to_string(), command).await
             {
                 error!(
                     "Failed to execute journal rejection command for \
@@ -99,7 +102,8 @@ pub(crate) async fn confirm_journal(
                 issuer_request_id: issuer_request_id.clone(),
             };
 
-            if let Err(err) = cqrs.execute(&issuer_request_id.0, command).await
+            if let Err(err) =
+                cqrs.execute(&issuer_request_id.to_string(), command).await
             {
                 error!(
                     "Failed to execute journal confirmation command for \
@@ -121,7 +125,7 @@ pub(crate) async fn confirm_journal(
 }
 
 #[tracing::instrument(skip(cqrs), fields(
-    issuer_request_id = %issuer_request_id.0
+    issuer_request_id = %issuer_request_id
 ))]
 async fn process_journal_completion(
     cqrs: MintCqrs,
@@ -129,7 +133,7 @@ async fn process_journal_completion(
 ) {
     if let Err(err) = cqrs
         .execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             MintCommand::Deposit {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -137,7 +141,7 @@ async fn process_journal_completion(
         .await
     {
         error!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id,
             error = ?err,
             "Deposit command failed"
         );
@@ -146,7 +150,7 @@ async fn process_journal_completion(
 
     if let Err(err) = cqrs
         .execute(
-            issuer_request_id.as_str(),
+            &issuer_request_id.to_string(),
             MintCommand::SendCallback {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -154,7 +158,7 @@ async fn process_journal_completion(
         .await
     {
         error!(
-            issuer_request_id = %issuer_request_id.0,
+            issuer_request_id = %issuer_request_id,
             error = ?err,
             "SendCallback command failed"
         );
@@ -167,6 +171,7 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
+    use uuid::Uuid;
 
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
@@ -187,7 +192,7 @@ mod tests {
 
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-ok-test");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
 
         let initiate_cmd = MintCommand::Initiate {
@@ -202,7 +207,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -222,7 +227,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "completed"
         });
 
@@ -249,7 +254,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-reject-ok-test");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-ok-test");
 
@@ -265,7 +270,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -285,7 +290,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "rejected"
         });
 
@@ -313,7 +318,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-complete-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-123");
 
@@ -329,7 +334,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -349,7 +354,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "completed"
         });
 
@@ -367,6 +372,7 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
+        let aggregate_id = issuer_request_id.to_string();
         let events = sqlx::query!(
             r"
             SELECT event_type, sequence
@@ -374,7 +380,7 @@ mod tests {
             WHERE aggregate_id = ? AND aggregate_type = 'Mint'
             ORDER BY sequence
             ",
-            issuer_request_id.0
+            aggregate_id
         )
         .fetch_all(&pool)
         .await
@@ -393,7 +399,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-view-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-view-123");
 
@@ -409,7 +415,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -429,7 +435,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "completed"
         });
 
@@ -476,7 +482,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-reject-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-123");
 
@@ -492,7 +498,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -512,7 +518,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "rejected"
         });
 
@@ -530,6 +536,7 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
+        let aggregate_id = issuer_request_id.to_string();
         let events = sqlx::query!(
             r"
             SELECT event_type, sequence
@@ -537,7 +544,7 @@ mod tests {
             WHERE aggregate_id = ? AND aggregate_type = 'Mint'
             ORDER BY sequence
             ",
-            issuer_request_id.0
+            aggregate_id
         )
         .fetch_all(&pool)
         .await
@@ -556,7 +563,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-reject-view-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-reject-view-123");
 
@@ -572,7 +579,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -592,7 +599,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "rejected"
         });
 
@@ -641,7 +648,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { pool, mint_cqrs, .. } = harness;
 
-        let issuer_request_id = IssuerRequestId::new("iss-mismatch-test");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let correct_tokenization_request_id =
             TokenizationRequestId::new("alp-correct");
         let wrong_tokenization_request_id =
@@ -659,7 +666,7 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(&issuer_request_id.0, initiate_cmd)
+            .execute(&issuer_request_id.to_string(), initiate_cmd)
             .await
             .expect("Failed to initiate mint");
 
@@ -679,7 +686,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": wrong_tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.0,
+            "issuer_request_id": issuer_request_id.to_string(),
             "status": "completed"
         });
 
@@ -719,7 +726,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-nonexistent",
-            "issuer_request_id": "iss-nonexistent",
+            "issuer_request_id": "00000000-0000-0000-0000-000000000000",
             "status": "completed"
         });
 
@@ -758,7 +765,7 @@ mod tests {
 
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
-            "issuer_request_id": "iss-456",
+            "issuer_request_id": "00000000-0000-0000-0000-000000000456",
             "status": "completed"
         });
 

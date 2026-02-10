@@ -4,6 +4,7 @@ use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::error;
+use uuid::Uuid;
 
 use super::{
     MintApiError, MintResponse, validate_asset_exists, validate_client_eligible,
@@ -60,8 +61,7 @@ pub(crate) async fn initiate_mint(
     validate_client_eligible(pool.inner(), &request.client_id, &request.wallet)
         .await?;
 
-    let issuer_request_id =
-        IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
+    let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
     let command = MintCommand::Initiate {
         issuer_request_id: issuer_request_id.clone(),
@@ -74,16 +74,18 @@ pub(crate) async fn initiate_mint(
         wallet: request.wallet,
     };
 
-    cqrs.execute(&issuer_request_id.0, command).await.map_err(|e| {
-        error!("Failed to execute mint command: {e}");
-        MintApiError::CommandExecutionFailed(Box::new(e))
-    })?;
+    cqrs.execute(&issuer_request_id.to_string(), command).await.map_err(
+        |error| {
+            error!("Failed to execute mint command: {error}");
+            MintApiError::CommandExecutionFailed(Box::new(error))
+        },
+    )?;
 
     let mint_view = find_by_issuer_request_id(pool.inner(), &issuer_request_id)
         .await
-        .map_err(|e| {
-            error!("Failed to find mint by issuer_request_id: {e}");
-            MintApiError::MintViewQueryFailed(e)
+        .map_err(|error| {
+            error!("Failed to find mint by issuer_request_id: {error}");
+            MintApiError::MintViewQueryFailed(error)
         })?
         .ok_or(MintApiError::MintViewNotFound)?;
 
@@ -101,7 +103,7 @@ mod tests {
     use rocket::routes;
     use rust_decimal::Decimal;
     use std::str::FromStr;
-    use tracing::debug;
+    use uuid::Uuid;
 
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
@@ -216,7 +218,7 @@ mod tests {
         )
         .expect("valid JSON response");
 
-        assert!(!mint_response.issuer_request_id.0.is_empty());
+        assert!(!mint_response.issuer_request_id.to_string().is_empty());
         assert_eq!(mint_response.status, "created");
     }
 
@@ -492,12 +494,7 @@ mod tests {
         )
         .expect("valid JSON response");
 
-        let all_events = sqlx::query!("SELECT COUNT(*) as count FROM events")
-            .fetch_one(&pool)
-            .await
-            .expect("Failed to count events");
-
-        debug!("Total events in database: {}", all_events.count);
+        let issuer_request_id_str = mint_response.issuer_request_id.to_string();
 
         let events = sqlx::query!(
             r"
@@ -506,20 +503,14 @@ mod tests {
             WHERE aggregate_id = ? AND aggregate_type = 'Mint'
             ORDER BY sequence
             ",
-            mint_response.issuer_request_id.0
+            issuer_request_id_str
         )
         .fetch_all(&pool)
         .await
         .expect("Failed to query events");
 
-        debug!(
-            "Events for mint {}: {}",
-            mint_response.issuer_request_id.0,
-            events.len()
-        );
-
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].aggregate_id, mint_response.issuer_request_id.0);
+        assert_eq!(events[0].aggregate_id, issuer_request_id_str);
         assert_eq!(events[0].event_type, "MintEvent::Initiated");
         assert_eq!(events[0].sequence, 1);
     }
@@ -737,10 +728,11 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness { mint_cqrs, .. } = harness;
 
-        let issuer_request_id = "test-issuer-request-id";
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let aggregate_id = issuer_request_id.to_string();
 
         let command = MintCommand::Initiate {
-            issuer_request_id: IssuerRequestId::new(issuer_request_id),
+            issuer_request_id,
             tokenization_request_id: TokenizationRequestId::new("alp-123"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: underlying.clone(),
@@ -751,11 +743,11 @@ mod tests {
         };
 
         mint_cqrs
-            .execute(issuer_request_id, command.clone())
+            .execute(&aggregate_id, command.clone())
             .await
             .expect("First execution should succeed");
 
-        let result = mint_cqrs.execute(issuer_request_id, command).await;
+        let result = mint_cqrs.execute(&aggregate_id, command).await;
 
         assert!(result.is_err());
     }

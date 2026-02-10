@@ -763,3 +763,30 @@ impl LocalEvm {
         Ok(())
     }
 }
+
+/// Asserts that a log line at the given level contains all snippets.
+///
+/// Use with `tracing_test::traced_test` to verify observability.
+#[cfg(test)]
+pub(crate) fn logs_contain_at(
+    level: tracing::Level,
+    snippets: &[&str],
+) -> bool {
+    let logs = {
+        let buf = tracing_test::internal::global_buf().lock().unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let level_str = match level {
+        tracing::Level::TRACE => "TRACE",
+        tracing::Level::DEBUG => "DEBUG",
+        tracing::Level::INFO => "INFO",
+        tracing::Level::WARN => "WARN",
+        tracing::Level::ERROR => "ERROR",
+    };
+
+    logs.lines().any(|line| {
+        line.contains(level_str)
+            && snippets.iter().all(|snippet| line.contains(snippet))
+    })
+}

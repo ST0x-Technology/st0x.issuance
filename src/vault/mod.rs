@@ -250,6 +250,7 @@ pub(crate) enum VaultError {
 mod tests {
     use chrono::Utc;
     use rust_decimal_macros::dec;
+    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
@@ -257,7 +258,7 @@ mod tests {
     fn sample_receipt_information() -> ReceiptInformation {
         ReceiptInformation {
             tokenization_request_id: TokenizationRequestId::new("tok-123"),
-            issuer_request_id: IssuerRequestId::new("iss-456"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             underlying: UnderlyingSymbol::new("AAPL"),
             quantity: Quantity::new(dec!(100.5)),
             operation_type: OperationType::Mint,
@@ -269,6 +270,7 @@ mod tests {
     #[test]
     fn encode_produces_valid_json() {
         let info = sample_receipt_information();
+        let expected_issuer_id = info.issuer_request_id.to_string();
 
         let encoded = info.encode().unwrap();
 
@@ -279,7 +281,10 @@ mod tests {
             decoded["tokenization_request_id"].as_str(),
             Some("tok-123")
         );
-        assert_eq!(decoded["issuer_request_id"].as_str(), Some("iss-456"));
+        assert_eq!(
+            decoded["issuer_request_id"].as_str(),
+            Some(expected_issuer_id.as_str())
+        );
         assert_eq!(decoded["underlying"].as_str(), Some("AAPL"));
         assert_eq!(decoded["quantity"].as_str(), Some("100.5"));
         assert_eq!(decoded["operation_type"].as_str(), Some("Mint"));

@@ -7,6 +7,7 @@ use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
@@ -304,6 +305,8 @@ pub(crate) enum RedemptionViewError {
     Json(#[from] serde_json::Error),
     #[error("Replay error: {0}")]
     Replay(#[from] AggregateError<RedemptionError>),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 /// Replays all `Redemption` events through the `redemption_view`.
@@ -348,7 +351,8 @@ pub(crate) async fn find_detected(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(&row.view_id), view))
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerRequestId::new(id), view))
         })
         .collect()
 }
@@ -373,7 +377,8 @@ pub(crate) async fn find_alpaca_called(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(&row.view_id), view))
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerRequestId::new(id), view))
         })
         .collect()
 }
@@ -398,7 +403,8 @@ pub(crate) async fn find_burning(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(&row.view_id), view))
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerRequestId::new(id), view))
         })
         .collect()
 }
@@ -423,7 +429,8 @@ pub(crate) async fn find_burn_failed(
     rows.into_iter()
         .map(|row| {
             let view: RedemptionView = serde_json::from_str(&row.payload)?;
-            Ok((IssuerRequestId::new(&row.view_id), view))
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerRequestId::new(id), view))
         })
         .collect()
 }
@@ -439,6 +446,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use super::{
         RedemptionView, find_alpaca_called, find_burn_failed, find_burning,
@@ -523,7 +531,7 @@ mod tests {
 
         async fn detect_redemption(
             &self,
-            id: &str,
+            id: &IssuerRequestId,
             underlying: &str,
             wallet: Address,
             quantity: u64,
@@ -532,9 +540,9 @@ mod tests {
         ) {
             self.cqrs
                 .execute(
-                    id,
+                    &id.to_string(),
                     RedemptionCommand::Detect {
-                        issuer_request_id: IssuerRequestId::new(id),
+                        issuer_request_id: id.clone(),
                         underlying: UnderlyingSymbol::new(underlying),
                         token: TokenSymbol::new(format!("t{underlying}")),
                         wallet,
@@ -547,12 +555,16 @@ mod tests {
                 .expect("Failed to detect redemption");
         }
 
-        async fn call_alpaca(&self, id: &str, tokenization_request_id: &str) {
+        async fn call_alpaca(
+            &self,
+            id: &IssuerRequestId,
+            tokenization_request_id: &str,
+        ) {
             self.cqrs
                 .execute(
-                    id,
+                    &id.to_string(),
                     RedemptionCommand::RecordAlpacaCall {
-                        issuer_request_id: IssuerRequestId::new(id),
+                        issuer_request_id: id.clone(),
                         tokenization_request_id: TokenizationRequestId::new(
                             tokenization_request_id,
                         ),
@@ -564,24 +576,24 @@ mod tests {
                 .expect("Failed to record alpaca call");
         }
 
-        async fn confirm_alpaca_complete(&self, id: &str) {
+        async fn confirm_alpaca_complete(&self, id: &IssuerRequestId) {
             self.cqrs
                 .execute(
-                    id,
+                    &id.to_string(),
                     RedemptionCommand::ConfirmAlpacaComplete {
-                        issuer_request_id: IssuerRequestId::new(id),
+                        issuer_request_id: id.clone(),
                     },
                 )
                 .await
                 .expect("Failed to confirm alpaca complete");
         }
 
-        async fn burn_tokens(&self, id: &str) {
+        async fn burn_tokens(&self, id: &IssuerRequestId) {
             self.cqrs
                 .execute(
-                    id,
+                    &id.to_string(),
                     RedemptionCommand::BurnTokens {
-                        issuer_request_id: IssuerRequestId::new(id),
+                        issuer_request_id: id.clone(),
                         vault: address!(
                             "0xcccccccccccccccccccccccccccccccccccccccc"
                         ),
@@ -597,7 +609,7 @@ mod tests {
                             tokenization_request_id: TokenizationRequestId::new(
                                 "tok-test",
                             ),
-                            issuer_request_id: IssuerRequestId::new(id),
+                            issuer_request_id: id.clone(),
                             underlying: UnderlyingSymbol::new("AAPL"),
                             quantity: Quantity::new(Decimal::from(100)),
                             operation_type: OperationType::Redeem,
@@ -621,7 +633,7 @@ mod tests {
     fn test_view_updates_on_detected_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new("red-view-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -633,7 +645,7 @@ mod tests {
         let detected_at = Utc::now();
 
         let event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -678,7 +690,7 @@ mod tests {
     fn test_view_updates_on_alpaca_called_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new("red-alpaca-called-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
@@ -692,7 +704,7 @@ mod tests {
         let called_at = Utc::now();
 
         let detected_event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -710,7 +722,7 @@ mod tests {
         view.update(&detected_event);
 
         let alpaca_called_event = EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
@@ -760,7 +772,7 @@ mod tests {
     fn test_view_updates_on_alpaca_journal_completed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new("red-burning-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
         let underlying = UnderlyingSymbol::new("NVDA");
@@ -776,7 +788,7 @@ mod tests {
         let alpaca_journal_completed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -792,7 +804,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
@@ -805,7 +817,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 3,
             payload: RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: issuer_request_id.clone(),
@@ -855,7 +867,7 @@ mod tests {
     fn test_view_updates_on_redemption_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new("red-failed-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let underlying = UnderlyingSymbol::new("META");
         let token = TokenSymbol::new("tMETA");
         let wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -869,7 +881,7 @@ mod tests {
         let failed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -885,7 +897,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: RedemptionEvent::RedemptionFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -913,7 +925,7 @@ mod tests {
     fn test_view_updates_on_alpaca_call_failed_event() {
         let mut view = RedemptionView::default();
 
-        let issuer_request_id = IssuerRequestId::new("red-call-failed-123");
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let underlying = UnderlyingSymbol::new("GOOGL");
         let token = TokenSymbol::new("tGOOGL");
         let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
@@ -927,7 +939,7 @@ mod tests {
         let failed_at = Utc::now();
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
             payload: RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -943,7 +955,7 @@ mod tests {
         });
 
         view.update(&EventEnvelope::<Redemption> {
-            aggregate_id: issuer_request_id.as_str().to_string(),
+            aggregate_id: issuer_request_id.to_string(),
             sequence: 2,
             payload: RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -972,10 +984,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = "red-detected-1";
+        let detected_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                detected_id,
+                &detected_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -984,10 +996,10 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = "red-alpaca-called-1";
+        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                alpaca_called_id,
+                &alpaca_called_id,
                 "TSLA",
                 address!("0x9876543210fedcba9876543210fedcba98765432"),
                 50,
@@ -995,12 +1007,12 @@ mod tests {
                 54321,
             )
             .await;
-        harness.call_alpaca(alpaca_called_id, "tok-1").await;
+        harness.call_alpaca(&alpaca_called_id, "tok-1").await;
 
-        let completed_id = "red-completed-1";
+        let completed_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                completed_id,
+                &completed_id,
                 "NVDA",
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 25,
@@ -1008,14 +1020,14 @@ mod tests {
                 77777,
             )
             .await;
-        harness.call_alpaca(completed_id, "tok-2").await;
-        harness.confirm_alpaca_complete(completed_id).await;
-        harness.burn_tokens(completed_id).await;
+        harness.call_alpaca(&completed_id, "tok-2").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
 
         let result = find_detected(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.as_str(), detected_id);
+        assert_eq!(result[0].0, detected_id);
         assert!(matches!(result[0].1, RedemptionView::Detected { .. }));
     }
 
@@ -1024,10 +1036,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = "red-completed-only";
+        let completed_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                completed_id,
+                &completed_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1035,9 +1047,9 @@ mod tests {
                 12345,
             )
             .await;
-        harness.call_alpaca(completed_id, "tok-1").await;
-        harness.confirm_alpaca_complete(completed_id).await;
-        harness.burn_tokens(completed_id).await;
+        harness.call_alpaca(&completed_id, "tok-1").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
 
         let result = find_detected(pool).await.unwrap();
 
@@ -1050,7 +1062,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=3 {
-            let id = format!("red-detected-{i}");
+            let id = IssuerRequestId::new(Uuid::new_v4());
             harness
                 .detect_redemption(
                     &id,
@@ -1073,10 +1085,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = "red-detected-for-alpaca";
+        let detected_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                detected_id,
+                &detected_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1085,10 +1097,10 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = "red-alpaca-called-query";
+        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                alpaca_called_id,
+                &alpaca_called_id,
                 "TSLA",
                 address!("0x9876543210fedcba9876543210fedcba98765432"),
                 50,
@@ -1096,12 +1108,12 @@ mod tests {
                 54321,
             )
             .await;
-        harness.call_alpaca(alpaca_called_id, "tok-query").await;
+        harness.call_alpaca(&alpaca_called_id, "tok-query").await;
 
-        let burning_id = "red-burning-for-alpaca";
+        let burning_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                burning_id,
+                &burning_id,
                 "NVDA",
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 25,
@@ -1109,13 +1121,13 @@ mod tests {
                 77777,
             )
             .await;
-        harness.call_alpaca(burning_id, "tok-burn").await;
-        harness.confirm_alpaca_complete(burning_id).await;
+        harness.call_alpaca(&burning_id, "tok-burn").await;
+        harness.confirm_alpaca_complete(&burning_id).await;
 
         let result = find_alpaca_called(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.as_str(), alpaca_called_id);
+        assert_eq!(result[0].0, alpaca_called_id);
         assert!(matches!(result[0].1, RedemptionView::AlpacaCalled { .. }));
     }
 
@@ -1124,10 +1136,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = "red-only-detected";
+        let detected_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                detected_id,
+                &detected_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1146,10 +1158,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = "red-detected-for-burn";
+        let detected_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                detected_id,
+                &detected_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1158,10 +1170,10 @@ mod tests {
             )
             .await;
 
-        let alpaca_called_id = "red-alpaca-for-burn";
+        let alpaca_called_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                alpaca_called_id,
+                &alpaca_called_id,
                 "TSLA",
                 address!("0x9876543210fedcba9876543210fedcba98765432"),
                 50,
@@ -1169,12 +1181,12 @@ mod tests {
                 54321,
             )
             .await;
-        harness.call_alpaca(alpaca_called_id, "tok-2").await;
+        harness.call_alpaca(&alpaca_called_id, "tok-2").await;
 
-        let burning_id = "red-burning-query";
+        let burning_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                burning_id,
+                &burning_id,
                 "NVDA",
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 25,
@@ -1182,13 +1194,13 @@ mod tests {
                 77777,
             )
             .await;
-        harness.call_alpaca(burning_id, "tok-burn-query").await;
-        harness.confirm_alpaca_complete(burning_id).await;
+        harness.call_alpaca(&burning_id, "tok-burn-query").await;
+        harness.confirm_alpaca_complete(&burning_id).await;
 
-        let completed_id = "red-completed-for-burn";
+        let completed_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                completed_id,
+                &completed_id,
                 "META",
                 address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 75,
@@ -1196,14 +1208,14 @@ mod tests {
                 66666,
             )
             .await;
-        harness.call_alpaca(completed_id, "tok-complete").await;
-        harness.confirm_alpaca_complete(completed_id).await;
-        harness.burn_tokens(completed_id).await;
+        harness.call_alpaca(&completed_id, "tok-complete").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
 
         let result = find_burning(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.as_str(), burning_id);
+        assert_eq!(result[0].0, burning_id);
         assert!(matches!(result[0].1, RedemptionView::Burning { .. }));
     }
 
@@ -1212,10 +1224,10 @@ mod tests {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let completed_id = "red-completed-only-burn";
+        let completed_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                completed_id,
+                &completed_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1223,9 +1235,9 @@ mod tests {
                 12345,
             )
             .await;
-        harness.call_alpaca(completed_id, "tok-1").await;
-        harness.confirm_alpaca_complete(completed_id).await;
-        harness.burn_tokens(completed_id).await;
+        harness.call_alpaca(&completed_id, "tok-1").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
 
         let result = find_burning(pool).await.unwrap();
 
@@ -1238,7 +1250,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         for i in 1_u64..=2 {
-            let id = format!("red-burning-{i}");
+            let id = IssuerRequestId::new(Uuid::new_v4());
             harness
                 .detect_redemption(
                     &id,
@@ -1261,8 +1273,8 @@ mod tests {
     #[test]
     fn test_view_updates_on_burning_failed_event() {
         let mut view = RedemptionView::default();
-        let id = "red-burn-failed-123";
-        let issuer_request_id = IssuerRequestId::new(id);
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let id = issuer_request_id.to_string();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-failed-456");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1280,7 +1292,7 @@ mod tests {
         let failed_at = Utc::now();
 
         view.update(&make_detected_envelope(
-            id,
+            &id,
             1,
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1295,7 +1307,7 @@ mod tests {
         ));
 
         view.update(&make_detected_envelope(
-            id,
+            &id,
             2,
             RedemptionEvent::AlpacaCalled {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1307,7 +1319,7 @@ mod tests {
         ));
 
         view.update(&make_detected_envelope(
-            id,
+            &id,
             3,
             RedemptionEvent::AlpacaJournalCompleted {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1318,7 +1330,7 @@ mod tests {
         assert!(matches!(view, RedemptionView::Burning { .. }));
 
         view.update(&make_detected_envelope(
-            id,
+            &id,
             4,
             RedemptionEvent::BurningFailed {
                 issuer_request_id: issuer_request_id.clone(),
@@ -1364,10 +1376,10 @@ mod tests {
         let TestHarness { pool, cqrs } = &harness;
 
         // Create a redemption in Detected state
-        let detected_id = "red-detected-for-burn-fail";
+        let detected_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                detected_id,
+                &detected_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1379,10 +1391,10 @@ mod tests {
             .await;
 
         // Create a redemption in Burning state
-        let burning_id = "red-burning-for-burn-fail";
+        let burning_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                burning_id,
+                &burning_id,
                 "TSLA",
                 address!("0x9876543210fedcba9876543210fedcba98765432"),
                 50,
@@ -1392,14 +1404,14 @@ mod tests {
                 54321,
             )
             .await;
-        harness.call_alpaca(burning_id, "tok-burning").await;
-        harness.confirm_alpaca_complete(burning_id).await;
+        harness.call_alpaca(&burning_id, "tok-burning").await;
+        harness.confirm_alpaca_complete(&burning_id).await;
 
         // Create a redemption in BurnFailed state
-        let burn_failed_id = "red-burn-failed-query";
+        let burn_failed_id = IssuerRequestId::new(Uuid::new_v4());
         harness
             .detect_redemption(
-                burn_failed_id,
+                &burn_failed_id,
                 "NVDA",
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 25,
@@ -1409,14 +1421,14 @@ mod tests {
                 77777,
             )
             .await;
-        harness.call_alpaca(burn_failed_id, "tok-burn-fail").await;
-        harness.confirm_alpaca_complete(burn_failed_id).await;
+        harness.call_alpaca(&burn_failed_id, "tok-burn-fail").await;
+        harness.confirm_alpaca_complete(&burn_failed_id).await;
 
         // Record burn failure
         cqrs.execute(
-            burn_failed_id,
+            &burn_failed_id.to_string(),
             RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: IssuerRequestId::new(burn_failed_id),
+                issuer_request_id: burn_failed_id.clone(),
                 error: "Insufficient gas".to_string(),
             },
         )
@@ -1426,7 +1438,7 @@ mod tests {
         let result = find_burn_failed(pool).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0.as_str(), burn_failed_id);
+        assert_eq!(result[0].0, burn_failed_id);
         assert!(matches!(result[0].1, RedemptionView::BurnFailed { .. }));
     }
 
@@ -1443,11 +1455,12 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let id = "red-replay-123";
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
+        let id = issuer_request_id.to_string();
         let quantity = Quantity::new(Decimal::from(100));
 
         let detected_event = RedemptionEvent::Detected {
-            issuer_request_id: IssuerRequestId::new(id),
+            issuer_request_id: issuer_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -1462,7 +1475,7 @@ mod tests {
         let detected_payload = serde_json::to_string(&detected_event).unwrap();
         insert_event_raw(
             &pool,
-            id,
+            &id,
             1,
             "RedemptionEvent::Detected",
             &detected_payload,
@@ -1470,7 +1483,7 @@ mod tests {
         .await;
 
         let alpaca_called_event = RedemptionEvent::AlpacaCalled {
-            issuer_request_id: IssuerRequestId::new(id),
+            issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: TokenizationRequestId::new(
                 "tok-replay-123",
             ),
@@ -1483,7 +1496,7 @@ mod tests {
             serde_json::to_string(&alpaca_called_event).unwrap();
         insert_event_raw(
             &pool,
-            id,
+            &id,
             2,
             "RedemptionEvent::AlpacaCalled",
             &alpaca_payload,
@@ -1523,7 +1536,7 @@ mod tests {
             panic!("Expected AlpacaCalled view, got {view:?}");
         };
 
-        assert_eq!(view_id.as_str(), id);
+        assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_alpaca_qty, quantity);
         assert_eq!(view_dust_qty, Quantity::new(Decimal::ZERO));
     }

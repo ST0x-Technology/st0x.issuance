@@ -233,6 +233,7 @@ mod tests {
     use alloy::primitives::{address, b256};
     use rust_decimal::Decimal;
     use serde_json::json;
+    use uuid::uuid;
 
     use crate::account::ClientId;
     use crate::mint::{IssuerRequestId, Quantity, TokenizationRequestId};
@@ -286,7 +287,9 @@ mod tests {
         let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
 
         let request = RedeemRequest {
-            issuer_request_id: IssuerRequestId::new("red-abc123"),
+            issuer_request_id: IssuerRequestId::new(uuid!(
+                "00000000-0000-0000-0000-00000abc0123"
+            )),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
             client_id,
@@ -300,7 +303,10 @@ mod tests {
 
         let serialized = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(serialized["issuer_request_id"], json!("red-abc123"));
+        assert_eq!(
+            serialized["issuer_request_id"],
+            json!("00000000-0000-0000-0000-00000abc0123")
+        );
         assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
         assert_eq!(serialized["token_symbol"], json!("tAAPL"));
         assert_eq!(

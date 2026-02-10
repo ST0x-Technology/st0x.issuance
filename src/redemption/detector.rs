@@ -6,8 +6,9 @@ use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use url::Url;
+use uuid::Uuid;
 
 use super::{
     Redemption, RedemptionCommand, RedemptionError, burn_manager::BurnManager,
@@ -140,7 +141,7 @@ where
 
         while let Some(log) = stream.next().await {
             if let Err(err) = self.process_transfer_log(&log).await {
-                error!("Failed to process transfer log: {err}");
+                warn!("Failed to process transfer log: {err}");
             }
         }
 
@@ -158,7 +159,7 @@ where
     async fn process_transfer_log(
         &self,
         log: &alloy::rpc::types::Log,
-    ) -> Result<(), RedemptionMonitorError> {
+    ) -> Result<Option<IssuerRequestId>, RedemptionMonitorError> {
         let transfer_event =
             bindings::OffchainAssetReceiptVault::Transfer::decode_log(
                 &log.inner,
@@ -186,7 +187,7 @@ where
                 value = %transfer_event.value,
                 "Ignoring mint event (from=0x0)"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         info!(
@@ -211,14 +212,14 @@ where
             self.get_account_info(&transfer_event.from).await?;
 
         self.handle_alpaca_and_polling(
-            issuer_request_id,
+            issuer_request_id.clone(),
             client_id,
             alpaca_account,
             network,
         )
         .await?;
 
-        Ok(())
+        Ok(Some(issuer_request_id))
     }
 
     async fn find_matching_asset(
@@ -255,10 +256,7 @@ where
             .transaction_hash
             .ok_or(RedemptionMonitorError::MissingTxHash)?;
 
-        let issuer_request_id = crate::mint::IssuerRequestId::new(format!(
-            "red-{}",
-            &tx_hash.to_string()[2..10]
-        ));
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
 
         let quantity =
             Quantity::from_u256_with_18_decimals(transfer_event.value)?;
@@ -277,10 +275,10 @@ where
             block_number,
         };
 
-        self.cqrs.execute(issuer_request_id.as_str(), command).await?;
+        self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
 
         info!(
-            issuer_request_id = %issuer_request_id.as_str(),
+            %issuer_request_id,
             "Redemption detection recorded successfully"
         );
 
@@ -316,8 +314,10 @@ where
         alpaca_account: AlpacaAccountNumber,
         network: Network,
     ) -> Result<(), RedemptionMonitorError> {
-        let aggregate_ctx =
-            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
+        let aggregate_ctx = self
+            .event_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await?;
 
         if let Err(err) = self
             .redeem_call_manager
@@ -331,15 +331,17 @@ where
             .await
         {
             warn!(
-                issuer_request_id = %issuer_request_id.as_str(),
+                %issuer_request_id,
                 error = ?err,
                 "handle_redemption_detected failed"
             );
             return Ok(());
         }
 
-        let aggregate_ctx =
-            self.event_store.load_aggregate(issuer_request_id.as_str()).await?;
+        let aggregate_ctx = self
+            .event_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await?;
 
         let Redemption::AlpacaCalled { tokenization_request_id, .. } =
             aggregate_ctx.aggregate()
@@ -370,13 +372,13 @@ where
             }
 
             let aggregate_ctx = match event_store
-                .load_aggregate(issuer_request_id_cloned.as_str())
+                .load_aggregate(&issuer_request_id_cloned.to_string())
                 .await
             {
                 Ok(ctx) => ctx,
                 Err(err) => {
                     warn!(
-                        issuer_request_id = %issuer_request_id_cloned.as_str(),
+                        issuer_request_id = %issuer_request_id_cloned,
                         error = ?err,
                         "Failed to load aggregate after journal completion"
                     );
@@ -393,7 +395,7 @@ where
                     .await
                 {
                     warn!(
-                        issuer_request_id = %issuer_request_id_cloned.as_str(),
+                        issuer_request_id = %issuer_request_id_cloned,
                         error = ?err,
                         "handle_burning_started failed"
                     );
@@ -458,7 +460,6 @@ mod tests {
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
-    use crate::mint::IssuerRequestId;
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
@@ -689,20 +690,16 @@ mod tests {
 
         let result = detector.process_transfer_log(&log).await;
 
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        let issuer_request_id = IssuerRequestId::new(format!(
-            "red-{}",
-            &tx_hash.to_string()[2..10]
-        ));
+        let issuer_request_id =
+            result.expect("Expected success").expect("Expected Some(id)");
 
         let context =
-            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
-        let aggregate = context.aggregate();
+            store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
 
         assert!(
-            matches!(aggregate, Redemption::AlpacaCalled { .. }),
-            "Expected AlpacaCalled state, got {aggregate:?}"
+            matches!(context.aggregate(), Redemption::AlpacaCalled { .. }),
+            "Expected AlpacaCalled state, got {:?}",
+            context.aggregate()
         );
     }
 
@@ -926,7 +923,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_transfer_log_duplicate_detection_fails() {
+    async fn test_process_transfer_log_duplicate_creates_separate_redemptions()
+    {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
@@ -998,8 +996,8 @@ mod tests {
 
         let second_result = detector.process_transfer_log(&log).await;
         assert!(
-            matches!(second_result, Err(RedemptionMonitorError::Aggregate(_))),
-            "Second detection should fail with CQRS error, got {second_result:?}"
+            second_result.is_ok(),
+            "Second detection creates a separate redemption with a new UUID, got {second_result:?}"
         );
     }
 
@@ -1073,16 +1071,9 @@ mod tests {
             "Mint events should be silently ignored, got {result:?}"
         );
 
-        // Verify no redemption was created
-        let issuer_request_id =
-            IssuerRequestId::new("red-abcdefab".to_string());
-        let context =
-            store.load_aggregate(issuer_request_id.as_str()).await.unwrap();
-        let aggregate = context.aggregate();
-
         assert!(
-            matches!(aggregate, Redemption::Uninitialized),
-            "No redemption should be created for mint events, got {aggregate:?}"
+            result.unwrap().is_none(),
+            "Mint events should return None (no redemption created)"
         );
     }
 

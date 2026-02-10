@@ -9,6 +9,7 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use uuid::{Uuid, uuid};
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
@@ -48,7 +49,7 @@ async fn insert_mint_event(
 async fn insert_minting_state_events(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     issuer_request_id: &str,
-    tokenization_request_id: &str,
+    tokenization_request_id: &Uuid,
     client_id: &str,
     wallet: Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -461,11 +462,15 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    let issuer_request_id = "iss-minting-no-receipt";
+    let issuer_request_id =
+        uuid!("00000001-0000-0000-0000-000000000001").to_string();
+    let issuer_request_id = issuer_request_id.as_str();
+    let tokenization_request_id = uuid!("10000001-0000-0000-0000-000000000001");
+
     insert_minting_state_events(
         &query_pool,
         issuer_request_id,
-        "tok-minting-no-receipt",
+        &tokenization_request_id,
         &client_id.to_string(),
         user_wallet,
     )
@@ -528,16 +533,21 @@ async fn test_mint_recovery_prevents_double_mint()
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
     // Manually mint on-chain with a specific issuer_request_id BEFORE service starts
-    let issuer_request_id = "iss-double-mint-test";
+    let issuer_request_id_uuid = uuid!("00000002-0000-0000-0000-000000000002");
+    let issuer_request_id = issuer_request_id_uuid.to_string();
+    let issuer_request_id = issuer_request_id.as_str();
+    let tokenization_request_id = uuid!("10000002-0000-0000-0000-000000000002");
+
     let receipt_info_json = json!({
-        "tokenization_request_id": "tok-double-mint-test",
-        "issuer_request_id": issuer_request_id,
+        "tokenization_request_id": tokenization_request_id,
+        "issuer_request_id": issuer_request_id_uuid,
         "underlying": "AAPL",
         "quantity": "50.0",
         "operation_type": "Mint",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "notes": null
     });
+
     let encoded_receipt_info =
         Bytes::from(serde_json::to_vec(&receipt_info_json)?);
 
@@ -571,7 +581,7 @@ async fn test_mint_recovery_prevents_double_mint()
     insert_minting_state_events(
         &query_pool,
         issuer_request_id,
-        "tok-double-mint-test",
+        &tokenization_request_id,
         &client_id.to_string(),
         user_wallet,
     )
@@ -677,12 +687,15 @@ async fn test_mint_recovery_from_minting_failed_state()
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    let issuer_request_id = "iss-minting-failed-recovery";
+    let issuer_request_id =
+        uuid!("00000003-0000-0000-0000-000000000003").to_string();
+    let issuer_request_id = issuer_request_id.as_str();
 
+    let tokenization_request_id = uuid!("10000003-0000-0000-0000-000000000003");
     insert_minting_state_events(
         &query_pool,
         issuer_request_id,
-        "tok-minting-failed",
+        &tokenization_request_id,
         &client_id.to_string(),
         user_wallet,
     )

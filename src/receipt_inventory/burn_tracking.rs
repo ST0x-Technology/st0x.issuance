@@ -213,6 +213,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     use super::*;
     use crate::mint::{Quantity, TokenizationRequestId};
@@ -239,8 +240,9 @@ mod tests {
         let mut view = ReceiptBurnsView::default();
         assert!(matches!(view, ReceiptBurnsView::Unavailable));
 
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("red-123"),
+            issuer_request_id: issuer_request_id.clone(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -272,10 +274,7 @@ mod tests {
             panic!("Expected Burned variant");
         };
 
-        assert_eq!(
-            redemption_issuer_request_id,
-            IssuerRequestId::new("red-123")
-        );
+        assert_eq!(redemption_issuer_request_id, issuer_request_id);
         assert_eq!(burns.len(), 1);
         assert_eq!(burns[0].receipt_id, uint!(42_U256));
         assert_eq!(burns[0].shares_burned, uint!(100_000000000000000000_U256));
@@ -285,9 +284,10 @@ mod tests {
     fn test_view_ignores_other_events() {
         let mut view = ReceiptBurnsView::default();
 
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4());
         let events = vec![
             RedemptionEvent::Detected {
-                issuer_request_id: IssuerRequestId::new("red-123"),
+                issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
                 wallet: address!("0x1111111111111111111111111111111111111111"),
@@ -299,14 +299,14 @@ mod tests {
                 detected_at: Utc::now(),
             },
             RedemptionEvent::AlpacaCalled {
-                issuer_request_id: IssuerRequestId::new("red-123"),
+                issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 alpaca_quantity: Quantity::new(dec!(10)),
                 dust_quantity: Quantity::new(Decimal::ZERO),
                 called_at: Utc::now(),
             },
             RedemptionEvent::BurningFailed {
-                issuer_request_id: IssuerRequestId::new("red-123"),
+                issuer_request_id,
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
             },
@@ -342,7 +342,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("iss-mint-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -418,9 +418,7 @@ mod tests {
         for i in 1_u64..=3 {
             let aggregate_id = format!("red-multi-{i}");
             let event = RedemptionEvent::TokensBurned {
-                issuer_request_id: IssuerRequestId::new(format!(
-                    "iss-mint-{i}"
-                )),
+                issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
                 tx_hash: b256!(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ),
@@ -488,7 +486,7 @@ mod tests {
         let shares_burned = uint!(100_000000000000000000_U256);
 
         let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRequestId::new("iss-mint-123"),
+            issuer_request_id: IssuerRequestId::new(Uuid::new_v4()),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
