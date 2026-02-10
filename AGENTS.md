@@ -137,10 +137,10 @@ time-travel debugging, and provide a single source of truth for all operations.
     `20251017000000_create_account_view.sql`)
   - After the file is created, edit it to add the SQL
 - **CRITICAL: Fix migrations in place during development** - When working on a
-  feature tracked in PLAN.md, if you discover a migration you added is
-  incorrect, fix the original migration file directly. NEVER add a new migration
-  to fix another migration added as part of the same task/feature. Only add fix
-  migrations for issues in migrations that have already been merged to main.
+  feature, if you discover a migration you added is incorrect, fix the original
+  migration file directly. NEVER add a new migration to fix another migration
+  added as part of the same task/feature. Only add fix migrations for issues in
+  migrations that have already been merged to main.
 - `sqlx db create` - Create the database
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration

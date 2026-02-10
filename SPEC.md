@@ -137,7 +137,16 @@ use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
 
 struct TokenizationRequestId(String);
-struct IssuerRequestId(String);
+
+/// Mint operations use a UUID-based issuer request ID.
+/// Serializes as a UUID string, e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+struct IssuerMintRequestId(Uuid);
+
+/// Redemption operations derive their issuer request ID from the first 4 bytes
+/// of the on-chain tx_hash that triggered the redemption.
+/// Serializes as "red-{hex}", e.g. "red-574378e0"
+struct IssuerRedemptionRequestId(FixedBytes<4>);
+
 struct ClientId(String);
 struct AlpacaAccountNumber(String);
 struct UnderlyingSymbol(String);
@@ -160,7 +169,7 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Aggregate State:**
 
-- `issuer_request_id`: Our unique identifier for this mint
+- `issuer_request_id: IssuerMintRequestId`: Our unique identifier for this mint
 - `tokenization_request_id`: Alpaca's identifier
 - `quantity`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
   details
@@ -229,7 +238,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Aggregate State:**
 
-- `issuer_request_id`: Our unique identifier for this redemption
+- `issuer_request_id: IssuerRedemptionRequestId`: Our unique identifier for this
+  redemption
 - `tokenization_request_id`: Alpaca's identifier (received after calling their
   API)
 - `underlying`, `token`, `wallet`, `quantity`: Redemption details
@@ -738,7 +748,7 @@ struct AlpacaMintRequest {
 }
 
 struct MintRequestResponse {
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     status: String,  // "created"
 }
 ```
@@ -759,7 +769,7 @@ account into our designated tokenization account at Alpaca.
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "ABC-123-DEF-456",
+  "issuer_request_id": "123-456-ABCD-7890",
   "status": "completed"
 }
 ```
@@ -788,7 +798,7 @@ enum AlpacaConfirmationStatus {
 
 struct AlpacaJournalConfirmation {
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     status: AlpacaConfirmationStatus,
 }
 ```
@@ -832,7 +842,7 @@ and receipts once the AP sends shares back).
 ```rust
 struct ReceiptInformation {
     alpaca_tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     quantity: Quantity,
@@ -948,7 +958,7 @@ stateDiagram-v2
 struct StoredMintRequest {
     id: i64,
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerMintRequestId,
     quantity: Quantity,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
@@ -1058,7 +1068,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 ```json
 {
-  "issuer_request_id": "ABC-123-DEF-456",
+  "issuer_request_id": "red-574378e0",
   "underlying_symbol": "AAPL",
   "token_symbol": "AAPL0x",
   "client_id": "5505-1234-ABC-4G45",
@@ -1074,7 +1084,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "ABCDEF123",
+  "issuer_request_id": "red-574378e0",
   "created_at": "2025-09-12T17:28:48.642437-04:00",
   "type": "redeem",
   "status": "pending",
@@ -1109,7 +1119,7 @@ client IDs from the account linking process.
 
 ```rust
 struct AlpacaRedeemRequest {
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     #[serde(rename = "underlying_symbol")]
     underlying: UnderlyingSymbol,
     #[serde(rename = "token_symbol")]
@@ -1138,7 +1148,7 @@ struct Fees(Decimal);
 
 struct AlpacaRedeemResponse {
     tokenization_request_id: TokenizationRequestId,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     created_at: DateTime<Utc>,
     #[serde(rename = "type")]
     r#type: TokenizationRequestType,
@@ -1261,7 +1271,7 @@ stateDiagram-v2
 ```rust
 struct StoredRedemption {
     id: i64,
-    issuer_request_id: IssuerRequestId,
+    issuer_request_id: IssuerRedemptionRequestId,
     tokenization_request_id: Option<TokenizationRequestId>,
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
