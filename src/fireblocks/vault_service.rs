@@ -236,7 +236,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .await?;
 
         if result.status != TransactionStatus::Completed {
-            if is_still_pending(&result.status) {
+            if is_still_pending(result.status) {
                 warn!(
                     fireblocks_tx_id = %tx_id,
                     status = ?result.status,
@@ -380,7 +380,7 @@ impl VaultOperation {
 /// Returns true if the transaction status indicates the transaction is still
 /// in progress and may eventually confirm on-chain. Used to distinguish
 /// "polling timed out but tx might still land" from "tx definitively failed."
-fn is_still_pending(status: &TransactionStatus) -> bool {
+const fn is_still_pending(status: TransactionStatus) -> bool {
     matches!(
         status,
         TransactionStatus::Confirming
@@ -867,18 +867,18 @@ mod tests {
 
     #[test]
     fn is_still_pending_true_for_in_progress_statuses() {
-        assert!(is_still_pending(&TransactionStatus::Confirming));
-        assert!(is_still_pending(&TransactionStatus::Broadcasting));
-        assert!(is_still_pending(&TransactionStatus::PendingSignature));
-        assert!(is_still_pending(&TransactionStatus::Submitted));
+        assert!(is_still_pending(TransactionStatus::Confirming));
+        assert!(is_still_pending(TransactionStatus::Broadcasting));
+        assert!(is_still_pending(TransactionStatus::PendingSignature));
+        assert!(is_still_pending(TransactionStatus::Submitted));
     }
 
     #[test]
     fn is_still_pending_false_for_terminal_statuses() {
-        assert!(!is_still_pending(&TransactionStatus::Completed));
-        assert!(!is_still_pending(&TransactionStatus::Failed));
-        assert!(!is_still_pending(&TransactionStatus::Cancelled));
-        assert!(!is_still_pending(&TransactionStatus::Blocked));
-        assert!(!is_still_pending(&TransactionStatus::Rejected));
+        assert!(!is_still_pending(TransactionStatus::Completed));
+        assert!(!is_still_pending(TransactionStatus::Failed));
+        assert!(!is_still_pending(TransactionStatus::Cancelled));
+        assert!(!is_still_pending(TransactionStatus::Blocked));
+        assert!(!is_still_pending(TransactionStatus::Rejected));
     }
 }

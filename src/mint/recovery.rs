@@ -15,7 +15,7 @@ pub(crate) struct MintRecoveryHandler {
 }
 
 impl MintRecoveryHandler {
-    pub(crate) fn new(mint_cqrs: Arc<SqliteCqrs<Mint>>) -> Self {
+    pub(crate) const fn new(mint_cqrs: Arc<SqliteCqrs<Mint>>) -> Self {
         Self { mint_cqrs }
     }
 }
@@ -40,11 +40,11 @@ impl ItnReceiptHandler for MintRecoveryHandler {
 /// `MintingFailed` → `CallbackPending`). This function loops until
 /// `NotRecoverable` is returned, which means the mint has either
 /// completed or reached a state that cannot be recovered from.
-pub(crate) async fn recover_mint<S>(
-    mint_cqrs: &CqrsFramework<Mint, S>,
-    issuer_request_id: super::IssuerMintRequestId,
+pub(crate) async fn recover_mint<ES>(
+    mint_cqrs: &CqrsFramework<Mint, ES>,
+    issuer_request_id: IssuerMintRequestId,
 ) where
-    S: EventStore<Mint>,
+    ES: EventStore<Mint>,
 {
     let aggregate_id = issuer_request_id.to_string();
 
