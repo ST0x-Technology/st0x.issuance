@@ -679,17 +679,34 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
 
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    // Start the service - receipt monitor will be running
-    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
-    let rocket = initialize_rocket(config).await?;
-    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+    // Phase 1: Start service to set up DB schema, seed asset and account.
+    // We need to stop and restart so the receipt monitor has vault configs
+    // (assets must exist in the DB before initialize_rocket for monitors to spawn).
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
-    let link_body = harness::setup_account(&client, user_wallet).await;
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    let link_body = harness::setup_account(&client1, user_wallet).await;
     let client_id = link_body.client_id;
 
-    // Insert events to create a mint stuck in MintingFailed state.
-    // This simulates the service having attempted a mint and marked it failed.
+    drop(client1);
+
+    // Phase 2: Restart service. The receipt monitor will spawn (asset exists).
+    // Auto-recovery runs but finds NO stuck mints (we haven't inserted any yet).
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    // Wait for auto-recovery to complete (it finds nothing) and for the
+    // receipt monitor to establish its WebSocket subscription.
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // NOW insert MintingFailed events. Auto-recovery already ran and found
+    // nothing. These events bypass the CQRS framework so the mint_view is NOT
+    // updated — only the event store has them. The receipt monitor is the only
+    // thing that can trigger recovery for this mint.
     let issuer_request_id_uuid = uuid!("00000004-0000-0000-0000-000000000004");
     let issuer_request_id = issuer_request_id_uuid.to_string();
     let issuer_request_id = issuer_request_id.as_str();
