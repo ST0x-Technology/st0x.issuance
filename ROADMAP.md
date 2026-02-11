@@ -243,6 +243,8 @@ Bug fixes and improvements that don't fit into the original phases.
       automatic recovery for burns detected as already completed on-chain
 - [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
       IssuerRedemptionRequestId has 4-byte ID space with collision risk at scale
+- [ ] [#111](https://github.com/ST0x-Technology/st0x.issuance/issues/111) -
+      Resume failed mints when receipt is discovered by monitor
 
 ### Completed
 
