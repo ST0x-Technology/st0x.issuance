@@ -223,7 +223,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .client
             .poll_transaction(
                 tx_id,
-                Duration::from_secs(300),
+                Duration::from_secs(600),
                 Duration::from_millis(500),
                 |tx| {
                     debug!(
@@ -236,6 +236,14 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .await?;
 
         if result.status != TransactionStatus::Completed {
+            if is_still_pending(&result.status) {
+                warn!(
+                    fireblocks_tx_id = %tx_id,
+                    status = ?result.status,
+                    "Polling timed out but transaction may still confirm on-chain"
+                );
+            }
+
             return Err(FireblocksVaultError::TransactionFailed {
                 tx_id: tx_id.to_string(),
                 status: result.status,
@@ -367,6 +375,19 @@ impl VaultOperation {
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         format!("{timestamp}-{self}-{issuer_request_id}")
     }
+}
+
+/// Returns true if the transaction status indicates the transaction is still
+/// in progress and may eventually confirm on-chain. Used to distinguish
+/// "polling timed out but tx might still land" from "tx definitively failed."
+fn is_still_pending(status: &TransactionStatus) -> bool {
+    matches!(
+        status,
+        TransactionStatus::Confirming
+            | TransactionStatus::Broadcasting
+            | TransactionStatus::PendingSignature
+            | TransactionStatus::Submitted
+    )
 }
 
 /// Parses a transaction hash string (with or without 0x prefix) into B256.
@@ -842,5 +863,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let id2 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
         assert_ne!(id1, id2, "Consecutive calls should produce unique IDs");
+    }
+
+    #[test]
+    fn is_still_pending_true_for_in_progress_statuses() {
+        assert!(is_still_pending(&TransactionStatus::Confirming));
+        assert!(is_still_pending(&TransactionStatus::Broadcasting));
+        assert!(is_still_pending(&TransactionStatus::PendingSignature));
+        assert!(is_still_pending(&TransactionStatus::Submitted));
+    }
+
+    #[test]
+    fn is_still_pending_false_for_terminal_statuses() {
+        assert!(!is_still_pending(&TransactionStatus::Completed));
+        assert!(!is_still_pending(&TransactionStatus::Failed));
+        assert!(!is_still_pending(&TransactionStatus::Cancelled));
+        assert!(!is_still_pending(&TransactionStatus::Blocked));
+        assert!(!is_still_pending(&TransactionStatus::Rejected));
     }
 }
