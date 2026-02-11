@@ -3,6 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -10,9 +11,10 @@ use tracing::{info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares, determine_source,
+    ReceiptInventoryError, ReceiptSource, Shares, determine_source,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::mint::IssuerMintRequestId;
 
 /// Configuration parameters for the receipt monitor.
 #[derive(Clone, Copy)]
@@ -20,6 +22,18 @@ pub(crate) struct ReceiptMonitorConfig {
     pub(crate) vault: Address,
     pub(crate) receipt_contract: Address,
     pub(crate) bot_wallet: Address,
+}
+
+/// Called when the receipt monitor discovers an ITN receipt (a receipt
+/// with a valid `issuer_request_id` in its receiptInformation).
+///
+/// Production implementation triggers mint recovery for the associated mint.
+#[async_trait]
+pub(crate) trait ItnReceiptHandler: Send + Sync {
+    async fn on_itn_receipt_discovered(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    );
 }
 
 /// Monitors for Deposit events on the vault in real-time.
