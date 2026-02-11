@@ -643,6 +643,118 @@ async fn test_mint_recovery_prevents_double_mint()
     Ok(())
 }
 
+/// Tests that the receipt monitor triggers mint recovery when it discovers a
+/// receipt for a mint stuck in `MintingFailed` state.
+///
+/// Production scenario this reproduces:
+/// 1. Service submitted a mint transaction to the blockchain
+/// 2. Service marked the mint as MintingFailed (polling timeout before confirmation)
+/// 3. The on-chain transaction actually succeeded (receipt exists)
+/// 4. The receipt monitor detects the Deposit event
+/// 5. The receipt monitor should trigger recovery for the associated mint
+///
+/// Without the fix, the receipt monitor discovers the receipt and registers it
+/// in the inventory, but nothing connects this to the failed mint. The mint
+/// remains in MintingFailed state until the next service restart.
+#[tokio::test]
+async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_receipt_monitor_recovery.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    // Start the service - receipt monitor will be running
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    harness::seed_tokenized_asset(&client, evm.vault_address).await;
+    let link_body = harness::setup_account(&client, user_wallet).await;
+    let client_id = link_body.client_id;
+
+    // Insert events to create a mint stuck in MintingFailed state.
+    // This simulates the service having attempted a mint and marked it failed.
+    let issuer_request_id_uuid = uuid!("00000004-0000-0000-0000-000000000004");
+    let issuer_request_id = issuer_request_id_uuid.to_string();
+    let issuer_request_id = issuer_request_id.as_str();
+    let tokenization_request_id = uuid!("10000004-0000-0000-0000-000000000004");
+
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    insert_minting_state_events(
+        &query_pool,
+        issuer_request_id,
+        &tokenization_request_id,
+        &client_id.to_string(),
+        user_wallet,
+    )
+    .await?;
+
+    let failed_payload = json!({
+        "MintingFailed": {
+            "issuer_request_id": issuer_request_id,
+            "error": "Polling timeout: transaction may still confirm",
+            "failed_at": chrono::Utc::now().to_rfc3339()
+        }
+    });
+    insert_mint_event(
+        &query_pool,
+        issuer_request_id,
+        4,
+        "MintEvent::MintingFailed",
+        &failed_payload,
+    )
+    .await?;
+    query_pool.close().await;
+
+    // Now simulate the on-chain transaction succeeding AFTER the service marked
+    // it failed. The receipt monitor is running and will detect this Deposit event.
+    let receipt_info_json = json!({
+        "tokenization_request_id": tokenization_request_id,
+        "issuer_request_id": issuer_request_id_uuid,
+        "underlying": "AAPL",
+        "quantity": "50.0",
+        "operation_type": "Mint",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "notes": null
+    });
+    let encoded_receipt_info =
+        Bytes::from(serde_json::to_vec(&receipt_info_json)?);
+    let amount = U256::from(50) * U256::from(10).pow(U256::from(18));
+
+    evm.mint_directly_with_info(amount, bot_wallet, encoded_receipt_info)
+        .await?;
+
+    // The receipt monitor should:
+    // 1. Detect the Deposit event
+    // 2. Discover the receipt (ReceiptSource::Itn with our issuer_request_id)
+    // 3. Trigger recovery for the MintingFailed mint
+    // 4. Recovery finds the receipt → ExistingMintRecovered → CallbackPending
+    // 5. Recovery sends callback → MintCompleted
+
+    // Assert: the Alpaca mock received the mint callback
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
+
+    Ok(())
+}
+
 /// Tests recovery from `MintingFailed` state.
 ///
 /// Scenario:
