@@ -6,7 +6,7 @@ mod view;
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -168,6 +168,10 @@ pub(crate) enum Mint {
         journal_confirmed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
+        /// The state the mint was in before it failed. Used to determine
+        /// whether receipt-triggered recovery is safe (only when failed
+        /// from `Minting`, meaning a tx was actually submitted).
+        failed_from: Box<Mint>,
     },
     Completed {
         issuer_request_id: IssuerMintRequestId,
@@ -207,6 +211,17 @@ impl Mint {
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
             Self::Completed { .. } => "Completed",
+        }
+    }
+
+    /// Traverses the `failed_from` chain to find the last state before
+    /// any failure. If this mint is not in `MintingFailed`, returns `self`.
+    fn non_failed_predecessor(&self) -> &Self {
+        match self {
+            Self::MintingFailed { failed_from, .. } => {
+                failed_from.non_failed_predecessor()
+            }
+            _ => self,
         }
     }
 
@@ -475,8 +490,45 @@ impl Mint {
                 self.handle_deposit(services, issuer_request_id).await
             }
             Self::Minting { .. } | Self::MintingFailed { .. } => {
-                self.handle_recover_incomplete(services, issuer_request_id)
-                    .await
+                self.handle_recover_incomplete(
+                    services,
+                    issuer_request_id,
+                    None,
+                )
+                .await
+            }
+            Self::CallbackPending { .. } => {
+                self.handle_send_callback(services, issuer_request_id).await
+            }
+            _ => Err(MintError::NotRecoverable {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Handles recovery triggered by receipt discovery. Only accepts
+    /// `MintingFailed` when the non-failed predecessor was `Minting`
+    /// (meaning a tx was actually submitted), and `CallbackPending`
+    /// (subsequent step after recovering from `MintingFailed`).
+    async fn handle_recover_from_receipt(
+        &self,
+        services: &MintServices,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::MintingFailed { .. }
+                if matches!(
+                    self.non_failed_predecessor(),
+                    Self::Minting { .. }
+                ) =>
+            {
+                self.handle_recover_incomplete(
+                    services,
+                    issuer_request_id,
+                    Some(tx_hash),
+                )
+                .await
             }
             Self::CallbackPending { .. } => {
                 self.handle_send_callback(services, issuer_request_id).await
@@ -491,6 +543,7 @@ impl Mint {
         &self,
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
+        receipt_tx_hash: Option<TxHash>,
     ) -> Result<Vec<MintEvent>, MintError> {
         let (Self::Minting {
             issuer_request_id: expected_id,
@@ -548,6 +601,7 @@ impl Mint {
             matches!(self, Self::MintingFailed { .. }).then(|| {
                 MintEvent::MintRetryStarted {
                     issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: receipt_tx_hash,
                     started_at: now,
                 }
             });
@@ -778,6 +832,8 @@ impl Mint {
         error: String,
         failed_at: DateTime<Utc>,
     ) {
+        let failed_from = Box::new(self.clone());
+
         let Self::Minting {
             issuer_request_id,
             tokenization_request_id,
@@ -808,6 +864,7 @@ impl Mint {
             journal_confirmed_at,
             error,
             failed_at,
+            failed_from,
         };
     }
 
@@ -1009,6 +1066,14 @@ impl Aggregate for Mint {
             MintCommand::Recover { issuer_request_id } => {
                 self.handle_recover(services, issuer_request_id).await
             }
+            MintCommand::RecoverFromReceipt { issuer_request_id, tx_hash } => {
+                self.handle_recover_from_receipt(
+                    services,
+                    issuer_request_id,
+                    tx_hash,
+                )
+                .await
+            }
         }
     }
 
@@ -1090,6 +1155,7 @@ impl Aggregate for Mint {
             MintEvent::MintRetryStarted {
                 issuer_request_id: _,
                 started_at,
+                ..
             } => {
                 self.apply_mint_retry_started(started_at);
             }
@@ -1857,15 +1923,25 @@ pub(crate) mod tests {
             issuer_request_id: state_issuer_id,
             error: state_error,
             failed_at: state_failed_at,
+            failed_from,
             ..
-        } = mint
+        } = &mint
         else {
             panic!("Expected MintingFailed state, got {mint:?}");
         };
 
-        assert_eq!(state_issuer_id, issuer_request_id);
+        assert_eq!(state_issuer_id, &issuer_request_id);
         assert_eq!(state_error, error_message);
-        assert_eq!(state_failed_at, failed_at);
+        assert_eq!(state_failed_at, &failed_at);
+        assert!(
+            matches!(**failed_from, Mint::Minting { .. }),
+            "Expected failed_from to be Minting, got {:?}",
+            failed_from.state_name()
+        );
+        assert!(
+            matches!(mint.non_failed_predecessor(), Mint::Minting { .. }),
+            "Expected non_failed_predecessor to be Minting"
+        );
     }
 
     #[test]
@@ -2257,5 +2333,91 @@ pub(crate) mod tests {
     fn test_tokenization_request_id_display() {
         let id = TokenizationRequestId::new("alp-456");
         assert_eq!(format!("{id}"), "alp-456");
+    }
+
+    #[test]
+    fn test_recover_from_receipt_rejects_journal_confirmed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+
+        let validator = MintTestFramework::with(test_mint_services())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-123",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id: ClientId::new(),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    initiated_at: now,
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: now,
+                },
+            ])
+            .when(MintCommand::RecoverFromReceipt {
+                issuer_request_id,
+                tx_hash: b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            });
+
+        assert!(
+            matches!(
+                validator.inspect_result(),
+                Err(MintError::NotRecoverable { .. })
+            ),
+            "RecoverFromReceipt should reject JournalConfirmed state"
+        );
+    }
+
+    #[test]
+    fn test_recover_from_receipt_rejects_minting() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+
+        let validator = MintTestFramework::with(test_mint_services())
+            .given(vec![
+                MintEvent::Initiated {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-123",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    client_id: ClientId::new(),
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    initiated_at: now,
+                },
+                MintEvent::JournalConfirmed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    confirmed_at: now,
+                },
+                MintEvent::MintingStarted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    started_at: now,
+                },
+            ])
+            .when(MintCommand::RecoverFromReceipt {
+                issuer_request_id,
+                tx_hash: b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            });
+
+        assert!(
+            matches!(
+                validator.inspect_result(),
+                Err(MintError::NotRecoverable { .. })
+            ),
+            "RecoverFromReceipt should reject Minting state"
+        );
     }
 }

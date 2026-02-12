@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -52,5 +52,18 @@ pub(crate) enum MintCommand {
     /// - Retries sending the callback
     Recover {
         issuer_request_id: IssuerMintRequestId,
+    },
+
+    /// Recovers a mint that failed during transaction submission but whose
+    /// on-chain transaction actually succeeded, as evidenced by a receipt
+    /// discovered by the receipt monitor.
+    ///
+    /// Only accepts `MintingFailed` and `CallbackPending` states. Unlike
+    /// `Recover`, this rejects `JournalConfirmed` and `Minting` because
+    /// receipt discovery only justifies recovery when the mint was marked
+    /// as failed after submission.
+    RecoverFromReceipt {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
     },
 }

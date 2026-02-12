@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -28,11 +28,14 @@ pub(crate) struct ReceiptMonitorConfig {
 /// with a valid `issuer_request_id` in its receiptInformation).
 ///
 /// Production implementation triggers mint recovery for the associated mint.
+/// The `tx_hash` is the on-chain transaction that created the receipt,
+/// serving as compiler-enforced evidence that the mint succeeded on-chain.
 #[async_trait]
 pub(crate) trait ItnReceiptHandler: Send + Sync {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
     );
 }
 
@@ -238,7 +241,9 @@ where
         );
 
         if let ReceiptSource::Itn { issuer_request_id } = source {
-            self.handler.on_itn_receipt_discovered(issuer_request_id).await;
+            self.handler
+                .on_itn_receipt_discovered(issuer_request_id, tx_hash)
+                .await;
         }
 
         Ok(())

@@ -1384,6 +1384,14 @@ We call these Alpaca endpoints:
    needed
 4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal,
    reconciliation required
+5. **Failed Mint with On-Chain Receipt**: When a mint is marked as
+   `MintingFailed` but the on-chain transaction actually succeeded (e.g., the
+   transaction was submitted but the service failed before confirming it), the
+   receipt monitor detects the Deposit event, discovers the receipt with a
+   matching `issuer_request_id`, and triggers mint recovery. Recovery finds the
+   existing receipt, transitions through `ExistingMintRecovered` ->
+   `CallbackPending` -> `MintCompleted`, completing the flow without waiting for
+   a service restart.
 
 ## Database Schema
 

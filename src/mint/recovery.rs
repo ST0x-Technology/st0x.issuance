@@ -1,3 +1,4 @@
+use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use sqlite_es::SqliteCqrs;
@@ -25,24 +26,45 @@ impl ItnReceiptHandler for MintRecoveryHandler {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
     ) {
         let mint_cqrs = self.mint_cqrs.clone();
         tokio::spawn(async move {
-            recover_mint(&mint_cqrs, issuer_request_id).await;
+            drive_recovery(&mint_cqrs, issuer_request_id, |id| {
+                MintCommand::RecoverFromReceipt {
+                    issuer_request_id: id,
+                    tx_hash,
+                }
+            })
+            .await;
         });
     }
 }
 
-/// Drives a mint through recovery to completion by repeatedly sending
-/// `MintCommand::Recover` until the mint reaches a terminal state.
-///
-/// A single `Recover` command advances the mint by one step (e.g.,
-/// `MintingFailed` → `CallbackPending`). This function loops until
-/// `NotRecoverable` is returned, which means the mint has either
-/// completed or reached a state that cannot be recovered from.
+/// Drives a mint through recovery to completion using `MintCommand::Recover`.
 pub(crate) async fn recover_mint<ES>(
     mint_cqrs: &CqrsFramework<Mint, ES>,
     issuer_request_id: IssuerMintRequestId,
+) where
+    ES: EventStore<Mint>,
+{
+    drive_recovery(mint_cqrs, issuer_request_id, |id| MintCommand::Recover {
+        issuer_request_id: id,
+    })
+    .await;
+}
+
+/// Drives a mint through recovery to completion by repeatedly sending
+/// commands built by `make_command` until the mint reaches a terminal state.
+///
+/// A single recovery command advances the mint by one step (e.g.,
+/// `MintingFailed` -> `CallbackPending`). This function loops until
+/// `NotRecoverable` is returned, which means the mint has either
+/// completed or reached a state that cannot be recovered from.
+async fn drive_recovery<ES>(
+    mint_cqrs: &CqrsFramework<Mint, ES>,
+    issuer_request_id: IssuerMintRequestId,
+    make_command: impl Fn(IssuerMintRequestId) -> MintCommand,
 ) where
     ES: EventStore<Mint>,
 {
@@ -50,12 +72,7 @@ pub(crate) async fn recover_mint<ES>(
 
     loop {
         let result = mint_cqrs
-            .execute(
-                &aggregate_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                },
-            )
+            .execute(&aggregate_id, make_command(issuer_request_id.clone()))
             .await;
 
         match result {
