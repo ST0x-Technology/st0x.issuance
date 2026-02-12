@@ -6,44 +6,34 @@ This file provides guidance to AI agents working with code in this repository.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
 the limit, condense explanations without removing any rules.
 
-Relevant docs:
+## Documentation
 
-- README.md
-- ROADMAP.md
-- SPEC.md
-- docs/alloy.md - **MUST READ before any alloy work** (FixedBytes aliases,
-  `::random()`, mocks, encoding, compile-time macros)
-- docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
-- docs/fireblocks.md - Fireblocks integration (externalTxId, SDK error handling)
+**Before doing any work**, read these two documents:
 
-## Plan & Review
+1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
+   be. All new features must be spec'ed here first. If your change contradicts
+   the spec, either update the spec first (with user approval) or change your
+   approach. Implementation is downstream from the spec.
+2. **[docs/workflow.md](docs/workflow.md)** — the mandatory process for all
+   changes. Describes how to get from current behavior to the desired behavior
+   defined in the spec.
 
-### Before starting work
+**Read when relevant** to your task:
 
-- **CRITICAL: SPEC.md is the source of truth for what this service should be.**
-  Always check the spec before planning, during implementation, and when making
-  design decisions. If you're unsure about the purpose of a concept (e.g.,
-  receipts, backing, custody model), the answer is in the spec — not in your
-  assumptions.
-  - What has already been implemented vs what the spec describes
-  - Existing patterns, types, and conventions in use
-  - How your changes will integrate with the current architecture
-  - **If the spec needs updating, update it FIRST** — implementation is
-    downstream from the plan, and the plan is downstream from the spec. Never
-    start planning implementation until the spec accurately reflects what should
-    be built.
-  - **If your change contradicts the spec, you're wrong** — either update the
-    spec first (with user approval) or change your approach to match the spec.
-- Write a comprehensive step-by-step plan with each task having a corresponding
-  section and a list of subtasks as checkboxes inside of it
-- The task sections should follow the format `## Task N. <TASK NAME>`
-- The plan should be a detailed implementation plan and the reasoning behind the
-  design decisions
-- Do not include timelines in the plan as they tend to be inaccurate
-- Remain focused on the task at hand, do not include unrelated improvements or
-  premature optimizations
-- Once you write the plan, ask me to review it. Do not continue until I approve
-  the plan.
+- [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros
+- [docs/cqrs.md](docs/cqrs.md) - CQRS/ES patterns (upcasters, views, replay,
+  services)
+- [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
+  (externalTxId, SDK error handling)
+
+**Update at the end** (see "After completing a plan" checklist below):
+
+- **ROADMAP.md** — mark completed issues, link PRs
+- **SPEC.md** — if aggregates, commands, events, state machines, or APIs changed
+- **README.md** — if project structure, features, commands, or architecture
+  changed
+- **AGENTS.md** — if new patterns or conventions were introduced
 
 ### While implementing
 
@@ -67,21 +57,11 @@ Relevant docs:
 When all tasks are complete, perform this checklist **before** creating or
 updating a PR:
 
-1. **Update ROADMAP.md**:
-   - Mark completed issues as `[x]` with PR link
-   - Format: `- [x] [#N](issue-url) - Task description`
-   - Add: `- **PR:** [#N](pr-url)`
-   - If work doesn't fit an existing phase, add it to "Fixes & Improvements"
-     section
-   - Use `gh issue list` and `gh pr list` to verify all related issues/PRs are
-     linked
-2. **Update other documentation** as needed:
-   - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
-     changed
-   - **README.md**: If project structure, features, commands, or architecture
-     changed
-   - **AGENTS.md**: If new patterns or conventions were introduced
-3. **Verify GitHub state**:
+1. **Update documentation**: See "Update at the end" list above for which docs
+   to update and when. For ROADMAP.md specifically: mark completed issues as
+   `[x]` with PR link, add `- **PR:** [#N](pr-url)`, and use `gh issue list` and
+   `gh pr list` to verify.
+2. **Verify GitHub state**:
    - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
      description)
    - Check that no issues are marked complete in ROADMAP.md but still open on
@@ -608,6 +588,8 @@ pipeline:
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
+- **FORBIDDEN**: Single-letter variable and argument names. All names must be
+  descriptive enough to convey meaning without surrounding context
 - **CRITICAL: Import Organization**: Follow a consistent two-group import
   pattern throughout the codebase:
   - **Group 1 - External imports**: All imports from external crates including
@@ -619,6 +601,9 @@ pipeline:
   - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
     within a group
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+    **Sole exception**: enum variant imports (`use MyEnum::*` or
+    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
+    qualification. Enum variant imports are never allowed at module level.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
@@ -838,16 +823,26 @@ fn test_journal_confirmed() {
 4. Mocks only truly external systems (Alpaca API)
 5. Asserts correctness via API responses, Anvil state, and mock interactions
 
+**Setup phase exception:** Some edge-case scenarios (e.g., recovering from a
+`MintingFailed` state) cannot be induced through the public API alone. In these
+cases, the **setup phase** may use direct SQL to seed the **event store only**
+(inserting rows into the `events` table). No other tables — including derived
+views and read models — may be pre-populated via SQL; views must be rebuilt by
+the running service during scenario execution. Once setup is complete, the
+**scenario execution and verification** must follow all e2e rules above — the
+service runs, reacts to real events (blockchain, monitors), and correctness is
+asserted via API responses, Anvil state, and mock interactions.
+
 **A test is NOT e2e if it:**
 
-- Touches implementation details for setup (e.g., directly calling CQRS
-  commands)
-- Touches implementation details for verification (e.g., querying aggregates
-  directly)
-- Requires access to internal types or functions
+- Touches implementation details for **verification** (e.g., querying aggregates
+  directly, inspecting internal state after the scenario runs)
+- Touches implementation details during the **scenario execution** (e.g.,
+  calling CQRS commands to drive the flow instead of letting the service react)
+- Requires access to internal types or functions outside the setup phase
 
-**If a test requires touching implementation details**, it belongs in `src/` as
-a unit or integration test, NOT in `tests/`.
+**If a test requires touching implementation details beyond setup**, it belongs
+in `src/` as a unit or integration test, NOT in `tests/`.
 
 E2E tests live in `./tests/`. They test complete production flows, happy paths
 only, with real blockchain (Anvil).

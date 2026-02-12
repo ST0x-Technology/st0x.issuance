@@ -198,6 +198,15 @@ initial request through journal confirmation to on-chain minting and callback.
   callback. If no receipt is found, recovery retries the on-chain deposit
   (`MintRetryStarted`). This prevents double-minting after crashes while
   ensuring stuck mints eventually complete
+- `RecoverFromReceipt { issuer_request_id, tx_hash }` - Recover a mint that
+  failed during the minting step when an ITN receipt is discovered on-chain.
+  Triggered by the receipt monitor when it finds a Deposit event with a matching
+  `issuer_request_id` for a mint in `MintingFailed` state. Unlike `Recover`,
+  this command only accepts `MintingFailed` state where the non-failed
+  predecessor was `Minting` (meaning a transaction was actually submitted).
+  Rejects `JournalConfirmed` and `Minting` states because receipt discovery only
+  justifies recovery when the mint was marked as failed after submission. Emits
+  `ExistingMintRecovered` and proceeds to callback
 
 **Events:**
 
@@ -214,14 +223,15 @@ initial request through journal confirmation to on-chain minting and callback.
 
 **Command -> Event Mappings:**
 
-| Command          | Events             | Notes                    |
-| ---------------- | ------------------ | ------------------------ |
-| `Initiate`       | `Initiated`        | Mint request created     |
-| `ConfirmJournal` | `JournalConfirmed` | Journal confirmed        |
-| `RejectJournal`  | `JournalRejected`  | Terminal failure         |
-| `Deposit`        | See below          | Calls vault service      |
-| `SendCallback`   | `MintCompleted`    | Calls Alpaca callback    |
-| `Recover`        | See below          | Checks receipt inventory |
+| Command              | Events                  | Notes                                           |
+| -------------------- | ----------------------- | ----------------------------------------------- |
+| `Initiate`           | `Initiated`             | Mint request created                            |
+| `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                               |
+| `RejectJournal`      | `JournalRejected`       | Terminal failure                                |
+| `Deposit`            | See below               | Calls vault service                             |
+| `SendCallback`       | `MintCompleted`         | Calls Alpaca callback                           |
+| `Recover`            | See below               | Checks receipt inventory                        |
+| `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt-triggered recovery from `MintingFailed` |
 
 `Deposit` emits `MintingStarted`, then either `TokensMinted` (success) or
 `MintingFailed` (failure).
@@ -230,6 +240,11 @@ initial request through journal confirmation to on-chain minting and callback.
 `issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found,
 emits `MintRetryStarted` then follows the same path as `Deposit`
 (`MintingStarted`, then `TokensMinted` or `MintingFailed`).
+
+`RecoverFromReceipt` is triggered when the receipt monitor discovers an on-chain
+receipt for a mint in `MintingFailed` state (where the predecessor was
+`Minting`). Emits `ExistingMintRecovered`, transitioning to `CallbackPending`,
+then continues through the existing `SendCallback` -> `MintCompleted` flow.
 
 ### Redemption Aggregate
 
@@ -964,6 +979,7 @@ stateDiagram-v2
     Minting --> CallbackPending: Deposit (TokensMinted)
     Minting --> MintingFailed: Deposit (MintingFailed)
     MintingFailed --> Minting: Recover (MintRetryStarted)
+    MintingFailed --> CallbackPending: RecoverFromReceipt (ExistingMintRecovered)
     Minting --> CallbackPending: Recover (ExistingMintRecovered)
     CallbackPending --> Completed: SendCallback
     JournalRejected --> [*]
@@ -1383,7 +1399,16 @@ We call these Alpaca endpoints:
 3. **Burn Failed**: Tokens stuck in redemption wallet, manual intervention
    needed
 4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal,
-   reconciliation required
+   reconciliation required.
+
+5. **Failed Mint with On-Chain Receipt**: When a mint is marked as
+   `MintingFailed` but the on-chain transaction actually succeeded (e.g., the
+   transaction was submitted but the service failed before confirming it), the
+   receipt monitor detects the Deposit event, discovers the receipt with a
+   matching `issuer_request_id`, and triggers mint recovery. Recovery finds the
+   existing receipt, transitions through `ExistingMintRecovered` ->
+   `CallbackPending` -> `MintCompleted`, completing the flow without waiting for
+   a service restart.
 
 ## Database Schema
 

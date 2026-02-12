@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,11 @@ pub(crate) enum MintEvent {
     /// Indicates that a mint retry has started during recovery.
     MintRetryStarted {
         issuer_request_id: IssuerMintRequestId,
+        /// The on-chain tx hash that evidences the original mint succeeded.
+        /// Present when recovery is triggered by receipt discovery, `None`
+        /// when triggered by startup auto-recovery (which may retry the mint).
+        #[serde(default)]
+        tx_hash: Option<TxHash>,
         started_at: DateTime<Utc>,
     },
 }

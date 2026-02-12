@@ -723,22 +723,16 @@ mod tests {
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
 
         assert!(
-            logs_contain_at(
+            logs_contain_at!(
                 tracing::Level::DEBUG,
-                &[
-                    "test_poll_pending_then_completed",
-                    "Polling Alpaca for journal status",
-                ]
+                &["Polling Alpaca for journal status"]
             ),
             "Polling log should be at DEBUG level, not INFO"
         );
         assert!(
-            !logs_contain_at(
+            !logs_contain_at!(
                 tracing::Level::INFO,
-                &[
-                    "test_poll_pending_then_completed",
-                    "Polling Alpaca for journal status",
-                ]
+                &["Polling Alpaca for journal status"]
             ),
             "Polling log must not appear at INFO level (loop body noise)"
         );

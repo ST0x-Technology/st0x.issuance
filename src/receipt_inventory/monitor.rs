@@ -1,8 +1,9 @@
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -10,9 +11,10 @@ use tracing::{info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares, determine_source,
+    ReceiptInventoryError, ReceiptSource, Shares, determine_source,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::mint::IssuerMintRequestId;
 
 /// Configuration parameters for the receipt monitor.
 #[derive(Clone, Copy)]
@@ -20,6 +22,21 @@ pub(crate) struct ReceiptMonitorConfig {
     pub(crate) vault: Address,
     pub(crate) receipt_contract: Address,
     pub(crate) bot_wallet: Address,
+}
+
+/// Called when the receipt monitor discovers an ITN receipt (a receipt
+/// with a valid `issuer_request_id` in its receiptInformation).
+///
+/// Production implementation triggers mint recovery for the associated mint.
+/// The `tx_hash` is the on-chain transaction that created the receipt,
+/// serving as compiler-enforced evidence that the mint succeeded on-chain.
+#[async_trait]
+pub(crate) trait ItnReceiptHandler: Send + Sync {
+    async fn on_itn_receipt_discovered(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
+    );
 }
 
 /// Monitors for Deposit events on the vault in real-time.
@@ -31,16 +48,18 @@ pub(crate) struct ReceiptMonitorConfig {
 ///
 /// See `ReceiptBackfiller` for the assumption about all mints using
 /// the bot wallet as depositor.
-pub(crate) struct ReceiptMonitor<ProviderType, ReceiptInventoryStore>
+pub(crate) struct ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
 where
     ProviderType: Provider,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler,
 {
     provider: ProviderType,
     vault: Address,
     receipt_contract: Address,
     bot_wallet: Address,
     cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    handler: Handler,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,16 +80,18 @@ pub(crate) enum ReceiptMonitorError {
     StreamEnded,
 }
 
-impl<ProviderType, ReceiptInventoryStore>
-    ReceiptMonitor<ProviderType, ReceiptInventoryStore>
+impl<ProviderType, ReceiptInventoryStore, Handler>
+    ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
 where
     ProviderType: Provider,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler,
 {
     pub(crate) const fn new(
         provider: ProviderType,
         config: ReceiptMonitorConfig,
         cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        handler: Handler,
     ) -> Self {
         Self {
             provider,
@@ -78,16 +99,18 @@ where
             receipt_contract: config.receipt_contract,
             bot_wallet: config.bot_wallet,
             cqrs,
+            handler,
         }
     }
 }
 
-impl<ProviderType, ReceiptInventoryStore>
-    ReceiptMonitor<ProviderType, ReceiptInventoryStore>
+impl<ProviderType, ReceiptInventoryStore, Handler>
+    ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
 where
     ProviderType: Provider + Clone + Send + Sync + 'static,
     ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
     ReceiptInventoryStore::AC: Send,
+    Handler: ItnReceiptHandler,
 {
     /// Runs the monitoring loop with automatic retry on errors.
     ///
@@ -204,7 +227,7 @@ where
                     balance: Shares::from(current_balance),
                     block_number,
                     tx_hash,
-                    source,
+                    source: source.clone(),
                     receipt_info,
                 },
             )
@@ -216,6 +239,12 @@ where
             balance = %current_balance,
             "Receipt discovered via live monitoring"
         );
+
+        if let ReceiptSource::Itn { issuer_request_id } = source {
+            self.handler
+                .on_itn_receipt_discovered(issuer_request_id, tx_hash)
+                .await;
+        }
 
         Ok(())
     }
@@ -230,7 +259,6 @@ mod tests {
     use cqrs_es::{AggregateContext, CqrsFramework};
 
     use super::*;
-    use crate::receipt_inventory::ReceiptSource;
 
     type TestStore = MemStore<ReceiptInventory>;
     type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;

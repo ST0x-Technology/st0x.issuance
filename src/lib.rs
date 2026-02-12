@@ -17,12 +17,13 @@ use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
-    Mint, MintCommand, MintServices, MintView, find_all_recoverable_mints,
+    Mint, MintServices, MintView, find_all_recoverable_mints,
+    recovery::{MintRecoveryHandler, recover_mint},
     replay_mint_view,
 };
 use crate::receipt_inventory::backfill::ReceiptBackfiller;
 use crate::receipt_inventory::{
-    CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
+    CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
     burn_tracking::replay_receipt_burns_view,
 };
@@ -294,6 +295,7 @@ pub async fn initialize_rocket(
         vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
+        &MintRecoveryHandler::new(mint.cqrs.clone()),
     );
 
     // Recovery runs AFTER reprojections and backfill so it can query accurate state
@@ -575,31 +577,8 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
 
         info!(count = recoverable_mints.len(), "Recovering mints");
 
-        for (issuer_request_id, view) in recoverable_mints {
-            let state = view.state_name();
-
-            let result = mint_cqrs
-                .execute(
-                    &issuer_request_id.to_string(),
-                    MintCommand::Recover {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                )
-                .await;
-
-            match result {
-                Ok(()) => info!(
-                    issuer_request_id = %issuer_request_id,
-                    state,
-                    "Recovered mint"
-                ),
-                Err(err) => error!(
-                    issuer_request_id = %issuer_request_id,
-                    state,
-                    error = %err,
-                    "Failed to recover mint"
-                ),
-            }
+        for (issuer_request_id, _view) in recoverable_mints {
+            recover_mint(&mint_cqrs, issuer_request_id).await;
         }
 
         debug!("Completed mint recovery");
@@ -741,13 +720,15 @@ async fn run_single_vault_backfill<P: alloy::providers::Provider + Clone>(
 }
 
 /// Spawns receipt monitors for ALL enabled vaults.
-fn spawn_all_receipt_monitors<P>(
+fn spawn_all_receipt_monitors<P, ITN>(
     provider: P,
     vault_configs: Vec<VaultBackfillConfig>,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     bot_wallet: Address,
+    handler: &ITN,
 ) where
     P: Provider + Clone + Send + Sync + 'static,
+    ITN: ItnReceiptHandler + Clone + 'static,
 {
     info!(
         vault_count = vault_configs.len(),
@@ -772,6 +753,7 @@ fn spawn_all_receipt_monitors<P>(
             provider.clone(),
             monitor_config,
             receipt_inventory_cqrs.clone(),
+            handler.clone(),
         );
 
         tokio::spawn(async move {

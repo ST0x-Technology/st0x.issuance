@@ -156,6 +156,7 @@ impl Default for MintView {
 }
 
 impl MintView {
+    #[cfg(test)]
     pub(crate) const fn state_name(&self) -> &'static str {
         match self {
             Self::NotFound => "NotFound",

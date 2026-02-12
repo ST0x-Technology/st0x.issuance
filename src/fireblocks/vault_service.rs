@@ -223,7 +223,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .client
             .poll_transaction(
                 tx_id,
-                Duration::from_secs(300),
+                Duration::from_secs(600),
                 Duration::from_millis(500),
                 |tx| {
                     debug!(
@@ -236,6 +236,14 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .await?;
 
         if result.status != TransactionStatus::Completed {
+            if is_still_pending(result.status) {
+                warn!(
+                    fireblocks_tx_id = %tx_id,
+                    status = ?result.status,
+                    "Polling timed out but transaction may still confirm on-chain"
+                );
+            }
+
             return Err(FireblocksVaultError::TransactionFailed {
                 tx_id: tx_id.to_string(),
                 status: result.status,
@@ -366,6 +374,29 @@ impl VaultOperation {
     ) -> String {
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         format!("{timestamp}-{self}-{issuer_request_id}")
+    }
+}
+
+/// Returns true if the transaction status indicates the transaction is still
+/// in progress and may eventually confirm on-chain. Used to distinguish
+/// "polling timed out but tx might still land" from "tx definitively failed."
+const fn is_still_pending(status: TransactionStatus) -> bool {
+    use TransactionStatus::*;
+
+    match status {
+        Submitted
+        | PendingAmlScreening
+        | PendingEnrichment
+        | PendingAuthorization
+        | Queued
+        | PendingSignature
+        | Pending3RdPartyManualApproval
+        | Pending3RdParty
+        | Broadcasting
+        | Confirming
+        | Cancelling => true,
+
+        Completed | Cancelled | Blocked | Rejected | Failed => false,
     }
 }
 
@@ -842,5 +873,33 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let id2 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
         assert_ne!(id1, id2, "Consecutive calls should produce unique IDs");
+    }
+
+    #[test]
+    fn is_still_pending_true_for_in_progress_statuses() {
+        use TransactionStatus::*;
+
+        assert!(is_still_pending(Submitted));
+        assert!(is_still_pending(PendingAmlScreening));
+        assert!(is_still_pending(PendingEnrichment));
+        assert!(is_still_pending(PendingAuthorization));
+        assert!(is_still_pending(Queued));
+        assert!(is_still_pending(PendingSignature));
+        assert!(is_still_pending(Pending3RdPartyManualApproval));
+        assert!(is_still_pending(Pending3RdParty));
+        assert!(is_still_pending(Broadcasting));
+        assert!(is_still_pending(Confirming));
+        assert!(is_still_pending(Cancelling));
+    }
+
+    #[test]
+    fn is_still_pending_false_for_terminal_statuses() {
+        use TransactionStatus::*;
+
+        assert!(!is_still_pending(Completed));
+        assert!(!is_still_pending(Failed));
+        assert!(!is_still_pending(Cancelled));
+        assert!(!is_still_pending(Blocked));
+        assert!(!is_still_pending(Rejected));
     }
 }
