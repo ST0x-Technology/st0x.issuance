@@ -17,7 +17,10 @@ use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{AlpacaConfig, AuthConfig, Config, IpWhitelist};
+use st0x_issuance::{
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
+    SignerConfig,
+};
 
 pub async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
@@ -181,8 +184,23 @@ pub async fn preseed_tokenized_asset(
     let view_payload_str = view_payload.to_string();
 
     sqlx::query(
-        "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
-         VALUES ('TokenizedAsset', ?, 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')",
+        "
+        INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES (
+            'TokenizedAsset',
+            ?,
+            1,
+            'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+        )
+        ",
     )
     .bind(&aggregate_id)
     .bind(&event_payload_str)
@@ -190,7 +208,8 @@ pub async fn preseed_tokenized_asset(
     .await?;
 
     sqlx::query(
-        "INSERT INTO tokenized_asset_view (view_id, version, payload) VALUES (?, 1, ?)",
+        "INSERT INTO tokenized_asset_view (view_id, version, payload)
+         VALUES (?, 1, ?)",
     )
     .bind(&aggregate_id)
     .bind(&view_payload_str)
@@ -267,8 +286,8 @@ pub fn create_config_with_db(
         database_url: db_path.to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
-        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
+        chain_id: ANVIL_CHAIN_ID,
+        signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -281,7 +300,7 @@ pub fn create_config_with_db(
                 .parse()
                 .expect("Valid IP ranges"),
         },
-        log_level: st0x_issuance::LogLevel::Debug,
+        log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),

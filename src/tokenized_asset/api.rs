@@ -107,7 +107,7 @@ pub(crate) async fn add_tokenized_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::B256;
+    use alloy::primitives::{B256, address};
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;

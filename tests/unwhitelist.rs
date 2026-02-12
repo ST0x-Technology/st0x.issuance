@@ -13,7 +13,8 @@ use url::Url;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
-    AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
+    SignerConfig, initialize_rocket,
 };
 
 #[tokio::test]
@@ -37,8 +38,8 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         database_url: ":memory:".to_string(),
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
-        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
+        chain_id: ANVIL_CHAIN_ID,
+        signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -51,7 +52,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
                 .parse()
                 .expect("Valid IP ranges"),
         },
-        log_level: st0x_issuance::LogLevel::Debug,
+        log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),

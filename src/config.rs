@@ -1,4 +1,3 @@
-use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
@@ -30,7 +29,6 @@ pub struct Config {
     pub rpc_url: Url,
     pub chain_id: u64,
     pub signer: SignerConfig,
-    pub vault: Address,
     pub backfill_start_block: u64,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
@@ -139,13 +137,6 @@ struct Env {
 
     #[arg(
         long,
-        env = "VAULT_ADDRESS",
-        help = "OffchainAssetReceiptVault contract address"
-    )]
-    vault: Address,
-
-    #[arg(
-        long,
         env = "BACKFILL_START_BLOCK",
         default_value = "40588950",
         help = "Block number from which to start backfilling receipts"
@@ -177,7 +168,6 @@ impl Env {
             rpc_url: self.rpc_url,
             chain_id: self.chain_id,
             signer,
-            vault: self.vault,
             backfill_start_block: self.backfill_start_block,
             auth: self.auth,
             log_level: self.log_level,
@@ -283,8 +273,6 @@ mod tests {
             "wss://localhost:8545",
             "--evm-private-key",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--vault",
-            "0x1111111111111111111111111111111111111111",
             "--backfill-start-block",
             "12345678",
             "--issuer-api-key",
@@ -387,8 +375,6 @@ mod tests {
             "wss://localhost:8545",
             "--evm-private-key",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--vault",
-            "0x1111111111111111111111111111111111111111",
             "--backfill-start-block",
             "12345678",
             "--issuer-api-key",

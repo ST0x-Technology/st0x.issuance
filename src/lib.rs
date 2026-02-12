@@ -603,11 +603,8 @@ fn spawn_redemption_detector(
 ) {
     info!("Spawning WebSocket monitoring task for bot wallet {bot_wallet}");
 
-    let detector_config = RedemptionDetectorConfig {
-        rpc_url: config.rpc_url.clone(),
-        vault: config.vault,
-        bot_wallet,
-    };
+    let detector_config =
+        RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
 
     let detector = RedemptionDetector::new(
         detector_config,
@@ -686,7 +683,7 @@ struct VaultBackfillConfig {
 /// Runs receipt backfill for ALL enabled tokenized assets.
 ///
 /// Returns the vault configurations needed for live monitoring.
-async fn run_all_receipt_backfills<P: alloy::providers::Provider + Clone>(
+async fn run_all_receipt_backfills<P: Provider + Clone>(
     pool: &Pool<Sqlite>,
     provider: P,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
@@ -732,7 +729,7 @@ async fn run_all_receipt_backfills<P: alloy::providers::Provider + Clone>(
 }
 
 /// Runs receipt backfill for a single vault.
-async fn run_single_vault_backfill<P: alloy::providers::Provider + Clone>(
+async fn run_single_vault_backfill<P: Provider + Clone>(
     provider: &P,
     vault: Address,
     backfill_start_block: u64,
@@ -785,10 +782,51 @@ async fn run_single_vault_backfill<P: alloy::providers::Provider + Clone>(
     Ok(VaultBackfillConfig { vault, receipt_contract })
 }
 
+/// Runs transfer backfill for ALL enabled vaults.
+///
+/// Scans historic Transfer events to detect redemptions that occurred while the
+/// service was down. Must run after receipt backfill (for burn planning) and
+/// before live monitoring (to avoid missing transfers in the gap).
+async fn run_all_transfer_backfills<P: Provider + Clone>(
+    vault_configs: &[VaultBackfillConfig],
+    backfiller: &TransferBackfiller<
+        P,
+        SqliteEventStore<Redemption>,
+        SqliteEventStore<ReceiptInventory>,
+    >,
+    backfill_start_block: u64,
+) -> Result<(), anyhow::Error> {
+    if vault_configs.is_empty() {
+        info!("No enabled vaults, skipping transfer backfill");
+        return Ok(());
+    }
+
+    info!(
+        vault_count = vault_configs.len(),
+        "Running transfer backfill for all vaults"
+    );
+
+    for config in vault_configs {
+        let result = backfiller
+            .backfill_transfers(config.vault, backfill_start_block)
+            .await?;
+
+        info!(
+            vault = %config.vault,
+            detected = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete for vault"
+        );
+    }
+
+    Ok(())
+}
+
 /// Spawns receipt monitors for ALL enabled vaults.
 fn spawn_all_receipt_monitors<P, ITN>(
     provider: P,
-    vault_configs: Vec<VaultBackfillConfig>,
+    vault_configs: &[VaultBackfillConfig],
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     bot_wallet: Address,
     handler: &ITN,

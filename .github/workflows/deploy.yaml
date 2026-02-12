@@ -69,7 +69,7 @@ jobs:
           host: ${{ secrets.DROPLET_HOST }}
           username: root
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,RPC_URL,VAULT_ADDRESS,FIREBLOCKS_API_USER_ID,ISSUER_API_KEY,ALPACA_IP_RANGES,ALPACA_API_BASE_URL,ALPACA_ACCOUNT_ID,ALPACA_API_KEY,ALPACA_API_SECRET,HYPERDX_API_KEY,HYPERDX_SERVICE_NAME,LOG_LEVEL,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,PREP_SCRIPT
+          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,RPC_URL,FIREBLOCKS_API_USER_ID,ISSUER_API_KEY,ALPACA_IP_RANGES,ALPACA_API_BASE_URL,ALPACA_ACCOUNT_ID,ALPACA_API_KEY,ALPACA_API_SECRET,HYPERDX_API_KEY,HYPERDX_SERVICE_NAME,LOG_LEVEL,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,PREP_SCRIPT
           script: |
             set -euo pipefail
 
@@ -118,8 +118,7 @@ jobs:
               local missing_vars=()
 
               for var in REGISTRY_NAME SHORT_SHA DATA_VOLUME_PATH \
-                         RPC_URL VAULT_ADDRESS \
-                         FIREBLOCKS_API_USER_ID \
+                         RPC_URL FIREBLOCKS_API_USER_ID \
                          ISSUER_API_KEY \
                          ALPACA_ACCOUNT_ID ALPACA_API_KEY ALPACA_API_SECRET; do
                 local value="${!var:-}"
@@ -235,7 +234,6 @@ jobs:
             echo "Deployment logs: ${DEPLOY_LOG}"
         env:
           RPC_URL: ${{ secrets.RPC_URL }}
-          VAULT_ADDRESS: ${{ secrets.VAULT_ADDRESS }}
           FIREBLOCKS_API_USER_ID: ${{ secrets.FIREBLOCKS_API_USER_ID }}
           ISSUER_API_KEY: ${{ secrets.ISSUER_API_KEY }}
           ALPACA_IP_RANGES: ${{ secrets.ALPACA_IP_RANGES }}

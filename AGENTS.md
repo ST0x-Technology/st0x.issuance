@@ -576,6 +576,35 @@ pipeline:
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
   possible
+- **SQL Formatting**: Long SQL queries in Rust code must be broken across
+  multiple lines for readability. Each clause and column list should be on its
+  own line:
+  ```rust
+  sqlx::query(
+      "
+      INSERT INTO events (
+          aggregate_type,
+          aggregate_id,
+          sequence,
+          event_type,
+          event_version,
+          payload,
+          metadata
+      )
+      VALUES (
+          'TokenizedAsset',
+          ?,
+          1,
+          'TokenizedAssetEvent::Added', '1.0', ?, '{}'
+      )
+      ",
+  )
+  .bind(&aggregate_id)
+  .bind(&event_payload_str)
+  .execute(&pool)
+  .await?;
+  ```
+  Never use `\` line continuations in SQL strings — use actual newlines
 - **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
   patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
   getter/setter patterns that don't make sense with Rust's algebraic data types.
@@ -904,8 +933,13 @@ signatures. Must be removed before completion - any `todo!()` in final code is
 unacceptable.
 
 While developing, continuously run `cargo check` and `cargo test` to verify
-types and behavior. Only after implementation is complete, run `cargo clippy`
-and fix all warnings. Finally, `cargo fmt` before committing.
+types and behavior.
+
+**CRITICAL: `cargo clippy` is the final polish — never run it until ALL
+implementation tasks are complete.** Running clippy on incomplete work is
+pointless; fix the logic first, then polish. Only after all tasks pass their
+tests, run `cargo clippy` and fix all warnings. Finally, `cargo fmt` before
+committing.
 
 **CRITICAL: Never use `cargo build` for verification.** Use `cargo check`
 (faster) or `cargo test` (more useful). Only use `cargo build` when you need the
