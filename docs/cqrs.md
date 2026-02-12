@@ -24,13 +24,21 @@ events. **Not currently enabled** — all aggregates use `new_event_store`.
 **Enabling:** Replace `new_event_store(repo)` with `new_snapshot_store(repo, N)`
 where `N` is the snapshot frequency (events between snapshots). On load, replays
 only events after the last snapshot. On commit, writes a new snapshot when the
-event count crosses a frequency boundary. Switching between modes is safe in
-either direction.
+event count crosses a frequency boundary. Switching between `new_event_store`
+and `new_snapshot_store` is safe **only when** existing snapshots are compatible
+with the current aggregate shape — if you've changed the aggregate's struct
+layout (fields, variants) since the last snapshot was written, you must reset
+snapshots first to avoid deserialization failures.
 
-**Resetting:** `DELETE FROM snapshots WHERE aggregate_type = 'Mint';` — safe
-anytime, the next load replays all events. **Must** reset after changing an
-aggregate's struct layout (fields, variants) since the serialized snapshot won't
-deserialize against the new shape. Events are unaffected.
+**Resetting:** Deleting snapshots is safe anytime — the next load replays all
+events from the beginning. **Must** reset after changing an aggregate's struct
+layout (fields, variants) since the serialized snapshot won't deserialize
+against the new shape. Events are unaffected.
+
+```sql
+-- Example: reset snapshots for the Mint aggregate
+DELETE FROM snapshots WHERE aggregate_type = 'Mint';
+```
 
 ## Event Upcasters
 
