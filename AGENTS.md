@@ -33,27 +33,6 @@ the limit, condense explanations without removing any rules.
   changed
 - **ROADMAP.md** — mark completed issues, link PRs
 
-### Before starting work
-
-- Check the spec before planning, during implementation, and when making design
-  decisions. If you're unsure about a concept (receipts, backing, custody
-  model), the answer is in the spec — not in your assumptions.
-  - What has already been implemented vs what the spec describes
-  - Existing patterns, types, and conventions in use
-  - How your changes will integrate with the current architecture
-  - **If the spec needs updating, update it FIRST** — never start planning
-    implementation until the spec accurately reflects what should be built.
-- Write a comprehensive step-by-step plan with each task having a corresponding
-  section and a list of subtasks as checkboxes inside of it
-- The task sections should follow the format `## Task N. <TASK NAME>`
-- The plan should be a detailed implementation plan and the reasoning behind the
-  design decisions
-- Do not include timelines in the plan as they tend to be inaccurate
-- Remain focused on the task at hand, do not include unrelated improvements or
-  premature optimizations
-- Once you write the plan, ask me to review it. Do not continue until I approve
-  the plan.
-
 ### While implementing
 
 - **Work until done:** Don't stop until all tasks are complete or you need user
