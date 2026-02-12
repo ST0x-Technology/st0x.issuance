@@ -764,29 +764,45 @@ impl LocalEvm {
     }
 }
 
-/// Asserts that a log line at the given level contains all snippets.
-///
-/// Use with `tracing_test::traced_test` to verify observability.
+/// Checks whether any log line at the given level, scoped to the
+/// caller's module, contains all snippets.
 #[cfg(test)]
-pub(crate) fn logs_contain_at(
-    level: tracing::Level,
-    snippets: &[&str],
-) -> bool {
-    let logs = {
-        let buf = tracing_test::internal::global_buf().lock().unwrap();
-        String::from_utf8_lossy(&buf).into_owned()
+macro_rules! logs_contain_at {
+    ($level:expr, $snippets:expr) => {
+        $crate::test_utils::log_count_at!($level, $snippets) > 0
     };
-
-    let level_str = match level {
-        tracing::Level::TRACE => "TRACE",
-        tracing::Level::DEBUG => "DEBUG",
-        tracing::Level::INFO => "INFO",
-        tracing::Level::WARN => "WARN",
-        tracing::Level::ERROR => "ERROR",
-    };
-
-    logs.lines().any(|line| {
-        line.contains(level_str)
-            && snippets.iter().all(|snippet| line.contains(snippet))
-    })
 }
+
+/// Counts log lines at the given level, scoped to the caller's
+/// module, that contain all snippets.
+#[cfg(test)]
+macro_rules! log_count_at {
+    ($level:expr, $snippets:expr) => {{
+        let logs = {
+            let buf = tracing_test::internal::global_buf().lock().unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let scope = module_path!();
+        let scope = scope.strip_suffix("::tests").unwrap_or(module_path!());
+        let level_str = match $level {
+            tracing::Level::TRACE => "TRACE",
+            tracing::Level::DEBUG => "DEBUG",
+            tracing::Level::INFO => "INFO",
+            tracing::Level::WARN => "WARN",
+            tracing::Level::ERROR => "ERROR",
+        };
+        let snippets: &[&str] = $snippets;
+        logs.lines()
+            .filter(|line| {
+                line.contains(scope)
+                    && line.contains(level_str)
+                    && snippets.iter().all(|snippet| line.contains(snippet))
+            })
+            .count()
+    }};
+}
+
+#[cfg(test)]
+pub(crate) use log_count_at;
+#[cfg(test)]
+pub(crate) use logs_contain_at;

@@ -441,23 +441,18 @@ mod tests {
         assert_eq!(result.processed_count, 1);
         assert_eq!(result.skipped_zero_balance, 0);
 
+        let test = "backfill_discovers_receipt_from_historic_deposit";
         assert!(
-            logs_contain_at(
+            logs_contain_at!(
                 tracing::Level::DEBUG,
-                &[
-                    "backfill_discovers_receipt_from_historic_deposit",
-                    "Processed block range",
-                ]
+                &[test, "Processed block range"]
             ),
             "Expected DEBUG log for block range processing"
         );
         assert!(
-            logs_contain_at(
+            logs_contain_at!(
                 tracing::Level::INFO,
-                &[
-                    "backfill_discovers_receipt_from_historic_deposit",
-                    "Processed receipt",
-                ]
+                &[test, "Processed receipt"]
             ),
             "Expected INFO log for processed receipt"
         );
@@ -589,20 +584,18 @@ mod tests {
         assert_eq!(result.processed_count, 0);
         assert_eq!(result.skipped_zero_balance, 1);
 
+        let test = "backfill_skips_zero_balance_receipts";
         assert!(
-            logs_contain_at(
+            logs_contain_at!(
                 tracing::Level::DEBUG,
-                &[
-                    "backfill_skips_zero_balance_receipts",
-                    "Processed block range",
-                ]
+                &[test, "Processed block range"]
             ),
             "Expected DEBUG log for block range processing"
         );
         assert!(
-            !logs_contain_at(
+            !logs_contain_at!(
                 tracing::Level::INFO,
-                &["backfill_skips_zero_balance_receipts", "Processed receipt",]
+                &[test, "Processed receipt"]
             ),
             "Should NOT log processed receipt when all receipts have zero balance"
         );
@@ -787,11 +780,11 @@ mod tests {
         );
 
         assert!(
-            logs_contain_at(
+            logs_contain_at!(
                 tracing::Level::INFO,
                 &[
                     "backfill_emits_checkpoint_after_processing",
-                    "Receipt backfill complete",
+                    "Receipt backfill complete"
                 ]
             ),
             "Expected INFO log for backfill completion"

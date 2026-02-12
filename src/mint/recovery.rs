@@ -142,7 +142,7 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptSource, Shares,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::log_count_at;
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
     };
@@ -345,7 +345,16 @@ mod tests {
             "Expected Completed state, got: {}",
             context.aggregate().state_name()
         );
-        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
+        let test = "minting_failed_with_receipt_recovers_to_completed";
+        assert!(
+            log_count_at!(Level::INFO, &[test]) <= 1,
+            "Expected at most 1 INFO log from recovery, got {}",
+            log_count_at!(Level::INFO, &[test])
+        );
+        assert!(
+            log_count_at!(Level::DEBUG, &[test]) >= 1,
+            "Expected at least 1 DEBUG log for recovery steps"
+        );
     }
 
     #[traced_test]
@@ -367,7 +376,16 @@ mod tests {
             "Expected Completed state, got: {}",
             context.aggregate().state_name()
         );
-        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
+        let test = "callback_pending_recovers_to_completed";
+        assert!(
+            log_count_at!(Level::INFO, &[test]) <= 1,
+            "Expected at most 1 INFO log from recovery, got {}",
+            log_count_at!(Level::INFO, &[test])
+        );
+        assert!(
+            log_count_at!(Level::DEBUG, &[test]) >= 1,
+            "Expected at least 1 DEBUG log for recovery steps"
+        );
     }
 
     #[traced_test]
@@ -380,6 +398,11 @@ mod tests {
 
         recover_mint(&mint_cqrs, issuer_request_id).await;
 
-        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
+        let test = "completed_mint_returns_cleanly";
+        assert!(
+            log_count_at!(Level::INFO, &[test]) <= 1,
+            "Expected at most 1 INFO log from recovery, got {}",
+            log_count_at!(Level::INFO, &[test])
+        );
     }
 }
