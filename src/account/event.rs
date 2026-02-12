@@ -20,6 +20,10 @@ pub(crate) enum AccountEvent {
         wallet: Address,
         whitelisted_at: DateTime<Utc>,
     },
+    WalletUnwhitelisted {
+        wallet: Address,
+        unwhitelisted_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for AccountEvent {
@@ -31,6 +35,9 @@ impl DomainEvent for AccountEvent {
             }
             Self::WalletWhitelisted { .. } => {
                 "AccountEvent::WalletWhitelisted".to_string()
+            }
+            Self::WalletUnwhitelisted { .. } => {
+                "AccountEvent::WalletUnwhitelisted".to_string()
             }
         }
     }

@@ -8,4 +8,5 @@ pub(crate) enum AccountCommand {
     Register { client_id: ClientId, email: Email },
     LinkToAlpaca { alpaca_account: AlpacaAccountNumber },
     WhitelistWallet { wallet: Address },
+    UnwhitelistWallet { wallet: Address },
 }

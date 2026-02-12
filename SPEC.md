@@ -325,6 +325,7 @@ system. The account lifecycle follows these steps:
   number
 - `WhitelistWallet { wallet }` - Authorize a wallet address for minting and
   redemptions
+- `UnwhitelistWallet { wallet }` - Remove a wallet address from the whitelist
 
 **Events:**
 
@@ -333,14 +334,17 @@ system. The account lifecycle follows these steps:
   account number
 - `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
   minting and redemptions
+- `WalletUnwhitelisted { wallet, unwhitelisted_at }` - Wallet address removed
+  from whitelist
 
 **Command -> Event Mappings:**
 
-| Command           | Events Produced     | Notes                                |
-| ----------------- | ------------------- | ------------------------------------ |
-| `Register`        | `Registered`        | New AP account created with email    |
-| `LinkToAlpaca`    | `LinkedToAlpaca`    | Existing account linked to Alpaca    |
-| `WhitelistWallet` | `WalletWhitelisted` | Wallet authorized (multiple allowed) |
+| Command             | Events Produced       | Notes                                 |
+| ------------------- | --------------------- | ------------------------------------- |
+| `Register`          | `Registered`          | New AP account created with email     |
+| `LinkToAlpaca`      | `LinkedToAlpaca`      | Existing account linked to Alpaca     |
+| `WhitelistWallet`   | `WalletWhitelisted`   | Wallet authorized (multiple allowed)  |
+| `UnwhitelistWallet` | `WalletUnwhitelisted` | Wallet removed (idempotent if absent) |
 
 **Account State Machine:**
 
@@ -349,8 +353,9 @@ stateDiagram-v2
     [*] --> Registered: Register
     Registered --> LinkedToAlpaca: LinkToAlpaca
     LinkedToAlpaca --> LinkedToAlpaca: WhitelistWallet
+    LinkedToAlpaca --> LinkedToAlpaca: UnwhitelistWallet
     Note right of Registered: Has email, client_id
-    Note right of LinkedToAlpaca: Has alpaca_account, can whitelist wallets
+    Note right of LinkedToAlpaca: Has alpaca_account, can whitelist/unwhitelist wallets
 ```
 
 ### TokenizedAsset Aggregate
@@ -579,6 +584,50 @@ struct WhitelistWalletResponse {
   the `client_id`
 - During redemption, we look up which `client_id` owns the wallet that sent the
   tokens
+
+#### Un-whitelist Wallet
+
+Removes a wallet from the account's whitelist. After removal, the wallet can no
+longer be used for minting or redemption.
+
+**Endpoint:** `DELETE /accounts/{client_id}/wallets/{wallet}` (internal, not
+exposed to Alpaca)
+
+**Our Response:**
+
+```json
+{
+  "success": true
+}
+```
+
+**Status Codes:**
+
+- `200`: Wallet successfully removed (or already absent - idempotent)
+- `404`: Client ID not found
+
+**In-flight Operations:**
+
+Unwhitelisting takes effect immediately in the account view. The impact on
+operations already in progress depends on the operation type:
+
+- **Mints**: In-flight mints complete normally. The wallet is only validated at
+  initiation (`POST /inkind/issuance`). Once initiated, all subsequent stages
+  (journal confirmation, on-chain deposit, callback) use the wallet address
+  stored in the mint's events — they do not re-check the account view. This
+  means a mint that was authorized before the unwhitelist will still deliver
+  shares to the wallet.
+- **Redemptions**: In-flight redemptions become stuck. Every stage of the
+  redemption flow (detection, Alpaca redeem call, journal polling) looks up the
+  wallet via `find_by_wallet` on the account view. After unwhitelist, this
+  lookup returns nothing, causing the stage to fail with a logged warning. On
+  each service restart, recovery retries stuck redemptions — so re-whitelisting
+  the wallet would unblock them automatically.
+
+**Data Structure:**
+
+No request body (wallet is in the URL path). The response reuses the same
+`WhitelistWalletResponse` schema as the whitelist endpoint.
 
 ### 2. Tokenized Assets Data Endpoint
 
@@ -1347,7 +1396,9 @@ We run an HTTP server that implements these endpoints.
 
 1. **`POST /accounts`** - Register new AP account with email
 2. **`POST /accounts/{client_id}/wallets`** - Whitelist wallet address for AP
-3. **`POST /tokenized-assets`** - Add a new tokenized asset
+3. **`DELETE /accounts/{client_id}/wallets/{wallet}`** - Un-whitelist wallet
+   address for AP
+4. **`POST /tokenized-assets`** - Add a new tokenized asset
 
 ### Endpoints We Call
 
@@ -1518,7 +1569,8 @@ events.
 
 **AccountView** - Current accounts:
 
-- Listens to: `Registered`, `LinkedToAlpaca`, `WalletWhitelisted`
+- Listens to: `Registered`, `LinkedToAlpaca`, `WalletWhitelisted`,
+  `WalletUnwhitelisted`
 - Updates: Account status, relationship data, whitelisted wallets
 - Used for: Validating client IDs, looking up accounts by email or Alpaca
   account number, checking wallet whitelisting

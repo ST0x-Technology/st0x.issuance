@@ -361,6 +361,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 account::register_account,
                 account::connect_account,
                 account::whitelist_wallet,
+                account::unwhitelist_wallet,
                 tokenized_asset::list_tokenized_assets,
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,

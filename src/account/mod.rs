@@ -16,7 +16,9 @@ use uuid::Uuid;
 pub use api::{
     AccountLinkResponse, RegisterAccountResponse, WhitelistWalletResponse,
 };
-pub(crate) use api::{connect_account, register_account, whitelist_wallet};
+pub(crate) use api::{
+    connect_account, register_account, unwhitelist_wallet, whitelist_wallet,
+};
 pub(crate) use cmd::AccountCommand;
 pub(crate) use event::AccountEvent;
 pub(crate) use view::AccountView;
@@ -187,6 +189,23 @@ impl Aggregate for Account {
                     }
                 }
             },
+
+            AccountCommand::UnwhitelistWallet { wallet } => match self {
+                Self::NotRegistered => Err(AccountError::NotRegistered),
+                Self::Registered { .. } => Err(AccountError::NotLinkedToAlpaca),
+                Self::LinkedToAlpaca { whitelisted_wallets, .. } => {
+                    if whitelisted_wallets.contains(&wallet) {
+                        let now = Utc::now();
+
+                        Ok(vec![AccountEvent::WalletUnwhitelisted {
+                            wallet,
+                            unwhitelisted_at: now,
+                        }])
+                    } else {
+                        Ok(vec![])
+                    }
+                }
+            },
         }
     }
 
@@ -201,7 +220,10 @@ impl Aggregate for Account {
                     self.clone()
                 else {
                     error!(
-                        "LinkedToAlpaca event applied to non-Registered state"
+                        event = "LinkedToAlpaca",
+                        alpaca_account = %alpaca_account.0,
+                        state = ?self,
+                        "event applied to non-Registered state"
                     );
                     return;
                 };
@@ -220,12 +242,30 @@ impl Aggregate for Account {
                 let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self
                 else {
                     error!(
-                        "WalletWhitelisted event applied to non-LinkedToAlpaca state"
+                        event = "WalletWhitelisted",
+                        wallet = %wallet,
+                        state = ?self,
+                        "event applied to non-LinkedToAlpaca state"
                     );
                     return;
                 };
 
                 whitelisted_wallets.push(wallet);
+            }
+
+            AccountEvent::WalletUnwhitelisted { wallet, .. } => {
+                let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self
+                else {
+                    error!(
+                        event = "WalletUnwhitelisted",
+                        wallet = %wallet,
+                        state = ?self,
+                        "event applied to non-LinkedToAlpaca state"
+                    );
+                    return;
+                };
+
+                whitelisted_wallets.retain(|w| *w != wallet);
             }
         }
     }
@@ -249,12 +289,15 @@ pub(crate) enum AccountError {
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use tracing::Level;
+    use tracing_test::traced_test;
     use uuid::Uuid;
 
     use super::{
         Account, AccountCommand, AccountError, AccountEvent,
         AlpacaAccountNumber, ClientId, Email,
     };
+    use crate::test_utils::logs_contain_at;
 
     type AccountTestFramework = TestFramework<Account>;
 
@@ -627,5 +670,175 @@ mod tests {
         assert_eq!(whitelisted_wallets.len(), 2);
         assert_eq!(whitelisted_wallets[0], wallet1);
         assert_eq!(whitelisted_wallets[1], wallet2);
+    }
+
+    #[test]
+    fn test_unwhitelist_wallet_on_linked_account() {
+        let email = Email("user@example.com".to_string());
+        let client_id = ClientId::new();
+        let registered_at = chrono::Utc::now();
+        let linked_at = chrono::Utc::now();
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+        let whitelisted_at = chrono::Utc::now();
+
+        let events = AccountTestFramework::with(())
+            .given(vec![
+                AccountEvent::Registered { client_id, email, registered_at },
+                AccountEvent::LinkedToAlpaca {
+                    alpaca_account: AlpacaAccountNumber(
+                        "ALPACA123".to_string(),
+                    ),
+                    linked_at,
+                },
+                AccountEvent::WalletWhitelisted { wallet, whitelisted_at },
+            ])
+            .when(AccountCommand::UnwhitelistWallet { wallet })
+            .inspect_result()
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+
+        let AccountEvent::WalletUnwhitelisted {
+            wallet: event_wallet,
+            unwhitelisted_at,
+        } = &events[0]
+        else {
+            panic!("Expected WalletUnwhitelisted event, got {:?}", &events[0])
+        };
+
+        assert_eq!(event_wallet, &wallet);
+        assert!(unwhitelisted_at.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_unwhitelist_not_registered() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        AccountTestFramework::with(())
+            .given_no_previous_events()
+            .when(AccountCommand::UnwhitelistWallet { wallet })
+            .then_expect_error(AccountError::NotRegistered);
+    }
+
+    #[test]
+    fn test_unwhitelist_not_linked() {
+        let client_id = ClientId::new();
+        let email = Email("user@example.com".to_string());
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        AccountTestFramework::with(())
+            .given(vec![AccountEvent::Registered {
+                client_id,
+                email,
+                registered_at: chrono::Utc::now(),
+            }])
+            .when(AccountCommand::UnwhitelistWallet { wallet })
+            .then_expect_error(AccountError::NotLinkedToAlpaca);
+    }
+
+    #[test]
+    fn test_unwhitelist_already_absent_is_idempotent() {
+        let email = Email("user@example.com".to_string());
+        let client_id = ClientId::new();
+        let registered_at = chrono::Utc::now();
+        let linked_at = chrono::Utc::now();
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        AccountTestFramework::with(())
+            .given(vec![
+                AccountEvent::Registered { client_id, email, registered_at },
+                AccountEvent::LinkedToAlpaca {
+                    alpaca_account: AlpacaAccountNumber(
+                        "ALPACA123".to_string(),
+                    ),
+                    linked_at,
+                },
+            ])
+            .when(AccountCommand::UnwhitelistWallet { wallet })
+            .then_expect_events(vec![]);
+    }
+
+    #[test]
+    fn test_apply_wallet_unwhitelisted_removes_wallet() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let mut account = Account::LinkedToAlpaca {
+            client_id: ClientId::new(),
+            email: Email("user@example.com".to_string()),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+            whitelisted_wallets: vec![wallet],
+            registered_at: chrono::Utc::now(),
+            linked_at: chrono::Utc::now(),
+        };
+
+        account.apply(AccountEvent::WalletUnwhitelisted {
+            wallet,
+            unwhitelisted_at: chrono::Utc::now(),
+        });
+
+        let Account::LinkedToAlpaca { whitelisted_wallets, .. } = account
+        else {
+            panic!("Expected account to be LinkedToAlpaca")
+        };
+
+        assert!(
+            whitelisted_wallets.is_empty(),
+            "Wallet should be removed after unwhitelisting"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_apply_wallet_whitelisted_to_non_linked_logs_error() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let mut account = Account::Registered {
+            client_id: ClientId::new(),
+            email: Email("user@example.com".to_string()),
+            registered_at: chrono::Utc::now(),
+        };
+
+        account.apply(AccountEvent::WalletWhitelisted {
+            wallet,
+            whitelisted_at: chrono::Utc::now(),
+        });
+
+        assert!(
+            matches!(account, Account::Registered { .. }),
+            "Account should remain Registered"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["WalletWhitelisted", "event applied to non-LinkedToAlpaca state"]
+        ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_apply_wallet_unwhitelisted_to_non_linked_logs_error() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let mut account = Account::Registered {
+            client_id: ClientId::new(),
+            email: Email("user@example.com".to_string()),
+            registered_at: chrono::Utc::now(),
+        };
+
+        account.apply(AccountEvent::WalletUnwhitelisted {
+            wallet,
+            unwhitelisted_at: chrono::Utc::now(),
+        });
+
+        assert!(
+            matches!(account, Account::Registered { .. }),
+            "Account should remain Registered"
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "WalletUnwhitelisted",
+                "event applied to non-LinkedToAlpaca state"
+            ]
+        ));
     }
 }
