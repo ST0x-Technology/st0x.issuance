@@ -274,13 +274,22 @@ async fn test_redemption_returns_dust_to_user()
         Arc::clone(&captured_qty),
     );
 
-    let config =
-        harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_dust_returns.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -363,13 +372,22 @@ async fn test_redemption_no_dust_when_9_decimals()
         Arc::clone(&captured_qty),
     );
 
-    let config =
-        harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_dust_no_dust.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;

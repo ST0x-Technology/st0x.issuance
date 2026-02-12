@@ -9,14 +9,11 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
-use url::Url;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
+use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{
-    AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
-};
 
 async fn perform_mint_flow(
     client: &Client,
@@ -107,41 +104,22 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let (redeem_mock, poll_mock) =
         harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
 
-    let config = Config {
-        database_url: ":memory:".to_string(),
-        database_max_connections: 5,
-        rpc_url: Url::parse(&evm.endpoint)?,
-        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
-        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
-        vault: evm.vault_address,
-        backfill_start_block: 0,
-        auth: AuthConfig {
-            issuer_api_key: "test-key-12345678901234567890123456"
-                .parse()
-                .expect("Valid API key"),
-            alpaca_ip_ranges: IpWhitelist::single(
-                "127.0.0.1/32".parse().expect("Valid IP range"),
-            ),
-            internal_ip_ranges: "127.0.0.0/8,::1/128"
-                .parse()
-                .expect("Valid IP ranges"),
-        },
-        log_level: st0x_issuance::LogLevel::Debug,
-        hyperdx: None,
-        alpaca: AlpacaConfig {
-            api_base_url: mock_alpaca.base_url(),
-            account_id: "test-account".to_string(),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-        },
-    };
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_tokenization.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -212,13 +190,23 @@ async fn test_mint_burn_mint_nonce_synchronization()
     let (_redeem_mock, _poll_mock) =
         harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
 
-    let config =
-        harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_nonce_sync.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);

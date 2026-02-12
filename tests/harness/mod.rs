@@ -5,10 +5,12 @@ mod alpaca_mocks;
 pub use alpaca_mocks::*;
 
 use alloy::primitives::{Address, U256};
+use chrono::Utc;
 use httpmock::Mock;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
+use sqlx::sqlite::SqlitePoolOptions;
 use url::Url;
 
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
@@ -95,6 +97,15 @@ pub async fn wait_for_mock_hit(
 }
 
 pub async fn seed_tokenized_asset(client: &Client, vault: Address) {
+    seed_tokenized_asset_with(client, vault, "AAPL", "tAAPL").await;
+}
+
+pub async fn seed_tokenized_asset_with(
+    client: &Client,
+    vault: Address,
+    underlying: &str,
+    token: &str,
+) {
     let response = client
         .post("/tokenized-assets")
         .header(rocket::http::ContentType::JSON)
@@ -105,8 +116,8 @@ pub async fn seed_tokenized_asset(client: &Client, vault: Address) {
         .remote("127.0.0.1:8000".parse().unwrap())
         .body(
             json!({
-                "underlying": "AAPL",
-                "token": "tAAPL",
+                "underlying": underlying,
+                "token": token,
                 "network": "base",
                 "vault": vault
             })
@@ -121,6 +132,74 @@ pub async fn seed_tokenized_asset(client: &Client, vault: Address) {
         "Failed to seed tokenized asset: {:?}",
         response.into_string().await
     );
+}
+
+/// Pre-seeds the tokenized asset into the database BEFORE the service starts.
+///
+/// This allows `initialize_rocket` to discover the asset during startup,
+/// so that receipt backfill and redemption monitoring are wired for this vault.
+///
+/// Uses direct SQL to seed both the event store and the view table.
+/// Per AGENTS.md "Setup phase exception", direct event store seeding is
+/// permitted in e2e test setup phases.
+pub async fn preseed_tokenized_asset(
+    db_url: &str,
+    vault: Address,
+    underlying: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    let aggregate_id = underlying;
+    let now = Utc::now();
+
+    let event_payload = json!({
+        "Added": {
+            "underlying": underlying,
+            "token": token,
+            "network": "base",
+            "vault": vault,
+            "added_at": now
+        }
+    });
+
+    let view_payload = json!({
+        "Asset": {
+            "underlying": underlying,
+            "token": token,
+            "network": "base",
+            "vault": vault,
+            "enabled": true,
+            "added_at": now
+        }
+    });
+
+    let event_payload_str = event_payload.to_string();
+    let view_payload_str = view_payload.to_string();
+
+    sqlx::query(
+        "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
+         VALUES ('TokenizedAsset', ?, 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')",
+    )
+    .bind(&aggregate_id)
+    .bind(&event_payload_str)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO tokenized_asset_view (view_id, version, payload) VALUES (?, 1, ?)",
+    )
+    .bind(&aggregate_id)
+    .bind(&view_payload_str)
+    .execute(&pool)
+    .await?;
+
+    pool.close().await;
+
+    Ok(())
 }
 
 pub async fn setup_account(
@@ -190,7 +269,6 @@ pub fn create_config_with_db(
         rpc_url: Url::parse(&evm.endpoint)?,
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
-        vault: evm.vault_address,
         backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -228,12 +306,54 @@ pub async fn setup_roles(
     Ok(())
 }
 
+pub async fn setup_roles_on_vault(
+    evm: &LocalEvm,
+    authorizer_address: Address,
+    vault_address: Address,
+    user_wallet: Address,
+    bot_wallet: Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    evm.grant_role_on_authorizer(authorizer_address, "DEPOSIT", user_wallet)
+        .await?;
+    evm.grant_role_on_authorizer(authorizer_address, "WITHDRAW", bot_wallet)
+        .await?;
+    evm.grant_role_on_authorizer(
+        authorizer_address,
+        "CERTIFY",
+        evm.wallet_address,
+    )
+    .await?;
+    evm.certify_specific_vault(vault_address, U256::MAX).await?;
+    Ok(())
+}
+
 pub async fn perform_mint_and_confirm(
     client: &Client,
     wallet: Address,
     client_id: &str,
     tokenization_request_id: &str,
     quantity: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    perform_mint_and_confirm_with(
+        client,
+        wallet,
+        client_id,
+        tokenization_request_id,
+        quantity,
+        "AAPL",
+        "tAAPL",
+    )
+    .await
+}
+
+pub async fn perform_mint_and_confirm_with(
+    client: &Client,
+    wallet: Address,
+    client_id: &str,
+    tokenization_request_id: &str,
+    quantity: &str,
+    underlying: &str,
+    token: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mint_response = client
         .post("/inkind/issuance")
@@ -247,8 +367,8 @@ pub async fn perform_mint_and_confirm(
             json!({
                 "tokenization_request_id": tokenization_request_id,
                 "qty": quantity,
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
+                "underlying_symbol": underlying,
+                "token_symbol": token,
                 "network": "base",
                 "client_id": client_id,
                 "wallet_address": wallet

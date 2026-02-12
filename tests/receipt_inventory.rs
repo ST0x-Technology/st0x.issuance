@@ -239,7 +239,6 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         rpc_url: Url::parse(&evm.endpoint)?,
         chain_id: st0x_issuance::ANVIL_CHAIN_ID,
         signer: st0x_issuance::SignerConfig::Local(evm.private_key),
-        vault: evm.vault_address,
         backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"

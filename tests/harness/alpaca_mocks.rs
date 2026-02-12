@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use alloy::primitives::Address;
 use httpmock::Mock;
 use httpmock::prelude::*;
 use serde_json::json;
@@ -25,12 +24,12 @@ pub struct RedemptionState {
     pub issuer_request_id: String,
     pub tx_hash: String,
     pub qty: String,
+    pub underlying_symbol: String,
+    pub token_symbol: String,
+    pub wallet_address: String,
 }
 
-pub fn setup_redemption_mocks(
-    mock_alpaca: &MockServer,
-    user_wallet: Address,
-) -> (Mock, Mock) {
+pub fn setup_redemption_mocks(mock_alpaca: &MockServer) -> (Mock, Mock) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_state = Arc::new(Mutex::new(Vec::<RedemptionState>::new()));
 
@@ -52,12 +51,25 @@ pub fn setup_redemption_mocks(
                 let tx_hash =
                     body["tx_hash"].as_str().unwrap().to_string();
                 let qty = body["qty"].as_str().unwrap().to_string();
+                let underlying_symbol = body["underlying_symbol"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let token_symbol =
+                    body["token_symbol"].as_str().unwrap().to_string();
+                let wallet_address = body["wallet_address"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
 
                 shared_state_redeem.lock().unwrap().push(
                     RedemptionState {
                         issuer_request_id: issuer_request_id.clone(),
                         tx_hash: tx_hash.clone(),
                         qty: qty.clone(),
+                        underlying_symbol: underlying_symbol.clone(),
+                        token_symbol: token_symbol.clone(),
+                        wallet_address: wallet_address.clone(),
                     },
                 );
 
@@ -67,12 +79,12 @@ pub fn setup_redemption_mocks(
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
                     "type": "redeem",
                     "status": "pending",
-                    "underlying_symbol": "AAPL",
-                    "token_symbol": "tAAPL",
+                    "underlying_symbol": underlying_symbol,
+                    "token_symbol": token_symbol,
                     "qty": qty,
                     "issuer": "test-issuer",
                     "network": "base",
-                    "wallet_address": user_wallet,
+                    "wallet_address": wallet_address,
                     "tx_hash": tx_hash,
                     "fees": "0.5"
                 }))
@@ -109,12 +121,12 @@ pub fn setup_redemption_mocks(
                                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                                 "type": "redeem",
                                 "status": "completed",
-                                "underlying_symbol": "AAPL",
-                                "token_symbol": "tAAPL",
+                                "underlying_symbol": state.underlying_symbol,
+                                "token_symbol": state.token_symbol,
                                 "qty": state.qty,
                                 "issuer": "test-issuer",
                                 "network": "base",
-                                "wallet_address": user_wallet,
+                                "wallet_address": state.wallet_address,
                                 "tx_hash": state.tx_hash,
                                 "fees": "0.5"
                             })
