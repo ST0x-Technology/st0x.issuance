@@ -346,14 +346,15 @@ mod tests {
             context.aggregate().state_name()
         );
         let test = "minting_failed_with_receipt_recovers_to_completed";
+        let info_count = log_count_at!(Level::INFO, &[test]);
+        let debug_count = log_count_at!(Level::DEBUG, &[test]);
         assert!(
-            log_count_at!(Level::INFO, &[test]) <= 1,
-            "Expected at most 1 INFO log from recovery, got {}",
-            log_count_at!(Level::INFO, &[test])
+            info_count <= 1,
+            "Expected at most 1 INFO log from recovery, got {info_count}",
         );
         assert!(
-            log_count_at!(Level::DEBUG, &[test]) >= 1,
-            "Expected at least 1 DEBUG log for recovery steps"
+            debug_count >= 1,
+            "Expected at least 1 DEBUG log for recovery steps, got {debug_count}",
         );
     }
 
@@ -377,14 +378,15 @@ mod tests {
             context.aggregate().state_name()
         );
         let test = "callback_pending_recovers_to_completed";
+        let info_count = log_count_at!(Level::INFO, &[test]);
+        let debug_count = log_count_at!(Level::DEBUG, &[test]);
         assert!(
-            log_count_at!(Level::INFO, &[test]) <= 1,
-            "Expected at most 1 INFO log from recovery, got {}",
-            log_count_at!(Level::INFO, &[test])
+            info_count <= 1,
+            "Expected at most 1 INFO log from recovery, got {info_count}",
         );
         assert!(
-            log_count_at!(Level::DEBUG, &[test]) >= 1,
-            "Expected at least 1 DEBUG log for recovery steps"
+            debug_count >= 1,
+            "Expected at least 1 DEBUG log for recovery steps, got {debug_count}",
         );
     }
 
@@ -409,10 +411,10 @@ mod tests {
         );
 
         let test = "completed_mint_returns_cleanly";
+        let info_count = log_count_at!(Level::INFO, &[test]);
         assert!(
-            log_count_at!(Level::INFO, &[test]) <= 1,
-            "Expected at most 1 INFO log from recovery, got {}",
-            log_count_at!(Level::INFO, &[test])
+            info_count <= 1,
+            "Expected at most 1 INFO log from recovery, got {info_count}",
         );
     }
 }
