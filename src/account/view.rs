@@ -523,4 +523,42 @@ mod tests {
             "Wallet should be removed after unwhitelisting"
         );
     }
+
+    #[test]
+    fn test_view_update_unwhitelist_absent_wallet_is_noop() {
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let mut view = AccountView::LinkedToAlpaca {
+            client_id: ClientId(Uuid::new_v4()),
+            email: Email("user@example.com".to_string()),
+            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
+            whitelisted_wallets: Vec::new(),
+            registered_at: Utc::now(),
+            linked_at: Utc::now(),
+        };
+
+        let event = AccountEvent::WalletUnwhitelisted {
+            wallet,
+            unwhitelisted_at: Utc::now(),
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "user@example.com".to_string(),
+            sequence: 4,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert!(
+            whitelisted_wallets.is_empty(),
+            "Wallets should remain empty after unwhitelisting absent wallet"
+        );
+    }
 }

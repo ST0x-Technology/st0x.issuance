@@ -590,16 +590,8 @@ struct WhitelistWalletResponse {
 Removes a wallet from the account's whitelist. After removal, the wallet can no
 longer be used for minting or redemption.
 
-**Endpoint:** `DELETE /accounts/{client_id}/wallets` (internal, not exposed to
-Alpaca)
-
-**Request Body:**
-
-```json
-{
-  "wallet": "0x1234567890abcdef1234567890abcdef12345678"
-}
-```
+**Endpoint:** `DELETE /accounts/{client_id}/wallets/{wallet}` (internal, not
+exposed to Alpaca)
 
 **Our Response:**
 
@@ -1381,7 +1373,9 @@ We run an HTTP server that implements these endpoints.
 
 1. **`POST /accounts`** - Register new AP account with email
 2. **`POST /accounts/{client_id}/wallets`** - Whitelist wallet address for AP
-3. **`POST /tokenized-assets`** - Add a new tokenized asset
+3. **`DELETE /accounts/{client_id}/wallets/{wallet}`** - Un-whitelist wallet
+   address for AP
+4. **`POST /tokenized-assets`** - Add a new tokenized asset
 
 ### Endpoints We Call
 
@@ -1552,7 +1546,8 @@ events.
 
 **AccountView** - Current accounts:
 
-- Listens to: `Registered`, `LinkedToAlpaca`, `WalletWhitelisted`
+- Listens to: `Registered`, `LinkedToAlpaca`, `WalletWhitelisted`,
+  `WalletUnwhitelisted`
 - Updates: Account status, relationship data, whitelisted wallets
 - Used for: Validating client IDs, looking up accounts by email or Alpaca
   account number, checking wallet whitelisting

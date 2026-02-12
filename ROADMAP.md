@@ -234,6 +234,7 @@ Bug fixes and improvements that don't fit into the original phases.
 
 - [x] [#115](https://github.com/ST0x-Technology/st0x.issuance/issues/115) -
       Un-whitelist wallet addresses
+  - **PR:** [#116](https://github.com/ST0x-Technology/st0x.issuance/pull/116)
 - [ ] [#65](https://github.com/ST0x-Technology/st0x.issuance/issues/65) - Allow
       linking more than one wallet to an account
 - [ ] [#96](https://github.com/ST0x-Technology/st0x.issuance/issues/96) - Create

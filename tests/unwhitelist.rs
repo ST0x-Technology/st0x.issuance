@@ -99,14 +99,12 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     // Step 2: Unwhitelist the wallet
     let unwhitelist_response = client
-        .delete(format!("/accounts/{client_id}/wallets"))
-        .header(rocket::http::ContentType::JSON)
+        .delete(format!("/accounts/{client_id}/wallets/{user_wallet}"))
         .header(rocket::http::Header::new(
             "X-API-KEY",
             "test-key-12345678901234567890123456",
         ))
         .remote("127.0.0.1:8000".parse().unwrap())
-        .body(json!({"wallet": user_wallet}).to_string())
         .dispatch()
         .await;
 
@@ -155,13 +153,18 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         .get_receipt()
         .await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(3);
+    let poll_interval = tokio::time::Duration::from_millis(100);
 
-    assert_eq!(
-        redeem_mock.calls_async().await,
-        0,
-        "Redeem should not be called for unwhitelisted wallet"
-    );
+    while start.elapsed() < timeout {
+        assert_eq!(
+            redeem_mock.calls_async().await,
+            0,
+            "Redeem should not be called for unwhitelisted wallet"
+        );
+        tokio::time::sleep(poll_interval).await;
+    }
 
     Ok(())
 }

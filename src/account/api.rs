@@ -25,6 +25,16 @@ impl<'a> FromParam<'a> for ClientId {
     }
 }
 
+pub(crate) struct WalletParam(Address);
+
+impl<'a> FromParam<'a> for WalletParam {
+    type Error = alloy::hex::FromHexError;
+
+    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
+        param.parse::<Address>().map(WalletParam)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApiError {
     #[error("Account not found")]
@@ -207,15 +217,15 @@ pub(crate) async fn whitelist_wallet(
 
 #[tracing::instrument(skip(_auth, cqrs, pool), fields(
     client_id = %client_id,
-    wallet = ?request.wallet
+    wallet = %wallet.0
 ))]
-#[delete("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
+#[delete("/accounts/<client_id>/wallets/<wallet>")]
 pub(crate) async fn unwhitelist_wallet(
     _auth: InternalAuth,
     cqrs: &rocket::State<crate::AccountCqrs>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
-    request: Json<WhitelistWalletRequest>,
+    wallet: WalletParam,
 ) -> Result<Json<WhitelistWalletResponse>, ApiError> {
     let account_view = find_by_client_id(pool.inner(), &client_id)
         .await?
@@ -225,7 +235,7 @@ pub(crate) async fn unwhitelist_wallet(
         return Err(ApiError::AccountNotFound);
     };
 
-    let command = AccountCommand::UnwhitelistWallet { wallet: request.wallet };
+    let command = AccountCommand::UnwhitelistWallet { wallet: wallet.0 };
 
     let aggregate_id = client_id.0.to_string();
     cqrs.execute(&aggregate_id, command).await?;
@@ -1091,17 +1101,13 @@ mod tests {
             .await
             .expect("valid rocket instance");
 
-        let request_body = serde_json::json!({"wallet": wallet});
-
         let response = client
-            .delete(format!("/accounts/{client_id}/wallets"))
-            .header(ContentType::JSON)
+            .delete(format!("/accounts/{client_id}/wallets/{wallet}"))
             .header(Header::new(
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
             .remote("127.0.0.1:8000".parse().unwrap())
-            .body(request_body.to_string())
             .dispatch()
             .await;
 
@@ -1162,17 +1168,14 @@ mod tests {
 
         let fake_client_id = ClientId::new();
         let wallet = address!("0x1111111111111111111111111111111111111111");
-        let request_body = serde_json::json!({"wallet": wallet});
 
         let response = client
-            .delete(format!("/accounts/{fake_client_id}/wallets"))
-            .header(ContentType::JSON)
+            .delete(format!("/accounts/{fake_client_id}/wallets/{wallet}"))
             .header(Header::new(
                 "X-API-KEY",
                 "test-key-12345678901234567890123456",
             ))
             .remote("127.0.0.1:8000".parse().unwrap())
-            .body(request_body.to_string())
             .dispatch()
             .await;
 
