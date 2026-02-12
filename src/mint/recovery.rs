@@ -346,15 +346,13 @@ mod tests {
             context.aggregate().state_name()
         );
         let test = "minting_failed_with_receipt_recovers_to_completed";
-        let info_count = log_count_at!(Level::INFO, &[test]);
-        let debug_count = log_count_at!(Level::DEBUG, &[test]);
-        assert!(
-            info_count <= 1,
-            "Expected at most 1 INFO log from recovery, got {info_count}",
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
+            1,
         );
-        assert!(
-            debug_count >= 1,
-            "Expected at least 1 DEBUG log for recovery steps, got {debug_count}",
+        assert_eq!(
+            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
+            2,
         );
     }
 
@@ -378,15 +376,13 @@ mod tests {
             context.aggregate().state_name()
         );
         let test = "callback_pending_recovers_to_completed";
-        let info_count = log_count_at!(Level::INFO, &[test]);
-        let debug_count = log_count_at!(Level::DEBUG, &[test]);
-        assert!(
-            info_count <= 1,
-            "Expected at most 1 INFO log from recovery, got {info_count}",
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
+            1,
         );
-        assert!(
-            debug_count >= 1,
-            "Expected at least 1 DEBUG log for recovery steps, got {debug_count}",
+        assert_eq!(
+            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
+            1,
         );
     }
 
@@ -411,10 +407,9 @@ mod tests {
         );
 
         let test = "completed_mint_returns_cleanly";
-        let info_count = log_count_at!(Level::INFO, &[test]);
-        assert!(
-            info_count <= 1,
-            "Expected at most 1 INFO log from recovery, got {info_count}",
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
+            1,
         );
     }
 }
