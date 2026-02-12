@@ -202,7 +202,7 @@ pub async fn preseed_tokenized_asset(
         )
         ",
     )
-    .bind(&aggregate_id)
+    .bind(aggregate_id)
     .bind(&event_payload_str)
     .execute(&pool)
     .await?;
@@ -211,7 +211,7 @@ pub async fn preseed_tokenized_asset(
         "INSERT INTO tokenized_asset_view (view_id, version, payload)
          VALUES (?, 1, ?)",
     )
-    .bind(&aggregate_id)
+    .bind(aggregate_id)
     .bind(&view_payload_str)
     .execute(&pool)
     .await?;

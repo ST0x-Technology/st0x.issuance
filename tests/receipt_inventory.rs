@@ -2,8 +2,7 @@
 
 mod harness;
 
-use alloy::primitives::{Address, U256, b256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::primitives::{Address, U256};
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -61,12 +60,6 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     let mock_alpaca = MockServer::start();
 
     let bot_wallet = evm.wallet_address;
-    let user_private_key = b256!(
-        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-    );
-    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
-    let user_wallet = user_signer.address();
-
     // Use file-based database to persist across restarts
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("test_backfill_checkpoint.db");

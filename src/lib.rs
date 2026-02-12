@@ -147,10 +147,12 @@ impl Quantity {
         let power = 10_u64
             .checked_pow(decimals)
             .ok_or(QuantityConversionError::Overflow)?;
+
         let multiplier = Decimal::from(power);
         let truncated_scaled = (self.0 * multiplier).trunc();
         let truncated = truncated_scaled / multiplier;
         let dust = self.0 - truncated;
+
         Ok((Self(truncated), Self(dust)))
     }
 

@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -99,7 +100,7 @@ pub(crate) enum TransferBackfillError {
 impl<ProviderType, RedemptionStore, ReceiptInventoryStore>
     TransferBackfiller<ProviderType, RedemptionStore, ReceiptInventoryStore>
 where
-    ProviderType: alloy::providers::Provider + Clone + Send + Sync,
+    ProviderType: Provider + Clone + Send + Sync,
     RedemptionStore: EventStore<Redemption> + 'static,
     ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
     RedemptionStore::AC: Send,
