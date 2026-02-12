@@ -107,13 +107,14 @@ pub(crate) async fn add_tokenized_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::B256;
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use url::Url;
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
@@ -123,16 +124,12 @@ mod tests {
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
     fn test_config() -> Config {
-        use alloy::primitives::{B256, address};
-        use url::Url;
-
         Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
             rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
-            vault: address!("0x1111111111111111111111111111111111111111"),
             backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,

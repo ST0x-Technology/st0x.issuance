@@ -31,7 +31,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+        harness::setup_redemption_mocks(&mock_alpaca);
 
     let config = Config {
         database_url: ":memory:".to_string(),

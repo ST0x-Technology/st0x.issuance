@@ -3,6 +3,7 @@ mod event;
 pub(crate) mod upcaster;
 mod view;
 
+pub(crate) mod backfill;
 pub(crate) mod burn_manager;
 pub(crate) mod detector;
 pub(crate) mod journal_manager;

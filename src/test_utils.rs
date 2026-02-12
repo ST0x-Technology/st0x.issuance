@@ -58,7 +58,6 @@ fn test_config() -> Result<Config, anyhow::Error> {
         rpc_url: Url::parse("wss://localhost:8545")?,
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
-        vault: address!("0x1111111111111111111111111111111111111111"),
         backfill_start_block: 0,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,

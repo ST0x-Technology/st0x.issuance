@@ -281,7 +281,7 @@ async fn test_burn_tracking_computes_available_balance_correctly()
 
     let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+        harness::setup_redemption_mocks(&mock_alpaca);
 
     harness::preseed_tokenized_asset(
         &db_url,

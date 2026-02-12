@@ -12,6 +12,7 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::{debug, error, info};
+use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
@@ -29,6 +30,7 @@ use crate::receipt_inventory::{
 };
 use crate::redemption::{
     Redemption, RedemptionView,
+    backfill::TransferBackfiller,
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
@@ -290,9 +292,30 @@ pub async fn initialize_rocket(
     )
     .await?;
 
+    // Transfer backfill must run after receipt backfill so that receipt inventory
+    // is available for burn planning, and before live monitoring so that missed
+    // transfers during downtime are detected before new ones come in.
+    let transfer_backfiller = TransferBackfiller {
+        provider: blockchain_setup.provider.clone(),
+        bot_wallet,
+        cqrs: redemption_cqrs.clone(),
+        event_store: redemption_event_store.clone(),
+        pool: pool.clone(),
+        redeem_call_manager: managers.redeem_call.clone(),
+        journal_manager: managers.journal.clone(),
+        burn_manager: managers.burn.clone(),
+    };
+
+    run_all_transfer_backfills(
+        &vault_configs,
+        &transfer_backfiller,
+        config.backfill_start_block,
+    )
+    .await?;
+
     spawn_all_receipt_monitors(
         blockchain_setup.provider,
-        vault_configs,
+        &vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
         &MintRecoveryHandler::new(mint.cqrs.clone()),
@@ -306,12 +329,13 @@ pub async fn initialize_rocket(
         managers.burn.clone(),
     );
 
-    spawn_redemption_detector(
-        &config,
-        redemption_cqrs.clone(),
-        redemption_event_store,
-        pool.clone(),
-        managers,
+    spawn_all_redemption_detectors(
+        &config.rpc_url,
+        &vault_configs,
+        &redemption_cqrs,
+        &redemption_event_store,
+        &pool,
+        &managers,
         bot_wallet,
     );
 
@@ -526,8 +550,49 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
+/// Spawns redemption detectors for ALL enabled vaults.
+fn spawn_all_redemption_detectors(
+    rpc_url: &Url,
+    vault_configs: &[VaultBackfillConfig],
+    redemption_cqrs: &Arc<SqliteCqrs<Redemption>>,
+    redemption_event_store: &Arc<
+        PersistedEventStore<SqliteEventRepository, Redemption>,
+    >,
+    pool: &Pool<Sqlite>,
+    managers: &RedemptionManagers,
+    bot_wallet: Address,
+) {
+    info!(
+        vault_count = vault_configs.len(),
+        "Spawning redemption detectors for all vaults"
+    );
+
+    for config in vault_configs {
+        info!(
+            vault = %config.vault,
+            bot_wallet = %bot_wallet,
+            "Spawning redemption detector for vault"
+        );
+
+        spawn_redemption_detector(
+            rpc_url.clone(),
+            config.vault,
+            redemption_cqrs.clone(),
+            redemption_event_store.clone(),
+            pool.clone(),
+            RedemptionManagers {
+                redeem_call: managers.redeem_call.clone(),
+                journal: managers.journal.clone(),
+                burn: managers.burn.clone(),
+            },
+            bot_wallet,
+        );
+    }
+}
+
 fn spawn_redemption_detector(
-    config: &Config,
+    rpc_url: Url,
+    vault: Address,
     redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
     redemption_event_store: Arc<
         PersistedEventStore<SqliteEventRepository, Redemption>,
