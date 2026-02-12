@@ -3,6 +3,13 @@ reviews:
   auto_review:
     base_branches:
       - ".*"
+
+    # Controls the "Reviews paused — this branch is under active development"
+    # message that CodeRabbit posts on PRs. After this many reviewed commits,
+    # it stops reviewing new ones. Default is 5; raised to 10. Set to 0 to
+    # disable entirely.
+    auto_pause_after_reviewed_commits: 10
+
   profile: assertive
   request_changes_workflow: true
   review_details: true
