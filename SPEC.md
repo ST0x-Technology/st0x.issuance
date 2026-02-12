@@ -606,6 +606,11 @@ exposed to Alpaca)
 - `200`: Wallet successfully removed (or already absent - idempotent)
 - `404`: Client ID not found
 
+**Data Structure:**
+
+No request body (wallet is in the URL path). The response reuses the same
+`WhitelistWalletResponse` schema as the whitelist endpoint.
+
 ### 2. Tokenized Assets Data Endpoint
 
 Alpaca needs to query which assets we support:

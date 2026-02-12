@@ -153,18 +153,13 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
         .get_receipt()
         .await?;
 
-    let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(3);
-    let poll_interval = tokio::time::Duration::from_millis(100);
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-    while start.elapsed() < timeout {
-        assert_eq!(
-            redeem_mock.calls_async().await,
-            0,
-            "Redeem should not be called for unwhitelisted wallet"
-        );
-        tokio::time::sleep(poll_interval).await;
-    }
+    assert_eq!(
+        redeem_mock.calls_async().await,
+        0,
+        "Redeem should not be called for unwhitelisted wallet"
+    );
 
     Ok(())
 }
