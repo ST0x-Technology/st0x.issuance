@@ -29,9 +29,11 @@ the limit, condense explanations without removing any rules.
 
 **Update at the end** (see "After completing a plan" checklist below):
 
+- **ROADMAP.md** — mark completed issues, link PRs
+- **SPEC.md** — if aggregates, commands, events, state machines, or APIs changed
 - **README.md** — if project structure, features, commands, or architecture
   changed
-- **ROADMAP.md** — mark completed issues, link PRs
+- **AGENTS.md** — if new patterns or conventions were introduced
 
 ### While implementing
 
@@ -830,8 +832,10 @@ fn test_journal_confirmed() {
 
 **Setup phase exception:** Some edge-case scenarios (e.g., recovering from a
 `MintingFailed` state) cannot be induced through the public API alone. In these
-cases, the **setup phase** may use direct SQL (e.g., inserting events into the
-event store) to establish the initial state. Once setup is complete, the
+cases, the **setup phase** may use direct SQL to seed the **event store only**
+(inserting rows into the `events` table). No other tables — including derived
+views and read models — may be pre-populated via SQL; views must be rebuilt by
+the running service during scenario execution. Once setup is complete, the
 **scenario execution and verification** must follow all e2e rules above — the
 service runs, reacts to real events (blockchain, monitors), and correctness is
 asserted via API responses, Anvil state, and mock interactions.
