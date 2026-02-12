@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{IssuerMintRequestId, Mint, MintCommand, MintError};
 use crate::receipt_inventory::ItnReceiptHandler;
@@ -54,6 +54,8 @@ pub(crate) async fn recover_mint<ES>(
     .await;
 }
 
+const MAX_RECOVERY_ATTEMPTS: usize = 10;
+
 /// Drives a mint through recovery to completion by repeatedly sending
 /// commands built by `make_command` until the mint reaches a terminal state.
 ///
@@ -61,6 +63,9 @@ pub(crate) async fn recover_mint<ES>(
 /// `MintingFailed` -> `CallbackPending`). This function loops until
 /// `NotRecoverable` is returned, which means the mint has either
 /// completed or reached a state that cannot be recovered from.
+///
+/// Bounded to [`MAX_RECOVERY_ATTEMPTS`] iterations to prevent infinite
+/// spinning if a command returns `Ok(())` without advancing state.
 async fn drive_recovery<ES>(
     mint_cqrs: &CqrsFramework<Mint, ES>,
     issuer_request_id: IssuerMintRequestId,
@@ -70,15 +75,16 @@ async fn drive_recovery<ES>(
 {
     let aggregate_id = issuer_request_id.to_string();
 
-    loop {
+    for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
         let result = mint_cqrs
             .execute(&aggregate_id, make_command(issuer_request_id.clone()))
             .await;
 
         match result {
             Ok(()) => {
-                info!(
+                debug!(
                     issuer_request_id = %issuer_request_id,
+                    attempt,
                     "Recovery step succeeded, continuing"
                 );
             }
@@ -102,6 +108,13 @@ async fn drive_recovery<ES>(
             }
         }
     }
+
+    error!(
+        issuer_request_id = %issuer_request_id,
+        aggregate_id,
+        max_attempts = MAX_RECOVERY_ATTEMPTS,
+        "Mint recovery exceeded maximum attempts without reaching terminal state"
+    );
 }
 
 #[cfg(test)]

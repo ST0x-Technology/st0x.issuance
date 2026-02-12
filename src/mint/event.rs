@@ -67,6 +67,7 @@ pub(crate) enum MintEvent {
         /// The on-chain tx hash that evidences the original mint succeeded.
         /// Present when recovery is triggered by receipt discovery, `None`
         /// when triggered by startup auto-recovery (which may retry the mint).
+        #[serde(default)]
         tx_hash: Option<TxHash>,
         started_at: DateTime<Utc>,
     },

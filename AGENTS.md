@@ -6,34 +6,43 @@ This file provides guidance to AI agents working with code in this repository.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
 the limit, condense explanations without removing any rules.
 
-Relevant docs:
+## Documentation
 
-- README.md
-- ROADMAP.md
-- SPEC.md
-- docs/alloy.md - **MUST READ before any alloy work** (FixedBytes aliases,
-  `::random()`, mocks, encoding, compile-time macros)
-- docs/cqrs.md - CQRS/ES patterns (upcasters, views, replay, services)
-- docs/fireblocks.md - Fireblocks integration (externalTxId, SDK error handling)
+**Before doing any work**, read these two documents:
 
-## Plan & Review
+1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
+   be. All new features must be spec'ed here first. If your change contradicts
+   the spec, either update the spec first (with user approval) or change your
+   approach. Implementation is downstream from the spec.
+2. **[docs/workflow.md](docs/workflow.md)** — the mandatory process for all
+   changes. Describes how to get from current behavior to the desired behavior
+   defined in the spec.
+
+**Read when relevant** to your task:
+
+- [docs/alloy.md](docs/alloy.md) - Alloy types, FixedBytes aliases,
+  `::random()`, mocks, encoding, compile-time macros
+- [docs/cqrs.md](docs/cqrs.md) - CQRS/ES patterns (upcasters, views, replay,
+  services)
+- [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
+  (externalTxId, SDK error handling)
+
+**Update at the end** (see "After completing a plan" checklist below):
+
+- **README.md** — if project structure, features, commands, or architecture
+  changed
+- **ROADMAP.md** — mark completed issues, link PRs
 
 ### Before starting work
 
-- **CRITICAL: SPEC.md is the source of truth for what this service should be.**
-  Always check the spec before planning, during implementation, and when making
-  design decisions. If you're unsure about the purpose of a concept (e.g.,
-  receipts, backing, custody model), the answer is in the spec — not in your
-  assumptions.
+- Check the spec before planning, during implementation, and when making design
+  decisions. If you're unsure about a concept (receipts, backing, custody
+  model), the answer is in the spec — not in your assumptions.
   - What has already been implemented vs what the spec describes
   - Existing patterns, types, and conventions in use
   - How your changes will integrate with the current architecture
-  - **If the spec needs updating, update it FIRST** — implementation is
-    downstream from the plan, and the plan is downstream from the spec. Never
-    start planning implementation until the spec accurately reflects what should
-    be built.
-  - **If your change contradicts the spec, you're wrong** — either update the
-    spec first (with user approval) or change your approach to match the spec.
+  - **If the spec needs updating, update it FIRST** — never start planning
+    implementation until the spec accurately reflects what should be built.
 - Write a comprehensive step-by-step plan with each task having a corresponding
   section and a list of subtasks as checkboxes inside of it
 - The task sections should follow the format `## Task N. <TASK NAME>`
@@ -67,21 +76,16 @@ Relevant docs:
 When all tasks are complete, perform this checklist **before** creating or
 updating a PR:
 
-1. **Update ROADMAP.md**:
-   - Mark completed issues as `[x]` with PR link
-   - Format: `- [x] [#N](issue-url) - Task description`
-   - Add: `- **PR:** [#N](pr-url)`
-   - If work doesn't fit an existing phase, add it to "Fixes & Improvements"
-     section
-   - Use `gh issue list` and `gh pr list` to verify all related issues/PRs are
-     linked
-2. **Update other documentation** as needed:
+1. **Update documentation** (see the Documentation section above for what each
+   doc covers):
+   - **ROADMAP.md**: Mark completed issues as `[x]` with PR link, add
+     `- **PR:** [#N](pr-url)`. Use `gh issue list` and `gh pr list` to verify.
    - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
      changed
    - **README.md**: If project structure, features, commands, or architecture
      changed
    - **AGENTS.md**: If new patterns or conventions were introduced
-3. **Verify GitHub state**:
+2. **Verify GitHub state**:
    - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
      description)
    - Check that no issues are marked complete in ROADMAP.md but still open on
@@ -608,6 +612,8 @@ pipeline:
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
+- **FORBIDDEN**: Single-letter variable and argument names. All names must be
+  descriptive enough to convey meaning without surrounding context
 - **CRITICAL: Import Organization**: Follow a consistent two-group import
   pattern throughout the codebase:
   - **Group 1 - External imports**: All imports from external crates including
@@ -619,6 +625,11 @@ pipeline:
   - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
     within a group
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+    **Exception**: enum variant imports are allowed inside function bodies when
+    it eliminates repetitive qualification (e.g., `use MyEnum::*;` or
+    `use MyEnum::{A, B, C};`). This is the only case where function-level
+    imports are permitted, and importing from enums is only allowed at function
+    level (never at module level).
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
@@ -915,124 +926,6 @@ and fix all warnings. Finally, `cargo fmt` before committing.
 **CRITICAL: Never use `cargo build` for verification.** Use `cargo check`
 (faster) or `cargo test` (more useful). Only use `cargo build` when you need the
 binary.
-
-### Test-Driven Change Procedure
-
-This procedure governs all changes to the system — bug fixes and new features
-alike. Every change is either correcting behavior we thought was right (bug fix)
-or providing behavior we didn't have before (new feature). In both cases, the
-process is the same: demonstrate that the system doesn't exhibit the desired
-behavior, then make it so.
-
-#### Why this process exists
-
-Without a failing test asserting correct behavior, there is no evidence that a
-change is needed. Without evidence that a change is needed, there is no way to
-tell whether the changes being made actually contribute to achieving the desired
-behavior. This is the scientific method applied to software: state a hypothesis
-("the system should do X"), run an experiment (the test), and observe whether
-the hypothesis holds. Only when the hypothesis is rejected (test fails) do we
-have justification to change the system.
-
-A failing test that asserts correct behavior proves one of two things: either
-the system has a bug, or the system lacks logic that should exist. A passing
-test that asserts correct behavior proves the system already behaves as expected
-— no change is justified for that behavior.
-
-Tests must always assert correct behavior and nothing else. A test that asserts
-wrong behavior tells us nothing about the system. Even following this process
-mechanically without understanding the reasoning leads to mistakes like thinking
-"asserting wrong behavior" achieves the purpose of writing failing tests first.
-It does not — it just produces noise that validates nothing.
-
-#### Starting level
-
-- **New feature**: Start with the spec. Define the desired behavior in SPEC.md
-  first. Then write an e2e test asserting that the system exhibits the specified
-  behavior. This fails, proving the system doesn't yet do what the spec says it
-  should.
-- **Production bug**: Start with an e2e test reproducing the exact failure path
-  observed in production, asserting the correct behavior the system should have
-  exhibited. This fails, confirming the bug exists.
-- **Bug identified at unit or integration level that doesn't (yet) produce
-  incorrect system-level behavior**: Start at the level where the incorrect
-  behavior exists. Write a failing integration or unit test reproducing the
-  issue, then drill down to the root cause and build back up with logic changes.
-
-#### The process
-
-##### Reproduce with a failing test
-
-Write a test at the appropriate starting level (see above) that asserts the
-correct behavior the system should exhibit. This test must fail with the current
-code. If it passes, the system already behaves correctly and no change is
-justified — either the test doesn't reproduce the issue or the issue doesn't
-exist. This failing test is the top-level hypothesis: "the system should behave
-this way, but it doesn't."
-
-Sometimes an existing test already has the scenario you need but doesn't assert
-enough, or needs a few extra steps at the beginning or end to cover the case. In
-that situation, extend the existing test rather than writing a new one from
-scratch. However, only extend if the scenario remains the same — if you need a
-different scenario, add a new test case. Modifying an existing test's scenario
-risks reducing coverage surface and introducing regressions.
-
-##### Identify the source of incorrect behavior
-
-Analyze why the test fails. The root cause will be at one of two levels:
-
-- **Unit level**: A component has incorrect logic, or a component that should
-  exist doesn't.
-- **Integration level**: Individual components work correctly in isolation, but
-  they aren't connected properly.
-
-##### Unit-level fix (when root cause is at the unit level)
-
-Define any new types, traits, and function signatures needed. Use `todo!()` for
-bodies. `cargo check` must pass. No behavioral logic yet.
-
-Write unit tests for the component in question, asserting what it should do.
-These fail because the logic doesn't exist yet (new unit) or is buggy (existing
-unit). Each failing test is a hypothesis: "this unit should behave this way." As
-above, extend existing tests if they already have the right scenario but lack
-sufficient assertions.
-
-Implement the unit logic. Fill in the `todo!()` stubs or fix the buggy logic.
-Unit tests now pass, confirming the hypothesis. The top-level test still fails
-because the unit isn't integrated into the system yet.
-
-##### Integration-level fix (when root cause is at the integration level)
-
-If individual components already work correctly but aren't connected, there are
-no unit-level hypotheses to validate — skip straight to integration.
-
-Adjust signatures, add parameters, update wiring types. Use `todo!()` for new
-wiring logic. `cargo check` must pass.
-
-Write integration tests that verify the components are connected properly,
-asserting the correct integrated behavior. These fail because the wiring doesn't
-exist yet.
-
-Wire the components together. Fill in the integration logic. Integration tests
-now pass, and the top-level test should pass too.
-
-##### Iterate if needed
-
-Sometimes the top-level test still fails after fixing one slice. This means
-another unit or integration is also contributing to the incorrect behavior.
-Apply the same approach: hypothesize which unit or integration is the next
-culprit or missing piece, write a failing test asserting correct behavior to
-validate that hypothesis, then fix it. Only make changes after rejecting the
-null hypothesis ("this component is NOT the problem / missing piece").
-
-##### Cleanup
-
-Once the top-level test passes, all functional changes are complete. Now
-refactor, improve code quality, fix clippy warnings, and update documentation.
-The full test suite ensures refactoring doesn't break the correct behavior
-established in previous steps. Only at this point do we know what changes were
-required, so only now can we accurately update SPEC.md, ROADMAP.md, and
-AGENTS.md to reflect what changed in the system.
 
 - **Before handing over a piece of work**, run checks in this order:
   1. `cargo test --workspace` - All tests must pass

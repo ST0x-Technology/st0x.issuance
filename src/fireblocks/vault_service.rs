@@ -381,13 +381,23 @@ impl VaultOperation {
 /// in progress and may eventually confirm on-chain. Used to distinguish
 /// "polling timed out but tx might still land" from "tx definitively failed."
 const fn is_still_pending(status: TransactionStatus) -> bool {
-    matches!(
-        status,
-        TransactionStatus::Confirming
-            | TransactionStatus::Broadcasting
-            | TransactionStatus::PendingSignature
-            | TransactionStatus::Submitted
-    )
+    use TransactionStatus::*;
+
+    match status {
+        Submitted
+        | PendingAmlScreening
+        | PendingEnrichment
+        | PendingAuthorization
+        | Queued
+        | PendingSignature
+        | Pending3RdPartyManualApproval
+        | Pending3RdParty
+        | Broadcasting
+        | Confirming
+        | Cancelling => true,
+
+        Completed | Cancelled | Blocked | Rejected | Failed => false,
+    }
 }
 
 /// Parses a transaction hash string (with or without 0x prefix) into B256.
@@ -867,18 +877,29 @@ mod tests {
 
     #[test]
     fn is_still_pending_true_for_in_progress_statuses() {
-        assert!(is_still_pending(TransactionStatus::Confirming));
-        assert!(is_still_pending(TransactionStatus::Broadcasting));
-        assert!(is_still_pending(TransactionStatus::PendingSignature));
-        assert!(is_still_pending(TransactionStatus::Submitted));
+        use TransactionStatus::*;
+
+        assert!(is_still_pending(Submitted));
+        assert!(is_still_pending(PendingAmlScreening));
+        assert!(is_still_pending(PendingEnrichment));
+        assert!(is_still_pending(PendingAuthorization));
+        assert!(is_still_pending(Queued));
+        assert!(is_still_pending(PendingSignature));
+        assert!(is_still_pending(Pending3RdPartyManualApproval));
+        assert!(is_still_pending(Pending3RdParty));
+        assert!(is_still_pending(Broadcasting));
+        assert!(is_still_pending(Confirming));
+        assert!(is_still_pending(Cancelling));
     }
 
     #[test]
     fn is_still_pending_false_for_terminal_statuses() {
-        assert!(!is_still_pending(TransactionStatus::Completed));
-        assert!(!is_still_pending(TransactionStatus::Failed));
-        assert!(!is_still_pending(TransactionStatus::Cancelled));
-        assert!(!is_still_pending(TransactionStatus::Blocked));
-        assert!(!is_still_pending(TransactionStatus::Rejected));
+        use TransactionStatus::*;
+
+        assert!(!is_still_pending(Completed));
+        assert!(!is_still_pending(Failed));
+        assert!(!is_still_pending(Cancelled));
+        assert!(!is_still_pending(Blocked));
+        assert!(!is_still_pending(Rejected));
     }
 }

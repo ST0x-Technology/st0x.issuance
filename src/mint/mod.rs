@@ -2420,4 +2420,82 @@ pub(crate) mod tests {
             "RecoverFromReceipt should reject Minting state"
         );
     }
+
+    #[tokio::test]
+    async fn test_recover_from_receipt_rejects_minting_failed_with_non_minting_predecessor()
+     {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+
+        let journal_confirmed = Mint::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: now,
+            journal_confirmed_at: now,
+        };
+
+        let mint = Mint::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: now,
+            journal_confirmed_at: now,
+            error: "some error".to_string(),
+            failed_at: now,
+            failed_from: Box::new(journal_confirmed),
+        };
+
+        assert!(
+            matches!(
+                mint.non_failed_predecessor(),
+                Mint::JournalConfirmed { .. }
+            ),
+            "Precondition: non_failed_predecessor should be JournalConfirmed"
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let receipt_cqrs =
+            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
+
+        let services = MintServices {
+            vault: Arc::new(MockVaultService::new_success()),
+            alpaca: Arc::new(MockAlpacaService::new_success()),
+            receipts: Arc::new(CqrsReceiptService::new(
+                receipt_store,
+                receipt_cqrs,
+            )),
+            pool,
+            bot: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        };
+
+        let result = mint
+            .handle_recover_from_receipt(
+                &services,
+                issuer_request_id,
+                b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(MintError::NotRecoverable { .. })),
+            "RecoverFromReceipt should reject MintingFailed with non-Minting predecessor, got: {result:?}"
+        );
+    }
 }
