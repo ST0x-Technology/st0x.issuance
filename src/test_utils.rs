@@ -783,7 +783,7 @@ macro_rules! log_count_at {
             String::from_utf8_lossy(&buf).into_owned()
         };
         let scope = module_path!();
-        let scope = scope.strip_suffix("::tests").unwrap_or(module_path!());
+        let scope = scope.strip_suffix("::tests").unwrap_or(scope);
         let level_str = match $level {
             tracing::Level::TRACE => "TRACE",
             tracing::Level::DEBUG => "DEBUG",

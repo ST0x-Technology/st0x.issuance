@@ -393,10 +393,20 @@ mod tests {
     async fn completed_mint_returns_cleanly() {
         let issuer_request_id = test_issuer_request_id();
         let events = completed_events(&issuer_request_id);
-        let (mint_cqrs, _mint_store) =
-            setup_mint_cqrs_with_events(events).await;
+        let (mint_cqrs, mint_store) = setup_mint_cqrs_with_events(events).await;
 
-        recover_mint(&mint_cqrs, issuer_request_id).await;
+        recover_mint(&mint_cqrs, issuer_request_id.clone()).await;
+
+        let context = mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(context.aggregate(), Mint::Completed { .. }),
+            "Expected Completed state, got: {}",
+            context.aggregate().state_name()
+        );
 
         let test = "completed_mint_returns_cleanly";
         assert!(
