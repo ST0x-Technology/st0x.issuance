@@ -1220,6 +1220,7 @@ pub(crate) mod tests {
     use rust_decimal::Decimal;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1231,9 +1232,100 @@ pub(crate) mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
+        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
     };
     use crate::vault::mock::MockVaultService;
+
+    pub(super) const VAULT: Address =
+        address!("0xcccccccccccccccccccccccccccccccccccccccc");
+
+    pub(super) const BOT: Address =
+        address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    pub(super) struct MintTestFixture {
+        pub(super) mint_cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
+        pub(super) mint_store: Arc<MemStore<Mint>>,
+        pub(super) receipt_cqrs:
+            Arc<CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>>,
+    }
+
+    impl MintTestFixture {
+        pub(super) async fn new() -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .unwrap();
+
+            sqlx::migrate!().run(&pool).await.unwrap();
+
+            let asset_view_repo = Arc::new(SqliteViewRepository::<
+                TokenizedAssetView,
+                TokenizedAsset,
+            >::new(
+                pool.clone(),
+                "tokenized_asset_view".to_string(),
+            ));
+            let asset_query = GenericQuery::new(asset_view_repo);
+            let asset_cqrs =
+                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+
+            asset_cqrs
+                .execute(
+                    "AAPL",
+                    TokenizedAssetCommand::Add {
+                        underlying: UnderlyingSymbol::new("AAPL"),
+                        token: TokenSymbol::new("tAAPL"),
+                        network: Network::new("base"),
+                        vault: VAULT,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let receipt_store =
+                Arc::new(MemStore::<ReceiptInventory>::default());
+            let receipt_cqrs = Arc::new(CqrsFramework::new(
+                (*receipt_store).clone(),
+                vec![],
+                (),
+            ));
+
+            let services = MintServices {
+                vault: Arc::new(MockVaultService::new_success()),
+                alpaca: Arc::new(MockAlpacaService::new_success()),
+                receipts: Arc::new(CqrsReceiptService::new(
+                    receipt_store,
+                    receipt_cqrs.clone(),
+                )),
+                pool: pool.clone(),
+                bot: BOT,
+            };
+
+            let mint_store = Arc::new(MemStore::<Mint>::default());
+            let mint_cqrs = Arc::new(CqrsFramework::new(
+                (*mint_store).clone(),
+                vec![],
+                services,
+            ));
+
+            Self { mint_cqrs, mint_store, receipt_cqrs }
+        }
+
+        pub(super) async fn seed_mint_events(
+            &self,
+            aggregate_id: &str,
+            events: Vec<MintEvent>,
+        ) {
+            let context =
+                self.mint_store.load_aggregate(aggregate_id).await.unwrap();
+
+            self.mint_store
+                .commit(events, context, HashMap::default())
+                .await
+                .unwrap();
+        }
+    }
 
     prop_compose! {
         pub(crate) fn arb_issuer_request_id()(bytes in any::<[u8; 16]>()) -> IssuerMintRequestId {
@@ -2141,68 +2233,8 @@ pub(crate) mod tests {
 
     async fn setup_cqrs_integration_test()
     -> (Arc<MemStore<Mint>>, Arc<CqrsFramework<Mint, MemStore<Mint>>>) {
-        let store = Arc::new(MemStore::<Mint>::default());
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let receipt_cqrs =
-            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
-        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let mint_services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            pool: pool.clone(),
-            bot,
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_store,
-                receipt_cqrs,
-            )),
-        };
-
-        let cqrs = Arc::new(CqrsFramework::new(
-            (*store).clone(),
-            vec![],
-            mint_services,
-        ));
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-        let asset_query = GenericQuery::new(asset_view_repo);
-        let asset_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
-
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
-
-        asset_cqrs
-            .execute(
-                &underlying.0,
-                TokenizedAssetCommand::Add {
-                    underlying: underlying.clone(),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    vault,
-                },
-            )
-            .await
-            .expect("Failed to add tokenized asset");
-
-        (store, cqrs)
+        let fixture = MintTestFixture::new().await;
+        (fixture.mint_store, fixture.mint_cqrs)
     }
 
     #[tokio::test]

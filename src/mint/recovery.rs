@@ -119,41 +119,24 @@ async fn drive_recovery<ES>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256, uint};
+    use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::mem_store::MemStore;
-    use cqrs_es::persist::GenericQuery;
-    use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
+    use cqrs_es::AggregateContext;
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::alpaca::mock::MockAlpacaService;
+    use crate::mint::tests::{MintTestFixture, VAULT};
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, MintServices, Network,
-        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptSource, Shares,
+        ReceiptId, ReceiptInventoryCommand, ReceiptSource, Shares,
     };
     use crate::test_utils::log_count_at;
-    use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
-    };
     use crate::vault::ReceiptInformation;
-    use crate::vault::mock::MockVaultService;
-
-    type TestMintStore = MemStore<Mint>;
-
-    const VAULT: Address =
-        address!("0xcccccccccccccccccccccccccccccccccccccccc");
-    const BOT: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     fn test_issuer_request_id() -> IssuerMintRequestId {
         IssuerMintRequestId::new(
@@ -229,47 +212,11 @@ mod tests {
         events
     }
 
-    async fn setup_mint_cqrs_with_events(
+    async fn setup_with_receipt_and_events(
         events: Vec<MintEvent>,
-    ) -> (Arc<CqrsFramework<Mint, TestMintStore>>, Arc<TestMintStore>) {
+    ) -> MintTestFixture {
         let issuer_request_id = test_issuer_request_id();
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .unwrap();
-
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        // Seed tokenized asset view into SQLite so find_vault_by_underlying works
-        let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-        let asset_query = GenericQuery::new(asset_view_repo);
-        let asset_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
-        asset_cqrs
-            .execute(
-                "AAPL",
-                TokenizedAssetCommand::Add {
-                    underlying: UnderlyingSymbol::new("AAPL"),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
-                    vault: VAULT,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Set up receipt inventory with a receipt for the issuer_request_id
-        let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let receipt_cqrs =
-            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
+        let fixture = MintTestFixture::new().await;
 
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
@@ -280,7 +227,8 @@ mod tests {
             None,
         );
 
-        receipt_cqrs
+        fixture
+            .receipt_cqrs
             .execute(
                 &VAULT.to_string(),
                 ReceiptInventoryCommand::DiscoverReceipt {
@@ -301,29 +249,9 @@ mod tests {
             .await
             .unwrap();
 
-        let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_store,
-                receipt_cqrs,
-            )),
-            pool,
-            bot: BOT,
-        };
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
 
-        let mint_store = Arc::new(MemStore::<Mint>::default());
-        let mint_cqrs = Arc::new(CqrsFramework::new(
-            (*mint_store).clone(),
-            vec![],
-            services,
-        ));
-
-        let aggregate_id = issuer_request_id.to_string();
-        let context = mint_store.load_aggregate(&aggregate_id).await.unwrap();
-        mint_store.commit(events, context, HashMap::default()).await.unwrap();
-
-        (mint_cqrs, mint_store)
+        fixture
     }
 
     #[traced_test]
@@ -331,11 +259,12 @@ mod tests {
     async fn minting_failed_with_receipt_recovers_to_completed() {
         let issuer_request_id = test_issuer_request_id();
         let events = minting_failed_events(&issuer_request_id);
-        let (mint_cqrs, mint_store) = setup_mint_cqrs_with_events(events).await;
+        let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = mint_store
+        let context = fixture
+            .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
             .unwrap();
@@ -361,11 +290,12 @@ mod tests {
     async fn callback_pending_recovers_to_completed() {
         let issuer_request_id = test_issuer_request_id();
         let events = callback_pending_events(&issuer_request_id);
-        let (mint_cqrs, mint_store) = setup_mint_cqrs_with_events(events).await;
+        let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = mint_store
+        let context = fixture
+            .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
             .unwrap();
@@ -391,11 +321,12 @@ mod tests {
     async fn completed_mint_returns_cleanly() {
         let issuer_request_id = test_issuer_request_id();
         let events = completed_events(&issuer_request_id);
-        let (mint_cqrs, mint_store) = setup_mint_cqrs_with_events(events).await;
+        let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = mint_store
+        let context = fixture
+            .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
             .unwrap();
