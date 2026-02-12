@@ -2,10 +2,10 @@ use alloy::primitives::Address;
 use cqrs_es::AggregateError;
 use rocket::Request;
 use rocket::http::Status;
-use rocket::post;
 use rocket::request::FromParam;
 use rocket::response::Responder;
 use rocket::serde::json::Json;
+use rocket::{delete, post};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use uuid::Uuid;
@@ -198,6 +198,34 @@ pub(crate) async fn whitelist_wallet(
     };
 
     let command = AccountCommand::WhitelistWallet { wallet: request.wallet };
+
+    let aggregate_id = client_id.0.to_string();
+    cqrs.execute(&aggregate_id, command).await?;
+
+    Ok(Json(WhitelistWalletResponse { success: true }))
+}
+
+#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+    client_id = %client_id,
+    wallet = ?request.wallet
+))]
+#[delete("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
+pub(crate) async fn unwhitelist_wallet(
+    _auth: InternalAuth,
+    cqrs: &rocket::State<crate::AccountCqrs>,
+    pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
+    client_id: ClientId,
+    request: Json<WhitelistWalletRequest>,
+) -> Result<Json<WhitelistWalletResponse>, ApiError> {
+    let account_view = find_by_client_id(pool.inner(), &client_id)
+        .await?
+        .ok_or(ApiError::AccountNotFound)?;
+
+    let AccountView::LinkedToAlpaca { .. } = account_view else {
+        return Err(ApiError::AccountNotFound);
+    };
+
+    let command = AccountCommand::UnwhitelistWallet { wallet: request.wallet };
 
     let aggregate_id = client_id.0.to_string();
     cqrs.execute(&aggregate_id, command).await?;
@@ -1000,5 +1028,154 @@ mod tests {
         };
 
         assert_eq!(client_id, first_client_id);
+    }
+
+    #[tokio::test]
+    async fn test_unwhitelist_wallet_succeeds() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let email = "unwhitelist@example.com";
+        let client_id = register_account(&account_cqrs, email).await;
+
+        account_cqrs
+            .execute(
+                &client_id.to_string(),
+                AccountCommand::LinkToAlpaca {
+                    alpaca_account: AlpacaAccountNumber(
+                        "ALPACA123".to_string(),
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to link to Alpaca");
+
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+        account_cqrs
+            .execute(
+                &client_id.to_string(),
+                AccountCommand::WhitelistWallet { wallet },
+            )
+            .await
+            .expect("Failed to whitelist wallet");
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool.clone())
+            .mount("/", routes![super::unwhitelist_wallet]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({"wallet": wallet});
+
+        let response = client
+            .delete(format!("/accounts/{client_id}/wallets"))
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let view = find_by_client_id(&pool, &client_id)
+            .await
+            .expect("Failed to query view")
+            .expect("View should exist");
+
+        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        else {
+            panic!("Expected LinkedToAlpaca, got {view:?}")
+        };
+
+        assert!(
+            whitelisted_wallets.is_empty(),
+            "Wallet should be removed from view after unwhitelisting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unwhitelist_wallet_account_not_found_returns_404() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let account_view_repo =
+            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+                pool.clone(),
+                "account_view".to_string(),
+            ));
+
+        let account_query = GenericQuery::new(account_view_repo);
+
+        let account_cqrs =
+            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_cqrs)
+            .manage(pool)
+            .mount("/", routes![super::unwhitelist_wallet]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let fake_client_id = ClientId::new();
+        let wallet = address!("0x1111111111111111111111111111111111111111");
+        let request_body = serde_json::json!({"wallet": wallet});
+
+        let response = client
+            .delete(format!("/accounts/{fake_client_id}/wallets"))
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NotFound);
     }
 }

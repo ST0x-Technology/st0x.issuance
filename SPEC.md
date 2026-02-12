@@ -325,6 +325,7 @@ system. The account lifecycle follows these steps:
   number
 - `WhitelistWallet { wallet }` - Authorize a wallet address for minting and
   redemptions
+- `UnwhitelistWallet { wallet }` - Remove a wallet address from the whitelist
 
 **Events:**
 
@@ -333,14 +334,17 @@ system. The account lifecycle follows these steps:
   account number
 - `WalletWhitelisted { wallet, whitelisted_at }` - Wallet address authorized for
   minting and redemptions
+- `WalletUnwhitelisted { wallet, unwhitelisted_at }` - Wallet address removed
+  from whitelist
 
 **Command -> Event Mappings:**
 
-| Command           | Events Produced     | Notes                                |
-| ----------------- | ------------------- | ------------------------------------ |
-| `Register`        | `Registered`        | New AP account created with email    |
-| `LinkToAlpaca`    | `LinkedToAlpaca`    | Existing account linked to Alpaca    |
-| `WhitelistWallet` | `WalletWhitelisted` | Wallet authorized (multiple allowed) |
+| Command             | Events Produced       | Notes                                 |
+| ------------------- | --------------------- | ------------------------------------- |
+| `Register`          | `Registered`          | New AP account created with email     |
+| `LinkToAlpaca`      | `LinkedToAlpaca`      | Existing account linked to Alpaca     |
+| `WhitelistWallet`   | `WalletWhitelisted`   | Wallet authorized (multiple allowed)  |
+| `UnwhitelistWallet` | `WalletUnwhitelisted` | Wallet removed (idempotent if absent) |
 
 **Account State Machine:**
 
@@ -349,8 +353,9 @@ stateDiagram-v2
     [*] --> Registered: Register
     Registered --> LinkedToAlpaca: LinkToAlpaca
     LinkedToAlpaca --> LinkedToAlpaca: WhitelistWallet
+    LinkedToAlpaca --> LinkedToAlpaca: UnwhitelistWallet
     Note right of Registered: Has email, client_id
-    Note right of LinkedToAlpaca: Has alpaca_account, can whitelist wallets
+    Note right of LinkedToAlpaca: Has alpaca_account, can whitelist/unwhitelist wallets
 ```
 
 ### TokenizedAsset Aggregate
@@ -579,6 +584,35 @@ struct WhitelistWalletResponse {
   the `client_id`
 - During redemption, we look up which `client_id` owns the wallet that sent the
   tokens
+
+#### Un-whitelist Wallet
+
+Removes a wallet from the account's whitelist. After removal, the wallet can no
+longer be used for minting or redemption.
+
+**Endpoint:** `DELETE /accounts/{client_id}/wallets` (internal, not exposed to
+Alpaca)
+
+**Request Body:**
+
+```json
+{
+  "wallet": "0x1234567890abcdef1234567890abcdef12345678"
+}
+```
+
+**Our Response:**
+
+```json
+{
+  "success": true
+}
+```
+
+**Status Codes:**
+
+- `200`: Wallet successfully removed (or already absent - idempotent)
+- `404`: Client ID not found
 
 ### 2. Tokenized Assets Data Endpoint
 
