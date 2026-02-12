@@ -57,15 +57,10 @@ the limit, condense explanations without removing any rules.
 When all tasks are complete, perform this checklist **before** creating or
 updating a PR:
 
-1. **Update documentation** (see the Documentation section above for what each
-   doc covers):
-   - **ROADMAP.md**: Mark completed issues as `[x]` with PR link, add
-     `- **PR:** [#N](pr-url)`. Use `gh issue list` and `gh pr list` to verify.
-   - **SPEC.md**: If aggregates, commands, events, state machines, or APIs
-     changed
-   - **README.md**: If project structure, features, commands, or architecture
-     changed
-   - **AGENTS.md**: If new patterns or conventions were introduced
+1. **Update documentation**: See "Update at the end" list above for which docs
+   to update and when. For ROADMAP.md specifically: mark completed issues as
+   `[x]` with PR link, add `- **PR:** [#N](pr-url)`, and use `gh issue list` and
+   `gh pr list` to verify.
 2. **Verify GitHub state**:
    - Ensure related issues will be closed when PR merges (use "Closes #N" in PR
      description)
@@ -606,11 +601,9 @@ pipeline:
   - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
     within a group
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
-    **Exception**: enum variant imports are allowed inside function bodies when
-    it eliminates repetitive qualification (e.g., `use MyEnum::*;` or
-    `use MyEnum::{A, B, C};`). This is the only case where function-level
-    imports are permitted, and importing from enums is only allowed at function
-    level (never at module level).
+    **Sole exception**: enum variant imports (`use MyEnum::*` or
+    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
+    qualification. Enum variant imports are never allowed at module level.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
