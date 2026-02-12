@@ -109,9 +109,14 @@ null hypothesis ("this component is NOT the problem / missing piece").
 
 ### Cleanup
 
-Once the top-level test passes, all functional changes are complete. Now
-refactor, improve code quality, fix clippy warnings, and update documentation.
-The full test suite ensures refactoring doesn't break the correct behavior
-established in previous steps. Only at this point do we know what changes were
-required, so only now can we accurately update SPEC.md, ROADMAP.md, and
-AGENTS.md to reflect what changed in the system.
+**Correct ordering:** SPEC.md describes the desired behavior and must be updated
+_before_ implementation begins — not after. The sequence is:
+
+1. **Update SPEC.md first** with any new or changed behavior
+2. **Implement** the changes following the process above (failing tests, then
+   logic)
+3. **Run the top-level test** to confirm the system exhibits the specified
+   behavior, then run the **full test suite** to ensure nothing else broke
+4. **Refine and clean up**: refactor, fix clippy warnings, improve code quality.
+   Re-validate SPEC.md — refine any details that became clearer during
+   implementation. Update ROADMAP.md and AGENTS.md to reflect what changed

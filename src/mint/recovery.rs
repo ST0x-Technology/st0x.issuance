@@ -129,6 +129,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
@@ -141,6 +142,7 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptSource, Shares,
     };
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, view::TokenizedAssetView,
     };
@@ -343,6 +345,7 @@ mod tests {
             "Expected Completed state, got: {}",
             context.aggregate().state_name()
         );
+        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
     }
 
     #[traced_test]
@@ -364,6 +367,7 @@ mod tests {
             "Expected Completed state, got: {}",
             context.aggregate().state_name()
         );
+        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
     }
 
     #[traced_test]
@@ -376,6 +380,6 @@ mod tests {
 
         recover_mint(&mint_cqrs, issuer_request_id).await;
 
-        assert!(logs_contain("Mint recovery complete"));
+        assert!(logs_contain_at(Level::INFO, &["Mint recovery complete"]));
     }
 }

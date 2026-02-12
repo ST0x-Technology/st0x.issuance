@@ -1399,7 +1399,8 @@ We call these Alpaca endpoints:
 3. **Burn Failed**: Tokens stuck in redemption wallet, manual intervention
    needed
 4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal,
-   reconciliation required
+   reconciliation required.
+
 5. **Failed Mint with On-Chain Receipt**: When a mint is marked as
    `MintingFailed` but the on-chain transaction actually succeeded (e.g., the
    transaction was submitted but the service failed before confirming it), the

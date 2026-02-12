@@ -4,14 +4,13 @@ mod event;
 pub(crate) mod recovery;
 mod view;
 
-use std::sync::Arc;
-
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 

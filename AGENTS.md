@@ -849,16 +849,24 @@ fn test_journal_confirmed() {
 4. Mocks only truly external systems (Alpaca API)
 5. Asserts correctness via API responses, Anvil state, and mock interactions
 
+**Setup phase exception:** Some edge-case scenarios (e.g., recovering from a
+`MintingFailed` state) cannot be induced through the public API alone. In these
+cases, the **setup phase** may use direct SQL (e.g., inserting events into the
+event store) to establish the initial state. Once setup is complete, the
+**scenario execution and verification** must follow all e2e rules above — the
+service runs, reacts to real events (blockchain, monitors), and correctness is
+asserted via API responses, Anvil state, and mock interactions.
+
 **A test is NOT e2e if it:**
 
-- Touches implementation details for setup (e.g., directly calling CQRS
-  commands)
-- Touches implementation details for verification (e.g., querying aggregates
-  directly)
-- Requires access to internal types or functions
+- Touches implementation details for **verification** (e.g., querying aggregates
+  directly, inspecting internal state after the scenario runs)
+- Touches implementation details during the **scenario execution** (e.g.,
+  calling CQRS commands to drive the flow instead of letting the service react)
+- Requires access to internal types or functions outside the setup phase
 
-**If a test requires touching implementation details**, it belongs in `src/` as
-a unit or integration test, NOT in `tests/`.
+**If a test requires touching implementation details beyond setup**, it belongs
+in `src/` as a unit or integration test, NOT in `tests/`.
 
 E2E tests live in `./tests/`. They test complete production flows, happy paths
 only, with real blockchain (Anvil).

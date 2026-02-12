@@ -16,6 +16,22 @@ they're derived from events.
 This is the power of event sourcing: unlimited flexibility in how you interpret
 historical data, as long as you preserve the raw facts.
 
+## Snapshots
+
+Performance optimization that caches aggregate state to skip replaying old
+events. **Not currently enabled** — all aggregates use `new_event_store`.
+
+**Enabling:** Replace `new_event_store(repo)` with `new_snapshot_store(repo, N)`
+where `N` is the snapshot frequency (events between snapshots). On load, replays
+only events after the last snapshot. On commit, writes a new snapshot when the
+event count crosses a frequency boundary. Switching between modes is safe in
+either direction.
+
+**Resetting:** `DELETE FROM snapshots WHERE aggregate_type = 'Mint';` — safe
+anytime, the next load replays all events. **Must** reset after changing an
+aggregate's struct layout (fields, variants) since the serialized snapshot won't
+deserialize against the new shape. Events are unaffected.
+
 ## Event Upcasters
 
 When you MUST change event structure (e.g., adding required fields to existing
