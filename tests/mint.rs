@@ -267,9 +267,18 @@ async fn test_mint_burn_mint_nonce_synchronization()
         "User should have shares after second mint"
     );
 
-    mint_callback_mock.assert();
-    redeem_mock.assert();
-    poll_mock.assert();
+    assert!(
+        mint_callback_mock.calls_async().await >= 2,
+        "Mint callback should be hit at least twice (once per mint)"
+    );
+    assert!(
+        redeem_mock.calls_async().await >= 1,
+        "Redeem endpoint should be hit at least once"
+    );
+    assert!(
+        poll_mock.calls_async().await >= 1,
+        "Poll endpoint should be hit at least once"
+    );
 
     Ok(())
 }
