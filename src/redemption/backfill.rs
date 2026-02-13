@@ -346,8 +346,14 @@ mod tests {
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
 
-        let transfer_log =
-            create_transfer_log(ap_wallet, bot_wallet, value, tx_hash, 100);
+        let transfer_log = create_transfer_log(
+            Address::ZERO,
+            ap_wallet,
+            bot_wallet,
+            value,
+            tx_hash,
+            100,
+        );
 
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
@@ -388,8 +394,14 @@ mod tests {
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
 
-        let mint_log =
-            create_transfer_log(Address::ZERO, bot_wallet, value, tx_hash, 100);
+        let mint_log = create_transfer_log(
+            Address::ZERO,
+            Address::ZERO,
+            bot_wallet,
+            value,
+            tx_hash,
+            100,
+        );
 
         let asserter = Asserter::new();
         asserter.push_success(&U256::from(200u64));
@@ -425,8 +437,14 @@ mod tests {
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         );
 
-        let transfer_log =
-            create_transfer_log(ap_wallet, bot_wallet, value, tx_hash, 100);
+        let transfer_log = create_transfer_log(
+            Address::ZERO,
+            ap_wallet,
+            bot_wallet,
+            value,
+            tx_hash,
+            100,
+        );
 
         let asserter1 = Asserter::new();
         asserter1.push_success(&U256::from(200u64));
@@ -481,6 +499,7 @@ mod tests {
         );
 
         let transfer_log = create_transfer_log(
+            Address::ZERO,
             unknown_wallet,
             bot_wallet,
             value,

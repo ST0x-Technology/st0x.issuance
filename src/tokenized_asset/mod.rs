@@ -125,13 +125,20 @@ impl Aggregate for TokenizedAsset {
                         updated_at: Utc::now(),
                     }])
                 }
-                Self::NotAdded => Ok(vec![TokenizedAssetEvent::Added {
-                    underlying,
-                    token,
-                    network,
-                    vault,
-                    added_at: Utc::now(),
-                }]),
+                Self::NotAdded => {
+                    tracing::info!(
+                        underlying = %underlying.0,
+                        vault = %vault,
+                        "Adding new tokenized asset"
+                    );
+                    Ok(vec![TokenizedAssetEvent::Added {
+                        underlying,
+                        token,
+                        network,
+                        vault,
+                        added_at: Utc::now(),
+                    }])
+                }
             },
         }
     }
@@ -173,14 +180,17 @@ pub(crate) enum TokenizedAssetError {}
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use tracing_test::traced_test;
 
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent, UnderlyingSymbol,
     };
+    use crate::test_utils::logs_contain_at;
 
     type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
 
+    #[traced_test]
     #[test]
     fn test_add_asset_creates_new_asset() {
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -222,8 +232,14 @@ mod tests {
             }
             Err(e) => panic!("Expected success, got error: {e}"),
         }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "AAPL"]
+        ));
     }
 
+    #[traced_test]
     #[test]
     fn test_add_asset_when_already_added_with_same_vault_is_idempotent() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -243,8 +259,14 @@ mod tests {
                 vault,
             })
             .then_expect_events(vec![]);
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Asset already added with same vault, skipping"]
+        ));
     }
 
+    #[traced_test]
     #[test]
     fn test_add_asset_with_different_vault_emits_vault_updated() {
         let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -287,6 +309,11 @@ mod tests {
             }
             Err(err) => panic!("Expected success, got error: {err}"),
         }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Updating vault address for asset", "AAPL"]
+        ));
     }
 
     #[test]

@@ -350,6 +350,7 @@ mod tests {
     }
 
     fn create_transfer_log(
+        vault_address: Address,
         from: Address,
         to: Address,
         value: U256,
@@ -366,7 +367,7 @@ mod tests {
 
         Log {
             inner: PrimitiveLog {
-                address: address!("0x0000000000000000000000000000000000000000"),
+                address: vault_address,
                 data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
             },
             block_hash: Some(b256!(
@@ -441,6 +442,7 @@ mod tests {
         let block_number = 12345;
 
         let log = create_transfer_log(
+            Address::ZERO,
             ap_wallet,
             bot_wallet,
             value,
@@ -516,6 +518,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
+            Address::ZERO,
             Address::ZERO,
             bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),
@@ -597,6 +600,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
+            Address::ZERO,
             address!("0x9999999999999999999999999999999999999999"),
             bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),

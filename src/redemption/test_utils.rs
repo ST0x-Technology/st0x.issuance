@@ -1,5 +1,5 @@
 use alloy::primitives::{
-    Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, address, b256,
+    Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, b256,
 };
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -106,6 +106,7 @@ pub(crate) async fn setup_test_db_with_asset(
 }
 
 pub(crate) fn create_transfer_log(
+    vault_address: Address,
     from: Address,
     to: Address,
     value: U256,
@@ -122,7 +123,7 @@ pub(crate) fn create_transfer_log(
 
     Log {
         inner: PrimitiveLog {
-            address: address!("0x0000000000000000000000000000000000000000"),
+            address: vault_address,
             data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
         },
         block_hash: Some(b256!(

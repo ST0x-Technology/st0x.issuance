@@ -10,6 +10,7 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 
+use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
@@ -187,10 +188,8 @@ async fn test_mint_burn_mint_nonce_synchronization()
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet = user_signer.address();
 
-    let _mint_callback_mock =
-        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (redeem_mock, poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("test_nonce_sync.db");
@@ -267,6 +266,10 @@ async fn test_mint_burn_mint_nonce_synchronization()
         final_balance > U256::ZERO,
         "User should have shares after second mint"
     );
+
+    mint_callback_mock.assert();
+    redeem_mock.assert();
+    poll_mock.assert();
 
     Ok(())
 }
