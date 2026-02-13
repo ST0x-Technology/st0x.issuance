@@ -1829,15 +1829,22 @@ LOG_LEVEL=info
 METRICS_PORT=9090
 ```
 
-### Private Key Management
+### Startup Job Orchestration
 
-**TBD** - Private key management strategy needs to be worked out in greater
-detail including:
+The service uses **apalis** (0.7.4, SQLite backend) for one-shot startup jobs
+that must complete before the service begins handling requests. Jobs are grouped
+into sequential phases:
 
-- Storage approach (encrypted file, HSM, KMS)
-- Access controls
-- Rotation procedures
-- Backup and recovery
-- Separation between minting and burning keys if needed
+| Phase | Job                     | Purpose                                            |
+| ----- | ----------------------- | -------------------------------------------------- |
+| 1     | `ViewReplayJob`         | Replays mint, redemption, receipt_burns views      |
+| 2     | `ReceiptBackfillJob`    | Backfills receipts for all vaults                  |
+| 2     | `TransferBackfillJob`   | Backfills transfers for all vaults (after receipt) |
+| 3     | `MintRecoveryJob`       | Recovers stuck mints                               |
+| 3     | `RedemptionRecoveryJob` | Recovers stuck redemptions                         |
 
-This is a critical security consideration that requires careful planning.
+Phases run sequentially. A phase controller pushes each job and polls until
+completion before moving to the next.
+
+**Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
+remain as `tokio::spawn` tasks since they run indefinitely.
