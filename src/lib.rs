@@ -24,12 +24,13 @@ use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
     Mint, MintServices, MintView, recovery::MintRecoveryHandler,
-    recovery_job::MintRecoveryJob,
+    recovery_job::MintRecoveryJob, replay_mint_view,
 };
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
     backfill_job::{ReceiptBackfillDeps, ReceiptBackfillJob},
+    burn_tracking::replay_receipt_burns_view,
 };
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -39,10 +40,12 @@ use crate::redemption::{
     journal_manager::JournalManager,
     recovery_job::RedemptionRecoveryJob,
     redeem_call_manager::RedeemCallManager,
+    replay_redemption_view,
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetViewRepo, VaultBackfillConfig,
+    view::replay_tokenized_asset_view,
 };
 
 pub mod account;
@@ -109,12 +112,10 @@ impl ViewReplayJob {
 
 async fn replay_all_views(pool: Pool<Sqlite>) -> Result<(), anyhow::Error> {
     replay_account_view(pool.clone()).await?;
-    crate::tokenized_asset::view::replay_tokenized_asset_view(pool.clone())
-        .await?;
-    crate::mint::replay_mint_view(pool.clone()).await?;
-    crate::redemption::replay_redemption_view(pool.clone()).await?;
-    crate::receipt_inventory::burn_tracking::replay_receipt_burns_view(pool)
-        .await?;
+    replay_tokenized_asset_view(pool.clone()).await?;
+    replay_mint_view(pool.clone()).await?;
+    replay_redemption_view(pool.clone()).await?;
+    replay_receipt_burns_view(pool).await?;
 
     Ok(())
 }
