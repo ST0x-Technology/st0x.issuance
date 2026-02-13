@@ -13,6 +13,9 @@ use super::{
     TokenizedAssetEvent, UnderlyingSymbol,
 };
 
+pub(crate) type TokenizedAssetViewRepo =
+    Arc<SqliteViewRepository<TokenizedAssetView, TokenizedAsset>>;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenizedAssetViewError {
     #[error("Database error: {0}")]
@@ -91,6 +94,9 @@ impl View<TokenizedAsset> for TokenizedAssetView {
                     added_at: *added_at,
                 };
             }
+            TokenizedAssetEvent::VaultAddressUpdated { vault, .. } => {
+                todo!("View update for VaultAddressUpdated: {vault}")
+            }
         }
     }
 }
@@ -114,6 +120,17 @@ pub(crate) async fn list_enabled_assets(
         .collect::<Result<_, _>>()?;
 
     Ok(views)
+}
+
+/// Loads the full tokenized asset view for a given underlying symbol.
+///
+/// Returns `Ok(Some(view))` if the asset exists, `Ok(None)` if not found,
+/// or an error on database failure.
+pub(crate) async fn load_asset_by_underlying(
+    repo: &TokenizedAssetViewRepo,
+    underlying: &UnderlyingSymbol,
+) -> Result<Option<TokenizedAssetView>, TokenizedAssetViewError> {
+    Ok(repo.load(&underlying.0).await?)
 }
 
 /// Finds the vault address for a given underlying symbol.

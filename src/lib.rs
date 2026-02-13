@@ -39,7 +39,7 @@ use crate::redemption::{
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView,
+    TokenizedAsset, TokenizedAssetView, TokenizedAssetViewRepo,
     view::{list_enabled_assets, replay_tokenized_asset_view},
 };
 
@@ -246,7 +246,11 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
+    let BasicCqrsSetup {
+        account_cqrs,
+        tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
+    } = setup_basic_cqrs(&pool);
 
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
@@ -349,6 +353,7 @@ pub async fn initialize_rocket(
         pool,
         account_cqrs,
         tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
         mint,
         redemption_cqrs,
     }))
@@ -360,6 +365,7 @@ struct RocketState {
     pool: Pool<Sqlite>,
     account_cqrs: AccountCqrs,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
+    tokenized_asset_view_repo: TokenizedAssetViewRepo,
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
 }
@@ -379,6 +385,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.rate_limiter)
         .manage(state.account_cqrs)
         .manage(state.tokenized_asset_cqrs)
+        .manage(state.tokenized_asset_view_repo)
         .manage(state.mint.cqrs)
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
@@ -391,6 +398,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 account::whitelist_wallet,
                 account::unwhitelist_wallet,
                 tokenized_asset::list_tokenized_assets,
+                tokenized_asset::get_tokenized_asset,
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
                 mint::confirm_journal
@@ -399,7 +407,13 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .register("/", catchers::json_catchers())
 }
 
-fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
+struct BasicCqrsSetup {
+    account_cqrs: AccountCqrs,
+    tokenized_asset_cqrs: TokenizedAssetCqrs,
+    tokenized_asset_view_repo: TokenizedAssetViewRepo,
+}
+
+fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -409,18 +423,21 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
+    let tokenized_asset_view_repo: TokenizedAssetViewRepo =
+        Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+    let tokenized_asset_query =
+        GenericQuery::new(tokenized_asset_view_repo.clone());
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    (account_cqrs, tokenized_asset_cqrs)
+    BasicCqrsSetup {
+        account_cqrs,
+        tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
+    }
 }
 
 fn setup_aggregate_cqrs(

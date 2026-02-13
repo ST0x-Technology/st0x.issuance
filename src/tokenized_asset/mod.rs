@@ -9,10 +9,12 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
-pub(crate) use api::{add_tokenized_asset, list_tokenized_assets};
+pub(crate) use api::{
+    add_tokenized_asset, get_tokenized_asset, list_tokenized_assets,
+};
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
-pub(crate) use view::TokenizedAssetView;
+pub(crate) use view::{TokenizedAssetView, TokenizedAssetViewRepo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnderlyingSymbol(pub(crate) String);
@@ -139,6 +141,9 @@ impl Aggregate for TokenizedAsset {
                     enabled: true,
                     added_at,
                 };
+            }
+            TokenizedAssetEvent::VaultAddressUpdated { vault, .. } => {
+                todo!("Apply VaultAddressUpdated: update vault to {vault}")
             }
         }
     }

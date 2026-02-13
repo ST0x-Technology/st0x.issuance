@@ -14,12 +14,20 @@ pub(crate) enum TokenizedAssetEvent {
         vault: Address,
         added_at: DateTime<Utc>,
     },
+    VaultAddressUpdated {
+        vault: Address,
+        previous_vault: Address,
+        updated_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for TokenizedAssetEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Added { .. } => "TokenizedAssetEvent::Added".to_string(),
+            Self::VaultAddressUpdated { .. } => {
+                "TokenizedAssetEvent::VaultAddressUpdated".to_string()
+            }
         }
     }
 

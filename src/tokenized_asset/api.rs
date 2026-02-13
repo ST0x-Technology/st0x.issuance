@@ -8,10 +8,57 @@ use sqlx::{Pool, Sqlite};
 use tracing::error;
 
 use super::{
-    Network, TokenSymbol, TokenizedAssetCommand, UnderlyingSymbol,
-    view::TokenizedAssetView,
+    Network, TokenSymbol, TokenizedAssetCommand, TokenizedAssetViewRepo,
+    UnderlyingSymbol, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TokenizedAssetDetailResponse {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) enabled: bool,
+}
+
+#[tracing::instrument(skip(_auth, view_repo))]
+#[get("/tokenized-assets/<underlying>")]
+pub(crate) async fn get_tokenized_asset(
+    underlying: &str,
+    _auth: InternalAuth,
+    view_repo: &rocket::State<TokenizedAssetViewRepo>,
+) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    let underlying_symbol = UnderlyingSymbol::new(underlying);
+
+    let view = super::view::load_asset_by_underlying(
+        view_repo.inner(),
+        &underlying_symbol,
+    )
+    .await
+    .map_err(|err| {
+        error!(error = %err, "Failed to load tokenized asset");
+        Status::InternalServerError
+    })?;
+
+    match view {
+        Some(TokenizedAssetView::Asset {
+            underlying,
+            token,
+            network,
+            vault,
+            enabled,
+            ..
+        }) => Ok(Json(TokenizedAssetDetailResponse {
+            underlying,
+            token,
+            network,
+            vault,
+            enabled,
+        })),
+        _ => Err(Status::NotFound),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TokenizedAssetResponse {
