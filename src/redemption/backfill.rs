@@ -236,6 +236,7 @@ mod tests {
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::SqlitePool;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::TransferBackfiller;
     use crate::account::{
@@ -248,6 +249,7 @@ mod tests {
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
     use crate::redemption::Redemption;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol, view::TokenizedAssetView,
@@ -468,6 +470,7 @@ mod tests {
         backfiller.backfill_transfers(vault, from_block).await
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn backfill_detects_transfer_to_bot_wallet() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -499,8 +502,18 @@ mod tests {
         assert_eq!(result.detected_count, 1);
         assert_eq!(result.skipped_mint, 0);
         assert_eq!(result.skipped_no_account, 0);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Starting transfer backfill"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Transfer backfill complete", "detected_count=1"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn backfill_skips_mint_events() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -525,8 +538,18 @@ mod tests {
 
         assert_eq!(result.detected_count, 0);
         assert_eq!(result.skipped_mint, 1);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Starting transfer backfill"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Transfer backfill complete", "skipped_mint=1"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn backfill_is_idempotent() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -573,8 +596,14 @@ mod tests {
             result2.is_ok(),
             "Backfill should be idempotent, got: {result2:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Transfer backfill complete"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn backfill_skips_transfers_from_unwhitelisted_wallets() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -606,8 +635,14 @@ mod tests {
 
         assert_eq!(result.detected_count, 0);
         assert_eq!(result.skipped_no_account, 1);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Transfer backfill complete", "skipped_no_account=1"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn backfill_skips_when_from_block_ahead_of_chain() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -624,5 +659,10 @@ mod tests {
         assert_eq!(result.detected_count, 0);
         assert_eq!(result.skipped_mint, 0);
         assert_eq!(result.skipped_no_account, 0);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Transfer backfill skipped", "from_block is ahead"]
+        ));
     }
 }

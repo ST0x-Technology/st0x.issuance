@@ -315,6 +315,7 @@ mod tests {
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::SqlitePool;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
     use crate::account::{
@@ -323,6 +324,7 @@ mod tests {
     };
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::redemption::Redemption;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol, view::TokenizedAssetView,
@@ -461,6 +463,7 @@ mod tests {
         }
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_success() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -497,8 +500,14 @@ mod tests {
                 context.aggregate()
             );
         }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Redemption transfer detected"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_skips_mint_events() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -526,8 +535,14 @@ mod tests {
             matches!(result, Ok(TransferOutcome::SkippedMint)),
             "Expected SkippedMint, got {result:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Skipping mint event"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_missing_tx_hash() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -555,6 +570,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_missing_block_number() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -582,6 +598,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_no_matching_asset() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -616,6 +633,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_skips_unknown_wallet() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -644,8 +662,14 @@ mod tests {
             matches!(result, Ok(TransferOutcome::SkippedNoAccount)),
             "Expected SkippedNoAccount, got {result:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Skipping transfer from unknown/unlinked wallet"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn detect_transfer_idempotent_on_duplicate() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -674,5 +698,14 @@ mod tests {
             matches!(second, Ok(TransferOutcome::AlreadyDetected)),
             "Second detection should return AlreadyDetected, got {second:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Redemption transfer detected"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Transfer already detected"]
+        ));
     }
 }

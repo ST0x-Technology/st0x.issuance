@@ -1,3 +1,7 @@
+pub const ROLE_DEPOSIT: &str = "DEPOSIT";
+pub const ROLE_WITHDRAW: &str = "WITHDRAW";
+pub const ROLE_CERTIFY: &str = "CERTIFY";
+
 use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -474,7 +478,7 @@ impl LocalEvm {
         &self,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        self.grant_role("DEPOSIT", to).await
+        self.grant_role(ROLE_DEPOSIT, to).await
     }
 
     /// Grants the WITHDRAW role to an address via the authorizer contract.
@@ -489,7 +493,7 @@ impl LocalEvm {
         &self,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        self.grant_role("WITHDRAW", to).await
+        self.grant_role(ROLE_WITHDRAW, to).await
     }
 
     /// Grants the CERTIFY role to an address via the authorizer contract.
@@ -504,7 +508,7 @@ impl LocalEvm {
         &self,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        self.grant_role("CERTIFY", to).await
+        self.grant_role(ROLE_CERTIFY, to).await
     }
 
     /// Certifies the vault to enable deposits/withdrawals.

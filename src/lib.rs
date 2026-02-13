@@ -572,7 +572,7 @@ fn spawn_all_redemption_detectors(
     );
 
     for config in vault_configs {
-        info!(
+        debug!(
             vault = %config.vault,
             bot_wallet = %bot_wallet,
             "Spawning redemption detector for vault"
@@ -815,7 +815,7 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
             .backfill_transfers(config.vault, backfill_start_block)
             .await?;
 
-        info!(
+        debug!(
             vault = %config.vault,
             detected = result.detected_count,
             skipped_mint = result.skipped_mint,

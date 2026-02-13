@@ -16,7 +16,9 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::mint::MintResponse;
-use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::test_utils::{
+    LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
+};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
     SignerConfig,
@@ -315,13 +317,13 @@ pub async fn setup_roles_on_vault(
     user_wallet: Address,
     bot_wallet: Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    evm.grant_role_on_authorizer(authorizer_address, "DEPOSIT", user_wallet)
+    evm.grant_role_on_authorizer(authorizer_address, ROLE_DEPOSIT, user_wallet)
         .await?;
-    evm.grant_role_on_authorizer(authorizer_address, "WITHDRAW", bot_wallet)
+    evm.grant_role_on_authorizer(authorizer_address, ROLE_WITHDRAW, bot_wallet)
         .await?;
     evm.grant_role_on_authorizer(
         authorizer_address,
-        "CERTIFY",
+        ROLE_CERTIFY,
         evm.wallet_address,
     )
     .await?;

@@ -20,8 +20,8 @@ pub(crate) enum TokenizedAssetViewError {
     Deserialization(#[from] serde_json::Error),
     #[error("Persistence error: {0}")]
     Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Replay error: {0}")]
-    Replay(#[from] cqrs_es::AggregateError<TokenizedAssetError>),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] cqrs_es::AggregateError<TokenizedAssetError>),
 }
 
 /// Replays all `TokenizedAsset` events through the `tokenized_asset_view`.
@@ -143,6 +143,7 @@ mod tests {
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
@@ -321,6 +322,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_replay_rebuilds_view_from_events() {
         let pool = SqlitePoolOptions::new()

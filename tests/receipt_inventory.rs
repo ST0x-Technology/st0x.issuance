@@ -8,7 +8,7 @@ use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use url::Url;
 
-use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
     SignerConfig, initialize_rocket,
@@ -204,9 +204,9 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     let (tsla_vault, tsla_authorizer) = evm.deploy_additional_vault().await?;
 
     // Grant roles on TSLA vault to bot wallet
-    evm.grant_role_on_authorizer(tsla_authorizer, "DEPOSIT", bot_wallet)
+    evm.grant_role_on_authorizer(tsla_authorizer, ROLE_DEPOSIT, bot_wallet)
         .await?;
-    evm.grant_role_on_authorizer(tsla_authorizer, "CERTIFY", bot_wallet)
+    evm.grant_role_on_authorizer(tsla_authorizer, ROLE_CERTIFY, bot_wallet)
         .await?;
     evm.certify_specific_vault(tsla_vault, U256::MAX).await?;
 
