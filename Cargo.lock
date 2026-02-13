@@ -5314,6 +5314,7 @@ dependencies = [
  "sqlite-es",
  "sqlx",
  "subtle",
+ "task-supervisor",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -5496,6 +5497,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "task-supervisor"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a2a73c89b01f8d04f1d73b27889d91b0e886551b50fbf64381f2de4e3075c8b"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5640,6 +5655,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.1",

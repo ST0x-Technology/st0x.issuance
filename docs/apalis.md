@@ -73,7 +73,36 @@ phase completes before the next begins:
 ## What stays outside apalis
 
 Continuous monitors — receipt monitors and redemption detectors — are **not**
-apalis jobs. They run as long-lived tasks via `tokio::spawn` because they
-maintain WebSocket subscriptions and process events indefinitely. Apalis is for
-finite work that completes; `tokio::spawn` is for processes that run for the
-lifetime of the service.
+apalis jobs. They run as long-lived supervised tasks via `task-supervisor`
+because they maintain WebSocket subscriptions and process events indefinitely.
+
+### Two-layer architecture
+
+```
+task-supervisor (outermost — runs indefinitely, restarts crashed tasks)
+  ├── ReceiptMonitor (vault A)
+  ├── ReceiptMonitor (vault B)
+  ├── RedemptionDetector (vault A)
+  └── RedemptionDetector (vault B)
+
+apalis (work layer — finite jobs that complete during startup)
+  ├── ViewReplayJob
+  ├── ReceiptBackfillJob
+  ├── TransferBackfillJob
+  ├── MintRecoveryJob
+  └── RedemptionRecoveryJob
+```
+
+**Apalis** handles finite startup/recovery work: backfilling historic data,
+replaying views, and recovering in-progress operations. Jobs run to completion
+during the phased startup sequence.
+
+**task-supervisor** handles long-running monitors that must survive transient
+failures. Each monitor implements `SupervisedTask` and is registered with a
+`SupervisorBuilder`. The supervisor restarts crashed tasks with configurable
+backoff (unlimited restarts, 5s base delay). Monitors have their own internal
+retry loops for transient WebSocket failures; the supervisor handles
+catastrophic failures (panics, unexpected exits).
+
+The startup sequence: apalis jobs run to completion first (producing vault
+configs), then the supervisor takes over with the long-running monitors.

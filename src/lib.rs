@@ -1,5 +1,4 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
 use apalis::prelude::{
     Monitor, State, Storage, WorkerBuilder, WorkerFactoryFn,
 };
@@ -14,9 +13,10 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
+use task_supervisor::{SupervisorBuilder, SupervisorHandle};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info};
-use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
@@ -26,7 +26,7 @@ use crate::mint::{
     recovery_job::MintRecoveryJob,
 };
 use crate::receipt_inventory::{
-    CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
+    CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
     backfill_job::{ReceiptBackfillDeps, ReceiptBackfillJob},
 };
@@ -115,6 +115,19 @@ async fn replay_all_views(pool: Pool<Sqlite>) -> Result<(), anyhow::Error> {
         .await?;
 
     Ok(())
+}
+
+/// A `JoinHandle` wrapper that aborts the task when dropped.
+///
+/// Ensures spawned background tasks (like the apalis monitor) are cleaned up
+/// when the owning service is dropped, preventing orphaned tasks from
+/// interfering with subsequent service instances sharing the same database.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Pushes a job to the storage and polls until it completes.
@@ -450,11 +463,11 @@ pub async fn initialize_rocket(
                 .build_fn(RedemptionRecoveryJob::run),
         );
 
-    tokio::spawn(async move {
+    let apalis_handle = AbortOnDrop(tokio::spawn(async move {
         if let Err(err) = monitor.run().await {
             error!(error = %err, "Startup job monitor failed");
         }
-    });
+    }));
 
     // Phase 1: View replay (must complete before recovery queries views)
     push_and_await(&mut view_replay_storage, ViewReplayJob, "view-replay")
@@ -495,22 +508,60 @@ pub async fn initialize_rocket(
         .clone()
         .unwrap_or_default();
 
-    spawn_all_receipt_monitors(
-        blockchain_setup.provider,
-        &final_vault_configs,
-        &receipt_inventory.cqrs,
-        bot_wallet,
-        &MintRecoveryHandler::new(mint.cqrs.clone()),
-    );
+    let mut supervisor_builder = SupervisorBuilder::new()
+        .with_unlimited_restarts()
+        .with_base_restart_delay(Duration::from_secs(5))
+        .with_health_check_interval(Duration::from_secs(60));
 
-    spawn_all_redemption_detectors(
-        &config.rpc_url,
-        &final_vault_configs,
-        &redemption_cqrs,
-        &redemption_event_store,
-        &pool,
-        &managers,
-        bot_wallet,
+    let itn_handler = MintRecoveryHandler::new(mint.cqrs.clone());
+
+    for vault_config in &final_vault_configs {
+        let monitor_config = ReceiptMonitorConfig {
+            vault: vault_config.vault,
+            receipt_contract: vault_config.receipt_contract,
+            bot_wallet,
+        };
+
+        let receipt_monitor = ReceiptMonitor::new(
+            blockchain_setup.provider.clone(),
+            monitor_config,
+            receipt_inventory.cqrs.clone(),
+            itn_handler.clone(),
+        );
+
+        supervisor_builder = supervisor_builder.with_task(
+            &format!("receipt-monitor-{:.8}", vault_config.vault),
+            receipt_monitor,
+        );
+
+        let detector_config = RedemptionDetectorConfig {
+            rpc_url: config.rpc_url.clone(),
+            vault: vault_config.vault,
+            bot_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            detector_config,
+            redemption_cqrs.clone(),
+            redemption_event_store.clone(),
+            pool.clone(),
+            managers.redeem_call.clone(),
+            managers.journal.clone(),
+            managers.burn.clone(),
+        );
+
+        supervisor_builder = supervisor_builder.with_task(
+            &format!("redemption-detector-{:.8}", vault_config.vault),
+            detector,
+        );
+    }
+
+    let supervisor = supervisor_builder.build();
+    let supervisor_handle = supervisor.run();
+
+    info!(
+        vault_count = final_vault_configs.len(),
+        "Task supervisor started with all monitors"
     );
 
     Ok(build_rocket(RocketState {
@@ -522,6 +573,8 @@ pub async fn initialize_rocket(
         tokenized_asset_view_repo,
         mint,
         redemption_cqrs,
+        supervisor_handle,
+        apalis_handle,
     }))
 }
 
@@ -534,6 +587,8 @@ struct RocketState {
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
+    supervisor_handle: SupervisorHandle,
+    apalis_handle: AbortOnDrop<()>,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -556,6 +611,8 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
         .manage(state.pool)
+        .manage(state.supervisor_handle)
+        .manage(state.apalis_handle)
         .mount(
             "/",
             routes![
@@ -735,116 +792,6 @@ fn setup_redemption_managers(
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
-}
-
-/// Spawns redemption detectors for ALL enabled vaults.
-fn spawn_all_redemption_detectors(
-    rpc_url: &Url,
-    vault_configs: &[VaultBackfillConfig],
-    redemption_cqrs: &Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: &Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: &Pool<Sqlite>,
-    managers: &RedemptionManagers,
-    bot_wallet: Address,
-) {
-    info!(
-        vault_count = vault_configs.len(),
-        "Spawning redemption detectors for all vaults"
-    );
-
-    for config in vault_configs {
-        debug!(
-            vault = %config.vault,
-            bot_wallet = %bot_wallet,
-            "Spawning redemption detector for vault"
-        );
-
-        spawn_redemption_detector(
-            rpc_url.clone(),
-            config.vault,
-            redemption_cqrs.clone(),
-            redemption_event_store.clone(),
-            pool.clone(),
-            managers.clone(),
-            bot_wallet,
-        );
-    }
-}
-
-fn spawn_redemption_detector(
-    rpc_url: Url,
-    vault: Address,
-    redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: Pool<Sqlite>,
-    managers: RedemptionManagers,
-    bot_wallet: Address,
-) {
-    info!(bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
-
-    let detector_config =
-        RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
-
-    let detector = RedemptionDetector::new(
-        detector_config,
-        redemption_cqrs,
-        redemption_event_store,
-        pool,
-        managers.redeem_call,
-        managers.journal,
-        managers.burn,
-    );
-
-    tokio::spawn(async move {
-        detector.run().await;
-    });
-}
-
-/// Spawns receipt monitors for ALL enabled vaults.
-fn spawn_all_receipt_monitors<P, ITN>(
-    provider: P,
-    vault_configs: &[VaultBackfillConfig],
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    bot_wallet: Address,
-    handler: &ITN,
-) where
-    P: Provider + Clone + Send + Sync + 'static,
-    ITN: ItnReceiptHandler + Clone + 'static,
-{
-    info!(
-        vault_count = vault_configs.len(),
-        "Spawning receipt monitors for all vaults"
-    );
-
-    for config in vault_configs {
-        info!(
-            vault = %config.vault,
-            receipt_contract = %config.receipt_contract,
-            bot_wallet = %bot_wallet,
-            "Spawning receipt monitor for vault"
-        );
-
-        let monitor_config = ReceiptMonitorConfig {
-            vault: config.vault,
-            receipt_contract: config.receipt_contract,
-            bot_wallet,
-        };
-
-        let monitor = ReceiptMonitor::new(
-            provider.clone(),
-            monitor_config,
-            receipt_inventory_cqrs.clone(),
-            handler.clone(),
-        );
-
-        tokio::spawn(async move {
-            monitor.run().await;
-        });
-    }
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {

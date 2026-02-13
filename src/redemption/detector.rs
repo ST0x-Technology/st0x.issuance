@@ -1,10 +1,12 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{info, warn};
 use url::Url;
 
@@ -47,6 +49,27 @@ where
     redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     journal_manager: Arc<JournalManager<RedemptionStore>>,
     burn_manager: Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
+}
+
+impl<RedemptionStore, ReceiptInventoryStore> Clone
+    for RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+where
+    RedemptionStore: EventStore<Redemption>,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            rpc_url: self.rpc_url.clone(),
+            vault: self.vault,
+            bot_wallet: self.bot_wallet,
+            cqrs: self.cqrs.clone(),
+            event_store: self.event_store.clone(),
+            pool: self.pool.clone(),
+            redeem_call_manager: self.redeem_call_manager.clone(),
+            journal_manager: self.journal_manager.clone(),
+            burn_manager: self.burn_manager.clone(),
+        }
+    }
 }
 
 impl<RedemptionStore, ReceiptInventoryStore>
@@ -95,7 +118,7 @@ where
     /// This method never returns under normal operation. If a WebSocket error occurs,
     /// it logs the error and reconnects after 5 seconds.
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn run(&self) {
+    pub(crate) async fn run_monitor(&self) {
         loop {
             if let Err(err) = self.monitor_once().await {
                 warn!(
@@ -182,6 +205,21 @@ where
             | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedNoAccount => Ok(None),
         }
+    }
+}
+
+#[async_trait]
+impl<RedemptionStore, ReceiptInventoryStore> SupervisedTask
+    for RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+where
+    RedemptionStore: EventStore<Redemption> + Send + Sync + 'static,
+    ReceiptInventoryStore: EventStore<ReceiptInventory> + Send + Sync + 'static,
+    RedemptionStore::AC: Send,
+    ReceiptInventoryStore::AC: Send,
+{
+    async fn run(&mut self) -> TaskResult {
+        self.run_monitor().await;
+        Ok(())
     }
 }
 

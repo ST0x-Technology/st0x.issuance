@@ -1793,4 +1793,5 @@ Phases run sequentially. A phase controller pushes each job and polls until
 completion before moving to the next.
 
 **Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
-remain as `tokio::spawn` tasks since they run indefinitely.
+run as supervised tasks via `task-supervisor`, which restarts them on crash. See
+[docs/apalis.md](docs/apalis.md) for the two-layer architecture.
