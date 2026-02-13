@@ -16,6 +16,14 @@ pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::{TokenizedAssetView, TokenizedAssetViewRepo};
 
+/// Configuration for a single vault, extracted from TokenizedAssetView during
+/// receipt backfill and shared with transfer backfill and continuous monitors.
+#[derive(Clone)]
+pub(crate) struct VaultBackfillConfig {
+    pub(crate) vault: Address,
+    pub(crate) receipt_contract: Address,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnderlyingSymbol(pub(crate) String);
 
