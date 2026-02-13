@@ -205,6 +205,8 @@ fn block_ranges(
     to: u64,
     chunk_size: u64,
 ) -> impl Iterator<Item = (u64, u64)> {
+    debug_assert!(chunk_size > 0, "chunk_size must be positive");
+
     std::iter::successors(Some(from), move |&start| {
         let next = start + chunk_size;
         if next <= to { Some(next) } else { None }
@@ -215,26 +217,23 @@ fn block_ranges(
 #[cfg(test)]
 mod tests {
     use alloy::network::EthereumWallet;
-    use alloy::primitives::{
-        Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, address, b256,
-    };
+    use alloy::primitives::{Address, U256, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
-    use alloy::sol_types::SolEvent;
     use cqrs_es::{CqrsFramework, mem_store::MemStore};
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::TransferBackfiller;
     use crate::alpaca::mock::MockAlpacaService;
-    use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
     use crate::redemption::Redemption;
-    use crate::redemption::test_utils::setup_test_db_with_asset;
+    use crate::redemption::test_utils::{
+        create_transfer_log, setup_test_db_with_asset,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::vault::mock::MockVaultService;
 
@@ -272,38 +271,6 @@ mod tests {
                 receipt_inventory_cqrs.clone(),
             ));
         (cqrs, store, receipt_service, receipt_inventory_cqrs)
-    }
-
-    fn create_transfer_log(
-        from: Address,
-        to: Address,
-        value: U256,
-        tx_hash: B256,
-        block_number: u64,
-    ) -> Log {
-        let topics = vec![
-            OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
-            B256::left_padding_from(&from[..]),
-            B256::left_padding_from(&to[..]),
-        ];
-
-        let data_bytes = value.to_be_bytes::<32>();
-
-        Log {
-            inner: PrimitiveLog {
-                address: address!("0x0000000000000000000000000000000000000000"),
-                data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
-            },
-            block_hash: Some(b256!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            )),
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash),
-            transaction_index: Some(0),
-            log_index: Some(0),
-            removed: false,
-        }
     }
 
     async fn setup_and_run_backfill(

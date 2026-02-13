@@ -1,4 +1,8 @@
-use alloy::primitives::Address;
+use alloy::primitives::{
+    Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, address, b256,
+};
+use alloy::rpc::types::Log;
+use alloy::sol_types::SolEvent;
 use cqrs_es::persist::GenericQuery;
 use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
@@ -8,6 +12,7 @@ use crate::account::view::AccountView;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
+use crate::bindings::OffchainAssetReceiptVault;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol, view::TokenizedAssetView,
@@ -98,4 +103,36 @@ pub(crate) async fn setup_test_db_with_asset(
     }
 
     pool
+}
+
+pub(crate) fn create_transfer_log(
+    from: Address,
+    to: Address,
+    value: U256,
+    tx_hash: B256,
+    block_number: u64,
+) -> Log {
+    let topics = vec![
+        OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
+        B256::left_padding_from(&from[..]),
+        B256::left_padding_from(&to[..]),
+    ];
+
+    let data_bytes = value.to_be_bytes::<32>();
+
+    Log {
+        inner: PrimitiveLog {
+            address: address!("0x0000000000000000000000000000000000000000"),
+            data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
+        },
+        block_hash: Some(b256!(
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        )),
+        block_number: Some(block_number),
+        block_timestamp: None,
+        transaction_hash: Some(tx_hash),
+        transaction_index: Some(0),
+        log_index: Some(0),
+        removed: false,
+    }
 }

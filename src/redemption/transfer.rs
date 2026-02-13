@@ -283,6 +283,12 @@ pub(crate) async fn drive_redemption_flow<
                     "handle_burning_started failed"
                 );
             }
+        } else {
+            debug!(
+                %issuer_request_id,
+                aggregate_state = ?aggregate_ctx.aggregate(),
+                "Aggregate not in Burning state after journal completion"
+            );
         }
     });
 }
@@ -310,11 +316,7 @@ async fn find_matching_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{
-        Address, B256, Bytes, Log as PrimitiveLog, LogData, U256, address, b256,
-    };
-    use alloy::rpc::types::Log;
-    use alloy::sol_types::SolEvent;
+    use alloy::primitives::{Address, U256, address, b256};
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
     };
@@ -322,9 +324,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
-    use crate::bindings::OffchainAssetReceiptVault;
     use crate::redemption::Redemption;
-    use crate::redemption::test_utils::setup_test_db_with_asset;
+    use crate::redemption::test_utils::{
+        create_transfer_log, setup_test_db_with_asset,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::vault::mock::MockVaultService;
 
@@ -341,38 +344,6 @@ mod tests {
             vault_service,
         ));
         (cqrs, store)
-    }
-
-    fn create_transfer_log(
-        from: Address,
-        to: Address,
-        value: U256,
-        tx_hash: B256,
-        block_number: u64,
-    ) -> Log {
-        let topics = vec![
-            OffchainAssetReceiptVault::Transfer::SIGNATURE_HASH,
-            B256::left_padding_from(&from[..]),
-            B256::left_padding_from(&to[..]),
-        ];
-
-        let data_bytes = value.to_be_bytes::<32>();
-
-        Log {
-            inner: PrimitiveLog {
-                address: address!("0x0000000000000000000000000000000000000000"),
-                data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
-            },
-            block_hash: Some(b256!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            )),
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash),
-            transaction_index: Some(0),
-            log_index: Some(0),
-            removed: false,
-        }
     }
 
     #[traced_test]
