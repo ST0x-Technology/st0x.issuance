@@ -153,16 +153,20 @@ where
             }
         }
 
-        info!(
-            detected_count,
-            skipped_mint, skipped_no_account, "Transfer backfill complete"
-        );
-
-        Ok(TransferBackfillResult {
+        let result = TransferBackfillResult {
             detected_count,
             skipped_mint,
             skipped_no_account,
-        })
+        };
+
+        info!(
+            detected_count = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete"
+        );
+
+        Ok(result)
     }
 
     async fn fetch_transfer_logs(

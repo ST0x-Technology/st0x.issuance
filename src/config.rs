@@ -1,4 +1,4 @@
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
 use std::sync::Arc;
@@ -14,9 +14,9 @@ use crate::fireblocks::{
 use crate::telemetry::HyperDxConfig;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
-pub(crate) struct BlockchainSetup<P> {
+pub(crate) struct BlockchainSetup {
     pub(crate) vault_service: Arc<dyn VaultService>,
-    pub(crate) provider: P,
+    pub(crate) provider: DynProvider,
 }
 
 /// Default chain ID (Base mainnet)
@@ -55,8 +55,7 @@ impl Config {
     /// connections to the same RPC endpoint.
     pub(crate) async fn create_blockchain_setup(
         &self,
-    ) -> Result<BlockchainSetup<impl Provider + Clone + use<>>, ConfigError>
-    {
+    ) -> Result<BlockchainSetup, ConfigError> {
         let provider =
             ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
 
@@ -93,7 +92,7 @@ impl Config {
             }
         };
 
-        Ok(BlockchainSetup { vault_service, provider })
+        Ok(BlockchainSetup { vault_service, provider: provider.erased() })
     }
 }
 

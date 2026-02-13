@@ -26,6 +26,8 @@ the limit, condense explanations without removing any rules.
   services)
 - [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
   (externalTxId, SDK error handling)
+- [docs/apalis.md](docs/apalis.md) - Apalis job management (startup jobs,
+  migration ordering, job pattern)
 
 **Update at the end** (see "After completing a plan" checklist below):
 
