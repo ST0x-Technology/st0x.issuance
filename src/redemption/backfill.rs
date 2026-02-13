@@ -223,28 +223,19 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolEvent;
-    use cqrs_es::{CqrsFramework, mem_store::MemStore, persist::GenericQuery};
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-    use sqlx::SqlitePool;
+    use cqrs_es::{CqrsFramework, mem_store::MemStore};
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::TransferBackfiller;
-    use crate::account::{
-        Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
-        view::AccountView,
-    };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
     use crate::redemption::Redemption;
+    use crate::redemption::test_utils::setup_test_db_with_asset;
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol, view::TokenizedAssetView,
-    };
     use crate::vault::mock::MockVaultService;
 
     type TestRedemptionStore = MemStore<Redemption>;
@@ -281,91 +272,6 @@ mod tests {
                 receipt_inventory_cqrs.clone(),
             ));
         (cqrs, store, receipt_service, receipt_inventory_cqrs)
-    }
-
-    async fn setup_test_db_with_asset(
-        vault: Address,
-        ap_wallet: Option<Address>,
-    ) -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-        let asset_query = GenericQuery::new(asset_view_repo);
-        let asset_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
-
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
-
-        asset_cqrs
-            .execute(
-                &underlying.0,
-                TokenizedAssetCommand::Add {
-                    underlying: underlying.clone(),
-                    token,
-                    network,
-                    vault,
-                },
-            )
-            .await
-            .unwrap();
-
-        if let Some(wallet) = ap_wallet {
-            let account_view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
-
-            let account_query = GenericQuery::new(account_view_repo);
-            let account_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
-
-            let client_id = ClientId::new();
-            let email = Email::new("test@example.com".to_string()).unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::Register { client_id, email },
-                )
-                .await
-                .unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::LinkToAlpaca {
-                        alpaca_account: AlpacaAccountNumber(
-                            "ALPACA123".to_string(),
-                        ),
-                    },
-                )
-                .await
-                .unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::WhitelistWallet { wallet },
-                )
-                .await
-                .unwrap();
-        }
-
-        pool
     }
 
     fn create_transfer_log(
@@ -542,7 +448,7 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn backfill_is_idempotent() {
+    async fn backfill_succeeds_on_repeated_input() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
@@ -570,7 +476,7 @@ mod tests {
         .unwrap();
         assert_eq!(result1.detected_count, 1);
 
-        // Second run with same transfer — should not error (idempotent)
+        // Second run with same transfer — independent store, verifies no crash
         let asserter2 = Asserter::new();
         asserter2.push_success(&U256::from(200u64));
         asserter2.push_success(&vec![transfer_log]);
@@ -585,7 +491,7 @@ mod tests {
         .await;
         assert!(
             result2.is_ok(),
-            "Backfill should be idempotent, got: {result2:?}"
+            "Backfill should succeed on repeated input, got: {result2:?}"
         );
 
         assert!(logs_contain_at!(

@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use alloy::sol_types::SolEvent;
-use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
+use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -113,15 +113,16 @@ where
         block_number,
     };
 
-    if let Err(err) =
-        cqrs.execute(&issuer_request_id.to_string(), command).await
-    {
-        debug!(
-            %issuer_request_id,
-            error = ?err,
-            "Transfer already detected"
-        );
-        return Ok(TransferOutcome::AlreadyDetected);
+    match cqrs.execute(&issuer_request_id.to_string(), command).await {
+        Ok(()) => {}
+        Err(AggregateError::UserError(_)) => {
+            debug!(
+                %issuer_request_id,
+                "Transfer already detected"
+            );
+            return Ok(TransferOutcome::AlreadyDetected);
+        }
+        Err(err) => return Err(err.into()),
     }
 
     info!(
@@ -136,27 +137,6 @@ where
         alpaca_account,
         network,
     })
-}
-
-async fn find_matching_asset(
-    pool: &Pool<Sqlite>,
-    vault: Address,
-) -> Result<(UnderlyingSymbol, TokenSymbol, Network), TransferProcessingError> {
-    let assets = list_enabled_assets(pool).await?;
-
-    assets
-        .into_iter()
-        .find_map(|view| match view {
-            TokenizedAssetView::Asset {
-                underlying,
-                token,
-                network,
-                vault: addr,
-                ..
-            } if addr == vault => Some((underlying, token, network)),
-            _ => None,
-        })
-        .ok_or(TransferProcessingError::NoMatchingAsset { vault })
 }
 
 /// Dependencies for driving the post-detection redemption flow.
@@ -244,6 +224,11 @@ pub(crate) async fn drive_redemption_flow<
     let Redemption::AlpacaCalled { tokenization_request_id, .. } =
         aggregate_ctx.aggregate()
     else {
+        debug!(
+            %issuer_request_id,
+            aggregate_state = ?aggregate_ctx.aggregate(),
+            "Aggregate not in AlpacaCalled state after redeem call"
+        );
         return;
     };
 
@@ -302,6 +287,27 @@ pub(crate) async fn drive_redemption_flow<
     });
 }
 
+async fn find_matching_asset(
+    pool: &Pool<Sqlite>,
+    vault: Address,
+) -> Result<(UnderlyingSymbol, TokenSymbol, Network), TransferProcessingError> {
+    let assets = list_enabled_assets(pool).await?;
+
+    assets
+        .into_iter()
+        .find_map(|view| match view {
+            TokenizedAssetView::Asset {
+                underlying,
+                token,
+                network,
+                vault: addr,
+                ..
+            } if addr == vault => Some((underlying, token, network)),
+            _ => None,
+        })
+        .ok_or(TransferProcessingError::NoMatchingAsset { vault })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{
@@ -311,25 +317,15 @@ mod tests {
     use alloy::sol_types::SolEvent;
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
-        persist::GenericQuery,
     };
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-    use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
-    use crate::account::{
-        Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
-        view::AccountView,
-    };
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::redemption::Redemption;
+    use crate::redemption::test_utils::setup_test_db_with_asset;
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol, view::TokenizedAssetView,
-    };
     use crate::vault::mock::MockVaultService;
 
     type TestStore = MemStore<Redemption>;
@@ -345,91 +341,6 @@ mod tests {
             vault_service,
         ));
         (cqrs, store)
-    }
-
-    async fn setup_test_db_with_asset(
-        vault: Address,
-        ap_wallet: Option<Address>,
-    ) -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        let asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-        let asset_query = GenericQuery::new(asset_view_repo);
-        let asset_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
-
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
-
-        asset_cqrs
-            .execute(
-                &underlying.0,
-                TokenizedAssetCommand::Add {
-                    underlying: underlying.clone(),
-                    token,
-                    network,
-                    vault,
-                },
-            )
-            .await
-            .unwrap();
-
-        if let Some(wallet) = ap_wallet {
-            let account_view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
-
-            let account_query = GenericQuery::new(account_view_repo);
-            let account_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
-
-            let client_id = ClientId::new();
-            let email = Email::new("test@example.com".to_string()).unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::Register { client_id, email },
-                )
-                .await
-                .unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::LinkToAlpaca {
-                        alpaca_account: AlpacaAccountNumber(
-                            "ALPACA123".to_string(),
-                        ),
-                    },
-                )
-                .await
-                .unwrap();
-
-            account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::WhitelistWallet { wallet },
-                )
-                .await
-                .unwrap();
-        }
-
-        pool
     }
 
     fn create_transfer_log(
