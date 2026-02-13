@@ -362,12 +362,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            Address::ZERO,
-            ap_wallet,
-            bot_wallet,
-            value,
-            tx_hash,
-            12345,
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
         );
 
         let result = detect_transfer(&log, vault, &cqrs, &pool).await;
@@ -411,7 +406,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             Address::ZERO,
             bot_wallet,
             value,
@@ -442,7 +437,7 @@ mod tests {
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let mut log = create_transfer_log(
-            Address::ZERO,
+            vault,
             address!("0x9999999999999999999999999999999999999999"),
             bot_wallet,
             U256::from(100),
@@ -471,7 +466,7 @@ mod tests {
         let pool = setup_test_db_with_asset(vault, None).await;
 
         let mut log = create_transfer_log(
-            Address::ZERO,
+            vault,
             address!("0x9999999999999999999999999999999999999999"),
             bot_wallet,
             U256::from(100),
@@ -505,7 +500,7 @@ mod tests {
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             ap_wallet,
             bot_wallet,
             value,
@@ -540,7 +535,7 @@ mod tests {
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             unknown_wallet,
             bot_wallet,
             value,
@@ -579,12 +574,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            Address::ZERO,
-            ap_wallet,
-            bot_wallet,
-            value,
-            tx_hash,
-            12345,
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
         );
 
         let first = detect_transfer(&log, vault, &cqrs, &pool).await;

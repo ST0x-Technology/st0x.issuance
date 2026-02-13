@@ -442,7 +442,7 @@ mod tests {
         let block_number = 12345;
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             ap_wallet,
             bot_wallet,
             value,
@@ -518,7 +518,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             Address::ZERO,
             bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),
@@ -600,7 +600,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            Address::ZERO,
+            vault,
             address!("0x9999999999999999999999999999999999999999"),
             bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),

@@ -347,12 +347,7 @@ mod tests {
         );
 
         let transfer_log = create_transfer_log(
-            Address::ZERO,
-            ap_wallet,
-            bot_wallet,
-            value,
-            tx_hash,
-            100,
+            vault, ap_wallet, bot_wallet, value, tx_hash, 100,
         );
 
         let asserter = Asserter::new();
@@ -395,7 +390,7 @@ mod tests {
         );
 
         let mint_log = create_transfer_log(
-            Address::ZERO,
+            vault,
             Address::ZERO,
             bot_wallet,
             value,
@@ -438,12 +433,7 @@ mod tests {
         );
 
         let transfer_log = create_transfer_log(
-            Address::ZERO,
-            ap_wallet,
-            bot_wallet,
-            value,
-            tx_hash,
-            100,
+            vault, ap_wallet, bot_wallet, value, tx_hash, 100,
         );
 
         let asserter1 = Asserter::new();
@@ -499,7 +489,7 @@ mod tests {
         );
 
         let transfer_log = create_transfer_log(
-            Address::ZERO,
+            vault,
             unknown_wallet,
             bot_wallet,
             value,
