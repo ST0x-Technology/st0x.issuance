@@ -279,16 +279,23 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     let db_path = temp_dir.path().join("test_receipt_inventory.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
 
     let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -414,7 +421,8 @@ async fn test_redemption_recovery_after_restart()
     let poll_should_succeed = Arc::new(AtomicBool::new(false));
 
     // Setup mocks - poll returns "pending" until we flip the flag
-    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_shared_state(
         &mock_alpaca,
         user_wallet,
@@ -423,12 +431,18 @@ async fn test_redemption_recovery_after_restart()
         Arc::clone(&poll_should_succeed),
     );
 
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
     let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     // Grant roles
     evm.grant_deposit_role(user_wallet).await?;

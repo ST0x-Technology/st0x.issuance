@@ -9,10 +9,12 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 
-pub(crate) use api::{add_tokenized_asset, list_tokenized_assets};
+pub(crate) use api::{
+    add_tokenized_asset, get_tokenized_asset, list_tokenized_assets,
+};
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
-pub(crate) use view::TokenizedAssetView;
+pub(crate) use view::{TokenizedAssetView, TokenizedAssetViewRepo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnderlyingSymbol(pub(crate) String);
@@ -100,25 +102,44 @@ impl Aggregate for TokenizedAsset {
                 token,
                 network,
                 vault,
-            } => {
-                if matches!(self, Self::Added { .. }) {
+            } => match self {
+                Self::Added { vault: current_vault, .. }
+                    if *current_vault == vault =>
+                {
                     tracing::debug!(
                         underlying = %underlying.0,
-                        "Asset already added, skipping"
+                        "Asset already added with same vault, skipping"
                     );
-                    return Ok(vec![]);
+                    Ok(vec![])
                 }
-
-                let now = Utc::now();
-
-                Ok(vec![TokenizedAssetEvent::Added {
-                    underlying,
-                    token,
-                    network,
-                    vault,
-                    added_at: now,
-                }])
-            }
+                Self::Added { vault: current_vault, .. } => {
+                    tracing::info!(
+                        underlying = %underlying.0,
+                        previous_vault = %current_vault,
+                        new_vault = %vault,
+                        "Updating vault address for asset"
+                    );
+                    Ok(vec![TokenizedAssetEvent::VaultAddressUpdated {
+                        vault,
+                        previous_vault: *current_vault,
+                        updated_at: Utc::now(),
+                    }])
+                }
+                Self::NotAdded => {
+                    tracing::info!(
+                        underlying = %underlying.0,
+                        vault = %vault,
+                        "Adding new tokenized asset"
+                    );
+                    Ok(vec![TokenizedAssetEvent::Added {
+                        underlying,
+                        token,
+                        network,
+                        vault,
+                        added_at: Utc::now(),
+                    }])
+                }
+            },
         }
     }
 
@@ -140,6 +161,14 @@ impl Aggregate for TokenizedAsset {
                     added_at,
                 };
             }
+            TokenizedAssetEvent::VaultAddressUpdated {
+                vault: new_vault,
+                ..
+            } => {
+                if let Self::Added { vault, .. } = self {
+                    *vault = new_vault;
+                }
+            }
         }
     }
 }
@@ -151,14 +180,17 @@ pub(crate) enum TokenizedAssetError {}
 mod tests {
     use alloy::primitives::address;
     use cqrs_es::{Aggregate, test::TestFramework};
+    use tracing_test::traced_test;
 
     use super::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent, UnderlyingSymbol,
     };
+    use crate::test_utils::logs_contain_at;
 
     type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
 
+    #[traced_test]
     #[test]
     fn test_add_asset_creates_new_asset() {
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -181,31 +213,35 @@ mod tests {
             Ok(events) => {
                 assert_eq!(events.len(), 1);
 
-                match &events[0] {
-                    TokenizedAssetEvent::Added {
-                        underlying: event_underlying,
-                        token: event_token,
-                        network: event_network,
-                        vault: event_vault,
-                        added_at,
-                    } => {
-                        assert_eq!(event_underlying, &underlying);
-                        assert_eq!(event_token, &token);
-                        assert_eq!(event_network, &network);
-                        assert_eq!(event_vault, &vault);
-                        assert!(added_at.timestamp() > 0);
-                    }
-                }
+                let TokenizedAssetEvent::Added {
+                    underlying: event_underlying,
+                    token: event_token,
+                    network: event_network,
+                    vault: event_vault,
+                    added_at,
+                } = &events[0]
+                else {
+                    panic!("Expected Added event, got: {:?}", events[0])
+                };
+
+                assert_eq!(event_underlying, &underlying);
+                assert_eq!(event_token, &token);
+                assert_eq!(event_network, &network);
+                assert_eq!(event_vault, &vault);
+                assert!(added_at.timestamp() > 0);
             }
             Err(e) => panic!("Expected success, got error: {e}"),
         }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Adding new tokenized asset", "AAPL"]
+        ));
     }
 
+    #[traced_test]
     #[test]
-    fn test_add_asset_when_already_added_is_idempotent() {
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+    fn test_add_asset_when_already_added_with_same_vault_is_idempotent() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         TokenizedAssetTestFramework::with(())
@@ -213,16 +249,71 @@ mod tests {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::new("base"),
-                vault: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                vault,
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::Add {
-                underlying,
-                token,
-                network,
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
                 vault,
             })
             .then_expect_events(vec![]);
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Asset already added with same vault, skipping"]
+        ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_add_asset_with_different_vault_emits_vault_updated() {
+        let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let validator = TokenizedAssetTestFramework::with(())
+            .given(vec![TokenizedAssetEvent::Added {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault: vault_a,
+                added_at: chrono::Utc::now(),
+            }])
+            .when(TokenizedAssetCommand::Add {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault: vault_b,
+            });
+
+        let result = validator.inspect_result();
+
+        match result {
+            Ok(events) => {
+                assert_eq!(events.len(), 1, "Expected exactly one event");
+
+                match &events[0] {
+                    TokenizedAssetEvent::VaultAddressUpdated {
+                        vault,
+                        previous_vault,
+                        ..
+                    } => {
+                        assert_eq!(*vault, vault_b);
+                        assert_eq!(*previous_vault, vault_a);
+                    }
+                    other @ TokenizedAssetEvent::Added { .. } => {
+                        panic!("Expected VaultAddressUpdated, got: {other:?}")
+                    }
+                }
+            }
+            Err(err) => panic!("Expected success, got error: {err}"),
+        }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Updating vault address for asset", "AAPL"]
+        ));
     }
 
     #[test]

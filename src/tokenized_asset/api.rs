@@ -8,10 +8,57 @@ use sqlx::{Pool, Sqlite};
 use tracing::error;
 
 use super::{
-    Network, TokenSymbol, TokenizedAssetCommand, UnderlyingSymbol,
-    view::TokenizedAssetView,
+    Network, TokenSymbol, TokenizedAssetCommand, TokenizedAssetViewRepo,
+    UnderlyingSymbol, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TokenizedAssetDetailResponse {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) enabled: bool,
+}
+
+#[tracing::instrument(skip(_auth, view_repo))]
+#[get("/tokenized-assets/<underlying>")]
+pub(crate) async fn get_tokenized_asset(
+    underlying: &str,
+    _auth: InternalAuth,
+    view_repo: &rocket::State<TokenizedAssetViewRepo>,
+) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    let underlying_symbol = UnderlyingSymbol::new(underlying);
+
+    let view = super::view::load_asset_by_underlying(
+        view_repo.inner(),
+        &underlying_symbol,
+    )
+    .await
+    .map_err(|err| {
+        error!(error = %err, "Failed to load tokenized asset");
+        Status::InternalServerError
+    })?;
+
+    match view {
+        Some(TokenizedAssetView::Asset {
+            underlying,
+            token,
+            network,
+            vault,
+            enabled,
+            ..
+        }) => Ok(Json(TokenizedAssetDetailResponse {
+            underlying,
+            token,
+            network,
+            vault,
+            enabled,
+        })),
+        _ => Err(Status::NotFound),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TokenizedAssetResponse {
@@ -107,13 +154,14 @@ pub(crate) async fn add_tokenized_asset(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{B256, address};
     use cqrs_es::persist::GenericQuery;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use url::Url;
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
@@ -123,16 +171,12 @@ mod tests {
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
     fn test_config() -> Config {
-        use alloy::primitives::{B256, address};
-        use url::Url;
-
         Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
             rpc_url: Url::parse("wss://localhost:8545").expect("Valid URL"),
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
-            vault: address!("0x1111111111111111111111111111111111111111"),
             backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,

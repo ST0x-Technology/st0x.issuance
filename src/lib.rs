@@ -12,6 +12,7 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
 use tracing::{debug, error, info};
+use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
@@ -29,6 +30,7 @@ use crate::receipt_inventory::{
 };
 use crate::redemption::{
     Redemption, RedemptionView,
+    backfill::TransferBackfiller,
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
@@ -37,7 +39,8 @@ use crate::redemption::{
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView, view::list_enabled_assets,
+    TokenizedAsset, TokenizedAssetView, TokenizedAssetViewRepo,
+    view::{list_enabled_assets, replay_tokenized_asset_view},
 };
 
 pub mod account;
@@ -145,10 +148,12 @@ impl Quantity {
         let power = 10_u64
             .checked_pow(decimals)
             .ok_or(QuantityConversionError::Overflow)?;
+
         let multiplier = Decimal::from(power);
         let truncated_scaled = (self.0 * multiplier).trunc();
         let truncated = truncated_scaled / multiplier;
         let dust = self.0 - truncated;
+
         Ok((Self(truncated), Self(dust)))
     }
 
@@ -241,7 +246,11 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (account_cqrs, tokenized_asset_cqrs) = setup_basic_cqrs(&pool);
+    let BasicCqrsSetup {
+        account_cqrs,
+        tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
+    } = setup_basic_cqrs(&pool);
 
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
@@ -274,6 +283,7 @@ pub async fn initialize_rocket(
     // up-to-date views. Without this ordering, recovery might miss stuck
     // operations if the view was deleted/corrupted.
     info!("Replaying views to ensure schema updates are applied");
+    replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
@@ -290,9 +300,30 @@ pub async fn initialize_rocket(
     )
     .await?;
 
+    // Transfer backfill must run after receipt backfill so that receipt inventory
+    // is available for burn planning, and before live monitoring so that missed
+    // transfers during downtime are detected before new ones come in.
+    let transfer_backfiller = TransferBackfiller {
+        provider: blockchain_setup.provider.clone(),
+        bot_wallet,
+        cqrs: redemption_cqrs.clone(),
+        event_store: redemption_event_store.clone(),
+        pool: pool.clone(),
+        redeem_call_manager: managers.redeem_call.clone(),
+        journal_manager: managers.journal.clone(),
+        burn_manager: managers.burn.clone(),
+    };
+
+    run_all_transfer_backfills(
+        &vault_configs,
+        &transfer_backfiller,
+        config.backfill_start_block,
+    )
+    .await?;
+
     spawn_all_receipt_monitors(
         blockchain_setup.provider,
-        vault_configs,
+        &vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
         &MintRecoveryHandler::new(mint.cqrs.clone()),
@@ -306,12 +337,13 @@ pub async fn initialize_rocket(
         managers.burn.clone(),
     );
 
-    spawn_redemption_detector(
-        &config,
-        redemption_cqrs.clone(),
-        redemption_event_store,
-        pool.clone(),
-        managers,
+    spawn_all_redemption_detectors(
+        &config.rpc_url,
+        &vault_configs,
+        &redemption_cqrs,
+        &redemption_event_store,
+        &pool,
+        &managers,
         bot_wallet,
     );
 
@@ -321,6 +353,7 @@ pub async fn initialize_rocket(
         pool,
         account_cqrs,
         tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
         mint,
         redemption_cqrs,
     }))
@@ -332,6 +365,7 @@ struct RocketState {
     pool: Pool<Sqlite>,
     account_cqrs: AccountCqrs,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
+    tokenized_asset_view_repo: TokenizedAssetViewRepo,
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
 }
@@ -351,6 +385,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.rate_limiter)
         .manage(state.account_cqrs)
         .manage(state.tokenized_asset_cqrs)
+        .manage(state.tokenized_asset_view_repo)
         .manage(state.mint.cqrs)
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
@@ -363,6 +398,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 account::whitelist_wallet,
                 account::unwhitelist_wallet,
                 tokenized_asset::list_tokenized_assets,
+                tokenized_asset::get_tokenized_asset,
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
                 mint::confirm_journal
@@ -371,7 +407,13 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .register("/", catchers::json_catchers())
 }
 
-fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
+struct BasicCqrsSetup {
+    account_cqrs: AccountCqrs,
+    tokenized_asset_cqrs: TokenizedAssetCqrs,
+    tokenized_asset_view_repo: TokenizedAssetViewRepo,
+}
+
+fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
     let account_view_repo =
         Arc::new(SqliteViewRepository::<AccountView, Account>::new(
             pool.clone(),
@@ -381,18 +423,21 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> (AccountCqrs, TokenizedAssetCqrs) {
     let account_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
 
-    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
+    let tokenized_asset_view_repo: TokenizedAssetViewRepo =
+        Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "tokenized_asset_view".to_string(),
+        ));
+    let tokenized_asset_query =
+        GenericQuery::new(tokenized_asset_view_repo.clone());
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    (account_cqrs, tokenized_asset_cqrs)
+    BasicCqrsSetup {
+        account_cqrs,
+        tokenized_asset_cqrs,
+        tokenized_asset_view_repo,
+    }
 }
 
 fn setup_aggregate_cqrs(
@@ -526,8 +571,49 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
+/// Spawns redemption detectors for ALL enabled vaults.
+fn spawn_all_redemption_detectors(
+    rpc_url: &Url,
+    vault_configs: &[VaultBackfillConfig],
+    redemption_cqrs: &Arc<SqliteCqrs<Redemption>>,
+    redemption_event_store: &Arc<
+        PersistedEventStore<SqliteEventRepository, Redemption>,
+    >,
+    pool: &Pool<Sqlite>,
+    managers: &RedemptionManagers,
+    bot_wallet: Address,
+) {
+    info!(
+        vault_count = vault_configs.len(),
+        "Spawning redemption detectors for all vaults"
+    );
+
+    for config in vault_configs {
+        debug!(
+            vault = %config.vault,
+            bot_wallet = %bot_wallet,
+            "Spawning redemption detector for vault"
+        );
+
+        spawn_redemption_detector(
+            rpc_url.clone(),
+            config.vault,
+            redemption_cqrs.clone(),
+            redemption_event_store.clone(),
+            pool.clone(),
+            RedemptionManagers {
+                redeem_call: managers.redeem_call.clone(),
+                journal: managers.journal.clone(),
+                burn: managers.burn.clone(),
+            },
+            bot_wallet,
+        );
+    }
+}
+
 fn spawn_redemption_detector(
-    config: &Config,
+    rpc_url: Url,
+    vault: Address,
     redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
     redemption_event_store: Arc<
         PersistedEventStore<SqliteEventRepository, Redemption>,
@@ -536,13 +622,10 @@ fn spawn_redemption_detector(
     managers: RedemptionManagers,
     bot_wallet: Address,
 ) {
-    info!("Spawning WebSocket monitoring task for bot wallet {bot_wallet}");
+    info!(bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
 
-    let detector_config = RedemptionDetectorConfig {
-        rpc_url: config.rpc_url.clone(),
-        vault: config.vault,
-        bot_wallet,
-    };
+    let detector_config =
+        RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
 
     let detector = RedemptionDetector::new(
         detector_config,
@@ -621,7 +704,7 @@ struct VaultBackfillConfig {
 /// Runs receipt backfill for ALL enabled tokenized assets.
 ///
 /// Returns the vault configurations needed for live monitoring.
-async fn run_all_receipt_backfills<P: alloy::providers::Provider + Clone>(
+async fn run_all_receipt_backfills<P: Provider + Clone>(
     pool: &Pool<Sqlite>,
     provider: P,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
@@ -667,7 +750,7 @@ async fn run_all_receipt_backfills<P: alloy::providers::Provider + Clone>(
 }
 
 /// Runs receipt backfill for a single vault.
-async fn run_single_vault_backfill<P: alloy::providers::Provider + Clone>(
+async fn run_single_vault_backfill<P: Provider + Clone>(
     provider: &P,
     vault: Address,
     backfill_start_block: u64,
@@ -720,10 +803,51 @@ async fn run_single_vault_backfill<P: alloy::providers::Provider + Clone>(
     Ok(VaultBackfillConfig { vault, receipt_contract })
 }
 
+/// Runs transfer backfill for ALL enabled vaults.
+///
+/// Scans historic Transfer events to detect redemptions that occurred while the
+/// service was down. Must run after receipt backfill (for burn planning) and
+/// before live monitoring (to avoid missing transfers in the gap).
+async fn run_all_transfer_backfills<P: Provider + Clone>(
+    vault_configs: &[VaultBackfillConfig],
+    backfiller: &TransferBackfiller<
+        P,
+        SqliteEventStore<Redemption>,
+        SqliteEventStore<ReceiptInventory>,
+    >,
+    backfill_start_block: u64,
+) -> Result<(), anyhow::Error> {
+    if vault_configs.is_empty() {
+        info!("No enabled vaults, skipping transfer backfill");
+        return Ok(());
+    }
+
+    info!(
+        vault_count = vault_configs.len(),
+        "Running transfer backfill for all vaults"
+    );
+
+    for config in vault_configs {
+        let result = backfiller
+            .backfill_transfers(config.vault, backfill_start_block)
+            .await?;
+
+        debug!(
+            vault = %config.vault,
+            detected = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete for vault"
+        );
+    }
+
+    Ok(())
+}
+
 /// Spawns receipt monitors for ALL enabled vaults.
 fn spawn_all_receipt_monitors<P, ITN>(
     provider: P,
-    vault_configs: Vec<VaultBackfillConfig>,
+    vault_configs: &[VaultBackfillConfig],
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     bot_wallet: Address,
     handler: &ITN,

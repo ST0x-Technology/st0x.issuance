@@ -1104,13 +1104,35 @@ sequenceDiagram
 #### Step 1: Monitor Bot Wallet for Redemptions
 
 We continuously monitor the bot's wallet for incoming share transfers (which
-signal redemption requests).
+signal redemption requests) on **every vault** associated with an enabled
+tokenized asset.
 
 **Monitoring Approach:**
 
-- Subscribe to `Transfer` events for the vault's ERC-20 shares
+- For each enabled tokenized asset, subscribe to `Transfer` events on that
+  asset's vault contract
 - Filter for transfers where `to` address is the bot's wallet
-- Can use WebSocket subscription or polling depending on infrastructure
+- Use WebSocket subscription for live monitoring
+- At startup, backfill historic Transfer events to detect transfers that
+  occurred while the service was down (mirrors the receipt backfilling pattern)
+
+**Transfer Backfilling:**
+
+At startup, before spawning live monitors, the service scans historic Transfer
+events on **each vault independently** to detect any redemption transfers that
+occurred while the service was down. This ensures no redemptions are silently
+missed due to downtime.
+
+Each vault is backfilled separately: the backfiller scans from the configured
+`backfill_start_block` to the current block for each vault contract. Idempotency
+is guaranteed by the `IssuerRedemptionRequestId` derived from each transaction
+hash — the Redemption aggregate rejects duplicate detections, so re-scanning
+already-processed blocks is safe.
+
+This mirrors the receipt backfill pattern, where per-vault checkpoints are
+tracked via the `ReceiptInventory` aggregate's `last_backfilled_block` state.
+Transfer backfill currently relies on idempotency rather than per-vault
+checkpoint tracking.
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
@@ -1734,7 +1756,6 @@ ALPACA_TOKENIZATION_ACCOUNT_ID=<our_designated_tokenization_account_at_alpaca>
 RPC_WS_URL=<ethereum_websocket_url>
 CHAIN_ID=8453  # Base
 CHAIN_NAME=base
-VAULT_ADDRESS=<offchain_asset_receipt_vault_address>
 REDEMPTION_WALLET_ADDRESS=<address_where_aps_send_tokens_to_redeem>
 
 # Database

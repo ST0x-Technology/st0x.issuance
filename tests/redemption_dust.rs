@@ -23,6 +23,7 @@ use httpmock::prelude::*;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+use harness::alpaca_mocks::setup_mint_mocks;
 use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
@@ -267,20 +268,29 @@ async fn test_redemption_returns_dust_to_user()
 
     let captured_qty: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_qty_capture(
         &mock_alpaca,
         user_wallet,
         Arc::clone(&captured_qty),
     );
 
-    let config =
-        harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_dust_returns.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -299,6 +309,8 @@ async fn test_redemption_returns_dust_to_user()
         minted_shares, ORIGINAL_SHARES,
         "Minted shares should match expected amount"
     );
+
+    mint_callback_mock.assert();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
@@ -356,20 +368,29 @@ async fn test_redemption_no_dust_when_9_decimals()
 
     let captured_qty: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_qty_capture(
         &mock_alpaca,
         user_wallet,
         Arc::clone(&captured_qty),
     );
 
-    let config =
-        harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_dust_no_dust.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
-
-    harness::seed_tokenized_asset(&client, evm.vault_address).await;
 
     evm.grant_deposit_role(user_wallet).await?;
     evm.grant_withdraw_role(bot_wallet).await?;
@@ -386,6 +407,8 @@ async fn test_redemption_no_dust_when_9_decimals()
     // 0.123456789 * 10^18 = 123456789000000000
     let expected_shares = U256::from(123_456_789_000_000_000_u64);
     assert_eq!(minted_shares, expected_shares);
+
+    mint_callback_mock.assert();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()

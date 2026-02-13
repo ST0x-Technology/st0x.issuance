@@ -11,6 +11,7 @@ use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use uuid::{Uuid, uuid};
 
+use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
@@ -147,9 +148,8 @@ async fn test_mint_recovery_after_view_deletion()
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     // Setup mocks
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
@@ -276,6 +276,11 @@ async fn test_mint_recovery_after_view_deletion()
         final_event_count.count
     );
 
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Mint callback should be hit at least once"
+    );
+
     Ok(())
 }
 
@@ -306,9 +311,8 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         temp_dir.path().join("test_minting_recovery_receipt_exists.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
@@ -412,6 +416,11 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         "User should have same shares (no double mint)"
     );
 
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Mint callback should be hit at least once"
+    );
+
     Ok(())
 }
 
@@ -439,9 +448,8 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
     let db_path = temp_dir.path().join("test_minting_recovery_no_receipt.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // First start the service to set up the database schema and seed data
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
@@ -503,6 +511,11 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
          Recovery for Minting state (no receipt) not implemented."
     );
 
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Mint callback should be hit at least once"
+    );
+
     Ok(())
 }
 
@@ -559,9 +572,8 @@ async fn test_mint_recovery_prevents_double_mint()
         .mint_directly_with_info(amount, bot_wallet, encoded_receipt_info)
         .await?;
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Start service to set up database
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
@@ -640,6 +652,11 @@ async fn test_mint_recovery_prevents_double_mint()
          Before: {shares_before}, After: {shares_after}"
     );
 
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Mint callback should be hit at least once"
+    );
+
     Ok(())
 }
 
@@ -673,9 +690,8 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
     let db_path = temp_dir.path().join("test_receipt_monitor_recovery.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
@@ -795,9 +811,8 @@ async fn test_mint_recovery_from_minting_failed_state()
     let db_path = temp_dir.path().join("test_minting_failed_recovery.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
     // Start service to set up database schema
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
@@ -872,6 +887,11 @@ async fn test_mint_recovery_from_minting_failed_state()
         shares.is_ok(),
         "Recovery should have retried the failed mint and user should have shares. \
          Recovery for MintingFailed state not implemented."
+    );
+
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Mint callback should be hit at least once"
     );
 
     Ok(())

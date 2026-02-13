@@ -324,7 +324,7 @@ pub enum TestAuthConfigError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, address};
+    use alloy::primitives::B256;
     use rocket::http::Header;
     use rocket::local::asynchronous::Client;
     use url::Url;
@@ -351,7 +351,6 @@ mod tests {
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
             chain_id: crate::test_utils::ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(B256::ZERO),
-            vault: address!("0x1111111111111111111111111111111111111111"),
             backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,

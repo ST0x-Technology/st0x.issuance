@@ -2,48 +2,16 @@
 
 mod harness;
 
-use alloy::primitives::{Address, U256, b256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::primitives::U256;
 use httpmock::prelude::*;
-use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use url::Url;
 
-use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
-    AlpacaConfig, AuthConfig, Config, IpWhitelist, initialize_rocket,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
+    SignerConfig, initialize_rocket,
 };
-
-async fn preseed_tokenized_asset(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    underlying: &str,
-    token: &str,
-    vault: Address,
-) {
-    let view_id = underlying;
-    let payload = json!({
-        "Asset": {
-            "underlying": underlying,
-            "token": token,
-            "network": "base",
-            "vault": vault,
-            "enabled": true,
-            "added_at": "2024-01-01T00:00:00Z"
-        }
-    });
-
-    sqlx::query!(
-        r#"
-        INSERT INTO tokenized_asset_view (view_id, version, payload)
-        VALUES (?, 1, ?)
-        "#,
-        view_id,
-        payload
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-}
 
 /// Tests that backfill checkpoint is independent from monitor discoveries.
 ///
@@ -60,12 +28,6 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     let mock_alpaca = MockServer::start();
 
     let bot_wallet = evm.wallet_address;
-    let user_private_key = b256!(
-        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-    );
-    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
-    let user_wallet = user_signer.address();
-
     // Use file-based database to persist across restarts
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("test_backfill_checkpoint.db");
@@ -83,15 +45,23 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
         evm.mint_directly(historic_amount, bot_wallet).await?;
 
     // Setup mocks
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca, user_wallet);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Preseed asset before starting service so backfill can discover receipts
     let pool =
         SqlitePoolOptions::new().max_connections(5).connect(&db_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
-    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
+    harness::preseed_tokenized_asset_into_pool(
+        &pool,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await
+    .unwrap();
     pool.close().await;
 
     // Step 2: Start service - backfill should discover the historic receipt
@@ -200,9 +170,9 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     let (tsla_vault, tsla_authorizer) = evm.deploy_additional_vault().await?;
 
     // Grant roles on TSLA vault to bot wallet
-    evm.grant_role_on_authorizer(tsla_authorizer, "DEPOSIT", bot_wallet)
+    evm.grant_role_on_authorizer(tsla_authorizer, ROLE_DEPOSIT, bot_wallet)
         .await?;
-    evm.grant_role_on_authorizer(tsla_authorizer, "CERTIFY", bot_wallet)
+    evm.grant_role_on_authorizer(tsla_authorizer, ROLE_CERTIFY, bot_wallet)
         .await?;
     evm.certify_specific_vault(tsla_vault, U256::MAX).await?;
 
@@ -227,8 +197,19 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
 
     // Preseed BOTH tokenized assets BEFORE rocket starts
     // This simulates production where assets are configured before the service runs
-    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
-    preseed_tokenized_asset(&pool, "TSLA", "tTSLA", tsla_vault).await;
+    harness::preseed_tokenized_asset_into_pool(
+        &pool,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await
+    .unwrap();
+    harness::preseed_tokenized_asset_into_pool(
+        &pool, tsla_vault, "TSLA", "tTSLA",
+    )
+    .await
+    .unwrap();
 
     // Close the pool so rocket can open it
     pool.close().await;
@@ -237,9 +218,8 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         database_url,
         database_max_connections: 5,
         rpc_url: Url::parse(&evm.endpoint)?,
-        chain_id: st0x_issuance::ANVIL_CHAIN_ID,
-        signer: st0x_issuance::SignerConfig::Local(evm.private_key),
-        vault: evm.vault_address,
+        chain_id: ANVIL_CHAIN_ID,
+        signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
@@ -252,7 +232,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
                 .parse()
                 .expect("Valid IP ranges"),
         },
-        log_level: st0x_issuance::LogLevel::Debug,
+        log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),

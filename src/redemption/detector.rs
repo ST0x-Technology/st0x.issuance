@@ -1,8 +1,7 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
+use cqrs_es::{CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -10,23 +9,17 @@ use tracing::{info, warn};
 use url::Url;
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
-    burn_manager::BurnManager, journal_manager::JournalManager,
+    IssuerRedemptionRequestId, Redemption,
+    burn_manager::BurnManager,
+    journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
-};
-use crate::account::{
-    AccountView, AlpacaAccountNumber, ClientId,
-    view::{AccountViewError, find_by_wallet},
+    transfer::{
+        RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
+        detect_transfer, drive_redemption_flow,
+    },
 };
 use crate::bindings;
 use crate::receipt_inventory::ReceiptInventory;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets,
-};
-use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
-};
-use crate::{Quantity, QuantityConversionError};
 
 /// Configuration parameters for the redemption detector.
 pub(crate) struct RedemptionDetectorConfig {
@@ -159,250 +152,36 @@ where
         &self,
         log: &alloy::rpc::types::Log,
     ) -> Result<Option<IssuerRedemptionRequestId>, RedemptionMonitorError> {
-        let transfer_event =
-            bindings::OffchainAssetReceiptVault::Transfer::decode_log(
-                &log.inner,
-            )?;
+        let outcome =
+            detect_transfer(log, self.vault, &self.cqrs, &self.pool).await?;
 
-        // Skip mint events where from=0x0.
-        //
-        // Call stack when our bot mints tokens to itself:
-        // 1. Bot calls vault.deposit() on OffchainAssetReceiptVault
-        // 2. OffchainAssetReceiptVault inherits from ReceiptVault
-        //    (lib/ethgild/src/concrete/vault/OffchainAssetReceiptVault.sol:243)
-        // 3. ReceiptVault._deposit() calls _mint(receiver, shares)
-        //    (lib/ethgild/src/abstract/ReceiptVault.sol:587)
-        // 4. ReceiptVault inherits from ERC20Upgradeable (aliased as ERC20)
-        //    (lib/ethgild/src/abstract/ReceiptVault.sol:5)
-        // 5. ERC20Upgradeable._mint() emits Transfer(address(0), account, amount)
-        //    (lib/ethgild/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/ERC20Upgradeable.sol:266)
-        //
-        // This Transfer event has from=0x0 and to=bot_wallet, which matches our
-        // subscription filter (we subscribe to transfers TO bot_wallet). These are
-        // mint events, not redemptions from users.
-        if transfer_event.from == Address::ZERO {
-            info!(
-                to = %transfer_event.to,
-                value = %transfer_event.value,
-                "Ignoring mint event (from=0x0)"
-            );
-            return Ok(None);
-        }
-
-        info!(
-            from = %transfer_event.from,
-            to = %transfer_event.to,
-            value = %transfer_event.value,
-            "Transfer event decoded"
-        );
-
-        let (underlying, token, network) = self.find_matching_asset().await?;
-
-        let issuer_request_id = self
-            .create_redemption_detection(
-                &transfer_event,
-                log,
-                underlying,
-                token,
-            )
-            .await?;
-
-        let (client_id, alpaca_account) =
-            self.get_account_info(&transfer_event.from).await?;
-
-        self.handle_alpaca_and_polling(
-            issuer_request_id.clone(),
-            client_id,
-            alpaca_account,
-            network,
-        )
-        .await?;
-
-        Ok(Some(issuer_request_id))
-    }
-
-    async fn find_matching_asset(
-        &self,
-    ) -> Result<(UnderlyingSymbol, TokenSymbol, Network), RedemptionMonitorError>
-    {
-        let assets = list_enabled_assets(&self.pool).await?;
-
-        assets
-            .into_iter()
-            .find_map(|view| match view {
-                TokenizedAssetView::Asset {
-                    underlying,
-                    token,
-                    network,
-                    vault: addr,
-                    ..
-                } if addr == self.vault => Some((underlying, token, network)),
-                _ => None,
-            })
-            .ok_or(RedemptionMonitorError::NoMatchingAsset {
-                vault: self.vault,
-            })
-    }
-
-    async fn create_redemption_detection(
-        &self,
-        transfer_event: &bindings::OffchainAssetReceiptVault::Transfer,
-        log: &alloy::rpc::types::Log,
-        underlying: UnderlyingSymbol,
-        token: TokenSymbol,
-    ) -> Result<IssuerRedemptionRequestId, RedemptionMonitorError> {
-        let tx_hash = log
-            .transaction_hash
-            .ok_or(RedemptionMonitorError::MissingTxHash)?;
-
-        let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
-
-        let quantity =
-            Quantity::from_u256_with_18_decimals(transfer_event.value)?;
-
-        let block_number = log
-            .block_number
-            .ok_or(RedemptionMonitorError::MissingBlockNumber)?;
-
-        let command = RedemptionCommand::Detect {
-            issuer_request_id: issuer_request_id.clone(),
-            underlying,
-            token,
-            wallet: transfer_event.from,
-            quantity,
-            tx_hash,
-            block_number,
-        };
-
-        self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
-
-        info!(
-            %issuer_request_id,
-            "Redemption detection recorded successfully"
-        );
-
-        Ok(issuer_request_id)
-    }
-
-    /// Looks up account info by wallet address.
-    ///
-    /// Note: `find_by_wallet` searches in `whitelisted_wallets` which only exists
-    /// in `LinkedToAlpaca` accounts, so the result is always `LinkedToAlpaca` if found.
-    async fn get_account_info(
-        &self,
-        wallet: &Address,
-    ) -> Result<(ClientId, AlpacaAccountNumber), RedemptionMonitorError> {
-        let account_view = find_by_wallet(&self.pool, wallet).await?.ok_or(
-            RedemptionMonitorError::AccountNotFound { wallet: *wallet },
-        )?;
-
-        match account_view {
-            AccountView::LinkedToAlpaca {
-                client_id, alpaca_account, ..
-            } => Ok((client_id, alpaca_account)),
-            _ => Err(RedemptionMonitorError::AccountNotLinked {
-                wallet: *wallet,
-            }),
-        }
-    }
-
-    async fn handle_alpaca_and_polling(
-        &self,
-        issuer_request_id: IssuerRedemptionRequestId,
-        client_id: ClientId,
-        alpaca_account: AlpacaAccountNumber,
-        network: Network,
-    ) -> Result<(), RedemptionMonitorError> {
-        let aggregate_ctx = self
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await?;
-
-        if let Err(err) = self
-            .redeem_call_manager
-            .handle_redemption_detected(
-                &alpaca_account,
-                &issuer_request_id,
-                aggregate_ctx.aggregate(),
+        match outcome {
+            TransferOutcome::Detected {
+                issuer_request_id,
                 client_id,
+                alpaca_account,
                 network,
-            )
-            .await
-        {
-            warn!(
-                %issuer_request_id,
-                error = ?err,
-                "handle_redemption_detected failed"
-            );
-            return Ok(());
-        }
-
-        let aggregate_ctx = self
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await?;
-
-        let Redemption::AlpacaCalled { tokenization_request_id, .. } =
-            aggregate_ctx.aggregate()
-        else {
-            return Ok(());
-        };
-
-        let journal_manager = self.journal_manager.clone();
-        let burn_manager = self.burn_manager.clone();
-        let event_store = self.event_store.clone();
-        let issuer_request_id_cloned = issuer_request_id.clone();
-        let tokenization_request_id_cloned = tokenization_request_id.clone();
-
-        tokio::spawn(async move {
-            if let Err(err) = journal_manager
-                .handle_alpaca_called(
-                    &alpaca_account,
-                    issuer_request_id_cloned.clone(),
-                    tokenization_request_id_cloned,
+            } => {
+                drive_redemption_flow(
+                    issuer_request_id.clone(),
+                    client_id,
+                    alpaca_account,
+                    network,
+                    RedemptionFlowCtx {
+                        event_store: self.event_store.clone(),
+                        redeem_call_manager: self.redeem_call_manager.clone(),
+                        journal_manager: self.journal_manager.clone(),
+                        burn_manager: self.burn_manager.clone(),
+                    },
                 )
-                .await
-            {
-                warn!(
-                    error = ?err,
-                    "handle_alpaca_called (journal polling) failed"
-                );
-                return;
+                .await;
+
+                Ok(Some(issuer_request_id))
             }
-
-            let aggregate_ctx = match event_store
-                .load_aggregate(&issuer_request_id_cloned.to_string())
-                .await
-            {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    warn!(
-                        issuer_request_id = %issuer_request_id_cloned,
-                        error = ?err,
-                        "Failed to load aggregate after journal completion"
-                    );
-                    return;
-                }
-            };
-
-            if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
-                if let Err(err) = burn_manager
-                    .handle_burning_started(
-                        &issuer_request_id_cloned,
-                        aggregate_ctx.aggregate(),
-                    )
-                    .await
-                {
-                    warn!(
-                        issuer_request_id = %issuer_request_id_cloned,
-                        error = ?err,
-                        "handle_burning_started failed"
-                    );
-                }
-            }
-        });
-
-        Ok(())
+            TransferOutcome::AlreadyDetected
+            | TransferOutcome::SkippedMint
+            | TransferOutcome::SkippedNoAccount => Ok(None),
+        }
     }
 }
 
@@ -410,26 +189,8 @@ where
 pub(crate) enum RedemptionMonitorError {
     #[error("RPC error")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("Sol types error: {0}")]
-    SolTypes(#[from] alloy::sol_types::Error),
-    #[error("Tokenized asset view error: {0}")]
-    TokenizedAssetView(#[from] TokenizedAssetViewError),
-    #[error("No asset found for vault {vault}")]
-    NoMatchingAsset { vault: Address },
-    #[error("Missing transaction hash in log")]
-    MissingTxHash,
-    #[error("Missing block number in log")]
-    MissingBlockNumber,
-    #[error("Failed to convert quantity: {0}")]
-    QuantityConversion(#[from] QuantityConversionError),
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] cqrs_es::AggregateError<RedemptionError>),
-    #[error("Account view error: {0}")]
-    AccountView(#[from] AccountViewError),
-    #[error("No account found for wallet {wallet}")]
-    AccountNotFound { wallet: Address },
-    #[error("Account not linked for wallet {wallet}")]
-    AccountNotLinked { wallet: Address },
+    #[error("Transfer processing error: {0}")]
+    TransferProcessing(#[from] TransferProcessingError),
     #[error("Stream ended unexpectedly")]
     StreamEnded,
 }
@@ -451,7 +212,7 @@ mod tests {
 
     use super::{
         BurnManager, JournalManager, RedeemCallManager, RedemptionDetector,
-        RedemptionDetectorConfig, RedemptionMonitorError,
+        RedemptionDetectorConfig,
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
@@ -589,6 +350,7 @@ mod tests {
     }
 
     fn create_transfer_log(
+        vault_address: Address,
         from: Address,
         to: Address,
         value: U256,
@@ -605,7 +367,7 @@ mod tests {
 
         Log {
             inner: PrimitiveLog {
-                address: address!("0x0000000000000000000000000000000000000000"),
+                address: vault_address,
                 data: LogData::new_unchecked(topics, Bytes::from(data_bytes)),
             },
             block_hash: Some(b256!(
@@ -680,6 +442,7 @@ mod tests {
         let block_number = 12345;
 
         let log = create_transfer_log(
+            vault,
             ap_wallet,
             bot_wallet,
             value,
@@ -703,7 +466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_transfer_log_missing_tx_hash() {
+    async fn test_process_transfer_log_ignores_mint_events() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -747,153 +510,7 @@ mod tests {
         let detector = RedemptionDetector::new(
             config,
             cqrs,
-            store,
-            pool,
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-        );
-
-        let mut log = create_transfer_log(
-            address!("0x9999999999999999999999999999999999999999"),
-            bot_wallet,
-            U256::from(100),
-            b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            12345,
-        );
-
-        log.transaction_hash = None;
-
-        let result = detector.process_transfer_log(&log).await;
-
-        assert!(
-            matches!(result, Err(RedemptionMonitorError::MissingTxHash)),
-            "Expected MissingTxHash error, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_transfer_log_missing_block_number() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-
-        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
-            setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault, None).await;
-
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(RedeemCallManager::new(
-            alpaca_service.clone(),
-            cqrs.clone(),
             store.clone(),
-            pool.clone(),
-        ));
-        let journal_manager = Arc::new(JournalManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let burn_manager = Arc::new(BurnManager::new(
-            vault_service,
-            pool.clone(),
-            cqrs.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
-            bot_wallet,
-        ));
-
-        let config = RedemptionDetectorConfig {
-            rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
-            bot_wallet,
-        };
-
-        let detector = RedemptionDetector::new(
-            config,
-            cqrs,
-            store,
-            pool,
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-        );
-
-        let mut log = create_transfer_log(
-            address!("0x9999999999999999999999999999999999999999"),
-            bot_wallet,
-            U256::from(100),
-            b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            12345,
-        );
-
-        log.block_number = None;
-
-        let result = detector.process_transfer_log(&log).await;
-
-        assert!(
-            matches!(result, Err(RedemptionMonitorError::MissingBlockNumber)),
-            "Expected MissingBlockNumber error, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_transfer_log_no_matching_asset() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let wrong_vault =
-            address!("0x9876543210fedcba9876543210fedcba98765432");
-        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-
-        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
-            setup_test_cqrs();
-        let pool = setup_test_db_with_asset(wrong_vault, None).await;
-
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(RedeemCallManager::new(
-            alpaca_service.clone(),
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-        let journal_manager = Arc::new(JournalManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let burn_manager = Arc::new(BurnManager::new(
-            vault_service,
-            pool.clone(),
-            cqrs.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
-            bot_wallet,
-        ));
-
-        let config = RedemptionDetectorConfig {
-            rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
-            bot_wallet,
-        };
-
-        let detector = RedemptionDetector::new(
-            config,
-            cqrs,
-            store,
             pool,
             redeem_call_manager,
             journal_manager,
@@ -901,9 +518,10 @@ mod tests {
         );
 
         let log = create_transfer_log(
-            address!("0x9999999999999999999999999999999999999999"),
+            vault,
+            Address::ZERO,
             bot_wallet,
-            U256::from(100),
+            U256::from_str_radix("100000000000000000000", 10).unwrap(),
             b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
@@ -913,11 +531,13 @@ mod tests {
         let result = detector.process_transfer_log(&log).await;
 
         assert!(
-            matches!(
-                result,
-                Err(RedemptionMonitorError::NoMatchingAsset { .. })
-            ),
-            "Expected NoMatchingAsset error, got {result:?}"
+            result.is_ok(),
+            "Mint events should be silently ignored, got {result:?}"
+        );
+
+        assert!(
+            result.unwrap().is_none(),
+            "Mint events should return None (no redemption created)"
         );
     }
 
@@ -980,6 +600,7 @@ mod tests {
         );
 
         let log = create_transfer_log(
+            vault,
             address!("0x9999999999999999999999999999999999999999"),
             bot_wallet,
             U256::from_str_radix("100000000000000000000", 10).unwrap(),
@@ -993,163 +614,15 @@ mod tests {
             "First detection should succeed, got {first_result:?}"
         );
 
-        // With deterministic IDs derived from tx_hash, duplicate detection
-        // of the same transfer is correctly rejected as AlreadyDetected.
+        // With idempotent detection, duplicate returns Ok(None) instead of error
         let second_result = detector.process_transfer_log(&log).await;
         assert!(
-            second_result.is_err(),
-            "Second detection of the same transfer should be rejected, got {second_result:?}"
+            second_result.is_ok(),
+            "Second detection should be handled idempotently, got {second_result:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_process_transfer_log_ignores_mint_events() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-
-        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
-            setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault, None).await;
-
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(RedeemCallManager::new(
-            alpaca_service.clone(),
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-        let journal_manager = Arc::new(JournalManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let burn_manager = Arc::new(BurnManager::new(
-            vault_service,
-            pool.clone(),
-            cqrs.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
-            bot_wallet,
-        ));
-
-        let config = RedemptionDetectorConfig {
-            rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
-            bot_wallet,
-        };
-
-        let detector = RedemptionDetector::new(
-            config,
-            cqrs,
-            store.clone(),
-            pool,
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-        );
-
-        // Mint event: from=0x0 (zero address) indicates token minting
-        let log = create_transfer_log(
-            Address::ZERO,
-            bot_wallet,
-            U256::from_str_radix("100000000000000000000", 10).unwrap(),
-            b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            12345,
-        );
-
-        let result = detector.process_transfer_log(&log).await;
-
         assert!(
-            result.is_ok(),
-            "Mint events should be silently ignored, got {result:?}"
-        );
-
-        assert!(
-            result.unwrap().is_none(),
-            "Mint events should return None (no redemption created)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_transfer_log_account_not_found() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let unknown_wallet =
-            address!("0x1111111111111111111111111111111111111111");
-
-        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
-            setup_test_cqrs();
-        let pool = setup_test_db_with_asset(vault, None).await;
-
-        let alpaca_service = Arc::new(MockAlpacaService::new_success())
-            as Arc<dyn crate::alpaca::AlpacaService>;
-        let redeem_call_manager = Arc::new(RedeemCallManager::new(
-            alpaca_service.clone(),
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-        let journal_manager = Arc::new(JournalManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        ));
-
-        let vault_service = Arc::new(MockVaultService::new_success())
-            as Arc<dyn crate::vault::VaultService>;
-        let burn_manager = Arc::new(BurnManager::new(
-            vault_service,
-            pool.clone(),
-            cqrs.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
-            bot_wallet,
-        ));
-
-        let config = RedemptionDetectorConfig {
-            rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
-            bot_wallet,
-        };
-
-        let detector = RedemptionDetector::new(
-            config,
-            cqrs,
-            store,
-            pool,
-            redeem_call_manager,
-            journal_manager,
-            burn_manager,
-        );
-
-        let log = create_transfer_log(
-            unknown_wallet,
-            bot_wallet,
-            U256::from_str_radix("100000000000000000000", 10).unwrap(),
-            b256!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            12345,
-        );
-
-        let result = detector.process_transfer_log(&log).await;
-
-        assert!(
-            matches!(
-                result,
-                Err(RedemptionMonitorError::AccountNotFound { .. })
-            ),
-            "Expected AccountNotFound error, got {result:?}"
+            second_result.unwrap().is_none(),
+            "Duplicate detection should return None"
         );
     }
 }
