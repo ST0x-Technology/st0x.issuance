@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use tracing::info;
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
@@ -32,6 +33,8 @@ pub(crate) enum TokenizedAssetViewError {
 pub(crate) async fn replay_tokenized_asset_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), TokenizedAssetViewError> {
+    info!("Replaying tokenized asset view from events");
+
     let view_repo = Arc::new(SqliteViewRepository::<
         TokenizedAssetView,
         TokenizedAsset,
@@ -44,6 +47,8 @@ pub(crate) async fn replay_tokenized_asset_view(
     let event_repo = SqliteEventRepository::new(pool);
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
+
+    info!("Tokenized asset view replay complete");
 
     Ok(())
 }
@@ -146,6 +151,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
     struct TestHarness {
@@ -389,5 +395,14 @@ mod tests {
                 panic!("Expected Asset after replay, got Unavailable")
             }
         }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Replaying tokenized asset view from events"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Tokenized asset view replay complete"]
+        ));
     }
 }

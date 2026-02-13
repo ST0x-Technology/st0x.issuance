@@ -260,6 +260,7 @@ pub(crate) async fn drive_redemption_flow<
             .await
         {
             warn!(
+                %issuer_request_id,
                 error = ?err,
                 "handle_alpaca_called (journal polling) failed"
             );

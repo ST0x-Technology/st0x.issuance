@@ -2,9 +2,8 @@
 
 mod harness;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use httpmock::prelude::*;
-use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use url::Url;
 
@@ -13,47 +12,6 @@ use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
     SignerConfig, initialize_rocket,
 };
-
-/// Seeds the events table with a `TokenizedAsset::Added` event so the view
-/// is rebuilt during `initialize_rocket` startup via `replay_tokenized_asset_view`.
-async fn preseed_tokenized_asset(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    underlying: &str,
-    token: &str,
-    vault: Address,
-) {
-    let event_payload = json!({
-        "Added": {
-            "underlying": underlying,
-            "token": token,
-            "network": "base",
-            "vault": vault,
-            "added_at": "2024-01-01T00:00:00Z"
-        }
-    });
-
-    let event_payload_str = event_payload.to_string();
-
-    sqlx::query(
-        "
-        INSERT INTO events (
-            aggregate_type,
-            aggregate_id,
-            sequence,
-            event_type,
-            event_version,
-            payload,
-            metadata
-        )
-        VALUES ('TokenizedAsset', ?, 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')
-        ",
-    )
-    .bind(underlying)
-    .bind(&event_payload_str)
-    .execute(pool)
-    .await
-    .unwrap();
-}
 
 /// Tests that backfill checkpoint is independent from monitor discoveries.
 ///
@@ -95,7 +53,14 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     let pool =
         SqlitePoolOptions::new().max_connections(5).connect(&db_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
-    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
+    harness::preseed_tokenized_asset_into_pool(
+        &pool,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await
+    .unwrap();
     pool.close().await;
 
     // Step 2: Start service - backfill should discover the historic receipt
@@ -231,8 +196,19 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
 
     // Preseed BOTH tokenized assets BEFORE rocket starts
     // This simulates production where assets are configured before the service runs
-    preseed_tokenized_asset(&pool, "AAPL", "tAAPL", evm.vault_address).await;
-    preseed_tokenized_asset(&pool, "TSLA", "tTSLA", tsla_vault).await;
+    harness::preseed_tokenized_asset_into_pool(
+        &pool,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await
+    .unwrap();
+    harness::preseed_tokenized_asset_into_pool(
+        &pool, tsla_vault, "TSLA", "tTSLA",
+    )
+    .await
+    .unwrap();
 
     // Close the pool so rocket can open it
     pool.close().await;

@@ -162,6 +162,22 @@ pub async fn preseed_tokenized_asset(
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    preseed_tokenized_asset_into_pool(&pool, vault, underlying, token).await?;
+
+    pool.close().await;
+
+    Ok(())
+}
+
+/// Seeds the `events` table with a `TokenizedAsset::Added` event using an
+/// existing pool. Use this when the caller manages the pool lifecycle
+/// (e.g., when multiple assets must be seeded before closing the pool).
+pub async fn preseed_tokenized_asset_into_pool(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    vault: Address,
+    underlying: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let aggregate_id = underlying;
     let now = Utc::now();
 
@@ -198,10 +214,8 @@ pub async fn preseed_tokenized_asset(
     )
     .bind(aggregate_id)
     .bind(&event_payload_str)
-    .execute(&pool)
+    .execute(pool)
     .await?;
-
-    pool.close().await;
 
     Ok(())
 }

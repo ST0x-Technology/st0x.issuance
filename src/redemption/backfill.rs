@@ -3,7 +3,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{CqrsFramework, EventStore};
-use futures::{StreamExt, TryStreamExt, stream};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -20,22 +19,6 @@ use super::{
 };
 use crate::bindings;
 use crate::receipt_inventory::ReceiptInventory;
-
-/// Maximum number of blocks to query in a single get_logs call.
-const BLOCK_CHUNK_SIZE: u64 = 2000;
-
-/// Generates inclusive block ranges of at most `chunk_size` blocks.
-fn block_ranges(
-    from: u64,
-    to: u64,
-    chunk_size: u64,
-) -> impl Iterator<Item = (u64, u64)> {
-    std::iter::successors(Some(from), move |&start| {
-        let next = start + chunk_size;
-        if next <= to { Some(next) } else { None }
-    })
-    .map(move |start| (start, (start + chunk_size - 1).min(to)))
-}
 
 /// Backfills Transfer events on a single vault by scanning historic blocks.
 ///
@@ -125,64 +108,56 @@ where
             "Starting transfer backfill"
         );
 
-        let all_logs: Vec<Log> = stream::iter(block_ranges(
-            from_block,
-            current_block,
-            BLOCK_CHUNK_SIZE,
-        ))
-        .then(|(chunk_from, chunk_to)| async move {
+        let mut detected_count = 0u64;
+        let mut skipped_mint = 0u64;
+        let mut skipped_no_account = 0u64;
+
+        for (chunk_from, chunk_to) in
+            block_ranges(from_block, current_block, BLOCK_CHUNK_SIZE)
+        {
             let logs =
                 self.fetch_transfer_logs(vault, chunk_from, chunk_to).await?;
+
             debug!(
                 chunk_from,
                 chunk_to,
                 logs_found = logs.len(),
                 "Processed block range"
             );
-            Ok::<_, TransferBackfillError>(logs)
-        })
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
 
-        let mut detected_count = 0u64;
-        let mut skipped_mint = 0u64;
-        let mut skipped_no_account = 0u64;
+            for log in &logs {
+                let outcome =
+                    detect_transfer(log, vault, &self.cqrs, &self.pool).await?;
 
-        for log in &all_logs {
-            let outcome =
-                detect_transfer(log, vault, &self.cqrs, &self.pool).await?;
-
-            match outcome {
-                TransferOutcome::Detected {
-                    issuer_request_id,
-                    client_id,
-                    alpaca_account,
-                    network,
-                } => {
-                    drive_redemption_flow(
+                match outcome {
+                    TransferOutcome::Detected {
                         issuer_request_id,
                         client_id,
                         alpaca_account,
                         network,
-                        RedemptionFlowCtx {
-                            event_store: self.event_store.clone(),
-                            redeem_call_manager: self
-                                .redeem_call_manager
-                                .clone(),
-                            journal_manager: self.journal_manager.clone(),
-                            burn_manager: self.burn_manager.clone(),
-                        },
-                    )
-                    .await;
-                    detected_count += 1;
-                }
-                TransferOutcome::AlreadyDetected => detected_count += 1,
-                TransferOutcome::SkippedMint => skipped_mint += 1,
-                TransferOutcome::SkippedNoAccount => {
-                    skipped_no_account += 1;
+                    } => {
+                        drive_redemption_flow(
+                            issuer_request_id,
+                            client_id,
+                            alpaca_account,
+                            network,
+                            RedemptionFlowCtx {
+                                event_store: self.event_store.clone(),
+                                redeem_call_manager: self
+                                    .redeem_call_manager
+                                    .clone(),
+                                journal_manager: self.journal_manager.clone(),
+                                burn_manager: self.burn_manager.clone(),
+                            },
+                        )
+                        .await;
+                        detected_count += 1;
+                    }
+                    TransferOutcome::AlreadyDetected => detected_count += 1,
+                    TransferOutcome::SkippedMint => skipped_mint += 1,
+                    TransferOutcome::SkippedNoAccount => {
+                        skipped_no_account += 1;
+                    }
                 }
             }
         }
@@ -219,6 +194,22 @@ where
 
         Ok(logs)
     }
+}
+
+/// Maximum number of blocks to query in a single get_logs call.
+const BLOCK_CHUNK_SIZE: u64 = 2000;
+
+/// Generates inclusive block ranges of at most `chunk_size` blocks.
+fn block_ranges(
+    from: u64,
+    to: u64,
+    chunk_size: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    std::iter::successors(Some(from), move |&start| {
+        let next = start + chunk_size;
+        if next <= to { Some(next) } else { None }
+    })
+    .map(move |start| (start, (start + chunk_size - 1).min(to)))
 }
 
 #[cfg(test)]
