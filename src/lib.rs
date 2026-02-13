@@ -39,7 +39,8 @@ use crate::redemption::{
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView, view::list_enabled_assets,
+    TokenizedAsset, TokenizedAssetView,
+    view::{list_enabled_assets, replay_tokenized_asset_view},
 };
 
 pub mod account;
@@ -278,6 +279,7 @@ pub async fn initialize_rocket(
     // up-to-date views. Without this ordering, recovery might miss stuck
     // operations if the view was deleted/corrupted.
     info!("Replaying views to ensure schema updates are applied");
+    replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
@@ -603,7 +605,7 @@ fn spawn_redemption_detector(
     managers: RedemptionManagers,
     bot_wallet: Address,
 ) {
-    info!("Spawning WebSocket monitoring task for bot wallet {bot_wallet}");
+    info!(bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
 
     let detector_config =
         RedemptionDetectorConfig { rpc_url, vault, bot_wallet };

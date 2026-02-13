@@ -142,9 +142,13 @@ pub async fn seed_tokenized_asset_with(
 /// This allows `initialize_rocket` to discover the asset during startup,
 /// so that receipt backfill and redemption monitoring are wired for this vault.
 ///
-/// Uses direct SQL to seed both the event store and the view table.
+/// Seeds the `events` table with a `TokenizedAsset::Added` event before the
+/// Rocket service starts.
+///
 /// Per AGENTS.md "Setup phase exception", direct event store seeding is
-/// permitted in e2e test setup phases.
+/// permitted in e2e test setup phases. The tokenized asset view is rebuilt
+/// from events by `initialize_rocket` during startup (via
+/// `replay_tokenized_asset_view`), so only the event needs to be seeded.
 pub async fn preseed_tokenized_asset(
     db_url: &str,
     vault: Address,
@@ -169,19 +173,7 @@ pub async fn preseed_tokenized_asset(
         }
     });
 
-    let view_payload = json!({
-        "Asset": {
-            "underlying": underlying,
-            "token": token,
-            "network": "base",
-            "vault": vault,
-            "enabled": true,
-            "added_at": now
-        }
-    });
-
     let event_payload_str = event_payload.to_string();
-    let view_payload_str = view_payload.to_string();
 
     sqlx::query(
         "
@@ -204,15 +196,6 @@ pub async fn preseed_tokenized_asset(
     )
     .bind(aggregate_id)
     .bind(&event_payload_str)
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO tokenized_asset_view (view_id, version, payload)
-         VALUES (?, 1, ?)",
-    )
-    .bind(aggregate_id)
-    .bind(&view_payload_str)
     .execute(&pool)
     .await?;
 

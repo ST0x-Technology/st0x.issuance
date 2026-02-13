@@ -1,31 +1,25 @@
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
-use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
+use cqrs_es::{CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
-    burn_manager::BurnManager, journal_manager::JournalManager,
+    Redemption,
+    burn_manager::BurnManager,
+    journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
+    transfer::{
+        RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
+        detect_transfer, drive_redemption_flow,
+    },
 };
-use crate::Quantity;
-use crate::QuantityConversionError;
-use crate::account::view::{AccountViewError, find_by_wallet};
-use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
 use crate::receipt_inventory::ReceiptInventory;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, list_enabled_assets,
-};
-use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
-};
 
 /// Maximum number of blocks to query in a single get_logs call.
 const BLOCK_CHUNK_SIZE: u64 = 2000;
@@ -79,22 +73,8 @@ pub(crate) struct TransferBackfillResult {
 pub(crate) enum TransferBackfillError {
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError<TransportErrorKind>),
-    #[error("Failed to decode Transfer event: {0}")]
-    SolTypes(#[from] alloy::sol_types::Error),
-    #[error("Missing transaction hash in log")]
-    MissingTxHash,
-    #[error("Missing block number in log")]
-    MissingBlockNumber,
-    #[error("Quantity conversion error: {0}")]
-    QuantityConversion(#[from] QuantityConversionError),
-    #[error("CQRS error: {0}")]
-    Aggregate(#[from] cqrs_es::AggregateError<RedemptionError>),
-    #[error("Account view error: {0}")]
-    AccountView(#[from] AccountViewError),
-    #[error("Tokenized asset view error: {0}")]
-    TokenizedAssetView(#[from] TokenizedAssetViewError),
-    #[error("No asset found for vault {vault}")]
-    NoMatchingAsset { vault: Address },
+    #[error("Transfer processing error: {0}")]
+    TransferProcessing(#[from] TransferProcessingError),
 }
 
 impl<ProviderType, RedemptionStore, ReceiptInventoryStore>
@@ -172,8 +152,34 @@ where
         let mut skipped_no_account = 0u64;
 
         for log in &all_logs {
-            match self.process_transfer(vault, log).await? {
-                TransferOutcome::Detected => detected_count += 1,
+            let outcome =
+                detect_transfer(log, vault, &self.cqrs, &self.pool).await?;
+
+            match outcome {
+                TransferOutcome::Detected {
+                    issuer_request_id,
+                    client_id,
+                    alpaca_account,
+                    network,
+                } => {
+                    drive_redemption_flow(
+                        issuer_request_id,
+                        client_id,
+                        alpaca_account,
+                        network,
+                        RedemptionFlowCtx {
+                            event_store: self.event_store.clone(),
+                            redeem_call_manager: self
+                                .redeem_call_manager
+                                .clone(),
+                            journal_manager: self.journal_manager.clone(),
+                            burn_manager: self.burn_manager.clone(),
+                        },
+                    )
+                    .await;
+                    detected_count += 1;
+                }
+                TransferOutcome::AlreadyDetected => detected_count += 1,
                 TransferOutcome::SkippedMint => skipped_mint += 1,
                 TransferOutcome::SkippedNoAccount => {
                     skipped_no_account += 1;
@@ -213,239 +219,6 @@ where
 
         Ok(logs)
     }
-
-    async fn process_transfer(
-        &self,
-        vault: Address,
-        log: &Log,
-    ) -> Result<TransferOutcome, TransferBackfillError> {
-        let transfer_event =
-            bindings::OffchainAssetReceiptVault::Transfer::decode_log(
-                &log.inner,
-            )?;
-
-        if transfer_event.from == Address::ZERO {
-            debug!(
-                to = %transfer_event.to,
-                value = %transfer_event.value,
-                "Skipping mint event (from=0x0)"
-            );
-            return Ok(TransferOutcome::SkippedMint);
-        }
-
-        let tx_hash =
-            log.transaction_hash.ok_or(TransferBackfillError::MissingTxHash)?;
-
-        let block_number = log
-            .block_number
-            .ok_or(TransferBackfillError::MissingBlockNumber)?;
-
-        let account_view =
-            find_by_wallet(&self.pool, &transfer_event.from).await?;
-
-        let Some(AccountView::LinkedToAlpaca {
-            client_id, alpaca_account, ..
-        }) = account_view
-        else {
-            debug!(
-                from = %transfer_event.from,
-                tx_hash = %tx_hash,
-                "Skipping transfer from unwhitelisted wallet"
-            );
-            return Ok(TransferOutcome::SkippedNoAccount);
-        };
-
-        let (underlying, token, network) =
-            self.find_matching_asset(vault).await?;
-
-        let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
-        let quantity =
-            Quantity::from_u256_with_18_decimals(transfer_event.value)?;
-
-        let command = RedemptionCommand::Detect {
-            issuer_request_id: issuer_request_id.clone(),
-            underlying,
-            token,
-            wallet: transfer_event.from,
-            quantity,
-            tx_hash,
-            block_number,
-        };
-
-        if let Err(err) =
-            self.cqrs.execute(&issuer_request_id.to_string(), command).await
-        {
-            debug!(
-                %issuer_request_id,
-                error = ?err,
-                "Skipping already-detected transfer"
-            );
-            return Ok(TransferOutcome::Detected);
-        }
-
-        info!(
-            %issuer_request_id,
-            from = %transfer_event.from,
-            "Backfill detected redemption transfer"
-        );
-
-        self.trigger_redemption_flow(
-            issuer_request_id,
-            client_id,
-            alpaca_account,
-            network,
-        )
-        .await;
-
-        Ok(TransferOutcome::Detected)
-    }
-
-    async fn find_matching_asset(
-        &self,
-        vault: Address,
-    ) -> Result<(UnderlyingSymbol, TokenSymbol, Network), TransferBackfillError>
-    {
-        let assets = list_enabled_assets(&self.pool).await?;
-
-        assets
-            .into_iter()
-            .find_map(|view| match view {
-                TokenizedAssetView::Asset {
-                    underlying,
-                    token,
-                    network,
-                    vault: addr,
-                    ..
-                } if addr == vault => Some((underlying, token, network)),
-                _ => None,
-            })
-            .ok_or(TransferBackfillError::NoMatchingAsset { vault })
-    }
-
-    async fn trigger_redemption_flow(
-        &self,
-        issuer_request_id: IssuerRedemptionRequestId,
-        client_id: ClientId,
-        alpaca_account: AlpacaAccountNumber,
-        network: Network,
-    ) {
-        let aggregate_ctx = match self
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-        {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                warn!(
-                    %issuer_request_id,
-                    error = ?err,
-                    "Failed to load aggregate after detection"
-                );
-                return;
-            }
-        };
-
-        if let Err(err) = self
-            .redeem_call_manager
-            .handle_redemption_detected(
-                &alpaca_account,
-                &issuer_request_id,
-                aggregate_ctx.aggregate(),
-                client_id,
-                network,
-            )
-            .await
-        {
-            warn!(
-                %issuer_request_id,
-                error = ?err,
-                "handle_redemption_detected failed during backfill"
-            );
-            return;
-        }
-
-        let aggregate_ctx = match self
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-        {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                warn!(
-                    %issuer_request_id,
-                    error = ?err,
-                    "Failed to load aggregate after redeem call"
-                );
-                return;
-            }
-        };
-
-        let Redemption::AlpacaCalled { tokenization_request_id, .. } =
-            aggregate_ctx.aggregate()
-        else {
-            return;
-        };
-
-        let journal_manager = self.journal_manager.clone();
-        let burn_manager = self.burn_manager.clone();
-        let event_store = self.event_store.clone();
-        let issuer_request_id_cloned = issuer_request_id.clone();
-        let tokenization_request_id_cloned = tokenization_request_id.clone();
-
-        tokio::spawn(async move {
-            if let Err(err) = journal_manager
-                .handle_alpaca_called(
-                    &alpaca_account,
-                    issuer_request_id_cloned.clone(),
-                    tokenization_request_id_cloned,
-                )
-                .await
-            {
-                warn!(
-                    error = ?err,
-                    "handle_alpaca_called (journal polling) failed during backfill"
-                );
-                return;
-            }
-
-            let aggregate_ctx = match event_store
-                .load_aggregate(&issuer_request_id_cloned.to_string())
-                .await
-            {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    warn!(
-                        issuer_request_id = %issuer_request_id_cloned,
-                        error = ?err,
-                        "Failed to load aggregate after journal completion"
-                    );
-                    return;
-                }
-            };
-
-            if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
-                if let Err(err) = burn_manager
-                    .handle_burning_started(
-                        &issuer_request_id_cloned,
-                        aggregate_ctx.aggregate(),
-                    )
-                    .await
-                {
-                    warn!(
-                        issuer_request_id = %issuer_request_id_cloned,
-                        error = ?err,
-                        "handle_burning_started failed during backfill"
-                    );
-                }
-            }
-        });
-    }
-}
-
-enum TransferOutcome {
-    Detected,
-    SkippedMint,
-    SkippedNoAccount,
 }
 
 #[cfg(test)]

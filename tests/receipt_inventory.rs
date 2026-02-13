@@ -14,32 +14,42 @@ use st0x_issuance::{
     SignerConfig, initialize_rocket,
 };
 
+/// Seeds the events table with a `TokenizedAsset::Added` event so the view
+/// is rebuilt during `initialize_rocket` startup via `replay_tokenized_asset_view`.
 async fn preseed_tokenized_asset(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     underlying: &str,
     token: &str,
     vault: Address,
 ) {
-    let view_id = underlying;
-    let payload = json!({
-        "Asset": {
+    let event_payload = json!({
+        "Added": {
             "underlying": underlying,
             "token": token,
             "network": "base",
             "vault": vault,
-            "enabled": true,
             "added_at": "2024-01-01T00:00:00Z"
         }
     });
 
-    sqlx::query!(
-        r#"
-        INSERT INTO tokenized_asset_view (view_id, version, payload)
-        VALUES (?, 1, ?)
-        "#,
-        view_id,
-        payload
+    let event_payload_str = event_payload.to_string();
+
+    sqlx::query(
+        "
+        INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES ('TokenizedAsset', ?, 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')
+        ",
     )
+    .bind(underlying)
+    .bind(&event_payload_str)
     .execute(pool)
     .await
     .unwrap();

@@ -8,6 +8,7 @@ pub(crate) mod burn_manager;
 pub(crate) mod detector;
 pub(crate) mod journal_manager;
 pub(crate) mod redeem_call_manager;
+pub(crate) mod transfer;
 
 use alloy::hex;
 use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
