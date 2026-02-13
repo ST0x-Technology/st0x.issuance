@@ -1101,10 +1101,20 @@ tokenized asset.
 **Transfer Backfilling:**
 
 At startup, before spawning live monitors, the service scans historic Transfer
-events on each vault to detect any redemption transfers that occurred while the
-service was down. This ensures no redemptions are silently missed due to
-downtime. The backfill scans from the last processed block (or the configured
-start block on first run) to the current block.
+events on **each vault independently** to detect any redemption transfers that
+occurred while the service was down. This ensures no redemptions are silently
+missed due to downtime.
+
+Each vault is backfilled separately: the backfiller scans from the configured
+`backfill_start_block` to the current block for each vault contract. Idempotency
+is guaranteed by the `IssuerRedemptionRequestId` derived from each transaction
+hash — the Redemption aggregate rejects duplicate detections, so re-scanning
+already-processed blocks is safe.
+
+This mirrors the receipt backfill pattern, where per-vault checkpoints are
+tracked via the `ReceiptInventory` aggregate's `last_backfilled_block` state.
+Transfer backfill currently relies on idempotency rather than per-vault
+checkpoint tracking.
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
