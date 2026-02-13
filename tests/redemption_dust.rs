@@ -267,7 +267,8 @@ async fn test_redemption_returns_dust_to_user()
 
     let captured_qty: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_qty_capture(
         &mock_alpaca,
         user_wallet,
@@ -365,7 +366,8 @@ async fn test_redemption_no_dust_when_9_decimals()
 
     let captured_qty: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_qty_capture(
         &mock_alpaca,
         user_wallet,

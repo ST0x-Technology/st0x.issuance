@@ -94,8 +94,13 @@ impl View<TokenizedAsset> for TokenizedAssetView {
                     added_at: *added_at,
                 };
             }
-            TokenizedAssetEvent::VaultAddressUpdated { vault, .. } => {
-                todo!("View update for VaultAddressUpdated: {vault}")
+            TokenizedAssetEvent::VaultAddressUpdated {
+                vault: new_vault,
+                ..
+            } => {
+                if let Self::Asset { vault, .. } = self {
+                    *vault = *new_vault;
+                }
             }
         }
     }
@@ -265,6 +270,61 @@ mod tests {
         assert_eq!(view_vault, vault);
         assert!(enabled);
         assert_eq!(view_added_at, added_at);
+    }
+
+    #[test]
+    fn test_view_update_from_vault_address_updated_event() {
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let added_at = Utc::now();
+        let updated_at = Utc::now();
+
+        let mut view = TokenizedAssetView::Asset {
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            vault: vault_a,
+            enabled: true,
+            added_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: underlying.0.clone(),
+            sequence: 2,
+            payload: TokenizedAssetEvent::VaultAddressUpdated {
+                vault: vault_b,
+                previous_vault: vault_a,
+                updated_at,
+            },
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let TokenizedAssetView::Asset {
+            underlying: view_underlying,
+            token: view_token,
+            network: view_network,
+            vault: view_vault,
+            enabled,
+            added_at: view_added_at,
+        } = view
+        else {
+            panic!("Expected Asset, got Unavailable")
+        };
+
+        assert_eq!(view_vault, vault_b, "Vault should be updated to vault B");
+        assert_eq!(
+            view_underlying, underlying,
+            "Underlying should be preserved"
+        );
+        assert_eq!(view_token, token, "Token should be preserved");
+        assert_eq!(view_network, network, "Network should be preserved");
+        assert!(enabled, "Enabled should be preserved");
+        assert_eq!(view_added_at, added_at, "Added-at should be preserved");
     }
 
     #[tokio::test]

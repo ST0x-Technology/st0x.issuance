@@ -1,8 +1,11 @@
+// Each integration test file (`tests/*.rs`) is compiled as a separate binary
+// crate. `mod harness;` includes the full harness in every binary, so functions
+// not used by a particular test trigger dead_code warnings. There is no way to
+// share a library module across integration test binaries without extracting it
+// into a separate crate.
 #![allow(dead_code)]
 
-mod alpaca_mocks;
-
-pub use alpaca_mocks::*;
+pub mod alpaca_mocks;
 
 use alloy::primitives::{Address, U256};
 use chrono::Utc;

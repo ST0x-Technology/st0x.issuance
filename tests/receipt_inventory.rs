@@ -45,9 +45,10 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
         evm.mint_directly(historic_amount, bot_wallet).await?;
 
     // Setup mocks
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Preseed asset before starting service so backfill can discover receipts
     let pool =

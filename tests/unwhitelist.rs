@@ -30,9 +30,10 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet = user_signer.address();
 
-    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let config = Config {
         database_url: ":memory:".to_string(),

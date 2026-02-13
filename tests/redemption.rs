@@ -279,9 +279,10 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     let db_path = temp_dir.path().join("test_receipt_inventory.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     harness::preseed_tokenized_asset(
         &db_url,
@@ -420,7 +421,8 @@ async fn test_redemption_recovery_after_restart()
     let poll_should_succeed = Arc::new(AtomicBool::new(false));
 
     // Setup mocks - poll returns "pending" until we flip the flag
-    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, _poll_mock) = setup_redemption_mocks_with_shared_state(
         &mock_alpaca,
         user_wallet,

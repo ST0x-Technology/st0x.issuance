@@ -42,9 +42,10 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
     let db_path = temp_dir.path().join("test_multi_vault.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Pre-seed assets BEFORE starting the service so that initialize_rocket
     // discovers both vaults and spawns redemption detectors for each.
@@ -201,9 +202,10 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     let db_path = temp_dir.path().join("test_backfill.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Only pre-seed AAPL — the first service will NOT spawn a detector for vault2.
     // TSLA gets added via API in phase 1 (after service starts), so no live

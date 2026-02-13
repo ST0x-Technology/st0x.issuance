@@ -100,9 +100,10 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet = user_signer.address();
 
-    let mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (redeem_mock, poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("test_tokenization.db");
@@ -186,9 +187,10 @@ async fn test_mint_burn_mint_nonce_synchronization()
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet = user_signer.address();
 
-    let _mint_callback_mock = harness::setup_mint_mocks(&mock_alpaca);
+    let _mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
-        harness::setup_redemption_mocks(&mock_alpaca);
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("test_nonce_sync.db");
