@@ -1794,4 +1794,4 @@ completion before moving to the next.
 
 **Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
 run as supervised tasks via `task-supervisor`, which restarts them on crash. See
-[docs/apalis.md](docs/apalis.md) for the two-layer architecture.
+[docs/orchestration.md](docs/orchestration.md) for the two-layer architecture.
