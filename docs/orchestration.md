@@ -24,7 +24,7 @@ backfilling historic data, replaying views, and recovering in-progress
 operations. It gives us retry with backoff, persistence across restarts, ordered
 execution within a worker, and visibility into job state (pending, running,
 failed, done) — all backed by the same SQLite database the rest of the system
-uses. Jobs run to completion during the phased startup sequence.
+uses. Jobs run to completion during the startup sequence.
 
 **task-supervisor** handles long-running monitors that must survive transient
 failures. Each monitor implements `SupervisedTask` and is registered with a
@@ -64,16 +64,21 @@ around this.
 
 ## Apalis job pattern
 
-Jobs are zero-size structs that implement the apalis job trait. The actual
-dependencies come through `Data<T>` extractors in the `run` function, and jobs
-are registered via `build_fn`:
+Jobs implement the `Job` trait (`src/job.rs`), which defines associated types
+for context (`Ctx`) and error (`Error`), plus a `label()` method returning a
+`Label` newtype and an async `run()` method:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MintRecoveryJob;
 
-impl MintRecoveryJob {
-    async fn run(self, pool: Data<Pool<Sqlite>>, cqrs: Data<MintCqrs>) {
+impl Job for MintRecoveryJob {
+    type Ctx = MintRecoveryCtx;
+    type Error = MintViewError;
+
+    fn label(&self) -> Label { Label::new("mint-recovery") }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
         // recovery logic
     }
 }
@@ -81,20 +86,30 @@ impl MintRecoveryJob {
 // registration
 Monitor::new().register(
     WorkerBuilder::new("mint-recovery")
-        .data(pool)
-        .data(cqrs)
+        .data(MintRecoveryCtx { pool, mint_cqrs })
         .backend(storage)
         .build_fn(MintRecoveryJob::run),
 );
 ```
 
-## Phase-based startup ordering
+Each job bundles its dependencies into a single `Ctx` type rather than using
+multiple `Data<T>` extractors.
 
-Startup jobs execute in a specific order to satisfy data dependencies. Each
-phase completes before the next begins:
+## Startup ordering
 
-1. **View replay** — rebuild read models from the event store
-2. **Receipt backfill** — sync historic on-chain receipts
-3. **Transfer backfill** — sync historic redemption transfers
+Startup jobs execute sequentially via `push_and_await`, which pushes a job and
+polls until completion before moving on. The ordering satisfies data
+dependencies — each job assumes the preceding jobs have completed:
+
+1. **View replay** — rebuild read models from the event store so recovery jobs
+   can query accurate state
+2. **Receipt backfill** (one per vault) — sync historic on-chain receipts into
+   the receipt inventory
+3. **Transfer backfill** (one per vault) — sync historic redemption transfers.
+   Runs after all receipt backfills because transfer detection depends on
+   receipt inventory being populated.
 4. **Mint recovery** — resume any in-progress mints
 5. **Redemption recovery** — resume any in-progress redemptions
+
+Any failure aborts startup — the service will not accept requests until all jobs
+succeed. All jobs are idempotent, so restarting retries safely.
