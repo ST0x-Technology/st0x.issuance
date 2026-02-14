@@ -2,7 +2,6 @@ mod api;
 mod cmd;
 mod event;
 pub(crate) mod recovery;
-pub(crate) mod recovery_job;
 mod view;
 
 use alloy::primitives::{Address, B256, TxHash, U256};

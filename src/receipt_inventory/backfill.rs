@@ -1,18 +1,57 @@
 use alloy::primitives::{Address, Bytes, TxHash};
+use alloy::providers::DynProvider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use apalis::prelude::Data;
+use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, Shares, determine_source,
 };
-use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::bindings::{self, OffchainAssetReceiptVault, Receipt};
+use crate::tokenized_asset::view::list_enabled_assets;
+use crate::tokenized_asset::{TokenizedAssetView, VaultBackfillConfig};
+use crate::{ReceiptInventoryCqrs, ReceiptInventoryEventStore, VaultConfigs};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReceiptBackfillJob;
+
+pub(crate) struct ReceiptBackfillCtx {
+    pub(crate) provider: DynProvider,
+    pub(crate) receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    pub(crate) receipt_inventory_event_store: ReceiptInventoryEventStore,
+    pub(crate) bot_wallet: Address,
+    pub(crate) backfill_start_block: u64,
+}
+
+impl ReceiptBackfillJob {
+    pub(crate) async fn run(
+        self,
+        pool: Data<Pool<Sqlite>>,
+        ctx: Data<Arc<ReceiptBackfillCtx>>,
+        vault_configs: Data<VaultConfigs>,
+    ) -> Result<(), anyhow::Error> {
+        let configs = run_all_receipt_backfills(&pool, &ctx).await?;
+
+        let mut guard = vault_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(configs);
+        drop(guard);
+
+        info!("Receipt backfill complete");
+
+        Ok(())
+    }
+}
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
