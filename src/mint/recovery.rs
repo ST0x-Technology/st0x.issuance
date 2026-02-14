@@ -9,24 +9,37 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerMintRequestId, Mint, MintCommand, MintError,
+    IssuerMintRequestId, Mint, MintCommand, MintError, MintViewError,
     find_all_recoverable_mints,
 };
 use crate::MintCqrs;
+use crate::job::{Job, Label};
 use crate::receipt_inventory::ItnReceiptHandler;
+
+#[derive(Clone)]
+pub(crate) struct MintRecoveryCtx {
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) mint_cqrs: MintCqrs,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MintRecoveryJob;
 
-impl MintRecoveryJob {
-    pub(crate) async fn run(
+impl Job for MintRecoveryJob {
+    type Ctx = MintRecoveryCtx;
+    type Error = MintViewError;
+
+    fn label(&self) -> Label {
+        Label::new("mint-recovery")
+    }
+
+    async fn run(
         self,
-        pool: Data<Pool<Sqlite>>,
-        mint_cqrs: Data<MintCqrs>,
-    ) -> Result<(), anyhow::Error> {
+        ctx: Data<MintRecoveryCtx>,
+    ) -> Result<(), MintViewError> {
         info!("Starting mint recovery");
 
-        let recoverable_mints = find_all_recoverable_mints(&pool).await?;
+        let recoverable_mints = find_all_recoverable_mints(&ctx.pool).await?;
 
         if recoverable_mints.is_empty() {
             debug!("No mints to recover");
@@ -36,7 +49,7 @@ impl MintRecoveryJob {
         info!(count = recoverable_mints.len(), "Recovering mints");
 
         for (issuer_request_id, _view) in recoverable_mints {
-            recover_mint(&mint_cqrs, issuer_request_id).await;
+            recover_mint(&ctx.mint_cqrs, issuer_request_id).await;
         }
 
         debug!("Completed mint recovery");

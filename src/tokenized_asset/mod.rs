@@ -15,13 +15,13 @@ pub(crate) use api::{
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::{
-    TokenizedAssetView, TokenizedAssetViewRepo, discover_vault_configs,
+    TokenizedAssetView, TokenizedAssetViewRepo, discover_vaults,
 };
 
 /// Configuration for a single vault, extracted from TokenizedAssetView during
 /// receipt backfill and shared with transfer backfill and continuous monitors.
 #[derive(Clone)]
-pub(crate) struct VaultBackfillConfig {
+pub(crate) struct VaultCtx {
     pub(crate) vault: Address,
     pub(crate) receipt_contract: Address,
 }

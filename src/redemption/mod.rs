@@ -24,6 +24,7 @@ use tracing::{info, warn};
 
 use crate::Quantity;
 use crate::RedemptionManagers;
+use crate::job::{Job, Label};
 use crate::mint::TokenizationRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
@@ -39,11 +40,15 @@ pub(crate) use view::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RedemptionRecoveryJob;
 
-impl RedemptionRecoveryJob {
-    pub(crate) async fn run(
-        self,
-        managers: Data<Arc<RedemptionManagers>>,
-    ) -> Result<(), anyhow::Error> {
+impl Job for RedemptionRecoveryJob {
+    type Ctx = Arc<RedemptionManagers>;
+    type Error = std::convert::Infallible;
+
+    fn label(&self) -> Label {
+        Label::new("redemption-recovery")
+    }
+
+    async fn run(self, managers: Data<Self::Ctx>) -> Result<(), Self::Error> {
         info!("Starting redemption recovery");
 
         managers.redeem_call.recover_detected_redemptions().await;
