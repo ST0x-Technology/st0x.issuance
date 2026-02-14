@@ -22,7 +22,7 @@ use crate::account::view::replay_account_view;
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
-use crate::job::Job;
+use crate::job::{Job, Label};
 use crate::mint::{
     Mint, MintServices, MintView,
     recovery::{MintRecoveryCtx, MintRecoveryHandler, MintRecoveryJob},
@@ -105,20 +105,107 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Maximum time to wait for a single startup job before treating it as stuck.
 const STARTUP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Pushes a job to the storage and polls until it completes.
+/// Pushes a job to the queue and polls until it completes.
 ///
 /// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails,
 /// is killed, or exceeds the timeout.
 async fn push_and_await<J: Job>(
-    storage: &mut SqliteStorage<J>,
+    job_queue: &mut SqliteStorage<J>,
     job: J,
 ) -> Result<(), anyhow::Error> {
     let label = job.label();
     info!(job = %label, "Pushing startup job");
-    let parts = storage.push(job).await?;
+    let parts = job_queue.push(job).await?;
     let task_id = parts.task_id;
     debug!(job = %label, %task_id, "Job queued, waiting for completion");
 
+    await_task(job_queue, &label, &task_id).await
+}
+
+/// Pushes multiple jobs to the queue and polls until all complete.
+///
+/// All jobs are pushed first (so the worker can start processing them
+/// concurrently), then polled together in a single loop.
+async fn push_all_and_await<J: Job>(
+    job_queue: &mut SqliteStorage<J>,
+    jobs: impl IntoIterator<Item = J>,
+) -> Result<(), anyhow::Error> {
+    let mut pending: Vec<(Label, apalis::prelude::TaskId)> = Vec::new();
+
+    for job in jobs {
+        let label = job.label();
+        info!(job = %label, "Pushing startup job");
+        let parts = job_queue.push(job).await?;
+        debug!(job = %label, task_id = %parts.task_id, "Job queued");
+        pending.push((label, parts.task_id));
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = pending.len(), "Waiting for startup jobs to complete");
+
+    let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
+
+    while !pending.is_empty() {
+        sleep(Duration::from_millis(100)).await;
+
+        if tokio::time::Instant::now() > deadline {
+            let still_pending: Vec<_> =
+                pending.iter().map(|(label, _)| label.to_string()).collect();
+            return Err(anyhow::anyhow!(
+                "Startup jobs timed out after {}s: {}",
+                STARTUP_JOB_TIMEOUT.as_secs(),
+                still_pending.join(", ")
+            ));
+        }
+
+        let mut still_pending = Vec::new();
+
+        for (label, task_id) in pending {
+            let Some(request) = job_queue.fetch_by_id(&task_id).await? else {
+                still_pending.push((label, task_id));
+                continue;
+            };
+
+            match request.parts.context.status() {
+                State::Done => {
+                    info!(job = %label, "Startup job completed");
+                }
+                State::Failed => {
+                    let error_msg = request
+                        .parts
+                        .context
+                        .last_error()
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    return Err(anyhow::anyhow!(
+                        "Startup job '{label}' failed: {error_msg}"
+                    ));
+                }
+                State::Killed => {
+                    return Err(anyhow::anyhow!(
+                        "Startup job '{label}' was killed"
+                    ));
+                }
+                _ => {
+                    still_pending.push((label, task_id));
+                }
+            }
+        }
+
+        pending = still_pending;
+    }
+
+    Ok(())
+}
+
+async fn await_task<J: Job>(
+    job_queue: &mut SqliteStorage<J>,
+    label: &Label,
+    task_id: &apalis::prelude::TaskId,
+) -> Result<(), anyhow::Error> {
     let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
 
     loop {
@@ -131,7 +218,7 @@ async fn push_and_await<J: Job>(
             ));
         }
 
-        let Some(request) = storage.fetch_by_id(&task_id).await? else {
+        let Some(request) = job_queue.fetch_by_id(task_id).await? else {
             continue;
         };
 
@@ -390,34 +477,34 @@ pub async fn initialize_rocket(
         backfill_start_block: config.backfill_start_block,
     });
 
-    let mut view_replay_storage =
+    let mut view_replay_job_queue =
         SqliteStorage::<ViewReplayJob>::new(pool.clone());
-    let mut receipt_backfill_storage =
+    let mut receipt_backfill_job_queue =
         SqliteStorage::<ReceiptBackfillJob>::new(pool.clone());
-    let mut transfer_backfill_storage =
+    let mut transfer_backfill_job_queue =
         SqliteStorage::<TransferBackfillJob>::new(pool.clone());
-    let mut mint_recovery_storage =
+    let mut mint_recovery_job_queue =
         SqliteStorage::<MintRecoveryJob>::new(pool.clone());
-    let mut redemption_recovery_storage =
+    let mut redemption_recovery_job_queue =
         SqliteStorage::<RedemptionRecoveryJob>::new(pool.clone());
 
     let monitor = Monitor::new()
         .register(
             WorkerBuilder::new("view-replay")
                 .data(pool.clone())
-                .backend(view_replay_storage.clone())
+                .backend(view_replay_job_queue.clone())
                 .build_fn(ViewReplayJob::run),
         )
         .register(
             WorkerBuilder::new("receipt-backfill")
                 .data(receipt_backfill_ctx)
-                .backend(receipt_backfill_storage.clone())
+                .backend(receipt_backfill_job_queue.clone())
                 .build_fn(ReceiptBackfillJob::run),
         )
         .register(
             WorkerBuilder::new("transfer-backfill")
                 .data(transfer_backfill_ctx)
-                .backend(transfer_backfill_storage.clone())
+                .backend(transfer_backfill_job_queue.clone())
                 .build_fn(TransferBackfillJob::run),
         )
         .register(
@@ -426,13 +513,13 @@ pub async fn initialize_rocket(
                     pool: pool.clone(),
                     mint_cqrs: mint.cqrs.clone(),
                 })
-                .backend(mint_recovery_storage.clone())
+                .backend(mint_recovery_job_queue.clone())
                 .build_fn(MintRecoveryJob::run),
         )
         .register(
             WorkerBuilder::new("redemption-recovery")
                 .data(Arc::new(managers.clone()))
-                .backend(redemption_recovery_storage.clone())
+                .backend(redemption_recovery_job_queue.clone())
                 .build_fn(RedemptionRecoveryJob::run),
         );
 
@@ -443,35 +530,40 @@ pub async fn initialize_rocket(
     }));
 
     // View replay — rebuild read models before recovery queries them
-    push_and_await(&mut view_replay_storage, ViewReplayJob).await?;
+    push_and_await(&mut view_replay_job_queue, ViewReplayJob).await?;
 
     // Discover vaults and run per-vault backfills
-    let vault_configs =
-        discover_vaults(&pool, &blockchain_setup.provider).await?;
+    let vault_ctxs = discover_vaults(&pool, &blockchain_setup.provider).await?;
 
-    for config in &vault_configs {
+    for vault_ctx in &vault_ctxs {
         push_and_await(
-            &mut receipt_backfill_storage,
+            &mut receipt_backfill_job_queue,
             ReceiptBackfillJob {
-                vault: config.vault,
-                receipt_contract: config.receipt_contract,
+                vault: vault_ctx.vault,
+                receipt_contract: vault_ctx.receipt_contract,
             },
         )
         .await?;
     }
 
-    for config in &vault_configs {
+    for vault_ctx in &vault_ctxs {
         push_and_await(
-            &mut transfer_backfill_storage,
-            TransferBackfillJob { vault: config.vault },
+            &mut transfer_backfill_job_queue,
+            TransferBackfillJob { vault: vault_ctx.vault },
         )
         .await?;
     }
 
     // Recovery — runs after backfills for accurate state
-    push_and_await(&mut mint_recovery_storage, MintRecoveryJob).await?;
-    push_and_await(&mut redemption_recovery_storage, RedemptionRecoveryJob)
-        .await?;
+    push_and_await(&mut mint_recovery_job_queue, MintRecoveryJob).await?;
+
+    push_all_and_await(
+        &mut redemption_recovery_job_queue,
+        vault_ctxs.iter().map(|vault_ctx| RedemptionRecoveryJob {
+            underlying: vault_ctx.underlying.clone(),
+        }),
+    )
+    .await?;
 
     let mut supervisor_builder = SupervisorBuilder::new()
         .with_unlimited_restarts()
@@ -480,10 +572,10 @@ pub async fn initialize_rocket(
 
     let itn_handler = MintRecoveryHandler::new(mint.cqrs.clone());
 
-    for vault_config in &vault_configs {
+    for vault_ctx in &vault_ctxs {
         let monitor_config = ReceiptMonitorConfig {
-            vault: vault_config.vault,
-            receipt_contract: vault_config.receipt_contract,
+            vault: vault_ctx.vault,
+            receipt_contract: vault_ctx.receipt_contract,
             bot_wallet,
         };
 
@@ -495,13 +587,13 @@ pub async fn initialize_rocket(
         );
 
         supervisor_builder = supervisor_builder.with_task(
-            &format!("receipt-monitor-{}", vault_config.vault),
+            &format!("receipt-monitor-{}", vault_ctx.vault),
             receipt_monitor,
         );
 
         let detector_config = RedemptionDetectorConfig {
             rpc_url: config.rpc_url.clone(),
-            vault: vault_config.vault,
+            vault: vault_ctx.vault,
             bot_wallet,
         };
 
@@ -516,7 +608,7 @@ pub async fn initialize_rocket(
         );
 
         supervisor_builder = supervisor_builder.with_task(
-            &format!("redemption-detector-{}", vault_config.vault),
+            &format!("redemption-detector-{}", vault_ctx.vault),
             detector,
         );
     }
@@ -525,7 +617,7 @@ pub async fn initialize_rocket(
     let supervisor_handle = supervisor.run();
 
     info!(
-        vault_count = vault_configs.len(),
+        vault_count = vault_ctxs.len(),
         "Task supervisor started with all monitors"
     );
 
