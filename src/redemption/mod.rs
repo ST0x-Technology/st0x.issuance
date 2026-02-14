@@ -38,25 +38,33 @@ pub(crate) use view::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RedemptionRecoveryJob;
+pub(crate) struct RedemptionRecoveryJob {
+    pub(crate) underlying: UnderlyingSymbol,
+}
 
 impl Job for RedemptionRecoveryJob {
     type Ctx = Arc<RedemptionManagers>;
     type Error = std::convert::Infallible;
 
     fn label(&self) -> Label {
-        Label::new("redemption-recovery")
+        Label::new(format!("redemption-recovery-{}", self.underlying))
     }
 
     async fn run(self, managers: Data<Self::Ctx>) -> Result<(), Self::Error> {
-        info!("Starting redemption recovery");
+        info!(underlying = %self.underlying, "Starting redemption recovery");
 
-        managers.redeem_call.recover_detected_redemptions().await;
-        managers.journal.recover_alpaca_called_redemptions().await;
-        managers.burn.recover_burning_redemptions().await;
-        managers.burn.recover_burn_failed_redemptions().await;
+        managers
+            .redeem_call
+            .recover_detected_redemptions(&self.underlying)
+            .await;
+        managers
+            .journal
+            .recover_alpaca_called_redemptions(&self.underlying)
+            .await;
+        managers.burn.recover_burning_redemptions(&self.underlying).await;
+        managers.burn.recover_burn_failed_redemptions(&self.underlying).await;
 
-        info!("Completed redemption recovery");
+        info!(underlying = %self.underlying, "Completed redemption recovery");
 
         Ok(())
     }

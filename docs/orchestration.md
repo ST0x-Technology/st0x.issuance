@@ -16,7 +16,8 @@ apalis (work layer — finite jobs that complete during startup)
   ├── ReceiptBackfillJob
   ├── TransferBackfillJob
   ├── MintRecoveryJob
-  └── RedemptionRecoveryJob
+  ├── RedemptionRecoveryJob (vault A)  -- concurrent
+  └── RedemptionRecoveryJob (vault B)  -- concurrent
 ```
 
 **Apalis** (v0.7.4, SQLite backend) handles finite startup/recovery work:
@@ -97,9 +98,16 @@ multiple `Data<T>` extractors.
 
 ## Startup ordering
 
-Startup jobs execute sequentially via `push_and_await`, which pushes a job and
-polls until completion before moving on. The ordering satisfies data
-dependencies — each job assumes the preceding jobs have completed:
+Startup jobs execute via two helpers:
+
+- `push_and_await` — pushes a single job and polls until completion. Used for
+  sequential jobs where ordering matters.
+- `push_all_and_await` — pushes all jobs first, then polls all of them in a
+  single loop until every job completes. Used when multiple independent jobs can
+  run concurrently.
+
+The ordering satisfies data dependencies — each step assumes the preceding steps
+have completed:
 
 1. **View replay** — rebuild read models from the event store so recovery jobs
    can query accurate state
@@ -109,7 +117,8 @@ dependencies — each job assumes the preceding jobs have completed:
    Runs after all receipt backfills because transfer detection depends on
    receipt inventory being populated.
 4. **Mint recovery** — resume any in-progress mints
-5. **Redemption recovery** — resume any in-progress redemptions
+5. **Redemption recovery** (one per vault, concurrent) — resume any in-progress
+   redemptions for each vault
 
 Any failure aborts startup — the service will not accept requests until all jobs
 succeed. All jobs are idempotent, so restarting retries safely.

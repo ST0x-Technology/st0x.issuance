@@ -22,6 +22,7 @@ pub(crate) use view::{
 /// receipt backfill and shared with transfer backfill and continuous monitors.
 #[derive(Clone)]
 pub(crate) struct VaultCtx {
+    pub(crate) underlying: UnderlyingSymbol,
     pub(crate) vault: Address,
     pub(crate) receipt_contract: Address,
 }

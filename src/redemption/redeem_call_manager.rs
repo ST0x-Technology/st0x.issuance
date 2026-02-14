@@ -34,7 +34,10 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         Self { alpaca_service, cqrs, event_store, pool }
     }
 
-    pub(crate) async fn recover_detected_redemptions(&self) {
+    pub(crate) async fn recover_detected_redemptions(
+        &self,
+        underlying: &UnderlyingSymbol,
+    ) {
         let stuck_redemptions = match find_detected(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -43,13 +46,19 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             }
         };
 
+        let stuck_redemptions: Vec<_> = stuck_redemptions
+            .into_iter()
+            .filter(|(_id, view)| view.underlying() == Some(underlying))
+            .collect();
+
         if stuck_redemptions.is_empty() {
-            info!("No Detected redemptions to recover");
+            info!(underlying = %underlying, "No Detected redemptions to recover");
             return;
         }
 
         info!(
             count = stuck_redemptions.len(),
+            underlying = %underlying,
             "Recovering stuck Detected redemptions"
         );
 
@@ -103,6 +112,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         }
 
         info!(
+            underlying = %underlying,
             total = stuck_redemptions.len(),
             recovered,
             auto_failed,
@@ -351,12 +361,12 @@ mod tests {
     use crate::mint::Quantity;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionView, UnderlyingSymbol,
+        RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetView,
+        TokenizedAssetView, UnderlyingSymbol,
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
@@ -828,7 +838,8 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(alpaca_service, cqrs, store, pool);
 
-        manager.recover_detected_redemptions().await;
+        let underlying = UnderlyingSymbol::new("AAPL");
+        manager.recover_detected_redemptions(&underlying).await;
 
         assert_eq!(
             alpaca_service_mock.get_call_count(),
@@ -866,7 +877,7 @@ mod tests {
             .detect_redemption(&issuer_request_id, &underlying, wallet)
             .await;
 
-        manager.recover_detected_redemptions().await;
+        manager.recover_detected_redemptions(&underlying).await;
 
         assert_eq!(
             alpaca_service_mock.get_call_count(),
