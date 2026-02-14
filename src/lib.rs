@@ -12,7 +12,7 @@ use sqlite_es::{
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use task_supervisor::{SupervisorBuilder, SupervisorHandle};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -22,30 +22,27 @@ use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
-    Mint, MintServices, MintView, recovery::MintRecoveryHandler,
-    recovery_job::MintRecoveryJob, replay_mint_view,
+    Mint, MintServices, MintView,
+    recovery::{MintRecoveryHandler, MintRecoveryJob},
 };
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
-    backfill_job::{ReceiptBackfillDeps, ReceiptBackfillJob},
-    burn_tracking::replay_receipt_burns_view,
+    backfill::{ReceiptBackfillCtx, ReceiptBackfillJob},
 };
 use crate::redemption::{
-    Redemption, RedemptionView,
-    backfill_job::{TransferBackfillDeps, TransferBackfillJob},
+    Redemption, RedemptionRecoveryJob, RedemptionView,
+    backfill::{TransferBackfillCtx, TransferBackfillJob},
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
-    recovery_job::RedemptionRecoveryJob,
     redeem_call_manager::RedeemCallManager,
-    replay_redemption_view,
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetViewRepo, VaultBackfillConfig,
-    view::replay_tokenized_asset_view,
+    TokenizedAsset, TokenizedAssetViewRepo, discover_vault_configs,
 };
+use crate::view_replay::ViewReplayJob;
 
 pub mod account;
 pub mod mint;
@@ -61,6 +58,7 @@ pub(crate) mod fireblocks;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
+mod view_replay;
 
 pub mod bindings;
 
@@ -88,36 +86,6 @@ pub(crate) type ReceiptInventoryEventStore =
 pub(crate) type SqliteEventStore<A> =
     PersistedEventStore<SqliteEventRepository, A>;
 
-/// Shared state for passing vault configs from receipt backfill to subsequent jobs.
-pub(crate) type VaultConfigs = Arc<Mutex<Option<Vec<VaultBackfillConfig>>>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ViewReplayJob;
-
-impl ViewReplayJob {
-    async fn run(self, pool: apalis::prelude::Data<Pool<Sqlite>>) {
-        info!("Replaying views to ensure schema updates are applied");
-
-        let pool: Pool<Sqlite> = (*pool).clone();
-
-        if let Err(err) = replay_all_views(pool).await {
-            error!(error = %err, "View replay failed");
-            return;
-        }
-
-        info!("View replay complete");
-    }
-}
-
-async fn replay_all_views(pool: Pool<Sqlite>) -> Result<(), anyhow::Error> {
-    replay_tokenized_asset_view(pool.clone()).await?;
-    replay_mint_view(pool.clone()).await?;
-    replay_redemption_view(pool.clone()).await?;
-    replay_receipt_burns_view(pool).await?;
-
-    Ok(())
-}
-
 /// A `JoinHandle` wrapper that aborts the task when dropped.
 ///
 /// Ensures spawned background tasks (like the apalis monitor) are cleaned up
@@ -131,10 +99,13 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Maximum time to wait for a single startup job before treating it as stuck.
+const STARTUP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Pushes a job to the storage and polls until it completes.
 ///
-/// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails or
-/// is killed.
+/// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails,
+/// is killed, or exceeds the timeout.
 async fn push_and_await<J>(
     storage: &mut SqliteStorage<J>,
     job: J,
@@ -148,8 +119,17 @@ where
     let task_id = parts.task_id;
     debug!(job = label, %task_id, "Job queued, waiting for completion");
 
+    let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
+
     loop {
         sleep(Duration::from_millis(100)).await;
+
+        if tokio::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "Startup job '{label}' timed out after {}s",
+                STARTUP_JOB_TIMEOUT.as_secs()
+            ));
+        }
 
         let Some(request) = storage.fetch_by_id(&task_id).await? else {
             continue;
@@ -181,19 +161,19 @@ where
     }
 }
 
-struct AggregateCqrsSetup {
-    mint: MintDeps,
+struct AggregateCqrsCtx {
+    mint: MintCtx,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
-    receipt_inventory: ReceiptInventoryDeps,
+    receipt_inventory: ReceiptInventoryCtx,
 }
 
-struct ReceiptInventoryDeps {
+struct ReceiptInventoryCtx {
     cqrs: ReceiptInventoryCqrs,
     event_store: ReceiptInventoryEventStore,
 }
 
-struct MintDeps {
+struct MintCtx {
     cqrs: MintCqrs,
     event_store: MintEventStore,
 }
@@ -371,7 +351,7 @@ pub async fn initialize_rocket(
     let bot_wallet = config.signer.address().await?;
     info!("Bot wallet address: {bot_wallet}");
 
-    let AggregateCqrsSetup {
+    let AggregateCqrsCtx {
         mint,
         redemption_cqrs,
         redemption_event_store,
@@ -393,9 +373,7 @@ pub async fn initialize_rocket(
         bot_wallet,
     )?;
 
-    let vault_configs: VaultConfigs = Arc::new(Mutex::new(None));
-
-    let receipt_backfill_deps = Arc::new(ReceiptBackfillDeps {
+    let receipt_backfill_ctx = Arc::new(ReceiptBackfillCtx {
         provider: blockchain_setup.provider.clone(),
         receipt_inventory_cqrs: receipt_inventory.cqrs.clone(),
         receipt_inventory_event_store: receipt_inventory.event_store.clone(),
@@ -403,7 +381,7 @@ pub async fn initialize_rocket(
         backfill_start_block: config.backfill_start_block,
     });
 
-    let transfer_backfill_deps = Arc::new(TransferBackfillDeps {
+    let transfer_backfill_ctx = Arc::new(TransferBackfillCtx {
         provider: blockchain_setup.provider.clone(),
         bot_wallet,
         cqrs: redemption_cqrs.clone(),
@@ -437,16 +415,13 @@ pub async fn initialize_rocket(
         )
         .register(
             WorkerBuilder::new("receipt-backfill")
-                .data(pool.clone())
-                .data(receipt_backfill_deps)
-                .data(vault_configs.clone())
+                .data(receipt_backfill_ctx)
                 .backend(receipt_backfill_storage.clone())
                 .build_fn(ReceiptBackfillJob::run),
         )
         .register(
             WorkerBuilder::new("transfer-backfill")
-                .data(transfer_backfill_deps)
-                .data(vault_configs.clone())
+                .data(transfer_backfill_ctx)
                 .backend(transfer_backfill_storage.clone())
                 .build_fn(TransferBackfillJob::run),
         )
@@ -474,19 +449,30 @@ pub async fn initialize_rocket(
     push_and_await(&mut view_replay_storage, ViewReplayJob, "view-replay")
         .await?;
 
-    // Phase 2: Backfills (sequential — transfer depends on receipt)
-    push_and_await(
-        &mut receipt_backfill_storage,
-        ReceiptBackfillJob,
-        "receipt-backfill",
-    )
-    .await?;
-    push_and_await(
-        &mut transfer_backfill_storage,
-        TransferBackfillJob,
-        "transfer-backfill",
-    )
-    .await?;
+    // Phase 2: Discover vaults and run per-vault backfills
+    let vault_configs =
+        discover_vault_configs(&pool, &blockchain_setup.provider).await?;
+
+    for config in &vault_configs {
+        push_and_await(
+            &mut receipt_backfill_storage,
+            ReceiptBackfillJob {
+                vault: config.vault,
+                receipt_contract: config.receipt_contract,
+            },
+            &format!("receipt-backfill-{:.8}", config.vault),
+        )
+        .await?;
+    }
+
+    for config in &vault_configs {
+        push_and_await(
+            &mut transfer_backfill_storage,
+            TransferBackfillJob { vault: config.vault },
+            &format!("transfer-backfill-{:.8}", config.vault),
+        )
+        .await?;
+    }
 
     // Phase 3: Recovery (runs after reprojections and backfill for accurate state)
     push_and_await(
@@ -502,13 +488,6 @@ pub async fn initialize_rocket(
     )
     .await?;
 
-    // Read vault configs produced by receipt backfill for continuous monitors
-    let final_vault_configs = vault_configs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .unwrap_or_default();
-
     let mut supervisor_builder = SupervisorBuilder::new()
         .with_unlimited_restarts()
         .with_base_restart_delay(Duration::from_secs(5))
@@ -516,7 +495,7 @@ pub async fn initialize_rocket(
 
     let itn_handler = MintRecoveryHandler::new(mint.cqrs.clone());
 
-    for vault_config in &final_vault_configs {
+    for vault_config in &vault_configs {
         let monitor_config = ReceiptMonitorConfig {
             vault: vault_config.vault,
             receipt_contract: vault_config.receipt_contract,
@@ -561,7 +540,7 @@ pub async fn initialize_rocket(
     let supervisor_handle = supervisor.run();
 
     info!(
-        vault_count = final_vault_configs.len(),
+        vault_count = vault_configs.len(),
         "Task supervisor started with all monitors"
     );
 
@@ -586,7 +565,7 @@ struct RocketState {
     account_cqrs: AccountCqrs,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
-    mint: MintDeps,
+    mint: MintCtx,
     redemption_cqrs: RedemptionCqrs,
     supervisor_handle: SupervisorHandle,
     apalis_handle: AbortOnDrop<()>,
@@ -669,7 +648,7 @@ fn setup_aggregate_cqrs(
     vault_service: Arc<dyn vault::VaultService>,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
-) -> AggregateCqrsSetup {
+) -> AggregateCqrsCtx {
     // Create receipt inventory first since MintServices depends on it
     let receipt_inventory_cqrs =
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
@@ -743,11 +722,11 @@ fn setup_aggregate_cqrs(
         .with_upcasters(vec![create_tokens_burned_upcaster()]),
     );
 
-    AggregateCqrsSetup {
-        mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
+    AggregateCqrsCtx {
+        mint: MintCtx { cqrs: mint_cqrs, event_store: mint_event_store },
         redemption_cqrs,
         redemption_event_store,
-        receipt_inventory: ReceiptInventoryDeps {
+        receipt_inventory: ReceiptInventoryCtx {
             cqrs: receipt_inventory_cqrs,
             event_store: receipt_inventory_event_store,
         },
@@ -759,7 +738,7 @@ fn setup_redemption_managers(
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-    receipt_inventory: &ReceiptInventoryDeps,
+    receipt_inventory: &ReceiptInventoryCtx,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
 ) -> Result<RedemptionManagers, anyhow::Error> {
