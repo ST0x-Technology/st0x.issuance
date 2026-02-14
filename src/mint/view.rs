@@ -156,17 +156,18 @@ impl Default for MintView {
 }
 
 impl MintView {
-    #[cfg(test)]
-    pub(crate) const fn state_name(&self) -> &'static str {
+    pub(crate) const fn is_recoverable(&self) -> bool {
+        use MintView::*;
         match self {
-            Self::NotFound => "NotFound",
-            Self::Initiated { .. } => "Initiated",
-            Self::JournalConfirmed { .. } => "JournalConfirmed",
-            Self::JournalRejected { .. } => "JournalRejected",
-            Self::Minting { .. } => "Minting",
-            Self::CallbackPending { .. } => "CallbackPending",
-            Self::MintingFailed { .. } => "MintingFailed",
-            Self::Completed { .. } => "Completed",
+            JournalConfirmed { .. }
+            | Minting { .. }
+            | MintingFailed { .. }
+            | CallbackPending { .. } => true,
+
+            NotFound
+            | Initiated { .. }
+            | JournalRejected { .. }
+            | Completed { .. } => false,
         }
     }
 
@@ -554,12 +555,8 @@ pub(crate) async fn find_all_recoverable_mints(
 ) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
     let rows = sqlx::query!(
         r#"
-        SELECT view_id as "view_id!: String", payload as "payload: String"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
         FROM mint_view
-        WHERE json_extract(payload, '$.JournalConfirmed') IS NOT NULL
-           OR json_extract(payload, '$.Minting') IS NOT NULL
-           OR json_extract(payload, '$.MintingFailed') IS NOT NULL
-           OR json_extract(payload, '$.CallbackPending') IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -570,6 +567,9 @@ pub(crate) async fn find_all_recoverable_mints(
             let view: MintView = serde_json::from_str(&row.payload)?;
             let id = Uuid::parse_str(&row.view_id)?;
             Ok((IssuerMintRequestId::new(id), view))
+        })
+        .filter(|result| {
+            result.as_ref().map_or(true, |(_, view)| view.is_recoverable())
         })
         .collect()
 }
@@ -1698,12 +1698,27 @@ mod tests {
             );
         }
 
-        let state_names: Vec<_> =
-            results.iter().map(|(_, view)| view.state_name()).collect();
-        assert!(state_names.contains(&"JournalConfirmed"));
-        assert!(state_names.contains(&"Minting"));
-        assert!(state_names.contains(&"MintingFailed"));
-        assert!(state_names.contains(&"CallbackPending"));
+        assert!(results.iter().any(|(_, view)| matches!(
+            view,
+            MintView::JournalConfirmed { .. }
+        )));
+        assert!(
+            results
+                .iter()
+                .any(|(_, view)| matches!(view, MintView::Minting { .. }))
+        );
+        assert!(
+            results.iter().any(|(_, view)| matches!(
+                view,
+                MintView::MintingFailed { .. }
+            ))
+        );
+        assert!(
+            results.iter().any(|(_, view)| matches!(
+                view,
+                MintView::CallbackPending { .. }
+            ))
+        );
     }
 
     #[tokio::test]

@@ -30,7 +30,9 @@ pub use api::MintResponse;
 pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;
-pub(crate) use view::{MintView, find_all_recoverable_mints, replay_mint_view};
+pub(crate) use view::{
+    MintView, MintViewError, find_all_recoverable_mints, replay_mint_view,
+};
 
 /// Services required by the Mint aggregate for command handling.
 pub(crate) struct MintServices {

@@ -1,8 +1,9 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use apalis::prelude::{
+    Monitor, State, Storage, WorkerBuilder, WorkerFactoryFn,
+};
+use apalis_sql::sqlite::SqliteStorage;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-use cqrs_es::{AggregateContext, EventStore};
-use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
@@ -10,38 +11,39 @@ use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
+use std::fmt::Debug;
 use std::sync::Arc;
+use task_supervisor::{SupervisorBuilder, SupervisorHandle};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info};
-use url::Url;
 
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
+use crate::job::{Job, Label};
 use crate::mint::{
-    Mint, MintServices, MintView, find_all_recoverable_mints,
-    recovery::{MintRecoveryHandler, recover_mint},
-    replay_mint_view,
+    Mint, MintServices, MintView,
+    recovery::{MintRecoveryCtx, MintRecoveryHandler, MintRecoveryJob},
 };
-use crate::receipt_inventory::backfill::ReceiptBackfiller;
 use crate::receipt_inventory::{
-    CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
+    CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
-    burn_tracking::replay_receipt_burns_view,
+    backfill::{ReceiptBackfillCtx, ReceiptBackfillJob},
 };
 use crate::redemption::{
-    Redemption, RedemptionView,
-    backfill::TransferBackfiller,
+    Redemption, RedemptionRecoveryJob, RedemptionView,
+    backfill::{TransferBackfillCtx, TransferBackfillJob},
     burn_manager::BurnManager,
     detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
-    replay_redemption_view,
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView, TokenizedAssetViewRepo,
-    view::{list_enabled_assets, replay_tokenized_asset_view},
+    TokenizedAsset, TokenizedAssetViewRepo, discover_vaults,
 };
+use crate::view_replay::ViewReplayJob;
 
 pub mod account;
 pub mod mint;
@@ -54,9 +56,11 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
 pub(crate) mod fireblocks;
+pub(crate) mod job;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
+mod view_replay;
 
 pub mod bindings;
 
@@ -74,37 +78,198 @@ pub(crate) type MintCqrs = Arc<SqliteCqrs<Mint>>;
 pub(crate) type MintEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Mint>>;
 
-type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
-type RedemptionEventStore =
+pub(crate) type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
+pub(crate) type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
-type ReceiptInventoryCqrs = Arc<SqliteCqrs<ReceiptInventory>>;
-type ReceiptInventoryEventStore =
+pub(crate) type ReceiptInventoryCqrs = Arc<SqliteCqrs<ReceiptInventory>>;
+pub(crate) type ReceiptInventoryEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, ReceiptInventory>>;
 
 pub(crate) type SqliteEventStore<A> =
     PersistedEventStore<SqliteEventRepository, A>;
 
-struct AggregateCqrsSetup {
-    mint: MintDeps,
-    redemption_cqrs: RedemptionCqrs,
-    redemption_event_store: RedemptionEventStore,
-    receipt_inventory: ReceiptInventoryDeps,
+/// A `JoinHandle` wrapper that aborts the task when dropped.
+///
+/// Ensures spawned background tasks (like the apalis monitor) are cleaned up
+/// when the owning service is dropped, preventing orphaned tasks from
+/// interfering with subsequent service instances sharing the same database.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
-struct ReceiptInventoryDeps {
+/// Maximum time to wait for a single startup job before treating it as stuck.
+const STARTUP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Pushes a job to the queue and polls until it completes.
+///
+/// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails,
+/// is killed, or exceeds the timeout.
+async fn push_and_await<J: Job>(
+    job_queue: &mut SqliteStorage<J>,
+    job: J,
+) -> Result<(), anyhow::Error> {
+    let label = job.label();
+    info!(job = %label, "Pushing startup job");
+    let parts = job_queue.push(job).await?;
+    let task_id = parts.task_id;
+    debug!(job = %label, %task_id, "Job queued, waiting for completion");
+
+    await_task(job_queue, &label, &task_id).await
+}
+
+/// Pushes multiple jobs to the queue and polls until all complete.
+///
+/// All jobs are pushed first (so the worker can start processing them
+/// concurrently), then polled together in a single loop.
+async fn push_all_and_await<J: Job>(
+    job_queue: &mut SqliteStorage<J>,
+    jobs: impl IntoIterator<Item = J>,
+) -> Result<(), anyhow::Error> {
+    let mut pending: Vec<(Label, apalis::prelude::TaskId)> = Vec::new();
+
+    for job in jobs {
+        let label = job.label();
+        info!(job = %label, "Pushing startup job");
+        let parts = job_queue.push(job).await?;
+        debug!(job = %label, task_id = %parts.task_id, "Job queued");
+        pending.push((label, parts.task_id));
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = pending.len(), "Waiting for startup jobs to complete");
+
+    let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
+
+    while !pending.is_empty() {
+        sleep(Duration::from_millis(100)).await;
+
+        if tokio::time::Instant::now() > deadline {
+            let still_pending: Vec<_> =
+                pending.iter().map(|(label, _)| label.to_string()).collect();
+            return Err(anyhow::anyhow!(
+                "Startup jobs timed out after {}s: {}",
+                STARTUP_JOB_TIMEOUT.as_secs(),
+                still_pending.join(", ")
+            ));
+        }
+
+        let mut still_pending = Vec::new();
+
+        for (label, task_id) in pending {
+            let Some(request) = job_queue.fetch_by_id(&task_id).await? else {
+                still_pending.push((label, task_id));
+                continue;
+            };
+
+            match request.parts.context.status() {
+                State::Done => {
+                    info!(job = %label, "Startup job completed");
+                }
+                State::Failed => {
+                    let error_msg = request
+                        .parts
+                        .context
+                        .last_error()
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    return Err(anyhow::anyhow!(
+                        "Startup job '{label}' failed: {error_msg}"
+                    ));
+                }
+                State::Killed => {
+                    return Err(anyhow::anyhow!(
+                        "Startup job '{label}' was killed"
+                    ));
+                }
+                _ => {
+                    still_pending.push((label, task_id));
+                }
+            }
+        }
+
+        pending = still_pending;
+    }
+
+    Ok(())
+}
+
+async fn await_task<J: Job>(
+    job_queue: &mut SqliteStorage<J>,
+    label: &Label,
+    task_id: &apalis::prelude::TaskId,
+) -> Result<(), anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
+
+    loop {
+        sleep(Duration::from_millis(100)).await;
+
+        if tokio::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "Startup job '{label}' timed out after {}s",
+                STARTUP_JOB_TIMEOUT.as_secs()
+            ));
+        }
+
+        let Some(request) = job_queue.fetch_by_id(task_id).await? else {
+            continue;
+        };
+
+        match request.parts.context.status() {
+            State::Done => {
+                info!(job = %label, "Startup job completed");
+                return Ok(());
+            }
+            State::Failed => {
+                let error_msg = request
+                    .parts
+                    .context
+                    .last_error()
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(anyhow::anyhow!(
+                    "Startup job '{label}' failed: {error_msg}"
+                ));
+            }
+            State::Killed => {
+                return Err(anyhow::anyhow!(
+                    "Startup job '{label}' was killed"
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+struct AggregateCqrsCtx {
+    mint: MintCtx,
+    redemption_cqrs: RedemptionCqrs,
+    redemption_event_store: RedemptionEventStore,
+    receipt_inventory: ReceiptInventoryCtx,
+}
+
+struct ReceiptInventoryCtx {
     cqrs: ReceiptInventoryCqrs,
     event_store: ReceiptInventoryEventStore,
 }
 
-struct MintDeps {
+struct MintCtx {
     cqrs: MintCqrs,
     event_store: MintEventStore,
 }
 
-struct RedemptionManagers {
-    redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
-    journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
-    burn: Arc<
+#[derive(Clone)]
+pub(crate) struct RedemptionManagers {
+    pub(crate) redeem_call:
+        Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
+    pub(crate) journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
+    pub(crate) burn: Arc<
         BurnManager<
             SqliteEventStore<Redemption>,
             SqliteEventStore<ReceiptInventory>,
@@ -244,7 +409,22 @@ pub async fn initialize_rocket(
     config: Config,
 ) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
     let pool = create_pool(&config).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    // Both apalis and our code use sqlx migrations, which share a single
+    // `_sqlx_migrations` table. Each migrator validates that all previously
+    // applied migrations exist in its own migration set — so running either
+    // migrator after the other will fail with `VersionMissing` unless both
+    // use `set_ignore_missing(true)`.
+    //
+    // We cannot call `SqliteStorage::setup()` because it runs apalis
+    // migrations without `ignore_missing`. Instead, we get the apalis
+    // migrator directly and run both with `ignore_missing`.
+    sqlx::query("PRAGMA journal_mode = 'WAL'").execute(&pool).await?;
+    apalis_sql::sqlite::SqliteStorage::<()>::migrations()
+        .set_ignore_missing(true)
+        .run(&pool)
+        .await?;
+    sqlx::migrate!("./migrations").set_ignore_missing(true).run(&pool).await?;
 
     let BasicCqrsSetup {
         account_cqrs,
@@ -257,7 +437,7 @@ pub async fn initialize_rocket(
     let bot_wallet = config.signer.address().await?;
     info!("Bot wallet address: {bot_wallet}");
 
-    let AggregateCqrsSetup {
+    let AggregateCqrsCtx {
         mint,
         redemption_cqrs,
         redemption_event_store,
@@ -279,72 +459,170 @@ pub async fn initialize_rocket(
         bot_wallet,
     )?;
 
-    // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Without this ordering, recovery might miss stuck
-    // operations if the view was deleted/corrupted.
-    info!("Replaying views to ensure schema updates are applied");
-    replay_tokenized_asset_view(pool.clone()).await?;
-    replay_mint_view(pool.clone()).await?;
-    replay_redemption_view(pool.clone()).await?;
-    replay_receipt_burns_view(pool.clone()).await?;
-
-    // Receipt backfill must run before recovery so that recovery can check
-    // receipt inventory to detect already-minted receipts (prevents double-mints).
-    let vault_configs = run_all_receipt_backfills(
-        &pool,
-        blockchain_setup.provider.clone(),
-        &receipt_inventory.cqrs,
-        &receipt_inventory.event_store,
+    let receipt_backfill_ctx = Arc::new(ReceiptBackfillCtx {
+        provider: blockchain_setup.provider.clone(),
+        receipt_inventory_cqrs: receipt_inventory.cqrs.clone(),
+        receipt_inventory_event_store: receipt_inventory.event_store.clone(),
         bot_wallet,
-        config.backfill_start_block,
-    )
-    .await?;
+        backfill_start_block: config.backfill_start_block,
+    });
 
-    // Transfer backfill must run after receipt backfill so that receipt inventory
-    // is available for burn planning, and before live monitoring so that missed
-    // transfers during downtime are detected before new ones come in.
-    let transfer_backfiller = TransferBackfiller {
+    let transfer_backfill_ctx = Arc::new(TransferBackfillCtx {
         provider: blockchain_setup.provider.clone(),
         bot_wallet,
         cqrs: redemption_cqrs.clone(),
         event_store: redemption_event_store.clone(),
         pool: pool.clone(),
-        redeem_call_manager: managers.redeem_call.clone(),
-        journal_manager: managers.journal.clone(),
-        burn_manager: managers.burn.clone(),
-    };
+        managers: RedemptionManagers {
+            redeem_call: managers.redeem_call.clone(),
+            journal: managers.journal.clone(),
+            burn: managers.burn.clone(),
+        },
+        backfill_start_block: config.backfill_start_block,
+    });
 
-    run_all_transfer_backfills(
-        &vault_configs,
-        &transfer_backfiller,
-        config.backfill_start_block,
+    let mut view_replay_job_queue =
+        SqliteStorage::<ViewReplayJob>::new(pool.clone());
+    let mut receipt_backfill_job_queue =
+        SqliteStorage::<ReceiptBackfillJob>::new(pool.clone());
+    let mut transfer_backfill_job_queue =
+        SqliteStorage::<TransferBackfillJob>::new(pool.clone());
+    let mut mint_recovery_job_queue =
+        SqliteStorage::<MintRecoveryJob>::new(pool.clone());
+    let mut redemption_recovery_job_queue =
+        SqliteStorage::<RedemptionRecoveryJob>::new(pool.clone());
+
+    let monitor = Monitor::new()
+        .register(
+            WorkerBuilder::new("view-replay")
+                .data(pool.clone())
+                .backend(view_replay_job_queue.clone())
+                .build_fn(ViewReplayJob::run),
+        )
+        .register(
+            WorkerBuilder::new("receipt-backfill")
+                .data(receipt_backfill_ctx)
+                .backend(receipt_backfill_job_queue.clone())
+                .build_fn(ReceiptBackfillJob::run),
+        )
+        .register(
+            WorkerBuilder::new("transfer-backfill")
+                .data(transfer_backfill_ctx)
+                .backend(transfer_backfill_job_queue.clone())
+                .build_fn(TransferBackfillJob::run),
+        )
+        .register(
+            WorkerBuilder::new("mint-recovery")
+                .data(MintRecoveryCtx {
+                    pool: pool.clone(),
+                    mint_cqrs: mint.cqrs.clone(),
+                })
+                .backend(mint_recovery_job_queue.clone())
+                .build_fn(MintRecoveryJob::run),
+        )
+        .register(
+            WorkerBuilder::new("redemption-recovery")
+                .data(Arc::new(managers.clone()))
+                .backend(redemption_recovery_job_queue.clone())
+                .build_fn(RedemptionRecoveryJob::run),
+        );
+
+    let apalis_handle = AbortOnDrop(tokio::spawn(async move {
+        if let Err(err) = monitor.run().await {
+            error!(error = %err, "Startup job monitor failed");
+        }
+    }));
+
+    // View replay — rebuild read models before recovery queries them
+    push_and_await(&mut view_replay_job_queue, ViewReplayJob).await?;
+
+    // Discover vaults and run per-vault backfills
+    let vault_ctxs = discover_vaults(&pool, &blockchain_setup.provider).await?;
+
+    for vault_ctx in &vault_ctxs {
+        push_and_await(
+            &mut receipt_backfill_job_queue,
+            ReceiptBackfillJob {
+                vault: vault_ctx.vault,
+                receipt_contract: vault_ctx.receipt_contract,
+            },
+        )
+        .await?;
+    }
+
+    for vault_ctx in &vault_ctxs {
+        push_and_await(
+            &mut transfer_backfill_job_queue,
+            TransferBackfillJob { vault: vault_ctx.vault },
+        )
+        .await?;
+    }
+
+    // Recovery — runs after backfills for accurate state
+    push_and_await(&mut mint_recovery_job_queue, MintRecoveryJob).await?;
+
+    push_all_and_await(
+        &mut redemption_recovery_job_queue,
+        vault_ctxs.iter().map(|vault_ctx| RedemptionRecoveryJob {
+            underlying: vault_ctx.underlying.clone(),
+        }),
     )
     .await?;
 
-    spawn_all_receipt_monitors(
-        blockchain_setup.provider,
-        &vault_configs,
-        &receipt_inventory.cqrs,
-        bot_wallet,
-        &MintRecoveryHandler::new(mint.cqrs.clone()),
-    );
+    let mut supervisor_builder = SupervisorBuilder::new()
+        .with_unlimited_restarts()
+        .with_base_restart_delay(Duration::from_secs(5))
+        .with_health_check_interval(Duration::from_secs(60));
 
-    // Recovery runs AFTER reprojections and backfill so it can query accurate state
-    spawn_mint_recovery(pool.clone(), mint.cqrs.clone());
-    spawn_redemption_recovery(
-        managers.redeem_call.clone(),
-        managers.journal.clone(),
-        managers.burn.clone(),
-    );
+    let itn_handler = MintRecoveryHandler::new(mint.cqrs.clone());
 
-    spawn_all_redemption_detectors(
-        &config.rpc_url,
-        &vault_configs,
-        &redemption_cqrs,
-        &redemption_event_store,
-        &pool,
-        &managers,
-        bot_wallet,
+    for vault_ctx in &vault_ctxs {
+        let monitor_config = ReceiptMonitorConfig {
+            vault: vault_ctx.vault,
+            receipt_contract: vault_ctx.receipt_contract,
+            bot_wallet,
+        };
+
+        let receipt_monitor = ReceiptMonitor::new(
+            blockchain_setup.provider.clone(),
+            monitor_config,
+            receipt_inventory.cqrs.clone(),
+            itn_handler.clone(),
+        );
+
+        supervisor_builder = supervisor_builder.with_task(
+            &format!("receipt-monitor-{}", vault_ctx.vault),
+            receipt_monitor,
+        );
+
+        let detector_config = RedemptionDetectorConfig {
+            rpc_url: config.rpc_url.clone(),
+            vault: vault_ctx.vault,
+            bot_wallet,
+        };
+
+        let detector = RedemptionDetector::new(
+            detector_config,
+            redemption_cqrs.clone(),
+            redemption_event_store.clone(),
+            pool.clone(),
+            managers.redeem_call.clone(),
+            managers.journal.clone(),
+            managers.burn.clone(),
+        );
+
+        supervisor_builder = supervisor_builder.with_task(
+            &format!("redemption-detector-{}", vault_ctx.vault),
+            detector,
+        );
+    }
+
+    let supervisor = supervisor_builder.build();
+    let supervisor_handle = supervisor.run();
+
+    info!(
+        vault_count = vault_ctxs.len(),
+        "Task supervisor started with all monitors"
     );
 
     Ok(build_rocket(RocketState {
@@ -356,6 +634,8 @@ pub async fn initialize_rocket(
         tokenized_asset_view_repo,
         mint,
         redemption_cqrs,
+        supervisor_handle,
+        apalis_handle,
     }))
 }
 
@@ -366,8 +646,10 @@ struct RocketState {
     account_cqrs: AccountCqrs,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
-    mint: MintDeps,
+    mint: MintCtx,
     redemption_cqrs: RedemptionCqrs,
+    supervisor_handle: SupervisorHandle,
+    apalis_handle: AbortOnDrop<()>,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -390,6 +672,8 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
         .manage(state.pool)
+        .manage(state.supervisor_handle)
+        .manage(state.apalis_handle)
         .mount(
             "/",
             routes![
@@ -445,7 +729,7 @@ fn setup_aggregate_cqrs(
     vault_service: Arc<dyn vault::VaultService>,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
-) -> AggregateCqrsSetup {
+) -> AggregateCqrsCtx {
     // Create receipt inventory first since MintServices depends on it
     let receipt_inventory_cqrs =
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
@@ -519,11 +803,11 @@ fn setup_aggregate_cqrs(
         .with_upcasters(vec![create_tokens_burned_upcaster()]),
     );
 
-    AggregateCqrsSetup {
-        mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
+    AggregateCqrsCtx {
+        mint: MintCtx { cqrs: mint_cqrs, event_store: mint_event_store },
         redemption_cqrs,
         redemption_event_store,
-        receipt_inventory: ReceiptInventoryDeps {
+        receipt_inventory: ReceiptInventoryCtx {
             cqrs: receipt_inventory_cqrs,
             event_store: receipt_inventory_event_store,
         },
@@ -535,7 +819,7 @@ fn setup_redemption_managers(
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-    receipt_inventory: &ReceiptInventoryDeps,
+    receipt_inventory: &ReceiptInventoryCtx,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
 ) -> Result<RedemptionManagers, anyhow::Error> {
@@ -569,322 +853,6 @@ fn setup_redemption_managers(
     ));
 
     Ok(RedemptionManagers { redeem_call, journal, burn })
-}
-
-/// Spawns redemption detectors for ALL enabled vaults.
-fn spawn_all_redemption_detectors(
-    rpc_url: &Url,
-    vault_configs: &[VaultBackfillConfig],
-    redemption_cqrs: &Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: &Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: &Pool<Sqlite>,
-    managers: &RedemptionManagers,
-    bot_wallet: Address,
-) {
-    info!(
-        vault_count = vault_configs.len(),
-        "Spawning redemption detectors for all vaults"
-    );
-
-    for config in vault_configs {
-        debug!(
-            vault = %config.vault,
-            bot_wallet = %bot_wallet,
-            "Spawning redemption detector for vault"
-        );
-
-        spawn_redemption_detector(
-            rpc_url.clone(),
-            config.vault,
-            redemption_cqrs.clone(),
-            redemption_event_store.clone(),
-            pool.clone(),
-            RedemptionManagers {
-                redeem_call: managers.redeem_call.clone(),
-                journal: managers.journal.clone(),
-                burn: managers.burn.clone(),
-            },
-            bot_wallet,
-        );
-    }
-}
-
-fn spawn_redemption_detector(
-    rpc_url: Url,
-    vault: Address,
-    redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: Pool<Sqlite>,
-    managers: RedemptionManagers,
-    bot_wallet: Address,
-) {
-    info!(bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
-
-    let detector_config =
-        RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
-
-    let detector = RedemptionDetector::new(
-        detector_config,
-        redemption_cqrs,
-        redemption_event_store,
-        pool,
-        managers.redeem_call,
-        managers.journal,
-        managers.burn,
-    );
-
-    tokio::spawn(async move {
-        detector.run().await;
-    });
-}
-
-fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
-    info!("Spawning mint recovery task");
-
-    tokio::spawn(async move {
-        let recoverable_mints = match find_all_recoverable_mints(&pool).await {
-            Ok(mints) => mints,
-            Err(err) => {
-                error!(error = %err, "Failed to query recoverable mints");
-                return;
-            }
-        };
-
-        if recoverable_mints.is_empty() {
-            debug!("No mints to recover");
-            return;
-        }
-
-        info!(count = recoverable_mints.len(), "Recovering mints");
-
-        for (issuer_request_id, _view) in recoverable_mints {
-            recover_mint(&mint_cqrs, issuer_request_id).await;
-        }
-
-        debug!("Completed mint recovery");
-    });
-}
-
-fn spawn_redemption_recovery(
-    redeem_call: Arc<
-        RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-        >,
-    >,
-    journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
-    burn: Arc<
-        BurnManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
-        >,
-    >,
-) {
-    info!("Spawning redemption recovery task");
-
-    tokio::spawn(async move {
-        redeem_call.recover_detected_redemptions().await;
-        journal.recover_alpaca_called_redemptions().await;
-        burn.recover_burning_redemptions().await;
-        burn.recover_burn_failed_redemptions().await;
-    });
-}
-
-/// Configuration for a single vault, extracted from TokenizedAssetView.
-struct VaultBackfillConfig {
-    vault: Address,
-    receipt_contract: Address,
-}
-
-/// Runs receipt backfill for ALL enabled tokenized assets.
-///
-/// Returns the vault configurations needed for live monitoring.
-async fn run_all_receipt_backfills<P: Provider + Clone>(
-    pool: &Pool<Sqlite>,
-    provider: P,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
-    bot_wallet: Address,
-    backfill_start_block: u64,
-) -> Result<Vec<VaultBackfillConfig>, anyhow::Error> {
-    let assets = list_enabled_assets(pool).await?;
-
-    if assets.is_empty() {
-        info!("No enabled tokenized assets found, skipping receipt backfill");
-        return Ok(vec![]);
-    }
-
-    info!(
-        asset_count = assets.len(),
-        "Running receipt backfill for all enabled assets"
-    );
-
-    stream::iter(assets.into_iter().filter_map(|asset| match asset {
-        TokenizedAssetView::Asset { vault, underlying, .. } => {
-            Some((vault, underlying))
-        }
-        TokenizedAssetView::Unavailable => None,
-    }))
-    .then(|(vault, underlying)| {
-        let provider = provider.clone();
-        async move {
-            run_single_vault_backfill(
-                &provider,
-                vault,
-                backfill_start_block,
-                &underlying.0,
-                receipt_inventory_cqrs,
-                receipt_inventory_event_store,
-                bot_wallet,
-            )
-            .await
-        }
-    })
-    .try_collect()
-    .await
-}
-
-/// Runs receipt backfill for a single vault.
-async fn run_single_vault_backfill<P: Provider + Clone>(
-    provider: &P,
-    vault: Address,
-    backfill_start_block: u64,
-    underlying: &str,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
-    bot_wallet: Address,
-) -> Result<VaultBackfillConfig, anyhow::Error> {
-    let vault_contract =
-        bindings::OffchainAssetReceiptVault::new(vault, provider);
-    let receipt_contract =
-        Address::from(vault_contract.receipt().call().await?.0);
-
-    let aggregate_context = receipt_inventory_event_store
-        .load_aggregate(&vault.to_string())
-        .await?;
-
-    let from_block = aggregate_context
-        .aggregate()
-        .last_backfilled_block()
-        .unwrap_or(backfill_start_block);
-
-    info!(
-        underlying,
-        vault = %vault,
-        receipt_contract = %receipt_contract,
-        bot_wallet = %bot_wallet,
-        from_block,
-        "Running receipt backfill for vault"
-    );
-
-    let backfiller = ReceiptBackfiller::new(
-        provider.clone(),
-        receipt_contract,
-        bot_wallet,
-        vault,
-        receipt_inventory_cqrs.clone(),
-    );
-
-    let result = backfiller.backfill_receipts(from_block).await?;
-
-    info!(
-        underlying,
-        vault = %vault,
-        processed = result.processed_count,
-        skipped_zero_balance = result.skipped_zero_balance,
-        "Receipt backfill complete for vault"
-    );
-
-    Ok(VaultBackfillConfig { vault, receipt_contract })
-}
-
-/// Runs transfer backfill for ALL enabled vaults.
-///
-/// Scans historic Transfer events to detect redemptions that occurred while the
-/// service was down. Must run after receipt backfill (for burn planning) and
-/// before live monitoring (to avoid missing transfers in the gap).
-async fn run_all_transfer_backfills<P: Provider + Clone>(
-    vault_configs: &[VaultBackfillConfig],
-    backfiller: &TransferBackfiller<
-        P,
-        SqliteEventStore<Redemption>,
-        SqliteEventStore<ReceiptInventory>,
-    >,
-    backfill_start_block: u64,
-) -> Result<(), anyhow::Error> {
-    if vault_configs.is_empty() {
-        info!("No enabled vaults, skipping transfer backfill");
-        return Ok(());
-    }
-
-    info!(
-        vault_count = vault_configs.len(),
-        "Running transfer backfill for all vaults"
-    );
-
-    for config in vault_configs {
-        let result = backfiller
-            .backfill_transfers(config.vault, backfill_start_block)
-            .await?;
-
-        debug!(
-            vault = %config.vault,
-            detected = result.detected_count,
-            skipped_mint = result.skipped_mint,
-            skipped_no_account = result.skipped_no_account,
-            "Transfer backfill complete for vault"
-        );
-    }
-
-    Ok(())
-}
-
-/// Spawns receipt monitors for ALL enabled vaults.
-fn spawn_all_receipt_monitors<P, ITN>(
-    provider: P,
-    vault_configs: &[VaultBackfillConfig],
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    bot_wallet: Address,
-    handler: &ITN,
-) where
-    P: Provider + Clone + Send + Sync + 'static,
-    ITN: ItnReceiptHandler + Clone + 'static,
-{
-    info!(
-        vault_count = vault_configs.len(),
-        "Spawning receipt monitors for all vaults"
-    );
-
-    for config in vault_configs {
-        info!(
-            vault = %config.vault,
-            receipt_contract = %config.receipt_contract,
-            bot_wallet = %bot_wallet,
-            "Spawning receipt monitor for vault"
-        );
-
-        let monitor_config = ReceiptMonitorConfig {
-            vault: config.vault,
-            receipt_contract: config.receipt_contract,
-            bot_wallet,
-        };
-
-        let monitor = ReceiptMonitor::new(
-            provider.clone(),
-            monitor_config,
-            receipt_inventory_cqrs.clone(),
-            handler.clone(),
-        );
-
-        tokio::spawn(async move {
-            monitor.run().await;
-        });
-    }
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {

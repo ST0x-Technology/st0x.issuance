@@ -1775,15 +1775,26 @@ LOG_LEVEL=info
 METRICS_PORT=9090
 ```
 
-### Private Key Management
+### Startup Job Orchestration
 
-**TBD** - Private key management strategy needs to be worked out in greater
-detail including:
+The service uses **apalis** (0.7.4, SQLite backend) for one-shot startup jobs
+that must complete before the service begins handling requests. Each job is
+pushed and awaited sequentially via `push_and_await`:
 
-- Storage approach (encrypted file, HSM, KMS)
-- Access controls
-- Rotation procedures
-- Backup and recovery
-- Separation between minting and burning keys if needed
+1. `ViewReplayJob` — replays mint, redemption, and receipt_burns views so read
+   models reflect the current event store
+2. `ReceiptBackfillJob` (one per vault) — backfills historic on-chain receipts
+3. `TransferBackfillJob` (one per vault) — backfills historic redemption
+   transfers. Runs after all receipt backfills because transfer detection
+   depends on receipt inventory being populated.
+4. `MintRecoveryJob` — recovers stuck mints
+5. `RedemptionRecoveryJob` (one per vault, concurrent) — recovers stuck
+   redemptions for each vault
 
-This is a critical security consideration that requires careful planning.
+Any failure aborts startup — the service will not accept requests until all jobs
+succeed. All jobs are idempotent, so restarting the service retries from the
+beginning safely.
+
+**Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
+run as supervised tasks via `task-supervisor`, which restarts them on crash. See
+[docs/orchestration.md](docs/orchestration.md) for the two-layer architecture.

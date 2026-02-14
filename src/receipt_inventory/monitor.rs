@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
 use std::sync::Arc;
+use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{info, warn};
 
 use super::{
@@ -48,18 +49,37 @@ pub(crate) trait ItnReceiptHandler: Send + Sync {
 ///
 /// See `ReceiptBackfiller` for the assumption about all mints using
 /// the bot wallet as depositor.
-pub(crate) struct ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
+pub(crate) struct ReceiptMonitor<Node, ReceiptInventoryStore, Handler>
 where
-    ProviderType: Provider,
+    Node: Provider + Clone,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
-    Handler: ItnReceiptHandler,
+    Handler: ItnReceiptHandler + Clone,
 {
-    provider: ProviderType,
+    node: Node,
     vault: Address,
     receipt_contract: Address,
     bot_wallet: Address,
     cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
     handler: Handler,
+}
+
+impl<Node, ReceiptInventoryStore, Handler> Clone
+    for ReceiptMonitor<Node, ReceiptInventoryStore, Handler>
+where
+    Node: Provider + Clone,
+    ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            vault: self.vault,
+            receipt_contract: self.receipt_contract,
+            bot_wallet: self.bot_wallet,
+            cqrs: self.cqrs.clone(),
+            handler: self.handler.clone(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,21 +100,21 @@ pub(crate) enum ReceiptMonitorError {
     StreamEnded,
 }
 
-impl<ProviderType, ReceiptInventoryStore, Handler>
-    ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
+impl<Node, ReceiptInventoryStore, Handler>
+    ReceiptMonitor<Node, ReceiptInventoryStore, Handler>
 where
-    ProviderType: Provider,
+    Node: Provider + Clone,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
-    Handler: ItnReceiptHandler,
+    Handler: ItnReceiptHandler + Clone,
 {
     pub(crate) const fn new(
-        provider: ProviderType,
+        node: Node,
         config: ReceiptMonitorConfig,
         cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
         handler: Handler,
     ) -> Self {
         Self {
-            provider,
+            node,
             vault: config.vault,
             receipt_contract: config.receipt_contract,
             bot_wallet: config.bot_wallet,
@@ -104,20 +124,20 @@ where
     }
 }
 
-impl<ProviderType, ReceiptInventoryStore, Handler>
-    ReceiptMonitor<ProviderType, ReceiptInventoryStore, Handler>
+impl<Node, ReceiptInventoryStore, Handler>
+    ReceiptMonitor<Node, ReceiptInventoryStore, Handler>
 where
-    ProviderType: Provider + Clone + Send + Sync + 'static,
+    Node: Provider + Clone + Send + Sync + 'static,
     ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
     ReceiptInventoryStore::AC: Send,
-    Handler: ItnReceiptHandler,
+    Handler: ItnReceiptHandler + Clone,
 {
     /// Runs the monitoring loop with automatic retry on errors.
     ///
     /// This method never returns under normal operation. If an error occurs,
     /// it logs the error and retries after 5 seconds.
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn run(&self) {
+    pub(crate) async fn run_monitor(&self) {
         loop {
             if let Err(err) = self.monitor_once().await {
                 warn!("Receipt monitor error: {err}. Retrying in 5s...");
@@ -129,7 +149,7 @@ where
     /// Monitors for Deposit events once, subscribing and processing them.
     async fn monitor_once(&self) -> Result<(), ReceiptMonitorError> {
         let vault_contract =
-            OffchainAssetReceiptVault::new(self.vault, &self.provider);
+            OffchainAssetReceiptVault::new(self.vault, &self.node);
 
         // Subscribe to all Deposit events on the vault.
         // We filter by owner == bot_wallet client-side since owner is not indexed.
@@ -141,7 +161,7 @@ where
             "Subscribing to Deposit events"
         );
 
-        let deposit_sub = self.provider.subscribe_logs(&deposit_filter).await?;
+        let deposit_sub = self.node.subscribe_logs(&deposit_filter).await?;
         let mut deposit_stream = deposit_sub.into_stream();
 
         info!("Receipt monitor WebSocket subscription active");
@@ -201,8 +221,7 @@ where
         block_number: u64,
         receipt_information: Bytes,
     ) -> Result<(), ReceiptMonitorError> {
-        let receipt_contract =
-            Receipt::new(self.receipt_contract, &self.provider);
+        let receipt_contract = Receipt::new(self.receipt_contract, &self.node);
 
         let current_balance = receipt_contract
             .balanceOf(self.bot_wallet, receipt_id.inner())
@@ -246,6 +265,21 @@ where
                 .await;
         }
 
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<Node, ReceiptInventoryStore, Handler> SupervisedTask
+    for ReceiptMonitor<Node, ReceiptInventoryStore, Handler>
+where
+    Node: Provider + Clone + Send + Sync + 'static,
+    ReceiptInventoryStore: EventStore<ReceiptInventory> + Send + Sync + 'static,
+    ReceiptInventoryStore::AC: Send,
+    Handler: ItnReceiptHandler + Clone + 'static,
+{
+    async fn run(&mut self) -> TaskResult {
+        Self::run_monitor(self).await;
         Ok(())
     }
 }
