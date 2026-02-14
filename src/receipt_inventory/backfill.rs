@@ -16,6 +16,7 @@ use super::{
     ReceiptInventoryError, Shares, determine_source,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::job::{Job, Label};
 use crate::{ReceiptInventoryCqrs, ReceiptInventoryEventStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,11 +33,15 @@ pub(crate) struct ReceiptBackfillCtx {
     pub(crate) backfill_start_block: u64,
 }
 
-impl ReceiptBackfillJob {
-    pub(crate) async fn run(
-        self,
-        ctx: Data<Arc<ReceiptBackfillCtx>>,
-    ) -> Result<(), anyhow::Error> {
+impl Job for ReceiptBackfillJob {
+    type Ctx = Arc<ReceiptBackfillCtx>;
+    type Error = BackfillError;
+
+    fn label(&self) -> Label {
+        Label::new(format!("receipt-backfill-{}", self.vault))
+    }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
         let aggregate_context = ctx
             .receipt_inventory_event_store
             .load_aggregate(&self.vault.to_string())

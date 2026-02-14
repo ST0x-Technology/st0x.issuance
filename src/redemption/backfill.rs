@@ -20,6 +20,7 @@ use super::{
     },
 };
 use crate::bindings;
+use crate::job::{Job, Label};
 use crate::receipt_inventory::ReceiptInventory;
 use crate::{RedemptionCqrs, RedemptionEventStore, RedemptionManagers};
 
@@ -38,11 +39,18 @@ pub(crate) struct TransferBackfillCtx {
     pub(crate) backfill_start_block: u64,
 }
 
-impl TransferBackfillJob {
-    pub(crate) async fn run(
+impl Job for TransferBackfillJob {
+    type Ctx = Arc<TransferBackfillCtx>;
+    type Error = TransferBackfillError;
+
+    fn label(&self) -> Label {
+        Label::new(format!("transfer-backfill-{}", self.vault))
+    }
+
+    async fn run(
         self,
         ctx: Data<Arc<TransferBackfillCtx>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), TransferBackfillError> {
         let backfiller = TransferBackfiller {
             provider: ctx.provider.clone(),
             bot_wallet: ctx.bot_wallet,

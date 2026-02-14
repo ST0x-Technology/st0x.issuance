@@ -6,7 +6,7 @@ use apalis_sql::sqlite::SqliteStorage;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
@@ -21,9 +21,10 @@ use tracing::{debug, error, info};
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
+use crate::job::Job;
 use crate::mint::{
     Mint, MintServices, MintView,
-    recovery::{MintRecoveryHandler, MintRecoveryJob},
+    recovery::{MintRecoveryCtx, MintRecoveryHandler, MintRecoveryJob},
 };
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
@@ -40,7 +41,7 @@ use crate::redemption::{
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetViewRepo, discover_vault_configs,
+    TokenizedAsset, TokenizedAssetViewRepo, discover_vaults,
 };
 use crate::view_replay::ViewReplayJob;
 
@@ -55,6 +56,7 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
 pub(crate) mod fireblocks;
+pub(crate) mod job;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
@@ -106,18 +108,15 @@ const STARTUP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails,
 /// is killed, or exceeds the timeout.
-async fn push_and_await<J>(
+async fn push_and_await<J: Job>(
     storage: &mut SqliteStorage<J>,
     job: J,
-    label: &str,
-) -> Result<(), anyhow::Error>
-where
-    J: Serialize + DeserializeOwned + Send + Sync + Unpin + Debug + 'static,
-{
-    info!(job = label, "Pushing startup job");
+) -> Result<(), anyhow::Error> {
+    let label = job.label();
+    info!(job = %label, "Pushing startup job");
     let parts = storage.push(job).await?;
     let task_id = parts.task_id;
-    debug!(job = label, %task_id, "Job queued, waiting for completion");
+    debug!(job = %label, %task_id, "Job queued, waiting for completion");
 
     let deadline = tokio::time::Instant::now() + STARTUP_JOB_TIMEOUT;
 
@@ -137,7 +136,7 @@ where
 
         match request.parts.context.status() {
             State::Done => {
-                info!(job = label, "Startup job completed");
+                info!(job = %label, "Startup job completed");
                 return Ok(());
             }
             State::Failed => {
@@ -427,8 +426,10 @@ pub async fn initialize_rocket(
         )
         .register(
             WorkerBuilder::new("mint-recovery")
-                .data(pool.clone())
-                .data(mint.cqrs.clone())
+                .data(MintRecoveryCtx {
+                    pool: pool.clone(),
+                    mint_cqrs: mint.cqrs.clone(),
+                })
                 .backend(mint_recovery_storage.clone())
                 .build_fn(MintRecoveryJob::run),
         )
@@ -445,13 +446,12 @@ pub async fn initialize_rocket(
         }
     }));
 
-    // Phase 1: View replay (must complete before recovery queries views)
-    push_and_await(&mut view_replay_storage, ViewReplayJob, "view-replay")
-        .await?;
+    // View replay — rebuild read models before recovery queries them
+    push_and_await(&mut view_replay_storage, ViewReplayJob).await?;
 
-    // Phase 2: Discover vaults and run per-vault backfills
+    // Discover vaults and run per-vault backfills
     let vault_configs =
-        discover_vault_configs(&pool, &blockchain_setup.provider).await?;
+        discover_vaults(&pool, &blockchain_setup.provider).await?;
 
     for config in &vault_configs {
         push_and_await(
@@ -460,7 +460,6 @@ pub async fn initialize_rocket(
                 vault: config.vault,
                 receipt_contract: config.receipt_contract,
             },
-            &format!("receipt-backfill-{:.8}", config.vault),
         )
         .await?;
     }
@@ -469,24 +468,14 @@ pub async fn initialize_rocket(
         push_and_await(
             &mut transfer_backfill_storage,
             TransferBackfillJob { vault: config.vault },
-            &format!("transfer-backfill-{:.8}", config.vault),
         )
         .await?;
     }
 
-    // Phase 3: Recovery (runs after reprojections and backfill for accurate state)
-    push_and_await(
-        &mut mint_recovery_storage,
-        MintRecoveryJob,
-        "mint-recovery",
-    )
-    .await?;
-    push_and_await(
-        &mut redemption_recovery_storage,
-        RedemptionRecoveryJob,
-        "redemption-recovery",
-    )
-    .await?;
+    // Recovery — runs after backfills for accurate state
+    push_and_await(&mut mint_recovery_storage, MintRecoveryJob).await?;
+    push_and_await(&mut redemption_recovery_storage, RedemptionRecoveryJob)
+        .await?;
 
     let mut supervisor_builder = SupervisorBuilder::new()
         .with_unlimited_restarts()
@@ -510,7 +499,7 @@ pub async fn initialize_rocket(
         );
 
         supervisor_builder = supervisor_builder.with_task(
-            &format!("receipt-monitor-{:.8}", vault_config.vault),
+            &format!("receipt-monitor-{}", vault_config.vault),
             receipt_monitor,
         );
 
@@ -531,7 +520,7 @@ pub async fn initialize_rocket(
         );
 
         supervisor_builder = supervisor_builder.with_task(
-            &format!("redemption-detector-{:.8}", vault_config.vault),
+            &format!("redemption-detector-{}", vault_config.vault),
             detector,
         );
     }
