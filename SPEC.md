@@ -1778,19 +1778,21 @@ METRICS_PORT=9090
 ### Startup Job Orchestration
 
 The service uses **apalis** (0.7.4, SQLite backend) for one-shot startup jobs
-that must complete before the service begins handling requests. Jobs are grouped
-into sequential phases:
+that must complete before the service begins handling requests. Each job is
+pushed and awaited sequentially via `push_and_await`:
 
-| Phase | Job                     | Purpose                                            |
-| ----- | ----------------------- | -------------------------------------------------- |
-| 1     | `ViewReplayJob`         | Replays mint, redemption, receipt_burns views      |
-| 2     | `ReceiptBackfillJob`    | Backfills receipts for all vaults                  |
-| 2     | `TransferBackfillJob`   | Backfills transfers for all vaults (after receipt) |
-| 3     | `MintRecoveryJob`       | Recovers stuck mints                               |
-| 3     | `RedemptionRecoveryJob` | Recovers stuck redemptions                         |
+1. `ViewReplayJob` — replays mint, redemption, and receipt_burns views so read
+   models reflect the current event store
+2. `ReceiptBackfillJob` (one per vault) — backfills historic on-chain receipts
+3. `TransferBackfillJob` (one per vault) — backfills historic redemption
+   transfers. Runs after all receipt backfills because transfer detection
+   depends on receipt inventory being populated.
+4. `MintRecoveryJob` — recovers stuck mints
+5. `RedemptionRecoveryJob` — recovers stuck redemptions
 
-Phases run sequentially. A phase controller pushes each job and polls until
-completion before moving to the next.
+Any failure aborts startup — the service will not accept requests until all jobs
+succeed. All jobs are idempotent, so restarting the service retries from the
+beginning safely.
 
 **Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
 run as supervised tasks via `task-supervisor`, which restarts them on crash. See
