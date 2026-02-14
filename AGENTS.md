@@ -26,8 +26,8 @@ the limit, condense explanations without removing any rules.
   services)
 - [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
   (externalTxId, SDK error handling)
-- [docs/apalis.md](docs/apalis.md) - Apalis job management (startup jobs,
-  migration ordering, job pattern)
+- [docs/orchestration.md](docs/orchestration.md) - Task orchestration (startup
+  jobs, long-running monitors, migration ordering, supervision)
 
 **Update at the end** (see "After completing a plan" checklist below):
 
@@ -947,11 +947,20 @@ committing.
 (faster) or `cargo test` (more useful). Only use `cargo build` when you need the
 binary.
 
-- **Before handing over a piece of work**, run checks in this order:
+- **Before handing over a piece of work**, run only the checks relevant to what
+  you changed:
+
+  **Rust code changes:**
   1. `cargo test --workspace` - All tests must pass
   2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
      Fix any linting issues (these should be minimal if code is well-structured)
   3. `cargo fmt --all` - Format the code
+
+  **Non-Rust changes only** (markdown, docs, config, etc.):
+  1. `pre-commit run -a` - Run all pre-commit hooks
+
+  Don't run the full Rust toolchain for docs-only changes, and don't skip Rust
+  checks when code changed.
 
 ### CRITICAL: Lint Policy
 
