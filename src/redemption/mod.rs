@@ -13,8 +13,8 @@ pub(crate) mod test_utils;
 pub(crate) mod transfer;
 
 use alloy::hex;
-use apalis::prelude::Data;
 use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
+use apalis::prelude::Data;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -25,6 +25,37 @@ use tracing::{info, warn};
 use crate::Quantity;
 use crate::RedemptionManagers;
 use crate::mint::TokenizationRequestId;
+use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::VaultError;
+use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
+
+pub(crate) use cmd::RedemptionCommand;
+pub(crate) use event::{BurnRecord, RedemptionEvent};
+pub(crate) use view::{
+    RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
+    replay_redemption_view,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RedemptionRecoveryJob;
+
+impl RedemptionRecoveryJob {
+    pub(crate) async fn run(
+        self,
+        managers: Data<Arc<RedemptionManagers>>,
+    ) -> Result<(), anyhow::Error> {
+        info!("Starting redemption recovery");
+
+        managers.redeem_call.recover_detected_redemptions().await;
+        managers.journal.recover_alpaca_called_redemptions().await;
+        managers.burn.recover_burning_redemptions().await;
+        managers.burn.recover_burn_failed_redemptions().await;
+
+        info!("Completed redemption recovery");
+
+        Ok(())
+    }
+}
 
 /// Issuer request ID for redemption operations.
 ///
@@ -91,16 +122,6 @@ impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
         s.parse().map_err(serde::de::Error::custom)
     }
 }
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-use crate::vault::VaultError;
-use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
-
-pub(crate) use cmd::RedemptionCommand;
-pub(crate) use event::{BurnRecord, RedemptionEvent};
-pub(crate) use view::{
-    RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
-    replay_redemption_view,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RedemptionMetadata {

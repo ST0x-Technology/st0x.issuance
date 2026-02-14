@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
+use alloy::providers::DynProvider;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::{GenericQuery, QueryReplay, ViewRepository};
 use cqrs_es::{EventEnvelope, View};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
@@ -10,8 +12,9 @@ use tracing::info;
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
-    TokenizedAssetEvent, UnderlyingSymbol,
+    TokenizedAssetEvent, UnderlyingSymbol, VaultBackfillConfig,
 };
+use crate::bindings::OffchainAssetReceiptVault;
 
 pub(crate) type TokenizedAssetViewRepo =
     Arc<SqliteViewRepository<TokenizedAssetView, TokenizedAsset>>;

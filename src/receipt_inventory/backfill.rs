@@ -8,21 +8,21 @@ use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, Shares, determine_source,
 };
-use crate::bindings::{self, OffchainAssetReceiptVault, Receipt};
-use crate::tokenized_asset::view::list_enabled_assets;
-use crate::tokenized_asset::{TokenizedAssetView, VaultBackfillConfig};
-use crate::{ReceiptInventoryCqrs, ReceiptInventoryEventStore, VaultConfigs};
+use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::{ReceiptInventoryCqrs, ReceiptInventoryEventStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ReceiptBackfillJob;
+pub(crate) struct ReceiptBackfillJob {
+    pub(crate) vault: Address,
+    pub(crate) receipt_contract: Address,
+}
 
 pub(crate) struct ReceiptBackfillCtx {
     pub(crate) provider: DynProvider,
@@ -35,19 +35,42 @@ pub(crate) struct ReceiptBackfillCtx {
 impl ReceiptBackfillJob {
     pub(crate) async fn run(
         self,
-        pool: Data<Pool<Sqlite>>,
         ctx: Data<Arc<ReceiptBackfillCtx>>,
-        vault_configs: Data<VaultConfigs>,
     ) -> Result<(), anyhow::Error> {
-        let configs = run_all_receipt_backfills(&pool, &ctx).await?;
+        let aggregate_context = ctx
+            .receipt_inventory_event_store
+            .load_aggregate(&self.vault.to_string())
+            .await?;
 
-        let mut guard = vault_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(configs);
-        drop(guard);
+        let from_block = aggregate_context
+            .aggregate()
+            .last_backfilled_block()
+            .unwrap_or(ctx.backfill_start_block);
 
-        info!("Receipt backfill complete");
+        info!(
+            vault = %self.vault,
+            receipt_contract = %self.receipt_contract,
+            bot_wallet = %ctx.bot_wallet,
+            from_block,
+            "Running receipt backfill for vault"
+        );
+
+        let backfiller = ReceiptBackfiller::new(
+            ctx.provider.clone(),
+            self.receipt_contract,
+            ctx.bot_wallet,
+            self.vault,
+            ctx.receipt_inventory_cqrs.clone(),
+        );
+
+        let result = backfiller.backfill_receipts(from_block).await?;
+
+        info!(
+            vault = %self.vault,
+            processed = result.processed_count,
+            skipped_zero_balance = result.skipped_zero_balance,
+            "Receipt backfill complete for vault"
+        );
 
         Ok(())
     }
