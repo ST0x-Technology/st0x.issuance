@@ -20,12 +20,12 @@ use super::{
     },
 };
 use crate::bindings;
-use crate::{
-    RedemptionCqrs, RedemptionEventStore, RedemptionManagers, VaultConfigs,
-};
+use crate::{RedemptionCqrs, RedemptionEventStore, RedemptionManagers};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct TransferBackfillJob;
+pub(crate) struct TransferBackfillJob {
+    pub(crate) vault: Address,
+}
 
 pub(crate) struct TransferBackfillCtx {
     pub(crate) provider: DynProvider,
@@ -41,27 +41,7 @@ impl TransferBackfillJob {
     pub(crate) async fn run(
         self,
         ctx: Data<Arc<TransferBackfillCtx>>,
-        vault_configs: Data<VaultConfigs>,
     ) -> Result<(), anyhow::Error> {
-        let configs = {
-            let guard = vault_configs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.clone()
-        };
-
-        let Some(configs) = configs else {
-            anyhow::bail!(
-                "Transfer backfill skipped: vault configs not available \
-                 (receipt backfill may have failed)"
-            );
-        };
-
-        if configs.is_empty() {
-            info!("No enabled vaults, skipping transfer backfill");
-            return Ok(());
-        }
-
         let backfiller = TransferBackfiller {
             provider: ctx.provider.clone(),
             bot_wallet: ctx.bot_wallet,
@@ -73,51 +53,16 @@ impl TransferBackfillJob {
             burn_manager: ctx.managers.burn.clone(),
         };
 
-        info!(
-            vault_count = configs.len(),
-            "Running transfer backfill for all vaults"
-        );
-
-        let mut total_detected = 0u64;
-        let mut total_skipped_mint = 0u64;
-        let mut total_skipped_no_account = 0u64;
-        let mut failed_vaults = 0u64;
-
-        for config in &configs {
-            match backfiller
-                .backfill_transfers(config.vault, ctx.backfill_start_block)
-                .await
-            {
-                Ok(result) => {
-                    debug!(
-                        vault = %config.vault,
-                        detected = result.detected_count,
-                        skipped_mint = result.skipped_mint,
-                        skipped_no_account = result.skipped_no_account,
-                        "Transfer backfill complete for vault"
-                    );
-                    total_detected += result.detected_count;
-                    total_skipped_mint += result.skipped_mint;
-                    total_skipped_no_account += result.skipped_no_account;
-                }
-                Err(err) => {
-                    debug!(
-                        vault = %config.vault,
-                        error = %err,
-                        "Transfer backfill failed for vault"
-                    );
-                    failed_vaults += 1;
-                }
-            }
-        }
+        let result = backfiller
+            .backfill_transfers(self.vault, ctx.backfill_start_block)
+            .await?;
 
         info!(
-            vault_count = configs.len(),
-            total_detected,
-            total_skipped_mint,
-            total_skipped_no_account,
-            failed_vaults,
-            "Transfer backfill complete"
+            vault = %self.vault,
+            detected = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete for vault"
         );
 
         Ok(())

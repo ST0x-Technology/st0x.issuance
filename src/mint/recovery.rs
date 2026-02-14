@@ -1,12 +1,49 @@
 use alloy::primitives::TxHash;
+use apalis::prelude::Data;
 use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
+use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use super::{IssuerMintRequestId, Mint, MintCommand, MintError};
+use super::{
+    IssuerMintRequestId, Mint, MintCommand, MintError,
+    find_all_recoverable_mints,
+};
+use crate::MintCqrs;
 use crate::receipt_inventory::ItnReceiptHandler;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MintRecoveryJob;
+
+impl MintRecoveryJob {
+    pub(crate) async fn run(
+        self,
+        pool: Data<Pool<Sqlite>>,
+        mint_cqrs: Data<MintCqrs>,
+    ) -> Result<(), anyhow::Error> {
+        info!("Starting mint recovery");
+
+        let recoverable_mints = find_all_recoverable_mints(&pool).await?;
+
+        if recoverable_mints.is_empty() {
+            debug!("No mints to recover");
+            return Ok(());
+        }
+
+        info!(count = recoverable_mints.len(), "Recovering mints");
+
+        for (issuer_request_id, _view) in recoverable_mints {
+            recover_mint(&mint_cqrs, issuer_request_id).await;
+        }
+
+        debug!("Completed mint recovery");
+
+        Ok(())
+    }
+}
 
 /// Production handler that triggers mint recovery when an ITN receipt is
 /// discovered by the receipt monitor.
