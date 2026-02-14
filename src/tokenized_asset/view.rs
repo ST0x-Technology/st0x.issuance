@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
-    TokenizedAssetEvent, UnderlyingSymbol, VaultBackfillConfig,
+    TokenizedAssetEvent, UnderlyingSymbol, VaultCtx,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 
@@ -164,6 +164,52 @@ pub(crate) async fn find_vault_by_underlying(
         }
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VaultDiscoveryError {
+    #[error(transparent)]
+    View(#[from] TokenizedAssetViewError),
+    #[error(transparent)]
+    Contract(#[from] alloy::contract::Error),
+}
+
+pub(crate) async fn discover_vaults(
+    pool: &Pool<Sqlite>,
+    provider: &DynProvider,
+) -> Result<Vec<VaultCtx>, VaultDiscoveryError> {
+    let assets = list_enabled_assets(pool).await?;
+
+    let vaults: Vec<_> = assets
+        .into_iter()
+        .filter_map(|asset| match asset {
+            TokenizedAssetView::Asset { vault, .. } => Some(vault),
+            TokenizedAssetView::Unavailable => None,
+        })
+        .collect();
+
+    if vaults.is_empty() {
+        info!("No enabled vaults found");
+        return Ok(vec![]);
+    }
+
+    let configs: Vec<VaultCtx> = stream::iter(vaults)
+        .then(|vault| async move {
+            let vault_contract =
+                OffchainAssetReceiptVault::new(vault, provider);
+            let receipt_contract =
+                Address::from(vault_contract.receipt().call().await?.0);
+
+            Ok::<_, VaultDiscoveryError>(VaultCtx { vault, receipt_contract })
+        })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    info!(vault_count = configs.len(), "Discovered vaults");
+
+    Ok(configs)
 }
 
 #[cfg(test)]
