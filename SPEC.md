@@ -1788,7 +1788,8 @@ pushed and awaited sequentially via `push_and_await`:
    transfers. Runs after all receipt backfills because transfer detection
    depends on receipt inventory being populated.
 4. `MintRecoveryJob` — recovers stuck mints
-5. `RedemptionRecoveryJob` — recovers stuck redemptions
+5. `RedemptionRecoveryJob` (one per vault, concurrent) — recovers stuck
+   redemptions for each vault
 
 Any failure aborts startup — the service will not accept requests until all jobs
 succeed. All jobs are idempotent, so restarting the service retries from the

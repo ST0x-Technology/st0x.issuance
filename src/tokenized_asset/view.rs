@@ -181,7 +181,9 @@ pub(crate) async fn discover_vaults(
     let vaults: Vec<_> = assets
         .into_iter()
         .filter_map(|asset| match asset {
-            TokenizedAssetView::Asset { vault, .. } => Some(vault),
+            TokenizedAssetView::Asset { underlying, vault, .. } => {
+                Some((underlying, vault))
+            }
             TokenizedAssetView::Unavailable => None,
         })
         .collect();
@@ -192,13 +194,17 @@ pub(crate) async fn discover_vaults(
     }
 
     let configs: Vec<VaultCtx> = stream::iter(vaults)
-        .then(|vault| async move {
+        .then(|(underlying, vault)| async move {
             let vault_contract =
                 OffchainAssetReceiptVault::new(vault, provider);
             let receipt_contract =
                 Address::from(vault_contract.receipt().call().await?.0);
 
-            Ok::<_, VaultDiscoveryError>(VaultCtx { vault, receipt_contract })
+            Ok::<_, VaultDiscoveryError>(VaultCtx {
+                underlying,
+                vault,
+                receipt_contract,
+            })
         })
         .collect::<Vec<_>>()
         .await
