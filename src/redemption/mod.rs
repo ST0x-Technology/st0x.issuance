@@ -1,11 +1,9 @@
 mod cmd;
 mod event;
-pub(crate) mod recovery_job;
 pub(crate) mod upcaster;
 mod view;
 
 pub(crate) mod backfill;
-pub(crate) mod backfill_job;
 pub(crate) mod burn_manager;
 pub(crate) mod detector;
 pub(crate) mod journal_manager;
@@ -15,15 +13,17 @@ pub(crate) mod test_utils;
 pub(crate) mod transfer;
 
 use alloy::hex;
+use apalis::prelude::Data;
 use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::Quantity;
+use crate::RedemptionManagers;
 use crate::mint::TokenizationRequestId;
 
 /// Issuer request ID for redemption operations.
