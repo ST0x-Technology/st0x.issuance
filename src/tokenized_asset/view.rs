@@ -36,7 +36,9 @@ pub(crate) enum TokenizedAssetViewError {
 pub(crate) async fn replay_tokenized_asset_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), TokenizedAssetViewError> {
-    info!("Replaying tokenized asset view from events");
+    info!("Rebuilding tokenized asset view from events");
+
+    sqlx::query!("DELETE FROM tokenized_asset_view").execute(&pool).await?;
 
     let view_repo = Arc::new(SqliteViewRepository::<
         TokenizedAssetView,
@@ -51,7 +53,7 @@ pub(crate) async fn replay_tokenized_asset_view(
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
 
-    info!("Tokenized asset view replay complete");
+    info!("Tokenized asset view rebuild complete");
 
     Ok(())
 }

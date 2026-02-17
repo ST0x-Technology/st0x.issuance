@@ -26,9 +26,12 @@
         devShell = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+
           buildInputs = with pkgs;
             [ bacon sqlx-cli cargo-expand cargo-chef packages.prepSolArtifacts ]
             ++ rainix.devShells.${system}.default.buildInputs;
+
+          DATABASE_URL = "sqlite:./issuance.db";
         };
       });
 }

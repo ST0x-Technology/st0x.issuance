@@ -3,6 +3,7 @@ pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
 pub(crate) mod monitor;
+pub(crate) mod reconcile;
 pub(crate) mod view;
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};

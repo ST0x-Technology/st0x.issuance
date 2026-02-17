@@ -280,9 +280,9 @@ pub async fn initialize_rocket(
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Without this ordering, recovery might miss stuck
-    // operations if the view was deleted/corrupted.
-    info!("Replaying views to ensure schema updates are applied");
+    // up-to-date views. Each replay clears its view table first to remove
+    // stale/corrupt data, then rebuilds from the event store.
+    info!("Rebuilding all views from events");
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use tracing::info;
 
 use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
 use crate::redemption::IssuerRedemptionRequestId;
@@ -193,6 +194,10 @@ pub(crate) fn plan_burn(
 pub(crate) async fn replay_receipt_burns_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), BurnTrackingError> {
+    info!("Rebuilding receipt burns view from events");
+
+    sqlx::query!("DELETE FROM receipt_burns_view").execute(&pool).await?;
+
     let view_repo =
         Arc::new(SqliteViewRepository::<ReceiptBurnsView, Redemption>::new(
             pool.clone(),
@@ -203,6 +208,8 @@ pub(crate) async fn replay_receipt_burns_view(
     let event_repo = SqliteEventRepository::new(pool);
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
+
+    info!("Receipt burns view rebuild complete");
 
     Ok(())
 }
