@@ -2041,4 +2041,73 @@ mod tests {
             "Expected Failed state unchanged when balance insufficient, got {updated_aggregate:?}"
         );
     }
+
+    #[tokio::test]
+    async fn test_recover_burn_failed_marks_failed_when_balance_insufficient() {
+        let harness = setup_test_environment().await;
+        let TestHarness {
+            cqrs,
+            store,
+            receipt_service,
+            receipt_inventory_cqrs,
+            pool,
+            ..
+        } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        // Configure mock to return 0 balance (burn already happened on-chain)
+        let blockchain_service_mock = Arc::new(
+            MockVaultService::new_success().with_share_balance(uint!(0_U256)),
+        );
+        let blockchain_service =
+            blockchain_service_mock.clone() as Arc<dyn VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            receipt_inventory_cqrs.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "ERC1155: burn amount exceeds balance".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        // Recovery should auto-fail (MarkFailed) instead of just skipping
+        manager.recover_burn_failed_redemptions().await;
+
+        // The aggregate should have a new RedemptionFailed event
+        // (from MarkFailed command, with reason about insufficient balance)
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::Failed { reason, .. } = &updated_aggregate else {
+            panic!("Expected Failed state, got {updated_aggregate:?}");
+        };
+
+        assert!(
+            reason.contains(
+                "On-chain balance insufficient for BurnFailed recovery"
+            ),
+            "Expected auto-fail reason about insufficient balance, got: {reason}"
+        );
+    }
 }
