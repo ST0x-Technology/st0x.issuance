@@ -708,6 +708,49 @@ impl LocalEvm {
             .ok_or(LocalEvmError::EventNotFound)
     }
 
+    /// Burns (withdraws) shares directly on-chain for a specific receipt.
+    ///
+    /// This bypasses the issuance API and calls `redeem()` directly via the
+    /// vault contract. Useful for simulating external burns that occurred
+    /// outside the service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signer creation, provider connection, or the redeem
+    /// transaction fails.
+    pub async fn withdraw_directly(
+        &self,
+        receipt_id: U256,
+        shares: U256,
+        receiver: Address,
+    ) -> Result<(), LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?;
+
+        let vault =
+            OffchainAssetReceiptVault::new(self.vault_address, &provider);
+
+        vault
+            .redeem(
+                shares,
+                receiver,
+                self.wallet_address,
+                receipt_id,
+                Bytes::new(),
+            )
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(())
+    }
+
     /// Grants a role on a specific authorizer (not necessarily this LocalEvm's authorizer).
     ///
     /// # Errors

@@ -249,6 +249,8 @@ Bug fixes and improvements that don't fit into the original phases.
 - [x] [#111](https://github.com/ST0x-Technology/st0x.issuance/issues/111) -
       Resume failed mints when receipt is discovered by monitor
   - **PR:** [#112](https://github.com/ST0x-Technology/st0x.issuance/pull/112)
+- [x] [#121](https://github.com/ST0x-Technology/st0x.issuance/issues/121) -
+      Receipt inventory unaware of external burns
 
 ### Completed
 
