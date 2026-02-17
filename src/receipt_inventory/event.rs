@@ -27,11 +27,6 @@ pub(crate) enum ReceiptInventoryEvent {
         #[serde(default)]
         receipt_info: Option<ReceiptInformation>,
     },
-    Burned {
-        receipt_id: ReceiptId,
-        amount_burned: Shares,
-        new_balance: Shares,
-    },
     BalanceReconciled {
         receipt_id: ReceiptId,
         previous_balance: Shares,
@@ -51,7 +46,6 @@ impl DomainEvent for ReceiptInventoryEvent {
             Self::Discovered { .. } => {
                 "ReceiptInventoryEvent::Discovered".to_string()
             }
-            Self::Burned { .. } => "ReceiptInventoryEvent::Burned".to_string(),
             Self::BalanceReconciled { .. } => {
                 "ReceiptInventoryEvent::BalanceReconciled".to_string()
             }

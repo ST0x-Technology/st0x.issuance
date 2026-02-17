@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 use url::Url;
 
+use crate::account::view::replay_account_view;
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
@@ -105,12 +106,7 @@ struct MintDeps {
 struct RedemptionManagers {
     redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
     journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
-    burn: Arc<
-        BurnManager<
-            SqliteEventStore<Redemption>,
-            SqliteEventStore<ReceiptInventory>,
-        >,
-    >,
+    burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +280,7 @@ pub async fn initialize_rocket(
     // up-to-date views. Each replay clears its view table first to remove
     // stale/corrupt data, then rebuilds from the event store.
     info!("Rebuilding all views from events");
+    replay_account_view(pool.clone()).await?;
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
@@ -581,7 +578,6 @@ fn setup_redemption_managers(
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
         receipt_service,
-        receipt_inventory.cqrs.clone(),
         bot_wallet,
     ));
 
@@ -696,10 +692,7 @@ fn spawn_redemption_recovery(
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
     burn: Arc<
-        BurnManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
-        >,
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
     info!("Spawning redemption recovery task");
@@ -827,11 +820,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
 /// before live monitoring (to avoid missing transfers in the gap).
 async fn run_all_transfer_backfills<P: Provider + Clone>(
     vault_configs: &[VaultBackfillConfig],
-    backfiller: &TransferBackfiller<
-        P,
-        SqliteEventStore<Redemption>,
-        SqliteEventStore<ReceiptInventory>,
-    >,
+    backfiller: &TransferBackfiller<P, SqliteEventStore<Redemption>>,
     backfill_start_block: u64,
 ) -> Result<(), anyhow::Error> {
     if vault_configs.is_empty() {

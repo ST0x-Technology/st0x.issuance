@@ -15,10 +15,6 @@ pub(crate) enum ReceiptInventoryCommand {
         source: ReceiptSource,
         receipt_info: Option<ReceiptInformation>,
     },
-    BurnShares {
-        receipt_id: ReceiptId,
-        amount: Shares,
-    },
     ReconcileBalance {
         receipt_id: ReceiptId,
         on_chain_balance: Shares,

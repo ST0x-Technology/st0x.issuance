@@ -12,8 +12,7 @@ use super::{
 };
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
-    BurnPlan, BurnTrackingError, ReceiptId, ReceiptInventory,
-    ReceiptInventoryCommand, ReceiptInventoryError, ReceiptService, Shares,
+    BurnPlan, BurnTrackingError, ReceiptService, Shares,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
@@ -28,10 +27,9 @@ use crate::vault::{MultiBurnEntry, VaultError, VaultService};
 /// handler calls the vault service to perform the actual burn operation.
 ///
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
-pub(crate) struct BurnManager<RedemptionStore, ReceiptInventoryStore>
+pub(crate) struct BurnManager<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Used only for balance queries during recovery (not for burns - those go through aggregate)
     vault_service: Arc<dyn VaultService>,
@@ -39,16 +37,12 @@ where
     cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     store: Arc<RedemptionStore>,
     receipt_service: Arc<dyn ReceiptService>,
-    receipt_inventory_cqrs:
-        Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
     bot_wallet: Address,
 }
 
-impl<RedemptionStore, ReceiptInventoryStore>
-    BurnManager<RedemptionStore, ReceiptInventoryStore>
+impl<RedemptionStore> BurnManager<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Creates a new burn manager.
     ///
@@ -59,7 +53,6 @@ where
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
     /// * `store` - Event store for loading aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
-    /// * `receipt_inventory_cqrs` - CQRS framework for updating ReceiptInventory after burns
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
         vault_service: Arc<dyn VaultService>,
@@ -67,9 +60,6 @@ where
         cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
         store: Arc<RedemptionStore>,
         receipt_service: Arc<dyn ReceiptService>,
-        receipt_inventory_cqrs: Arc<
-            CqrsFramework<ReceiptInventory, ReceiptInventoryStore>,
-        >,
         bot_wallet: Address,
     ) -> Self {
         Self {
@@ -78,7 +68,6 @@ where
             cqrs,
             store,
             receipt_service,
-            receipt_inventory_cqrs,
             bot_wallet,
         }
     }
@@ -536,12 +525,6 @@ where
         vault: Address,
         plan: BurnPlan,
     ) -> Result<(), BurnManagerError> {
-        let inventory_updates: Vec<(ReceiptId, Shares)> = plan
-            .allocations
-            .iter()
-            .map(|alloc| (alloc.receipt.receipt_id, alloc.burn_amount))
-            .collect();
-
         let burns: Vec<MultiBurnEntry> = plan
             .allocations
             .into_iter()
@@ -573,13 +556,6 @@ where
                     "BurnTokens command executed successfully"
                 );
 
-                // Update ReceiptInventory to reflect burned shares
-                self.update_receipt_inventory_after_burn(
-                    vault,
-                    &inventory_updates,
-                )
-                .await;
-
                 Ok(())
             }
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
@@ -609,41 +585,6 @@ where
             Err(err) => Err(err.into()),
         }
     }
-
-    /// Updates the ReceiptInventory aggregate after a successful burn.
-    ///
-    /// Emits `BurnShares` commands for each receipt that was burned. Failures
-    /// are logged but don't fail the overall operation since the on-chain burn
-    /// already succeeded.
-    async fn update_receipt_inventory_after_burn(
-        &self,
-        vault: Address,
-        burns: &[(ReceiptId, Shares)],
-    ) {
-        let aggregate_id = vault.to_string();
-
-        for (receipt_id, amount) in burns {
-            if let Err(err) = self
-                .receipt_inventory_cqrs
-                .execute(
-                    &aggregate_id,
-                    ReceiptInventoryCommand::BurnShares {
-                        receipt_id: *receipt_id,
-                        amount: *amount,
-                    },
-                )
-                .await
-            {
-                warn!(
-                    vault = %vault,
-                    receipt_id = %receipt_id,
-                    amount = %amount,
-                    error = %err,
-                    "Failed to update ReceiptInventory after burn"
-                );
-            }
-        }
-    }
 }
 
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
@@ -665,8 +606,6 @@ pub(crate) enum BurnManagerError {
     Sqlx(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-    #[error("Receipt inventory aggregate error: {0}")]
-    AggregateReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]
@@ -922,14 +861,7 @@ mod tests {
     async fn test_handle_burning_started_with_success() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -943,7 +875,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1005,7 +936,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1091,7 +1021,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1159,7 +1088,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1212,7 +1140,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1281,7 +1208,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1342,7 +1268,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1443,7 +1368,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1502,7 +1426,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1572,7 +1495,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1639,7 +1561,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1692,7 +1613,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1724,7 +1644,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1786,7 +1705,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1839,7 +1757,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1909,7 +1826,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1996,7 +1912,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -2079,7 +1994,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 

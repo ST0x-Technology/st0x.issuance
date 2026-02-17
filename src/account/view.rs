@@ -1,18 +1,50 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
+use tracing::info;
 
-use super::{Account, AccountEvent, AlpacaAccountNumber, ClientId, Email};
+use super::{
+    Account, AccountError, AccountEvent, AlpacaAccountNumber, ClientId, Email,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccountViewError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] cqrs_es::persist::PersistenceError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] cqrs_es::AggregateError<AccountError>),
+}
+
+pub(crate) async fn replay_account_view(
+    pool: Pool<Sqlite>,
+) -> Result<(), AccountViewError> {
+    info!("Rebuilding account view from events");
+
+    sqlx::query!("DELETE FROM account_view").execute(&pool).await?;
+
+    let view_repo =
+        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
+            pool.clone(),
+            "account_view".to_string(),
+        ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    info!("Account view rebuild complete");
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

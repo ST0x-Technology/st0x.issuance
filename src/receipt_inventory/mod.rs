@@ -366,19 +366,6 @@ pub(crate) fn determine_source(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReceiptInventoryError {
-    #[error("Receipt {receipt_id} not found")]
-    ReceiptNotFound { receipt_id: ReceiptId },
-
-    #[error(
-        "Insufficient balance for receipt {receipt_id}:\
-         available={available}, requested={requested}"
-    )]
-    InsufficientBalance {
-        receipt_id: ReceiptId,
-        available: Shares,
-        requested: Shares,
-    },
-
     #[error(
         "Unexpected balance increase for receipt {receipt_id}: \
          aggregate_balance={aggregate_balance}, on_chain_balance={on_chain_balance}"
@@ -427,42 +414,6 @@ impl Aggregate for ReceiptInventory {
                     source,
                     receipt_info,
                 }])
-            }
-
-            ReceiptInventoryCommand::BurnShares { receipt_id, amount } => {
-                let metadata = self.receipts.get(&receipt_id).cloned();
-
-                let Some(metadata) = metadata else {
-                    return Err(ReceiptInventoryError::ReceiptNotFound {
-                        receipt_id,
-                    });
-                };
-
-                let available = metadata.balance;
-                let new_balance = available.checked_sub(amount).ok_or(
-                    ReceiptInventoryError::InsufficientBalance {
-                        receipt_id,
-                        available,
-                        requested: amount,
-                    },
-                )?;
-
-                if new_balance.is_zero() {
-                    Ok(vec![
-                        ReceiptInventoryEvent::Burned {
-                            receipt_id,
-                            amount_burned: amount,
-                            new_balance,
-                        },
-                        ReceiptInventoryEvent::Depleted { receipt_id },
-                    ])
-                } else {
-                    Ok(vec![ReceiptInventoryEvent::Burned {
-                        receipt_id,
-                        amount_burned: amount,
-                        new_balance,
-                    }])
-                }
             }
 
             ReceiptInventoryCommand::ReconcileBalance {
@@ -530,18 +481,6 @@ impl Aggregate for ReceiptInventory {
                 );
                 if let ReceiptSource::Itn { issuer_request_id } = source {
                     self.itn_receipts.insert(issuer_request_id, receipt_id);
-                }
-            }
-
-            ReceiptInventoryEvent::Burned {
-                receipt_id, new_balance, ..
-            } => {
-                if new_balance.is_zero() {
-                    self.receipts.remove(&receipt_id);
-                } else if let Some(metadata) =
-                    self.receipts.get_mut(&receipt_id)
-                {
-                    metadata.balance = new_balance;
                 }
             }
 
@@ -707,175 +646,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_burn_shares_emits_burned_event() {
-        let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-
-        // Discover receipt first
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        // Partial burn
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::BurnShares {
-                    receipt_id: make_receipt_id(42),
-                    amount: make_shares(30),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            ReceiptInventoryEvent::Burned {
-                receipt_id,
-                amount_burned,
-                new_balance,
-            } if *receipt_id == make_receipt_id(42)
-                && *amount_burned == make_shares(30)
-                && *new_balance == make_shares(70)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_burn_full_balance_emits_burned_and_depleted() {
-        let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-
-        // Discover receipt
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        // Full burn
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::BurnShares {
-                    receipt_id: make_receipt_id(42),
-                    amount: make_shares(100),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0],
-            ReceiptInventoryEvent::Burned { new_balance, .. }
-            if new_balance.is_zero()
-        ));
-        assert!(matches!(
-            &events[1],
-            ReceiptInventoryEvent::Depleted { receipt_id }
-            if *receipt_id == make_receipt_id(42)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_burn_nonexistent_receipt_returns_error() {
-        let aggregate = ReceiptInventory::default();
-
-        let result = aggregate
-            .handle(
-                ReceiptInventoryCommand::BurnShares {
-                    receipt_id: make_receipt_id(99),
-                    amount: make_shares(50),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(ReceiptInventoryError::ReceiptNotFound { receipt_id })
-            if receipt_id == make_receipt_id(99)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_burn_insufficient_balance_returns_error() {
-        let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-
-        // Discover receipt with 50 balance
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(50),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        // Try to burn more than available
-        let result = aggregate
-            .handle(
-                ReceiptInventoryCommand::BurnShares {
-                    receipt_id: make_receipt_id(42),
-                    amount: make_shares(100),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(ReceiptInventoryError::InsufficientBalance {
-                receipt_id,
-                available,
-                requested,
-            }) if receipt_id == make_receipt_id(42)
-                && available == make_shares(50)
-                && requested == make_shares(100)
-        ));
-    }
-
-    #[tokio::test]
     async fn test_advance_backfill_checkpoint_emits_event() {
         let aggregate = ReceiptInventory::default();
 
@@ -989,37 +759,6 @@ mod tests {
             Some(receipt_info),
             "receipt_info should be preserved through command -> event -> state"
         );
-    }
-
-    #[test]
-    fn test_apply_burned_updates_balance() {
-        let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_metadata(100));
-
-        aggregate.apply(ReceiptInventoryEvent::Burned {
-            receipt_id: make_receipt_id(42),
-            amount_burned: make_shares(30),
-            new_balance: make_shares(70),
-        });
-
-        assert_eq!(
-            aggregate.receipts.get(&make_receipt_id(42)).map(|m| m.balance),
-            Some(make_shares(70))
-        );
-    }
-
-    #[test]
-    fn test_apply_burned_with_zero_balance_removes_receipt() {
-        let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_metadata(100));
-
-        aggregate.apply(ReceiptInventoryEvent::Burned {
-            receipt_id: make_receipt_id(42),
-            amount_burned: make_shares(100),
-            new_balance: make_shares(0),
-        });
-
-        assert!(!aggregate.receipts.contains_key(&make_receipt_id(42)));
     }
 
     #[test]
