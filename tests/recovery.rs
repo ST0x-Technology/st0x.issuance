@@ -16,8 +16,9 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
-async fn insert_redemption_event(
+async fn insert_event(
     pool: &sqlx::Pool<sqlx::Sqlite>,
+    aggregate_type: &str,
     aggregate_id: &str,
     sequence: i32,
     event_type: &str,
@@ -35,39 +36,9 @@ async fn insert_redemption_event(
             payload,
             metadata
         )
-        VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+        VALUES (?, ?, ?, ?, '1.0', ?, '{}')
         "#,
-        aggregate_id,
-        sequence,
-        event_type,
-        payload_str
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-async fn insert_mint_event(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    aggregate_id: &str,
-    sequence: i32,
-    event_type: &str,
-    payload: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let payload_str = payload.to_string();
-    sqlx::query!(
-        r#"
-        INSERT INTO events (
-            aggregate_type,
-            aggregate_id,
-            sequence,
-            event_type,
-            event_version,
-            payload,
-            metadata
-        )
-        VALUES ('Mint', ?, ?, ?, '1.0', ?, '{}')
-        "#,
+        aggregate_type,
         aggregate_id,
         sequence,
         event_type,
@@ -100,8 +71,9 @@ async fn insert_minting_state_events(
             "initiated_at": now.to_rfc3339()
         }
     });
-    insert_mint_event(
+    insert_event(
         pool,
+        "Mint",
         issuer_request_id,
         1,
         "MintEvent::Initiated",
@@ -115,8 +87,9 @@ async fn insert_minting_state_events(
             "confirmed_at": now.to_rfc3339()
         }
     });
-    insert_mint_event(
+    insert_event(
         pool,
+        "Mint",
         issuer_request_id,
         2,
         "MintEvent::JournalConfirmed",
@@ -130,8 +103,9 @@ async fn insert_minting_state_events(
             "started_at": now.to_rfc3339()
         }
     });
-    insert_mint_event(
+    insert_event(
         pool,
+        "Mint",
         issuer_request_id,
         3,
         "MintEvent::MintingStarted",
@@ -756,8 +730,9 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
             "failed_at": chrono::Utc::now().to_rfc3339()
         }
     });
-    insert_mint_event(
+    insert_event(
         &query_pool,
+        "Mint",
         issuer_request_id,
         4,
         "MintEvent::MintingFailed",
@@ -862,8 +837,9 @@ async fn test_mint_recovery_from_minting_failed_state()
             "failed_at": chrono::Utc::now().to_rfc3339()
         }
     });
-    insert_mint_event(
+    insert_event(
         &query_pool,
+        "Mint",
         issuer_request_id,
         4,
         "MintEvent::MintingFailed",
@@ -964,8 +940,9 @@ async fn test_startup_clears_and_rebuilds_views()
             "detected_at": "2025-01-01T00:00:00Z"
         }
     });
-    insert_redemption_event(
+    insert_event(
         &query_pool,
+        "Redemption",
         redemption_id,
         1,
         "RedemptionEvent::Detected",
@@ -1082,8 +1059,9 @@ async fn test_detected_redemption_auto_failed_when_no_account()
             "detected_at": "2025-01-01T00:00:00Z"
         }
     });
-    insert_redemption_event(
+    insert_event(
         &query_pool,
+        "Redemption",
         orphan_id,
         1,
         "RedemptionEvent::Detected",
@@ -1211,8 +1189,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     let stuck_id = "red-baadf00d";
     let now = chrono::Utc::now().to_rfc3339();
 
-    insert_redemption_event(
-        &query_pool,
+    insert_event(&query_pool, "Redemption",
         stuck_id,
         1,
         "RedemptionEvent::Detected",
@@ -1231,8 +1208,9 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     )
     .await?;
 
-    insert_redemption_event(
+    insert_event(
         &query_pool,
+        "Redemption",
         stuck_id,
         2,
         "RedemptionEvent::AlpacaCalled",
@@ -1248,8 +1226,9 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     )
     .await?;
 
-    insert_redemption_event(
+    insert_event(
         &query_pool,
+        "Redemption",
         stuck_id,
         3,
         "RedemptionEvent::AlpacaJournalCompleted",
@@ -1262,8 +1241,9 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     )
     .await?;
 
-    insert_redemption_event(
+    insert_event(
         &query_pool,
+        "Redemption",
         stuck_id,
         4,
         "RedemptionEvent::BurningFailed",

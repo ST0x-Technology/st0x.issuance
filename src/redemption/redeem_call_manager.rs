@@ -53,9 +53,15 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             "Recovering stuck Detected redemptions"
         );
 
-        for (issuer_request_id, _view) in stuck_redemptions {
-            match self.recover_single_detected(&issuer_request_id).await {
-                Ok(()) => {}
+        let mut recovered = 0u32;
+        let mut auto_failed = 0u32;
+        let mut failed = 0u32;
+
+        for (issuer_request_id, _view) in &stuck_redemptions {
+            match self.recover_single_detected(issuer_request_id).await {
+                Ok(()) => {
+                    recovered += 1;
+                }
                 Err(
                     RedeemCallManagerError::AccountNotFound { .. }
                     | RedeemCallManagerError::AccountNotLinked { .. },
@@ -71,27 +77,38 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                         .execute(&issuer_request_id.to_string(), command)
                         .await
                     {
-                        error!(
+                        debug!(
                             issuer_request_id = %issuer_request_id,
                             error = %err,
                             "Failed to mark unrecoverable Detected redemption as failed"
                         );
+                        failed += 1;
                     } else {
-                        info!(
+                        debug!(
                             issuer_request_id = %issuer_request_id,
                             "Auto-failed Detected redemption with no linked account"
                         );
+                        auto_failed += 1;
                     }
                 }
                 Err(err) => {
-                    warn!(
+                    debug!(
                         issuer_request_id = %issuer_request_id,
                         error = %err,
                         "Failed to recover Detected redemption"
                     );
+                    failed += 1;
                 }
             }
         }
+
+        info!(
+            total = stuck_redemptions.len(),
+            recovered,
+            auto_failed,
+            failed,
+            "Detected redemption recovery complete"
+        );
     }
 
     async fn recover_single_detected(
@@ -934,8 +951,12 @@ mod tests {
         );
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Auto-failed Detected redemption", "no linked account"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Detected redemption recovery complete", "auto_failed=1"]
         ));
     }
 

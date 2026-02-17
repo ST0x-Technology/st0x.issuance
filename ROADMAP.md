@@ -251,6 +251,7 @@ Bug fixes and improvements that don't fit into the original phases.
   - **PR:** [#112](https://github.com/ST0x-Technology/st0x.issuance/pull/112)
 - [x] [#121](https://github.com/ST0x-Technology/st0x.issuance/issues/121) -
       Receipt inventory unaware of external burns
+  - **PR:** [#122](https://github.com/ST0x-Technology/st0x.issuance/pull/122)
 
 ### Completed
 

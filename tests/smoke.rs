@@ -209,14 +209,13 @@ async fn test_production_db_three_round_trips()
         if calls >= expected_callbacks {
             break;
         }
-        if start.elapsed() >= timeout {
-            panic!(
-                "Timed out waiting for {expected_callbacks} Alpaca mint callbacks. \
-                 Got {calls}. The mint callback is sent after on-chain minting — \
-                 if this consistently gets {calls}, the service may not be sending \
-                 callbacks for all mints."
-            );
-        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for {expected_callbacks} Alpaca mint callbacks. \
+             Got {calls}. The mint callback is sent after on-chain minting — \
+             if this consistently gets {calls}, the service may not be sending \
+             callbacks for all mints."
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
