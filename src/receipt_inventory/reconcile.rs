@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, stream};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -100,6 +100,7 @@ where
 
         let mut checked = 0usize;
         let mut mismatches = 0usize;
+        let mut errors = 0usize;
 
         for result in results {
             match result {
@@ -111,11 +112,12 @@ where
                     checked += 1;
                 }
                 Err(err) => {
-                    warn!(
+                    debug!(
                         vault = %self.vault,
                         error = %err,
                         "Failed to reconcile receipt"
                     );
+                    errors += 1;
                 }
             }
         }
@@ -123,6 +125,7 @@ where
         info!(
             checked,
             mismatches,
+            errors,
             vault = %self.vault,
             "Receipt reconciliation complete"
         );
@@ -207,30 +210,45 @@ pub(crate) async fn run_startup_reconciliation<
         .collect::<Vec<_>>()
         .await;
 
-    let first_error =
-        results.into_iter().find_map(|(vault, receipt_contract, result)| {
-            match result {
-                Ok(result) if result.mismatches > 0 => {
-                    info!(
+    let mut total_checked = 0usize;
+    let mut total_mismatches = 0usize;
+    let mut failed_vaults = 0usize;
+    let mut first_error = None;
+
+    for (vault, receipt_contract, result) in results {
+        match result {
+            Ok(result) => {
+                total_checked += result.checked;
+                total_mismatches += result.mismatches;
+
+                if result.mismatches > 0 {
+                    debug!(
                         vault = %vault,
                         checked = result.checked,
                         mismatches = result.mismatches,
                         "Receipt reconciliation found mismatches"
                     );
-                    None
-                }
-                Ok(_) => None,
-                Err(err) => {
-                    warn!(
-                        vault = %vault,
-                        receipt_contract = %receipt_contract,
-                        error = %err,
-                        "Receipt reconciliation failed for vault"
-                    );
-                    Some(err)
                 }
             }
-        });
+            Err(err) => {
+                debug!(
+                    vault = %vault,
+                    receipt_contract = %receipt_contract,
+                    error = %err,
+                    "Receipt reconciliation failed for vault"
+                );
+                failed_vaults += 1;
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+
+    if total_mismatches > 0 || failed_vaults > 0 {
+        info!(
+            total_checked,
+            total_mismatches, failed_vaults, "Receipt reconciliation complete"
+        );
+    }
 
     first_error.map_or(Ok(()), Err)
 }

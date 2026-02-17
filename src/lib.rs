@@ -11,7 +11,7 @@ use sqlite_es::{
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::account::view::replay_account_view;
@@ -305,14 +305,21 @@ pub async fn initialize_rocket(
         .map(|config| (config.vault, config.receipt_contract))
         .collect();
 
-    run_startup_reconciliation(
+    if let Err(error) = run_startup_reconciliation(
         blockchain_setup.provider.clone(),
         &vault_receipt_pairs,
         &receipt_inventory.cqrs,
         receipt_inventory.event_store.as_ref(),
         bot_wallet,
     )
-    .await?;
+    .await
+    {
+        warn!(
+            error = %error,
+            "Startup reconciliation failed — receipt balances may be stale \
+             until the next withdraw event triggers reconciliation"
+        );
+    }
 
     // Transfer backfill must run after receipt backfill so that receipt inventory
     // is available for burn planning, and before live monitoring so that missed

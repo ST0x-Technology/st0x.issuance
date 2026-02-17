@@ -320,9 +320,10 @@ mod tests {
     use alloy::sol_types::SolEvent;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{AggregateContext, CqrsFramework};
+    use tracing_test::traced_test;
 
     use super::*;
-    use crate::test_utils::LocalEvm;
+    use crate::test_utils::{LocalEvm, logs_contain_at};
 
     type TestStore = MemStore<ReceiptInventory>;
     type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;
@@ -560,6 +561,7 @@ mod tests {
         }
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_withdraw_event_triggers_reconcile_balance() {
         let evm = LocalEvm::new().await.unwrap();
@@ -618,6 +620,18 @@ mod tests {
         });
 
         monitor.process_withdraw(&withdraw_log).await.unwrap();
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Withdraw detected", "receipt_id=255"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Receipt balance reconciled after withdraw",
+                "on_chain_balance=0"
+            ]
+        ));
 
         // On-chain balance is 0 for this receipt (never minted on Anvil),
         // so ReconcileBalance should deplete it

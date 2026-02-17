@@ -54,10 +54,9 @@ pub(crate) enum TransferBackfillError {
     TransferProcessing(#[from] TransferProcessingError),
 }
 
-impl<ProviderType, RedemptionStore>
-    TransferBackfiller<ProviderType, RedemptionStore>
+impl<Node, RedemptionStore> TransferBackfiller<Node, RedemptionStore>
 where
-    ProviderType: Provider + Clone + Send + Sync,
+    Node: Provider + Clone + Send + Sync,
     RedemptionStore: EventStore<Redemption> + 'static,
     RedemptionStore::AC: Send,
 {
