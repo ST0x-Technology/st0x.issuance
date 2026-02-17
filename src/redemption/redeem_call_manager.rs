@@ -876,6 +876,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recover_detected_missing_account_marks_failed() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+
+        // No account registered for this wallet — recovery should auto-fail
+        manager.recover_detected_redemptions().await;
+
+        let context = harness
+            .redemption_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let updated_aggregate = context.aggregate();
+        assert!(
+            matches!(updated_aggregate, Redemption::Failed { .. }),
+            "Expected Detected redemption with missing account to be auto-failed, \
+             got {updated_aggregate:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_recover_single_detected_missing_asset() {
         let harness = TestHarness::new().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());

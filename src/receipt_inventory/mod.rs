@@ -377,6 +377,16 @@ pub(crate) enum ReceiptInventoryError {
         available: Shares,
         requested: Shares,
     },
+
+    #[error(
+        "Unexpected balance increase for receipt {receipt_id}: \
+         aggregate_balance={aggregate_balance}, on_chain_balance={on_chain_balance}"
+    )]
+    UnexpectedBalanceIncrease {
+        receipt_id: ReceiptId,
+        aggregate_balance: Shares,
+        on_chain_balance: Shares,
+    },
 }
 
 #[async_trait]
@@ -454,6 +464,13 @@ impl Aggregate for ReceiptInventory {
                 }
             }
 
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: _,
+                on_chain_balance: _,
+            } => {
+                todo!("ReconcileBalance handler not yet implemented")
+            }
+
             ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
                 block_number,
             } => Ok(vec![ReceiptInventoryEvent::BackfillCheckpoint {
@@ -495,6 +512,20 @@ impl Aggregate for ReceiptInventory {
                     self.receipts.get_mut(&receipt_id)
                 {
                     metadata.balance = new_balance;
+                }
+            }
+
+            ReceiptInventoryEvent::BalanceReconciled {
+                receipt_id,
+                on_chain_balance,
+                ..
+            } => {
+                if on_chain_balance.is_zero() {
+                    self.receipts.remove(&receipt_id);
+                } else if let Some(metadata) =
+                    self.receipts.get_mut(&receipt_id)
+                {
+                    metadata.balance = on_chain_balance;
                 }
             }
 
@@ -1458,6 +1489,206 @@ mod tests {
                 panic!("Expected Itn source, got External");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_matching_balance_emits_no_events() {
+        let mut aggregate = ReceiptInventory::default();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let events = aggregate
+            .handle(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "Reconcile with matching balance should emit no events, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_decreased_balance_emits_balance_reconciled() {
+        let mut aggregate = ReceiptInventory::default();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let events = aggregate
+            .handle(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(50),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ReceiptInventoryEvent::BalanceReconciled {
+                receipt_id,
+                previous_balance,
+                on_chain_balance,
+            } if *receipt_id == make_receipt_id(42)
+                && *previous_balance == make_shares(100)
+                && *on_chain_balance == make_shares(50)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_zero_balance_emits_balance_reconciled_and_depleted()
+    {
+        let mut aggregate = ReceiptInventory::default();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let events = aggregate
+            .handle(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ReceiptInventoryEvent::BalanceReconciled {
+                on_chain_balance, ..
+            } if on_chain_balance.is_zero()
+        ));
+        assert!(matches!(
+            &events[1],
+            ReceiptInventoryEvent::Depleted { receipt_id }
+            if *receipt_id == make_receipt_id(42)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_unknown_receipt_emits_no_events() {
+        let aggregate = ReceiptInventory::default();
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(99),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "Reconcile for unknown receipt should emit no events, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_increased_balance_returns_error() {
+        let mut aggregate = ReceiptInventory::default();
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let events = aggregate
+            .handle(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(50),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let result = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ReceiptInventoryError::UnexpectedBalanceIncrease { .. })
+        ));
     }
 
     #[tokio::test]
