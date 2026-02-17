@@ -75,7 +75,7 @@ pub(crate) enum ReceiptMonitorError {
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
     #[error("CQRS error: {0}")]
-    Cqrs(AggregateError<ReceiptInventoryError>),
+    Cqrs(#[from] AggregateError<ReceiptInventoryError>),
     #[error("WebSocket stream ended unexpectedly")]
     StreamEnded,
 }
@@ -126,23 +126,28 @@ where
         }
     }
 
-    /// Monitors for Deposit events once, subscribing and processing them.
+    /// Monitors for Deposit and Withdraw events, subscribing and processing them.
     async fn monitor_once(&self) -> Result<(), ReceiptMonitorError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(self.vault, &self.provider);
 
-        // Subscribe to all Deposit events on the vault.
+        // Subscribe to all Deposit and Withdraw events on the vault.
         // We filter by owner == bot_wallet client-side since owner is not indexed.
         let deposit_filter = vault_contract.Deposit_filter().filter;
+        let withdraw_filter = vault_contract.Withdraw_filter().filter;
 
         info!(
             vault = %self.vault,
             bot_wallet = %self.bot_wallet,
-            "Subscribing to Deposit events"
+            "Subscribing to Deposit and Withdraw events"
         );
 
         let deposit_sub = self.provider.subscribe_logs(&deposit_filter).await?;
+        let withdraw_sub =
+            self.provider.subscribe_logs(&withdraw_filter).await?;
+
         let mut deposit_stream = deposit_sub.into_stream();
+        let mut withdraw_stream = withdraw_sub.into_stream();
 
         info!("Receipt monitor WebSocket subscription active");
 
@@ -151,6 +156,11 @@ where
                 Some(log) = deposit_stream.next() => {
                     if let Err(err) = self.process_deposit(&log).await {
                         warn!("Failed to process Deposit: {err}");
+                    }
+                }
+                Some(log) = withdraw_stream.next() => {
+                    if let Err(err) = self.process_withdraw(&log).await {
+                        warn!("Failed to process Withdraw: {err}");
                     }
                 }
                 else => {
@@ -193,6 +203,59 @@ where
         .await
     }
 
+    /// Processes a Withdraw event by reconciling the receipt's on-chain balance.
+    ///
+    /// When a withdrawal from the bot wallet is detected, queries the current
+    /// on-chain balance and issues a ReconcileBalance command to correct any
+    /// mismatch with the aggregate state.
+    pub(crate) async fn process_withdraw(
+        &self,
+        log: &Log,
+    ) -> Result<(), ReceiptMonitorError> {
+        let event =
+            OffchainAssetReceiptVault::Withdraw::decode_log(&log.inner)?;
+
+        if event.owner != self.bot_wallet {
+            return Ok(());
+        }
+
+        let receipt_id = ReceiptId::from(event.id);
+
+        info!(
+            receipt_id = %receipt_id,
+            sender = %event.sender,
+            owner = %event.owner,
+            shares = %event.shares,
+            "Withdraw detected"
+        );
+
+        let receipt_contract =
+            Receipt::new(self.receipt_contract, &self.provider);
+
+        let on_chain_balance = receipt_contract
+            .balanceOf(self.bot_wallet, receipt_id.inner())
+            .call()
+            .await?;
+
+        self.cqrs
+            .execute(
+                &self.vault.to_string(),
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id,
+                    on_chain_balance: Shares::from(on_chain_balance),
+                },
+            )
+            .await?;
+
+        info!(
+            receipt_id = %receipt_id,
+            on_chain_balance = %on_chain_balance,
+            "Receipt balance reconciled after withdraw"
+        );
+
+        Ok(())
+    }
+
     /// Checks on-chain balance and emits DiscoverReceipt if balance > 0.
     async fn discover_receipt_if_has_balance(
         &self,
@@ -231,8 +294,7 @@ where
                     receipt_info,
                 },
             )
-            .await
-            .map_err(ReceiptMonitorError::Cqrs)?;
+            .await?;
 
         info!(
             receipt_id = %receipt_id,

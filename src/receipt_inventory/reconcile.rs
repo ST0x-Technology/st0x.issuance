@@ -1,9 +1,7 @@
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use async_trait::async_trait;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, stream};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -12,20 +10,6 @@ use super::{
     ReceiptInventoryError, Shares,
 };
 use crate::bindings::Receipt;
-
-/// Triggers receipt reconciliation for a vault.
-///
-/// Compares aggregate receipt balances against on-chain state and corrects
-/// mismatches by emitting ExternalBurnDetected events.
-#[async_trait]
-pub(crate) trait ReconciliationService: Send + Sync {
-    async fn reconcile_vault(
-        &self,
-        vault: Address,
-    ) -> Result<ReconcileResult, ReconcileError>;
-
-    async fn reconcile_all_vaults(&self) -> Vec<(Address, ReconcileResult)>;
-}
 
 /// Maximum concurrent RPC calls for balance checks.
 const MAX_CONCURRENT_BALANCE_CHECKS: usize = 4;
@@ -44,8 +28,6 @@ pub(crate) enum ReconcileError {
     Aggregate(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Persistence error: {0}")]
     Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Unknown vault: {vault}")]
-    UnknownVault { vault: Address },
 }
 
 pub(crate) struct ReceiptReconciler<ProviderType, ReceiptInventoryStore>
@@ -435,89 +417,5 @@ mod tests {
             result.mismatches, 0,
             "Balance matches, no mismatch expected"
         );
-    }
-}
-
-/// Shared reconciliation service that can be used by multiple components
-/// (burn manager, periodic monitor) to trigger reconciliation on demand.
-pub(crate) struct SharedReconciler<ProviderType, ReceiptInventoryStore>
-where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
-{
-    provider: ProviderType,
-    vault_receipt_contracts: HashMap<Address, Address>,
-    bot_wallet: Address,
-    cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
-    event_store: Arc<ReceiptInventoryStore>,
-}
-
-impl<ProviderType, ReceiptInventoryStore>
-    SharedReconciler<ProviderType, ReceiptInventoryStore>
-where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
-{
-    pub(crate) const fn new(
-        provider: ProviderType,
-        vault_receipt_contracts: HashMap<Address, Address>,
-        bot_wallet: Address,
-        cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
-        event_store: Arc<ReceiptInventoryStore>,
-    ) -> Self {
-        Self {
-            provider,
-            vault_receipt_contracts,
-            bot_wallet,
-            cqrs,
-            event_store,
-        }
-    }
-}
-
-#[async_trait]
-impl<ProviderType, ReceiptInventoryStore> ReconciliationService
-    for SharedReconciler<ProviderType, ReceiptInventoryStore>
-where
-    ProviderType: alloy::providers::Provider + Clone + Send + Sync,
-    ReceiptInventoryStore: EventStore<ReceiptInventory> + Send + Sync,
-    ReceiptInventoryStore::AC: Send,
-{
-    async fn reconcile_vault(
-        &self,
-        vault: Address,
-    ) -> Result<ReconcileResult, ReconcileError> {
-        let receipt_contract = self
-            .vault_receipt_contracts
-            .get(&vault)
-            .copied()
-            .ok_or(ReconcileError::UnknownVault { vault })?;
-
-        let reconciler = ReceiptReconciler::new(
-            self.provider.clone(),
-            receipt_contract,
-            self.bot_wallet,
-            vault,
-            self.cqrs.clone(),
-        );
-
-        reconciler.reconcile(self.event_store.as_ref()).await
-    }
-
-    async fn reconcile_all_vaults(&self) -> Vec<(Address, ReconcileResult)> {
-        let mut results = Vec::new();
-
-        for vault in self.vault_receipt_contracts.keys().copied() {
-            match self.reconcile_vault(vault).await {
-                Ok(result) => results.push((vault, result)),
-                Err(err) => {
-                    warn!(
-                        vault = %vault,
-                        error = %err,
-                        "Failed to reconcile vault"
-                    );
-                }
-            }
-        }
-
-        results
     }
 }

@@ -1003,7 +1003,7 @@ async fn test_startup_clears_and_rebuilds_views()
             "wallet": "0x0000000000000000000000000000000000000000",
             "quantity": "100.0",
             "tx_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "block_number": 999999,
+            "block_number": 999_999,
             "detected_at": "2025-01-01T00:00:00Z"
         }
     });
