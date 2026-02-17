@@ -45,16 +45,13 @@ where
     }
 }
 
-/// Copies the cleaned production database, replaces production addresses with
-/// Anvil-compatible addresses, and verifies the service starts cleanly and
-/// can perform three complete mint/redeem round trips.
+/// Starts a fresh service and verifies three complete mint/redeem round trips.
 ///
 /// Round 1: mint 1, redeem 1
 /// Round 2: mint 1.5, mint 0.5, redeem 2
 /// Round 3: mint 2, redeem 0.5, redeem 1.5
 #[tokio::test]
-async fn test_production_db_three_round_trips()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -70,21 +67,26 @@ async fn test_production_db_three_round_trips()
     let (_redeem_mock, _poll_mock) =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
-    // Copy the cleaned production database to a temp location
     let temp_dir = tempfile::tempdir()?;
     let db_path = temp_dir.path().join("smoke.db");
-    std::fs::copy("./issuance.db", &db_path)?;
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    // Replace production addresses with Anvil-compatible ones
-    replace_production_addresses(&db_url, evm.vault_address, user_wallet)
-        .await?;
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        UNDERLYING,
+        TOKEN,
+    )
+    .await?;
 
     let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
 
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client, user_wallet).await;
+    let client_id = link_body.client_id.to_string();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
@@ -95,8 +97,6 @@ async fn test_production_db_three_round_trips()
         evm.vault_address,
         &user_provider,
     );
-
-    let client_id = get_client_id(&db_url).await?;
 
     // --- Round 1: mint 1 token, redeem 1 token ---
 
@@ -220,102 +220,4 @@ async fn test_production_db_three_round_trips()
     }
 
     Ok(())
-}
-
-/// Replaces production vault and wallet addresses in the copied database
-/// with Anvil-compatible addresses.
-async fn replace_production_addresses(
-    db_url: &str,
-    anvil_vault: Address,
-    anvil_user_wallet: Address,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool =
-        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
-
-    let vault_str = format!("{anvil_vault:#x}");
-    let wallet_str = format!("{anvil_user_wallet:#x}");
-
-    // Remove non-TSLA assets from the test copy — their production vault
-    // addresses don't exist on Anvil and would cause startup failures.
-    sqlx::query(
-        "
-        DELETE FROM events
-        WHERE aggregate_type = 'TokenizedAsset'
-          AND aggregate_id != 'TSLA'
-        ",
-    )
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "
-        UPDATE events
-        SET payload = json_set(payload, '$.Added.vault', ?)
-        WHERE aggregate_type = 'TokenizedAsset'
-          AND event_type = 'TokenizedAssetEvent::Added'
-        ",
-    )
-    .bind(&vault_str)
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "
-        UPDATE events
-        SET payload = json_set(
-            json_set(payload, '$.VaultAddressUpdated.vault', ?),
-            '$.VaultAddressUpdated.previous_vault', ?
-        )
-        WHERE aggregate_type = 'TokenizedAsset'
-          AND event_type = 'TokenizedAssetEvent::VaultAddressUpdated'
-        ",
-    )
-    .bind(&vault_str)
-    .bind(&vault_str)
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "
-        UPDATE events
-        SET payload = json_set(payload, '$.WalletWhitelisted.wallet', ?)
-        WHERE aggregate_type = 'Account'
-          AND event_type = 'AccountEvent::WalletWhitelisted'
-        ",
-    )
-    .bind(&wallet_str)
-    .execute(&pool)
-    .await?;
-
-    pool.close().await;
-
-    Ok(())
-}
-
-/// Retrieves one of the production account client_ids from the database.
-async fn get_client_id(
-    db_url: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool =
-        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
-
-    let row = sqlx::query_scalar::<_, String>(
-        "
-        SELECT json_extract(payload, '$.Registered.client_id')
-        FROM events
-        WHERE aggregate_type = 'Account'
-          AND event_type = 'AccountEvent::Registered'
-        LIMIT 1
-        ",
-    )
-    .fetch_one(&pool)
-    .await?;
-
-    pool.close().await;
-
-    Ok(row)
 }
