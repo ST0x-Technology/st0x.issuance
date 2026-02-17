@@ -281,9 +281,11 @@ impl Redemption {
             Self::Detected { .. }
                 | Self::AlpacaCalled { .. }
                 | Self::Burning { .. }
+                | Self::Failed { .. }
         ) {
             return Err(RedemptionError::InvalidState {
-                expected: "Detected, AlpacaCalled, or Burning".to_string(),
+                expected: "Detected, AlpacaCalled, Burning, or Failed"
+                    .to_string(),
                 found: self.state_name().to_string(),
             });
         }

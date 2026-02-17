@@ -465,10 +465,39 @@ impl Aggregate for ReceiptInventory {
             }
 
             ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: _,
-                on_chain_balance: _,
+                receipt_id,
+                on_chain_balance,
             } => {
-                todo!("ReconcileBalance handler not yet implemented")
+                let Some(metadata) = self.receipts.get(&receipt_id) else {
+                    return Ok(vec![]);
+                };
+
+                let aggregate_balance = metadata.balance;
+                if on_chain_balance == aggregate_balance {
+                    return Ok(vec![]);
+                }
+
+                if aggregate_balance.checked_sub(on_chain_balance).is_none() {
+                    return Err(
+                        ReceiptInventoryError::UnexpectedBalanceIncrease {
+                            receipt_id,
+                            aggregate_balance,
+                            on_chain_balance,
+                        },
+                    );
+                }
+
+                let reconciled = ReceiptInventoryEvent::BalanceReconciled {
+                    receipt_id,
+                    previous_balance: aggregate_balance,
+                    on_chain_balance,
+                };
+
+                let depleted = on_chain_balance
+                    .is_zero()
+                    .then_some(ReceiptInventoryEvent::Depleted { receipt_id });
+
+                Ok(std::iter::once(reconciled).chain(depleted).collect())
             }
 
             ReceiptInventoryCommand::AdvanceBackfillCheckpoint {

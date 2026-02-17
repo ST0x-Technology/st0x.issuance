@@ -207,16 +207,25 @@ where
             .await?;
 
         if on_chain_balance < total_shares {
-            warn!(
+            let reason = format!(
+                "On-chain balance insufficient for BurnFailed recovery: \
+                 balance={on_chain_balance}, required={total_shares}"
+            );
+
+            info!(
                 issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
-                burn_shares = %burn_shares,
-                dust_shares = %dust_shares,
                 total_shares = %total_shares,
-                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for BurnFailed recovery. \
-                 Burn likely already succeeded but was not recorded. \
-                 Skipping to avoid double-burning."
+                "Auto-failing BurnFailed redemption with insufficient on-chain balance"
             );
+
+            let command = RedemptionCommand::MarkFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason,
+            };
+
+            self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
+
             return Ok(());
         }
 

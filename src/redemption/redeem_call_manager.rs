@@ -56,14 +56,42 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         );
 
         for (issuer_request_id, _view) in stuck_redemptions {
-            if let Err(err) =
-                self.recover_single_detected(&issuer_request_id).await
-            {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Failed to recover Detected redemption"
-                );
+            match self.recover_single_detected(&issuer_request_id).await {
+                Ok(()) => {}
+                Err(
+                    RedeemCallManagerError::AccountNotFound { .. }
+                    | RedeemCallManagerError::AccountNotLinked { .. },
+                ) => {
+                    let command = RedemptionCommand::MarkFailed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        reason: "No linked account found for redemption wallet"
+                            .to_string(),
+                    };
+
+                    if let Err(err) = self
+                        .cqrs
+                        .execute(&issuer_request_id.to_string(), command)
+                        .await
+                    {
+                        error!(
+                            issuer_request_id = %issuer_request_id,
+                            error = %err,
+                            "Failed to mark unrecoverable Detected redemption as failed"
+                        );
+                    } else {
+                        info!(
+                            issuer_request_id = %issuer_request_id,
+                            "Auto-failed Detected redemption with no linked account"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Failed to recover Detected redemption"
+                    );
+                }
             }
         }
 
