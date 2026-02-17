@@ -23,6 +23,7 @@ use crate::mint::{
     replay_mint_view,
 };
 use crate::receipt_inventory::backfill::ReceiptBackfiller;
+use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
@@ -297,6 +298,22 @@ pub async fn initialize_rocket(
         &receipt_inventory.event_store,
         bot_wallet,
         config.backfill_start_block,
+    )
+    .await?;
+
+    // Reconcile receipt balances with on-chain state after backfill. This detects
+    // external burns (manual burns by stakeholders) that the service didn't track.
+    let vault_receipt_pairs: Vec<_> = vault_configs
+        .iter()
+        .map(|config| (config.vault, config.receipt_contract))
+        .collect();
+
+    run_startup_reconciliation(
+        blockchain_setup.provider.clone(),
+        &vault_receipt_pairs,
+        &receipt_inventory.cqrs,
+        receipt_inventory.event_store.as_ref(),
+        bot_wallet,
     )
     .await?;
 

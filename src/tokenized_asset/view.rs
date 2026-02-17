@@ -477,11 +477,11 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Replaying tokenized asset view from events"]
+            &["Rebuilding tokenized asset view from events"]
         ));
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Tokenized asset view replay complete"]
+            &["Tokenized asset view rebuild complete"]
         ));
     }
 }
