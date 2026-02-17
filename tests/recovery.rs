@@ -16,6 +16,37 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
 
+async fn insert_redemption_event(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    aggregate_id: &str,
+    sequence: i32,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload_str = payload.to_string();
+    sqlx::query!(
+        r#"
+        INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')
+        "#,
+        aggregate_id,
+        sequence,
+        event_type,
+        payload_str
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn insert_mint_event(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     aggregate_id: &str,
@@ -892,6 +923,448 @@ async fn test_mint_recovery_from_minting_failed_state()
     assert!(
         mint_callback_mock.calls_async().await >= 1,
         "Mint callback should be hit at least once"
+    );
+
+    Ok(())
+}
+
+/// Tests that stale view data is cleared on startup and rebuilt from events.
+///
+/// Scenario:
+/// 1. Complete a mint normally via API
+/// 2. Insert a phantom redemption_view row with no matching events (simulates
+///    view corruption from vault address changes or other operational issues)
+/// 3. Restart the service
+/// 4. Assert: the phantom view row is gone (views were cleared before rebuild)
+///
+/// Without view clearing, the stale view row persists because UPSERT-based
+/// replay only updates rows that have matching events — it never deletes
+/// orphaned rows.
+#[tokio::test]
+async fn test_startup_clears_and_rebuilds_views()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_view_clearing.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+
+    // Phase 1: Complete a mint normally
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client1, user_wallet).await;
+    let _issuer_request_id = harness::perform_mint_and_confirm(
+        &client1,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-view-clear-test",
+        "50.0",
+    )
+    .await?;
+
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+    harness::wait_for_shares(&vault, user_wallet).await?;
+
+    drop(client1);
+
+    // Phase 2: Insert a phantom view row with no matching events
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let stale_view_payload = json!({
+        "Detected": {
+            "issuer_request_id": "red-deadbeef",
+            "underlying": "FAKE",
+            "token": "tFAKE",
+            "wallet": "0x0000000000000000000000000000000000000000",
+            "quantity": "100.0",
+            "tx_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "block_number": 999999,
+            "detected_at": "2025-01-01T00:00:00Z"
+        }
+    });
+    let stale_payload_str = stale_view_payload.to_string();
+    sqlx::query!(
+        r#"
+        INSERT INTO redemption_view (view_id, version, payload)
+        VALUES ('red-deadbeef', 1, ?)
+        "#,
+        stale_payload_str
+    )
+    .execute(&query_pool)
+    .await?;
+
+    let stale_count = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count: i64" FROM redemption_view WHERE view_id = 'red-deadbeef'"#
+    )
+    .fetch_one(&query_pool)
+    .await?;
+    assert_eq!(stale_count, 1, "Stale view row should exist before restart");
+
+    query_pool.close().await;
+
+    // Phase 3: Restart service
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Phase 4: Stale view row should be gone after clearing + rebuild
+    let verify_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let stale_after = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count: i64" FROM redemption_view WHERE view_id = 'red-deadbeef'"#
+    )
+    .fetch_one(&verify_pool)
+    .await?;
+
+    assert_eq!(
+        stale_after, 0,
+        "Stale view row 'red-deadbeef' should be cleared on startup. \
+         Found {stale_after} rows. Views are not being cleared before rebuild."
+    );
+
+    Ok(())
+}
+
+/// Tests that a redemption stuck in Detected state with no linked account
+/// is auto-failed on startup, not retried infinitely.
+///
+/// Scenario:
+/// 1. Seed a Detected redemption for a wallet with no linked account
+///    (simulates a redemption from an old wallet that was unlinked)
+/// 2. Start service
+/// 3. Assert: Alpaca redeem mock is NOT called for the orphaned redemption
+/// 4. Assert: service can still process new mints normally
+///
+/// Without auto-failure, recovery calls recover_single_detected which hits
+/// AccountNotFound, logs a warning, and retries on every startup forever.
+#[tokio::test]
+async fn test_detected_redemption_auto_failed_when_no_account()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_detected_auto_fail.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+
+    // Phase 1: Start service to set up DB, seed asset and account
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client1, user_wallet).await;
+
+    drop(client1);
+
+    // Phase 2: Seed a Detected redemption for an UNKNOWN wallet (no linked account)
+    let orphan_wallet = Address::random();
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let orphan_id = "red-deadbeef";
+    let detected_payload = json!({
+        "Detected": {
+            "issuer_request_id": orphan_id,
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "wallet": orphan_wallet,
+            "quantity": "50.0",
+            "tx_hash": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "block_number": 1,
+            "detected_at": "2025-01-01T00:00:00Z"
+        }
+    });
+    insert_redemption_event(
+        &query_pool,
+        orphan_id,
+        1,
+        "RedemptionEvent::Detected",
+        &detected_payload,
+    )
+    .await?;
+
+    query_pool.close().await;
+
+    // Phase 3: Restart service — recovery should auto-fail the orphaned redemption
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let client2 = rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Assert: Alpaca redeem was NOT called for the orphaned redemption
+    assert_eq!(
+        redeem_mock.calls_async().await,
+        0,
+        "Alpaca redeem should NOT be called for orphaned redemption (no account). \
+         Recovery should auto-fail it instead of retrying."
+    );
+
+    // Assert: The orphaned redemption should have a RedemptionFailed event
+    let verify_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let failed_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) as "count: i64"
+        FROM events
+        WHERE aggregate_type = 'Redemption'
+          AND aggregate_id = 'red-deadbeef'
+          AND event_type = 'RedemptionEvent::RedemptionFailed'
+        "#
+    )
+    .fetch_one(&verify_pool)
+    .await?;
+
+    assert_eq!(
+        failed_count, 1,
+        "Orphaned redemption should have a RedemptionFailed event (auto-failed). \
+         Found {failed_count}. Recovery is not auto-failing unrecoverable redemptions."
+    );
+
+    // Assert: service still works — can process a new mint
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    harness::perform_mint_and_confirm(
+        &client2,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-after-orphan",
+        "50.0",
+    )
+    .await?;
+
+    harness::wait_for_shares(&vault, user_wallet).await?;
+
+    assert!(
+        mint_callback_mock.calls_async().await >= 1,
+        "Service should still be able to process new mints after auto-failing orphaned redemption"
+    );
+
+    Ok(())
+}
+
+/// Tests that a redemption stuck in BurnFailed state with no receipt balance
+/// on-chain is auto-failed on startup, not retried infinitely.
+///
+/// Scenario:
+/// 1. Complete a normal mint+redemption cycle (receipt is depleted)
+/// 2. Seed a NEW BurnFailed redemption that references the depleted receipt
+/// 3. Restart service
+/// 4. Assert: redemption is auto-failed (RedemptionFailed event emitted)
+///
+/// Without auto-failure, recovery retries the burn every startup, hitting
+/// "burn amount exceeds balance" and logging a warning forever.
+#[tokio::test]
+async fn test_burn_failed_redemption_auto_failed_when_no_balance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_burning_auto_fail.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+
+    // Phase 1: Complete a full mint+redemption cycle so the receipt is depleted
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket1 = initialize_rocket(config1).await?;
+    let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
+
+    harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
+
+    let link_body = harness::setup_account(&client1, user_wallet).await;
+
+    harness::perform_mint_and_confirm(
+        &client1,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-burning-test",
+        "50.0",
+    )
+    .await?;
+
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = ProviderBuilder::new()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    let shares = harness::wait_for_shares(&vault, user_wallet).await?;
+
+    vault.transfer(bot_wallet, shares).send().await?.get_receipt().await?;
+
+    harness::wait_for_burn(&vault, bot_wallet).await?;
+
+    drop(client1);
+
+    // Phase 2: Seed a stuck BurnFailed redemption referencing the depleted receipt
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let stuck_id = "red-baadf00d";
+    let now = chrono::Utc::now().to_rfc3339();
+
+    insert_redemption_event(
+        &query_pool,
+        stuck_id,
+        1,
+        "RedemptionEvent::Detected",
+        &json!({
+            "Detected": {
+                "issuer_request_id": stuck_id,
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "wallet": user_wallet,
+                "quantity": "50.0",
+                "tx_hash": "0xbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00d",
+                "block_number": 999,
+                "detected_at": &now
+            }
+        }),
+    )
+    .await?;
+
+    insert_redemption_event(
+        &query_pool,
+        stuck_id,
+        2,
+        "RedemptionEvent::AlpacaCalled",
+        &json!({
+            "AlpacaCalled": {
+                "issuer_request_id": stuck_id,
+                "tokenization_request_id": "tok-stuck-burning",
+                "alpaca_quantity": "50.0",
+                "dust_quantity": "0",
+                "called_at": &now
+            }
+        }),
+    )
+    .await?;
+
+    insert_redemption_event(
+        &query_pool,
+        stuck_id,
+        3,
+        "RedemptionEvent::AlpacaJournalCompleted",
+        &json!({
+            "AlpacaJournalCompleted": {
+                "issuer_request_id": stuck_id,
+                "alpaca_journal_completed_at": &now
+            }
+        }),
+    )
+    .await?;
+
+    insert_redemption_event(
+        &query_pool,
+        stuck_id,
+        4,
+        "RedemptionEvent::BurningFailed",
+        &json!({
+            "BurningFailed": {
+                "issuer_request_id": stuck_id,
+                "error": "ERC1155: burn amount exceeds balance",
+                "failed_at": &now
+            }
+        }),
+    )
+    .await?;
+
+    query_pool.close().await;
+
+    // Phase 3: Restart service — recovery should auto-fail the stuck redemption
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let rocket2 = initialize_rocket(config2).await?;
+    let _client2 =
+        rocket::local::asynchronous::Client::tracked(rocket2).await?;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Assert: The stuck redemption should have a RedemptionFailed event
+    let verify_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let failed_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) as "count: i64"
+        FROM events
+        WHERE aggregate_type = 'Redemption'
+          AND aggregate_id = 'red-baadf00d'
+          AND event_type = 'RedemptionEvent::RedemptionFailed'
+        "#
+    )
+    .fetch_one(&verify_pool)
+    .await?;
+
+    assert_eq!(
+        failed_count, 1,
+        "Stuck BurnFailed redemption should have a RedemptionFailed event (auto-failed). \
+         Found {failed_count}. Recovery is not auto-failing redemptions with insufficient balance."
     );
 
     Ok(())
