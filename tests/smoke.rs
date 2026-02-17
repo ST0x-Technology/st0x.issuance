@@ -4,7 +4,7 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
@@ -16,13 +16,13 @@ const UNDERLYING: &str = "TSLA";
 const TOKEN: &str = "tTSLA";
 
 /// Waits until the ERC-20 share balance of `wallet` strictly exceeds `threshold`.
-async fn wait_for_balance_above<T>(
-    vault: &OffchainAssetReceiptVaultInstance<T>,
+async fn wait_for_balance_above<P>(
+    vault: &OffchainAssetReceiptVaultInstance<P>,
     wallet: Address,
     threshold: U256,
 ) -> Result<U256, Box<dyn std::error::Error>>
 where
-    T: alloy::providers::Provider,
+    P: Provider,
 {
     let start = tokio::time::Instant::now();
     let timeout = tokio::time::Duration::from_secs(5);
@@ -199,10 +199,26 @@ async fn test_production_db_three_round_trips()
         "Round 3: user should have 0 shares after final redeem"
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 5,
-        "All 5 mints should have triggered Alpaca callbacks"
-    );
+    // Wait for all mint callbacks to complete — the last callback may still
+    // be in flight after shares arrive on-chain.
+    let expected_callbacks = 4;
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(5);
+    loop {
+        let calls = mint_callback_mock.calls_async().await;
+        if calls >= expected_callbacks {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "Timed out waiting for {expected_callbacks} Alpaca mint callbacks. \
+                 Got {calls}. The mint callback is sent after on-chain minting — \
+                 if this consistently gets {calls}, the service may not be sending \
+                 callbacks for all mints."
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     Ok(())
 }

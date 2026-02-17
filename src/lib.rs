@@ -668,7 +668,7 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
         };
 
         if recoverable_mints.is_empty() {
-            debug!("No mints to recover");
+            info!("No mints to recover");
             return;
         }
 
@@ -677,8 +677,6 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
         for (issuer_request_id, _view) in recoverable_mints {
             recover_mint(&mint_cqrs, issuer_request_id).await;
         }
-
-        debug!("Completed mint recovery");
     });
 }
 

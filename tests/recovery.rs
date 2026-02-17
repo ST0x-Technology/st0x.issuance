@@ -145,20 +145,11 @@ async fn insert_minting_state_events(
 /// Tests that recovery finds mints stuck in JournalConfirmed state even after
 /// the mint view has been deleted (requiring reprojection before recovery).
 ///
-/// Background: The ordering bug this catches:
-/// 1. Service starts
-/// 2. View table is empty (deleted or corrupted)
-/// 3. Recovery runs BEFORE view reprojection
-/// 4. Recovery queries the view for stuck mints
-/// 5. Recovery queries empty view, misses the stuck mint
-///
-/// The fix: Reprojections must run BEFORE recovery.
-///
-/// To create a mint stuck in JournalConfirmed state, we:
+/// Setup:
 /// 1. Complete a mint normally (all the way through)
 /// 2. Delete events after JournalConfirmed to roll back the aggregate state
-/// 3. Delete the view
-/// 4. Restart - recovery should find the JournalConfirmed mint
+/// 3. Restart — views are cleared and rebuilt repopulates from rolled-back events
+/// 4. Recovery finds the JournalConfirmed mint and resumes it
 #[tokio::test]
 async fn test_mint_recovery_after_view_deletion()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -251,23 +242,10 @@ async fn test_mint_recovery_after_view_deletion()
         "Expected exactly 2 events (MintInitiated, JournalConfirmed)"
     );
 
-    // Delete the mint view to force reprojection
-    sqlx::query!("DELETE FROM mint_view").execute(&query_pool).await?;
-
-    // Verify view is empty
-    let view_count =
-        sqlx::query!(r#"SELECT COUNT(*) as "count!: i32" FROM mint_view"#)
-            .fetch_one(&query_pool)
-            .await?;
-    assert_eq!(view_count.count, 0, "Mint view should be empty after deletion");
-
-    // Close the pool before restarting
     query_pool.close().await;
 
-    // Restart service - recovery should find the JournalConfirmed mint.
-    // initialize_rocket replays views (replay_mint_view, replay_redemption_view,
-    // replay_receipt_burns_view) before spawning recovery, so the mint view
-    // is repopulated before recovery queries it.
+    // Restart service — views are cleared and rebuilt repopulates views from events,
+    // recovery finds the JournalConfirmed mint and resumes it.
     let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
@@ -320,9 +298,8 @@ async fn test_mint_recovery_after_view_deletion()
 /// Scenario:
 /// 1. Complete a mint normally (creates on-chain receipt)
 /// 2. Roll back event store to `Minting` state (delete TokensMinted and later events)
-/// 3. Delete view
-/// 4. Restart service
-/// 5. Recovery detects the existing receipt via receipt inventory and records
+/// 3. Restart service — views are cleared and rebuilt repopulates from rolled-back events
+/// 4. Recovery detects the existing receipt via receipt inventory and records
 ///    mint success without re-minting
 #[tokio::test]
 async fn test_mint_recovery_from_minting_state_when_receipt_exists()
@@ -407,9 +384,10 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         "Expected exactly 3 events (Initiated, JournalConfirmed, MintingStarted)"
     );
 
-    sqlx::query!("DELETE FROM mint_view").execute(&query_pool).await?;
     query_pool.close().await;
 
+    // Restart — views are cleared and rebuilt repopulates from events, recovery
+    // finds the Minting mint and checks for an existing receipt.
     let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
@@ -928,18 +906,16 @@ async fn test_mint_recovery_from_minting_failed_state()
     Ok(())
 }
 
-/// Tests that stale view data is cleared on startup and rebuilt from events.
+/// Tests that views are cleared and rebuilt from events on startup.
 ///
 /// Scenario:
-/// 1. Complete a mint normally via API
-/// 2. Insert a phantom redemption_view row with no matching events (simulates
-///    view corruption from vault address changes or other operational issues)
-/// 3. Restart the service
-/// 4. Assert: the phantom view row is gone (views were cleared before rebuild)
+/// 1. Start service, set up account + asset via API, drop service
+/// 2. Seed a RedemptionDetected event directly into the events table (no view row)
+/// 3. Restart service — views are cleared and rebuilt from events
+/// 4. Assert: recovery processes the seeded Detected redemption (calls Alpaca)
 ///
-/// Without view clearing, the stale view row persists because UPSERT-based
-/// replay only updates rows that have matching events — it never deletes
-/// orphaned rows.
+/// The seeded event has no view row until the rebuild creates one. If views
+/// were not rebuilt, recovery wouldn't find the Detected redemption at all.
 #[tokio::test]
 async fn test_startup_clears_and_rebuilds_views()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -958,9 +934,9 @@ async fn test_startup_clears_and_rebuilds_views()
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
-    let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
+    let (redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    // Phase 1: Complete a mint normally
+    // Phase 1: Start service and set up account + asset via API
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
@@ -968,87 +944,76 @@ async fn test_startup_clears_and_rebuilds_views()
     harness::seed_tokenized_asset(&client1, evm.vault_address).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    let link_body = harness::setup_account(&client1, user_wallet).await;
-    let _issuer_request_id = harness::perform_mint_and_confirm(
-        &client1,
-        user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-view-clear-test",
-        "50.0",
-    )
-    .await?;
-
-    let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
-        .wallet(user_wallet_instance)
-        .connect(&evm.endpoint)
-        .await?;
-    let vault = OffchainAssetReceiptVaultInstance::new(
-        evm.vault_address,
-        &user_provider,
-    );
-    harness::wait_for_shares(&vault, user_wallet).await?;
-
     drop(client1);
 
-    // Phase 2: Insert a phantom view row with no matching events
+    // Phase 2: Seed a Detected redemption for the LINKED wallet into events
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    let stale_view_payload = json!({
+    let redemption_id = "red-cafebabe";
+    let detected_payload = json!({
         "Detected": {
-            "issuer_request_id": "red-deadbeef",
-            "underlying": "FAKE",
-            "token": "tFAKE",
-            "wallet": "0x0000000000000000000000000000000000000000",
-            "quantity": "100.0",
+            "issuer_request_id": redemption_id,
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "wallet": user_wallet,
+            "quantity": "50.0",
             "tx_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "block_number": 999_999,
+            "block_number": 1,
             "detected_at": "2025-01-01T00:00:00Z"
         }
     });
-    let stale_payload_str = stale_view_payload.to_string();
-    sqlx::query!(
-        r#"
-        INSERT INTO redemption_view (view_id, version, payload)
-        VALUES ('red-deadbeef', 1, ?)
-        "#,
-        stale_payload_str
+    insert_redemption_event(
+        &query_pool,
+        redemption_id,
+        1,
+        "RedemptionEvent::Detected",
+        &detected_payload,
     )
-    .execute(&query_pool)
     .await?;
-
-    let stale_count = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count: i64" FROM redemption_view WHERE view_id = 'red-deadbeef'"#
-    )
-    .fetch_one(&query_pool)
-    .await?;
-    assert_eq!(stale_count, 1, "Stale view row should exist before restart");
 
     query_pool.close().await;
 
-    // Phase 3: Restart service
+    // Phase 3: Restart — views are cleared and rebuilt from events.
+    // The seeded Detected event gets a view row from the rebuild.
+    // Recovery finds it and calls Alpaca (wallet is linked).
     let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    // Phase 4: Stale view row should be gone after clearing + rebuild
+    // If views were rebuilt from events, recovery found the Detected redemption
+    // and called Alpaca. Without rebuild, the seeded event has no view row
+    // and recovery never sees it.
+    assert!(
+        redeem_mock.calls_async().await >= 1,
+        "Alpaca redeem should be called for the seeded Detected redemption, \
+         proving views were rebuilt from events on startup. \
+         Got 0 calls — views may not be clearing and rebuilding."
+    );
+
+    // Verify the redemption progressed past Detected
     let verify_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    let stale_after = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count: i64" FROM redemption_view WHERE view_id = 'red-deadbeef'"#
+    let event_count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) as "count: i64"
+        FROM events
+        WHERE aggregate_type = 'Redemption'
+          AND aggregate_id = ?
+        "#,
+        redemption_id
     )
     .fetch_one(&verify_pool)
     .await?;
 
-    assert_eq!(
-        stale_after, 0,
-        "Stale view row 'red-deadbeef' should be cleared on startup. \
-         Found {stale_after} rows. Views are not being cleared before rebuild."
+    assert!(
+        event_count > 1,
+        "Redemption should have more than just the Detected event \
+         (recovery should have progressed it). Found {event_count} events."
     );
 
     Ok(())

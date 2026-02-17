@@ -1454,36 +1454,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mark_failed_from_failed_state_succeeds() {
+    #[test]
+    fn test_mark_failed_from_failed_state_succeeds() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let failed_at = Utc::now();
-
-        let redemption = Redemption::Failed {
-            issuer_request_id: issuer_request_id.clone(),
-            reason: "BurningFailed: original error".to_string(),
-            failed_at,
-        };
-
-        let vault_service: Arc<dyn VaultService> =
-            Arc::new(MockVaultService::new_success());
-
-        let events = redemption
-            .handle(
-                RedemptionCommand::MarkFailed {
-                    issuer_request_id: issuer_request_id.clone(),
-                    reason: "Auto-failed: insufficient balance".to_string(),
-                },
-                &vault_service,
-            )
-            .await;
-
-        assert!(
-            events.is_ok(),
-            "MarkFailed from Failed state should succeed, got {events:?}"
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = events.unwrap();
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number: 1,
+                    detected_at: Utc::now(),
+                },
+                RedemptionEvent::RedemptionFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: "BurningFailed: original error".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::MarkFailed {
+                issuer_request_id,
+                reason: "Auto-failed: insufficient balance".to_string(),
+            });
+
+        let events = validator.inspect_result().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],

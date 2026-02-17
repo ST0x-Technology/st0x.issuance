@@ -30,24 +30,23 @@ pub(crate) enum ReconcileError {
     Persistence(#[from] cqrs_es::persist::PersistenceError),
 }
 
-pub(crate) struct ReceiptReconciler<ProviderType, ReceiptInventoryStore>
+pub(crate) struct ReceiptReconciler<Node, ReceiptInventoryStore>
 where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
-    provider: ProviderType,
+    provider: Node,
     receipt_contract: Address,
     bot_wallet: Address,
     vault: Address,
     cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
 }
 
-impl<ProviderType, ReceiptInventoryStore>
-    ReceiptReconciler<ProviderType, ReceiptInventoryStore>
+impl<Node, ReceiptInventoryStore> ReceiptReconciler<Node, ReceiptInventoryStore>
 where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     pub(crate) const fn new(
-        provider: ProviderType,
+        provider: Node,
         receipt_contract: Address,
         bot_wallet: Address,
         vault: Address,
@@ -156,7 +155,7 @@ where
             return Ok(false);
         }
 
-        info!(
+        debug!(
             receipt_id = %receipt_id,
             aggregate_balance = %aggregate_balance,
             on_chain_balance = %on_chain_shares,
@@ -187,28 +186,53 @@ pub(crate) async fn run_startup_reconciliation<
     event_store: &ES,
     bot_wallet: Address,
 ) -> Result<(), ReconcileError> {
-    for &(vault, receipt_contract) in vault_receipt_contracts {
-        let result = ReceiptReconciler::new(
-            provider.clone(),
-            receipt_contract,
-            bot_wallet,
-            vault,
-            cqrs.clone(),
-        )
-        .reconcile(event_store)
-        .await?;
+    let results = stream::iter(vault_receipt_contracts.iter().copied())
+        .then(|(vault, receipt_contract)| {
+            let provider = provider.clone();
+            let cqrs = cqrs.clone();
+            async move {
+                let result = ReceiptReconciler::new(
+                    provider,
+                    receipt_contract,
+                    bot_wallet,
+                    vault,
+                    cqrs,
+                )
+                .reconcile(event_store)
+                .await;
 
-        if result.mismatches > 0 {
-            info!(
-                vault = %vault,
-                checked = result.checked,
-                mismatches = result.mismatches,
-                "Receipt reconciliation found mismatches"
-            );
-        }
-    }
+                (vault, receipt_contract, result)
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
 
-    Ok(())
+    let first_error =
+        results.into_iter().find_map(|(vault, receipt_contract, result)| {
+            match result {
+                Ok(result) if result.mismatches > 0 => {
+                    info!(
+                        vault = %vault,
+                        checked = result.checked,
+                        mismatches = result.mismatches,
+                        "Receipt reconciliation found mismatches"
+                    );
+                    None
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(
+                        vault = %vault,
+                        receipt_contract = %receipt_contract,
+                        error = %err,
+                        "Receipt reconciliation failed for vault"
+                    );
+                    Some(err)
+                }
+            }
+        });
+
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -350,8 +374,7 @@ mod tests {
         evm.grant_certify_role(evm.wallet_address).await.unwrap();
         evm.certify_vault(U256::MAX).await.unwrap();
 
-        let one_share = U256::from(10).pow(U256::from(18));
-        let deposit_amount = U256::from(50) * one_share;
+        let deposit_amount = uint!(50_000000000000000000_U256);
 
         let signer = alloy::signers::local::PrivateKeySigner::from_bytes(
             &evm.private_key,

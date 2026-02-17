@@ -46,8 +46,6 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
     }
 
     pub(crate) async fn recover_alpaca_called_redemptions(&self) {
-        debug!("Starting recovery of AlpacaCalled redemptions");
-
         let stuck_redemptions = match find_alpaca_called(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -57,7 +55,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         };
 
         if stuck_redemptions.is_empty() {
-            debug!("No AlpacaCalled redemptions to recover");
+            info!("No AlpacaCalled redemptions to recover");
             return;
         }
 
@@ -78,8 +76,6 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 );
             }
         }
-
-        debug!("Completed recovery of AlpacaCalled redemptions");
     }
 
     async fn recover_single_alpaca_called(

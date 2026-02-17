@@ -74,8 +74,8 @@ pub(crate) enum ReceiptMonitorError {
     MissingBlockNumber,
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
-    #[error("CQRS error: {0}")]
-    Cqrs(#[from] AggregateError<ReceiptInventoryError>),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<ReceiptInventoryError>),
     #[error("WebSocket stream ended unexpectedly")]
     StreamEnded,
 }
@@ -208,7 +208,7 @@ where
     /// When a withdrawal from the bot wallet is detected, queries the current
     /// on-chain balance and issues a ReconcileBalance command to correct any
     /// mismatch with the aggregate state.
-    pub(crate) async fn process_withdraw(
+    async fn process_withdraw(
         &self,
         log: &Log,
     ) -> Result<(), ReceiptMonitorError> {
@@ -333,7 +333,7 @@ mod tests {
         (cqrs, store)
     }
 
-    struct DepositLogParams {
+    struct VaultEventLogParams {
         vault: Address,
         sender: Address,
         owner: Address,
@@ -345,7 +345,7 @@ mod tests {
         block_number: u64,
     }
 
-    fn create_deposit_log(params: DepositLogParams) -> RpcLog {
+    fn create_deposit_log(params: VaultEventLogParams) -> RpcLog {
         let event = OffchainAssetReceiptVault::Deposit {
             sender: params.sender,
             owner: params.owner,
@@ -390,7 +390,7 @@ mod tests {
         let receipt_bytes =
             Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
 
-        let log = create_deposit_log(DepositLogParams {
+        let log = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: bot_wallet,
@@ -422,7 +422,7 @@ mod tests {
         let sender = address!("0x3333333333333333333333333333333333333333");
 
         // Create deposit for bot_wallet
-        let log_for_bot = create_deposit_log(DepositLogParams {
+        let log_for_bot = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: bot_wallet,
@@ -437,7 +437,7 @@ mod tests {
         });
 
         // Create deposit for other wallet
-        let log_for_other = create_deposit_log(DepositLogParams {
+        let log_for_other = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: other_wallet,
@@ -532,19 +532,7 @@ mod tests {
         assert_eq!(receipts.len(), 1);
     }
 
-    struct WithdrawLogParams {
-        vault: Address,
-        sender: Address,
-        owner: Address,
-        assets: U256,
-        shares: U256,
-        id: U256,
-        receipt_information: Bytes,
-        tx_hash: B256,
-        block_number: u64,
-    }
-
-    fn create_withdraw_log(params: WithdrawLogParams) -> RpcLog {
+    fn create_withdraw_log(params: VaultEventLogParams) -> RpcLog {
         let event = OffchainAssetReceiptVault::Withdraw {
             sender: params.sender,
             receiver: params.sender,
@@ -615,7 +603,7 @@ mod tests {
         let monitor =
             ReceiptMonitor::new(provider, config, cqrs.clone(), NoOpHandler);
 
-        let withdraw_log = create_withdraw_log(WithdrawLogParams {
+        let withdraw_log = create_withdraw_log(VaultEventLogParams {
             vault: evm.vault_address,
             sender: bot_wallet,
             owner: bot_wallet,
@@ -647,7 +635,7 @@ mod tests {
         let vault = address!("0x1111111111111111111111111111111111111111");
         let bot_wallet = address!("0x2222222222222222222222222222222222222222");
 
-        let log = create_withdraw_log(WithdrawLogParams {
+        let log = create_withdraw_log(VaultEventLogParams {
             vault,
             sender: bot_wallet,
             owner: bot_wallet,
@@ -677,7 +665,7 @@ mod tests {
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
 
-        let log_for_bot = create_withdraw_log(WithdrawLogParams {
+        let log_for_bot = create_withdraw_log(VaultEventLogParams {
             vault,
             sender: bot_wallet,
             owner: bot_wallet,
@@ -691,7 +679,7 @@ mod tests {
             block_number: 1000,
         });
 
-        let log_for_other = create_withdraw_log(WithdrawLogParams {
+        let log_for_other = create_withdraw_log(VaultEventLogParams {
             vault,
             sender: other_wallet,
             owner: other_wallet,

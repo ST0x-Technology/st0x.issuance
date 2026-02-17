@@ -35,8 +35,6 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     }
 
     pub(crate) async fn recover_detected_redemptions(&self) {
-        debug!("Starting recovery of Detected redemptions");
-
         let stuck_redemptions = match find_detected(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -46,7 +44,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         };
 
         if stuck_redemptions.is_empty() {
-            debug!("No Detected redemptions to recover");
+            info!("No Detected redemptions to recover");
             return;
         }
 
@@ -94,8 +92,6 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                 }
             }
         }
-
-        debug!("Completed recovery of Detected redemptions");
     }
 
     async fn recover_single_detected(
@@ -123,7 +119,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let network =
             self.lookup_network_for_asset(&metadata.underlying).await?;
 
-        info!(
+        debug!(
             issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
         );
@@ -327,6 +323,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
@@ -339,6 +336,7 @@ mod tests {
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionView, UnderlyingSymbol,
     };
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetView,
@@ -903,6 +901,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_recover_detected_missing_account_marks_failed() {
         let harness = TestHarness::new().await;
@@ -933,6 +932,11 @@ mod tests {
             "Expected Detected redemption with missing account to be auto-failed, \
              got {updated_aggregate:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Auto-failed Detected redemption", "no linked account"]
+        ));
     }
 
     #[tokio::test]

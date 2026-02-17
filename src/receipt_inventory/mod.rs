@@ -491,6 +491,9 @@ impl Aggregate for ReceiptInventory {
             } => {
                 if on_chain_balance.is_zero() {
                     self.receipts.remove(&receipt_id);
+                    self.itn_receipts.retain(|_, indexed_receipt_id| {
+                        *indexed_receipt_id != receipt_id
+                    });
                 } else if let Some(metadata) =
                     self.receipts.get_mut(&receipt_id)
                 {
@@ -500,6 +503,9 @@ impl Aggregate for ReceiptInventory {
 
             ReceiptInventoryEvent::Depleted { receipt_id } => {
                 self.receipts.remove(&receipt_id);
+                self.itn_receipts.retain(|_, indexed_receipt_id| {
+                    *indexed_receipt_id != receipt_id
+                });
             }
 
             ReceiptInventoryEvent::BackfillCheckpoint { block_number } => {
