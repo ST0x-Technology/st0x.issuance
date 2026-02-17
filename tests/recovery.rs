@@ -1194,17 +1194,18 @@ async fn test_detected_redemption_auto_failed_when_no_account()
     Ok(())
 }
 
-/// Tests that a redemption stuck in BurnFailed state with no receipt balance
-/// on-chain is auto-failed on startup, not retried infinitely.
+/// Tests that a redemption stuck in BurnFailed state with no on-chain share
+/// balance is auto-failed on startup, not retried infinitely.
 ///
 /// Scenario:
-/// 1. Complete a normal mint+redemption cycle (receipt is depleted)
-/// 2. Seed a NEW BurnFailed redemption that references the depleted receipt
-/// 3. Restart service
+/// 1. Start service to set up DB schema, seed asset and account
+/// 2. Seed a BurnFailed redemption directly in the event store
+/// 3. Restart service (bot has 0 shares on-chain — fresh Anvil)
 /// 4. Assert: redemption is auto-failed (RedemptionFailed event emitted)
 ///
-/// Without auto-failure, recovery retries the burn every startup, hitting
-/// "burn amount exceeds balance" and logging a warning forever.
+/// Without auto-failure, recovery checks on-chain balance, sees it's
+/// insufficient, logs "MANUAL INTERVENTION REQUIRED", and skips — repeating
+/// this warning on every startup forever.
 #[tokio::test]
 async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1225,7 +1226,7 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     let _mint_callback_mock = setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) = setup_redemption_mocks(&mock_alpaca);
 
-    // Phase 1: Complete a full mint+redemption cycle so the receipt is depleted
+    // Phase 1: Start service to set up DB schema, seed asset and account
     let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
@@ -1233,36 +1234,11 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     harness::seed_tokenized_asset(&client1, evm.vault_address).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
-    let link_body = harness::setup_account(&client1, user_wallet).await;
-
-    harness::perform_mint_and_confirm(
-        &client1,
-        user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-burning-test",
-        "50.0",
-    )
-    .await?;
-
-    let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
-        .wallet(user_wallet_instance)
-        .connect(&evm.endpoint)
-        .await?;
-    let vault = OffchainAssetReceiptVaultInstance::new(
-        evm.vault_address,
-        &user_provider,
-    );
-
-    let shares = harness::wait_for_shares(&vault, user_wallet).await?;
-
-    vault.transfer(bot_wallet, shares).send().await?.get_receipt().await?;
-
-    harness::wait_for_burn(&vault, bot_wallet).await?;
+    let _link_body = harness::setup_account(&client1, user_wallet).await;
 
     drop(client1);
 
-    // Phase 2: Seed a stuck BurnFailed redemption referencing the depleted receipt
+    // Phase 2: Seed a BurnFailed redemption directly in the event store
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
@@ -1337,7 +1313,8 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 
     query_pool.close().await;
 
-    // Phase 3: Restart service — recovery should auto-fail the stuck redemption
+    // Phase 3: Restart service — bot has 0 shares on fresh Anvil, so recovery
+    // should detect insufficient balance and auto-fail the stuck redemption
     let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
