@@ -942,6 +942,7 @@ async fn test_startup_clears_and_rebuilds_views()
     let client1 = rocket::local::asynchronous::Client::tracked(rocket1).await?;
 
     harness::seed_tokenized_asset(&client1, evm.vault_address).await;
+    harness::setup_account(&client1, user_wallet).await;
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
     drop(client1);
