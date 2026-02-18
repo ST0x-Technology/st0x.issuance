@@ -12,8 +12,7 @@ use super::{
 };
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
-    BurnPlan, BurnTrackingError, ReceiptId, ReceiptInventory,
-    ReceiptInventoryCommand, ReceiptInventoryError, ReceiptService, Shares,
+    BurnPlan, BurnTrackingError, ReceiptService, Shares,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
@@ -28,10 +27,9 @@ use crate::vault::{MultiBurnEntry, VaultError, VaultService};
 /// handler calls the vault service to perform the actual burn operation.
 ///
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
-pub(crate) struct BurnManager<RedemptionStore, ReceiptInventoryStore>
+pub(crate) struct BurnManager<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Used only for balance queries during recovery (not for burns - those go through aggregate)
     vault_service: Arc<dyn VaultService>,
@@ -39,16 +37,12 @@ where
     cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     store: Arc<RedemptionStore>,
     receipt_service: Arc<dyn ReceiptService>,
-    receipt_inventory_cqrs:
-        Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
     bot_wallet: Address,
 }
 
-impl<RedemptionStore, ReceiptInventoryStore>
-    BurnManager<RedemptionStore, ReceiptInventoryStore>
+impl<RedemptionStore> BurnManager<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Creates a new burn manager.
     ///
@@ -59,7 +53,6 @@ where
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
     /// * `store` - Event store for loading aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
-    /// * `receipt_inventory_cqrs` - CQRS framework for updating ReceiptInventory after burns
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
         vault_service: Arc<dyn VaultService>,
@@ -67,9 +60,6 @@ where
         cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
         store: Arc<RedemptionStore>,
         receipt_service: Arc<dyn ReceiptService>,
-        receipt_inventory_cqrs: Arc<
-            CqrsFramework<ReceiptInventory, ReceiptInventoryStore>,
-        >,
         bot_wallet: Address,
     ) -> Self {
         Self {
@@ -78,7 +68,6 @@ where
             cqrs,
             store,
             receipt_service,
-            receipt_inventory_cqrs,
             bot_wallet,
         }
     }
@@ -89,8 +78,6 @@ where
     /// the burn process for each. This handles cases where the bot crashed
     /// after Alpaca journal completion but before burn was executed.
     pub(crate) async fn recover_burning_redemptions(&self) {
-        debug!("Starting recovery of Burning redemptions");
-
         let stuck_redemptions = match find_burning(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -100,7 +87,7 @@ where
         };
 
         if stuck_redemptions.is_empty() {
-            debug!("No Burning redemptions to recover");
+            info!("No Burning redemptions to recover");
             return;
         }
 
@@ -120,8 +107,6 @@ where
                 );
             }
         }
-
-        debug!("Completed recovery of Burning redemptions");
     }
 
     /// Recovers redemptions stuck in the `BurnFailed` state at startup.
@@ -129,8 +114,6 @@ where
     /// Queries the view for all redemptions where burn failed and retries
     /// the burn process for each using metadata preserved in the view.
     pub(crate) async fn recover_burn_failed_redemptions(&self) {
-        debug!("Starting recovery of BurnFailed redemptions");
-
         let failed_redemptions = match find_burn_failed(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -140,7 +123,7 @@ where
         };
 
         if failed_redemptions.is_empty() {
-            debug!("No BurnFailed redemptions to recover");
+            info!("No BurnFailed redemptions to recover");
             return;
         }
 
@@ -160,8 +143,6 @@ where
                 );
             }
         }
-
-        debug!("Completed recovery of BurnFailed redemptions");
     }
 
     async fn recover_single_burn_failed(
@@ -207,16 +188,25 @@ where
             .await?;
 
         if on_chain_balance < total_shares {
-            warn!(
+            let reason = format!(
+                "On-chain balance insufficient for BurnFailed recovery: \
+                 balance={on_chain_balance}, required={total_shares}"
+            );
+
+            info!(
                 issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
-                burn_shares = %burn_shares,
-                dust_shares = %dust_shares,
                 total_shares = %total_shares,
-                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for BurnFailed recovery. \
-                 Burn likely already succeeded but was not recorded. \
-                 Skipping to avoid double-burning."
+                "Auto-failing BurnFailed redemption with insufficient on-chain balance"
             );
+
+            let command = RedemptionCommand::MarkFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason,
+            };
+
+            self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
+
             return Ok(());
         }
 
@@ -240,7 +230,7 @@ where
             })
             .collect();
 
-        info!(
+        debug!(
             issuer_request_id = %issuer_request_id,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
@@ -262,7 +252,7 @@ where
             )
             .await?;
 
-        info!(
+        debug!(
             issuer_request_id = %issuer_request_id,
             "Successfully retried burn"
         );
@@ -331,7 +321,7 @@ where
             return Ok(());
         }
 
-        info!(
+        debug!(
             issuer_request_id = %issuer_request_id,
             "Recovering Burning redemption - resuming burn"
         );
@@ -527,12 +517,6 @@ where
         vault: Address,
         plan: BurnPlan,
     ) -> Result<(), BurnManagerError> {
-        let inventory_updates: Vec<(ReceiptId, Shares)> = plan
-            .allocations
-            .iter()
-            .map(|alloc| (alloc.receipt.receipt_id, alloc.burn_amount))
-            .collect();
-
         let burns: Vec<MultiBurnEntry> = plan
             .allocations
             .into_iter()
@@ -564,13 +548,6 @@ where
                     "BurnTokens command executed successfully"
                 );
 
-                // Update ReceiptInventory to reflect burned shares
-                self.update_receipt_inventory_after_burn(
-                    vault,
-                    &inventory_updates,
-                )
-                .await;
-
                 Ok(())
             }
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
@@ -600,41 +577,6 @@ where
             Err(err) => Err(err.into()),
         }
     }
-
-    /// Updates the ReceiptInventory aggregate after a successful burn.
-    ///
-    /// Emits `BurnShares` commands for each receipt that was burned. Failures
-    /// are logged but don't fail the overall operation since the on-chain burn
-    /// already succeeded.
-    async fn update_receipt_inventory_after_burn(
-        &self,
-        vault: Address,
-        burns: &[(ReceiptId, Shares)],
-    ) {
-        let aggregate_id = vault.to_string();
-
-        for (receipt_id, amount) in burns {
-            if let Err(err) = self
-                .receipt_inventory_cqrs
-                .execute(
-                    &aggregate_id,
-                    ReceiptInventoryCommand::BurnShares {
-                        receipt_id: *receipt_id,
-                        amount: *amount,
-                    },
-                )
-                .await
-            {
-                warn!(
-                    vault = %vault,
-                    receipt_id = %receipt_id,
-                    amount = %amount,
-                    error = %err,
-                    "Failed to update ReceiptInventory after burn"
-                );
-            }
-        }
-    }
 }
 
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
@@ -656,8 +598,6 @@ pub(crate) enum BurnManagerError {
     Sqlx(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
-    #[error("Receipt inventory aggregate error: {0}")]
-    AggregateReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]
@@ -690,6 +630,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
     use crate::mint::IssuerMintRequestId;
@@ -700,6 +641,7 @@ mod tests {
     };
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionView;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
@@ -913,14 +855,7 @@ mod tests {
     async fn test_handle_burning_started_with_success() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -934,7 +869,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -996,7 +930,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1061,14 +994,7 @@ mod tests {
     async fn test_handle_burning_started_with_blockchain_failure() {
         let vault_mock = Arc::new(MockVaultService::new_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1082,7 +1008,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1129,14 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_burning_started_with_insufficient_balance() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1150,7 +1068,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1187,14 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_burning_started_with_wrong_state_fails() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1203,7 +1113,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1251,14 +1160,7 @@ mod tests {
     async fn test_complete_redemption_with_burn() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1272,7 +1174,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1312,14 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn test_partial_burn_receipt_remains_active() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying_symbol = UnderlyingSymbol::new("AAPL");
@@ -1333,7 +1227,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1413,14 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_depletes_receipt() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1434,7 +1320,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1470,86 +1355,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_burn_updates_receipt_inventory() {
-        let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
-
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
-        harness.add_asset(&underlying, vault).await;
-
-        let blockchain_service =
-            Arc::new(MockVaultService::new_success()) as Arc<dyn VaultService>;
-        let manager = BurnManager::new(
-            blockchain_service,
-            pool.clone(),
-            cqrs.clone(),
-            store.clone(),
-            receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
-            TEST_WALLET,
-        );
-
-        let issuer_request_id = IssuerRedemptionRequestId::random();
-        let receipt_id = uint!(99_U256);
-        let initial_balance = uint!(200_000000000000000000_U256);
-
-        harness.discover_receipt(vault, receipt_id, initial_balance).await;
-
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
-
-        let result = manager
-            .handle_burning_started(&issuer_request_id, &aggregate)
-            .await;
-
-        assert!(result.is_ok(), "Expected success, got error: {result:?}");
-
-        // Verify the receipt inventory was updated to reflect the burn.
-        // The redemption burns 100 shares (100_000000000000000000 in 18 decimals),
-        // so 100 should remain from the initial 200.
-        let inventory_store = SqliteEventRepository::new(pool.clone());
-        let inventory_event_store: PersistedEventStore<
-            SqliteEventRepository,
-            ReceiptInventory,
-        > = PersistedEventStore::new_event_store(inventory_store);
-
-        let context = inventory_event_store
-            .load_aggregate(&vault.to_string())
-            .await
-            .unwrap();
-        let receipts = context.aggregate().receipts_with_balance();
-
-        assert_eq!(receipts.len(), 1, "Expected 1 receipt remaining");
-        assert_eq!(
-            receipts[0].available_balance.inner(),
-            uint!(100_000000000000000000_U256),
-            "Expected 100 shares remaining after burning 100 from 200"
-        );
-    }
-
-    #[tokio::test]
     async fn test_burn_with_multiple_receipts() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1563,7 +1371,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1609,14 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn test_insufficient_balance_scenario() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1630,7 +1430,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1667,14 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_redemptions_empty() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
@@ -1683,7 +1475,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1694,14 +1485,7 @@ mod tests {
     async fn test_recover_burning_redemptions_with_valid_redemption() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1715,7 +1499,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1751,14 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_skips_when_balance_insufficient() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1777,7 +1553,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1813,14 +1588,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_skips_non_burning_state() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
@@ -1830,7 +1598,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1880,14 +1647,7 @@ mod tests {
     async fn test_recover_burn_failed_redemptions() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1900,7 +1660,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -1961,14 +1720,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burn_failed_skips_when_balance_insufficient() {
         let harness = setup_test_environment().await;
-        let TestHarness {
-            cqrs,
-            store,
-            receipt_service,
-            receipt_inventory_cqrs,
-            pool,
-            ..
-        } = &harness;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1987,7 +1739,6 @@ mod tests {
             cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
-            receipt_inventory_cqrs.clone(),
             TEST_WALLET,
         );
 
@@ -2040,5 +1791,75 @@ mod tests {
             matches!(updated_aggregate, Redemption::Failed { .. }),
             "Expected Failed state unchanged when balance insufficient, got {updated_aggregate:?}"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_burn_failed_marks_failed_when_balance_insufficient() {
+        let harness = setup_test_environment().await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        // Configure mock to return 0 balance (burn already happened on-chain)
+        let blockchain_service_mock = Arc::new(
+            MockVaultService::new_success().with_share_balance(uint!(0_U256)),
+        );
+        let blockchain_service =
+            blockchain_service_mock.clone() as Arc<dyn VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "ERC1155: burn amount exceeds balance".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        // Recovery should auto-fail (MarkFailed) instead of just skipping
+        manager.recover_burn_failed_redemptions().await;
+
+        // The aggregate should have a new RedemptionFailed event
+        // (from MarkFailed command, with reason about insufficient balance)
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::Failed { reason, .. } = &updated_aggregate else {
+            panic!("Expected Failed state, got {updated_aggregate:?}");
+        };
+
+        assert!(
+            reason.contains(
+                "On-chain balance insufficient for BurnFailed recovery"
+            ),
+            "Expected auto-fail reason about insufficient balance, got: {reason}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Auto-failing BurnFailed redemption",
+                "insufficient on-chain balance"
+            ]
+        ));
     }
 }

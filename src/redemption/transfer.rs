@@ -13,7 +13,6 @@ use super::{
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
-use crate::receipt_inventory::ReceiptInventory;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
@@ -140,35 +139,28 @@ where
 }
 
 /// Dependencies for driving the post-detection redemption flow.
-pub(crate) struct RedemptionFlowCtx<RedemptionStore, ReceiptInventoryStore>
+pub(crate) struct RedemptionFlowCtx<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     pub(crate) event_store: Arc<RedemptionStore>,
     pub(crate) redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     pub(crate) journal_manager: Arc<JournalManager<RedemptionStore>>,
-    pub(crate) burn_manager:
-        Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
+    pub(crate) burn_manager: Arc<BurnManager<RedemptionStore>>,
 }
 
 /// Drives the post-detection redemption flow: Alpaca call, journal polling,
 /// and burn. Errors are logged but do not propagate — the detection is already
 /// recorded.
-pub(crate) async fn drive_redemption_flow<
-    RedemptionStore,
-    ReceiptInventoryStore,
->(
+pub(crate) async fn drive_redemption_flow<RedemptionStore>(
     issuer_request_id: IssuerRedemptionRequestId,
     client_id: ClientId,
     alpaca_account: AlpacaAccountNumber,
     network: Network,
-    deps: RedemptionFlowCtx<RedemptionStore, ReceiptInventoryStore>,
+    deps: RedemptionFlowCtx<RedemptionStore>,
 ) where
     RedemptionStore: EventStore<Redemption> + 'static,
-    ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
     RedemptionStore::AC: Send,
-    ReceiptInventoryStore::AC: Send,
 {
     let aggregate_ctx = match deps
         .event_store

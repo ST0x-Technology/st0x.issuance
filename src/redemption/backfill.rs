@@ -18,7 +18,6 @@ use super::{
     },
 };
 use crate::bindings;
-use crate::receipt_inventory::ReceiptInventory;
 
 /// Backfills Transfer events on a single vault by scanning historic blocks.
 ///
@@ -26,23 +25,18 @@ use crate::receipt_inventory::ReceiptInventory;
 /// For each qualifying transfer (non-mint, from a whitelisted wallet), triggers
 /// the full redemption flow. Idempotent via `IssuerRedemptionRequestId` derived
 /// from the transaction hash — the Redemption aggregate rejects duplicates.
-pub(crate) struct TransferBackfiller<
-    ProviderType,
-    RedemptionStore,
-    ReceiptInventoryStore,
-> where
+pub(crate) struct TransferBackfiller<Node, RedemptionStore>
+where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
-    pub(crate) provider: ProviderType,
+    pub(crate) provider: Node,
     pub(crate) bot_wallet: Address,
     pub(crate) cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     pub(crate) event_store: Arc<RedemptionStore>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     pub(crate) journal_manager: Arc<JournalManager<RedemptionStore>>,
-    pub(crate) burn_manager:
-        Arc<BurnManager<RedemptionStore, ReceiptInventoryStore>>,
+    pub(crate) burn_manager: Arc<BurnManager<RedemptionStore>>,
 }
 
 #[derive(Debug)]
@@ -60,14 +54,11 @@ pub(crate) enum TransferBackfillError {
     TransferProcessing(#[from] TransferProcessingError),
 }
 
-impl<ProviderType, RedemptionStore, ReceiptInventoryStore>
-    TransferBackfiller<ProviderType, RedemptionStore, ReceiptInventoryStore>
+impl<Node, RedemptionStore> TransferBackfiller<Node, RedemptionStore>
 where
-    ProviderType: Provider + Clone + Send + Sync,
+    Node: Provider + Clone + Send + Sync,
     RedemptionStore: EventStore<Redemption> + 'static,
-    ReceiptInventoryStore: EventStore<ReceiptInventory> + 'static,
     RedemptionStore::AC: Send,
-    ReceiptInventoryStore::AC: Send,
 {
     /// Scans historic Transfer events to detect redemptions that occurred
     /// while the service was down.
@@ -238,20 +229,14 @@ mod tests {
     use crate::vault::mock::MockVaultService;
 
     type TestRedemptionStore = MemStore<Redemption>;
-    type TestReceiptInventoryStore = MemStore<ReceiptInventory>;
     type TestRedemptionCqrs =
         Arc<CqrsFramework<Redemption, TestRedemptionStore>>;
-    type TestReceiptInventoryCqrs =
-        Arc<CqrsFramework<ReceiptInventory, TestReceiptInventoryStore>>;
 
-    fn setup_test_cqrs() -> (
-        TestRedemptionCqrs,
-        Arc<TestRedemptionStore>,
-        Arc<dyn ReceiptService>,
-        TestReceiptInventoryCqrs,
-    ) {
+    fn setup_test_cqrs()
+    -> (TestRedemptionCqrs, Arc<TestRedemptionStore>, Arc<dyn ReceiptService>)
+    {
         let store = Arc::new(MemStore::default());
-        let receipt_inventory_store: Arc<TestReceiptInventoryStore> =
+        let receipt_inventory_store: Arc<MemStore<ReceiptInventory>> =
             Arc::new(MemStore::default());
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
@@ -268,9 +253,9 @@ mod tests {
         let receipt_service: Arc<dyn ReceiptService> =
             Arc::new(CqrsReceiptService::new(
                 receipt_inventory_store,
-                receipt_inventory_cqrs.clone(),
+                receipt_inventory_cqrs,
             ));
-        (cqrs, store, receipt_service, receipt_inventory_cqrs)
+        (cqrs, store, receipt_service)
     }
 
     async fn setup_and_run_backfill(
@@ -281,8 +266,7 @@ mod tests {
         from_block: u64,
     ) -> Result<super::TransferBackfillResult, super::TransferBackfillError>
     {
-        let (cqrs, store, receipt_service, receipt_inventory_cqrs) =
-            setup_test_cqrs();
+        let (cqrs, store, receipt_service) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, ap_wallet).await;
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
@@ -312,7 +296,6 @@ mod tests {
                 cqrs.clone(),
                 store.clone(),
                 receipt_service,
-                receipt_inventory_cqrs,
                 bot_wallet,
             ));
 

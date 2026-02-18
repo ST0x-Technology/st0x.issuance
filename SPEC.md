@@ -400,43 +400,68 @@ tokenization.
 ## Services
 
 Aggregates use services to interact with external systems while keeping business
-logic testable and isolated.
+logic testable and isolated. Services are injected into aggregate command
+handlers, making aggregates testable with mock services.
 
-**AlpacaService:**
+### AlpacaService
 
 - HTTP client for Alpaca API
 - Methods: `call_redeem_endpoint()`, `send_mint_callback()`,
   `poll_request_status()`
 - Handles authentication, retries, and error mapping
 
-**VaultService:**
+### VaultService
 
 - RPC client for on-chain vault interaction
 - Methods: `deposit()`, `withdraw()`
 - Two implementations: local key signing and Fireblocks
 
-**ReceiptService:**
+### ReceiptService
 
-- Tracks on-chain ERC-1155 receipts across all vaults for burn planning and mint
-  recovery
-- Backfills historic receipts by scanning Deposit events from a configurable
-  start block
-- Monitors new receipts in real time via event subscription
-- Plans multi-receipt burns: selects receipts in descending balance order and
-  allocates burn amounts across them
-- Methods:
-  - `register_minted_receipt()` - Registers a newly minted receipt immediately
-    (avoids waiting for backfill/monitor)
-  - `for_burn(vault, shares_to_burn, dust) -> BurnPlan` - Plans a burn across
-    multiple receipts, returning allocations (receipt_id, burn_amount) per
-    receipt
-  - `find_by_issuer_request_id(vault, id) -> Option<RecoveredReceipt>` - Looks
-    up a receipt by ITN issuer_request_id for mint recovery
-- Indexes ITN receipts by `issuer_request_id` to detect whether a mint succeeded
-  on-chain during recovery
+Tracks on-chain ERC-1155 receipts across all vaults for burn planning and mint
+recovery. Methods:
 
-These services are injected into aggregate command handlers, making aggregates
-testable with mock services.
+- `register_minted_receipt()` - Registers a receipt immediately after mint
+- `for_burn(vault, shares_to_burn, dust) -> BurnPlan` - Plans a multi-receipt
+  burn, selecting receipts in descending balance order
+- `find_by_issuer_request_id(vault, id) -> Option<RecoveredReceipt>` - Looks up
+  a receipt by ITN issuer_request_id for mint recovery
+
+Receipts enter the inventory through backfill (scanning historic Deposit events
+at startup from `last_backfilled_block`), live monitoring (WebSocket
+subscription to Deposit events at runtime), or direct registration after a mint.
+
+Receipts leave the inventory through reconciliation — querying
+`balanceOf(bot_wallet, receipt_id)` on-chain and emitting `BalanceDecreased`
+when on-chain < aggregate. Reconciliation is triggered by:
+
+- **Startup**: After receipt backfill, reconciles all receipts with positive
+  aggregate balance before transfer backfill begins
+- **Post-burn**: After every burn attempt (successful or failed), reconciles the
+  affected vault immediately
+- **Live monitoring**: WebSocket subscription to Withdraw events on each vault
+  contract. When a Withdraw event fires with `owner == bot_wallet`, reconciles
+  the specific receipt. This detects external burns (manual burns by
+  stakeholders) in real time, mirroring the Deposit event subscription for
+  receipt discovery
+
+#### ReceiptInventory Aggregate
+
+Commands:
+
+- `DiscoverReceipt` - Register a newly discovered receipt
+- `AdvanceBackfillCheckpoint` - Update the last backfilled block number
+- `ReconcileBalance { receipt_id, on_chain_balance }` - Correct aggregate
+  balance to match on-chain state. No-op if balances match or receipt unknown.
+  Errors if on-chain > aggregate (safety check)
+
+Events:
+
+- `Discovered` - Receipt discovered with initial balance
+- `BalanceDecreased { receipt_id, previous_balance, on_chain_balance }` -
+  Balance decreased (detected during reconciliation)
+- `Depleted` - Receipt fully consumed (balance reached zero)
+- `BackfillCheckpoint` - Backfill progress marker
 
 ## Core Functionality
 
@@ -1363,11 +1388,12 @@ struct BurnResult {
 stateDiagram-v2
     [*] --> Detected: DetectRedemption
     Detected --> AlpacaCalled: RecordAlpacaCall
-    Detected --> Failed: Error
+    Detected --> Failed: MarkFailed
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
-    AlpacaCalled --> Failed: RecordAlpacaFailure
+    AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> Completed: RecordBurnSuccess
-    Burning --> Failed: RecordBurnFailure
+    Burning --> Failed: RecordBurnFailure / MarkFailed
+    Failed --> Failed: MarkFailed (re-classify failure)
     Failed --> [*]
     Completed --> [*]
 ```
@@ -1469,11 +1495,14 @@ We call these Alpaca endpoints:
 1. **Journal Failed**: Mark mint as failed, do not mint tokens
 2. **Callback Failed**: Retry callback with exponential backoff, alert if
    persistent
-3. **Burn Failed**: Tokens stuck in redemption wallet, manual intervention
-   needed
-4. **Alpaca Redeem Failed**: Tokens in redemption wallet but no journal,
-   reconciliation required.
-
+3. **Burn Failed (insufficient balance)**: If the bot's on-chain share balance
+   is insufficient for a `Burning` redemption, the burn likely already succeeded
+   on-chain but wasn't recorded. Auto-fail via `MarkFailed` to prevent infinite
+   retries.
+4. **Alpaca Redeem Failed (AccountNotFound)**: Redemptions stuck in `Detected`
+   or `AlpacaCalled` state where the wallet has no linked account (e.g., old
+   wallet redemptions) are auto-failed via `MarkFailed`. The `Failed` state is
+   terminal — these operations are never retried.
 5. **Failed Mint with On-Chain Receipt**: When a mint is marked as
    `MintingFailed` but the on-chain transaction actually succeeded (e.g., the
    transaction was submitted but the service failed before confirming it), the
@@ -1482,6 +1511,31 @@ We call these Alpaca endpoints:
    existing receipt, transitions through `ExistingMintRecovered` ->
    `CallbackPending` -> `MintCompleted`, completing the flow without waiting for
    a service restart.
+6. **Receipt balance reconciliation**: At startup (after receipt backfill),
+   after every burn (both successful and failed), and on live Withdraw events,
+   the service reconciles each receipt's aggregate balance against its on-chain
+   `balanceOf`. If on-chain < aggregate, emits `BalanceDecreased` to correct the
+   inventory. This single mechanism handles all balance changes — burns by this
+   service, manual burns by stakeholders, or any other on-chain activity.
+7. **BurnFailed auto-fail**: Redemptions stuck in `BurnFailed` state (after a
+   `BurningFailed` event) are auto-failed via `MarkFailed` when recovery
+   determines they cannot be retried — either because the on-chain share balance
+   is insufficient (burn likely already succeeded) or because the receipt
+   inventory has insufficient balance. This prevents infinite retry loops where
+   the same unrecoverable redemption is attempted every startup.
+8. **Post-burn reconciliation**: After every burn attempt (both successful and
+   failed), receipt reconciliation is triggered immediately for the affected
+   vault. This is the primary mechanism for updating inventory after burns
+   performed by this service.
+9. **Live burn monitoring**: The receipt monitor subscribes to Withdraw events
+   on each vault contract via WebSocket. When a Withdraw event fires with
+   `owner == bot_wallet`, reconciliation is triggered for that receipt. This
+   detects external burns in real time, mirroring the Deposit event subscription
+   used for receipt discovery.
+
+**Startup view rebuild:** All view tables are cleared before replay on every
+startup, ensuring views are rebuilt cleanly from events and eliminating stale or
+corrupt view state.
 
 ## Database Schema
 

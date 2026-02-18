@@ -138,7 +138,7 @@ struct Env {
     #[arg(
         long,
         env = "BACKFILL_START_BLOCK",
-        default_value = "40588950",
+        default_value = "41704326",
         help = "Block number from which to start backfilling receipts"
     )]
     backfill_start_block: u64,

@@ -15,9 +15,9 @@ pub(crate) enum ReceiptInventoryCommand {
         source: ReceiptSource,
         receipt_info: Option<ReceiptInformation>,
     },
-    BurnShares {
+    ReconcileBalance {
         receipt_id: ReceiptId,
-        amount: Shares,
+        on_chain_balance: Shares,
     },
     AdvanceBackfillCheckpoint {
         block_number: u64,

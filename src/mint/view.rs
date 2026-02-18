@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use tracing::info;
 use uuid::Uuid;
 
 use super::{
@@ -31,6 +32,10 @@ pub(crate) enum MintViewError {
 /// This is used at startup to ensure the view is in sync with events after manual
 /// event store modifications or schema changes.
 pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
+    info!("Rebuilding mint view from events");
+
+    sqlx::query!("DELETE FROM mint_view").execute(&pool).await?;
+
     let view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
         pool.clone(),
         "mint_view".to_string(),
@@ -40,6 +45,8 @@ pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
     let event_repo = SqliteEventRepository::new(pool);
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
+
+    info!("Mint view rebuild complete");
 
     Ok(())
 }

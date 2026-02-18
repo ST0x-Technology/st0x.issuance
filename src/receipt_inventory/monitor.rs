@@ -74,8 +74,8 @@ pub(crate) enum ReceiptMonitorError {
     MissingBlockNumber,
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
-    #[error("CQRS error: {0}")]
-    Cqrs(AggregateError<ReceiptInventoryError>),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<ReceiptInventoryError>),
     #[error("WebSocket stream ended unexpectedly")]
     StreamEnded,
 }
@@ -126,23 +126,28 @@ where
         }
     }
 
-    /// Monitors for Deposit events once, subscribing and processing them.
+    /// Monitors for Deposit and Withdraw events, subscribing and processing them.
     async fn monitor_once(&self) -> Result<(), ReceiptMonitorError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(self.vault, &self.provider);
 
-        // Subscribe to all Deposit events on the vault.
+        // Subscribe to all Deposit and Withdraw events on the vault.
         // We filter by owner == bot_wallet client-side since owner is not indexed.
         let deposit_filter = vault_contract.Deposit_filter().filter;
+        let withdraw_filter = vault_contract.Withdraw_filter().filter;
 
         info!(
             vault = %self.vault,
             bot_wallet = %self.bot_wallet,
-            "Subscribing to Deposit events"
+            "Subscribing to Deposit and Withdraw events"
         );
 
         let deposit_sub = self.provider.subscribe_logs(&deposit_filter).await?;
+        let withdraw_sub =
+            self.provider.subscribe_logs(&withdraw_filter).await?;
+
         let mut deposit_stream = deposit_sub.into_stream();
+        let mut withdraw_stream = withdraw_sub.into_stream();
 
         info!("Receipt monitor WebSocket subscription active");
 
@@ -151,6 +156,11 @@ where
                 Some(log) = deposit_stream.next() => {
                     if let Err(err) = self.process_deposit(&log).await {
                         warn!("Failed to process Deposit: {err}");
+                    }
+                }
+                Some(log) = withdraw_stream.next() => {
+                    if let Err(err) = self.process_withdraw(&log).await {
+                        warn!("Failed to process Withdraw: {err}");
                     }
                 }
                 else => {
@@ -193,6 +203,59 @@ where
         .await
     }
 
+    /// Processes a Withdraw event by reconciling the receipt's on-chain balance.
+    ///
+    /// When a withdrawal from the bot wallet is detected, queries the current
+    /// on-chain balance and issues a ReconcileBalance command to correct any
+    /// mismatch with the aggregate state.
+    async fn process_withdraw(
+        &self,
+        log: &Log,
+    ) -> Result<(), ReceiptMonitorError> {
+        let event =
+            OffchainAssetReceiptVault::Withdraw::decode_log(&log.inner)?;
+
+        if event.owner != self.bot_wallet {
+            return Ok(());
+        }
+
+        let receipt_id = ReceiptId::from(event.id);
+
+        info!(
+            receipt_id = %receipt_id,
+            sender = %event.sender,
+            owner = %event.owner,
+            shares = %event.shares,
+            "Withdraw detected"
+        );
+
+        let receipt_contract =
+            Receipt::new(self.receipt_contract, &self.provider);
+
+        let on_chain_balance = receipt_contract
+            .balanceOf(self.bot_wallet, receipt_id.inner())
+            .call()
+            .await?;
+
+        self.cqrs
+            .execute(
+                &self.vault.to_string(),
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id,
+                    on_chain_balance: Shares::from(on_chain_balance),
+                },
+            )
+            .await?;
+
+        info!(
+            receipt_id = %receipt_id,
+            on_chain_balance = %on_chain_balance,
+            "Receipt balance reconciled after withdraw"
+        );
+
+        Ok(())
+    }
+
     /// Checks on-chain balance and emits DiscoverReceipt if balance > 0.
     async fn discover_receipt_if_has_balance(
         &self,
@@ -231,8 +294,7 @@ where
                     receipt_info,
                 },
             )
-            .await
-            .map_err(ReceiptMonitorError::Cqrs)?;
+            .await?;
 
         info!(
             receipt_id = %receipt_id,
@@ -253,12 +315,15 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, Bytes, U256, address, b256, uint};
+    use alloy::providers::ProviderBuilder;
     use alloy::rpc::types::Log as RpcLog;
     use alloy::sol_types::SolEvent;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{AggregateContext, CqrsFramework};
+    use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::{LocalEvm, logs_contain_at};
 
     type TestStore = MemStore<ReceiptInventory>;
     type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;
@@ -269,7 +334,7 @@ mod tests {
         (cqrs, store)
     }
 
-    struct DepositLogParams {
+    struct VaultEventLogParams {
         vault: Address,
         sender: Address,
         owner: Address,
@@ -281,7 +346,7 @@ mod tests {
         block_number: u64,
     }
 
-    fn create_deposit_log(params: DepositLogParams) -> RpcLog {
+    fn create_deposit_log(params: VaultEventLogParams) -> RpcLog {
         let event = OffchainAssetReceiptVault::Deposit {
             sender: params.sender,
             owner: params.owner,
@@ -326,7 +391,7 @@ mod tests {
         let receipt_bytes =
             Bytes::from(serde_json::to_vec(&receipt_info).unwrap());
 
-        let log = create_deposit_log(DepositLogParams {
+        let log = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: bot_wallet,
@@ -358,7 +423,7 @@ mod tests {
         let sender = address!("0x3333333333333333333333333333333333333333");
 
         // Create deposit for bot_wallet
-        let log_for_bot = create_deposit_log(DepositLogParams {
+        let log_for_bot = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: bot_wallet,
@@ -373,7 +438,7 @@ mod tests {
         });
 
         // Create deposit for other wallet
-        let log_for_other = create_deposit_log(DepositLogParams {
+        let log_for_other = create_deposit_log(VaultEventLogParams {
             vault,
             sender,
             owner: other_wallet,
@@ -466,5 +531,203 @@ mod tests {
         let receipts = context.aggregate().receipts_with_balance();
 
         assert_eq!(receipts.len(), 1);
+    }
+
+    fn create_withdraw_log(params: VaultEventLogParams) -> RpcLog {
+        let event = OffchainAssetReceiptVault::Withdraw {
+            sender: params.sender,
+            receiver: params.sender,
+            owner: params.owner,
+            assets: params.assets,
+            shares: params.shares,
+            id: params.id,
+            receiptInformation: params.receipt_information,
+        };
+
+        RpcLog {
+            inner: alloy::primitives::Log {
+                address: params.vault,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(b256!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )),
+            block_number: Some(params.block_number),
+            block_timestamp: None,
+            transaction_hash: Some(params.tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_withdraw_event_triggers_reconcile_balance() {
+        let evm = LocalEvm::new().await.unwrap();
+        let (cqrs, store) = setup_test_cqrs();
+        let bot_wallet = evm.wallet_address;
+
+        let provider =
+            ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+        let vault_contract =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider);
+        let receipt_contract =
+            Address::from(vault_contract.receipt().call().await.unwrap().0);
+
+        // Seed aggregate with a receipt that has 0 balance on-chain (never minted)
+        let receipt_id = ReceiptId::from(uint!(0xff_U256));
+        let stale_balance = Shares::from(uint!(100_000000000000000000_U256));
+
+        cqrs.execute(
+            &evm.vault_address.to_string(),
+            ReceiptInventoryCommand::DiscoverReceipt {
+                receipt_id,
+                balance: stale_balance,
+                block_number: 1,
+                tx_hash: b256!(
+                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                ),
+                source: ReceiptSource::External,
+                receipt_info: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = ReceiptMonitorConfig {
+            vault: evm.vault_address,
+            receipt_contract,
+            bot_wallet,
+        };
+
+        let monitor =
+            ReceiptMonitor::new(provider, config, cqrs.clone(), NoOpHandler);
+
+        let withdraw_log = create_withdraw_log(VaultEventLogParams {
+            vault: evm.vault_address,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: uint!(100_000000000000000000_U256),
+            shares: uint!(100_000000000000000000_U256),
+            id: uint!(0xff_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            ),
+            block_number: 100,
+        });
+
+        monitor.process_withdraw(&withdraw_log).await.unwrap();
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Withdraw detected", "receipt_id=255"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Receipt balance reconciled after withdraw",
+                "on_chain_balance=0"
+            ]
+        ));
+
+        // On-chain balance is 0 for this receipt (never minted on Anvil),
+        // so ReconcileBalance should deplete it
+        let context =
+            store.load_aggregate(&evm.vault_address.to_string()).await.unwrap();
+        let receipts = context.aggregate().receipts_with_balance();
+        assert!(
+            receipts.is_empty(),
+            "Receipt should be depleted after withdraw reconciliation"
+        );
+    }
+
+    #[test]
+    fn test_withdraw_event_decodes_correctly() {
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let log = create_withdraw_log(VaultEventLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: uint!(50_U256),
+            shares: uint!(50_U256),
+            id: uint!(7_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 500,
+        });
+
+        let event = OffchainAssetReceiptVault::Withdraw::decode_log(&log.inner)
+            .unwrap();
+
+        assert_eq!(event.sender, bot_wallet);
+        assert_eq!(event.owner, bot_wallet);
+        assert_eq!(event.id, uint!(7_U256));
+        assert_eq!(event.shares, uint!(50_U256));
+    }
+
+    #[test]
+    fn test_withdraw_event_filters_by_owner() {
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
+
+        let log_for_bot = create_withdraw_log(VaultEventLogParams {
+            vault,
+            sender: bot_wallet,
+            owner: bot_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(1_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 1000,
+        });
+
+        let log_for_other = create_withdraw_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(200_U256),
+            shares: uint!(200_U256),
+            id: uint!(2_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            block_number: 1001,
+        });
+
+        let event_for_bot =
+            OffchainAssetReceiptVault::Withdraw::decode_log(&log_for_bot.inner)
+                .unwrap();
+        let event_for_other = OffchainAssetReceiptVault::Withdraw::decode_log(
+            &log_for_other.inner,
+        )
+        .unwrap();
+
+        assert_eq!(event_for_bot.owner, bot_wallet);
+        assert!(event_for_other.owner != bot_wallet);
+    }
+
+    struct NoOpHandler;
+
+    #[async_trait]
+    impl ItnReceiptHandler for NoOpHandler {
+        async fn on_itn_receipt_discovered(
+            &self,
+            _issuer_request_id: IssuerMintRequestId,
+            _tx_hash: TxHash,
+        ) {
+        }
     }
 }

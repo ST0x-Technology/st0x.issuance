@@ -11,9 +11,10 @@ use sqlite_es::{
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::account::view::replay_account_view;
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
@@ -23,6 +24,7 @@ use crate::mint::{
     replay_mint_view,
 };
 use crate::receipt_inventory::backfill::ReceiptBackfiller;
+use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
@@ -104,12 +106,7 @@ struct MintDeps {
 struct RedemptionManagers {
     redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
     journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
-    burn: Arc<
-        BurnManager<
-            SqliteEventStore<Redemption>,
-            SqliteEventStore<ReceiptInventory>,
-        >,
-    >,
+    burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,9 +277,10 @@ pub async fn initialize_rocket(
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
-    // up-to-date views. Without this ordering, recovery might miss stuck
-    // operations if the view was deleted/corrupted.
-    info!("Replaying views to ensure schema updates are applied");
+    // up-to-date views. Each replay clears its view table first to remove
+    // stale/corrupt data, then rebuilds from the event store.
+    info!("Rebuilding all views from events");
+    replay_account_view(pool.clone()).await?;
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
@@ -299,6 +297,29 @@ pub async fn initialize_rocket(
         config.backfill_start_block,
     )
     .await?;
+
+    // Reconcile receipt balances with on-chain state after backfill. This detects
+    // external burns (manual burns by stakeholders) that the service didn't track.
+    let vault_receipt_pairs: Vec<_> = vault_configs
+        .iter()
+        .map(|config| (config.vault, config.receipt_contract))
+        .collect();
+
+    if let Err(error) = run_startup_reconciliation(
+        blockchain_setup.provider.clone(),
+        &vault_receipt_pairs,
+        &receipt_inventory.cqrs,
+        receipt_inventory.event_store.as_ref(),
+        bot_wallet,
+    )
+    .await
+    {
+        warn!(
+            error = %error,
+            "Startup reconciliation failed — receipt balances may be stale \
+             until the next withdraw event triggers reconciliation"
+        );
+    }
 
     // Transfer backfill must run after receipt backfill so that receipt inventory
     // is available for burn planning, and before live monitoring so that missed
@@ -564,7 +585,6 @@ fn setup_redemption_managers(
         redemption_cqrs.clone(),
         redemption_event_store.clone(),
         receipt_service,
-        receipt_inventory.cqrs.clone(),
         bot_wallet,
     ));
 
@@ -655,7 +675,7 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
         };
 
         if recoverable_mints.is_empty() {
-            debug!("No mints to recover");
+            info!("No mints to recover");
             return;
         }
 
@@ -664,8 +684,6 @@ fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
         for (issuer_request_id, _view) in recoverable_mints {
             recover_mint(&mint_cqrs, issuer_request_id).await;
         }
-
-        debug!("Completed mint recovery");
     });
 }
 
@@ -679,10 +697,7 @@ fn spawn_redemption_recovery(
         JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
     burn: Arc<
-        BurnManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-            PersistedEventStore<SqliteEventRepository, ReceiptInventory>,
-        >,
+        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
     >,
 ) {
     info!("Spawning redemption recovery task");
@@ -810,11 +825,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
 /// before live monitoring (to avoid missing transfers in the gap).
 async fn run_all_transfer_backfills<P: Provider + Clone>(
     vault_configs: &[VaultBackfillConfig],
-    backfiller: &TransferBackfiller<
-        P,
-        SqliteEventStore<Redemption>,
-        SqliteEventStore<ReceiptInventory>,
-    >,
+    backfiller: &TransferBackfiller<P, SqliteEventStore<Redemption>>,
     backfill_start_block: u64,
 ) -> Result<(), anyhow::Error> {
     if vault_configs.is_empty() {

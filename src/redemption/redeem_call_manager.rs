@@ -35,8 +35,6 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     }
 
     pub(crate) async fn recover_detected_redemptions(&self) {
-        debug!("Starting recovery of Detected redemptions");
-
         let stuck_redemptions = match find_detected(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -46,7 +44,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         };
 
         if stuck_redemptions.is_empty() {
-            debug!("No Detected redemptions to recover");
+            info!("No Detected redemptions to recover");
             return;
         }
 
@@ -55,19 +53,62 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             "Recovering stuck Detected redemptions"
         );
 
-        for (issuer_request_id, _view) in stuck_redemptions {
-            if let Err(err) =
-                self.recover_single_detected(&issuer_request_id).await
-            {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Failed to recover Detected redemption"
-                );
+        let mut recovered = 0u32;
+        let mut auto_failed = 0u32;
+        let mut failed = 0u32;
+
+        for (issuer_request_id, _view) in &stuck_redemptions {
+            match self.recover_single_detected(issuer_request_id).await {
+                Ok(()) => {
+                    recovered += 1;
+                }
+                Err(
+                    RedeemCallManagerError::AccountNotFound { .. }
+                    | RedeemCallManagerError::AccountNotLinked { .. },
+                ) => {
+                    let command = RedemptionCommand::MarkFailed {
+                        issuer_request_id: issuer_request_id.clone(),
+                        reason: "No linked account found for redemption wallet"
+                            .to_string(),
+                    };
+
+                    if let Err(err) = self
+                        .cqrs
+                        .execute(&issuer_request_id.to_string(), command)
+                        .await
+                    {
+                        debug!(
+                            issuer_request_id = %issuer_request_id,
+                            error = %err,
+                            "Failed to mark unrecoverable Detected redemption as failed"
+                        );
+                        failed += 1;
+                    } else {
+                        debug!(
+                            issuer_request_id = %issuer_request_id,
+                            "Auto-failed Detected redemption with no linked account"
+                        );
+                        auto_failed += 1;
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Failed to recover Detected redemption"
+                    );
+                    failed += 1;
+                }
             }
         }
 
-        debug!("Completed recovery of Detected redemptions");
+        info!(
+            total = stuck_redemptions.len(),
+            recovered,
+            auto_failed,
+            failed,
+            "Detected redemption recovery complete"
+        );
     }
 
     async fn recover_single_detected(
@@ -95,7 +136,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let network =
             self.lookup_network_for_asset(&metadata.underlying).await?;
 
-        info!(
+        debug!(
             issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
         );
@@ -299,6 +340,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
@@ -311,6 +353,7 @@ mod tests {
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionView, UnderlyingSymbol,
     };
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetView,
@@ -873,6 +916,48 @@ mod tests {
             ),
             "Expected AccountNotFound, got {result:?}"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_detected_missing_account_marks_failed() {
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let underlying = UnderlyingSymbol::new("AAPL");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+
+        // No account registered for this wallet — recovery should auto-fail
+        manager.recover_detected_redemptions().await;
+
+        let context = harness
+            .redemption_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let updated_aggregate = context.aggregate();
+        assert!(
+            matches!(updated_aggregate, Redemption::Failed { .. }),
+            "Expected Detected redemption with missing account to be auto-failed, \
+             got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Auto-failed Detected redemption", "no linked account"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Detected redemption recovery complete", "auto_failed=1"]
+        ));
     }
 
     #[tokio::test]
