@@ -653,25 +653,166 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use std::sync::LazyLock;
+
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use uuid::Uuid;
 
     use super::*;
+    use crate::fireblocks::config::parse_chain_asset_ids;
 
-    // ==================== Unit Tests for build_contract_call_request ====================
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    });
+
+    fn mock_client(server: &MockServer) -> Client {
+        ClientBuilder::new("test-api-user", &TEST_RSA_PEM)
+            .with_url(&server.base_url())
+            .build()
+            .unwrap()
+    }
+
+    fn build_test_service(
+        client: Client,
+    ) -> FireblocksVaultService<impl Provider + Clone + Send + Sync + 'static>
+    {
+        let chain_asset_ids =
+            parse_chain_asset_ids("8453:BASECHAIN_ETH").unwrap();
+
+        let read_provider = alloy::providers::RootProvider::new_http(
+            "http://localhost:1".parse().unwrap(),
+        );
+
+        FireblocksVaultService {
+            client,
+            vault_account_id: "0".to_string(),
+            chain_asset_ids,
+            read_provider,
+            chain_id: 8453,
+        }
+    }
+
+    fn mock_whitelisted_contracts<'a>(
+        server: &'a MockServer,
+        contract_address: &str,
+        asset_id: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([
+                    {
+                        "id": "contract-wallet-123",
+                        "name": "Test Vault",
+                        "assets": [
+                            {
+                                "id": asset_id,
+                                "address": contract_address
+                            }
+                        ]
+                    }
+                ]));
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_finds_whitelisted_contract() {
+        let contract = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        let mock = mock_whitelisted_contracts(
+            &server,
+            &contract.to_string().to_lowercase(),
+            "BASECHAIN_ETH",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let wallet_id =
+            service.resolve_contract_wallet(contract).await.unwrap();
+
+        assert_eq!(wallet_id.as_str(), "contract-wallet-123");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_rejects_unknown_contract() {
+        let contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        // Mock returns a wallet with a different address
+        let mock = mock_whitelisted_contracts(
+            &server,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "BASECHAIN_ETH",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service.resolve_contract_wallet(contract).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FireblocksVaultError::ContractNotWhitelisted { .. })
+            ),
+            "Expected ContractNotWhitelisted, got {result:?}"
+        );
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_rejects_wrong_asset_id() {
+        let contract = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        // Mock returns matching address but wrong asset ID
+        let mock = mock_whitelisted_contracts(
+            &server,
+            &contract.to_string().to_lowercase(),
+            "ETH_TEST",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service.resolve_contract_wallet(contract).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FireblocksVaultError::ContractNotWhitelisted { .. })
+            ),
+            "Expected ContractNotWhitelisted, got {result:?}"
+        );
+        mock.assert();
+    }
 
     #[test]
     fn build_contract_call_request_has_correct_structure() {
         let asset_id = "BASECHAIN_ETH";
         let vault_account_id = "0";
-        let contract_address = Address::ZERO;
+        let wallet_id = ContractWalletId::from("wallet-abc".to_string());
         let calldata = Bytes::from(vec![0x12, 0x34, 0x56, 0x78]);
         let note = "Test transaction";
 
         let request = build_contract_call_request(
             asset_id,
             vault_account_id,
-            contract_address,
+            &wallet_id,
             &calldata,
             note,
             "test-id",
@@ -697,21 +838,18 @@ mod tests {
         assert_eq!(source.id, Some(vault_account_id.to_string()));
 
         let dest = request.destination.as_ref().unwrap();
-        assert_eq!(dest.r#type, models::TransferPeerPathType::OneTimeAddress);
-        assert!(dest.one_time_address.is_some());
+        assert_eq!(dest.r#type, models::TransferPeerPathType::ExternalWallet);
+        assert_eq!(dest.id, Some("wallet-abc".to_string()));
+        assert!(dest.one_time_address.is_none());
     }
 
     #[test]
     fn build_contract_call_request_encodes_calldata_as_hex() {
         let calldata = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let wallet_id = ContractWalletId::from("w".to_string());
 
         let request = build_contract_call_request(
-            "ETH",
-            "0",
-            Address::ZERO,
-            &calldata,
-            "test",
-            "test-id",
+            "ETH", "0", &wallet_id, &calldata, "test", "test-id",
         );
 
         let extra = request.extra_parameters.unwrap();
@@ -719,59 +857,13 @@ mod tests {
     }
 
     #[test]
-    fn build_contract_call_request_formats_contract_address() {
-        let contract_address =
-            "0x1234567890123456789012345678901234567890".parse().unwrap();
-
-        let request = build_contract_call_request(
-            "ETH",
-            "0",
-            contract_address,
-            &Bytes::new(),
-            "test",
-            "test-id",
-        );
-
-        let dest = request.destination.unwrap();
-        let one_time = dest.one_time_address.unwrap();
-        assert!(
-            one_time
-                .address
-                .contains("0x1234567890123456789012345678901234567890")
-        );
-    }
-
-    #[test]
-    fn build_contract_call_request_uses_eip55_checksummed_address() {
-        // Address with letters to verify EIP-55 mixed-case checksumming
-        let contract_address =
-            address!("0xdead000000000000000000000000000000000000");
-
-        let request = build_contract_call_request(
-            "ETH",
-            "0",
-            contract_address,
-            &Bytes::new(),
-            "test",
-            "test-id",
-        );
-
-        let dest = request.destination.unwrap();
-        let one_time = dest.one_time_address.unwrap();
-        // EIP-55 checksum produces mixed-case "0xdEad" not lowercase "0xdead"
-        assert!(
-            one_time.address.contains("0xdEad"),
-            "Expected EIP-55 checksummed address, got: {}",
-            one_time.address
-        );
-    }
-
-    #[test]
     fn build_contract_call_request_uses_medium_fee_level() {
+        let wallet_id = ContractWalletId::from("w".to_string());
+
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            &wallet_id,
             &Bytes::new(),
             "test",
             "test-id",
