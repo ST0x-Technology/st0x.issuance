@@ -947,7 +947,7 @@ mod tests {
             .await;
 
         // No account registered for this wallet — recovery should auto-fail
-        manager.recover_detected_redemptions().await;
+        manager.recover_detected_redemptions(&underlying).await;
 
         let context = harness
             .redemption_store

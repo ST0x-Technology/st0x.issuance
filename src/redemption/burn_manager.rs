@@ -1868,7 +1868,7 @@ mod tests {
         .expect("Failed to record burn failure");
 
         // Recovery should auto-fail (MarkFailed) instead of just skipping
-        manager.recover_burn_failed_redemptions().await;
+        manager.recover_burn_failed_redemptions(&underlying).await;
 
         // The aggregate should have a new RedemptionFailed event
         // (from MarkFailed command, with reason about insufficient balance)

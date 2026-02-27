@@ -184,8 +184,7 @@ where
         );
 
         let deposit_sub = self.node.subscribe_logs(&deposit_filter).await?;
-        let withdraw_sub =
-            self.provider.subscribe_logs(&withdraw_filter).await?;
+        let withdraw_sub = self.node.subscribe_logs(&withdraw_filter).await?;
 
         let mut deposit_stream = deposit_sub.into_stream();
         let mut withdraw_stream = withdraw_sub.into_stream();
@@ -200,7 +199,7 @@ where
                     }
                 }
                 Some(log) = withdraw_stream.next() => {
-                    if let Err(err) = self.process_withdraw(&log).await {
+                    if let Err(err) = self.process_withdraw(&log, vault_ctx.vault, vault_ctx.receipt_contract).await {
                         warn!("Failed to process Withdraw: {err}");
                     }
                 }
@@ -256,6 +255,8 @@ where
     async fn process_withdraw(
         &self,
         log: &Log,
+        vault: Address,
+        receipt_contract: Address,
     ) -> Result<(), ReceiptMonitorError> {
         let event =
             OffchainAssetReceiptVault::Withdraw::decode_log(&log.inner)?;
@@ -274,8 +275,7 @@ where
             "Withdraw detected"
         );
 
-        let receipt_contract =
-            Receipt::new(self.receipt_contract, &self.provider);
+        let receipt_contract = Receipt::new(receipt_contract, &self.node);
 
         let on_chain_balance = receipt_contract
             .balanceOf(self.bot_wallet, receipt_id.inner())
@@ -284,7 +284,7 @@ where
 
         self.cqrs
             .execute(
-                &self.vault.to_string(),
+                &vault.to_string(),
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id,
                     on_chain_balance: Shares::from(on_chain_balance),
@@ -381,10 +381,12 @@ mod tests {
     use alloy::sol_types::SolEvent;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{AggregateContext, CqrsFramework};
+    use sqlx::sqlite::SqlitePoolOptions;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::test_utils::{LocalEvm, logs_contain_at};
+    use crate::tokenized_asset::UnderlyingSymbol;
 
     type TestStore = MemStore<ReceiptInventory>;
     type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;
@@ -657,10 +659,13 @@ mod tests {
         .await
         .unwrap();
 
-        let config = ReceiptMonitorConfig {
-            vault: evm.vault_address,
-            receipt_contract,
+        let pool =
+            SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+
+        let config = ReceiptMonitorCtx {
+            underlying: UnderlyingSymbol::new("AAPL"),
             bot_wallet,
+            pool,
         };
 
         let monitor =
@@ -680,7 +685,14 @@ mod tests {
             block_number: 100,
         });
 
-        monitor.process_withdraw(&withdraw_log).await.unwrap();
+        monitor
+            .process_withdraw(
+                &withdraw_log,
+                evm.vault_address,
+                receipt_contract,
+            )
+            .await
+            .unwrap();
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
@@ -780,6 +792,7 @@ mod tests {
         assert!(event_for_other.owner != bot_wallet);
     }
 
+    #[derive(Clone)]
     struct NoOpHandler;
 
     #[async_trait]
