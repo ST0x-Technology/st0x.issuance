@@ -172,6 +172,29 @@ pub(crate) enum VaultDiscoveryError {
     View(#[from] TokenizedAssetViewError),
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
+    #[error("Asset not found or disabled: {0}")]
+    AssetNotFound(UnderlyingSymbol),
+}
+
+/// Discovers a single vault's context by underlying symbol.
+///
+/// Loads the vault address from the tokenized asset view and queries the
+/// on-chain contract for the receipt contract address.
+pub(crate) async fn discover_vault(
+    pool: &Pool<Sqlite>,
+    provider: &DynProvider,
+    underlying: &UnderlyingSymbol,
+) -> Result<VaultCtx, VaultDiscoveryError> {
+    let vault =
+        find_vault_by_underlying(pool, underlying).await?.ok_or_else(|| {
+            VaultDiscoveryError::AssetNotFound(underlying.clone())
+        })?;
+
+    let vault_contract = OffchainAssetReceiptVault::new(vault, provider);
+    let receipt_contract =
+        Address::from(vault_contract.receipt().call().await?.0);
+
+    Ok(VaultCtx { underlying: underlying.clone(), vault, receipt_contract })
 }
 
 pub(crate) async fn discover_vaults(
@@ -538,5 +561,25 @@ mod tests {
             tracing::Level::INFO,
             &["View rebuild complete", "tokenized_asset_view"]
         ));
+    }
+
+    #[tokio::test]
+    async fn test_discover_vault_returns_asset_not_found_for_missing_underlying()
+     {
+        let harness = TestHarness::new().await;
+
+        let result = discover_vault(
+            &harness.pool,
+            &DynProvider::new(
+                alloy::providers::ProviderBuilder::new().connect_anvil(),
+            ),
+            &UnderlyingSymbol::new("NONEXISTENT"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(VaultDiscoveryError::AssetNotFound(ref underlying)) if underlying.0 == "NONEXISTENT"),
+            "Expected AssetNotFound error for missing underlying, got {result:?}"
+        );
     }
 }

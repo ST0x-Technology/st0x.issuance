@@ -321,11 +321,12 @@ instead.
 
 ### CRITICAL: Reading Views with GenericQuery
 
-**ALWAYS use `GenericQuery::load()` to read views. NEVER use raw SQL to parse
-JSON from view tables.**
+**Use `GenericQuery::load()` or `ViewRepository::load()` for loading a single
+view by ID or iterating all views. NEVER use raw SQL to deserialize full view
+payloads when `load()` would suffice.**
 
 ```rust
-// CORRECT - Use GenericQuery
+// CORRECT - Use GenericQuery / ViewRepository for single-view loads
 pub(crate) type MintViewQuery = GenericQuery<
     SqliteViewRepository<MintView, Mint>, MintView, Mint,
 >;
@@ -334,9 +335,16 @@ pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerMintRequestId) -
     query.load(&Mint::aggregate_id(id)).await
 }
 
-// FORBIDDEN - Raw SQL with JSON parsing bypasses type safety
-sqlx::query!(r#"SELECT json_extract(payload, '$.field') FROM view"#)
+// FORBIDDEN - Raw SQL deserializing full payload when load() would work
+sqlx::query!(r#"SELECT payload FROM mint_view WHERE view_id = ?"#)
 ```
+
+**When SQL-level filtering is needed** (e.g.,
+`WHERE json_extract(payload,
+'$.Asset.enabled') = 1`), raw SQL queries against
+view tables are valid. The alternative is to create a dedicated read model (with
+proper SQL columns, not JSON) that pre-filters the data so `load()` can be used
+directly.
 
 **For cross-aggregate queries** (e.g., "find all receipts for underlying X"):
 

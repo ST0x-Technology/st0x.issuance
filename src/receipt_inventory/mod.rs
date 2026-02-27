@@ -25,7 +25,7 @@ pub(crate) use burn_tracking::{
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 pub(crate) use monitor::{
-    ItnReceiptHandler, ReceiptMonitor, ReceiptMonitorConfig,
+    ItnReceiptHandler, ReceiptMonitor, ReceiptMonitorCtx,
 };
 pub(crate) use view::ReceiptInventoryView;
 

@@ -13,7 +13,7 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::fmt::Debug;
 use std::sync::Arc;
-use task_supervisor::{SupervisorBuilder, SupervisorHandle};
+use task_supervisor::SupervisorHandle;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
@@ -25,18 +25,17 @@ use crate::auth::FailedAuthRateLimiter;
 use crate::job::{Job, Label};
 use crate::mint::{
     Mint, MintServices, MintView,
-    recovery::{MintRecoveryCtx, MintRecoveryHandler, MintRecoveryJob},
+    recovery::{MintRecoveryCtx, MintRecoveryJob},
 };
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
-    ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
+    ReceiptInventoryView,
     backfill::{ReceiptBackfillCtx, ReceiptBackfillJob},
 };
 use crate::redemption::{
     Redemption, RedemptionRecoveryJob, RedemptionView,
     backfill::{TransferBackfillCtx, TransferBackfillJob},
     burn_manager::BurnManager,
-    detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
     upcaster::create_tokens_burned_upcaster,
@@ -105,6 +104,34 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Maximum time to wait for a single startup job before treating it as stuck.
 const STARTUP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
+enum JobStatus {
+    Completed,
+    Pending,
+}
+
+fn check_job_status(
+    label: &Label,
+    context: &apalis_sql::context::SqlContext,
+) -> Result<JobStatus, anyhow::Error> {
+    match context.status() {
+        State::Done => {
+            info!(job = %label, "Startup job completed");
+            Ok(JobStatus::Completed)
+        }
+        State::Failed => {
+            let error_msg = context
+                .last_error()
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
+            Err(anyhow::anyhow!("Startup job '{label}' failed: {error_msg}"))
+        }
+        State::Killed => {
+            Err(anyhow::anyhow!("Startup job '{label}' was killed"))
+        }
+        _ => Ok(JobStatus::Pending),
+    }
+}
+
 /// Pushes a job to the queue and polls until it completes.
 ///
 /// Returns `Ok(())` if the job reaches `Done` state, or `Err` if it fails,
@@ -114,7 +141,7 @@ async fn push_and_await<J: Job>(
     job: J,
 ) -> Result<(), anyhow::Error> {
     let label = job.label();
-    info!(job = %label, "Pushing startup job");
+    debug!(job = %label, "Pushing startup job");
     let parts = job_queue.push(job).await?;
     let task_id = parts.task_id;
     debug!(job = %label, %task_id, "Job queued, waiting for completion");
@@ -134,7 +161,7 @@ async fn push_all_and_await<J: Job>(
 
     for job in jobs {
         let label = job.label();
-        info!(job = %label, "Pushing startup job");
+        debug!(job = %label, "Pushing startup job");
         let parts = job_queue.push(job).await?;
         debug!(job = %label, task_id = %parts.task_id, "Job queued");
         pending.push((label, parts.task_id));
@@ -169,27 +196,9 @@ async fn push_all_and_await<J: Job>(
                 continue;
             };
 
-            match request.parts.context.status() {
-                State::Done => {
-                    info!(job = %label, "Startup job completed");
-                }
-                State::Failed => {
-                    let error_msg = request
-                        .parts
-                        .context
-                        .last_error()
-                        .clone()
-                        .unwrap_or_else(|| "unknown error".to_string());
-                    return Err(anyhow::anyhow!(
-                        "Startup job '{label}' failed: {error_msg}"
-                    ));
-                }
-                State::Killed => {
-                    return Err(anyhow::anyhow!(
-                        "Startup job '{label}' was killed"
-                    ));
-                }
-                _ => {
+            match check_job_status(&label, &request.parts.context)? {
+                JobStatus::Completed => {}
+                JobStatus::Pending => {
                     still_pending.push((label, task_id));
                 }
             }
@@ -222,28 +231,11 @@ async fn await_task<J: Job>(
             continue;
         };
 
-        match request.parts.context.status() {
-            State::Done => {
-                info!(job = %label, "Startup job completed");
-                return Ok(());
-            }
-            State::Failed => {
-                let error_msg = request
-                    .parts
-                    .context
-                    .last_error()
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string());
-                return Err(anyhow::anyhow!(
-                    "Startup job '{label}' failed: {error_msg}"
-                ));
-            }
-            State::Killed => {
-                return Err(anyhow::anyhow!(
-                    "Startup job '{label}' was killed"
-                ));
-            }
-            _ => {}
+        if matches!(
+            check_job_status(label, &request.parts.context)?,
+            JobStatus::Completed
+        ) {
+            return Ok(());
         }
     }
 }
@@ -416,17 +408,17 @@ pub async fn initialize_rocket(
     // migrations without `ignore_missing`. Instead, we get the apalis
     // migrator directly and run both with `ignore_missing`.
     sqlx::query("PRAGMA journal_mode = 'WAL'").execute(&pool).await?;
+    sqlx::query("PRAGMA busy_timeout = 5000").execute(&pool).await?;
+
     apalis_sql::sqlite::SqliteStorage::<()>::migrations()
         .set_ignore_missing(true)
         .run(&pool)
         .await?;
+
     sqlx::migrate!("./migrations").set_ignore_missing(true).run(&pool).await?;
 
-    let BasicCqrsSetup {
-        account_cqrs,
-        tokenized_asset_cqrs,
-        tokenized_asset_view_repo,
-    } = setup_basic_cqrs(&pool);
+    let BasicCqrsSetup { account_cqrs, tokenized_asset_view_repo } =
+        setup_basic_cqrs(&pool);
 
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
@@ -523,102 +515,92 @@ pub async fn initialize_rocket(
                 .build_fn(RedemptionRecoveryJob::run),
         );
 
-    let apalis_handle = AbortOnDrop(tokio::spawn(async move {
-        if let Err(err) = monitor.run().await {
-            error!(error = %err, "Startup job monitor failed");
+    let mut monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+    let startup_jobs = async {
+        // View replay — rebuild read models before recovery queries them
+        push_and_await(&mut view_replay_job_queue, ViewReplayJob).await?;
+
+        // Discover vaults and run per-vault backfills
+        let vault_ctxs =
+            discover_vaults(&pool, &blockchain_setup.provider).await?;
+
+        for vault_ctx in &vault_ctxs {
+            push_and_await(
+                &mut receipt_backfill_job_queue,
+                ReceiptBackfillJob {
+                    vault: vault_ctx.vault,
+                    receipt_contract: vault_ctx.receipt_contract,
+                },
+            )
+            .await?;
         }
-    }));
 
-    // View replay — rebuild read models before recovery queries them
-    push_and_await(&mut view_replay_job_queue, ViewReplayJob).await?;
+        for vault_ctx in &vault_ctxs {
+            push_and_await(
+                &mut transfer_backfill_job_queue,
+                TransferBackfillJob { vault: vault_ctx.vault },
+            )
+            .await?;
+        }
 
-    // Discover vaults and run per-vault backfills
-    let vault_ctxs = discover_vaults(&pool, &blockchain_setup.provider).await?;
+        // Recovery — runs after backfills for accurate state
+        push_and_await(&mut mint_recovery_job_queue, MintRecoveryJob).await?;
 
-    for vault_ctx in &vault_ctxs {
-        push_and_await(
-            &mut receipt_backfill_job_queue,
-            ReceiptBackfillJob {
-                vault: vault_ctx.vault,
-                receipt_contract: vault_ctx.receipt_contract,
+        push_all_and_await(
+            &mut redemption_recovery_job_queue,
+            vault_ctxs.iter().map(|vault_ctx| RedemptionRecoveryJob {
+                underlying: vault_ctx.underlying.clone(),
+            }),
+        )
+        .await?;
+
+        Ok::<_, anyhow::Error>(vault_ctxs)
+    };
+
+    let vault_ctxs = tokio::select! {
+        result = &mut monitor_handle => {
+            match result {
+                Ok(Err(err)) => return Err(anyhow::anyhow!(
+                    "Startup job monitor failed: {err}"
+                )),
+                Ok(Ok(())) => return Err(anyhow::anyhow!(
+                    "Startup job monitor exited unexpectedly during startup"
+                )),
+                Err(err) => return Err(anyhow::anyhow!(
+                    "Startup job monitor panicked: {err}"
+                )),
+            }
+        }
+        result = startup_jobs => result?,
+    };
+
+    let apalis_handle = AbortOnDrop(monitor_handle);
+
+    let (monitor_query, supervisor_handle) =
+        tokenized_asset::monitor_query::TokenizedAssetMonitorQuery::new(
+            tokenized_asset::monitor_query::MonitorQuerySetup {
+                rpc_url: config.rpc_url.clone(),
+                pool: pool.clone(),
+                bot_wallet,
+                vault_ctxs: &vault_ctxs,
+                provider: blockchain_setup.provider,
+                mint_cqrs: &mint.cqrs,
+                receipt_inventory_cqrs: receipt_inventory.cqrs,
+                redemption_cqrs: redemption_cqrs.clone(),
+                redemption_event_store,
+                managers,
+                receipt_backfill_job_queue,
+                transfer_backfill_job_queue,
             },
-        )
-        .await?;
-    }
-
-    for vault_ctx in &vault_ctxs {
-        push_and_await(
-            &mut transfer_backfill_job_queue,
-            TransferBackfillJob { vault: vault_ctx.vault },
-        )
-        .await?;
-    }
-
-    // Recovery — runs after backfills for accurate state
-    push_and_await(&mut mint_recovery_job_queue, MintRecoveryJob).await?;
-
-    push_all_and_await(
-        &mut redemption_recovery_job_queue,
-        vault_ctxs.iter().map(|vault_ctx| RedemptionRecoveryJob {
-            underlying: vault_ctx.underlying.clone(),
-        }),
-    )
-    .await?;
-
-    let mut supervisor_builder = SupervisorBuilder::new()
-        .with_unlimited_restarts()
-        .with_base_restart_delay(Duration::from_secs(5))
-        .with_health_check_interval(Duration::from_secs(60));
-
-    let itn_handler = MintRecoveryHandler::new(mint.cqrs.clone());
-
-    for vault_ctx in &vault_ctxs {
-        let monitor_config = ReceiptMonitorConfig {
-            vault: vault_ctx.vault,
-            receipt_contract: vault_ctx.receipt_contract,
-            bot_wallet,
-        };
-
-        let receipt_monitor = ReceiptMonitor::new(
-            blockchain_setup.provider.clone(),
-            monitor_config,
-            receipt_inventory.cqrs.clone(),
-            itn_handler.clone(),
         );
 
-        supervisor_builder = supervisor_builder.with_task(
-            &format!("receipt-monitor-{}", vault_ctx.vault),
-            receipt_monitor,
-        );
-
-        let detector_config = RedemptionDetectorConfig {
-            rpc_url: config.rpc_url.clone(),
-            vault: vault_ctx.vault,
-            bot_wallet,
-        };
-
-        let detector = RedemptionDetector::new(
-            detector_config,
-            redemption_cqrs.clone(),
-            redemption_event_store.clone(),
-            pool.clone(),
-            managers.redeem_call.clone(),
-            managers.journal.clone(),
-            managers.burn.clone(),
-        );
-
-        supervisor_builder = supervisor_builder.with_task(
-            &format!("redemption-detector-{}", vault_ctx.vault),
-            detector,
-        );
-    }
-
-    let supervisor = supervisor_builder.build();
-    let supervisor_handle = supervisor.run();
-
-    info!(
-        vault_count = vault_ctxs.len(),
-        "Task supervisor started with all monitors"
+    let tokenized_asset_query =
+        GenericQuery::new(tokenized_asset_view_repo.clone());
+    let tokenized_asset_cqrs = sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(tokenized_asset_query), Box::new(monitor_query)],
+        (),
     );
 
     Ok(build_rocket(RocketState {
@@ -645,7 +627,7 @@ struct RocketState {
     mint: MintCtx,
     redemption_cqrs: RedemptionCqrs,
     supervisor_handle: SupervisorHandle,
-    apalis_handle: AbortOnDrop<()>,
+    apalis_handle: AbortOnDrop<Result<(), std::io::Error>>,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -689,7 +671,6 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
 
 struct BasicCqrsSetup {
     account_cqrs: AccountCqrs,
-    tokenized_asset_cqrs: TokenizedAssetCqrs,
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
 }
 
@@ -708,16 +689,8 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
             pool.clone(),
             "tokenized_asset_view".to_string(),
         ));
-    let tokenized_asset_query =
-        GenericQuery::new(tokenized_asset_view_repo.clone());
-    let tokenized_asset_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    BasicCqrsSetup {
-        account_cqrs,
-        tokenized_asset_cqrs,
-        tokenized_asset_view_repo,
-    }
+    BasicCqrsSetup { account_cqrs, tokenized_asset_view_repo }
 }
 
 fn setup_aggregate_cqrs(
