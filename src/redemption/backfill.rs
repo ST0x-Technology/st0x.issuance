@@ -21,7 +21,6 @@ use super::{
 };
 use crate::bindings;
 use crate::job::{Job, Label};
-use crate::receipt_inventory::ReceiptInventory;
 use crate::{RedemptionCqrs, RedemptionEventStore, RedemptionManagers};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

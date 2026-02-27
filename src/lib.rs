@@ -16,9 +16,8 @@ use std::sync::Arc;
 use task_supervisor::SupervisorHandle;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use crate::account::view::replay_account_view;
 use crate::account::{Account, AccountView};
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;

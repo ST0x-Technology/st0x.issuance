@@ -58,11 +58,9 @@ where
     burn_manager: Arc<BurnManager<RedemptionStore>>,
 }
 
-impl<RedemptionStore, ReceiptInventoryStore> Clone
-    for RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+impl<RedemptionStore> Clone for RedemptionDetector<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     fn clone(&self) -> Self {
         Self {
@@ -227,13 +225,10 @@ where
 }
 
 #[async_trait]
-impl<RedemptionStore, ReceiptInventoryStore> SupervisedTask
-    for RedemptionDetector<RedemptionStore, ReceiptInventoryStore>
+impl<RedemptionStore> SupervisedTask for RedemptionDetector<RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption> + Send + Sync + 'static,
-    ReceiptInventoryStore: EventStore<ReceiptInventory> + Send + Sync + 'static,
     RedemptionStore::AC: Send,
-    ReceiptInventoryStore::AC: Send,
 {
     async fn run(&mut self) -> TaskResult {
         self.run_monitor().await;
