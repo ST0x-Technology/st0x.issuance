@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use fireblocks_sdk::apis::transactions_api::{
     CreateTransactionError, CreateTransactionParams,
 };
+use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::{debug, warn};
 
 use super::config::{
-    AssetId, ChainAssetIds, Environment, FireblocksConfig,
+    AssetId, ChainAssetIds, ContractWalletId, Environment, FireblocksConfig,
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
@@ -51,6 +52,10 @@ pub(crate) enum FireblocksVaultError {
         #[source]
         source: alloy::hex::FromHexError,
     },
+    #[error("Fireblocks contracts API error: {0}")]
+    ContractsApi(#[from] fireblocks_sdk::apis::Error<GetContractsError>),
+    #[error("contract {contract} is not whitelisted in Fireblocks")]
+    ContractNotWhitelisted { contract: Address },
     #[error("no asset ID configured for chain {chain_id}")]
     UnknownChain { chain_id: u64 },
     #[error("transaction {tx_hash} has no receipt after confirmation")]
@@ -146,6 +151,19 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         })
     }
 
+    /// Resolves a contract address to its Fireblocks whitelisted wallet ID.
+    ///
+    /// Queries Fireblocks' `GET /contracts` API and finds the wallet whose
+    /// asset entry matches both the configured chain asset ID and the given
+    /// contract address. This ensures transactions go through TAP policy
+    /// controls instead of bypassing them with `OneTimeAddress`.
+    async fn resolve_contract_wallet(
+        &self,
+        contract: Address,
+    ) -> Result<ContractWalletId, FireblocksVaultError> {
+        todo!()
+    }
+
     /// Submits a CONTRACT_CALL transaction to Fireblocks.
     ///
     /// # Arguments
@@ -169,10 +187,12 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
         )?;
 
+        let wallet_id = self.resolve_contract_wallet(contract_address).await?;
+
         let tx_request = build_contract_call_request(
             asset_id.as_str(),
             &self.vault_account_id,
-            contract_address,
+            &wallet_id,
             calldata,
             note,
             external_tx_id,
@@ -278,10 +298,13 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
 }
 
 /// Builds a Fireblocks CONTRACT_CALL transaction request.
+///
+/// Uses `ExternalWallet` destination type with the resolved whitelisted
+/// contract wallet ID, enabling Fireblocks TAP policy enforcement.
 fn build_contract_call_request(
     asset_id: &str,
     vault_account_id: &str,
-    contract_address: Address,
+    wallet_id: &ContractWalletId,
     calldata: &Bytes,
     note: &str,
     external_tx_id: &str,
@@ -306,12 +329,10 @@ fn build_contract_call_request(
             is_collateral: None,
         }),
         destination: Some(models::DestinationTransferPeerPath {
-            r#type: models::TransferPeerPathType::OneTimeAddress,
-            one_time_address: Some(models::OneTimeAddress::new(
-                contract_address.to_string(),
-            )),
+            r#type: models::TransferPeerPathType::ExternalWallet,
+            id: Some(wallet_id.as_str().to_string()),
+            one_time_address: None,
             sub_type: None,
-            id: None,
             name: None,
             wallet_id: None,
             is_collateral: None,
