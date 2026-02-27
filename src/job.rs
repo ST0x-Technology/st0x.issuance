@@ -1,6 +1,6 @@
 use apalis::prelude::Data;
 use serde::{Serialize, de::DeserializeOwned};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 
 pub(crate) trait Job:
     Serialize + DeserializeOwned + Send + Sync + Unpin + Debug + 'static
@@ -21,8 +21,8 @@ impl Label {
     }
 }
 
-impl std::fmt::Display for Label {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl Display for Label {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        write!(formatter, "{}", self.0)
     }
 }

@@ -6,6 +6,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
+use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{info, warn};
@@ -16,13 +17,20 @@ use super::{
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::IssuerMintRequestId;
+use crate::tokenized_asset::UnderlyingSymbol;
 
 /// Configuration parameters for the receipt monitor.
-#[derive(Clone, Copy)]
-pub(crate) struct ReceiptMonitorConfig {
-    pub(crate) vault: Address,
-    pub(crate) receipt_contract: Address,
+#[derive(Clone)]
+pub(crate) struct ReceiptMonitorCtx {
+    pub(crate) underlying: UnderlyingSymbol,
     pub(crate) bot_wallet: Address,
+    pub(crate) pool: Pool<Sqlite>,
+}
+
+impl ReceiptMonitorCtx {
+    pub(crate) fn task_name(&self) -> String {
+        format!("receipt-monitor-{}", self.underlying)
+    }
 }
 
 /// Called when the receipt monitor discovers an ITN receipt (a receipt
@@ -56,9 +64,9 @@ where
     Handler: ItnReceiptHandler + Clone,
 {
     node: Node,
-    vault: Address,
-    receipt_contract: Address,
+    underlying: UnderlyingSymbol,
     bot_wallet: Address,
+    pool: Pool<Sqlite>,
     cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
     handler: Handler,
 }
@@ -73,9 +81,9 @@ where
     fn clone(&self) -> Self {
         Self {
             node: self.node.clone(),
-            vault: self.vault,
-            receipt_contract: self.receipt_contract,
+            underlying: self.underlying.clone(),
             bot_wallet: self.bot_wallet,
+            pool: self.pool.clone(),
             cqrs: self.cqrs.clone(),
             handler: self.handler.clone(),
         }
@@ -96,6 +104,8 @@ pub(crate) enum ReceiptMonitorError {
     ContractCall(#[from] alloy::contract::Error),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<ReceiptInventoryError>),
+    #[error("Vault discovery error: {0}")]
+    VaultDiscovery(#[from] crate::tokenized_asset::view::VaultDiscoveryError),
     #[error("WebSocket stream ended unexpectedly")]
     StreamEnded,
 }
@@ -107,17 +117,17 @@ where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
     Handler: ItnReceiptHandler + Clone,
 {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         node: Node,
-        config: ReceiptMonitorConfig,
+        ctx: ReceiptMonitorCtx,
         cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
         handler: Handler,
     ) -> Self {
         Self {
             node,
-            vault: config.vault,
-            receipt_contract: config.receipt_contract,
-            bot_wallet: config.bot_wallet,
+            underlying: ctx.underlying,
+            bot_wallet: ctx.bot_wallet,
+            pool: ctx.pool,
             cqrs,
             handler,
         }
@@ -147,9 +157,19 @@ where
     }
 
     /// Monitors for Deposit and Withdraw events, subscribing and processing them.
+    ///
+    /// Looks up current vault details from the tokenized asset view at the
+    /// start of each cycle, so restarts automatically pick up address changes.
     async fn monitor_once(&self) -> Result<(), ReceiptMonitorError> {
+        let vault_ctx = crate::tokenized_asset::discover_vault(
+            &self.pool,
+            &self.node.root().clone().erased(),
+            &self.underlying,
+        )
+        .await?;
+
         let vault_contract =
-            OffchainAssetReceiptVault::new(self.vault, &self.node);
+            OffchainAssetReceiptVault::new(vault_ctx.vault, &self.node);
 
         // Subscribe to all Deposit and Withdraw events on the vault.
         // We filter by owner == bot_wallet client-side since owner is not indexed.
@@ -157,7 +177,8 @@ where
         let withdraw_filter = vault_contract.Withdraw_filter().filter;
 
         info!(
-            vault = %self.vault,
+            underlying = %self.underlying,
+            vault = %vault_ctx.vault,
             bot_wallet = %self.bot_wallet,
             "Subscribing to Deposit and Withdraw events"
         );
@@ -174,7 +195,7 @@ where
         loop {
             tokio::select! {
                 Some(log) = deposit_stream.next() => {
-                    if let Err(err) = self.process_deposit(&log).await {
+                    if let Err(err) = self.process_deposit(&log, vault_ctx.vault, vault_ctx.receipt_contract).await {
                         warn!("Failed to process Deposit: {err}");
                     }
                 }
@@ -194,6 +215,8 @@ where
     async fn process_deposit(
         &self,
         log: &Log,
+        vault: Address,
+        receipt_contract: Address,
     ) -> Result<(), ReceiptMonitorError> {
         let event = OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)?;
         let tx_hash =
@@ -219,6 +242,8 @@ where
             tx_hash,
             block_number,
             event.receiptInformation.clone(),
+            vault,
+            receipt_contract,
         )
         .await
     }
@@ -283,8 +308,10 @@ where
         tx_hash: B256,
         block_number: u64,
         receipt_information: Bytes,
+        vault: Address,
+        receipt_contract_addr: Address,
     ) -> Result<(), ReceiptMonitorError> {
-        let receipt_contract = Receipt::new(self.receipt_contract, &self.node);
+        let receipt_contract = Receipt::new(receipt_contract_addr, &self.node);
 
         let current_balance = receipt_contract
             .balanceOf(self.bot_wallet, receipt_id.inner())
@@ -303,7 +330,7 @@ where
 
         self.cqrs
             .execute(
-                &self.vault.to_string(),
+                &vault.to_string(),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id,
                     balance: Shares::from(current_balance),

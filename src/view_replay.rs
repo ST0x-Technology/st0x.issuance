@@ -1,6 +1,7 @@
 use apalis::prelude::Data;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use tokio::time::Instant;
 use tracing::info;
 
 use crate::account::view::{AccountViewError, replay_account_view};
@@ -29,8 +30,15 @@ impl Job for ViewReplayJob {
         self,
         pool: Data<Pool<Sqlite>>,
     ) -> Result<(), ViewReplayError> {
-        info!("Replaying views to ensure schema updates are applied");
+        let views = "tokenized_asset, mint, redemption, receipt_burns";
 
+        info!(
+            job = "view-replay",
+            views = %views,
+            "Replaying views"
+        );
+
+        let start = Instant::now();
         let pool: Pool<Sqlite> = (*pool).clone();
 
         replay_account_view(pool.clone()).await?;
@@ -39,7 +47,12 @@ impl Job for ViewReplayJob {
         replay_redemption_view(pool.clone()).await?;
         replay_receipt_burns_view(pool).await?;
 
-        info!("View replay complete");
+        info!(
+            job = "view-replay",
+            views = %views,
+            duration_ms = start.elapsed().as_millis(),
+            "View replay complete"
+        );
 
         Ok(())
     }

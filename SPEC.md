@@ -1832,8 +1832,11 @@ METRICS_PORT=9090
 ### Startup Job Orchestration
 
 The service uses **apalis** (0.7.4, SQLite backend) for one-shot startup jobs
-that must complete before the service begins handling requests. Each job is
-pushed and awaited sequentially via `push_and_await`:
+that must complete before the service begins handling requests. The startup
+sequence is raced against the apalis monitor via `tokio::select!` — if the
+monitor dies, startup fails immediately instead of hanging.
+
+Jobs are pushed and awaited **sequentially** via `push_and_await`:
 
 1. `ViewReplayJob` — replays mint, redemption, and receipt_burns views so read
    models reflect the current event store
@@ -1842,8 +1845,12 @@ pushed and awaited sequentially via `push_and_await`:
    transfers. Runs after all receipt backfills because transfer detection
    depends on receipt inventory being populated.
 4. `MintRecoveryJob` — recovers stuck mints
-5. `RedemptionRecoveryJob` (one per vault, concurrent) — recovers stuck
-   redemptions for each vault
+
+Per-vault `RedemptionRecoveryJob` instances are pushed **concurrently** via
+`push_all_and_await` — all jobs are enqueued first, then polled together in a
+single loop:
+
+5. `RedemptionRecoveryJob` (one per vault) — recovers stuck redemptions
 
 Any failure aborts startup — the service will not accept requests until all jobs
 succeed. All jobs are idempotent, so restarting the service retries from the
@@ -1852,3 +1859,33 @@ beginning safely.
 **Not on apalis:** Continuous monitors (receipt monitors, redemption detectors)
 run as supervised tasks via `task-supervisor`, which restarts them on crash. See
 [docs/orchestration.md](docs/orchestration.md) for the two-layer architecture.
+
+### Runtime Reactions to Asset Changes
+
+At startup, the service discovers all enabled vaults and spawns backfill jobs
+and continuous monitors for each. When a tokenized asset is added or updated at
+runtime (via `POST /tokenized-assets`), the service reacts without requiring a
+restart:
+
+**New asset (`AddAsset` produces `AssetAdded`):**
+
+After the CQRS command succeeds, the endpoint:
+
+1. Pushes `ReceiptBackfillJob` and `TransferBackfillJob` for the new vault
+2. Adds a receipt monitor and redemption detector to the task supervisor via
+   `add_task()`
+
+This ensures the new vault is fully monitored immediately.
+
+**Vault address change (`AddAsset` produces `VaultAddressUpdated`):**
+
+After the CQRS command succeeds, the endpoint:
+
+1. Restarts the receipt monitor and redemption detector for that underlying via
+   `restart()` on the supervisor handle
+
+Monitors load vault details from the tokenized asset view at the start of each
+`run()` cycle, so restarting them causes them to pick up the new vault address
+automatically. Monitor names are keyed by underlying symbol (e.g.,
+`receipt-monitor-AAPL`, `redemption-detector-AAPL`) so restarts target the
+correct monitors regardless of address changes.
