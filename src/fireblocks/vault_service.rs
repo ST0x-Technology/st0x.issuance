@@ -161,7 +161,33 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         &self,
         contract: Address,
     ) -> Result<ContractWalletId, FireblocksVaultError> {
-        todo!()
+        let contract_address = contract.to_string().to_lowercase();
+        let asset_id = self.chain_asset_ids.get(self.chain_id).ok_or(
+            FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
+        )?;
+        let expected_asset_id = asset_id.as_str();
+
+        self.client
+            .wallet_contract_api()
+            .get_contracts()
+            .await?
+            .into_iter()
+            .find_map(|wallet| {
+                wallet
+                    .assets
+                    .iter()
+                    .any(|asset| {
+                        asset
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| id == expected_asset_id)
+                            && asset.address.as_ref().is_some_and(|addr| {
+                                addr.to_lowercase() == contract_address
+                            })
+                    })
+                    .then_some(ContractWalletId::from(wallet.id))
+            })
+            .ok_or(FireblocksVaultError::ContractNotWhitelisted { contract })
     }
 
     /// Submits a CONTRACT_CALL transaction to Fireblocks.
