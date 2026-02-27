@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use fireblocks_sdk::apis::transactions_api::{
     CreateTransactionError, CreateTransactionParams,
 };
+use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionStatus};
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::{debug, warn};
 
 use super::config::{
-    AssetId, ChainAssetIds, Environment, FireblocksConfig,
+    AssetId, ChainAssetIds, ContractWalletId, Environment, FireblocksConfig,
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
@@ -51,6 +52,10 @@ pub(crate) enum FireblocksVaultError {
         #[source]
         source: alloy::hex::FromHexError,
     },
+    #[error("Fireblocks contracts API error: {0}")]
+    ContractsApi(#[from] fireblocks_sdk::apis::Error<GetContractsError>),
+    #[error("contract {contract} is not whitelisted in Fireblocks")]
+    ContractNotWhitelisted { contract: Address },
     #[error("no asset ID configured for chain {chain_id}")]
     UnknownChain { chain_id: u64 },
     #[error("transaction {tx_hash} has no receipt after confirmation")]
@@ -146,6 +151,45 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         })
     }
 
+    /// Resolves a contract address to its Fireblocks whitelisted wallet ID.
+    ///
+    /// Queries Fireblocks' `GET /contracts` API and finds the wallet whose
+    /// asset entry matches both the configured chain asset ID and the given
+    /// contract address. This ensures transactions go through TAP policy
+    /// controls instead of bypassing them with `OneTimeAddress`.
+    async fn resolve_contract_wallet(
+        &self,
+        contract: Address,
+    ) -> Result<ContractWalletId, FireblocksVaultError> {
+        let contract_address = contract.to_string().to_lowercase();
+        let asset_id = self.chain_asset_ids.get(self.chain_id).ok_or(
+            FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
+        )?;
+        let expected_asset_id = asset_id.as_str();
+
+        self.client
+            .wallet_contract_api()
+            .get_contracts()
+            .await?
+            .into_iter()
+            .find_map(|wallet| {
+                wallet
+                    .assets
+                    .iter()
+                    .any(|asset| {
+                        asset
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| id == expected_asset_id)
+                            && asset.address.as_ref().is_some_and(|addr| {
+                                addr.to_lowercase() == contract_address
+                            })
+                    })
+                    .then_some(ContractWalletId::from(wallet.id))
+            })
+            .ok_or(FireblocksVaultError::ContractNotWhitelisted { contract })
+    }
+
     /// Submits a CONTRACT_CALL transaction to Fireblocks.
     ///
     /// # Arguments
@@ -169,10 +213,12 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             FireblocksVaultError::UnknownChain { chain_id: self.chain_id },
         )?;
 
+        let wallet_id = self.resolve_contract_wallet(contract_address).await?;
+
         let tx_request = build_contract_call_request(
             asset_id.as_str(),
             &self.vault_account_id,
-            contract_address,
+            &wallet_id,
             calldata,
             note,
             external_tx_id,
@@ -278,10 +324,13 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
 }
 
 /// Builds a Fireblocks CONTRACT_CALL transaction request.
+///
+/// Uses `ExternalWallet` destination type with the resolved whitelisted
+/// contract wallet ID, enabling Fireblocks TAP policy enforcement.
 fn build_contract_call_request(
     asset_id: &str,
     vault_account_id: &str,
-    contract_address: Address,
+    wallet_id: &ContractWalletId,
     calldata: &Bytes,
     note: &str,
     external_tx_id: &str,
@@ -306,12 +355,10 @@ fn build_contract_call_request(
             is_collateral: None,
         }),
         destination: Some(models::DestinationTransferPeerPath {
-            r#type: models::TransferPeerPathType::OneTimeAddress,
-            one_time_address: Some(models::OneTimeAddress::new(
-                contract_address.to_string(),
-            )),
+            r#type: models::TransferPeerPathType::ExternalWallet,
+            id: Some(wallet_id.as_str().to_string()),
+            one_time_address: None,
             sub_type: None,
-            id: None,
             name: None,
             wallet_id: None,
             is_collateral: None,
@@ -632,25 +679,165 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use std::sync::LazyLock;
+
+    use httpmock::MockServer;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
     use uuid::Uuid;
 
     use super::*;
+    use crate::fireblocks::config::parse_chain_asset_ids;
 
-    // ==================== Unit Tests for build_contract_call_request ====================
+    static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    });
+
+    fn mock_client(server: &MockServer) -> Client {
+        ClientBuilder::new("test-api-user", &TEST_RSA_PEM)
+            .with_url(&server.base_url())
+            .build()
+            .unwrap()
+    }
+
+    fn build_test_service(
+        client: Client,
+    ) -> FireblocksVaultService<impl Provider + Clone + 'static> {
+        let chain_asset_ids =
+            parse_chain_asset_ids("8453:BASECHAIN_ETH").unwrap();
+
+        let read_provider = alloy::providers::RootProvider::new_http(
+            "http://localhost:1".parse().unwrap(),
+        );
+
+        FireblocksVaultService {
+            client,
+            vault_account_id: "0".to_string(),
+            chain_asset_ids,
+            read_provider,
+            chain_id: 8453,
+        }
+    }
+
+    fn mock_whitelisted_contracts<'a>(
+        server: &'a MockServer,
+        contract_address: &str,
+        asset_id: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method("GET").path("/contracts");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([
+                    {
+                        "id": "contract-wallet-123",
+                        "name": "Test Vault",
+                        "assets": [
+                            {
+                                "id": asset_id,
+                                "address": contract_address
+                            }
+                        ]
+                    }
+                ]));
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_finds_whitelisted_contract() {
+        let contract = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        let mock = mock_whitelisted_contracts(
+            &server,
+            &contract.to_string().to_lowercase(),
+            "BASECHAIN_ETH",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let wallet_id =
+            service.resolve_contract_wallet(contract).await.unwrap();
+
+        assert_eq!(wallet_id.as_str(), "contract-wallet-123");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_rejects_unknown_contract() {
+        let contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        // Mock returns a wallet with a different address
+        let mock = mock_whitelisted_contracts(
+            &server,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "BASECHAIN_ETH",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service.resolve_contract_wallet(contract).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FireblocksVaultError::ContractNotWhitelisted { .. })
+            ),
+            "Expected ContractNotWhitelisted, got {result:?}"
+        );
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_wallet_rejects_wrong_asset_id() {
+        let contract = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+
+        let server = MockServer::start();
+        // Mock returns matching address but wrong asset ID
+        let mock = mock_whitelisted_contracts(
+            &server,
+            &contract.to_string().to_lowercase(),
+            "ETH_TEST",
+        );
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service.resolve_contract_wallet(contract).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FireblocksVaultError::ContractNotWhitelisted { .. })
+            ),
+            "Expected ContractNotWhitelisted, got {result:?}"
+        );
+        mock.assert();
+    }
 
     #[test]
     fn build_contract_call_request_has_correct_structure() {
         let asset_id = "BASECHAIN_ETH";
         let vault_account_id = "0";
-        let contract_address = Address::ZERO;
+        let wallet_id = ContractWalletId::from("wallet-abc".to_string());
         let calldata = Bytes::from(vec![0x12, 0x34, 0x56, 0x78]);
         let note = "Test transaction";
 
         let request = build_contract_call_request(
             asset_id,
             vault_account_id,
-            contract_address,
+            &wallet_id,
             &calldata,
             note,
             "test-id",
@@ -676,21 +863,18 @@ mod tests {
         assert_eq!(source.id, Some(vault_account_id.to_string()));
 
         let dest = request.destination.as_ref().unwrap();
-        assert_eq!(dest.r#type, models::TransferPeerPathType::OneTimeAddress);
-        assert!(dest.one_time_address.is_some());
+        assert_eq!(dest.r#type, models::TransferPeerPathType::ExternalWallet);
+        assert_eq!(dest.id, Some("wallet-abc".to_string()));
+        assert!(dest.one_time_address.is_none());
     }
 
     #[test]
     fn build_contract_call_request_encodes_calldata_as_hex() {
         let calldata = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let wallet_id = ContractWalletId::from("w".to_string());
 
         let request = build_contract_call_request(
-            "ETH",
-            "0",
-            Address::ZERO,
-            &calldata,
-            "test",
-            "test-id",
+            "ETH", "0", &wallet_id, &calldata, "test", "test-id",
         );
 
         let extra = request.extra_parameters.unwrap();
@@ -698,59 +882,13 @@ mod tests {
     }
 
     #[test]
-    fn build_contract_call_request_formats_contract_address() {
-        let contract_address =
-            "0x1234567890123456789012345678901234567890".parse().unwrap();
-
-        let request = build_contract_call_request(
-            "ETH",
-            "0",
-            contract_address,
-            &Bytes::new(),
-            "test",
-            "test-id",
-        );
-
-        let dest = request.destination.unwrap();
-        let one_time = dest.one_time_address.unwrap();
-        assert!(
-            one_time
-                .address
-                .contains("0x1234567890123456789012345678901234567890")
-        );
-    }
-
-    #[test]
-    fn build_contract_call_request_uses_eip55_checksummed_address() {
-        // Address with letters to verify EIP-55 mixed-case checksumming
-        let contract_address =
-            address!("0xdead000000000000000000000000000000000000");
-
-        let request = build_contract_call_request(
-            "ETH",
-            "0",
-            contract_address,
-            &Bytes::new(),
-            "test",
-            "test-id",
-        );
-
-        let dest = request.destination.unwrap();
-        let one_time = dest.one_time_address.unwrap();
-        // EIP-55 checksum produces mixed-case "0xdEad" not lowercase "0xdead"
-        assert!(
-            one_time.address.contains("0xdEad"),
-            "Expected EIP-55 checksummed address, got: {}",
-            one_time.address
-        );
-    }
-
-    #[test]
     fn build_contract_call_request_uses_medium_fee_level() {
+        let wallet_id = ContractWalletId::from("w".to_string());
+
         let request = build_contract_call_request(
             "ETH",
             "0",
-            Address::ZERO,
+            &wallet_id,
             &Bytes::new(),
             "test",
             "test-id",

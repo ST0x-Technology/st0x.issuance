@@ -35,6 +35,22 @@ impl From<String> for FireblocksVaultAccountId {
     }
 }
 
+/// Fireblocks whitelisted contract wallet identifier.
+#[derive(Debug, Clone)]
+pub(crate) struct ContractWalletId(String);
+
+impl ContractWalletId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ContractWalletId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// Fireblocks asset identifier (e.g., "ETH", "BASECHAIN_ETH").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AssetId(String);

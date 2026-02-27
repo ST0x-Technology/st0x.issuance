@@ -242,6 +242,10 @@ Bug fixes and improvements that don't fit into the original phases.
 
 #### Reliability
 
+- [x] [#124](https://github.com/ST0x-Technology/st0x.issuance/issues/124) -
+      Fireblocks integration uses OneTimeAddress instead of whitelisted contract
+      wallets
+  - **PR:** [#125](https://github.com/ST0x-Technology/st0x.issuance/pull/125)
 - [ ] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
       automatic recovery for burns detected as already completed on-chain
 - [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
