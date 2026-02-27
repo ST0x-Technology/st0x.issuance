@@ -707,8 +707,7 @@ mod tests {
 
     fn build_test_service(
         client: Client,
-    ) -> FireblocksVaultService<impl Provider + Clone + Send + Sync + 'static>
-    {
+    ) -> FireblocksVaultService<impl Provider + Clone + 'static> {
         let chain_asset_ids =
             parse_chain_asset_ids("8453:BASECHAIN_ETH").unwrap();
 
