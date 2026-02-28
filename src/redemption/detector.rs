@@ -1,10 +1,12 @@
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{info, warn};
 use url::Url;
 
@@ -20,11 +22,20 @@ use super::{
 };
 use crate::bindings;
 
+use crate::tokenized_asset::UnderlyingSymbol;
+
 /// Configuration parameters for the redemption detector.
-pub(crate) struct RedemptionDetectorConfig {
+pub(crate) struct RedemptionDetectorCtx {
     pub(crate) rpc_url: Url,
-    pub(crate) vault: Address,
+    pub(crate) underlying: UnderlyingSymbol,
     pub(crate) bot_wallet: Address,
+    pub(crate) pool: Pool<Sqlite>,
+}
+
+impl RedemptionDetectorCtx {
+    pub(crate) fn task_name(&self) -> String {
+        format!("redemption-detector-{}", self.underlying)
+    }
 }
 
 /// Orchestrates the WebSocket monitoring process for redemption detection.
@@ -37,7 +48,7 @@ where
     RedemptionStore: EventStore<Redemption>,
 {
     rpc_url: Url,
-    vault: Address,
+    underlying: UnderlyingSymbol,
     bot_wallet: Address,
     cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     event_store: Arc<RedemptionStore>,
@@ -45,6 +56,25 @@ where
     redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     journal_manager: Arc<JournalManager<RedemptionStore>>,
     burn_manager: Arc<BurnManager<RedemptionStore>>,
+}
+
+impl<RedemptionStore> Clone for RedemptionDetector<RedemptionStore>
+where
+    RedemptionStore: EventStore<Redemption>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            rpc_url: self.rpc_url.clone(),
+            underlying: self.underlying.clone(),
+            bot_wallet: self.bot_wallet,
+            cqrs: self.cqrs.clone(),
+            event_store: self.event_store.clone(),
+            pool: self.pool.clone(),
+            redeem_call_manager: self.redeem_call_manager.clone(),
+            journal_manager: self.journal_manager.clone(),
+            burn_manager: self.burn_manager.clone(),
+        }
+    }
 }
 
 impl<RedemptionStore> RedemptionDetector<RedemptionStore>
@@ -56,7 +86,7 @@ where
     ///
     /// # Arguments
     ///
-    /// * `config` - Configuration parameters (RPC URL, addresses)
+    /// * `ctx` - Configuration parameters (RPC URL, addresses)
     /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
     /// * `event_store` - Event store for loading aggregates
     /// * `pool` - Database connection pool for querying tokenized assets
@@ -64,21 +94,20 @@ where
     /// * `journal_manager` - Manager for polling Alpaca journal status
     /// * `burn_manager` - Manager for handling token burning after Alpaca journal completes
     pub(crate) fn new(
-        config: RedemptionDetectorConfig,
+        ctx: RedemptionDetectorCtx,
         cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
         event_store: Arc<RedemptionStore>,
-        pool: Pool<Sqlite>,
         redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
         journal_manager: Arc<JournalManager<RedemptionStore>>,
         burn_manager: Arc<BurnManager<RedemptionStore>>,
     ) -> Self {
         Self {
-            rpc_url: config.rpc_url,
-            vault: config.vault,
-            bot_wallet: config.bot_wallet,
+            rpc_url: ctx.rpc_url,
+            underlying: ctx.underlying,
+            bot_wallet: ctx.bot_wallet,
+            pool: ctx.pool,
             cqrs,
             event_store,
-            pool,
             redeem_call_manager,
             journal_manager,
             burn_manager,
@@ -90,7 +119,7 @@ where
     /// This method never returns under normal operation. If a WebSocket error occurs,
     /// it logs the error and reconnects after 5 seconds.
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn run(&self) {
+    pub(crate) async fn run_monitor(&self) {
         loop {
             if let Err(err) = self.monitor_once().await {
                 warn!(
@@ -103,21 +132,33 @@ where
 
     /// Monitors for redemptions once, establishing a WebSocket connection and processing events.
     ///
-    /// Returns an error if the connection fails, subscription fails, or the stream ends.
+    /// Looks up current vault details from the tokenized asset view at the
+    /// start of each cycle, so restarts automatically pick up address changes.
     async fn monitor_once(&self) -> Result<(), RedemptionMonitorError> {
         info!("Connecting to WebSocket at {}", self.rpc_url);
 
         let provider =
             ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
 
-        let vault =
-            bindings::OffchainAssetReceiptVault::new(self.vault, &provider);
+        let vault_ctx = crate::tokenized_asset::discover_vault(
+            &self.pool,
+            &provider.clone().erased(),
+            &self.underlying,
+        )
+        .await?;
+
+        let vault = bindings::OffchainAssetReceiptVault::new(
+            vault_ctx.vault,
+            &provider,
+        );
 
         let filter = vault.Transfer_filter().topic2(self.bot_wallet).filter;
 
         info!(
-            "Subscribing to Transfer events for bot wallet {}",
-            self.bot_wallet
+            underlying = %self.underlying,
+            vault = %vault_ctx.vault,
+            bot_wallet = %self.bot_wallet,
+            "Subscribing to Transfer events"
         );
 
         let sub = provider.subscribe_logs(&filter).await?;
@@ -127,7 +168,9 @@ where
         info!("WebSocket subscription active, monitoring for redemptions");
 
         while let Some(log) = stream.next().await {
-            if let Err(err) = self.process_transfer_log(&log).await {
+            if let Err(err) =
+                self.process_transfer_log(&log, vault_ctx.vault).await
+            {
                 warn!("Failed to process transfer log: {err}");
             }
         }
@@ -146,9 +189,10 @@ where
     async fn process_transfer_log(
         &self,
         log: &alloy::rpc::types::Log,
+        vault: Address,
     ) -> Result<Option<IssuerRedemptionRequestId>, RedemptionMonitorError> {
         let outcome =
-            detect_transfer(log, self.vault, &self.cqrs, &self.pool).await?;
+            detect_transfer(log, vault, &self.cqrs, &self.pool).await?;
 
         match outcome {
             TransferOutcome::Detected {
@@ -180,12 +224,26 @@ where
     }
 }
 
+#[async_trait]
+impl<RedemptionStore> SupervisedTask for RedemptionDetector<RedemptionStore>
+where
+    RedemptionStore: EventStore<Redemption> + Send + Sync + 'static,
+    RedemptionStore::AC: Send,
+{
+    async fn run(&mut self) -> TaskResult {
+        self.run_monitor().await;
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RedemptionMonitorError {
     #[error("RPC error")]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Transfer processing error: {0}")]
     TransferProcessing(#[from] TransferProcessingError),
+    #[error("Vault discovery error: {0}")]
+    VaultDiscovery(#[from] crate::tokenized_asset::view::VaultDiscoveryError),
     #[error("Stream ended unexpectedly")]
     StreamEnded,
 }
@@ -207,7 +265,7 @@ mod tests {
 
     use super::{
         BurnManager, JournalManager, RedeemCallManager, RedemptionDetector,
-        RedemptionDetectorConfig,
+        RedemptionDetectorCtx,
     };
     use crate::account::{
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
@@ -406,17 +464,17 @@ mod tests {
             bot_wallet,
         ));
 
-        let config = RedemptionDetectorConfig {
+        let ctx = RedemptionDetectorCtx {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
+            underlying: UnderlyingSymbol::new("AAPL"),
             bot_wallet,
+            pool: pool.clone(),
         };
 
         let detector = RedemptionDetector::new(
-            config,
+            ctx,
             cqrs.clone(),
             store.clone(),
-            pool,
             redeem_call_manager,
             journal_manager,
             burn_manager,
@@ -437,7 +495,7 @@ mod tests {
             block_number,
         );
 
-        let result = detector.process_transfer_log(&log).await;
+        let result = detector.process_transfer_log(&log, vault).await;
 
         let issuer_request_id =
             result.expect("Expected success").expect("Expected Some(id)");
@@ -486,17 +544,17 @@ mod tests {
             bot_wallet,
         ));
 
-        let config = RedemptionDetectorConfig {
+        let ctx = RedemptionDetectorCtx {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
+            underlying: UnderlyingSymbol::new("AAPL"),
             bot_wallet,
+            pool: pool.clone(),
         };
 
         let detector = RedemptionDetector::new(
-            config,
+            ctx,
             cqrs,
             store.clone(),
-            pool,
             redeem_call_manager,
             journal_manager,
             burn_manager,
@@ -513,7 +571,7 @@ mod tests {
             12345,
         );
 
-        let result = detector.process_transfer_log(&log).await;
+        let result = detector.process_transfer_log(&log, vault).await;
 
         assert!(
             result.is_ok(),
@@ -562,17 +620,17 @@ mod tests {
             bot_wallet,
         ));
 
-        let config = RedemptionDetectorConfig {
+        let ctx = RedemptionDetectorCtx {
             rpc_url: "wss://fake.url".parse().unwrap(),
-            vault,
+            underlying: UnderlyingSymbol::new("AAPL"),
             bot_wallet,
+            pool: pool.clone(),
         };
 
         let detector = RedemptionDetector::new(
-            config,
+            ctx,
             cqrs,
             store,
-            pool,
             redeem_call_manager,
             journal_manager,
             burn_manager,
@@ -591,14 +649,14 @@ mod tests {
             12345,
         );
 
-        let first_result = detector.process_transfer_log(&log).await;
+        let first_result = detector.process_transfer_log(&log, vault).await;
         assert!(
             first_result.is_ok(),
             "First detection should succeed, got {first_result:?}"
         );
 
         // With idempotent detection, duplicate returns Ok(None) instead of error
-        let second_result = detector.process_transfer_log(&log).await;
+        let second_result = detector.process_transfer_log(&log, vault).await;
         assert!(
             second_result.is_ok(),
             "Second detection should be handled idempotently, got {second_result:?}"

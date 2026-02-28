@@ -77,7 +77,10 @@ where
     /// Queries the view for all redemptions in `Burning` state and resumes
     /// the burn process for each. This handles cases where the bot crashed
     /// after Alpaca journal completion but before burn was executed.
-    pub(crate) async fn recover_burning_redemptions(&self) {
+    pub(crate) async fn recover_burning_redemptions(
+        &self,
+        underlying: &UnderlyingSymbol,
+    ) {
         let stuck_redemptions = match find_burning(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -86,13 +89,19 @@ where
             }
         };
 
+        let stuck_redemptions: Vec<_> = stuck_redemptions
+            .into_iter()
+            .filter(|(_id, view)| view.underlying() == Some(underlying))
+            .collect();
+
         if stuck_redemptions.is_empty() {
-            info!("No Burning redemptions to recover");
+            info!(underlying = %underlying, "No Burning redemptions to recover");
             return;
         }
 
         info!(
             count = stuck_redemptions.len(),
+            underlying = %underlying,
             "Recovering stuck Burning redemptions"
         );
 
@@ -113,7 +122,10 @@ where
     ///
     /// Queries the view for all redemptions where burn failed and retries
     /// the burn process for each using metadata preserved in the view.
-    pub(crate) async fn recover_burn_failed_redemptions(&self) {
+    pub(crate) async fn recover_burn_failed_redemptions(
+        &self,
+        underlying: &UnderlyingSymbol,
+    ) {
         let failed_redemptions = match find_burn_failed(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -122,13 +134,19 @@ where
             }
         };
 
+        let failed_redemptions: Vec<_> = failed_redemptions
+            .into_iter()
+            .filter(|(_id, view)| view.underlying() == Some(underlying))
+            .collect();
+
         if failed_redemptions.is_empty() {
-            info!("No BurnFailed redemptions to recover");
+            info!(underlying = %underlying, "No BurnFailed redemptions to recover");
             return;
         }
 
         info!(
             count = failed_redemptions.len(),
+            underlying = %underlying,
             "Recovering BurnFailed redemptions"
         );
 
@@ -1478,7 +1496,9 @@ mod tests {
             TEST_WALLET,
         );
 
-        manager.recover_burning_redemptions().await;
+        manager
+            .recover_burning_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
     }
 
     #[tokio::test]
@@ -1519,7 +1539,9 @@ mod tests {
         )
         .await;
 
-        manager.recover_burning_redemptions().await;
+        manager
+            .recover_burning_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         assert_eq!(vault_mock.get_multi_burn_call_count(), 1);
 
@@ -1567,7 +1589,9 @@ mod tests {
         .await;
 
         // Recovery should skip this redemption without attempting burn
-        manager.recover_burning_redemptions().await;
+        manager
+            .recover_burning_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         // No burn should have been attempted
         assert_eq!(
@@ -1627,7 +1651,9 @@ mod tests {
         .await
         .unwrap();
 
-        manager.recover_burning_redemptions().await;
+        manager
+            .recover_burning_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         assert_eq!(
             blockchain_service_mock.get_multi_burn_call_count(),
@@ -1700,7 +1726,9 @@ mod tests {
         );
 
         // Recovery should find the BurnFailed view and retry
-        manager.recover_burn_failed_redemptions().await;
+        manager
+            .recover_burn_failed_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         // Burn should have been retried
         assert_eq!(
@@ -1776,7 +1804,9 @@ mod tests {
         );
 
         // Recovery should skip due to insufficient balance
-        manager.recover_burn_failed_redemptions().await;
+        manager
+            .recover_burn_failed_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         // No burn should have been attempted
         assert_eq!(
@@ -1838,7 +1868,7 @@ mod tests {
         .expect("Failed to record burn failure");
 
         // Recovery should auto-fail (MarkFailed) instead of just skipping
-        manager.recover_burn_failed_redemptions().await;
+        manager.recover_burn_failed_redemptions(&underlying).await;
 
         // The aggregate should have a new RedemptionFailed event
         // (from MarkFailed command, with reason about insufficient balance)

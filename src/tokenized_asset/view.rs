@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
+use alloy::providers::DynProvider;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::{GenericQuery, QueryReplay, ViewRepository};
 use cqrs_es::{EventEnvelope, View};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
@@ -10,8 +12,9 @@ use tracing::info;
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
-    TokenizedAssetEvent, UnderlyingSymbol,
+    TokenizedAssetEvent, UnderlyingSymbol, VaultCtx,
 };
+use crate::bindings::OffchainAssetReceiptVault;
 
 pub(crate) type TokenizedAssetViewRepo =
     Arc<SqliteViewRepository<TokenizedAssetView, TokenizedAsset>>;
@@ -161,6 +164,81 @@ pub(crate) async fn find_vault_by_underlying(
         }
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VaultDiscoveryError {
+    #[error(transparent)]
+    View(#[from] TokenizedAssetViewError),
+    #[error(transparent)]
+    Contract(#[from] alloy::contract::Error),
+    #[error("Asset not found or disabled: {0}")]
+    AssetNotFound(UnderlyingSymbol),
+}
+
+/// Discovers a single vault's context by underlying symbol.
+///
+/// Loads the vault address from the tokenized asset view and queries the
+/// on-chain contract for the receipt contract address.
+pub(crate) async fn discover_vault(
+    pool: &Pool<Sqlite>,
+    provider: &DynProvider,
+    underlying: &UnderlyingSymbol,
+) -> Result<VaultCtx, VaultDiscoveryError> {
+    let vault =
+        find_vault_by_underlying(pool, underlying).await?.ok_or_else(|| {
+            VaultDiscoveryError::AssetNotFound(underlying.clone())
+        })?;
+
+    let vault_contract = OffchainAssetReceiptVault::new(vault, provider);
+    let receipt_contract =
+        Address::from(vault_contract.receipt().call().await?.0);
+
+    Ok(VaultCtx { underlying: underlying.clone(), vault, receipt_contract })
+}
+
+pub(crate) async fn discover_vaults(
+    pool: &Pool<Sqlite>,
+    provider: &DynProvider,
+) -> Result<Vec<VaultCtx>, VaultDiscoveryError> {
+    let assets = list_enabled_assets(pool).await?;
+
+    let vaults: Vec<_> = assets
+        .into_iter()
+        .filter_map(|asset| match asset {
+            TokenizedAssetView::Asset { underlying, vault, .. } => {
+                Some((underlying, vault))
+            }
+            TokenizedAssetView::Unavailable => None,
+        })
+        .collect();
+
+    if vaults.is_empty() {
+        info!("No enabled vaults found");
+        return Ok(vec![]);
+    }
+
+    let configs: Vec<VaultCtx> = stream::iter(vaults)
+        .then(|(underlying, vault)| async move {
+            let vault_contract =
+                OffchainAssetReceiptVault::new(vault, provider);
+            let receipt_contract =
+                Address::from(vault_contract.receipt().call().await?.0);
+
+            Ok::<_, VaultDiscoveryError>(VaultCtx {
+                underlying,
+                vault,
+                receipt_contract,
+            })
+        })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    info!(vault_count = configs.len(), "Discovered vaults");
+
+    Ok(configs)
 }
 
 #[cfg(test)]
@@ -483,5 +561,25 @@ mod tests {
             tracing::Level::INFO,
             &["View rebuild complete", "tokenized_asset_view"]
         ));
+    }
+
+    #[tokio::test]
+    async fn test_discover_vault_returns_asset_not_found_for_missing_underlying()
+     {
+        let harness = TestHarness::new().await;
+
+        let result = discover_vault(
+            &harness.pool,
+            &DynProvider::new(
+                alloy::providers::ProviderBuilder::new().connect_anvil(),
+            ),
+            &UnderlyingSymbol::new("NONEXISTENT"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(VaultDiscoveryError::AssetNotFound(ref underlying)) if underlying.0 == "NONEXISTENT"),
+            "Expected AssetNotFound error for missing underlying, got {result:?}"
+        );
     }
 }
