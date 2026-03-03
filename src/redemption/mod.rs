@@ -14,15 +14,61 @@ pub(crate) mod transfer;
 
 use alloy::hex;
 use alloy::primitives::{Address, B256, FixedBytes, TxHash, U256};
+use apalis::prelude::Data;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::Quantity;
+use crate::RedemptionManagers;
+use crate::job::{Job, Label};
 use crate::mint::TokenizationRequestId;
+use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::VaultError;
+use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
+
+pub(crate) use cmd::RedemptionCommand;
+pub(crate) use event::{BurnRecord, RedemptionEvent};
+pub(crate) use view::{
+    RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
+    replay_redemption_view,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RedemptionRecoveryJob {
+    pub(crate) underlying: UnderlyingSymbol,
+}
+
+impl Job for RedemptionRecoveryJob {
+    type Ctx = Arc<RedemptionManagers>;
+    type Error = std::convert::Infallible;
+
+    fn label(&self) -> Label {
+        Label::new(format!("redemption-recovery-{}", self.underlying))
+    }
+
+    async fn run(self, managers: Data<Self::Ctx>) -> Result<(), Self::Error> {
+        info!(underlying = %self.underlying, "Starting redemption recovery");
+
+        managers
+            .redeem_call
+            .recover_detected_redemptions(&self.underlying)
+            .await;
+        managers
+            .journal
+            .recover_alpaca_called_redemptions(&self.underlying)
+            .await;
+        managers.burn.recover_burning_redemptions(&self.underlying).await;
+        managers.burn.recover_burn_failed_redemptions(&self.underlying).await;
+
+        info!(underlying = %self.underlying, "Completed redemption recovery");
+
+        Ok(())
+    }
+}
 
 /// Issuer request ID for redemption operations.
 ///
@@ -89,16 +135,6 @@ impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
         s.parse().map_err(serde::de::Error::custom)
     }
 }
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-use crate::vault::VaultError;
-use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
-
-pub(crate) use cmd::RedemptionCommand;
-pub(crate) use event::{BurnRecord, RedemptionEvent};
-pub(crate) use view::{
-    RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
-    replay_redemption_view,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RedemptionMetadata {

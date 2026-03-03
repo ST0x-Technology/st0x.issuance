@@ -16,6 +16,7 @@ use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
 };
 use crate::mint::TokenizationRequestId;
+use crate::tokenized_asset::UnderlyingSymbol;
 
 pub(crate) struct JournalManager<ES: EventStore<Redemption>> {
     alpaca_service: Arc<dyn AlpacaService>,
@@ -45,7 +46,10 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         }
     }
 
-    pub(crate) async fn recover_alpaca_called_redemptions(&self) {
+    pub(crate) async fn recover_alpaca_called_redemptions(
+        &self,
+        underlying: &UnderlyingSymbol,
+    ) {
         let stuck_redemptions = match find_alpaca_called(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
@@ -54,13 +58,19 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             }
         };
 
+        let stuck_redemptions: Vec<_> = stuck_redemptions
+            .into_iter()
+            .filter(|(_id, view)| view.underlying() == Some(underlying))
+            .collect();
+
         if stuck_redemptions.is_empty() {
-            info!("No AlpacaCalled redemptions to recover");
+            info!(underlying = %underlying, "No AlpacaCalled redemptions to recover");
             return;
         }
 
         info!(
             count = stuck_redemptions.len(),
+            underlying = %underlying,
             "Recovering stuck AlpacaCalled redemptions"
         );
 
@@ -1198,7 +1208,9 @@ mod tests {
             pool,
         );
 
-        manager.recover_alpaca_called_redemptions().await;
+        manager
+            .recover_alpaca_called_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
     }
 
     #[tokio::test]
@@ -1250,7 +1262,9 @@ mod tests {
         insert_redemption_view(&pool, &issuer_request_id.to_string(), &view)
             .await;
 
-        manager.recover_alpaca_called_redemptions().await;
+        manager
+            .recover_alpaca_called_redemptions(&UnderlyingSymbol::new("AAPL"))
+            .await;
 
         let events =
             store.load_events(&issuer_request_id.to_string()).await.unwrap();

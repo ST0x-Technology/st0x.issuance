@@ -76,6 +76,9 @@ ipnetwork = "0.21.1"
 subtle = "2.6.1"
 governor = "0.10.2"
 fireblocks-sdk = "2025.10.17"
+apalis = "0.7.4"
+apalis-sql = { version = "0.7.4", features = ["sqlite"] }
+task-supervisor = { version = "0.3.5", features = ["with_tracing"] }
 
 [lints]
 workspace = true

@@ -163,7 +163,7 @@ pub async fn preseed_tokenized_asset(
     let pool =
         SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations").set_ignore_missing(true).run(&pool).await?;
 
     preseed_tokenized_asset_into_pool(&pool, vault, underlying, token).await?;
 

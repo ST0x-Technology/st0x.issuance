@@ -93,6 +93,18 @@ impl Default for RedemptionView {
 }
 
 impl RedemptionView {
+    pub(crate) const fn underlying(&self) -> Option<&UnderlyingSymbol> {
+        use RedemptionView::*;
+        match self {
+            Detected { underlying, .. }
+            | AlpacaCalled { underlying, .. }
+            | Burning { underlying, .. }
+            | BurnFailed { underlying, .. } => Some(underlying),
+
+            Unavailable | Completed { .. } | Failed { .. } => None,
+        }
+    }
+
     fn update_alpaca_called(
         &mut self,
         issuer_request_id: IssuerRedemptionRequestId,

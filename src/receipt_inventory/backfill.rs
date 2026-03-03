@@ -1,10 +1,13 @@
 use alloy::primitives::{Address, Bytes, TxHash};
+use alloy::providers::DynProvider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use apalis::prelude::Data;
+use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -13,6 +16,70 @@ use super::{
     ReceiptInventoryError, Shares, determine_source,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::job::{Job, Label};
+use crate::{ReceiptInventoryCqrs, ReceiptInventoryEventStore};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReceiptBackfillJob {
+    pub(crate) vault: Address,
+    pub(crate) receipt_contract: Address,
+}
+
+pub(crate) struct ReceiptBackfillCtx {
+    pub(crate) provider: DynProvider,
+    pub(crate) receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    pub(crate) receipt_inventory_event_store: ReceiptInventoryEventStore,
+    pub(crate) bot_wallet: Address,
+    pub(crate) backfill_start_block: u64,
+}
+
+impl Job for ReceiptBackfillJob {
+    type Ctx = Arc<ReceiptBackfillCtx>;
+    type Error = BackfillError;
+
+    fn label(&self) -> Label {
+        Label::new(format!("receipt-backfill-{}", self.vault))
+    }
+
+    async fn run(self, ctx: Data<Self::Ctx>) -> Result<(), Self::Error> {
+        let aggregate_context = ctx
+            .receipt_inventory_event_store
+            .load_aggregate(&self.vault.to_string())
+            .await?;
+
+        let from_block = aggregate_context
+            .aggregate()
+            .last_backfilled_block()
+            .unwrap_or(ctx.backfill_start_block);
+
+        info!(
+            vault = %self.vault,
+            receipt_contract = %self.receipt_contract,
+            bot_wallet = %ctx.bot_wallet,
+            from_block,
+            "Running receipt backfill for vault"
+        );
+
+        let backfiller = ReceiptBackfiller::new(
+            ctx.provider.clone(),
+            self.receipt_contract,
+            ctx.bot_wallet,
+            self.vault,
+            ctx.receipt_inventory_cqrs.clone(),
+        );
+
+        let result = backfiller.backfill_receipts(from_block).await?;
+
+        info!(
+            vault = %self.vault,
+            processed = result.processed_count,
+            skipped_zero_balance = result.skipped_zero_balance,
+            "Receipt backfill complete for vault"
+        );
+
+        Ok(())
+    }
+}
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.

@@ -26,6 +26,8 @@ the limit, condense explanations without removing any rules.
   services)
 - [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
   (externalTxId, SDK error handling)
+- [docs/orchestration.md](docs/orchestration.md) - Task orchestration (startup
+  jobs, long-running monitors, migration ordering, supervision)
 
 **Update at the end** (see "After completing a plan" checklist below):
 
@@ -319,11 +321,12 @@ instead.
 
 ### CRITICAL: Reading Views with GenericQuery
 
-**ALWAYS use `GenericQuery::load()` to read views. NEVER use raw SQL to parse
-JSON from view tables.**
+**Use `GenericQuery::load()` or `ViewRepository::load()` for loading a single
+view by ID or iterating all views. NEVER use raw SQL to deserialize full view
+payloads when `load()` would suffice.**
 
 ```rust
-// CORRECT - Use GenericQuery
+// CORRECT - Use GenericQuery / ViewRepository for single-view loads
 pub(crate) type MintViewQuery = GenericQuery<
     SqliteViewRepository<MintView, Mint>, MintView, Mint,
 >;
@@ -332,9 +335,16 @@ pub(crate) async fn load_mint(query: &MintViewQuery, id: &IssuerMintRequestId) -
     query.load(&Mint::aggregate_id(id)).await
 }
 
-// FORBIDDEN - Raw SQL with JSON parsing bypasses type safety
-sqlx::query!(r#"SELECT json_extract(payload, '$.field') FROM view"#)
+// FORBIDDEN - Raw SQL deserializing full payload when load() would work
+sqlx::query!(r#"SELECT payload FROM mint_view WHERE view_id = ?"#)
 ```
+
+**When SQL-level filtering is needed** (e.g.,
+`WHERE json_extract(payload,
+'$.Asset.enabled') = 1`), raw SQL queries against
+view tables are valid. The alternative is to create a dedicated read model (with
+proper SQL columns, not JSON) that pre-filters the data so `load()` can be used
+directly.
 
 **For cross-aggregate queries** (e.g., "find all receipts for underlying X"):
 
@@ -945,11 +955,20 @@ committing.
 (faster) or `cargo test` (more useful). Only use `cargo build` when you need the
 binary.
 
-- **Before handing over a piece of work**, run checks in this order:
+- **Before handing over a piece of work**, run only the checks relevant to what
+  you changed:
+
+  **Rust code changes:**
   1. `cargo test --workspace` - All tests must pass
   2. `cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D warnings` -
      Fix any linting issues (these should be minimal if code is well-structured)
   3. `cargo fmt --all` - Format the code
+
+  **Non-Rust changes only** (markdown, docs, config, etc.):
+  1. `pre-commit run -a` - Run all pre-commit hooks
+
+  Don't run the full Rust toolchain for docs-only changes, and don't skip Rust
+  checks when code changed.
 
 ### CRITICAL: Lint Policy
 

@@ -1,8 +1,10 @@
 use alloy::primitives::Address;
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::Log;
 use alloy::transports::{RpcError, TransportErrorKind};
+use apalis::prelude::Data;
 use cqrs_es::{CqrsFramework, EventStore};
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -18,6 +20,62 @@ use super::{
     },
 };
 use crate::bindings;
+use crate::job::{Job, Label};
+use crate::{RedemptionCqrs, RedemptionEventStore, RedemptionManagers};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TransferBackfillJob {
+    pub(crate) vault: Address,
+}
+
+pub(crate) struct TransferBackfillCtx {
+    pub(crate) provider: DynProvider,
+    pub(crate) bot_wallet: Address,
+    pub(crate) cqrs: RedemptionCqrs,
+    pub(crate) event_store: RedemptionEventStore,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) managers: RedemptionManagers,
+    pub(crate) backfill_start_block: u64,
+}
+
+impl Job for TransferBackfillJob {
+    type Ctx = Arc<TransferBackfillCtx>;
+    type Error = TransferBackfillError;
+
+    fn label(&self) -> Label {
+        Label::new(format!("transfer-backfill-{}", self.vault))
+    }
+
+    async fn run(
+        self,
+        ctx: Data<Arc<TransferBackfillCtx>>,
+    ) -> Result<(), TransferBackfillError> {
+        let backfiller = TransferBackfiller {
+            provider: ctx.provider.clone(),
+            bot_wallet: ctx.bot_wallet,
+            cqrs: ctx.cqrs.clone(),
+            event_store: ctx.event_store.clone(),
+            pool: ctx.pool.clone(),
+            redeem_call_manager: ctx.managers.redeem_call.clone(),
+            journal_manager: ctx.managers.journal.clone(),
+            burn_manager: ctx.managers.burn.clone(),
+        };
+
+        let result = backfiller
+            .backfill_transfers(self.vault, ctx.backfill_start_block)
+            .await?;
+
+        info!(
+            vault = %self.vault,
+            detected = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete for vault"
+        );
+
+        Ok(())
+    }
+}
 
 /// Backfills Transfer events on a single vault by scanning historic blocks.
 ///
@@ -153,16 +211,20 @@ where
             }
         }
 
-        info!(
-            detected_count,
-            skipped_mint, skipped_no_account, "Transfer backfill complete"
-        );
-
-        Ok(TransferBackfillResult {
+        let result = TransferBackfillResult {
             detected_count,
             skipped_mint,
             skipped_no_account,
-        })
+        };
+
+        info!(
+            detected_count = result.detected_count,
+            skipped_mint = result.skipped_mint,
+            skipped_no_account = result.skipped_no_account,
+            "Transfer backfill complete"
+        );
+
+        Ok(result)
     }
 
     async fn fetch_transfer_logs(
