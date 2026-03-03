@@ -30,6 +30,7 @@ use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView,
     backfill::{ReceiptBackfillCtx, ReceiptBackfillJob},
+    reconcile::run_startup_reconciliation,
 };
 use crate::redemption::{
     Redemption, RedemptionRecoveryJob, RedemptionView,
@@ -534,6 +535,22 @@ pub async fn initialize_rocket(
             )
             .await?;
         }
+
+        // Reconcile receipt balances with on-chain state after backfill
+        // discovers receipts but before recovery uses them for burn planning
+        let vault_receipt_pairs: Vec<_> = vault_ctxs
+            .iter()
+            .map(|ctx| (ctx.vault, ctx.receipt_contract))
+            .collect();
+
+        run_startup_reconciliation(
+            blockchain_setup.provider.clone(),
+            &vault_receipt_pairs,
+            &receipt_inventory.cqrs,
+            receipt_inventory.event_store.as_ref(),
+            bot_wallet,
+        )
+        .await?;
 
         for vault_ctx in &vault_ctxs {
             push_and_await(
