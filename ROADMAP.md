@@ -246,9 +246,10 @@ Bug fixes and improvements that don't fit into the original phases.
       Fireblocks integration uses OneTimeAddress instead of whitelisted contract
       wallets
   - **PR:** [#125](https://github.com/ST0x-Technology/st0x.issuance/pull/125)
-- [ ] [#126](https://github.com/ST0x-Technology/st0x.issuance/issues/126) -
+- [x] [#126](https://github.com/ST0x-Technology/st0x.issuance/issues/126) -
       MintView silently drops ExistingMintRecovered and MintCompleted events
       from MintingFailed state
+  - **PR:** [#127](https://github.com/ST0x-Technology/st0x.issuance/pull/127)
 - [ ] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
       automatic recovery for burns detected as already completed on-chain
 - [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
