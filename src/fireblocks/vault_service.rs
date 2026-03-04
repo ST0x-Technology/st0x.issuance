@@ -679,7 +679,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
 
     use httpmock::MockServer;
     use rsa::RsaPrivateKey;
@@ -1039,5 +1039,73 @@ mod tests {
         assert!(!is_still_pending(Cancelled));
         assert!(!is_still_pending(Blocked));
         assert!(!is_still_pending(Rejected));
+    }
+
+    /// The Fireblocks SDK must treat `Confirming` as a non-terminal status and
+    /// keep polling. A transaction that is `Confirming` will eventually become
+    /// `Completed` — stopping early causes a spurious `TransactionFailed` error.
+    ///
+    /// This test simulates a transaction that reports `CONFIRMING` for its first
+    /// two polls, then transitions to `COMPLETED`. With a correct SDK,
+    /// `wait_for_completion` polls through the `Confirming` state and succeeds.
+    /// With a buggy SDK that treats `Confirming` as terminal, the poll loop
+    /// exits early and returns `TransactionFailed { status: Confirming }`.
+    #[tokio::test]
+    async fn wait_for_completion_polls_through_confirming_status() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let server = MockServer::start();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&call_count);
+
+        let expected_tx_hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        let tx_hash = expected_tx_hash.to_string();
+
+        server.mock(|when, then| {
+            when.method("GET").path("/transactions/tx-confirming-123");
+            then.respond_with(move |_req: &httpmock::HttpMockRequest| {
+                let call = counter.fetch_add(1, Ordering::SeqCst);
+
+                let status = if call < 2 { "CONFIRMING" } else { "COMPLETED" };
+
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        serde_json::json!({
+                            "id": "tx-confirming-123",
+                            "status": status,
+                            "txHash": tx_hash,
+                        })
+                        .to_string(),
+                    )
+                    .build()
+            });
+        });
+
+        let service = build_test_service(mock_client(&server));
+
+        let result = service.wait_for_completion("tx-confirming-123").await;
+
+        assert!(
+            result.is_ok(),
+            "wait_for_completion should succeed after polling through \
+             Confirming status, but got: {result:?}"
+        );
+
+        let hash = result.unwrap();
+        assert_eq!(
+            hash,
+            expected_tx_hash.parse::<B256>().unwrap(),
+            "Should return the on-chain transaction hash"
+        );
+
+        let total_calls = call_count.load(Ordering::SeqCst);
+        assert!(
+            total_calls >= 3,
+            "SDK should have polled past Confirming status \
+             (expected >= 3 calls, got {total_calls})"
+        );
     }
 }
