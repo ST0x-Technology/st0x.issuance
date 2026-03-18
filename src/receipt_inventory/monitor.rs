@@ -282,6 +282,14 @@ where
 
         let (source, receipt_info) = determine_source(&receipt_information);
 
+        // Always preserve the original on-chain bytes so redeem() can pass
+        // them back exactly, regardless of whether we could parse them.
+        let receipt_info_bytes = if receipt_information.is_empty() {
+            None
+        } else {
+            Some(receipt_information.clone())
+        };
+
         self.cqrs
             .execute(
                 &self.vault.to_string(),
@@ -291,7 +299,8 @@ where
                     block_number,
                     tx_hash,
                     source: source.clone(),
-                    receipt_info,
+                    receipt_info: receipt_info.map(Box::new),
+                    receipt_info_bytes,
                 },
             )
             .await?;
@@ -487,6 +496,7 @@ mod tests {
                 tx_hash,
                 source: ReceiptSource::External,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         )
         .await
@@ -521,6 +531,7 @@ mod tests {
                     tx_hash,
                     source: ReceiptSource::External,
                     receipt_info: None,
+                    receipt_info_bytes: None,
                 },
             )
             .await
@@ -591,6 +602,7 @@ mod tests {
                 ),
                 source: ReceiptSource::External,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         )
         .await

@@ -67,6 +67,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         log_level: LogLevel::Debug,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
+        subgraph_url: Url::parse("http://localhost:0/subgraph")?,
     })
 }
 

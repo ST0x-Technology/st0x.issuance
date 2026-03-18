@@ -76,6 +76,8 @@ ipnetwork = "0.21.1"
 subtle = "2.6.1"
 governor = "0.10.2"
 fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", branch = "fix/confirming-not-terminal" }
+ciborium = "0.2.2"
+flate2 = "1.1.9"
 
 [lints]
 workspace = true

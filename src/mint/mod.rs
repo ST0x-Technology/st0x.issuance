@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::account::view::AccountViewError;
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::receipt_inventory::{
-    ReceiptId, ReceiptLookupError, ReceiptService, Shares,
+    MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
     view::ReceiptInventoryViewError,
 };
 use crate::tokenized_asset::view::{
@@ -401,14 +401,15 @@ impl Mint {
 
         if let Err(err) = services
             .receipts
-            .register_minted_receipt(
+            .register_minted_receipt(MintedReceiptParams {
                 vault,
-                ReceiptId::from(result.receipt_id),
-                Shares::from(result.shares_minted),
-                result.block_number,
-                result.tx_hash,
+                receipt_id: ReceiptId::from(result.receipt_id),
+                shares: Shares::from(result.shares_minted),
+                block_number: result.block_number,
+                tx_hash: result.tx_hash,
                 receipt_info,
-            )
+                receipt_info_bytes: result.receipt_info_bytes.clone(),
+            })
             .await
         {
             warn!(

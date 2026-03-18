@@ -1,4 +1,4 @@
-use alloy::primitives::TxHash;
+use alloy::primitives::{Bytes, TxHash};
 use serde::{Deserialize, Serialize};
 
 use super::event::ReceiptSource;
@@ -13,7 +13,8 @@ pub(crate) enum ReceiptInventoryCommand {
         block_number: u64,
         tx_hash: TxHash,
         source: ReceiptSource,
-        receipt_info: Option<ReceiptInformation>,
+        receipt_info: Option<Box<ReceiptInformation>>,
+        receipt_info_bytes: Option<Bytes>,
     },
     ReconcileBalance {
         receipt_id: ReceiptId,
