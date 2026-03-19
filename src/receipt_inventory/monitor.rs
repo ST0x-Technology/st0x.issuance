@@ -137,12 +137,29 @@ where
         let withdraw_filter = vault_contract.Withdraw_filter().filter;
 
         // Subscribe to ERC-1155 TransferSingle and TransferBatch events on
-        // the Receipt contract. These capture direct token transfers that
-        // bypass the vault's deposit/withdraw (e.g., manual receipt transfers).
-        let transfer_single_filter =
-            transfer_single_filter(self.receipt_contract);
-        let transfer_batch_filter =
-            transfer_batch_filter(self.receipt_contract);
+        // the Receipt contract with indexed topic filtering for bot_wallet.
+        // Separate inbound (to == bot_wallet) and outbound (from == bot_wallet)
+        // subscriptions reduce WebSocket traffic by filtering at the node level.
+        let transfer_single_inbound = transfer_single_filter(
+            self.receipt_contract,
+            self.bot_wallet,
+            TransferDirection::Inbound,
+        );
+        let transfer_single_outbound = transfer_single_filter(
+            self.receipt_contract,
+            self.bot_wallet,
+            TransferDirection::Outbound,
+        );
+        let transfer_batch_inbound = transfer_batch_filter(
+            self.receipt_contract,
+            self.bot_wallet,
+            TransferDirection::Inbound,
+        );
+        let transfer_batch_outbound = transfer_batch_filter(
+            self.receipt_contract,
+            self.bot_wallet,
+            TransferDirection::Outbound,
+        );
 
         info!(
             vault = %self.vault,
@@ -154,15 +171,25 @@ where
         let deposit_sub = self.provider.subscribe_logs(&deposit_filter).await?;
         let withdraw_sub =
             self.provider.subscribe_logs(&withdraw_filter).await?;
-        let transfer_single_sub =
-            self.provider.subscribe_logs(&transfer_single_filter).await?;
-        let transfer_batch_sub =
-            self.provider.subscribe_logs(&transfer_batch_filter).await?;
+        let transfer_single_inbound_sub =
+            self.provider.subscribe_logs(&transfer_single_inbound).await?;
+        let transfer_single_outbound_sub =
+            self.provider.subscribe_logs(&transfer_single_outbound).await?;
+        let transfer_batch_inbound_sub =
+            self.provider.subscribe_logs(&transfer_batch_inbound).await?;
+        let transfer_batch_outbound_sub =
+            self.provider.subscribe_logs(&transfer_batch_outbound).await?;
 
         let mut deposit_stream = deposit_sub.into_stream();
         let mut withdraw_stream = withdraw_sub.into_stream();
-        let mut transfer_single_stream = transfer_single_sub.into_stream();
-        let mut transfer_batch_stream = transfer_batch_sub.into_stream();
+        let mut transfer_single_inbound_stream =
+            transfer_single_inbound_sub.into_stream();
+        let mut transfer_single_outbound_stream =
+            transfer_single_outbound_sub.into_stream();
+        let mut transfer_batch_inbound_stream =
+            transfer_batch_inbound_sub.into_stream();
+        let mut transfer_batch_outbound_stream =
+            transfer_batch_outbound_sub.into_stream();
 
         info!("Receipt monitor WebSocket subscription active");
 
@@ -186,7 +213,7 @@ where
                         warn!("Failed to process Withdraw: {err}");
                     }
                 }
-                Some(log) = transfer_single_stream.next() => {
+                Some(log) = transfer_single_inbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferSingle log (reorg)");
                         continue;
@@ -195,7 +222,25 @@ where
                         warn!("Failed to process TransferSingle: {err}");
                     }
                 }
-                Some(log) = transfer_batch_stream.next() => {
+                Some(log) = transfer_single_outbound_stream.next() => {
+                    if log.removed {
+                        debug!("Skipping removed TransferSingle log (reorg)");
+                        continue;
+                    }
+                    if let Err(err) = self.process_transfer_single(&log).await {
+                        warn!("Failed to process TransferSingle: {err}");
+                    }
+                }
+                Some(log) = transfer_batch_inbound_stream.next() => {
+                    if log.removed {
+                        debug!("Skipping removed TransferBatch log (reorg)");
+                        continue;
+                    }
+                    if let Err(err) = self.process_transfer_batch(&log).await {
+                        warn!("Failed to process TransferBatch: {err}");
+                    }
+                }
+                Some(log) = transfer_batch_outbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferBatch log (reorg)");
                         continue;
@@ -518,25 +563,58 @@ where
     }
 }
 
-/// Builds a log filter for ERC-1155 TransferSingle events on the given contract.
-pub(crate) fn transfer_single_filter(receipt_contract: Address) -> Filter {
-    Filter::new()
-        .address(receipt_contract)
-        .event_signature(Receipt::TransferSingle::SIGNATURE_HASH)
+/// Direction of token transfer relative to the bot wallet.
+///
+/// ERC-1155 TransferSingle/TransferBatch events have indexed `from` (topic2)
+/// and `to` (topic3) fields. Using directional filters reduces RPC payload
+/// by filtering at the node level rather than client-side.
+#[derive(Clone, Copy)]
+pub(crate) enum TransferDirection {
+    /// Tokens received: `to == bot_wallet` (topic3)
+    Inbound,
+    /// Tokens sent: `from == bot_wallet` (topic2)
+    Outbound,
 }
 
-/// Builds a log filter for ERC-1155 TransferBatch events on the given contract.
-pub(crate) fn transfer_batch_filter(receipt_contract: Address) -> Filter {
-    Filter::new()
+/// Builds a log filter for ERC-1155 TransferSingle events on the given
+/// contract, filtered by indexed topic for the specified direction.
+pub(crate) fn transfer_single_filter(
+    receipt_contract: Address,
+    bot_wallet: Address,
+    direction: TransferDirection,
+) -> Filter {
+    let base = Filter::new()
         .address(receipt_contract)
-        .event_signature(Receipt::TransferBatch::SIGNATURE_HASH)
+        .event_signature(Receipt::TransferSingle::SIGNATURE_HASH);
+
+    match direction {
+        TransferDirection::Inbound => base.topic3(bot_wallet.into_word()),
+        TransferDirection::Outbound => base.topic2(bot_wallet.into_word()),
+    }
+}
+
+/// Builds a log filter for ERC-1155 TransferBatch events on the given
+/// contract, filtered by indexed topic for the specified direction.
+pub(crate) fn transfer_batch_filter(
+    receipt_contract: Address,
+    bot_wallet: Address,
+    direction: TransferDirection,
+) -> Filter {
+    let base = Filter::new()
+        .address(receipt_contract)
+        .event_signature(Receipt::TransferBatch::SIGNATURE_HASH);
+
+    match direction {
+        TransferDirection::Inbound => base.topic3(bot_wallet.into_word()),
+        TransferDirection::Outbound => base.topic2(bot_wallet.into_word()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, Bytes, U256, address, b256, uint};
     use alloy::providers::ProviderBuilder;
-    use alloy::rpc::types::Log as RpcLog;
+    use alloy::rpc::types::{Filter, Log as RpcLog};
     use alloy::sol_types::SolEvent;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{AggregateContext, CqrsFramework};
@@ -1381,7 +1459,7 @@ mod tests {
         let monitor =
             ReceiptMonitor::new(provider, config, cqrs.clone(), NoOpHandler);
 
-        // Mint transfer: from == address(0) — should be skipped
+        // Mint transfer: from == address(0)
         let mint_log = create_transfer_single_log(TransferSingleLogParams {
             receipt_contract,
             operator: bot_wallet,
@@ -1395,6 +1473,7 @@ mod tests {
             block_number: 100,
         });
 
+        // Route through monitor — should be skipped (no state changes)
         monitor.process_transfer_single(&mint_log).await.unwrap();
 
         // Verify: only the pre-existing receipt remains, unchanged
@@ -1457,7 +1536,7 @@ mod tests {
         let monitor =
             ReceiptMonitor::new(provider, config, cqrs.clone(), NoOpHandler);
 
-        // Burn transfer: to == address(0) — should be skipped
+        // Burn transfer: to == address(0)
         let burn_log = create_transfer_single_log(TransferSingleLogParams {
             receipt_contract,
             operator: bot_wallet,
@@ -1471,6 +1550,7 @@ mod tests {
             block_number: 200,
         });
 
+        // Route through monitor — should be skipped (no state changes)
         monitor.process_transfer_single(&burn_log).await.unwrap();
 
         // Verify: only the pre-existing receipt remains, unchanged
@@ -1700,6 +1780,101 @@ mod tests {
         );
     }
 
+    /// Verifies that `transfer_single_filter` and `transfer_batch_filter`
+    /// bind `bot_wallet` to the correct ERC-1155 indexed topic slot:
+    ///   Inbound  → topic3 (to)
+    ///   Outbound → topic2 (from)
+    ///
+    /// A flipped index would silently miss all relevant transfer events
+    /// while still compiling, so this regression test is load-bearing.
+    #[test]
+    fn test_transfer_filters_use_correct_topic_indices() {
+        let receipt_contract =
+            address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let wallet_word = bot_wallet.into_word();
+
+        // Helper: assert that exactly one of topic2/topic3 contains the
+        // wallet and the other is empty.
+        let assert_topic_placement =
+            |filter: &Filter, expect_topic2: bool, label: &str| {
+                let topics = &filter.topics;
+
+                if expect_topic2 {
+                    assert!(
+                        topics[2].matches(&wallet_word),
+                        "{label}: expected topic2 to contain bot_wallet"
+                    );
+                    assert!(
+                        topics[3].is_empty(),
+                        "{label}: expected topic3 to be empty"
+                    );
+                } else {
+                    assert!(
+                        topics[2].is_empty(),
+                        "{label}: expected topic2 to be empty"
+                    );
+                    assert!(
+                        topics[3].matches(&wallet_word),
+                        "{label}: expected topic3 to contain bot_wallet"
+                    );
+                }
+
+                // topic0 should always be the event signature
+                assert!(
+                    !topics[0].is_empty(),
+                    "{label}: expected topic0 (event signature) to be set"
+                );
+            };
+
+        // TransferSingle
+        let single_in = transfer_single_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Inbound,
+        );
+        assert_topic_placement(&single_in, false, "TransferSingle Inbound");
+
+        let single_out = transfer_single_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Outbound,
+        );
+        assert_topic_placement(&single_out, true, "TransferSingle Outbound");
+
+        // TransferBatch
+        let batch_in = transfer_batch_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Inbound,
+        );
+        assert_topic_placement(&batch_in, false, "TransferBatch Inbound");
+
+        let batch_out = transfer_batch_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Outbound,
+        );
+        assert_topic_placement(&batch_out, true, "TransferBatch Outbound");
+
+        // Verify event signatures differ between Single and Batch
+        assert_ne!(
+            single_in.topics[0], batch_in.topics[0],
+            "TransferSingle and TransferBatch should have different event signatures"
+        );
+
+        // Verify event signatures match expected hashes
+        assert!(
+            single_in.topics[0]
+                .matches(&Receipt::TransferSingle::SIGNATURE_HASH),
+            "TransferSingle filter should use TransferSingle signature"
+        );
+        assert!(
+            batch_in.topics[0].matches(&Receipt::TransferBatch::SIGNATURE_HASH),
+            "TransferBatch filter should use TransferBatch signature"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_transfer_single_ignores_unrelated_wallets() {
@@ -1760,6 +1935,7 @@ mod tests {
             block_number: 100,
         });
 
+        // Route through monitor — should be a no-op (neither from nor to is bot_wallet)
         monitor.process_transfer_single(&log).await.unwrap();
 
         // Verify: pre-existing receipt is untouched, no new receipts added

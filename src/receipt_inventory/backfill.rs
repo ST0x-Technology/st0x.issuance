@@ -8,7 +8,9 @@ use itertools::Itertools;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use super::monitor::{transfer_batch_filter, transfer_single_filter};
+use super::monitor::{
+    TransferDirection, transfer_batch_filter, transfer_single_filter,
+};
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, Shares, determine_source,
@@ -236,26 +238,35 @@ where
 
         // Also scan ERC-1155 TransferSingle and TransferBatch events on the
         // Receipt contract for inbound transfers to the bot wallet.
+        // Topic3 (to) is indexed, so we filter at the RPC level.
         let transfer_single_logs = self
             .provider
             .get_logs(
-                &transfer_single_filter(self.receipt_contract)
-                    .from_block(from_block)
-                    .to_block(to_block),
+                &transfer_single_filter(
+                    self.receipt_contract,
+                    self.bot_wallet,
+                    TransferDirection::Inbound,
+                )
+                .from_block(from_block)
+                .to_block(to_block),
             )
             .await?;
 
         let transfer_batch_logs = self
             .provider
             .get_logs(
-                &transfer_batch_filter(self.receipt_contract)
-                    .from_block(from_block)
-                    .to_block(to_block),
+                &transfer_batch_filter(
+                    self.receipt_contract,
+                    self.bot_wallet,
+                    TransferDirection::Inbound,
+                )
+                .from_block(from_block)
+                .to_block(to_block),
             )
             .await?;
 
-        // Filter transfer events: keep only inbound (to == bot_wallet),
-        // skip mint transfers (from == address(0)) since Deposit covers those.
+        // Sanity guard: topic filtering already restricts to inbound (to == bot_wallet),
+        // but we still skip mint transfers (from == address(0)) since Deposit covers those.
         for log in transfer_single_logs {
             let event = Receipt::TransferSingle::decode_log(&log.inner)?;
 
