@@ -350,13 +350,17 @@ pub async fn initialize_rocket(
         &MintRecoveryHandler::new(mint.cqrs.clone()),
     );
 
-    // Recovery runs AFTER reprojections and backfill so it can query accurate state
-    spawn_mint_recovery(pool.clone(), mint.cqrs.clone());
-    spawn_redemption_recovery(
-        managers.redeem_call.clone(),
-        managers.journal.clone(),
-        managers.burn.clone(),
-    );
+    // Recovery runs AFTER reprojections and backfill so it can query accurate state.
+    // Recovery must complete BEFORE the HTTP server starts accepting requests to
+    // prevent race conditions between recovery and incoming confirm/redeem requests
+    // that could cause duplicate side effects (e.g., duplicate Alpaca callbacks).
+    run_mint_recovery(&pool, &mint.cqrs).await;
+    run_redemption_recovery(
+        &managers.redeem_call,
+        &managers.journal,
+        &managers.burn,
+    )
+    .await;
 
     spawn_all_redemption_detectors(
         &config.rpc_url,
@@ -662,52 +666,47 @@ fn spawn_redemption_detector(
     });
 }
 
-fn spawn_mint_recovery(pool: Pool<Sqlite>, mint_cqrs: MintCqrs) {
-    info!("Spawning mint recovery task");
+async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_cqrs: &MintCqrs) {
+    info!("Running mint recovery");
 
-    tokio::spawn(async move {
-        let recoverable_mints = match find_all_recoverable_mints(&pool).await {
-            Ok(mints) => mints,
-            Err(err) => {
-                error!(error = %err, "Failed to query recoverable mints");
-                return;
-            }
-        };
-
-        if recoverable_mints.is_empty() {
-            info!("No mints to recover");
+    let recoverable_mints = match find_all_recoverable_mints(pool).await {
+        Ok(mints) => mints,
+        Err(err) => {
+            error!(error = %err, "Failed to query recoverable mints");
             return;
         }
+    };
 
-        info!(count = recoverable_mints.len(), "Recovering mints");
+    if recoverable_mints.is_empty() {
+        info!("No mints to recover");
+        return;
+    }
 
-        for (issuer_request_id, _view) in recoverable_mints {
-            recover_mint(&mint_cqrs, issuer_request_id).await;
-        }
-    });
+    let count = recoverable_mints.len();
+    info!(count, "Recovering mints");
+
+    for (issuer_request_id, _view) in recoverable_mints {
+        recover_mint(mint_cqrs, issuer_request_id).await;
+    }
+
+    info!(count, "Mint recovery complete");
 }
 
-fn spawn_redemption_recovery(
-    redeem_call: Arc<
-        RedeemCallManager<
-            PersistedEventStore<SqliteEventRepository, Redemption>,
-        >,
+async fn run_redemption_recovery(
+    redeem_call: &RedeemCallManager<
+        PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
-    journal: Arc<
-        JournalManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    journal: &JournalManager<
+        PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
-    burn: Arc<
-        BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
-    >,
+    burn: &BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
 ) {
-    info!("Spawning redemption recovery task");
+    info!("Running redemption recovery");
 
-    tokio::spawn(async move {
-        redeem_call.recover_detected_redemptions().await;
-        journal.recover_alpaca_called_redemptions().await;
-        burn.recover_burning_redemptions().await;
-        burn.recover_burn_failed_redemptions().await;
-    });
+    redeem_call.recover_detected_redemptions().await;
+    journal.recover_alpaca_called_redemptions().await;
+    burn.recover_burning_redemptions().await;
+    burn.recover_burn_failed_redemptions().await;
 }
 
 /// Configuration for a single vault, extracted from TokenizedAssetView.
