@@ -268,8 +268,8 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>, RainMetaError> {
 /// Transient failures are NOT cached, allowing retries on subsequent calls.
 pub(crate) struct OaSchemaCache {
     mode: OaSchemaCacheMode,
-    /// `Some(hash)` = successfully fetched, `None` = vault has no schema
-    /// (permanently cached). Absent key = not yet fetched or last fetch failed.
+    /// Only positive results (`Some(hash)`) are cached. Absent key means not
+    /// yet fetched, last fetch failed, or vault had no schema (all retried).
     cache: Arc<RwLock<HashMap<Address, Option<String>>>>,
 }
 
