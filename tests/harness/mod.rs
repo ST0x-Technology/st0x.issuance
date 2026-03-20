@@ -7,6 +7,7 @@
 
 pub mod alpaca_mocks;
 
+use alloy::hex;
 use alloy::primitives::{Address, U256};
 use chrono::Utc;
 use httpmock::Mock;
@@ -14,6 +15,7 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::collections::HashMap;
 use url::Url;
 
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
@@ -279,40 +281,98 @@ pub async fn setup_account(
     link_body
 }
 
+/// Schema hash used by the mock subgraph in e2e tests.
+pub const TEST_OA_SCHEMA_HASH: &str =
+    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
+
+/// Builds a mock Rain meta v1 `information` hex string containing the given
+/// schema hash, suitable for the subgraph `receiptVaultInformations` response.
+fn mock_information_hex(schema_hash: &str) -> String {
+    let schema_hex = hex::encode(schema_hash);
+    let payload_hex = format!("78{:02x}{schema_hex}", schema_hash.len());
+
+    // Rain meta v1 prefix + OA_SCHEMA CBOR item + OA_HASH_LIST CBOR item
+    format!(
+        "0xff0a89c674ee7874\
+         a40058020000011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465\
+         a200{payload_hex}011bff9fae3cc645f463"
+    )
+}
+
+/// Sets up a mock subgraph server that returns `OA_SCHEMA` hashes for specific
+/// vaults. Each entry maps a vault address to a schema hash. The mock validates
+/// the request body contains the expected vault address (as lowercase hex),
+/// ensuring `OaSchemaCache` sends correct per-vault GraphQL queries.
+pub fn setup_mock_subgraph(
+    vault_schemas: &HashMap<Address, &str>,
+) -> MockServer {
+    let server = MockServer::start();
+
+    for (vault, schema_hash) in vault_schemas {
+        let vault_hex = format!("{vault:#x}");
+        let information = mock_information_hex(schema_hash);
+
+        server.mock(|when, then| {
+            when.method(POST).path("/").body_includes(&vault_hex);
+            then.status(200).json_body(json!({
+                "data": {
+                    "receiptVaultInformations": [{
+                        "information": information
+                    }]
+                }
+            }));
+        });
+    }
+
+    server
+}
+
+/// Returns `(Config, MockServer)` — the caller must keep the `MockServer` alive
+/// for the duration of the test so the subgraph mock remains reachable.
 pub fn create_config_with_db(
     db_path: &str,
     mock_alpaca: &MockServer,
     evm: &LocalEvm,
-) -> Result<Config, Box<dyn std::error::Error>> {
-    Ok(Config {
-        database_url: db_path.to_string(),
-        database_max_connections: 5,
-        rpc_url: Url::parse(&evm.endpoint)?,
-        chain_id: ANVIL_CHAIN_ID,
-        signer: SignerConfig::Local(evm.private_key),
-        backfill_start_block: 0,
-        auth: AuthConfig {
-            issuer_api_key: "test-key-12345678901234567890123456"
-                .parse()
-                .expect("Valid API key"),
-            alpaca_ip_ranges: IpWhitelist::single(
-                "127.0.0.1/32".parse().expect("Valid IP range"),
-            ),
-            internal_ip_ranges: "127.0.0.0/8,::1/128"
-                .parse()
-                .expect("Valid IP ranges"),
+) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
+    let vault_schemas =
+        HashMap::from([(evm.vault_address, TEST_OA_SCHEMA_HASH)]);
+    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
+    let subgraph_url =
+        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+
+    Ok((
+        Config {
+            database_url: db_path.to_string(),
+            database_max_connections: 5,
+            rpc_url: Url::parse(&evm.endpoint)?,
+            chain_id: ANVIL_CHAIN_ID,
+            signer: SignerConfig::Local(evm.private_key),
+            backfill_start_block: 0,
+            auth: AuthConfig {
+                issuer_api_key: "test-key-12345678901234567890123456"
+                    .parse()
+                    .expect("Valid API key"),
+                alpaca_ip_ranges: IpWhitelist::single(
+                    "127.0.0.1/32".parse().expect("Valid IP range"),
+                ),
+                internal_ip_ranges: "127.0.0.0/8,::1/128"
+                    .parse()
+                    .expect("Valid IP ranges"),
+            },
+            log_level: LogLevel::Debug,
+            hyperdx: None,
+            alpaca: AlpacaConfig {
+                api_base_url: mock_alpaca.base_url(),
+                account_id: "test-account".to_string(),
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+                connect_timeout_secs: 10,
+                request_timeout_secs: 30,
+            },
+            subgraph_url,
         },
-        log_level: LogLevel::Debug,
-        hyperdx: None,
-        alpaca: AlpacaConfig {
-            api_base_url: mock_alpaca.base_url(),
-            account_id: "test-account".to_string(),
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-        },
-    })
+        mock_subgraph,
+    ))
 }
 
 pub async fn setup_roles(

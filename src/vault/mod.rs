@@ -9,6 +9,7 @@ use crate::mint::{
 use crate::redemption::IssuerRedemptionRequestId;
 
 pub(crate) mod mock;
+pub(crate) mod rain_meta;
 pub(crate) mod service;
 
 /// Service abstraction for vault operations.
@@ -112,6 +113,10 @@ pub(crate) struct MintResult {
     pub(crate) gas_used: u64,
     /// Block number where the transaction was included
     pub(crate) block_number: u64,
+    /// The exact encoded bytes passed to deposit() on-chain.
+    /// Preserved so that register_minted_receipt stores the same bytes
+    /// that were committed on-chain, avoiding encoding mismatches.
+    pub(crate) receipt_info_bytes: Bytes,
 }
 
 /// A single burn within a multi-receipt burn operation.
@@ -124,6 +129,12 @@ pub(crate) struct MultiBurnEntry {
     /// Original mint's receipt information (for on-chain audit trail).
     /// `None` for external receipts or receipts minted before this feature.
     pub(crate) receipt_info: Option<ReceiptInformation>,
+    /// Original on-chain encoded bytes from the deposit event.
+    /// When present, these exact bytes are passed to redeem() to preserve
+    /// the original encoding (avoiding re-encoding legacy JSON as CBOR).
+    /// Falls back to encoding `receipt_info` when absent (old events).
+    #[serde(default)]
+    pub(crate) receipt_info_bytes: Option<Bytes>,
 }
 
 /// Parameters for a multi-receipt burn operation.
@@ -171,10 +182,13 @@ pub(crate) struct MultiBurnResult {
 
 /// Metadata emitted on-chain with each vault deposit and withdrawal.
 ///
-/// Serialized to JSON bytes and passed as the `receiptInformation` parameter
-/// to `deposit()` and `redeem()`. The contract emits this data in events,
-/// providing an on-chain audit trail linking receipts to off-chain
-/// tokenization requests.
+/// Encoded as a Rain metadata v1 document (CBOR with magic prefix) and passed
+/// as the `receiptInformation` parameter to `deposit()` and `redeem()`. The
+/// contract emits this data in events, providing an on-chain audit trail
+/// linking receipts to off-chain tokenization requests.
+///
+/// The encoding uses the `OA_STRUCTURE` magic number with deflated JSON payload,
+/// matching the format expected by the h20.market UI.
 ///
 /// Only constructed for mints (deposits). When burning (withdrawing),
 /// the original mint's `ReceiptInformation` is passed back to the contract.
@@ -207,10 +221,28 @@ impl ReceiptInformation {
         }
     }
 
-    /// Encodes the receipt information as JSON bytes for on-chain storage.
-    pub(crate) fn encode(&self) -> Result<Bytes, serde_json::Error> {
-        serde_json::to_vec(self).map(Bytes::from)
+    /// Encodes the receipt information as a Rain metadata v1 document.
+    ///
+    /// Format: rain meta prefix + CBOR map with deflated JSON payload,
+    /// `OA_STRUCTURE` magic number, and optional `OA_SCHEMA` IPFS CID.
+    pub(crate) fn encode(
+        &self,
+        oa_schema: Option<&str>,
+    ) -> Result<Bytes, ReceiptEncodeError> {
+        let json_bytes = serde_json::to_vec(self)?;
+        let rain_meta = rain_meta::encode_receipt_meta(&json_bytes, oa_schema)?;
+        Ok(Bytes::from(rain_meta))
     }
+}
+
+/// Errors that can occur when encoding receipt information.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReceiptEncodeError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error(transparent)]
+    RainMeta(#[from] rain_meta::RainMetaError),
 }
 
 /// Errors that can occur during vault operations.
@@ -225,8 +257,8 @@ pub(crate) enum VaultError {
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
-    #[error("JSON error")]
-    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    ReceiptEncode(#[from] ReceiptEncodeError),
     /// Failed to get transaction receipt
     #[error(transparent)]
     PendingTransaction(#[from] alloy::providers::PendingTransactionError),
@@ -243,6 +275,9 @@ mod tests {
     use super::*;
     use crate::mint::{IssuerMintRequestId, Quantity, TokenizationRequestId};
 
+    const TEST_OA_SCHEMA: &str =
+        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
+
     fn sample_receipt_information() -> ReceiptInformation {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
@@ -255,12 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn encode_produces_valid_json() {
+    fn encode_produces_rain_meta_with_valid_json_payload() {
         let info = sample_receipt_information();
-        let encoded = info.encode().unwrap();
+        let encoded = info.encode(Some(TEST_OA_SCHEMA)).unwrap();
 
+        assert!(rain_meta::is_rain_meta(&encoded));
+
+        let json_bytes = rain_meta::decode_receipt_meta(&encoded).unwrap();
         let decoded: serde_json::Value =
-            serde_json::from_slice(&encoded).unwrap();
+            serde_json::from_slice(&json_bytes).unwrap();
 
         assert_eq!(
             decoded["tokenization_request_id"].as_str(),
@@ -276,12 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_roundtrips_through_deserialize() {
+    fn encode_roundtrips_through_rain_meta() {
         let original = sample_receipt_information();
 
-        let encoded = original.encode().unwrap();
+        let encoded = original.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let json_bytes = rain_meta::decode_receipt_meta(&encoded).unwrap();
         let decoded: ReceiptInformation =
-            serde_json::from_slice(&encoded).unwrap();
+            serde_json::from_slice(&json_bytes).unwrap();
 
         assert_eq!(decoded.issuer_request_id, original.issuer_request_id);
     }
@@ -297,9 +336,10 @@ mod tests {
             None,
         );
 
-        let encoded = info.encode().unwrap();
+        let encoded = info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        let json_bytes = rain_meta::decode_receipt_meta(&encoded).unwrap();
         let decoded: serde_json::Value =
-            serde_json::from_slice(&encoded).unwrap();
+            serde_json::from_slice(&json_bytes).unwrap();
 
         assert!(decoded["notes"].is_null());
     }

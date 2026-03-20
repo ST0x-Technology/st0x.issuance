@@ -1,7 +1,9 @@
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
+use std::sync::Arc;
 
+use super::rain_meta::OaSchemaCache;
 use super::{MintResult, ReceiptInformation, VaultError, VaultService};
 use crate::bindings::OffchainAssetReceiptVault;
 
@@ -12,6 +14,7 @@ use crate::bindings::OffchainAssetReceiptVault;
 /// for testing.
 pub(crate) struct RealBlockchainService<P> {
     provider: P,
+    oa_schema_cache: Arc<OaSchemaCache>,
 }
 
 impl<P: Provider + Clone> RealBlockchainService<P> {
@@ -20,8 +23,12 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
     /// # Arguments
     ///
     /// * `provider` - Alloy provider for blockchain communication
-    pub(crate) const fn new(provider: P) -> Self {
-        Self { provider }
+    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
+    pub(crate) const fn new(
+        provider: P,
+        oa_schema_cache: Arc<OaSchemaCache>,
+    ) -> Self {
+        Self { provider, oa_schema_cache }
     }
 }
 
@@ -37,7 +44,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
-        let receipt_info_bytes = receipt_info.encode()?;
+        let oa_schema = self.oa_schema_cache.get(vault).await;
+        let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.provider);
@@ -50,7 +58,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // Encode deposit call - mints shares + receipts to bot
         let deposit_call = vault_contract
-            .deposit(assets, bot, share_ratio, receipt_info_bytes)
+            .deposit(assets, bot, share_ratio, receipt_info_bytes.clone())
             .calldata()
             .clone();
 
@@ -92,6 +100,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             shares_minted,
             gas_used,
             block_number,
+            receipt_info_bytes,
         })
     }
 
@@ -113,16 +122,30 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
 
+        let needs_encoding = params.burns.iter().any(|b| {
+            b.receipt_info_bytes.is_none() && b.receipt_info.is_some()
+        });
+
+        let oa_schema = if needs_encoding {
+            self.oa_schema_cache.get(params.vault).await
+        } else {
+            None
+        };
+
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
             .map(|burn| {
-                let receipt_info_bytes = burn
-                    .receipt_info
-                    .as_ref()
-                    .map(ReceiptInformation::encode)
-                    .transpose()?
-                    .unwrap_or_default();
+                let receipt_bytes = if let Some(raw) = &burn.receipt_info_bytes
+                {
+                    raw.clone()
+                } else {
+                    burn.receipt_info
+                        .as_ref()
+                        .map(|info| info.encode(oa_schema.as_deref()))
+                        .transpose()?
+                        .unwrap_or_default()
+                };
 
                 Ok(vault_contract
                     .redeem(
@@ -130,7 +153,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                         params.user,
                         params.owner,
                         burn.receipt_id,
-                        receipt_info_bytes,
+                        receipt_bytes,
                     )
                     .calldata()
                     .clone())
@@ -208,6 +231,7 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use std::sync::Arc;
 
     use super::RealBlockchainService;
     use crate::bindings::OffchainAssetReceiptVault;
@@ -215,10 +239,14 @@ mod tests {
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::redemption::IssuerRedemptionRequestId;
+    use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
         MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
         VaultService,
     };
+
+    const TEST_OA_SCHEMA: &str =
+        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
@@ -279,7 +307,10 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        RealBlockchainService::new(provider)
+        RealBlockchainService::new(
+            provider,
+            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
+        )
     }
 
     #[tokio::test]
@@ -398,7 +429,10 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider);
+        let service = RealBlockchainService::new(
+            provider,
+            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
+        );
 
         let result = service
             .mint_and_transfer_shares(
@@ -506,7 +540,10 @@ mod tests {
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
-        let service = RealBlockchainService::new(provider);
+        let service = RealBlockchainService::new(
+            provider,
+            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
+        );
 
         let result = service
             .mint_and_transfer_shares(
@@ -585,7 +622,8 @@ mod tests {
 
         let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
 
-        let receipt_info_bytes = receipt_info.encode().unwrap();
+        let receipt_info_bytes =
+            receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
         let share_ratio = U256::from(10).pow(U256::from(18));
 
         let deposit_call = vault
@@ -731,6 +769,7 @@ mod tests {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     })
                     .collect(),
                 dust_shares: U256::ZERO,
@@ -789,6 +828,7 @@ mod tests {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     })
                     .collect(),
                 dust_shares,
@@ -846,6 +886,7 @@ mod tests {
                         receipt_id: *receipt_id,
                         burn_shares: *burn_shares,
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     })
                     .collect(),
                 dust_shares: U256::ZERO,
@@ -903,11 +944,13 @@ mod tests {
                         receipt_id: U256::from(1),
                         burn_shares: U256::from(100),
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     },
                     MultiBurnEntry {
                         receipt_id: U256::from(2),
                         burn_shares: U256::from(200),
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     },
                 ],
                 dust_shares: U256::ZERO,

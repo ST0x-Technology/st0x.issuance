@@ -227,6 +227,7 @@ where
                 receipt_id: allocation.receipt.receipt_id.inner(),
                 burn_shares: allocation.burn_amount.inner(),
                 receipt_info: allocation.receipt.receipt_info,
+                receipt_info_bytes: allocation.receipt.receipt_info_bytes,
             })
             .collect();
 
@@ -524,6 +525,7 @@ where
                 receipt_id: alloc.receipt.receipt_id.inner(),
                 burn_shares: alloc.burn_amount.inner(),
                 receipt_info: alloc.receipt.receipt_info,
+                receipt_info_bytes: alloc.receipt.receipt_info_bytes,
             })
             .collect();
 
@@ -618,7 +620,7 @@ pub(crate) enum BurnManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256, uint};
+    use alloy::primitives::{Address, Bytes, U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::{
         AggregateContext, EventStore,
@@ -776,6 +778,7 @@ mod tests {
                         ),
                         source: ReceiptSource::External,
                         receipt_info: None,
+                        receipt_info_bytes: None,
                     },
                 )
                 .await
@@ -957,7 +960,8 @@ mod tests {
                     source: ReceiptSource::Itn {
                         issuer_request_id: IssuerMintRequestId::random(),
                     },
-                    receipt_info: Some(receipt_info.clone()),
+                    receipt_info: Some(Box::new(receipt_info.clone())),
+                    receipt_info_bytes: None,
                 },
             )
             .await
@@ -987,6 +991,98 @@ mod tests {
             params.burns[0].receipt_info.as_ref(),
             Some(&receipt_info),
             "MultiBurnEntry should preserve the original receipt_info"
+        );
+    }
+
+    /// Verifies that when a receipt has `receipt_info_bytes` set, those exact
+    /// bytes flow through to `MultiBurnParams` for the vault service to pass
+    /// back to `redeem()` without re-encoding.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_receipt_info_bytes_flows_through_to_multi_burn_params() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness {
+            cqrs,
+            store,
+            receipt_service,
+            receipt_inventory_cqrs,
+            pool,
+            ..
+        } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let receipt_info = ReceiptInformation::new(
+            TokenizationRequestId::new("tok-bytes-test"),
+            IssuerMintRequestId::random(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity::new(Decimal::from(50)),
+            Utc::now(),
+            None,
+        );
+
+        let raw_bytes = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        receipt_inventory_cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(uint!(99_U256)),
+                    balance: Shares::from(
+                        uint!(100_000000000000000000_U256),
+                    ),
+                    block_number: 1,
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    source: ReceiptSource::Itn {
+                        issuer_request_id: IssuerMintRequestId::random(),
+                    },
+                    receipt_info: Some(Box::new(receipt_info)),
+                    receipt_info_bytes: Some(raw_bytes.clone()),
+                },
+            )
+            .await
+            .expect("Failed to discover receipt with receipt_info_bytes");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let aggregate = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        let params = vault_mock
+            .get_last_multi_burn_params()
+            .expect("Expected multi_burn to have been called");
+
+        assert_eq!(params.burns.len(), 1);
+        assert_eq!(
+            params.burns[0].receipt_info_bytes.as_ref(),
+            Some(&raw_bytes),
+            "MultiBurnEntry should preserve the original receipt_info_bytes"
         );
     }
 

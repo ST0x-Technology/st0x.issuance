@@ -152,15 +152,22 @@ impl VaultService for MockVaultService {
         }
 
         match &self.behavior {
-            MockBehavior::Success => Ok(MintResult {
-                tx_hash: b256!(
-                    "0x4242424242424242424242424242424242424242424242424242424242424242"
-                ),
-                receipt_id: U256::from(1),
-                shares_minted: assets,
-                gas_used: 21000,
-                block_number: 1000,
-            }),
+            MockBehavior::Success => {
+                let receipt_info_bytes = receipt_info.encode(Some(
+                    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm",
+                ))?;
+
+                Ok(MintResult {
+                    tx_hash: b256!(
+                        "0x4242424242424242424242424242424242424242424242424242424242424242"
+                    ),
+                    receipt_id: U256::from(1),
+                    shares_minted: assets,
+                    gas_used: 21000,
+                    block_number: 1000,
+                    receipt_info_bytes,
+                })
+            }
             #[cfg(test)]
             MockBehavior::Failure => Err(VaultError::InvalidReceipt),
         }
@@ -446,6 +453,7 @@ mod tests {
                 receipt_id: U256::from(42),
                 burn_shares: U256::from(500),
                 receipt_info: Some(test_receipt_info()),
+                receipt_info_bytes: None,
             }],
             dust_shares: U256::from(10),
             owner: test_receiver(),

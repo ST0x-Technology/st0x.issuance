@@ -295,6 +295,7 @@ mod tests {
                 ),
                 source: ReceiptSource::External,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         )
         .await

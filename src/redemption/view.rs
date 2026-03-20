@@ -617,6 +617,7 @@ mod tests {
                             receipt_id: U256::from(1),
                             burn_shares: U256::from(100),
                             receipt_info: None,
+                            receipt_info_bytes: None,
                         }],
                         dust_shares: U256::ZERO,
                         owner: address!(
