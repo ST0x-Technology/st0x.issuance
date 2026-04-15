@@ -12,6 +12,7 @@ use crate::fireblocks::{
     resolve_local_signer,
 };
 use crate::telemetry::HyperDxConfig;
+use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
 pub(crate) struct BlockchainSetup<P> {
@@ -34,6 +35,7 @@ pub struct Config {
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
+    pub subgraph_url: Url,
 }
 
 impl Config {
@@ -68,6 +70,9 @@ impl Config {
             });
         }
 
+        let oa_schema_cache =
+            Arc::new(OaSchemaCache::new(self.subgraph_url.clone())?);
+
         let vault_service: Arc<dyn VaultService> = match &self.signer {
             SignerConfig::Local(key) => {
                 let resolved = resolve_local_signer(key, self.chain_id)
@@ -78,7 +83,10 @@ impl Config {
                     .connect(self.rpc_url.as_str())
                     .await?;
 
-                Arc::new(RealBlockchainService::new(signing_provider))
+                Arc::new(RealBlockchainService::new(
+                    signing_provider,
+                    oa_schema_cache.clone(),
+                ))
             }
 
             SignerConfig::Fireblocks(env) => {
@@ -86,6 +94,7 @@ impl Config {
                     env,
                     provider.clone(),
                     self.chain_id,
+                    oa_schema_cache.clone(),
                 )
                 .map_err(|err| ConfigError::FireblocksVault(Box::new(err)))?;
 
@@ -154,6 +163,13 @@ struct Env {
 
     #[clap(flatten)]
     pub(crate) alpaca: AlpacaConfig,
+
+    #[arg(
+        long,
+        env = "SUBGRAPH_URL",
+        help = "Goldsky subgraph URL for querying OA schema hashes"
+    )]
+    subgraph_url: Url,
 }
 
 impl Env {
@@ -161,6 +177,15 @@ impl Env {
         let log_level_tracing = (&self.log_level).into();
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
         let signer = self.signer.into_config()?;
+
+        match self.subgraph_url.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(ConfigError::InvalidSubgraphScheme(
+                    scheme.to_string(),
+                ));
+            }
+        }
 
         Ok(Config {
             database_url: self.database_url,
@@ -173,6 +198,7 @@ impl Env {
             log_level: self.log_level,
             hyperdx,
             alpaca: self.alpaca,
+            subgraph_url: self.subgraph_url,
         })
     }
 }
@@ -240,6 +266,10 @@ pub enum ConfigError {
     ParseError(#[from] clap::Error),
     #[error("Fireblocks vault service initialization failed: {0}")]
     FireblocksVault(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error("SUBGRAPH_URL must use http or https scheme, got: {0}")]
+    InvalidSubgraphScheme(String),
     #[error(
         "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
     )]
@@ -283,6 +313,8 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
+            "--subgraph-url",
+            "http://localhost:0/subgraph",
         ]
     }
 
@@ -385,11 +417,41 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
+            "--subgraph-url",
+            "http://localhost:0/subgraph",
         ];
 
         let result = Env::try_parse_from(args);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wss_subgraph_url_rejected() {
+        let args = vec![
+            "test-binary",
+            "--rpc-url",
+            "wss://localhost:8545",
+            "--evm-private-key",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--backfill-start-block",
+            "12345678",
+            "--issuer-api-key",
+            "test-key-that-is-at-least-32-chars-long",
+            "--alpaca-account-id",
+            "test-alpaca-account-id",
+            "--alpaca-api-key",
+            "alpaca-test-key",
+            "--alpaca-api-secret",
+            "alpaca-test-secret",
+            "--subgraph-url",
+            "wss://api.goldsky.com/api/public/project_xxx/subgraphs/test/1.0.0/gn",
+        ];
+
+        let env = Env::try_parse_from(args).unwrap();
+        let result = env.into_config();
+
+        assert!(matches!(result, Err(ConfigError::InvalidSubgraphScheme(_))));
     }
 
     #[tokio::test]

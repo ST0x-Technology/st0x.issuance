@@ -1,5 +1,4 @@
-use alloy::primitives::TxHash;
-use alloy::primitives::U256;
+use alloy::primitives::{Bytes, TxHash, U256};
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{AggregateError, EventEnvelope, View};
@@ -85,6 +84,9 @@ pub(crate) struct ReceiptWithBalance {
     pub(crate) tx_hash: TxHash,
     pub(crate) block_number: u64,
     pub(crate) receipt_info: Option<ReceiptInformation>,
+    /// Original on-chain encoded bytes. Used to pass exact deposit bytes back
+    /// to redeem(), avoiding re-encoding legacy JSON receipts as CBOR.
+    pub(crate) receipt_info_bytes: Option<Bytes>,
 }
 
 /// A single allocation within a multi-receipt burn plan.
@@ -568,6 +570,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
             block_number: 0,
             receipt_info: None,
+            receipt_info_bytes: None,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -602,6 +605,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -611,6 +615,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
@@ -620,6 +625,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         ];
 
@@ -660,6 +666,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
             block_number: 0,
             receipt_info: None,
+            receipt_info_bytes: None,
         }];
 
         let burn_amount = Shares::new(uint!(100_000000000000000000_U256));
@@ -689,6 +696,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -698,6 +706,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(3_U256)),
@@ -707,6 +716,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         ];
 
@@ -755,6 +765,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -764,6 +775,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         ];
 
@@ -817,6 +829,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -826,6 +839,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         ];
 
@@ -887,6 +901,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
             block_number: 0,
             receipt_info: None,
+            receipt_info_bytes: None,
         }];
 
         let burn_amount = Shares::new(uint!(50_000000000000000000_U256));
@@ -909,6 +924,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(2_U256)),
@@ -918,6 +934,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             },
         ];
 
@@ -949,6 +966,7 @@ mod tests {
                 tx_hash: TxHash::ZERO,
                 block_number: 0,
                 receipt_info: None,
+                receipt_info_bytes: None,
             }
         }
     }

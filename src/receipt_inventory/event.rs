@@ -1,4 +1,4 @@
-use alloy::primitives::TxHash;
+use alloy::primitives::{Bytes, TxHash};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,12 @@ pub(crate) enum ReceiptInventoryEvent {
         tx_hash: TxHash,
         source: ReceiptSource,
         #[serde(default)]
-        receipt_info: Option<ReceiptInformation>,
+        receipt_info: Option<Box<ReceiptInformation>>,
+        /// Original on-chain encoded bytes for the receipt information.
+        /// Preserved so that redeem() passes back the exact bytes from deposit(),
+        /// avoiding re-encoding legacy JSON receipts as CBOR.
+        #[serde(default)]
+        receipt_info_bytes: Option<Bytes>,
     },
     BalanceReconciled {
         receipt_id: ReceiptId,

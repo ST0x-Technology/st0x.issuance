@@ -243,7 +243,8 @@ mod tests {
                     source: ReceiptSource::Itn {
                         issuer_request_id: issuer_request_id.clone(),
                     },
-                    receipt_info: Some(receipt_info),
+                    receipt_info: Some(Box::new(receipt_info)),
+                    receipt_info_bytes: None,
                 },
             )
             .await

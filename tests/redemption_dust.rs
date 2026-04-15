@@ -287,7 +287,8 @@ async fn test_redemption_returns_dust_to_user()
     )
     .await?;
 
-    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let (config, _mock_subgraph) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -387,7 +388,8 @@ async fn test_redemption_no_dust_when_9_decimals()
     )
     .await?;
 
-    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let (config, _mock_subgraph) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

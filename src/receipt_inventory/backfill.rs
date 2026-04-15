@@ -273,6 +273,11 @@ where
 
         let (source, receipt_info) =
             determine_source(&deposit.receipt_information);
+        let receipt_info_bytes = if deposit.receipt_information.is_empty() {
+            None
+        } else {
+            Some(deposit.receipt_information.clone())
+        };
 
         self.cqrs
             .execute(
@@ -283,12 +288,13 @@ where
                     block_number: deposit.block_number,
                     tx_hash: deposit.tx_hash,
                     source,
-                    receipt_info,
+                    receipt_info: receipt_info.map(Box::new),
+                    receipt_info_bytes,
                 },
             )
             .await?;
 
-        info!(
+        debug!(
             receipt_id = %deposit.receipt_id,
             balance = %current_balance,
             "Processed receipt"
@@ -451,10 +457,10 @@ mod tests {
         );
         assert!(
             logs_contain_at!(
-                tracing::Level::INFO,
+                tracing::Level::DEBUG,
                 &[test, "Processed receipt"]
             ),
-            "Expected INFO log for processed receipt"
+            "Expected DEBUG log for processed receipt"
         );
     }
 
@@ -594,7 +600,7 @@ mod tests {
         );
         assert!(
             !logs_contain_at!(
-                tracing::Level::INFO,
+                tracing::Level::DEBUG,
                 &[test, "Processed receipt"]
             ),
             "Should NOT log processed receipt when all receipts have zero balance"

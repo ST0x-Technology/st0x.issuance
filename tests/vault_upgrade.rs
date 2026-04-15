@@ -14,7 +14,7 @@ async fn test_vault_upgrade_via_add_endpoint()
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
-    let config =
+    let (config, _mock_subgraph) =
         harness::create_config_with_db(":memory:", &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;

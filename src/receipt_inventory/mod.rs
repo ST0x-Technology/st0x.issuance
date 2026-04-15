@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::mint::IssuerMintRequestId;
 use crate::vault::ReceiptInformation;
+use crate::vault::rain_meta;
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
@@ -146,6 +148,20 @@ struct ReceiptMetadata {
     block_number: u64,
     #[serde(default)]
     receipt_info: Option<ReceiptInformation>,
+    #[serde(default)]
+    receipt_info_bytes: Option<Bytes>,
+}
+
+/// Parameters for registering a newly minted receipt.
+pub(crate) struct MintedReceiptParams {
+    pub(crate) vault: Address,
+    pub(crate) receipt_id: ReceiptId,
+    pub(crate) shares: Shares,
+    pub(crate) block_number: u64,
+    pub(crate) tx_hash: B256,
+    pub(crate) receipt_info: ReceiptInformation,
+    /// The exact encoded bytes passed to deposit() on-chain.
+    pub(crate) receipt_info_bytes: Bytes,
 }
 
 /// Provides receipt inventory capabilities for command handlers.
@@ -162,12 +178,7 @@ pub(crate) trait ReceiptService: Send + Sync {
     /// avoids the timing gap.
     async fn register_minted_receipt(
         &self,
-        vault: Address,
-        receipt_id: ReceiptId,
-        shares: Shares,
-        block_number: u64,
-        tx_hash: B256,
-        receipt_info: ReceiptInformation,
+        params: MintedReceiptParams,
     ) -> Result<(), ReceiptRegistrationError>;
 
     /// Returns a burn plan: which receipts to burn and how much from each.
@@ -227,25 +238,21 @@ where
 {
     async fn register_minted_receipt(
         &self,
-        vault: Address,
-        receipt_id: ReceiptId,
-        shares: Shares,
-        block_number: u64,
-        tx_hash: B256,
-        receipt_info: ReceiptInformation,
+        params: MintedReceiptParams,
     ) -> Result<(), ReceiptRegistrationError> {
-        let issuer_request_id = receipt_info.issuer_request_id.clone();
+        let issuer_request_id = params.receipt_info.issuer_request_id.clone();
 
         self.cqrs
             .execute(
-                &vault.to_string(),
+                &params.vault.to_string(),
                 ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id,
-                    balance: shares,
-                    block_number,
-                    tx_hash,
+                    receipt_id: params.receipt_id,
+                    balance: params.shares,
+                    block_number: params.block_number,
+                    tx_hash: params.tx_hash,
                     source: ReceiptSource::Itn { issuer_request_id },
-                    receipt_info: Some(receipt_info),
+                    receipt_info: Some(Box::new(params.receipt_info)),
+                    receipt_info_bytes: Some(params.receipt_info_bytes),
                 },
             )
             .await?;
@@ -324,6 +331,7 @@ impl ReceiptInventory {
                 tx_hash: metadata.tx_hash,
                 block_number: metadata.block_number,
                 receipt_info: metadata.receipt_info.clone(),
+                receipt_info_bytes: metadata.receipt_info_bytes.clone(),
             })
             .collect()
     }
@@ -344,8 +352,13 @@ impl ReceiptInventory {
 
 /// Determines the source of a receipt by parsing the vault's receiptInformation.
 ///
-/// If the receiptInformation contains a valid `issuer_request_id`, this returns
-/// `ReceiptSource::Itn` with the parsed `ReceiptInformation`;
+/// Supports two formats:
+/// 1. Rain metadata v1 CBOR (new format): starts with magic prefix `0xff0a89c674ee7874`,
+///    contains deflated JSON payload with `OA_STRUCTURE` magic number
+/// 2. Raw JSON (legacy format): plain JSON bytes from before the CBOR migration
+///
+/// If the receiptInformation contains a valid `issuer_request_id` in either format,
+/// returns `ReceiptSource::Itn` with the parsed `ReceiptInformation`;
 /// otherwise `ReceiptSource::External` with `None`.
 pub(crate) fn determine_source(
     receipt_information: &Bytes,
@@ -354,14 +367,35 @@ pub(crate) fn determine_source(
         return (ReceiptSource::External, None);
     }
 
-    serde_json::from_slice::<ReceiptInformation>(receipt_information)
-        .ok()
-        .map_or((ReceiptSource::External, None), |info| {
+    let json_bytes = if rain_meta::is_rain_meta(receipt_information) {
+        match rain_meta::decode_receipt_meta(receipt_information) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    data_len = receipt_information.len(),
+                    data_prefix = %alloy::hex::encode(
+                        &receipt_information[..receipt_information.len().min(32)]
+                    ),
+                    "Failed to decode Rain metadata from receipt information, \
+                     classifying as External"
+                );
+                return (ReceiptSource::External, None);
+            }
+        }
+    } else {
+        receipt_information.to_vec()
+    };
+
+    serde_json::from_slice::<ReceiptInformation>(&json_bytes).ok().map_or(
+        (ReceiptSource::External, None),
+        |info| {
             let source = ReceiptSource::Itn {
                 issuer_request_id: info.issuer_request_id.clone(),
             };
             (source, Some(info))
-        })
+        },
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -401,6 +435,7 @@ impl Aggregate for ReceiptInventory {
                 tx_hash,
                 source,
                 receipt_info,
+                receipt_info_bytes,
             } => {
                 if self.receipts.contains_key(&receipt_id) {
                     return Ok(vec![]);
@@ -413,6 +448,7 @@ impl Aggregate for ReceiptInventory {
                     tx_hash,
                     source,
                     receipt_info,
+                    receipt_info_bytes,
                 }])
             }
 
@@ -469,6 +505,7 @@ impl Aggregate for ReceiptInventory {
                 tx_hash,
                 source,
                 receipt_info,
+                receipt_info_bytes,
             } => {
                 self.receipts.insert(
                     receipt_id,
@@ -476,7 +513,8 @@ impl Aggregate for ReceiptInventory {
                         balance,
                         tx_hash,
                         block_number,
-                        receipt_info,
+                        receipt_info: receipt_info.map(|boxed| *boxed),
+                        receipt_info_bytes,
                     },
                 );
                 if let ReceiptSource::Itn { issuer_request_id } = source {
@@ -526,6 +564,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_OA_SCHEMA: &str =
+        "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
+
     fn make_receipt_id(n: u64) -> ReceiptId {
         ReceiptId::from(U256::from(n))
     }
@@ -540,6 +581,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
             block_number: 0,
             receipt_info: None,
+            receipt_info_bytes: None,
         }
     }
 
@@ -556,6 +598,7 @@ mod tests {
             tx_hash,
             source: ReceiptSource::External,
             receipt_info: None,
+            receipt_info_bytes: None,
         }
     }
 
@@ -573,6 +616,7 @@ mod tests {
             tx_hash,
             source: ReceiptSource::Itn { issuer_request_id },
             receipt_info: None,
+            receipt_info_bytes: None,
         }
     }
 
@@ -686,9 +730,11 @@ mod tests {
             tx_hash,
             source: ReceiptSource::External,
             receipt_info: None,
+            receipt_info_bytes: None,
         });
 
         assert_eq!(aggregate.receipts.len(), 1);
+
         assert_eq!(
             aggregate.receipts.get(&make_receipt_id(42)).map(|m| m.balance),
             Some(make_shares(100))
@@ -717,7 +763,8 @@ mod tests {
             block_number: 1000,
             tx_hash,
             source: ReceiptSource::Itn { issuer_request_id },
-            receipt_info: Some(receipt_info.clone()),
+            receipt_info: Some(Box::new(receipt_info.clone())),
+            receipt_info_bytes: None,
         });
 
         let receipts = aggregate.receipts_with_balance();
@@ -751,7 +798,8 @@ mod tests {
                 block_number: 2000,
                 tx_hash,
                 source: ReceiptSource::Itn { issuer_request_id },
-                receipt_info: Some(receipt_info.clone()),
+                receipt_info: Some(Box::new(receipt_info.clone())),
+                receipt_info_bytes: None,
             },
         )
         .await
@@ -1014,6 +1062,49 @@ mod tests {
         assert!(info.is_none());
     }
 
+    #[test]
+    fn test_determine_source_returns_itn_when_receipt_info_is_rain_cbor() {
+        let expected_id = IssuerMintRequestId::random();
+        let receipt_info = ReceiptInformation::new(
+            TokenizationRequestId::new("tok-cbor-test"),
+            expected_id.clone(),
+            UnderlyingSymbol::new("AAPL"),
+            Quantity(Decimal::new(1005, 1)),
+            Utc.timestamp_opt(1_704_067_200, 0).unwrap(),
+            Some("cbor test".to_string()),
+        );
+
+        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
+        assert!(
+            rain_meta::is_rain_meta(&encoded),
+            "encoded receipt should be rain meta format"
+        );
+
+        let (source, info) = determine_source(&encoded);
+
+        assert!(
+            matches!(
+                &source,
+                ReceiptSource::Itn { issuer_request_id } if issuer_request_id == &expected_id
+            ),
+            "Expected Itn source with matching issuer_request_id, got {source:?}"
+        );
+        assert!(info.is_some());
+    }
+
+    #[test]
+    fn test_determine_source_returns_external_when_rain_meta_has_invalid_cbor()
+    {
+        let mut bytes = vec![0xff, 0x0a, 0x89, 0xc6, 0x74, 0xee, 0x78, 0x74];
+        bytes.extend_from_slice(&[0x00, 0x01, 0x02]);
+        let bytes = Bytes::from(bytes);
+
+        let (source, info) = determine_source(&bytes);
+
+        assert!(matches!(source, ReceiptSource::External));
+        assert!(info.is_none());
+    }
+
     async fn setup_receipt_service_with_receipts(
         receipts: Vec<(u64, u64)>,
     ) -> CqrsReceiptService<MemStore<ReceiptInventory>> {
@@ -1203,7 +1294,7 @@ mod tests {
         fn encode_then_determine_source_preserves_issuer_request_id(
             receipt_info in arb_mint_receipt_information()
         ) {
-            let encoded = receipt_info.encode().unwrap();
+            let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
             let (source, parsed_info) = determine_source(&encoded);
 
             prop_assert!(
@@ -1211,7 +1302,11 @@ mod tests {
                     if issuer_request_id == &receipt_info.issuer_request_id),
                 "Expected Itn source with matching issuer_request_id, got {:?}", source
             );
-            prop_assert!(parsed_info.is_some());
+            prop_assert_eq!(
+                parsed_info,
+                Some(receipt_info),
+                "Decoded receipt information should round-trip through Rain metadata"
+            );
         }
     }
 
@@ -1233,7 +1328,7 @@ mod tests {
             Some("Anvil integration test".to_string()),
         );
 
-        let encoded = receipt_info.encode().unwrap();
+        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
         let amount = U256::from(100) * U256::from(10).pow(U256::from(18));
 
         let (_receipt_id, _shares, returned_info) = evm
@@ -1477,16 +1572,19 @@ mod tests {
         );
 
         let issuer_request_id = IssuerMintRequestId::random();
+        let receipt_info = make_receipt_info(&issuer_request_id);
+        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
 
         service
-            .register_minted_receipt(
+            .register_minted_receipt(MintedReceiptParams {
                 vault,
-                make_receipt_id(1),
-                make_shares(100),
-                5000,
+                receipt_id: make_receipt_id(1),
+                shares: make_shares(100),
+                block_number: 5000,
                 tx_hash,
-                make_receipt_info(&issuer_request_id),
-            )
+                receipt_info,
+                receipt_info_bytes: encoded,
+            })
             .await
             .expect("Registration should succeed");
 
@@ -1509,16 +1607,19 @@ mod tests {
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         let issuer_request_id = IssuerMintRequestId::random();
+        let receipt_info = make_receipt_info(&issuer_request_id);
+        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
 
         service
-            .register_minted_receipt(
+            .register_minted_receipt(MintedReceiptParams {
                 vault,
-                make_receipt_id(42),
-                make_shares(200),
-                6000,
+                receipt_id: make_receipt_id(42),
+                shares: make_shares(200),
+                block_number: 6000,
                 tx_hash,
-                make_receipt_info(&issuer_request_id),
-            )
+                receipt_info,
+                receipt_info_bytes: encoded,
+            })
             .await
             .expect("Registration should succeed");
 
@@ -1547,16 +1648,19 @@ mod tests {
 
         for _ in 0..2 {
             let issuer_request_id = IssuerMintRequestId::random();
+            let receipt_info = make_receipt_info(&issuer_request_id);
+            let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
 
             service
-                .register_minted_receipt(
+                .register_minted_receipt(MintedReceiptParams {
                     vault,
-                    make_receipt_id(7),
-                    make_shares(500),
-                    7000,
+                    receipt_id: make_receipt_id(7),
+                    shares: make_shares(500),
+                    block_number: 7000,
                     tx_hash,
-                    make_receipt_info(&issuer_request_id),
-                )
+                    receipt_info,
+                    receipt_info_bytes: encoded,
+                })
                 .await
                 .expect("Registration should succeed (idempotent)");
         }
@@ -1582,16 +1686,18 @@ mod tests {
         );
         let issuer_request_id = IssuerMintRequestId::random();
         let receipt_info = make_receipt_info(&issuer_request_id);
+        let encoded = receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
 
         service
-            .register_minted_receipt(
+            .register_minted_receipt(MintedReceiptParams {
                 vault,
-                make_receipt_id(42),
-                make_shares(100),
-                5000,
+                receipt_id: make_receipt_id(42),
+                shares: make_shares(100),
+                block_number: 5000,
                 tx_hash,
-                receipt_info.clone(),
-            )
+                receipt_info: receipt_info.clone(),
+                receipt_info_bytes: encoded,
+            })
             .await
             .expect("Registration should succeed");
 

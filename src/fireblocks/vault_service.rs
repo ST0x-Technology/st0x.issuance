@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -18,6 +19,7 @@ use super::config::{
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
     ReceiptInformation, VaultError, VaultService,
@@ -109,6 +111,7 @@ pub(crate) struct FireblocksVaultService<P> {
     chain_asset_ids: ChainAssetIds,
     read_provider: P,
     chain_id: u64,
+    oa_schema_cache: Arc<OaSchemaCache>,
 }
 
 impl<P: Provider + Clone> FireblocksVaultService<P> {
@@ -119,6 +122,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     /// * `config` - Fireblocks configuration (with secret already loaded)
     /// * `read_provider` - Read-only RPC provider for view calls and receipt fetching
     /// * `chain_id` - The chain ID for transaction routing
+    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
     ///
     /// # Errors
     ///
@@ -127,6 +131,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         config: &FireblocksConfig,
         read_provider: P,
         chain_id: u64,
+        oa_schema_cache: Arc<OaSchemaCache>,
     ) -> Result<Self, FireblocksVaultError> {
         let mut builder =
             ClientBuilder::new(config.api_user_id.as_str(), &config.secret);
@@ -148,6 +153,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             chain_asset_ids: config.chain_asset_ids.clone(),
             read_provider,
             chain_id,
+            oa_schema_cache,
         })
     }
 
@@ -476,7 +482,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         user: Address,
         receipt_info: ReceiptInformation,
     ) -> Result<MintResult, VaultError> {
-        let receipt_info_bytes = receipt_info.encode()?;
+        let oa_schema = self.oa_schema_cache.get(vault).await;
+        let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
 
         let vault_contract =
             OffchainAssetReceiptVault::new(vault, &self.read_provider);
@@ -489,7 +496,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         // Encode deposit call - mints shares + receipts to bot
         let deposit_call = vault_contract
-            .deposit(assets, bot, share_ratio, receipt_info_bytes)
+            .deposit(assets, bot, share_ratio, receipt_info_bytes.clone())
             .calldata()
             .clone();
 
@@ -552,6 +559,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             shares_minted,
             gas_used,
             block_number,
+            receipt_info_bytes,
         })
     }
 
@@ -562,16 +570,30 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
+        let needs_encoding = params.burns.iter().any(|b| {
+            b.receipt_info_bytes.is_none() && b.receipt_info.is_some()
+        });
+
+        let oa_schema = if needs_encoding {
+            self.oa_schema_cache.get(params.vault).await
+        } else {
+            None
+        };
+
         let redeem_calls: Vec<Bytes> = params
             .burns
             .iter()
             .map(|burn| {
-                let receipt_info_bytes = burn
-                    .receipt_info
-                    .as_ref()
-                    .map(ReceiptInformation::encode)
-                    .transpose()?
-                    .unwrap_or_default();
+                let receipt_bytes = if let Some(raw) = &burn.receipt_info_bytes
+                {
+                    raw.clone()
+                } else {
+                    burn.receipt_info
+                        .as_ref()
+                        .map(|info| info.encode(oa_schema.as_deref()))
+                        .transpose()?
+                        .unwrap_or_default()
+                };
 
                 Ok(vault_contract
                     .redeem(
@@ -579,7 +601,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                         params.user,
                         params.owner,
                         burn.receipt_id,
-                        receipt_info_bytes,
+                        receipt_bytes,
                     )
                     .calldata()
                     .clone())
@@ -721,6 +743,9 @@ mod tests {
             chain_asset_ids,
             read_provider,
             chain_id: 8453,
+            oa_schema_cache: Arc::new(OaSchemaCache::fixed(
+                "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm",
+            )),
         }
     }
 

@@ -118,7 +118,8 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let (config, _mock_subgraph) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -129,7 +130,11 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     evm.certify_vault(U256::MAX).await?;
 
     let shares_minted = perform_mint_flow(&client, &evm, user_wallet).await?;
-    mint_callback_mock.assert();
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        1,
+        "Mint callback must be sent exactly once"
+    );
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
@@ -203,7 +208,8 @@ async fn test_mint_burn_mint_nonce_synchronization()
     )
     .await?;
 
-    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let (config, _mock_subgraph) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;

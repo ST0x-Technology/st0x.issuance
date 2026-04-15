@@ -1,4 +1,5 @@
 .direnv/
+.idea/
 .sqlx/
 target/
 .env
