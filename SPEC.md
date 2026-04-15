@@ -427,23 +427,33 @@ recovery. Methods:
 - `find_by_issuer_request_id(vault, id) -> Option<RecoveredReceipt>` - Looks up
   a receipt by ITN issuer_request_id for mint recovery
 
-Receipts enter the inventory through backfill (scanning historic Deposit events
-at startup from `last_backfilled_block`), live monitoring (WebSocket
-subscription to Deposit events at runtime), or direct registration after a mint.
+Receipts enter the inventory through backfill (scanning historic Deposit and
+ERC-1155 transfer events at startup from `last_backfilled_block`), live
+monitoring (WebSocket subscription to Deposit and ERC-1155 transfer events at
+runtime), or direct registration after a mint.
 
-Receipts leave the inventory through reconciliation — querying
-`balanceOf(bot_wallet, receipt_id)` on-chain and emitting `BalanceDecreased`
-when on-chain < aggregate. Reconciliation is triggered by:
+The Receipt contract is an ERC-1155 token that emits `TransferSingle` and
+`TransferBatch` events on all token movements. The receipt monitor and
+backfiller track these events to discover inbound receipt transfers (to ==
+bot_wallet) and reconcile outbound transfers (from == bot_wallet). Mint/burn
+transfers (from/to == address(0)) are filtered out since those are already
+covered by the vault's Deposit/Withdraw events.
+
+Receipts leave the inventory (or have their balance corrected) through
+reconciliation — querying `balanceOf(bot_wallet, receipt_id)` on-chain and
+emitting `BalanceReconciled` when the on-chain balance differs from the
+aggregate balance in either direction. Reconciliation is triggered by:
 
 - **Startup**: After receipt backfill, reconciles all receipts with positive
-  aggregate balance before transfer backfill begins
+  aggregate balance before redemption transfer backfill begins
 - **Post-burn**: After every burn attempt (successful or failed), reconciles the
   affected vault immediately
-- **Live monitoring**: WebSocket subscription to Withdraw events on each vault
-  contract. When a Withdraw event fires with `owner == bot_wallet`, reconciles
-  the specific receipt. This detects external burns (manual burns by
-  stakeholders) in real time, mirroring the Deposit event subscription for
-  receipt discovery
+- **Live monitoring**: WebSocket subscription to Withdraw events and ERC-1155
+  TransferSingle/TransferBatch events. When a Withdraw event fires with
+  `owner == bot_wallet`, or an outbound transfer from bot_wallet is detected,
+  reconciles the specific receipt. This detects external burns (manual burns by
+  stakeholders) and direct token transfers in real time, mirroring the Deposit
+  event subscription for receipt discovery
 
 #### ReceiptInventory Aggregate
 
@@ -452,14 +462,14 @@ Commands:
 - `DiscoverReceipt` - Register a newly discovered receipt
 - `AdvanceBackfillCheckpoint` - Update the last backfilled block number
 - `ReconcileBalance { receipt_id, on_chain_balance }` - Correct aggregate
-  balance to match on-chain state. No-op if balances match or receipt unknown.
-  Errors if on-chain > aggregate (safety check)
+  balance to match on-chain state (both increases and decreases). No-op if
+  balances match or receipt unknown
 
 Events:
 
 - `Discovered` - Receipt discovered with initial balance
-- `BalanceDecreased { receipt_id, previous_balance, on_chain_balance }` -
-  Balance decreased (detected during reconciliation)
+- `BalanceReconciled { receipt_id, previous_balance, on_chain_balance }` -
+  Balance changed (detected during reconciliation, either increase or decrease)
 - `Depleted` - Receipt fully consumed (balance reached zero)
 - `BackfillCheckpoint` - Backfill progress marker
 
@@ -1512,11 +1522,13 @@ We call these Alpaca endpoints:
    `CallbackPending` -> `MintCompleted`, completing the flow without waiting for
    a service restart.
 6. **Receipt balance reconciliation**: At startup (after receipt backfill),
-   after every burn (both successful and failed), and on live Withdraw events,
-   the service reconciles each receipt's aggregate balance against its on-chain
-   `balanceOf`. If on-chain < aggregate, emits `BalanceDecreased` to correct the
-   inventory. This single mechanism handles all balance changes — burns by this
-   service, manual burns by stakeholders, or any other on-chain activity.
+   after every burn (both successful and failed), on live Withdraw events, and
+   on inbound/outbound ERC-1155 transfers, the service reconciles each receipt's
+   aggregate balance against its on-chain `balanceOf`. Emits `BalanceReconciled`
+   to correct the inventory in either direction (increases from inbound
+   transfers, decreases from burns or outbound transfers). This single mechanism
+   handles all balance changes — burns by this service, manual burns by
+   stakeholders, direct token transfers, or any other on-chain activity.
 7. **BurnFailed auto-fail**: Redemptions stuck in `BurnFailed` state (after a
    `BurningFailed` event) are auto-failed via `MarkFailed` when recovery
    determines they cannot be retried — either because the on-chain share balance
@@ -1527,11 +1539,13 @@ We call these Alpaca endpoints:
    failed), receipt reconciliation is triggered immediately for the affected
    vault. This is the primary mechanism for updating inventory after burns
    performed by this service.
-9. **Live burn monitoring**: The receipt monitor subscribes to Withdraw events
-   on each vault contract via WebSocket. When a Withdraw event fires with
-   `owner == bot_wallet`, reconciliation is triggered for that receipt. This
-   detects external burns in real time, mirroring the Deposit event subscription
-   used for receipt discovery.
+9. **Live transfer monitoring**: The receipt monitor subscribes to Withdraw
+   events on each vault contract and ERC-1155 TransferSingle/TransferBatch
+   events on the Receipt contract via WebSocket. When a Withdraw event fires
+   with `owner == bot_wallet`, or an outbound/inbound transfer involving the bot
+   wallet is detected, reconciliation is triggered for that receipt. Inbound
+   transfers also attempt discovery (for new receipt IDs). This detects external
+   burns, direct token transfers, and inbound receipts in real time.
 
 **Startup view rebuild:** All view tables are cleared before replay on every
 startup, ensuring views are rebuilt cleanly from events and eliminating stale or

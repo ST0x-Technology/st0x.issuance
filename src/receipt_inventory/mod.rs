@@ -399,17 +399,7 @@ pub(crate) fn determine_source(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ReceiptInventoryError {
-    #[error(
-        "Unexpected balance increase for receipt {receipt_id}: \
-         aggregate_balance={aggregate_balance}, on_chain_balance={on_chain_balance}"
-    )]
-    UnexpectedBalanceIncrease {
-        receipt_id: ReceiptId,
-        aggregate_balance: Shares,
-        on_chain_balance: Shares,
-    },
-}
+pub(crate) enum ReceiptInventoryError {}
 
 #[async_trait]
 impl Aggregate for ReceiptInventory {
@@ -463,16 +453,6 @@ impl Aggregate for ReceiptInventory {
                 let aggregate_balance = metadata.balance;
                 if on_chain_balance == aggregate_balance {
                     return Ok(vec![]);
-                }
-
-                if aggregate_balance.checked_sub(on_chain_balance).is_none() {
-                    return Err(
-                        ReceiptInventoryError::UnexpectedBalanceIncrease {
-                            receipt_id,
-                            aggregate_balance,
-                            on_chain_balance,
-                        },
-                    );
                 }
 
                 let reconciled = ReceiptInventoryEvent::BalanceReconciled {
@@ -1522,7 +1502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_increased_balance_returns_error() {
+    async fn test_reconcile_increased_balance_emits_reconciled_event() {
         let mut aggregate = ReceiptInventory::default();
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1545,7 +1525,7 @@ mod tests {
             aggregate.apply(event);
         }
 
-        let result = aggregate
+        let events = aggregate
             .handle(
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: make_receipt_id(42),
@@ -1553,12 +1533,26 @@ mod tests {
                 },
                 &(),
             )
-            .await;
+            .await
+            .unwrap();
 
+        assert_eq!(events.len(), 1);
         assert!(matches!(
-            result,
-            Err(ReceiptInventoryError::UnexpectedBalanceIncrease { .. })
+            &events[0],
+            ReceiptInventoryEvent::BalanceReconciled {
+                previous_balance,
+                on_chain_balance,
+                ..
+            } if *previous_balance == make_shares(50) && *on_chain_balance == make_shares(100)
         ));
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let receipts = aggregate.receipts_with_balance();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].available_balance, make_shares(100));
     }
 
     #[tokio::test]
