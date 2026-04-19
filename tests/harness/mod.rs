@@ -89,17 +89,30 @@ where
 pub async fn wait_for_mock_hit(
     mock: &Mock<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_mock_hits(mock, 1).await
+}
+
+pub async fn wait_for_mock_hits(
+    mock: &Mock<'_>,
+    expected: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let start = tokio::time::Instant::now();
     let timeout = tokio::time::Duration::from_secs(5);
     let poll_interval = tokio::time::Duration::from_millis(50);
 
     loop {
-        if mock.calls_async().await > 0 {
+        if mock.calls_async().await >= expected {
             return Ok(());
         }
 
         if start.elapsed() >= timeout {
-            return Err("Timeout waiting for mock to be hit".into());
+            return Err(format!(
+                "Timeout waiting for mock to be hit {expected} time(s) \
+                 (got {} after {}s)",
+                mock.calls_async().await,
+                timeout.as_secs()
+            )
+            .into());
         }
 
         tokio::time::sleep(poll_interval).await;
