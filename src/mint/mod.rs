@@ -508,8 +508,17 @@ impl Mint {
 
     /// Handles recovery triggered by receipt discovery. Only accepts
     /// `MintingFailed` when the non-failed predecessor was `Minting`
-    /// (meaning a tx was actually submitted), and `CallbackPending`
-    /// (subsequent step after recovering from `MintingFailed`).
+    /// (meaning a tx was actually submitted).
+    ///
+    /// Unlike `handle_recover`, this does NOT accept `CallbackPending`
+    /// because receipt discovery also fires during the normal mint flow
+    /// (when the deposit creates a new on-chain receipt). Handling
+    /// `CallbackPending` here would race with the normal flow's
+    /// `SendCallback` command, causing duplicate Alpaca callbacks.
+    ///
+    /// Instead, when the deposit recovery succeeds and the mint moves to
+    /// `CallbackPending`, this handler immediately sends the callback in
+    /// the same command execution, atomically advancing to `Completed`.
     async fn handle_recover_from_receipt(
         &self,
         services: &MintServices,
@@ -523,15 +532,42 @@ impl Mint {
                     Self::Minting { .. }
                 ) =>
             {
-                self.handle_recover_incomplete(
-                    services,
-                    issuer_request_id,
-                    Some(tx_hash),
-                )
-                .await
-            }
-            Self::CallbackPending { .. } => {
-                self.handle_send_callback(services, issuer_request_id).await
+                let deposit_events = self
+                    .handle_recover_incomplete(
+                        services,
+                        issuer_request_id.clone(),
+                        Some(tx_hash),
+                    )
+                    .await?;
+
+                // If the deposit failed, return early with just the failure
+                // event — no callback should be sent.
+                let deposit_succeeded = deposit_events.iter().any(|event| {
+                    matches!(
+                        event,
+                        MintEvent::TokensMinted { .. }
+                            | MintEvent::ExistingMintRecovered { .. }
+                    )
+                });
+
+                if !deposit_succeeded {
+                    return Ok(deposit_events);
+                }
+
+                // Construct intermediate state to send callback from.
+                let mut intermediate = self.clone();
+                for event in &deposit_events {
+                    intermediate.apply(event.clone());
+                }
+
+                let callback_events = intermediate
+                    .handle_send_callback(services, issuer_request_id)
+                    .await?;
+
+                let all_events =
+                    deposit_events.into_iter().chain(callback_events).collect();
+
+                Ok(all_events)
             }
             _ => Err(MintError::NotRecoverable {
                 current_state: self.state_name().to_string(),
