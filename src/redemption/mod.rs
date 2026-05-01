@@ -1,7 +1,7 @@
 mod cmd;
 mod event;
 pub(crate) mod upcaster;
-mod view;
+pub(crate) mod view;
 
 pub(crate) mod backfill;
 pub(crate) mod burn_manager;
@@ -72,6 +72,14 @@ pub(crate) enum IssuerRedemptionRequestIdParseError {
     Format,
 }
 
+impl<'r> rocket::request::FromParam<'r> for IssuerRedemptionRequestId {
+    type Error = IssuerRedemptionRequestIdParseError;
+
+    fn from_param(param: &'r str) -> Result<Self, Self::Error> {
+        param.parse()
+    }
+}
+
 impl Serialize for IssuerRedemptionRequestId {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -97,7 +105,7 @@ pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent};
 pub(crate) use view::{
     RedemptionView, RedemptionViewError, find_alpaca_called, find_detected,
-    replay_redemption_view,
+    find_stuck, replay_redemption_view,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +415,41 @@ impl Redemption {
         }])
     }
 
+    /// Reprocessing is only valid from `Failed` state. Post-Alpaca states
+    /// (`AlpacaCalled`, `Burning`) have dedicated recovery paths in the
+    /// burn/journal managers and resetting them to `Detected` would cause
+    /// a duplicate Alpaca redeem call.
+    fn handle_reprocess(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        metadata: RedemptionMetadata,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let Self::Failed { .. } = self else {
+            return Err(match self {
+                Self::Completed { .. } => {
+                    RedemptionError::AlreadyCompleted { issuer_request_id }
+                }
+                _ => RedemptionError::InvalidState {
+                    expected: "Failed".to_string(),
+                    found: self.state_name().to_string(),
+                },
+            });
+        };
+
+        Ok(vec![RedemptionEvent::Reprocessed {
+            issuer_request_id,
+            underlying: metadata.underlying,
+            token: metadata.token,
+            wallet: metadata.wallet,
+            quantity: metadata.quantity,
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            previous_state: self.state_name().to_string(),
+            reprocessed_at: Utc::now(),
+        }])
+    }
+
     fn handle_confirm_alpaca_complete(
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
@@ -488,6 +531,10 @@ pub(crate) enum RedemptionError {
     AlreadyDetected { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Invalid state for operation: expected {expected}, found {found}")]
     InvalidState { expected: String, found: String },
+    #[error(
+        "Redemption already completed, cannot reprocess: {issuer_request_id}"
+    )]
+    AlreadyCompleted { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
 }
@@ -498,6 +545,10 @@ impl PartialEq for RedemptionError {
             (
                 Self::AlreadyDetected { issuer_request_id: a },
                 Self::AlreadyDetected { issuer_request_id: b },
+            )
+            | (
+                Self::AlreadyCompleted { issuer_request_id: a },
+                Self::AlreadyCompleted { issuer_request_id: b },
             ) => a == b,
             (
                 Self::InvalidState { expected: e1, found: f1 },
@@ -598,6 +649,9 @@ impl Aggregate for Redemption {
                 )
                 .await
             }
+            RedemptionCommand::Reprocess { issuer_request_id, metadata } => {
+                self.handle_reprocess(issuer_request_id, metadata)
+            }
         }
     }
 
@@ -612,6 +666,17 @@ impl Aggregate for Redemption {
                 tx_hash,
                 block_number,
                 detected_at,
+            }
+            | RedemptionEvent::Reprocessed {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+                detected_at,
+                ..
             } => {
                 *self = Self::Detected {
                     metadata: RedemptionMetadata {
@@ -1626,6 +1691,252 @@ mod tests {
             result.unwrap_err(),
             super::IssuerRedemptionRequestIdParseError::Slice(_)
         ));
+    }
+
+    fn test_metadata() -> RedemptionMetadata {
+        RedemptionMetadata {
+            issuer_request_id: IssuerRedemptionRequestId::random(),
+            underlying: UnderlyingSymbol::new("RKLB"),
+            token: TokenSymbol::new("tRKLB"),
+            wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
+            quantity: Quantity::new(Decimal::from(100)),
+            detected_tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 12345,
+            detected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_reprocess_from_failed_state_succeeds() {
+        let metadata = test_metadata();
+        let expected_underlying = metadata.underlying.clone();
+        let expected_id = metadata.issuer_request_id.clone();
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: expected_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    detected_at: metadata.detected_at,
+                },
+                RedemptionEvent::AlpacaCallFailed {
+                    issuer_request_id: expected_id.clone(),
+                    error: "Alpaca bug".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Reprocess {
+                issuer_request_id: expected_id.clone(),
+                metadata,
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::Reprocessed {
+            issuer_request_id: event_id,
+            previous_state,
+            underlying,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Reprocessed event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &expected_id);
+        assert_eq!(previous_state, "Failed");
+        assert_eq!(underlying, &expected_underlying);
+    }
+
+    #[test]
+    fn test_reprocess_from_detected_state_rejected() {
+        let metadata = test_metadata();
+        let issuer_request_id = metadata.issuer_request_id.clone();
+
+        RedemptionTestFramework::with(mock_services())
+            .given(vec![RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: metadata.underlying.clone(),
+                token: metadata.token.clone(),
+                wallet: metadata.wallet,
+                quantity: metadata.quantity.clone(),
+                tx_hash: metadata.detected_tx_hash,
+                block_number: metadata.block_number,
+                detected_at: metadata.detected_at,
+            }])
+            .when(RedemptionCommand::Reprocess { issuer_request_id, metadata })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: "Detected".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_reprocess_from_burning_state_rejected() {
+        let metadata = test_metadata();
+        let issuer_request_id = metadata.issuer_request_id.clone();
+
+        RedemptionTestFramework::with(mock_services())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    detected_at: metadata.detected_at,
+                },
+                RedemptionEvent::AlpacaCalled {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-1",
+                    ),
+                    alpaca_quantity: metadata.quantity.clone(),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                    called_at: Utc::now(),
+                },
+                RedemptionEvent::AlpacaJournalCompleted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    alpaca_journal_completed_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Reprocess { issuer_request_id, metadata })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: "Burning".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_reprocess_from_completed_state_rejected() {
+        let metadata = test_metadata();
+        let issuer_request_id = metadata.issuer_request_id.clone();
+
+        RedemptionTestFramework::with(mock_services())
+            .given(vec![
+                RedemptionEvent::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    detected_at: metadata.detected_at,
+                },
+                RedemptionEvent::AlpacaCalled {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-1",
+                    ),
+                    alpaca_quantity: metadata.quantity.clone(),
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                    called_at: Utc::now(),
+                },
+                RedemptionEvent::AlpacaJournalCompleted {
+                    issuer_request_id: issuer_request_id.clone(),
+                    alpaca_journal_completed_at: Utc::now(),
+                },
+                RedemptionEvent::TokensBurned {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: b256!(
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    ),
+                    burns: vec![BurnRecord {
+                        receipt_id: uint!(1_U256),
+                        shares_burned: uint!(100_000000000000000000_U256),
+                    }],
+                    dust_returned: U256::ZERO,
+                    gas_used: 50000,
+                    block_number: 99999,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(RedemptionCommand::Reprocess {
+                issuer_request_id: issuer_request_id.clone(),
+                metadata,
+            })
+            .then_expect_error(RedemptionError::AlreadyCompleted {
+                issuer_request_id,
+            });
+    }
+
+    #[test]
+    fn test_reprocess_from_uninitialized_state_rejected() {
+        let metadata = test_metadata();
+        let issuer_request_id = metadata.issuer_request_id.clone();
+
+        RedemptionTestFramework::with(mock_services())
+            .given_no_previous_events()
+            .when(RedemptionCommand::Reprocess { issuer_request_id, metadata })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: "Uninitialized".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_apply_reprocessed_transitions_to_detected() {
+        let mut redemption = Redemption::default();
+        let metadata = test_metadata();
+        let issuer_request_id = metadata.issuer_request_id.clone();
+
+        redemption.apply(RedemptionEvent::Detected {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+        });
+
+        redemption.apply(RedemptionEvent::AlpacaCallFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "Alpaca bug".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        assert!(matches!(redemption, Redemption::Failed { .. }));
+
+        redemption.apply(RedemptionEvent::Reprocessed {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            previous_state: "Failed".to_string(),
+            reprocessed_at: Utc::now(),
+        });
+
+        assert_eq!(
+            redemption,
+            Redemption::Detected {
+                metadata: RedemptionMetadata {
+                    issuer_request_id,
+                    underlying: metadata.underlying,
+                    token: metadata.token,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity,
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                    detected_at: metadata.detected_at,
+                }
+            }
+        );
     }
 
     proptest! {

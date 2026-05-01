@@ -65,4 +65,13 @@ pub(crate) enum RedemptionCommand {
         /// Wallet to return dust to (from view metadata)
         user_wallet: Address,
     },
+    /// Resets a failed redemption back to Detected state for reprocessing.
+    /// Only valid from `Failed` state — post-Alpaca states have dedicated
+    /// recovery paths and resetting them would cause duplicate Alpaca calls.
+    /// Metadata is provided by the API layer (extracted from the event
+    /// store) since the Failed state does not preserve it.
+    Reprocess {
+        issuer_request_id: IssuerRedemptionRequestId,
+        metadata: super::RedemptionMetadata,
+    },
 }

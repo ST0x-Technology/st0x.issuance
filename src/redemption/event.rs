@@ -79,6 +79,20 @@ pub(crate) enum RedemptionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    /// Redemption reset to Detected state for reprocessing.
+    /// Carries the original metadata so apply() can reconstruct Detected.
+    Reprocessed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        previous_state: String,
+        reprocessed_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for RedemptionEvent {
@@ -102,6 +116,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurningFailed { .. } => {
                 "RedemptionEvent::BurningFailed".to_string()
+            }
+            Self::Reprocessed { .. } => {
+                "RedemptionEvent::Reprocessed".to_string()
             }
         }
     }

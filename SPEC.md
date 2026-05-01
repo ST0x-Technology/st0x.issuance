@@ -272,6 +272,15 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RecordBurnSuccess` - On-chain burn succeeded
 - `RecordBurnFailure` - On-chain burn failed
 - `MarkFailed` - Mark redemption as failed
+- `Reprocess { issuer_request_id, metadata }` - Reset a failed redemption back
+  to `Detected` state for reprocessing. Only valid from `Failed` state —
+  post-Alpaca states (`AlpacaCalled`, `Burning`) have dedicated recovery paths
+  and resetting them would cause duplicate Alpaca calls. The `metadata` field
+  carries the original `RedemptionMetadata` (extracted by the API layer from the
+  event store's first `Detected` event), since the `Failed` aggregate state does
+  not preserve metadata. Emits `Reprocessed` event with the metadata, previous
+  state name, and timestamp for audit trail. The existing recovery logic then
+  picks it up naturally from `Detected` state.
 
 **Events:**
 
@@ -284,6 +293,10 @@ on-chain transfer through calling Alpaca to burning tokens.
   has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
   single redemption spans multiple ERC-1155 receipts
 - `BurningFailed` - On-chain burn failed (terminal)
+- `Reprocessed` - Redemption reset to `Detected` state for reprocessing. Carries
+  the original `RedemptionMetadata`, the previous state name, and a timestamp.
+  Used for audit trail — shows when and from what state a manual reprocess was
+  triggered.
 
 **Command -> Event Mappings:**
 
@@ -295,6 +308,7 @@ on-chain transfer through calling Alpaca to burning tokens.
 | `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                     |
 | `RecordBurnSuccess`     | `TokensBurned`           | Multi-receipt burn, terminal success |
 | `RecordBurnFailure`     | `BurningFailed`          | Terminal failure                     |
+| `Reprocess`             | `Reprocessed`            | Reset to Detected for reprocessing   |
 
 ### Account Aggregate
 
@@ -1811,6 +1825,47 @@ fn test_journal_confirmed_for_missing_mint() {
         .then_expect_error("Mint not found or already completed");
 }
 ```
+
+## Admin API
+
+Internal endpoints for operational management, protected by `InternalAuth`
+(X-API-KEY header + internal IP whitelist).
+
+### Reprocess Stuck Aggregates
+
+Resets a stuck or failed aggregate back to its initial processing state so
+existing recovery logic picks it up.
+
+**Redemption:** Dispatches a `Reprocess` command that transitions the aggregate
+back to `Detected`. Only valid from `Failed` state — post-Alpaca states have
+dedicated recovery paths. The API layer extracts the original
+`RedemptionMetadata` from the event store (first `Detected` event) since the
+`Failed` aggregate state does not preserve it.
+
+**Mint:** Dispatches the existing `Recover` command which already handles
+`JournalConfirmed`, `Minting`, `MintingFailed`, and `CallbackPending` states.
+
+**Endpoint:** `POST /admin/reprocess/<aggregate_type>/<aggregate_id>`
+
+- `POST /admin/reprocess/redemption/red-61e089c6`
+- `POST /admin/reprocess/mint/358508d1-54eb-4e3a-b1c5-c08fb0424f82`
+
+**Status Codes:**
+
+- `200`: Reprocess initiated
+- `404`: Aggregate not found
+- `409`: Aggregate already completed (cannot reprocess)
+- `422`: Aggregate in a state that cannot be reprocessed
+
+### List Stuck Aggregates
+
+Lists all non-completed aggregates that may need manual intervention.
+
+**Endpoint:** `GET /admin/stuck`
+
+Returns all redemptions in `Failed` or `BurnFailed` state, and all mints in
+recoverable states (`JournalConfirmed`, `Minting`, `MintingFailed`,
+`CallbackPending`).
 
 ## Configuration
 

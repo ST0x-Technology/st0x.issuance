@@ -223,6 +223,17 @@ impl View<Redemption> for RedemptionView {
                 tx_hash,
                 block_number,
                 detected_at,
+            }
+            | RedemptionEvent::Reprocessed {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+                detected_at,
+                ..
             } => {
                 *self = Self::Detected {
                     issuer_request_id: issuer_request_id.clone(),
@@ -446,6 +457,34 @@ pub(crate) async fn find_burn_failed(
         .collect()
 }
 
+/// Finds all redemptions in Failed or BurnFailed states.
+///
+/// These are redemptions that have terminally failed and need manual
+/// intervention via the reprocess endpoint.
+pub(crate) async fn find_stuck(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
+    let rows = sqlx::query!(
+        r#"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
+        FROM redemption_view
+        WHERE json_extract(payload, '$.Failed') IS NOT NULL
+           OR json_extract(payload, '$.BurnFailed') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let view: RedemptionView = serde_json::from_str(&row.payload)?;
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, U256, address, b256};
@@ -460,7 +499,7 @@ mod tests {
 
     use super::{
         RedemptionView, find_alpaca_called, find_burn_failed, find_burning,
-        find_detected,
+        find_detected, find_stuck,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::{
@@ -1546,5 +1585,193 @@ mod tests {
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_alpaca_qty, quantity);
         assert_eq!(view_dust_qty, Quantity::new(Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn test_find_stuck_returns_failed_and_burn_failed() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, cqrs } = &harness;
+
+        // Detected — not stuck
+        let detected_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
+
+        // Failed (AlpacaCallFailed) — stuck
+        let failed_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &failed_id,
+                "TSLA",
+                address!("0x9876543210fedcba9876543210fedcba98765432"),
+                50,
+                b256!("0x1111111111111111111111111111111111111111111111111111111111111111"),
+                54321,
+            )
+            .await;
+        cqrs.execute(
+            &failed_id.to_string(),
+            RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id: failed_id.clone(),
+                error: "Alpaca bug".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record alpaca failure");
+
+        // BurnFailed — stuck
+        let burn_failed_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &burn_failed_id,
+                "NVDA",
+                address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                25,
+                b256!("0x2222222222222222222222222222222222222222222222222222222222222222"),
+                77777,
+            )
+            .await;
+        harness.call_alpaca(&burn_failed_id, "tok-burn-fail").await;
+        harness.confirm_alpaca_complete(&burn_failed_id).await;
+        cqrs.execute(
+            &burn_failed_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: burn_failed_id.clone(),
+                error: "Insufficient gas".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        // Completed — not stuck
+        let completed_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &completed_id,
+                "META",
+                address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                75,
+                b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
+                88888,
+            )
+            .await;
+        harness.call_alpaca(&completed_id, "tok-complete").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
+
+        let result = find_stuck(pool).await.unwrap();
+
+        assert_eq!(result.len(), 2, "Expected 2 stuck (Failed + BurnFailed)");
+
+        let ids: Vec<_> = result.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.contains(&failed_id), "Should include Failed redemption");
+        assert!(
+            ids.contains(&burn_failed_id),
+            "Should include BurnFailed redemption"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_stuck_returns_empty_when_none_stuck() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        let detected_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &detected_id,
+                "AAPL",
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                100,
+                b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                12345,
+            )
+            .await;
+
+        let result = find_stuck(pool).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_view_updates_on_reprocessed_event() {
+        let mut view = RedemptionView::default();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let id = issuer_request_id.to_string();
+        let underlying = UnderlyingSymbol::new("RKLB");
+        let token = TokenSymbol::new("tRKLB");
+        let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let block_number = 12345_u64;
+        let detected_at = Utc::now();
+
+        // Start in Detected
+        view.update(&make_detected_envelope(
+            &id,
+            1,
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: underlying.clone(),
+                token: token.clone(),
+                wallet,
+                quantity: quantity.clone(),
+                tx_hash,
+                block_number,
+                detected_at,
+            },
+        ));
+
+        // Fail
+        view.update(&make_detected_envelope(
+            &id,
+            2,
+            RedemptionEvent::AlpacaCallFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Alpaca bug".to_string(),
+                failed_at: Utc::now(),
+            },
+        ));
+
+        assert!(matches!(view, RedemptionView::Failed { .. }));
+
+        // Reprocess back to Detected
+        view.update(&make_detected_envelope(
+            &id,
+            3,
+            RedemptionEvent::Reprocessed {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: underlying.clone(),
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+                detected_at,
+                previous_state: "Failed".to_string(),
+                reprocessed_at: Utc::now(),
+            },
+        ));
+
+        let RedemptionView::Detected {
+            issuer_request_id: view_id,
+            underlying: view_underlying,
+            ..
+        } = view
+        else {
+            panic!("Expected Detected view after reprocess, got {view:?}");
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_underlying, underlying);
     }
 }

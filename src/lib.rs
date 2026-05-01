@@ -52,6 +52,7 @@ pub mod redemption;
 pub mod test_utils;
 pub mod tokenized_asset;
 
+pub(crate) mod admin;
 pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
@@ -77,8 +78,8 @@ pub(crate) type MintCqrs = Arc<SqliteCqrs<Mint>>;
 pub(crate) type MintEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Mint>>;
 
-type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
-type RedemptionEventStore =
+pub(crate) type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
+pub(crate) type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
 type ReceiptInventoryCqrs = Arc<SqliteCqrs<ReceiptInventory>>;
 type ReceiptInventoryEventStore =
@@ -390,6 +391,7 @@ pub async fn initialize_rocket(
         tokenized_asset_view_repo,
         mint,
         redemption_cqrs,
+        redemption_event_store,
     }))
 }
 
@@ -402,6 +404,7 @@ struct RocketState {
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
+    redemption_event_store: RedemptionEventStore,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -423,6 +426,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.mint.cqrs)
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
+        .manage(state.redemption_event_store)
         .manage(state.pool)
         .mount(
             "/",
@@ -435,7 +439,10 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 tokenized_asset::get_tokenized_asset,
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
-                mint::confirm_journal
+                mint::confirm_journal,
+                admin::reprocess_redemption,
+                admin::reprocess_mint,
+                admin::list_stuck,
             ],
         )
         .register("/", catchers::json_catchers())
