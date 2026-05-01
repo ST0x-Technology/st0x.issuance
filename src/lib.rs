@@ -10,7 +10,8 @@ use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
 };
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -121,6 +122,9 @@ impl std::fmt::Display for Quantity {
 /// Maximum decimal places supported by Alpaca's tokenization API.
 /// Quantities with more decimals must be truncated before sending to Alpaca.
 pub(crate) const ALPACA_MAX_DECIMALS: u32 = 9;
+
+const RECEIPT_BACKFILL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const TRANSFER_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
@@ -321,9 +325,6 @@ pub async fn initialize_rocket(
         );
     }
 
-    // Transfer backfill must run after receipt backfill so that receipt inventory
-    // is available for burn planning, and before live monitoring so that missed
-    // transfers during downtime are detected before new ones come in.
     let transfer_backfiller = TransferBackfiller {
         provider: blockchain_setup.provider.clone(),
         bot_wallet,
@@ -335,15 +336,8 @@ pub async fn initialize_rocket(
         burn_manager: managers.burn.clone(),
     };
 
-    run_all_transfer_backfills(
-        &vault_configs,
-        &transfer_backfiller,
-        config.backfill_start_block,
-    )
-    .await?;
-
     spawn_all_receipt_monitors(
-        blockchain_setup.provider,
+        blockchain_setup.provider.clone(),
         &vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
@@ -361,6 +355,21 @@ pub async fn initialize_rocket(
         &managers.burn,
     )
     .await;
+
+    spawn_periodic_receipt_backfills(
+        blockchain_setup.provider.clone(),
+        vault_configs.clone(),
+        receipt_inventory.cqrs.clone(),
+        receipt_inventory.event_store.clone(),
+        bot_wallet,
+        config.backfill_start_block,
+    );
+
+    spawn_all_transfer_backfills(
+        vault_configs.clone(),
+        transfer_backfiller,
+        config.backfill_start_block,
+    );
 
     spawn_all_redemption_detectors(
         &config.rpc_url,
@@ -710,6 +719,7 @@ async fn run_redemption_recovery(
 }
 
 /// Configuration for a single vault, extracted from TokenizedAssetView.
+#[derive(Clone, Copy)]
 struct VaultBackfillConfig {
     vault: Address,
     receipt_contract: Address,
@@ -782,10 +792,10 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         .load_aggregate(&vault.to_string())
         .await?;
 
-    let from_block = aggregate_context
-        .aggregate()
-        .last_backfilled_block()
-        .unwrap_or(backfill_start_block);
+    let from_block = next_receipt_backfill_block(
+        aggregate_context.aggregate().last_backfilled_block(),
+        backfill_start_block,
+    )?;
 
     info!(
         underlying,
@@ -817,11 +827,110 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     Ok(VaultBackfillConfig { vault, receipt_contract })
 }
 
-/// Runs transfer backfill for ALL enabled vaults.
+fn next_receipt_backfill_block(
+    last_backfilled_block: Option<u64>,
+    backfill_start_block: u64,
+) -> Result<u64, anyhow::Error> {
+    last_backfilled_block.map_or(Ok(backfill_start_block), |block| {
+        block.checked_add(1).map_or_else(
+            || Err(anyhow::anyhow!("Receipt backfill checkpoint overflow")),
+            |next_block| Ok(next_block.max(backfill_start_block)),
+        )
+    })
+}
+
+async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
+    provider: &P,
+    config: VaultBackfillConfig,
+    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+    receipt_inventory_event_store: &ReceiptInventoryEventStore,
+    bot_wallet: Address,
+    backfill_start_block: u64,
+) -> Result<(), anyhow::Error> {
+    let aggregate_context = receipt_inventory_event_store
+        .load_aggregate(&config.vault.to_string())
+        .await?;
+
+    let from_block = next_receipt_backfill_block(
+        aggregate_context.aggregate().last_backfilled_block(),
+        backfill_start_block,
+    )?;
+
+    debug!(
+        vault = %config.vault,
+        receipt_contract = %config.receipt_contract,
+        from_block,
+        "Running periodic receipt backfill for vault"
+    );
+
+    let backfiller = ReceiptBackfiller::new(
+        provider.clone(),
+        config.receipt_contract,
+        bot_wallet,
+        config.vault,
+        receipt_inventory_cqrs.clone(),
+    );
+
+    let result = backfiller.backfill_receipts(from_block).await?;
+
+    debug!(
+        vault = %config.vault,
+        processed = result.processed_count,
+        skipped_zero_balance = result.skipped_zero_balance,
+        "Periodic receipt backfill complete for vault"
+    );
+
+    Ok(())
+}
+
+fn spawn_periodic_receipt_backfills<P>(
+    provider: P,
+    vault_configs: Vec<VaultBackfillConfig>,
+    receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    receipt_inventory_event_store: ReceiptInventoryEventStore,
+    bot_wallet: Address,
+    backfill_start_block: u64,
+) where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        tokio::time::sleep(RECEIPT_BACKFILL_REFRESH_INTERVAL).await;
+
+        let mut interval =
+            tokio::time::interval(RECEIPT_BACKFILL_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+
+            for config in &vault_configs {
+                if let Err(error) = run_periodic_receipt_backfill_for_config(
+                    &provider,
+                    *config,
+                    &receipt_inventory_cqrs,
+                    &receipt_inventory_event_store,
+                    bot_wallet,
+                    backfill_start_block,
+                )
+                .await
+                {
+                    warn!(
+                        error = %error,
+                        vault = %config.vault,
+                        "Periodic receipt backfill failed; next run will resume \
+                         from the last checkpoint"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Runs transfer backfill for all enabled vaults.
 ///
 /// Scans historic Transfer events to detect redemptions that occurred while the
-/// service was down. Must run after receipt backfill (for burn planning) and
-/// before live monitoring (to avoid missing transfers in the gap).
+/// service was down. A failure for one vault is logged and does not prevent
+/// later vaults from being attempted in the same pass.
 async fn run_all_transfer_backfills<P: Provider + Clone>(
     vault_configs: &[VaultBackfillConfig],
     backfiller: &TransferBackfiller<P, SqliteEventStore<Redemption>>,
@@ -837,10 +946,25 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
         "Running transfer backfill for all vaults"
     );
 
+    let mut failed_count = 0u64;
+
     for config in vault_configs {
-        let result = backfiller
+        let result = match backfiller
             .backfill_transfers(config.vault, backfill_start_block)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                failed_count += 1;
+                warn!(
+                    error = %error,
+                    vault = %config.vault,
+                    "Transfer backfill failed for vault; continuing with \
+                     remaining vaults"
+                );
+                continue;
+            }
+        };
 
         debug!(
             vault = %config.vault,
@@ -851,7 +975,49 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
         );
     }
 
+    if failed_count > 0 {
+        return Err(anyhow::anyhow!(
+            "transfer backfill failed for {failed_count} vault(s)"
+        ));
+    }
+
     Ok(())
+}
+
+/// Starts transfer backfill in the background so HTTP startup is not blocked by
+/// catch-up scans. Progress is checkpointed per vault by the backfiller.
+fn spawn_all_transfer_backfills<P>(
+    vault_configs: Vec<VaultBackfillConfig>,
+    backfiller: TransferBackfiller<P, SqliteEventStore<Redemption>>,
+    backfill_start_block: u64,
+) where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match run_all_transfer_backfills(
+                &vault_configs,
+                &backfiller,
+                backfill_start_block,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        retry_after_secs =
+                            TRANSFER_BACKFILL_RETRY_INTERVAL.as_secs(),
+                        "Transfer backfill pass failed; redemption detector \
+                         remains live and the background task will retry from \
+                         the last checkpoint"
+                    );
+                }
+            }
+
+            tokio::time::sleep(TRANSFER_BACKFILL_RETRY_INTERVAL).await;
+        }
+    });
 }
 
 /// Spawns receipt monitors for ALL enabled vaults.
@@ -910,7 +1076,9 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    use super::{Quantity, QuantityConversionError};
+    use super::{
+        Quantity, QuantityConversionError, next_receipt_backfill_block,
+    };
 
     #[test]
     fn test_quantity_display() {
@@ -1108,5 +1276,34 @@ mod tests {
 
         // Verify: truncated_u256 + dust_u256 == original_u256
         assert_eq!(truncated_u256 + dust_u256, original_u256);
+    }
+
+    #[test]
+    fn test_next_receipt_backfill_block_fails_on_overflow() {
+        let result = next_receipt_backfill_block(Some(u64::MAX), 50);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_next_receipt_backfill_block_uses_configured_start_without_checkpoint()
+     {
+        let start_block = next_receipt_backfill_block(None, 50).unwrap();
+
+        assert_eq!(start_block, 50);
+    }
+
+    #[test]
+    fn test_next_receipt_backfill_block_resumes_after_checkpoint() {
+        let start_block = next_receipt_backfill_block(Some(80), 50).unwrap();
+
+        assert_eq!(start_block, 81);
+    }
+
+    #[test]
+    fn test_next_receipt_backfill_block_respects_configured_floor() {
+        let start_block = next_receipt_backfill_block(Some(20), 50).unwrap();
+
+        assert_eq!(start_block, 50);
     }
 }

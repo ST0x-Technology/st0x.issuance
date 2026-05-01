@@ -216,6 +216,13 @@ endpoints.
 3. We poll for journal completion
 4. We burn tokens on-chain via `vault.withdraw()`
 
+Receipt and redemption transfer backfills use durable per-vault checkpoints.
+Periodic receipt backfill keeps receipt checkpoints current during long uptime,
+and live receipt monitoring processes new events without advancing the durable
+checkpoint out of block order. Redemption transfer backfill runs as background
+startup work. Restarts resume after the last successfully processed block
+instead of rescanning the full configured historical range.
+
 ## Configuration
 
 Configuration is managed through environment variables. See `.env.example` for

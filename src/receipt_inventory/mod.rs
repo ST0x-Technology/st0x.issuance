@@ -470,9 +470,18 @@ impl Aggregate for ReceiptInventory {
 
             ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
                 block_number,
-            } => Ok(vec![ReceiptInventoryEvent::BackfillCheckpoint {
-                block_number,
-            }]),
+            } => {
+                if self
+                    .last_backfilled_block
+                    .is_some_and(|last_block| block_number <= last_block)
+                {
+                    return Ok(vec![]);
+                }
+
+                Ok(vec![ReceiptInventoryEvent::BackfillCheckpoint {
+                    block_number,
+                }])
+            }
         }
     }
 
@@ -694,6 +703,38 @@ mod tests {
             &events[0],
             ReceiptInventoryEvent::BackfillCheckpoint { block_number: 100 }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_advance_backfill_checkpoint_ignores_stale_blocks() {
+        let aggregate = ReceiptInventory {
+            last_backfilled_block: Some(100),
+            ..Default::default()
+        };
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                    block_number: 99,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                    block_number: 100,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
     }
 
     #[test]

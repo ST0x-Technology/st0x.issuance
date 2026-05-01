@@ -200,59 +200,98 @@ where
                         debug!("Skipping removed Deposit log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_deposit(&log).await {
-                        warn!("Failed to process Deposit: {err}");
-                    }
+                    self.process_live_log(&log, "Deposit", |log| {
+                        Box::pin(self.process_deposit(log))
+                    }).await;
                 }
                 Some(log) = withdraw_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed Withdraw log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_withdraw(&log).await {
-                        warn!("Failed to process Withdraw: {err}");
-                    }
+                    self.process_live_log(&log, "Withdraw", |log| {
+                        Box::pin(self.process_withdraw(log))
+                    }).await;
                 }
                 Some(log) = transfer_single_inbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferSingle log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_transfer_single(&log).await {
-                        warn!("Failed to process TransferSingle: {err}");
-                    }
+                    self.process_live_log(&log, "TransferSingle", |log| {
+                        Box::pin(self.process_transfer_single(log))
+                    }).await;
                 }
                 Some(log) = transfer_single_outbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferSingle log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_transfer_single(&log).await {
-                        warn!("Failed to process TransferSingle: {err}");
-                    }
+                    self.process_live_log(&log, "TransferSingle", |log| {
+                        Box::pin(self.process_transfer_single(log))
+                    }).await;
                 }
                 Some(log) = transfer_batch_inbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferBatch log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_transfer_batch(&log).await {
-                        warn!("Failed to process TransferBatch: {err}");
-                    }
+                    self.process_live_log(&log, "TransferBatch", |log| {
+                        Box::pin(self.process_transfer_batch(log))
+                    }).await;
                 }
                 Some(log) = transfer_batch_outbound_stream.next() => {
                     if log.removed {
                         debug!("Skipping removed TransferBatch log (reorg)");
                         continue;
                     }
-                    if let Err(err) = self.process_transfer_batch(&log).await {
-                        warn!("Failed to process TransferBatch: {err}");
-                    }
+                    self.process_live_log(&log, "TransferBatch", |log| {
+                        Box::pin(self.process_transfer_batch(log))
+                    }).await;
                 }
                 else => {
                     return Err(ReceiptMonitorError::StreamEnded);
                 }
             }
+        }
+    }
+
+    async fn process_live_log<'a, FutureType>(
+        &self,
+        log: &'a Log,
+        event_name: &'static str,
+        process: impl FnOnce(&'a Log) -> FutureType,
+    ) where
+        FutureType:
+            std::future::Future<Output = Result<(), ReceiptMonitorError>>,
+    {
+        let Some(block_number) = log.block_number else {
+            // Without a block number we cannot prove where this live log fits
+            // relative to the durable checkpoint. Skip live processing and let
+            // periodic backfill rescan the range in block order.
+            warn!(
+                event_name,
+                "Live receipt log missing block number; periodic backfill will \
+                 rescan the range in block order"
+            );
+            return;
+        };
+
+        if let Err(err) = process(log).await {
+            warn!(
+                event_name,
+                block_number,
+                error = %err,
+                "Failed to process live receipt log; periodic backfill will \
+                 rescan from the durable checkpoint"
+            );
+        } else {
+            debug!(
+                event_name,
+                block_number,
+                "Processed live receipt log; periodic backfill owns durable \
+                 checkpoint advancement"
+            );
         }
     }
 
@@ -355,6 +394,8 @@ where
         let event = Receipt::TransferSingle::decode_log(&log.inner)?;
         let tx_hash =
             log.transaction_hash.ok_or(ReceiptMonitorError::MissingTxHash)?;
+        let block_number =
+            log.block_number.ok_or(ReceiptMonitorError::MissingBlockNumber)?;
 
         // Skip mint/burn transfers — already covered by Deposit/Withdraw
         if event.from.is_zero() || event.to.is_zero() {
@@ -370,10 +411,6 @@ where
                 value = %event.value,
                 "Inbound TransferSingle detected"
             );
-
-            let block_number = log
-                .block_number
-                .ok_or(ReceiptMonitorError::MissingBlockNumber)?;
 
             self.discover_receipt_if_has_balance(
                 receipt_id,
@@ -405,6 +442,8 @@ where
         log: &Log,
     ) -> Result<(), ReceiptMonitorError> {
         let event = Receipt::TransferBatch::decode_log(&log.inner)?;
+        let block_number =
+            log.block_number.ok_or(ReceiptMonitorError::MissingBlockNumber)?;
 
         // Skip mint/burn transfers — already covered by Deposit/Withdraw
         if event.from.is_zero() || event.to.is_zero() {
@@ -415,10 +454,6 @@ where
             log.transaction_hash.ok_or(ReceiptMonitorError::MissingTxHash)?;
 
         if event.to == self.bot_wallet {
-            let block_number = log
-                .block_number
-                .ok_or(ReceiptMonitorError::MissingBlockNumber)?;
-
             for receipt_id_raw in &event.ids {
                 let receipt_id = ReceiptId::from(*receipt_id_raw);
 
@@ -771,6 +806,318 @@ mod tests {
         assert_eq!(event_for_other.owner, other_wallet);
         assert!(event_for_bot.owner == bot_wallet);
         assert!(event_for_other.owner != bot_wallet);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_live_deposit_does_not_advance_receipt_checkpoint() {
+        let (cqrs, store) = setup_test_cqrs();
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
+        let receipt_contract =
+            address!("0x5555555555555555555555555555555555555555");
+
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+
+        let monitor = ReceiptMonitor::new(
+            provider,
+            ReceiptMonitorConfig { vault, receipt_contract, bot_wallet },
+            cqrs.clone(),
+            NoOpHandler,
+        );
+
+        let log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(42_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 123,
+        });
+
+        monitor
+            .process_live_log(&log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert_eq!(context.aggregate().last_backfilled_block(), None);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Processed live receipt log",
+                "periodic backfill owns durable checkpoint advancement",
+                "block_number=123"
+            ]
+        ));
+        assert!(
+            context.aggregate().receipts_with_balance().is_empty(),
+            "Non-bot deposit should not register a receipt"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_failed_live_log_does_not_affect_later_live_processing() {
+        let (cqrs, store) = setup_test_cqrs();
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
+        let receipt_contract =
+            address!("0x5555555555555555555555555555555555555555");
+
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+
+        let monitor = ReceiptMonitor::new(
+            provider,
+            ReceiptMonitorConfig { vault, receipt_contract, bot_wallet },
+            cqrs.clone(),
+            NoOpHandler,
+        );
+
+        let mut failed_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(42_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 123,
+        });
+        failed_log.transaction_hash = None;
+
+        monitor
+            .process_live_log(&failed_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let later_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(43_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            block_number: 124,
+        });
+
+        monitor
+            .process_live_log(&later_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert_eq!(context.aggregate().last_backfilled_block(), None);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Failed to process live receipt log",
+                "periodic backfill will rescan from the durable checkpoint",
+                "error=Missing transaction hash in log"
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Processed live receipt log",
+                "periodic backfill owns durable checkpoint advancement",
+                "block_number=124"
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_periodic_backfill_remains_checkpoint_authority() {
+        let (cqrs, store) = setup_test_cqrs();
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
+        let receipt_contract =
+            address!("0x5555555555555555555555555555555555555555");
+
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+
+        let monitor = ReceiptMonitor::new(
+            provider,
+            ReceiptMonitorConfig { vault, receipt_contract, bot_wallet },
+            cqrs.clone(),
+            NoOpHandler,
+        );
+
+        let mut failed_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(42_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 123,
+        });
+        failed_log.transaction_hash = None;
+
+        monitor
+            .process_live_log(&failed_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        cqrs.execute(
+            &vault.to_string(),
+            ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                block_number: 123,
+            },
+        )
+        .await
+        .unwrap();
+
+        let later_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(43_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            block_number: 124,
+        });
+
+        monitor
+            .process_live_log(&later_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert_eq!(context.aggregate().last_backfilled_block(), Some(123));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Processed live receipt log",
+                "periodic backfill owns durable checkpoint advancement",
+                "block_number=124"
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_unpositioned_live_log_does_not_clear_existing_checkpoint() {
+        let (cqrs, store) = setup_test_cqrs();
+        let vault = address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let other_wallet =
+            address!("0x4444444444444444444444444444444444444444");
+        let receipt_contract =
+            address!("0x5555555555555555555555555555555555555555");
+
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+
+        let monitor = ReceiptMonitor::new(
+            provider,
+            ReceiptMonitorConfig { vault, receipt_contract, bot_wallet },
+            cqrs.clone(),
+            NoOpHandler,
+        );
+
+        cqrs.execute(
+            &vault.to_string(),
+            ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
+                block_number: 123,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut unpositioned_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(42_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            block_number: 123,
+        });
+        unpositioned_log.block_number = None;
+
+        monitor
+            .process_live_log(&unpositioned_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let later_log = create_deposit_log(VaultEventLogParams {
+            vault,
+            sender: other_wallet,
+            owner: other_wallet,
+            assets: uint!(100_U256),
+            shares: uint!(100_U256),
+            id: uint!(43_U256),
+            receipt_information: Bytes::new(),
+            tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            block_number: 124,
+        });
+
+        monitor
+            .process_live_log(&later_log, "Deposit", |log| {
+                Box::pin(monitor.process_deposit(log))
+            })
+            .await;
+
+        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert_eq!(context.aggregate().last_backfilled_block(), Some(123));
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Live receipt log missing block number",
+                "periodic backfill will rescan the range in block order"
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Processed live receipt log",
+                "periodic backfill owns durable checkpoint advancement",
+                "block_number=124"
+            ]
+        ));
     }
 
     #[tokio::test]

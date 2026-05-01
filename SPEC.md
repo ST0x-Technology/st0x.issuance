@@ -428,9 +428,18 @@ recovery. Methods:
   a receipt by ITN issuer_request_id for mint recovery
 
 Receipts enter the inventory through backfill (scanning historic Deposit and
-ERC-1155 transfer events at startup from `last_backfilled_block`), live
-monitoring (WebSocket subscription to Deposit and ERC-1155 transfer events at
-runtime), or direct registration after a mint.
+ERC-1155 transfer events at startup from the block after
+`last_backfilled_block`), live monitoring (WebSocket subscription to Deposit and
+ERC-1155 transfer events at runtime), or direct registration after a mint. After
+startup backfill succeeds, periodic receipt backfill safely scans the small
+runtime range from the durable checkpoint to the current block and advances
+`last_backfilled_block` only after ordered range processing succeeds. Live
+monitoring processes observed logs opportunistically but does not advance the
+durable checkpoint, because WebSocket logs can arrive out of order within or
+across blocks. This prevents long-running services from restarting with a stale
+receipt checkpoint that forces a large historical scan before Rocket can serve
+requests without allowing one live log to checkpoint past another unprocessed
+log in the same block.
 
 The Receipt contract is an ERC-1155 token that emits `TransferSingle` and
 `TransferBatch` events on all token movements. The receipt monitor and
@@ -445,7 +454,7 @@ emitting `BalanceReconciled` when the on-chain balance differs from the
 aggregate balance in either direction. Reconciliation is triggered by:
 
 - **Startup**: After receipt backfill, reconciles all receipts with positive
-  aggregate balance before redemption transfer backfill begins
+  aggregate balance before redemption recovery and live monitoring begin
 - **Post-burn**: After every burn attempt (successful or failed), reconciles the
   affected vault immediately
 - **Live monitoring**: WebSocket subscription to Withdraw events and ERC-1155
@@ -1153,21 +1162,23 @@ tokenized asset.
 
 **Transfer Backfilling:**
 
-At startup, before spawning live monitors, the service scans historic Transfer
-events on **each vault independently** to detect any redemption transfers that
-occurred while the service was down. This ensures no redemptions are silently
-missed due to downtime.
+At startup, the service starts historic Transfer backfill in the background so
+HTTP serving and health checks are not blocked by avoidable chain catch-up work.
+The backfiller scans Transfer events on **each vault independently** to detect
+any redemption transfers that occurred while the service was down. This ensures
+no redemptions are silently missed due to downtime.
 
-Each vault is backfilled separately: the backfiller scans from the configured
-`backfill_start_block` to the current block for each vault contract. Idempotency
-is guaranteed by the `IssuerRedemptionRequestId` derived from each transaction
-hash — the Redemption aggregate rejects duplicate detections, so re-scanning
-already-processed blocks is safe.
+Each vault is backfilled separately. The configured `backfill_start_block` is
+only the first-run seed; after a successful range, the service persists a
+per-vault `redemption_backfill_checkpoints` row and the next startup resumes at
+`last_processed_block + 1`. The checkpoint advances only after the requested
+range succeeds, and writes are monotonic so a shorter later range cannot move
+progress backward. Idempotency is still guaranteed by the
+`IssuerRedemptionRequestId` derived from each transaction hash — the Redemption
+aggregate rejects duplicate detections.
 
 This mirrors the receipt backfill pattern, where per-vault checkpoints are
 tracked via the `ReceiptInventory` aggregate's `last_backfilled_block` state.
-Transfer backfill currently relies on idempotency rather than per-vault
-checkpoint tracking.
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
