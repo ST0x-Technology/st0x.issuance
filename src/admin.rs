@@ -443,16 +443,14 @@ async fn recover_post_alpaca(
         }
     }
 
-    let alpaca_journal_completed_at = match alpaca_updated_at {
-        Some(ts) => *ts,
-        None => {
-            error!(
-                aggregate_id = %aggregate_id,
-                "Alpaca returned completed status but updated_at is null"
-            );
-            return Err(Status::BadGateway);
-        }
+    let Some(alpaca_journal_completed_at) = alpaca_updated_at else {
+        error!(
+            aggregate_id = %aggregate_id,
+            "Alpaca returned completed status but updated_at is null"
+        );
+        return Err(Status::BadGateway);
     };
+    let alpaca_journal_completed_at = *alpaca_journal_completed_at;
 
     cqrs.execute(
         &aggregate_id,
