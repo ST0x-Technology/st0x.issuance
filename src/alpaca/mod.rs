@@ -160,6 +160,7 @@ pub(crate) enum TokenizationRequest {
             deserialize_with = "deserialize_optional_b256"
         )]
         tx_hash: Option<B256>,
+        updated_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -361,7 +362,8 @@ mod tests {
             "token_symbol": "tAAPL",
             "qty": "50.00",
             "wallet_address": "0x9999999999999999999999999999999999999999",
-            "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "updated_at": "2025-09-12T17:30:00.000000-04:00"
         });
 
         let request: TokenizationRequest =
@@ -392,7 +394,8 @@ mod tests {
                 "token_symbol": "tAAPL",
                 "qty": "50.00",
                 "wallet_address": "0x9999999999999999999999999999999999999999",
-                "tx_hash": ""
+                "tx_hash": "",
+                "updated_at": "2025-09-12T17:30:00.000000-04:00"
             }
         ]);
 

@@ -586,6 +586,7 @@ mod tests {
                 tx_hash: Some(b256!(
                     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                 )),
+                updated_at: Some(chrono::Utc::now()),
             }
         }
     }
@@ -988,6 +989,7 @@ mod tests {
                     tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                     )),
+                    updated_at: Some(chrono::Utc::now()),
                 })
             }
         }

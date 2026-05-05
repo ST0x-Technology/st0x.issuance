@@ -62,6 +62,15 @@ pub(crate) enum FireblocksVaultError {
     UnknownChain { chain_id: u64 },
     #[error("transaction {tx_hash} has no receipt after confirmation")]
     MissingReceipt { tx_hash: TxHash },
+    /// An error occurred after the Fireblocks transaction was submitted and
+    /// potentially completed on-chain. The `tx_id` is preserved so that
+    /// recovery can look up the transaction on Fireblocks.
+    #[error("post-submit error for Fireblocks tx {tx_id}: {source}")]
+    PostSubmit {
+        tx_id: String,
+        #[source]
+        source: Box<VaultError>,
+    },
 }
 
 /// Fetches the vault account address from Fireblocks.
@@ -326,6 +335,48 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or(FireblocksVaultError::MissingReceipt { tx_hash })
+    }
+
+    /// Fetches the receipt for a confirmed burn tx and parses Withdraw events.
+    async fn parse_burn_receipt(
+        &self,
+        tx_hash: B256,
+        dust_shares: U256,
+    ) -> Result<MultiBurnResult, VaultError> {
+        let receipt = self.fetch_receipt(tx_hash).await?;
+
+        let burns: Vec<MultiBurnResultEntry> = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
+                    .ok()
+                    .map(|decoded| {
+                        let event_data = decoded.data();
+                        MultiBurnResultEntry {
+                            receipt_id: event_data.id,
+                            shares_burned: event_data.shares,
+                        }
+                    })
+            })
+            .collect();
+
+        if burns.is_empty() {
+            return Err(VaultError::EventNotFound { tx_hash });
+        }
+
+        let gas_used = receipt.gas_used;
+        let block_number =
+            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+
+        Ok(MultiBurnResult {
+            tx_hash,
+            burns,
+            dust_returned: dust_shares,
+            gas_used,
+            block_number,
+        })
     }
 }
 
@@ -646,45 +697,65 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             )
             .await?;
 
-        // Wait for Fireblocks to complete the transaction
+        // Wait for Fireblocks to complete the transaction.
+        // TransactionFailed already carries tx_id, so no wrapping needed.
         let tx_hash = self.wait_for_completion(&tx_id).await?;
 
-        // Fetch the receipt from our RPC provider to parse events
-        let receipt = self.fetch_receipt(tx_hash).await?;
+        // Post-submit: any error after this point means the tx may have
+        // landed on-chain. Wrap errors with PostSubmit to preserve tx_id
+        // for recovery.
+        self.parse_burn_receipt(tx_hash, params.dust_shares).await.map_err(
+            |err| {
+                VaultError::Fireblocks(FireblocksVaultError::PostSubmit {
+                    tx_id,
+                    source: Box::new(err),
+                })
+            },
+        )
+    }
 
-        // Parse all Withdraw events from the receipt
-        let burns: Vec<MultiBurnResultEntry> = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter_map(|log| {
-                log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
-                    .ok()
-                    .map(|decoded| {
-                        let event_data = decoded.data();
-                        MultiBurnResultEntry {
-                            receipt_id: event_data.id,
-                            shares_burned: event_data.shares,
-                        }
-                    })
-            })
-            .collect();
+    async fn check_fireblocks_tx(
+        &self,
+        fireblocks_tx_id: &str,
+    ) -> Result<Option<crate::vault::FireblocksTxStatus>, VaultError> {
+        use crate::vault::FireblocksTxStatus;
 
-        if burns.is_empty() {
-            return Err(VaultError::EventNotFound { tx_hash });
-        }
+        let tx = self
+            .client
+            .get_transaction(fireblocks_tx_id)
+            .await
+            .map_err(FireblocksVaultError::from)?;
 
-        let gas_used = receipt.gas_used;
-        let block_number =
-            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+        let status = match tx.status {
+            TransactionStatus::Completed => {
+                let tx_hash_str = tx.tx_hash.ok_or_else(|| {
+                    FireblocksVaultError::MissingTxHash {
+                        tx_id: fireblocks_tx_id.to_string(),
+                    }
+                })?;
+                let tx_hash = parse_tx_hash(&tx_hash_str)?;
+                let receipt = self.fetch_receipt(tx_hash).await?;
+                let block_number =
+                    receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(MultiBurnResult {
-            tx_hash,
-            burns,
-            dust_returned: params.dust_shares,
-            gas_used,
-            block_number,
-        })
+                // Verify EVM execution succeeded — a mined tx can still be a revert.
+                if !receipt.status() {
+                    return Ok(Some(FireblocksTxStatus::Failed {
+                        status: format!(
+                            "EVM reverted (Fireblocks Completed, tx {tx_hash})"
+                        ),
+                    }));
+                }
+
+                FireblocksTxStatus::Completed { tx_hash, block_number }
+            }
+            status if is_still_pending(status) => FireblocksTxStatus::Pending,
+            status => {
+                FireblocksTxStatus::Failed { status: format!("{status:?}") }
+            }
+        };
+
+        Ok(Some(status))
     }
 
     async fn get_share_balance(

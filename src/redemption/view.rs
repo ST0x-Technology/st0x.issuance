@@ -84,6 +84,11 @@ pub(crate) enum RedemptionView {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    Closed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        reason: String,
+        closed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for RedemptionView {
@@ -291,6 +296,38 @@ impl View<Redemption> for RedemptionView {
                     *alpaca_journal_completed_at,
                 );
             }
+            RedemptionEvent::BurnResumed {
+                issuer_request_id,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number,
+                detected_at,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                ..
+            } => {
+                *self = Self::Burning {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    underlying: underlying.clone(),
+                    token: token.clone(),
+                    wallet: *wallet,
+                    quantity: quantity.clone(),
+                    alpaca_quantity: alpaca_quantity.clone(),
+                    dust_quantity: dust_quantity.clone(),
+                    tx_hash: *tx_hash,
+                    block_number: *block_number,
+                    detected_at: *detected_at,
+                    called_at: *called_at,
+                    alpaca_journal_completed_at: *alpaca_journal_completed_at,
+                };
+            }
             RedemptionEvent::TokensBurned {
                 issuer_request_id,
                 tx_hash,
@@ -303,6 +340,31 @@ impl View<Redemption> for RedemptionView {
                     burn_tx_hash: *tx_hash,
                     block_number: *block_number,
                     completed_at: *burned_at,
+                };
+            }
+            RedemptionEvent::ExistingBurnRecovered {
+                issuer_request_id,
+                tx_hash,
+                block_number,
+                recovered_at,
+                ..
+            } => {
+                *self = Self::Completed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    burn_tx_hash: *tx_hash,
+                    block_number: *block_number,
+                    completed_at: *recovered_at,
+                };
+            }
+            RedemptionEvent::RedemptionClosed {
+                issuer_request_id,
+                reason,
+                closed_at,
+            } => {
+                *self = Self::Closed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: reason.clone(),
+                    closed_at: *closed_at,
                 };
             }
         }
@@ -1382,6 +1444,8 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
                 failed_at,
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         ));
 
@@ -1476,6 +1540,8 @@ mod tests {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: burn_failed_id.clone(),
                 error: "Insufficient gas".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         )
         .await
@@ -1646,6 +1712,8 @@ mod tests {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: burn_failed_id.clone(),
                 error: "Insufficient gas".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         )
         .await
@@ -1773,5 +1841,156 @@ mod tests {
 
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_underlying, underlying);
+    }
+
+    #[test]
+    fn test_view_updates_on_burn_resumed_event() {
+        let mut view = RedemptionView::default();
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("tok-resumed-789");
+        let underlying = UnderlyingSymbol::new("TSLA");
+        let token = TokenSymbol::new("tTSLA");
+        let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let quantity = Quantity::new(Decimal::from(42));
+        let alpaca_quantity = Quantity::new(Decimal::from(42));
+        let dust_quantity = Quantity::new(Decimal::ZERO);
+        let tx_hash = b256!(
+            "0x4444444444444444444444444444444444444444444444444444444444444444"
+        );
+        let block_number = 55555;
+        let detected_at = Utc::now();
+        let called_at = Utc::now();
+        let alpaca_journal_completed_at = Utc::now();
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.to_string(),
+            sequence: 1,
+            payload: RedemptionEvent::BurnResumed {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: underlying.clone(),
+                token: token.clone(),
+                wallet,
+                quantity: quantity.clone(),
+                tx_hash,
+                block_number,
+                detected_at,
+                tokenization_request_id: tokenization_request_id.clone(),
+                alpaca_quantity: alpaca_quantity.clone(),
+                dust_quantity: dust_quantity.clone(),
+                called_at,
+                alpaca_journal_completed_at,
+                resumed_at: Utc::now(),
+            },
+            metadata: HashMap::default(),
+        });
+
+        let RedemptionView::Burning {
+            issuer_request_id: view_id,
+            tokenization_request_id: view_tok_id,
+            underlying: view_underlying,
+            token: view_token,
+            wallet: view_wallet,
+            quantity: view_quantity,
+            alpaca_quantity: view_alpaca_quantity,
+            dust_quantity: view_dust_quantity,
+            tx_hash: view_tx_hash,
+            block_number: view_block_number,
+            detected_at: view_detected_at,
+            called_at: view_called_at,
+            alpaca_journal_completed_at: view_journal_completed_at,
+        } = view
+        else {
+            panic!("Expected Burning view after BurnResumed, got {view:?}");
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_tok_id, tokenization_request_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(view_wallet, wallet);
+        assert_eq!(view_quantity, quantity);
+        assert_eq!(view_alpaca_quantity, alpaca_quantity);
+        assert_eq!(view_dust_quantity, dust_quantity);
+        assert_eq!(view_tx_hash, tx_hash);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_detected_at, detected_at);
+        assert_eq!(view_called_at, called_at);
+        assert_eq!(view_journal_completed_at, alpaca_journal_completed_at);
+    }
+
+    #[test]
+    fn test_existing_burn_recovered_projects_to_completed() {
+        let mut view = RedemptionView::default();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = b256!(
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
+        );
+        let block_number = 77777;
+        let recovered_at = Utc::now();
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.to_string(),
+            sequence: 1,
+            payload: RedemptionEvent::ExistingBurnRecovered {
+                issuer_request_id: issuer_request_id.clone(),
+                fireblocks_tx_id: "fb-recovered-123".to_string(),
+                tx_hash,
+                burns: vec![],
+                block_number,
+                recovered_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        let RedemptionView::Completed {
+            issuer_request_id: view_id,
+            burn_tx_hash: view_tx_hash,
+            block_number: view_block_number,
+            completed_at: view_completed_at,
+        } = view
+        else {
+            panic!(
+                "Expected Completed view after ExistingBurnRecovered, got {view:?}"
+            );
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_tx_hash, tx_hash);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_completed_at, recovered_at);
+    }
+
+    #[test]
+    fn test_redemption_closed_projects_to_closed() {
+        let mut view = RedemptionView::default();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let reason = "Legacy entry — tokens already consumed".to_string();
+        let closed_at = Utc::now();
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.to_string(),
+            sequence: 1,
+            payload: RedemptionEvent::RedemptionClosed {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: reason.clone(),
+                closed_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        let RedemptionView::Closed {
+            issuer_request_id: view_id,
+            reason: view_reason,
+            closed_at: view_closed_at,
+        } = view
+        else {
+            panic!("Expected Closed view after RedemptionClosed, got {view:?}");
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_reason, reason);
+        assert_eq!(view_closed_at, closed_at);
     }
 }

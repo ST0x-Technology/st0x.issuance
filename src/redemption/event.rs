@@ -78,6 +78,14 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         failed_at: DateTime<Utc>,
+        /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
+        /// Absent for non-Fireblocks backends or pre-enrichment events.
+        #[serde(default)]
+        fireblocks_tx_id: Option<String>,
+        /// Planned burns at the time of failure.
+        /// Absent for pre-enrichment events.
+        #[serde(default)]
+        planned_burns: Vec<BurnRecord>,
     },
     /// Redemption reset to Detected state for reprocessing.
     /// Carries the original metadata so apply() can reconstruct Detected.
@@ -92,6 +100,46 @@ pub(crate) enum RedemptionEvent {
         detected_at: DateTime<Utc>,
         previous_state: String,
         reprocessed_at: DateTime<Utc>,
+    },
+    /// Existing on-chain burn discovered during recovery via Fireblocks tx lookup.
+    /// Mirrors mint's `ExistingMintRecovered` — the burn already landed on-chain
+    /// but the bot failed to record it (e.g., Fireblocks polling timeout).
+    ExistingBurnRecovered {
+        issuer_request_id: IssuerRedemptionRequestId,
+        fireblocks_tx_id: String,
+        tx_hash: B256,
+        burns: Vec<BurnRecord>,
+        block_number: u64,
+        recovered_at: DateTime<Utc>,
+    },
+    /// Admin-closed redemption that cannot be automatically recovered.
+    /// Terminal state — closed redemptions do not appear in stuck queries.
+    RedemptionClosed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        reason: String,
+        closed_at: DateTime<Utc>,
+    },
+    /// Post-Alpaca failed redemption resumed directly to Burning state.
+    /// Used when Alpaca was already called and the journal eventually completed,
+    /// but the bot had already timed out and marked the redemption as Failed.
+    /// Carries all data needed to reconstruct the Burning state.
+    BurnResumed {
+        issuer_request_id: IssuerRedemptionRequestId,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        wallet: Address,
+        quantity: Quantity,
+        tx_hash: B256,
+        block_number: u64,
+        detected_at: DateTime<Utc>,
+        tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+        called_at: DateTime<Utc>,
+        /// Alpaca's `updated_at` for the completed journal — the closest
+        /// approximation we have to the actual journal completion time.
+        alpaca_journal_completed_at: DateTime<Utc>,
+        resumed_at: DateTime<Utc>,
     },
 }
 
@@ -119,6 +167,15 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::Reprocessed { .. } => {
                 "RedemptionEvent::Reprocessed".to_string()
+            }
+            Self::BurnResumed { .. } => {
+                "RedemptionEvent::BurnResumed".to_string()
+            }
+            Self::ExistingBurnRecovered { .. } => {
+                "RedemptionEvent::ExistingBurnRecovered".to_string()
+            }
+            Self::RedemptionClosed { .. } => {
+                "RedemptionEvent::RedemptionClosed".to_string()
             }
         }
     }
@@ -208,6 +265,8 @@ mod tests {
             issuer_request_id: test_redemption_id(),
             error: "Blockchain error: timeout".to_string(),
             failed_at: Utc::now(),
+            fireblocks_tx_id: None,
+            planned_burns: vec![],
         };
 
         assert_eq!(event.event_type(), "RedemptionEvent::BurningFailed");
@@ -220,6 +279,11 @@ mod tests {
             issuer_request_id: test_redemption_id(),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
+            fireblocks_tx_id: Some("fb-tx-123".to_string()),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(7_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
         };
 
         let serialized = serde_json::to_string(&event).unwrap();
@@ -227,6 +291,32 @@ mod tests {
             serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(event, deserialized);
+    }
+
+    /// Tests that old BurningFailed events without the new fields deserialize correctly.
+    #[test]
+    fn test_backwards_compat_burning_failed_without_enrichment_fields() {
+        let json = r#"{
+            "BurningFailed": {
+                "issuer_request_id": "red-abcdef12",
+                "error": "polling timeout",
+                "failed_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::BurningFailed {
+            fireblocks_tx_id,
+            planned_burns,
+            ..
+        } = event
+        else {
+            panic!("Expected BurningFailed variant");
+        };
+
+        assert_eq!(fireblocks_tx_id, None);
+        assert!(planned_burns.is_empty());
     }
 
     #[test]

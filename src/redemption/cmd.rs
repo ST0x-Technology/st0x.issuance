@@ -51,6 +51,10 @@ pub(crate) enum RedemptionCommand {
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
+        /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
+        fireblocks_tx_id: Option<String>,
+        /// Planned burns at the time of failure.
+        planned_burns: Vec<super::BurnRecord>,
     },
     /// Retries a failed burn operation.
     /// Only valid from Failed state after a BurningFailed event.
@@ -73,5 +77,35 @@ pub(crate) enum RedemptionCommand {
     Reprocess {
         issuer_request_id: IssuerRedemptionRequestId,
         metadata: super::RedemptionMetadata,
+    },
+    /// Records an existing on-chain burn discovered via Fireblocks tx lookup.
+    /// Only valid from `Failed` state. Used when the Fireblocks transaction
+    /// succeeded on-chain but the bot timed out before recording it.
+    RecordExistingBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        fireblocks_tx_id: String,
+        tx_hash: B256,
+        planned_burns: Vec<super::BurnRecord>,
+        block_number: u64,
+    },
+    /// Admin-closes a failed redemption that cannot be automatically recovered.
+    /// Only valid from `Failed` state.
+    CloseRedemption {
+        issuer_request_id: IssuerRedemptionRequestId,
+        reason: String,
+    },
+    /// Resumes a post-Alpaca failed redemption directly to Burning state.
+    /// Only valid from `Failed` state when Alpaca was already called and
+    /// the journal has since completed on Alpaca's side.
+    /// Metadata is provided by the API layer (extracted from the event store).
+    ResumeBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        metadata: super::RedemptionMetadata,
+        tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+        called_at: chrono::DateTime<chrono::Utc>,
+        /// Alpaca's `updated_at` for the completed journal.
+        alpaca_journal_completed_at: chrono::DateTime<chrono::Utc>,
     },
 }

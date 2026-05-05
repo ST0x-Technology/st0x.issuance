@@ -259,6 +259,8 @@ pub async fn initialize_rocket(
     let bot_wallet = config.signer.address().await?;
     info!("Bot wallet address: {bot_wallet}");
 
+    let vault_service_for_rocket = blockchain_setup.vault_service.clone();
+
     let AggregateCqrsSetup {
         mint,
         redemption_cqrs,
@@ -392,6 +394,8 @@ pub async fn initialize_rocket(
         mint,
         redemption_cqrs,
         redemption_event_store,
+        alpaca_service,
+        vault_service: vault_service_for_rocket,
     }))
 }
 
@@ -405,6 +409,8 @@ struct RocketState {
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
+    alpaca_service: Arc<dyn AlpacaService>,
+    vault_service: Arc<dyn vault::VaultService>,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -427,6 +433,8 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
         .manage(state.redemption_event_store)
+        .manage(state.alpaca_service)
+        .manage(state.vault_service)
         .manage(state.pool)
         .mount(
             "/",
@@ -440,7 +448,8 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 tokenized_asset::add_tokenized_asset,
                 mint::initiate_mint,
                 mint::confirm_journal,
-                admin::reprocess_redemption,
+                admin::recover_redemption,
+                admin::close_redemption,
                 admin::reprocess_mint,
                 admin::list_stuck,
             ],

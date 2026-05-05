@@ -78,6 +78,20 @@ pub(crate) trait VaultService: Send + Sync {
         owner: Address,
     ) -> Result<U256, VaultError>;
 
+    /// Checks the status of a Fireblocks transaction by its ID.
+    ///
+    /// Returns `Ok(None)` for non-Fireblocks backends (no Fireblocks state to check).
+    /// Returns `Ok(Some(status))` if the transaction was found on Fireblocks.
+    ///
+    /// This is a single-shot check, not a polling loop. Used by the admin recovery
+    /// endpoint to detect burns that succeeded on-chain but weren't recorded.
+    async fn check_fireblocks_tx(
+        &self,
+        _fireblocks_tx_id: &str,
+    ) -> Result<Option<FireblocksTxStatus>, VaultError> {
+        Ok(None)
+    }
+
     /// Atomically burns tokens from multiple receipts and returns dust using multicall.
     ///
     /// This method handles redemptions that require burning from multiple receipts
@@ -95,6 +109,17 @@ pub(crate) trait VaultService: Send + Sync {
         &self,
         params: MultiBurnParams,
     ) -> Result<MultiBurnResult, VaultError>;
+}
+
+/// Status of a Fireblocks transaction, as returned by `check_fireblocks_tx`.
+#[derive(Debug, Clone)]
+pub(crate) enum FireblocksTxStatus {
+    /// Transaction completed on-chain.
+    Completed { tx_hash: B256, block_number: u64 },
+    /// Transaction is still pending (submitted, confirming, etc.).
+    Pending,
+    /// Transaction reached a terminal failure status.
+    Failed { status: String },
 }
 
 /// Result of a successful on-chain minting operation.

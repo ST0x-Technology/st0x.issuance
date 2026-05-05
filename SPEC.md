@@ -273,14 +273,22 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RecordBurnFailure` - On-chain burn failed
 - `MarkFailed` - Mark redemption as failed
 - `Reprocess { issuer_request_id, metadata }` - Reset a failed redemption back
-  to `Detected` state for reprocessing. Only valid from `Failed` state —
-  post-Alpaca states (`AlpacaCalled`, `Burning`) have dedicated recovery paths
-  and resetting them would cause duplicate Alpaca calls. The `metadata` field
-  carries the original `RedemptionMetadata` (extracted by the API layer from the
-  event store's first `Detected` event), since the `Failed` aggregate state does
-  not preserve metadata. Emits `Reprocessed` event with the metadata, previous
-  state name, and timestamp for audit trail. The existing recovery logic then
-  picks it up naturally from `Detected` state.
+  to `Detected` state for reprocessing. Only valid from `Failed` state when no
+  `AlpacaCalled` event exists in the history — post-Alpaca failures use
+  `ResumeBurn` instead. The `metadata` field carries the original
+  `RedemptionMetadata` (extracted by the API layer from the event store's first
+  `Detected` event), since the `Failed` aggregate state does not preserve
+  metadata. Emits `Reprocessed` event with the metadata, previous state name,
+  and timestamp for audit trail. The existing recovery logic then picks it up
+  naturally from `Detected` state.
+- `ResumeBurn { issuer_request_id, metadata, tokenization_request_id,
+  alpaca_quantity, dust_quantity, called_at }` -
+  Resume a failed redemption directly to `Burning` state, bypassing the Alpaca
+  call step. Only valid from `Failed` state. Used for post-Alpaca failures where
+  Alpaca has already completed the journal. The API layer polls Alpaca to verify
+  journal completion before issuing this command — refuses if Pending or
+  Rejected. Emits `BurnResumed` event. Burn executes on next service restart via
+  `recover_burning_redemptions`.
 
 **Events:**
 
@@ -297,18 +305,24 @@ on-chain transfer through calling Alpaca to burning tokens.
   the original `RedemptionMetadata`, the previous state name, and a timestamp.
   Used for audit trail — shows when and from what state a manual reprocess was
   triggered.
+- `BurnResumed` - Redemption resumed directly to `Burning` state from `Failed`.
+  Carries the original `RedemptionMetadata`, `tokenization_request_id`,
+  `alpaca_quantity`, `dust_quantity`, `called_at` (from the original
+  `AlpacaCalled` event), and `resumed_at` timestamp. Used for post-Alpaca
+  recovery where the journal already completed.
 
 **Command -> Event Mappings:**
 
-| Command                 | Events                   | Notes                                |
-| ----------------------- | ------------------------ | ------------------------------------ |
-| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                    |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                    |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                     |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                     |
-| `RecordBurnSuccess`     | `TokensBurned`           | Multi-receipt burn, terminal success |
-| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure                     |
-| `Reprocess`             | `Reprocessed`            | Reset to Detected for reprocessing   |
+| Command                 | Events                   | Notes                                      |
+| ----------------------- | ------------------------ | ------------------------------------------ |
+| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                          |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                          |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                           |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                           |
+| `RecordBurnSuccess`     | `TokensBurned`           | Multi-receipt burn, terminal success       |
+| `RecordBurnFailure`     | `BurningFailed`          | Terminal failure                           |
+| `Reprocess`             | `Reprocessed`            | Reset to Detected for reprocessing         |
+| `ResumeBurn`            | `BurnResumed`            | Resume to Burning for post-Alpaca recovery |
 
 ### Account Aggregate
 
@@ -1429,6 +1443,8 @@ stateDiagram-v2
     Burning --> Completed: RecordBurnSuccess
     Burning --> Failed: RecordBurnFailure / MarkFailed
     Failed --> Failed: MarkFailed (re-classify failure)
+    Failed --> Detected: Reprocess (pre-Alpaca)
+    Failed --> Burning: ResumeBurn (post-Alpaca)
     Failed --> [*]
     Completed --> [*]
 ```
@@ -1831,31 +1847,64 @@ fn test_journal_confirmed_for_missing_mint() {
 Internal endpoints for operational management, protected by `InternalAuth`
 (X-API-KEY header + internal IP whitelist).
 
-### Reprocess Stuck Aggregates
+### Recover Stuck Aggregates
 
-Resets a stuck or failed aggregate back to its initial processing state so
-existing recovery logic picks it up.
+Recovers a stuck or failed aggregate so existing recovery logic picks it up.
 
-**Redemption:** Dispatches a `Reprocess` command that transitions the aggregate
-back to `Detected`. Only valid from `Failed` state — post-Alpaca states have
-dedicated recovery paths. The API layer extracts the original
-`RedemptionMetadata` from the event store (first `Detected` event) since the
-`Failed` aggregate state does not preserve it.
+**Redemption:** `POST /admin/recover/redemption/<issuer_request_id>`
 
-**Mint:** Dispatches the existing `Recover` command which already handles
+Auto-detects the right recovery path from the event history:
+
+- **Pre-Alpaca failures** (no `AlpacaCalled` event): Dispatches `Reprocess` to
+  reset to `Detected`. `RedeemCallManager` re-calls Alpaca on next restart.
+- **Post-Alpaca failures** (`AlpacaCalled` event exists): Polls Alpaca to verify
+  journal completion, then dispatches `ResumeBurn` to transition to `Burning`.
+  Refuses if Alpaca journal is `Pending` or `Rejected` (to avoid burning without
+  backing). `BurnManager` executes the burn on next restart.
+
+**Mint:** `POST /admin/reprocess/mint/<aggregate_id>`
+
+Dispatches the existing `Recover` command which already handles
 `JournalConfirmed`, `Minting`, `MintingFailed`, and `CallbackPending` states.
 
-**Endpoint:** `POST /admin/reprocess/<aggregate_type>/<aggregate_id>`
+**Post-Alpaca with existing on-chain burn:** If a `BurningFailed` event carries
+a Fireblocks tx ID (enrichment added in PR #143), the endpoint queries
+Fireblocks. If the tx completed on-chain, dispatches `RecordExistingBurn` →
+`ExistingBurnRecovered` event → `Completed` state. This handles the Fireblocks
+polling timeout scenario where burns landed on-chain but weren't recorded.
 
-- `POST /admin/reprocess/redemption/red-61e089c6`
+**Examples:**
+
+- `POST /admin/recover/redemption/red-61e089c6`
 - `POST /admin/reprocess/mint/358508d1-54eb-4e3a-b1c5-c08fb0424f82`
 
 **Status Codes:**
 
-- `200`: Reprocess initiated
+- `200`: Recovery initiated
 - `404`: Aggregate not found
-- `409`: Aggregate already completed (cannot reprocess)
-- `422`: Aggregate in a state that cannot be reprocessed
+- `409`: Aggregate already completed or closed (cannot recover)
+- `422`: Aggregate in a state that cannot be recovered, or Alpaca journal not
+  completed (for post-Alpaca redemption recovery)
+- `502`: Failed to poll Alpaca for journal status (post-Alpaca recovery only)
+
+### Close Redemption
+
+Closes a failed redemption that cannot be automatically recovered (e.g., Alpaca
+permanently rejected the journal, or tokens were consumed by other operations).
+
+**Endpoint:** `POST /admin/close/redemption/<issuer_request_id>`
+
+**Request body:** `{ "reason": "string" }`
+
+**Commands/Events:**
+
+- `CloseRedemption` → `RedemptionClosed` event → `Closed` state (terminal)
+
+**Status Codes:**
+
+- `200`: Redemption closed
+- `409`: Already completed or closed
+- `422`: Not in `Failed` state
 
 ### List Stuck Aggregates
 
@@ -1863,9 +1912,9 @@ Lists all non-completed aggregates that may need manual intervention.
 
 **Endpoint:** `GET /admin/stuck`
 
-Returns all redemptions in `Failed` or `BurnFailed` state, and all mints in
-recoverable states (`JournalConfirmed`, `Minting`, `MintingFailed`,
-`CallbackPending`).
+Returns all redemptions in `Failed` or `BurnFailed` state (excluding `Closed`),
+and all mints in recoverable states (`JournalConfirmed`, `Minting`,
+`MintingFailed`, `CallbackPending`).
 
 ## Configuration
 

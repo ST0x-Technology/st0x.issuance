@@ -172,6 +172,7 @@ impl AlpacaService for MockAlpacaService {
                     tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                     )),
+                    updated_at: Some(Utc::now()),
                 })
             } else {
                 Err(AlpacaError::RequestNotFound(
@@ -194,6 +195,7 @@ impl AlpacaService for MockAlpacaService {
             tx_hash: Some(b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             )),
+            updated_at: Some(Utc::now()),
         })
     }
 }

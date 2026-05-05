@@ -39,18 +39,32 @@ pub(crate) enum ReceiptBurnsView {
 
 impl View<Redemption> for ReceiptBurnsView {
     fn update(&mut self, event: &EventEnvelope<Redemption>) {
-        if let RedemptionEvent::TokensBurned {
-            issuer_request_id,
-            burns,
-            burned_at,
-            ..
-        } = &event.payload
-        {
-            *self = Self::Burned {
-                redemption_issuer_request_id: issuer_request_id.clone(),
-                burns: burns.clone(),
-                burned_at: *burned_at,
-            };
+        match &event.payload {
+            RedemptionEvent::TokensBurned {
+                issuer_request_id,
+                burns,
+                burned_at,
+                ..
+            } => {
+                *self = Self::Burned {
+                    redemption_issuer_request_id: issuer_request_id.clone(),
+                    burns: burns.clone(),
+                    burned_at: *burned_at,
+                };
+            }
+            RedemptionEvent::ExistingBurnRecovered {
+                issuer_request_id,
+                burns,
+                recovered_at,
+                ..
+            } => {
+                *self = Self::Burned {
+                    redemption_issuer_request_id: issuer_request_id.clone(),
+                    burns: burns.clone(),
+                    burned_at: *recovered_at,
+                };
+            }
+            _ => {}
         }
     }
 }
@@ -291,6 +305,50 @@ mod tests {
     }
 
     #[test]
+    fn test_view_updates_on_existing_burn_recovered() {
+        let mut view = ReceiptBurnsView::default();
+        assert!(matches!(view, ReceiptBurnsView::Unavailable));
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let event = RedemptionEvent::ExistingBurnRecovered {
+            issuer_request_id: issuer_request_id.clone(),
+            fireblocks_tx_id: "fb-tx-123".to_string(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            block_number: 1000,
+            recovered_at: Utc::now(),
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "red-789".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let ReceiptBurnsView::Burned {
+            redemption_issuer_request_id,
+            burns,
+            ..
+        } = view
+        else {
+            panic!("Expected Burned variant");
+        };
+
+        assert_eq!(redemption_issuer_request_id, issuer_request_id);
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0].receipt_id, uint!(42_U256));
+        assert_eq!(burns[0].shares_burned, uint!(100_000000000000000000_U256));
+    }
+
+    #[test]
     fn test_view_ignores_other_events() {
         let mut view = ReceiptBurnsView::default();
 
@@ -319,6 +377,8 @@ mod tests {
                 issuer_request_id,
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         ];
 

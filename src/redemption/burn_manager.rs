@@ -396,6 +396,8 @@ where
                     RedemptionCommand::RecordBurnFailure {
                         issuer_request_id: issuer_request_id.clone(),
                         error: error_msg,
+                        fireblocks_tx_id: None,
+                        planned_burns: vec![],
                     },
                 )
                 .await?;
@@ -500,6 +502,8 @@ where
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error_msg.clone(),
+                    fireblocks_tx_id: None,
+                    planned_burns: vec![],
                 },
             )
             .await?;
@@ -529,6 +533,16 @@ where
             })
             .collect();
 
+        // Capture planned burns before they are consumed by the command,
+        // so we can include them in the BurningFailed event if the burn fails.
+        let planned_burns: Vec<super::BurnRecord> = burns
+            .iter()
+            .map(|entry| super::BurnRecord {
+                receipt_id: entry.receipt_id,
+                shares_burned: entry.burn_shares,
+            })
+            .collect();
+
         let burn_result = self
             .cqrs
             .execute(
@@ -553,9 +567,12 @@ where
                 Ok(())
             }
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
+                let fireblocks_tx_id = extract_fireblocks_tx_id(&err);
+
                 warn!(
                     issuer_request_id = %issuer_request_id,
                     error = %err,
+                    fireblocks_tx_id = ?fireblocks_tx_id,
                     "On-chain burning failed"
                 );
 
@@ -565,6 +582,8 @@ where
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: err.to_string(),
+                            fireblocks_tx_id,
+                            planned_burns,
                         },
                     )
                     .await?;
@@ -589,6 +608,27 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
         Redemption::Burning { .. } => "Burning",
         Redemption::Failed { .. } => "Failed",
         Redemption::Completed { .. } => "Completed",
+        Redemption::Closed { .. } => "Closed",
+    }
+}
+
+/// Extracts the Fireblocks transaction ID from a `VaultError`, if the error
+/// originated from a Fireblocks error that carries a transaction ID.
+/// Matches both `TransactionFailed` (polling timeout / terminal status) and
+/// `PostSubmit` (errors after a tx was submitted and potentially completed).
+fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
+    match error {
+        VaultError::Fireblocks(
+            crate::fireblocks::FireblocksVaultError::TransactionFailed {
+                tx_id,
+                ..
+            }
+            | crate::fireblocks::FireblocksVaultError::PostSubmit {
+                tx_id, ..
+            }
+            | crate::fireblocks::FireblocksVaultError::MissingTxHash { tx_id },
+        ) => Some(tx_id.clone()),
+        _ => None,
     }
 }
 
@@ -1783,6 +1823,8 @@ mod tests {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "Initial burn failed".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         )
         .await
@@ -1860,6 +1902,8 @@ mod tests {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "RPC timeout".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         )
         .await
@@ -1928,6 +1972,8 @@ mod tests {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "ERC1155: burn amount exceeds balance".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
             },
         )
         .await
