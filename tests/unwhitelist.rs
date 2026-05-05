@@ -103,7 +103,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     let shares_minted = harness::wait_for_shares(&vault, user_wallet).await?;
     assert!(shares_minted > U256::ZERO, "First mint should succeed");
-    mint_callback_mock.assert();
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     // Step 2: Unwhitelist the wallet
     let unwhitelist_response = client
