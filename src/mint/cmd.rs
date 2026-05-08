@@ -54,6 +54,15 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
     },
 
+    /// Admin-closes a mint that cannot be automatically recovered.
+    ///
+    /// Valid from any non-terminal state. Closed mints are excluded from
+    /// recovery and stuck queries.
+    CloseMint {
+        issuer_request_id: IssuerMintRequestId,
+        reason: String,
+    },
+
     /// Recovers a mint that failed during transaction submission but whose
     /// on-chain transaction actually succeeded, as evidenced by a receipt
     /// discovered by the receipt monitor.

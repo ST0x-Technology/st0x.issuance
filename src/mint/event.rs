@@ -61,6 +61,14 @@ pub(crate) enum MintEvent {
         block_number: u64,
         recovered_at: DateTime<Utc>,
     },
+    /// Admin-closed mint that cannot be automatically recovered.
+    /// Terminal state — closed mints do not appear in stuck queries.
+    MintClosed {
+        issuer_request_id: IssuerMintRequestId,
+        reason: String,
+        closed_at: DateTime<Utc>,
+    },
+
     /// Indicates that a mint retry has started during recovery.
     MintRetryStarted {
         issuer_request_id: IssuerMintRequestId,
@@ -96,6 +104,7 @@ impl DomainEvent for MintEvent {
             Self::ExistingMintRecovered { .. } => {
                 "MintEvent::ExistingMintRecovered".to_string()
             }
+            Self::MintClosed { .. } => "MintEvent::MintClosed".to_string(),
             Self::MintRetryStarted { .. } => {
                 "MintEvent::MintRetryStarted".to_string()
             }

@@ -154,6 +154,11 @@ pub(crate) enum MintView {
         minted_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     },
+    Closed {
+        issuer_request_id: IssuerMintRequestId,
+        reason: String,
+        closed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for MintView {
@@ -174,6 +179,7 @@ impl MintView {
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
             Self::Completed { .. } => "Completed",
+            Self::Closed { .. } => "Closed",
         }
     }
 
@@ -536,6 +542,13 @@ impl View<Mint> for MintView {
             }
             MintEvent::MintRetryStarted { started_at, .. } => {
                 self.handle_mint_retry_started(*started_at);
+            }
+            MintEvent::MintClosed { issuer_request_id, reason, closed_at } => {
+                *self = Self::Closed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: reason.clone(),
+                    closed_at: *closed_at,
+                };
             }
         }
     }

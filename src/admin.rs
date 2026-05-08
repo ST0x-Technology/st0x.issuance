@@ -42,7 +42,7 @@ pub(crate) struct StuckAggregate {
     aggregate_type: AggregateKind,
     aggregate_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tokenization_request_id: Option<String>,
+    tokenization_request_id: Option<TokenizationRequestId>,
     state: String,
     detail: String,
     timestamp: DateTime<Utc>,
@@ -557,7 +557,9 @@ pub(crate) async fn reprocess_mint(
         Ok(Some(view)) => {
             let state = match &view {
                 MintView::NotFound => return Err(Status::NotFound),
-                MintView::Completed { .. } => return Err(Status::Conflict),
+                MintView::Completed { .. } | MintView::Closed { .. } => {
+                    return Err(Status::Conflict);
+                }
                 MintView::Initiated { .. } => "Initiated",
                 MintView::JournalConfirmed { .. } => "JournalConfirmed",
                 MintView::JournalRejected { .. } => "JournalRejected",
@@ -603,6 +605,56 @@ pub(crate) async fn reprocess_mint(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct CloseMintRequest {
+    reason: String,
+}
+
+/// Admin endpoint to close a mint that cannot be automatically recovered.
+///
+/// Valid from any non-terminal state. Closed mints do not appear in stuck queries.
+#[tracing::instrument(skip(_auth, cqrs))]
+#[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
+pub(crate) async fn close_mint(
+    _auth: InternalAuth,
+    cqrs: &rocket::State<MintCqrs>,
+    aggregate_id: &str,
+    body: Json<CloseMintRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    let issuer_request_id: IssuerMintRequestId = aggregate_id
+        .parse::<uuid::Uuid>()
+        .map(IssuerMintRequestId::new)
+        .map_err(|_| Status::BadRequest)?;
+
+    cqrs.execute(
+        aggregate_id,
+        MintCommand::CloseMint {
+            issuer_request_id: issuer_request_id.clone(),
+            reason: body.into_inner().reason,
+        },
+    )
+    .await
+    .map_err(|err| {
+        error!(target: "admin", aggregate_id = %aggregate_id,
+            error = %err,
+            "Failed to close mint"
+        );
+        match err {
+            AggregateError::UserError(_) => Status::UnprocessableEntity,
+            _ => Status::InternalServerError,
+        }
+    })?;
+
+    info!(target: "admin", aggregate_id = %aggregate_id, "Mint closed");
+
+    Ok(Json(ReprocessResponse {
+        aggregate_type: AggregateKind::Mint,
+        aggregate_id: aggregate_id.to_string(),
+        previous_state: "Unknown".to_string(),
+        message: "Mint closed by admin".to_string(),
+    }))
+}
+
 #[tracing::instrument(skip(_auth, pool))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
@@ -628,7 +680,7 @@ pub(crate) async fn list_stuck(
                 failed_at,
                 ..
             } => (
-                Some(tokenization_request_id.0.clone()),
+                Some(tokenization_request_id.clone()),
                 "BurnFailed".to_string(),
                 error.clone(),
                 *failed_at,
@@ -660,7 +712,7 @@ pub(crate) async fn list_stuck(
                 journal_confirmed_at,
                 ..
             } => (
-                Some(tokenization_request_id.0.clone()),
+                Some(tokenization_request_id.clone()),
                 "JournalConfirmed".to_string(),
                 "Waiting for deposit".to_string(),
                 *journal_confirmed_at,
@@ -670,7 +722,7 @@ pub(crate) async fn list_stuck(
                 minting_started_at,
                 ..
             } => (
-                Some(tokenization_request_id.0.clone()),
+                Some(tokenization_request_id.clone()),
                 "Minting".to_string(),
                 "Deposit in progress".to_string(),
                 *minting_started_at,
@@ -681,7 +733,7 @@ pub(crate) async fn list_stuck(
                 failed_at,
                 ..
             } => (
-                Some(tokenization_request_id.0.clone()),
+                Some(tokenization_request_id.clone()),
                 "MintingFailed".to_string(),
                 error.clone(),
                 *failed_at,
@@ -691,7 +743,7 @@ pub(crate) async fn list_stuck(
                 minted_at,
                 ..
             } => (
-                Some(tokenization_request_id.0.clone()),
+                Some(tokenization_request_id.clone()),
                 "CallbackPending".to_string(),
                 "Waiting for callback".to_string(),
                 *minted_at,

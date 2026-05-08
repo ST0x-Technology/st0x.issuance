@@ -194,6 +194,11 @@ pub(crate) enum Mint {
         minted_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     },
+    Closed {
+        issuer_request_id: IssuerMintRequestId,
+        reason: String,
+        closed_at: DateTime<Utc>,
+    },
 }
 
 impl Default for Mint {
@@ -213,6 +218,7 @@ impl Mint {
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
             Self::Completed { .. } => "Completed",
+            Self::Closed { .. } => "Closed",
         }
     }
 
@@ -240,7 +246,7 @@ impl Mint {
             | Self::Completed { tokenization_request_id, .. } => {
                 Some(tokenization_request_id)
             }
-            Self::Uninitialized => None,
+            Self::Uninitialized | Self::Closed { .. } => None,
         }
     }
 
@@ -1048,6 +1054,27 @@ impl Mint {
             minting_started_at: started_at,
         };
     }
+    fn handle_close_mint(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        reason: String,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Completed { .. } | Self::Closed { .. } => {
+                Err(MintError::NotRecoverable {
+                    current_state: self.state_name().to_string(),
+                })
+            }
+            Self::Uninitialized => Err(MintError::NotRecoverable {
+                current_state: self.state_name().to_string(),
+            }),
+            _ => Ok(vec![MintEvent::MintClosed {
+                issuer_request_id,
+                reason,
+                closed_at: Utc::now(),
+            }]),
+        }
+    }
 }
 
 #[async_trait]
@@ -1119,6 +1146,9 @@ impl Aggregate for Mint {
                     tx_hash,
                 )
                 .await
+            }
+            MintCommand::CloseMint { issuer_request_id, reason } => {
+                self.handle_close_mint(issuer_request_id, reason)
             }
         }
     }
@@ -1204,6 +1234,9 @@ impl Aggregate for Mint {
                 ..
             } => {
                 self.apply_mint_retry_started(started_at);
+            }
+            MintEvent::MintClosed { issuer_request_id, reason, closed_at } => {
+                *self = Self::Closed { issuer_request_id, reason, closed_at };
             }
         }
     }
@@ -1475,7 +1508,8 @@ pub(crate) mod tests {
                     | MintEvent::MintingFailed { .. }
                     | MintEvent::MintCompleted { .. }
                     | MintEvent::ExistingMintRecovered { .. }
-                    | MintEvent::MintRetryStarted { .. } => {
+                    | MintEvent::MintRetryStarted { .. }
+                    | MintEvent::MintClosed { .. } => {
                         panic!(
                             "Expected MintInitiated event, got {:?}",
                             &events[0]
