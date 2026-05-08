@@ -41,8 +41,11 @@ pub(crate) struct ReprocessResponse {
 pub(crate) struct StuckAggregate {
     aggregate_type: AggregateKind,
     aggregate_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokenization_request_id: Option<String>,
     state: String,
     detail: String,
+    timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -615,21 +618,31 @@ pub(crate) async fn list_stuck(
     })?;
 
     for (id, view) in stuck_redemptions {
-        let (state, detail) = match &view {
-            RedemptionView::Failed { reason, .. } => {
-                ("Failed".to_string(), reason.clone())
+        let (tokenization_request_id, state, detail, timestamp) = match &view {
+            RedemptionView::Failed { reason, failed_at, .. } => {
+                (None, "Failed".to_string(), reason.clone(), *failed_at)
             }
-            RedemptionView::BurnFailed { error, .. } => {
-                ("BurnFailed".to_string(), error.clone())
-            }
+            RedemptionView::BurnFailed {
+                tokenization_request_id,
+                error,
+                failed_at,
+                ..
+            } => (
+                Some(tokenization_request_id.0.clone()),
+                "BurnFailed".to_string(),
+                error.clone(),
+                *failed_at,
+            ),
             _ => continue,
         };
 
         stuck.push(StuckAggregate {
             aggregate_type: AggregateKind::Redemption,
             aggregate_id: id.to_string(),
+            tokenization_request_id,
             state,
             detail,
+            timestamp,
         });
     }
 
@@ -641,20 +654,47 @@ pub(crate) async fn list_stuck(
         })?;
 
     for (id, view) in recoverable_mints {
-        let (state, detail) = match &view {
-            MintView::JournalConfirmed { .. } => (
+        let (tokenization_request_id, state, detail, timestamp) = match &view {
+            MintView::JournalConfirmed {
+                tokenization_request_id,
+                journal_confirmed_at,
+                ..
+            } => (
+                Some(tokenization_request_id.0.clone()),
                 "JournalConfirmed".to_string(),
                 "Waiting for deposit".to_string(),
+                *journal_confirmed_at,
             ),
-            MintView::Minting { .. } => {
-                ("Minting".to_string(), "Deposit in progress".to_string())
-            }
-            MintView::MintingFailed { error, .. } => {
-                ("MintingFailed".to_string(), error.clone())
-            }
-            MintView::CallbackPending { .. } => (
+            MintView::Minting {
+                tokenization_request_id,
+                minting_started_at,
+                ..
+            } => (
+                Some(tokenization_request_id.0.clone()),
+                "Minting".to_string(),
+                "Deposit in progress".to_string(),
+                *minting_started_at,
+            ),
+            MintView::MintingFailed {
+                tokenization_request_id,
+                error,
+                failed_at,
+                ..
+            } => (
+                Some(tokenization_request_id.0.clone()),
+                "MintingFailed".to_string(),
+                error.clone(),
+                *failed_at,
+            ),
+            MintView::CallbackPending {
+                tokenization_request_id,
+                minted_at,
+                ..
+            } => (
+                Some(tokenization_request_id.0.clone()),
                 "CallbackPending".to_string(),
                 "Waiting for callback".to_string(),
+                *minted_at,
             ),
             _ => continue,
         };
@@ -662,8 +702,10 @@ pub(crate) async fn list_stuck(
         stuck.push(StuckAggregate {
             aggregate_type: AggregateKind::Mint,
             aggregate_id: id.to_string(),
+            tokenization_request_id,
             state,
             detail,
+            timestamp,
         });
     }
 
