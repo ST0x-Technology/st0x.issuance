@@ -15,9 +15,12 @@ use crate::telemetry::HyperDxConfig;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
-pub(crate) struct BlockchainSetup<P> {
+pub(crate) struct BlockchainSetup<HttpP> {
     pub(crate) vault_service: Arc<dyn VaultService>,
-    pub(crate) provider: P,
+    /// HTTP provider — used for all non-subscription RPC calls (backfill,
+    /// reconciliation, vault service balance checks, etc.). Receipt monitors
+    /// and redemption detectors create their own WSS connections.
+    pub(crate) http_provider: HttpP,
 }
 
 /// Default chain ID (Base mainnet)
@@ -49,20 +52,20 @@ impl Config {
         env.into_config()
     }
 
-    /// Creates the blockchain provider and vault service.
+    /// Creates the HTTP provider and vault service.
     ///
-    /// Initializes a single provider connection and builds the appropriate
-    /// VaultService (local signer or Fireblocks). The provider is returned
-    /// for reuse by other components (backfill, monitor) to avoid multiple
-    /// connections to the same RPC endpoint.
+    /// Initializes an HTTP provider for non-subscription RPC calls (backfill,
+    /// reconciliation, vault service) and builds the appropriate VaultService
+    /// (local signer or Fireblocks). Receipt monitors and redemption detectors
+    /// create their own WSS connections independently.
     pub(crate) async fn create_blockchain_setup(
         &self,
     ) -> Result<BlockchainSetup<impl Provider + Clone + use<>>, ConfigError>
     {
-        let provider =
-            ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
+        let http_url = wss_to_http(&self.rpc_url)?;
+        let http_provider = ProviderBuilder::new().connect_http(http_url);
 
-        let rpc_chain_id = provider.get_chain_id().await?;
+        let rpc_chain_id = http_provider.get_chain_id().await?;
         if rpc_chain_id != self.chain_id {
             return Err(ConfigError::ChainIdMismatch {
                 configured: self.chain_id,
@@ -80,21 +83,20 @@ impl Config {
 
                 let signing_provider = ProviderBuilder::new()
                     .wallet(resolved.wallet)
-                    .connect(self.rpc_url.as_str())
-                    .await?;
+                    .connect_http(wss_to_http(&self.rpc_url)?);
 
                 Arc::new(RealBlockchainService::new(
                     signing_provider,
-                    oa_schema_cache.clone(),
+                    oa_schema_cache,
                 ))
             }
 
             SignerConfig::Fireblocks(env) => {
                 let service = FireblocksVaultService::new(
                     env,
-                    provider.clone(),
+                    http_provider.clone(),
                     self.chain_id,
-                    oa_schema_cache.clone(),
+                    oa_schema_cache,
                 )
                 .map_err(|err| ConfigError::FireblocksVault(Box::new(err)))?;
 
@@ -102,7 +104,7 @@ impl Config {
             }
         };
 
-        Ok(BlockchainSetup { vault_service, provider })
+        Ok(BlockchainSetup { vault_service, http_provider })
     }
 }
 
@@ -274,6 +276,27 @@ pub enum ConfigError {
         "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
     )]
     ChainIdMismatch { configured: u64, from_rpc: u64 },
+    #[error("Cannot derive HTTP URL from RPC URL: {0}")]
+    InvalidRpcScheme(String),
+}
+
+/// Derives an HTTP URL from a WebSocket URL by replacing the scheme.
+///
+/// `wss://` → `https://`, `ws://` → `http://`. Leaves HTTP URLs unchanged.
+fn wss_to_http(url: &Url) -> Result<Url, ConfigError> {
+    let new_scheme = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        "http" | "https" => return Ok(url.clone()),
+        other => return Err(ConfigError::InvalidRpcScheme(other.to_string())),
+    };
+
+    let mut http_url = url.clone();
+    http_url.set_scheme(new_scheme).map_err(|()| {
+        ConfigError::InvalidRpcScheme(url.scheme().to_string())
+    })?;
+
+    Ok(http_url)
 }
 
 /// Domain target categories used in `target:` on all tracing macros.

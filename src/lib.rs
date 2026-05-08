@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, ProviderBuilder};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use cqrs_es::{AggregateContext, EventStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -297,7 +297,7 @@ pub async fn initialize_rocket(
     // receipt inventory to detect already-minted receipts (prevents double-mints).
     let vault_configs = run_all_receipt_backfills(
         &pool,
-        blockchain_setup.provider.clone(),
+        blockchain_setup.http_provider.clone(),
         &receipt_inventory.cqrs,
         &receipt_inventory.event_store,
         bot_wallet,
@@ -313,7 +313,7 @@ pub async fn initialize_rocket(
         .collect();
 
     if let Err(error) = run_startup_reconciliation(
-        blockchain_setup.provider.clone(),
+        blockchain_setup.http_provider.clone(),
         &vault_receipt_pairs,
         &receipt_inventory.cqrs,
         receipt_inventory.event_store.as_ref(),
@@ -330,7 +330,7 @@ pub async fn initialize_rocket(
     }
 
     let transfer_backfiller = TransferBackfiller {
-        provider: blockchain_setup.provider.clone(),
+        provider: blockchain_setup.http_provider.clone(),
         bot_wallet,
         cqrs: redemption_cqrs.clone(),
         event_store: redemption_event_store.clone(),
@@ -341,27 +341,21 @@ pub async fn initialize_rocket(
     };
 
     spawn_all_receipt_monitors(
-        blockchain_setup.provider.clone(),
+        &config.rpc_url,
         &vault_configs,
         &receipt_inventory.cqrs,
         bot_wallet,
         &MintRecoveryHandler::new(mint.cqrs.clone()),
     );
 
-    // Recovery runs AFTER reprojections and backfill so it can query accurate state.
-    // Recovery must complete BEFORE the HTTP server starts accepting requests to
-    // prevent race conditions between recovery and incoming confirm/redeem requests
-    // that could cause duplicate side effects (e.g., duplicate Alpaca callbacks).
-    run_mint_recovery(&pool, &mint.cqrs).await;
-    run_redemption_recovery(
-        &managers.redeem_call,
-        &managers.journal,
-        &managers.burn,
-    )
-    .await;
+    // Recovery runs with a timeout before the HTTP server starts. If it
+    // completes within the timeout, there is no race with incoming requests.
+    // If it hangs (e.g., Fireblocks call), it is cancelled and stuck
+    // aggregates are left for manual admin intervention.
+    run_recovery_with_timeout(&pool, &mint.cqrs, &managers).await;
 
     spawn_periodic_receipt_backfills(
-        blockchain_setup.provider.clone(),
+        blockchain_setup.http_provider,
         vault_configs.clone(),
         receipt_inventory.cqrs.clone(),
         receipt_inventory.event_store.clone(),
@@ -738,6 +732,50 @@ async fn run_redemption_recovery(
     burn.recover_burn_failed_redemptions().await;
 }
 
+/// Maximum time to wait for recovery before starting the HTTP server.
+///
+/// Recovery runs as a background task with a timeout. If it completes within
+/// this window, no race condition is possible (recovery is done before any
+/// HTTP request arrives). If it hangs (e.g., Fireblocks call), the task is
+/// **cancelled** — not left running — so no concurrent side effects can
+/// race with incoming HTTP requests. Stuck aggregates that weren't recovered
+/// in time require manual intervention via `/admin/recover` or `/admin/close`.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs mint and redemption recovery with a timeout, then starts the HTTP
+/// server. Recovery that completes within [`RECOVERY_TIMEOUT`] runs to
+/// completion before Rocket serves requests. Recovery that hangs is
+/// cancelled to prevent concurrent side effects.
+async fn run_recovery_with_timeout(
+    pool: &Pool<Sqlite>,
+    mint_cqrs: &MintCqrs,
+    managers: &RedemptionManagers,
+) {
+    let recovery = async {
+        run_mint_recovery(pool, mint_cqrs).await;
+        run_redemption_recovery(
+            &managers.redeem_call,
+            &managers.journal,
+            &managers.burn,
+        )
+        .await;
+    };
+
+    match tokio::time::timeout(RECOVERY_TIMEOUT, recovery).await {
+        Ok(()) => {
+            info!(target: "startup", "Recovery complete");
+        }
+        Err(_) => {
+            warn!(
+                target: "startup",
+                timeout_secs = RECOVERY_TIMEOUT.as_secs(),
+                "Recovery timed out — remaining stuck aggregates require \
+                 manual recovery via /admin/recover or /admin/close endpoints"
+            );
+        }
+    }
+}
+
 /// Configuration for a single vault, extracted from TokenizedAssetView.
 #[derive(Clone, Copy)]
 struct VaultBackfillConfig {
@@ -1050,21 +1088,23 @@ fn spawn_all_transfer_backfills<P>(
     });
 }
 
-/// Spawns receipt monitors for ALL enabled vaults.
-fn spawn_all_receipt_monitors<P, ITN>(
-    provider: P,
+/// Spawns one receipt monitor per vault, each with its own WebSocket
+/// connection. This avoids hitting per-connection subscription limits
+/// (each monitor creates 6 subscriptions) regardless of how many assets
+/// are added.
+fn spawn_all_receipt_monitors<ITN>(
+    rpc_url: &Url,
     vault_configs: &[VaultBackfillConfig],
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     bot_wallet: Address,
     handler: &ITN,
 ) where
-    P: Provider + Clone + Send + Sync + 'static,
     ITN: ItnReceiptHandler + Clone + 'static,
 {
     info!(
         target: "receipt",
         vault_count = vault_configs.len(),
-        "Spawning receipt monitors for all vaults"
+        "Spawning receipt monitors (one WSS connection per vault)"
     );
 
     for config in vault_configs {
@@ -1076,21 +1116,51 @@ fn spawn_all_receipt_monitors<P, ITN>(
             "Spawning receipt monitor for vault"
         );
 
+        let rpc_url = rpc_url.clone();
+        let cqrs = receipt_inventory_cqrs.clone();
+        let handler = handler.clone();
         let monitor_config = ReceiptMonitorConfig {
             vault: config.vault,
             receipt_contract: config.receipt_contract,
             bot_wallet,
         };
 
-        let monitor = ReceiptMonitor::new(
-            provider.clone(),
-            monitor_config,
-            receipt_inventory_cqrs.clone(),
-            handler.clone(),
-        );
-
         tokio::spawn(async move {
-            monitor.run().await;
+            loop {
+                let provider = match ProviderBuilder::new()
+                    .connect(rpc_url.as_str())
+                    .await
+                {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        warn!(
+                            target: "receipt",
+                            vault = %monitor_config.vault,
+                            error = %err,
+                            "Failed to connect WSS for receipt monitor, retrying in 5s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let monitor = ReceiptMonitor::new(
+                    provider,
+                    monitor_config,
+                    cqrs.clone(),
+                    handler.clone(),
+                );
+
+                monitor.run().await;
+
+                warn!(
+                    target: "receipt",
+                    vault = %monitor_config.vault,
+                    retry_after_secs = 5,
+                    "Receipt monitor exited; reconnecting after backoff"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         });
     }
 }

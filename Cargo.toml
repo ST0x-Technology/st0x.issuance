@@ -53,6 +53,7 @@ async-trait.workspace = true
 clap = { version = "4.5.49", features = ["derive", "env"] }
 alloy = { version = "1.0.41", features = [
   "provider-ws",
+  "provider-http",
   "pubsub",
   "node-bindings",
   "rand",
