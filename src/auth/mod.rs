@@ -9,7 +9,7 @@ use std::io::Cursor;
 use std::net::IpAddr;
 use std::str::FromStr;
 use subtle::ConstantTimeEq;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::config::Config;
 pub use ip_whitelist::IpWhitelist;
@@ -96,8 +96,7 @@ impl<'r> FromRequest<'r> for IssuerAuth {
     ) -> Outcome<Self, Self::Error> {
         match authenticate_request(request, |auth| &auth.alpaca_ip_ranges) {
             Ok(client_ip) => {
-                info!(
-                    ip = %client_ip,
+                debug!(target: "auth", ip = %client_ip,
                     endpoint = %request.uri(),
                     "Issuer authentication success"
                 );
@@ -122,8 +121,7 @@ impl<'r> FromRequest<'r> for InternalAuth {
     ) -> Outcome<Self, Self::Error> {
         match authenticate_request(request, |auth| &auth.internal_ip_ranges) {
             Ok(client_ip) => {
-                info!(
-                    ip = %client_ip,
+                debug!(target: "auth", ip = %client_ip,
                     endpoint = %request.uri(),
                     "Internal authentication success"
                 );
@@ -159,7 +157,7 @@ fn get_config<'a>(
     request: &'a Request<'_>,
 ) -> Result<&'a Config, (Status, AuthError)> {
     request.rocket().state::<Config>().ok_or_else(|| {
-        warn!("Config not found in Rocket state");
+        warn!(target: "auth", "Config not found in Rocket state");
         (Status::InternalServerError, AuthError::ConfigMissing)
     })
 }
@@ -168,7 +166,7 @@ fn get_rate_limiter<'a>(
     request: &'a Request<'_>,
 ) -> Result<&'a FailedAuthRateLimiter, (Status, AuthError)> {
     request.rocket().state::<FailedAuthRateLimiter>().ok_or_else(|| {
-        warn!("Rate limiter not found in Rocket state");
+        warn!(target: "auth", "Rate limiter not found in Rocket state");
         (Status::InternalServerError, AuthError::ConfigMissing)
     })
 }
@@ -179,8 +177,7 @@ fn check_api_key(
     rate_limiter: &FailedAuthRateLimiter,
 ) -> Result<(), (Status, AuthError)> {
     let Some(api_key) = request.headers().get_one("X-API-KEY") else {
-        warn!(
-            endpoint = %request.uri(),
+        warn!(target: "auth", endpoint = %request.uri(),
             "Missing X-API-KEY header"
         );
         return Err((Status::Unauthorized, AuthError::MissingApiKey));
@@ -195,8 +192,7 @@ fn check_api_key(
         check_rate_limit(request, rate_limiter, &client_ip)?;
     }
 
-    warn!(
-        endpoint = %request.uri(),
+    warn!(target: "auth", endpoint = %request.uri(),
         "Invalid API key"
     );
     Err((Status::Unauthorized, AuthError::InvalidApiKey))
@@ -204,8 +200,7 @@ fn check_api_key(
 
 fn get_client_ip(request: &Request<'_>) -> Result<IpAddr, (Status, AuthError)> {
     extract_client_ip(request).ok_or_else(|| {
-        warn!(
-            endpoint = %request.uri(),
+        warn!(target: "auth", endpoint = %request.uri(),
             "Could not determine client IP"
         );
         (Status::BadRequest, AuthError::NoClientIp)
@@ -226,8 +221,7 @@ fn check_ip_whitelist(
 
     check_rate_limit(request, rate_limiter, &client_ip)?;
 
-    warn!(
-        ip = %client_ip,
+    warn!(target: "auth", ip = %client_ip,
         endpoint = %request.uri(),
         "IP not whitelisted"
     );
@@ -243,8 +237,7 @@ fn check_rate_limit(
         return Ok(());
     }
 
-    warn!(
-        ip = %client_ip,
+    warn!(target: "auth", ip = %client_ip,
         endpoint = %request.uri(),
         "Rate limit exceeded for failed authentication"
     );

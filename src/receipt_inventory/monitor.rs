@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::StreamExt;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -120,7 +120,7 @@ where
     pub(crate) async fn run(&self) {
         loop {
             if let Err(err) = self.monitor_once().await {
-                warn!("Receipt monitor error: {err}. Retrying in 5s...");
+                warn!(target: "receipt", "Receipt monitor error: {err}. Retrying in 5s...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
@@ -161,8 +161,7 @@ where
             TransferDirection::Outbound,
         );
 
-        info!(
-            vault = %self.vault,
+        debug!(target: "receipt", vault = %self.vault,
             receipt_contract = %self.receipt_contract,
             bot_wallet = %self.bot_wallet,
             "Subscribing to Deposit, Withdraw, TransferSingle, and TransferBatch events"
@@ -191,13 +190,13 @@ where
         let mut transfer_batch_outbound_stream =
             transfer_batch_outbound_sub.into_stream();
 
-        info!("Receipt monitor WebSocket subscription active");
+        debug!(target: "receipt", "Receipt monitor WebSocket subscription active");
 
         loop {
             tokio::select! {
                 Some(log) = deposit_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed Deposit log (reorg)");
+                        trace!(target: "receipt", "Skipping removed Deposit log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "Deposit", |log| {
@@ -206,7 +205,7 @@ where
                 }
                 Some(log) = withdraw_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed Withdraw log (reorg)");
+                        trace!(target: "receipt", "Skipping removed Withdraw log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "Withdraw", |log| {
@@ -215,7 +214,7 @@ where
                 }
                 Some(log) = transfer_single_inbound_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed TransferSingle log (reorg)");
+                        trace!(target: "receipt", "Skipping removed TransferSingle log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "TransferSingle", |log| {
@@ -224,7 +223,7 @@ where
                 }
                 Some(log) = transfer_single_outbound_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed TransferSingle log (reorg)");
+                        trace!(target: "receipt", "Skipping removed TransferSingle log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "TransferSingle", |log| {
@@ -233,7 +232,7 @@ where
                 }
                 Some(log) = transfer_batch_inbound_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed TransferBatch log (reorg)");
+                        trace!(target: "receipt", "Skipping removed TransferBatch log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "TransferBatch", |log| {
@@ -242,7 +241,7 @@ where
                 }
                 Some(log) = transfer_batch_outbound_stream.next() => {
                     if log.removed {
-                        debug!("Skipping removed TransferBatch log (reorg)");
+                        trace!(target: "receipt", "Skipping removed TransferBatch log (reorg)");
                         continue;
                     }
                     self.process_live_log(&log, "TransferBatch", |log| {
@@ -269,8 +268,7 @@ where
             // Without a block number we cannot prove where this live log fits
             // relative to the durable checkpoint. Skip live processing and let
             // periodic backfill rescan the range in block order.
-            warn!(
-                event_name,
+            warn!(target: "receipt", event_name,
                 "Live receipt log missing block number; periodic backfill will \
                  rescan the range in block order"
             );
@@ -278,16 +276,14 @@ where
         };
 
         if let Err(err) = process(log).await {
-            warn!(
-                event_name,
+            error!(target: "receipt", event_name,
                 block_number,
                 error = %err,
                 "Failed to process live receipt log; periodic backfill will \
                  rescan from the durable checkpoint"
             );
         } else {
-            debug!(
-                event_name,
+            debug!(target: "receipt", event_name,
                 block_number,
                 "Processed live receipt log; periodic backfill owns durable \
                  checkpoint advancement"
@@ -311,8 +307,7 @@ where
             return Ok(());
         }
 
-        info!(
-            receipt_id = %event.id,
+        info!(target: "receipt", receipt_id = %event.id,
             sender = %event.sender,
             owner = %event.owner,
             shares = %event.shares,
@@ -346,8 +341,7 @@ where
 
         let receipt_id = ReceiptId::from(event.id);
 
-        info!(
-            receipt_id = %receipt_id,
+        info!(target: "receipt", receipt_id = %receipt_id,
             sender = %event.sender,
             owner = %event.owner,
             shares = %event.shares,
@@ -372,8 +366,7 @@ where
             )
             .await?;
 
-        info!(
-            receipt_id = %receipt_id,
+        info!(target: "receipt", receipt_id = %receipt_id,
             on_chain_balance = %on_chain_balance,
             "Receipt balance reconciled after withdraw"
         );
@@ -405,8 +398,7 @@ where
         let receipt_id = ReceiptId::from(event.id);
 
         if event.to == self.bot_wallet {
-            debug!(
-                receipt_id = %receipt_id,
+            trace!(target: "receipt", receipt_id = %receipt_id,
                 from = %event.from,
                 value = %event.value,
                 "Inbound TransferSingle detected"
@@ -420,8 +412,7 @@ where
             )
             .await?;
         } else if event.from == self.bot_wallet {
-            debug!(
-                receipt_id = %receipt_id,
+            trace!(target: "receipt", receipt_id = %receipt_id,
                 to = %event.to,
                 value = %event.value,
                 "Outbound TransferSingle detected"
@@ -457,8 +448,7 @@ where
             for receipt_id_raw in &event.ids {
                 let receipt_id = ReceiptId::from(*receipt_id_raw);
 
-                debug!(
-                    receipt_id = %receipt_id,
+                trace!(target: "receipt", receipt_id = %receipt_id,
                     from = %event.from,
                     "Inbound TransferBatch item detected"
                 );
@@ -475,8 +465,7 @@ where
             for receipt_id_raw in &event.ids {
                 let receipt_id = ReceiptId::from(*receipt_id_raw);
 
-                debug!(
-                    receipt_id = %receipt_id,
+                trace!(target: "receipt", receipt_id = %receipt_id,
                     to = %event.to,
                     "Outbound TransferBatch item detected"
                 );
@@ -511,8 +500,7 @@ where
             )
             .await?;
 
-        debug!(
-            receipt_id = %receipt_id,
+        debug!(target: "receipt", receipt_id = %receipt_id,
             on_chain_balance = %on_chain_balance,
             "Receipt balance reconciled after transfer"
         );
@@ -537,8 +525,7 @@ where
             .await?;
 
         if current_balance.is_zero() {
-            info!(
-                receipt_id = %receipt_id,
+            debug!(target: "receipt", receipt_id = %receipt_id,
                 "Receipt has zero balance, skipping"
             );
             return Ok(());
@@ -582,8 +569,7 @@ where
             )
             .await?;
 
-        info!(
-            receipt_id = %receipt_id,
+        info!(target: "receipt", receipt_id = %receipt_id,
             balance = %current_balance,
             "Receipt discovered or reconciled via live monitoring"
         );
@@ -930,7 +916,7 @@ mod tests {
         let context = store.load_aggregate(&vault.to_string()).await.unwrap();
         assert_eq!(context.aggregate().last_backfilled_block(), None);
         assert!(logs_contain_at!(
-            tracing::Level::WARN,
+            tracing::Level::ERROR,
             &[
                 "Failed to process live receipt log",
                 "periodic backfill will rescan from the durable checkpoint",
@@ -1544,7 +1530,7 @@ mod tests {
         monitor.process_transfer_single(&transfer_log).await.unwrap();
 
         assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
             &["Inbound TransferSingle detected"]
         ));
 
@@ -1654,7 +1640,7 @@ mod tests {
         monitor.process_transfer_single(&transfer_log).await.unwrap();
 
         assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
             &["Outbound TransferSingle detected", "receipt_id=171"]
         ));
         assert!(logs_contain_at!(
@@ -1978,7 +1964,7 @@ mod tests {
         for (receipt_id, _) in &deposits {
             assert!(
                 logs_contain_at!(
-                    tracing::Level::DEBUG,
+                    tracing::Level::TRACE,
                     &[
                         "Inbound TransferBatch item detected",
                         &format!("receipt_id={receipt_id}")
@@ -2108,11 +2094,11 @@ mod tests {
         monitor.process_transfer_batch(&batch_log).await.unwrap();
 
         assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
             &["Outbound TransferBatch item detected", "receipt_id=30"]
         ));
         assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
             &["Outbound TransferBatch item detected", "receipt_id=31"]
         ));
 

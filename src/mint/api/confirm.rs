@@ -41,8 +41,7 @@ pub(crate) async fn confirm_journal(
         reason,
     } = request.into_inner();
 
-    info!(
-        "Received journal confirmation for issuer_request_id={}, \
+    info!(target: "mint", "Received journal confirmation for issuer_request_id={}, \
          tokenization_request_id={}, status={:?}",
         issuer_request_id, tokenization_request_id.0, status
     );
@@ -53,8 +52,7 @@ pub(crate) async fn confirm_journal(
     {
         Ok(ctx) => ctx,
         Err(err) => {
-            error!(
-                "Failed to load mint aggregate for issuer_request_id={}: {}",
+            error!(target: "mint", "Failed to load mint aggregate for issuer_request_id={}: {}",
                 issuer_request_id, err
             );
             return rocket::http::Status::InternalServerError;
@@ -65,8 +63,7 @@ pub(crate) async fn confirm_journal(
         mint_ctx.aggregate().tokenization_request_id()
     {
         if &tokenization_request_id != expected_tokenization_id {
-            error!(
-                "Tokenization request ID mismatch for issuer_request_id={}. \
+            error!(target: "mint", "Tokenization request ID mismatch for issuer_request_id={}. \
                  Expected: {}, provided: {}",
                 issuer_request_id,
                 expected_tokenization_id.0,
@@ -88,8 +85,7 @@ pub(crate) async fn confirm_journal(
             if let Err(err) =
                 cqrs.execute(&issuer_request_id.to_string(), command).await
             {
-                error!(
-                    "Failed to execute journal rejection command for \
+                error!(target: "mint", "Failed to execute journal rejection command for \
                      issuer_request_id={}: {}",
                     issuer_request_id, err
                 );
@@ -105,8 +101,7 @@ pub(crate) async fn confirm_journal(
             if let Err(err) =
                 cqrs.execute(&issuer_request_id.to_string(), command).await
             {
-                error!(
-                    "Failed to execute journal confirmation command for \
+                error!(target: "mint", "Failed to execute journal confirmation command for \
                      issuer_request_id={}: {}",
                     issuer_request_id, err
                 );
@@ -140,8 +135,7 @@ async fn process_journal_completion(
         )
         .await
     {
-        error!(
-            issuer_request_id = %issuer_request_id,
+        error!(target: "mint", issuer_request_id = %issuer_request_id,
             error = ?err,
             "Deposit command failed"
         );
@@ -157,8 +151,7 @@ async fn process_journal_completion(
         )
         .await
     {
-        error!(
-            issuer_request_id = %issuer_request_id,
+        error!(target: "mint", issuer_request_id = %issuer_request_id,
             error = ?err,
             "SendCallback command failed"
         );

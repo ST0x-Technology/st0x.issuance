@@ -3,7 +3,7 @@ use rocket::http::{ContentType, Status};
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::{
     ClientId, IssuerMintRequestId, Network, TokenSymbol, UnderlyingSymbol,
@@ -96,13 +96,13 @@ impl<'r> Responder<'r, 'static> for MintApiError {
                 Self::handle_query_error(&e, "Failed to query mint view")
             }
             Self::MintViewNotFound => {
-                error!("Mint view not found after creation");
+                error!(target: "mint", "Mint view not found after creation");
                 MintErrorResponse::internal_server_error(
                     "Internal server error",
                 )
             }
             Self::UnexpectedMintState => {
-                error!("Unexpected mint state");
+                error!(target: "mint", "Unexpected mint state");
                 MintErrorResponse::internal_server_error(
                     "Internal server error",
                 )
@@ -117,7 +117,7 @@ impl MintApiError {
     fn handle_command_execution_error(
         e: &(dyn std::error::Error + Send),
     ) -> MintErrorResponse {
-        error!(error = %e, "Failed to execute mint command");
+        error!(target: "mint", error = %e, "Failed to execute mint command");
 
         let error_msg = e.to_string().to_lowercase();
         if error_msg.contains("already") || error_msg.contains("duplicate") {
@@ -133,7 +133,7 @@ impl MintApiError {
         e: &E,
         message: &str,
     ) -> MintErrorResponse {
-        error!(error = %e, "{message}");
+        error!(target: "mint", error = %e, "{message}");
         MintErrorResponse::internal_server_error("Internal server error")
     }
 }
@@ -204,7 +204,7 @@ pub(crate) async fn validate_asset_exists(
     .fetch_one(pool)
     .await
     .map_err(|e| {
-        error!("Failed to query asset: {e}");
+        error!(target: "mint", "Failed to query asset: {e}");
         MintApiError::AssetQueryFailed(e.into())
     })?;
 
@@ -222,7 +222,7 @@ pub(crate) async fn validate_client_eligible(
 ) -> Result<(), MintApiError> {
     let account_view =
         find_by_client_id(pool, client_id).await.map_err(|e| {
-            error!("Failed to find account by client_id: {e}");
+            error!(target: "mint", "Failed to find account by client_id: {e}");
             MintApiError::AccountQueryFailed(e)
         })?;
 
@@ -233,7 +233,8 @@ pub(crate) async fn validate_client_eligible(
     };
 
     if !whitelisted_wallets.contains(wallet) {
-        error!(
+        warn!(
+            target: "mint",
             client_id = %client_id,
             whitelisted_wallet_count = whitelisted_wallets.len(),
             "Wallet not in client's whitelisted wallets"

@@ -75,7 +75,7 @@ pub(crate) async fn initiate_mint(
 
     cqrs.execute(&issuer_request_id.to_string(), command).await.map_err(
         |error| {
-            error!("Failed to execute mint command: {error}");
+            error!(target: "mint", "Failed to execute mint command: {error}");
             MintApiError::CommandExecutionFailed(Box::new(error))
         },
     )?;
@@ -83,7 +83,7 @@ pub(crate) async fn initiate_mint(
     let mint_view = find_by_issuer_request_id(pool.inner(), &issuer_request_id)
         .await
         .map_err(|error| {
-            error!("Failed to find mint by issuer_request_id: {error}");
+            error!(target: "mint", "Failed to find mint by issuer_request_id: {error}");
             MintApiError::MintViewQueryFailed(error)
         })?
         .ok_or(MintApiError::MintViewNotFound)?;

@@ -38,18 +38,17 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let stuck_redemptions = match find_detected(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
-                error!(error = %err, "Failed to query for stuck Detected redemptions");
+                error!(target: "redemption", error = %err, "Failed to query for stuck Detected redemptions");
                 return;
             }
         };
 
         if stuck_redemptions.is_empty() {
-            info!("No Detected redemptions to recover");
+            debug!(target: "redemption", "No Detected redemptions to recover");
             return;
         }
 
-        info!(
-            count = stuck_redemptions.len(),
+        info!(target: "redemption", count = stuck_redemptions.len(),
             "Recovering stuck Detected redemptions"
         );
 
@@ -77,23 +76,20 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                         .execute(&issuer_request_id.to_string(), command)
                         .await
                     {
-                        debug!(
-                            issuer_request_id = %issuer_request_id,
+                        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                             error = %err,
                             "Failed to mark unrecoverable Detected redemption as failed"
                         );
                         failed += 1;
                     } else {
-                        debug!(
-                            issuer_request_id = %issuer_request_id,
+                        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                             "Auto-failed Detected redemption with no linked account"
                         );
                         auto_failed += 1;
                     }
                 }
                 Err(err) => {
-                    debug!(
-                        issuer_request_id = %issuer_request_id,
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
                         "Failed to recover Detected redemption"
                     );
@@ -102,8 +98,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             }
         }
 
-        info!(
-            total = stuck_redemptions.len(),
+        info!(target: "redemption", total = stuck_redemptions.len(),
             recovered,
             auto_failed,
             failed,
@@ -123,8 +118,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let aggregate = aggregate_ctx.aggregate();
 
         let Redemption::Detected { metadata } = aggregate else {
-            debug!(
-                issuer_request_id = %issuer_request_id,
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "Redemption no longer in Detected state, skipping"
             );
             return Ok(());
@@ -136,8 +130,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let network =
             self.lookup_network_for_asset(&metadata.underlying).await?;
 
-        debug!(
-            issuer_request_id = %issuer_request_id,
+        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering Detected redemption - calling Alpaca"
         );
 
@@ -215,8 +208,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let (alpaca_quantity, dust_quantity) =
             metadata.quantity.truncate_for_alpaca()?;
 
-        info!(
-            issuer_request_id = %issuer_request_id,
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
             underlying = %metadata.underlying,
             original_quantity = %metadata.quantity.0,
             alpaca_quantity = %alpaca_quantity.0,
@@ -238,8 +230,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
-                info!(
-                    issuer_request_id = %response.issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %response.issuer_request_id,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
                     status = ?response.status,
@@ -268,16 +259,14 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     )
                     .await?;
 
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "RecordAlpacaCall command executed successfully"
                 );
 
                 Ok(())
             }
             Err(err) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Alpaca redeem API call failed"
                 );
@@ -292,8 +281,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     )
                     .await?;
 
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "RecordAlpacaFailure command executed successfully"
                 );
 

@@ -70,8 +70,7 @@ where
         bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
 
     if transfer_event.from == Address::ZERO {
-        debug!(
-            to = %transfer_event.to,
+        debug!(target: "redemption", to = %transfer_event.to,
             value = %transfer_event.value,
             "Skipping mint event (from=0x0)"
         );
@@ -89,8 +88,7 @@ where
     let Some(AccountView::LinkedToAlpaca { client_id, alpaca_account, .. }) =
         account_view
     else {
-        debug!(
-            from = %transfer_event.from,
+        debug!(target: "redemption", from = %transfer_event.from,
             tx_hash = %tx_hash,
             "Skipping transfer from unknown/unlinked wallet"
         );
@@ -115,8 +113,7 @@ where
     match cqrs.execute(&issuer_request_id.to_string(), command).await {
         Ok(()) => {}
         Err(AggregateError::UserError(_)) => {
-            debug!(
-                %issuer_request_id,
+            debug!(target: "redemption", %issuer_request_id,
                 "Transfer already detected"
             );
             return Ok(TransferOutcome::AlreadyDetected);
@@ -124,8 +121,7 @@ where
         Err(err) => return Err(err.into()),
     }
 
-    info!(
-        %issuer_request_id,
+    info!(target: "redemption", %issuer_request_id,
         from = %transfer_event.from,
         "Redemption transfer detected"
     );
@@ -169,8 +165,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
     {
         Ok(ctx) => ctx,
         Err(err) => {
-            warn!(
-                %issuer_request_id,
+            warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
                 "Failed to load aggregate after detection"
             );
@@ -189,8 +184,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         )
         .await
     {
-        warn!(
-            %issuer_request_id,
+        warn!(target: "redemption", %issuer_request_id,
             error = ?err,
             "handle_redemption_detected failed"
         );
@@ -204,8 +198,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
     {
         Ok(ctx) => ctx,
         Err(err) => {
-            warn!(
-                %issuer_request_id,
+            warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
                 "Failed to load aggregate after redeem call"
             );
@@ -216,8 +209,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
     let Redemption::AlpacaCalled { tokenization_request_id, .. } =
         aggregate_ctx.aggregate()
     else {
-        debug!(
-            %issuer_request_id,
+        debug!(target: "redemption", %issuer_request_id,
             aggregate_state = ?aggregate_ctx.aggregate(),
             "Aggregate not in AlpacaCalled state after redeem call"
         );
@@ -236,8 +228,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
             )
             .await
         {
-            warn!(
-                %issuer_request_id,
+            warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
                 "handle_alpaca_called (journal polling) failed"
             );
@@ -251,8 +242,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         {
             Ok(ctx) => ctx,
             Err(err) => {
-                warn!(
-                    %issuer_request_id,
+                warn!(target: "redemption", %issuer_request_id,
                     error = ?err,
                     "Failed to load aggregate after journal completion"
                 );
@@ -269,15 +259,13 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
                 )
                 .await
             {
-                warn!(
-                    %issuer_request_id,
+                warn!(target: "redemption", %issuer_request_id,
                     error = ?err,
                     "handle_burning_started failed"
                 );
             }
         } else {
-            debug!(
-                %issuer_request_id,
+            debug!(target: "redemption", %issuer_request_id,
                 aggregate_state = ?aggregate_ctx.aggregate(),
                 "Aggregate not in Burning state after journal completion"
             );

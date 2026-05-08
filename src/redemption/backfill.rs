@@ -5,7 +5,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::{CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use super::{
     Redemption,
@@ -92,8 +92,7 @@ where
         .await?;
 
         if from_block > current_block {
-            info!(
-                %vault,
+            info!(target: "redemption", %vault,
                 from_block,
                 current_block,
                 "Transfer backfill skipped: from_block is ahead of current block"
@@ -106,8 +105,7 @@ where
             });
         }
 
-        info!(
-            %vault,
+        debug!(target: "redemption", %vault,
             bot_wallet = %self.bot_wallet,
             from_block,
             to_block = current_block,
@@ -124,8 +122,7 @@ where
             let logs =
                 self.fetch_transfer_logs(vault, chunk_from, chunk_to).await?;
 
-            debug!(
-                chunk_from,
+            trace!(target: "redemption", chunk_from,
                 chunk_to,
                 logs_found = logs.len(),
                 "Processed block range"
@@ -170,8 +167,7 @@ where
 
         save_backfill_checkpoint(&self.pool, vault, current_block).await?;
 
-        info!(
-            %vault,
+        debug!(target: "redemption", %vault,
             detected_count,
             skipped_mint,
             skipped_no_account,
@@ -490,11 +486,11 @@ mod tests {
         assert_eq!(result.skipped_no_account, 0);
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Starting transfer backfill"]
         ));
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Transfer backfill complete", "detected_count=1"]
         ));
     }
@@ -532,11 +528,11 @@ mod tests {
         assert_eq!(result.skipped_mint, 1);
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Starting transfer backfill"]
         ));
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Transfer backfill complete", "skipped_mint=1"]
         ));
     }
@@ -591,7 +587,7 @@ mod tests {
         );
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Transfer backfill complete"]
         ));
     }
@@ -631,7 +627,7 @@ mod tests {
         assert_eq!(result.skipped_no_account, 1);
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Transfer backfill complete", "skipped_no_account=1"]
         ));
     }
@@ -779,11 +775,11 @@ mod tests {
         );
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Starting transfer backfill", "from_block=50", "to_block=200"]
         ));
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Transfer backfill complete", "checkpoint_block=200"]
         ));
     }

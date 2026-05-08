@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 
 use super::{
     Account, AccountError, AccountEvent, AlpacaAccountNumber, ClientId, Email,
@@ -27,7 +27,7 @@ pub(crate) enum AccountViewError {
 pub(crate) async fn replay_account_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), AccountViewError> {
-    info!("Rebuilding account view from events");
+    debug!(target: "account", "Rebuilding account view from events");
 
     sqlx::query!("DELETE FROM account_view").execute(&pool).await?;
 
@@ -42,7 +42,7 @@ pub(crate) async fn replay_account_view(
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
 
-    info!("Account view rebuild complete");
+    debug!(target: "account", "Account view rebuild complete");
 
     Ok(())
 }

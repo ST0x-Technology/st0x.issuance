@@ -7,7 +7,7 @@ use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::info;
+use tracing::debug;
 
 use super::IssuerRedemptionRequestId;
 use crate::mint::{Quantity, TokenizationRequestId};
@@ -391,7 +391,7 @@ pub(crate) enum RedemptionViewError {
 pub async fn replay_redemption_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), RedemptionViewError> {
-    info!("Rebuilding redemption view from events");
+    debug!(target: "redemption", "Rebuilding redemption view from events");
 
     sqlx::query!("DELETE FROM redemption_view").execute(&pool).await?;
 
@@ -406,7 +406,7 @@ pub async fn replay_redemption_view(
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
 
-    info!("Redemption view rebuild complete");
+    debug!(target: "redemption", "Redemption view rebuild complete");
 
     Ok(())
 }

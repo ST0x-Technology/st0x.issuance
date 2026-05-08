@@ -49,18 +49,17 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         let stuck_redemptions = match find_alpaca_called(&self.pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
-                error!(error = %err, "Failed to query for stuck AlpacaCalled redemptions");
+                error!(target: "redemption", error = %err, "Failed to query for stuck AlpacaCalled redemptions");
                 return;
             }
         };
 
         if stuck_redemptions.is_empty() {
-            info!("No AlpacaCalled redemptions to recover");
+            debug!(target: "redemption", "No AlpacaCalled redemptions to recover");
             return;
         }
 
-        info!(
-            count = stuck_redemptions.len(),
+        info!(target: "redemption", count = stuck_redemptions.len(),
             "Recovering stuck AlpacaCalled redemptions"
         );
 
@@ -69,8 +68,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 .recover_single_alpaca_called(&issuer_request_id, &view)
                 .await
             {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover AlpacaCalled redemption"
                 );
@@ -89,8 +87,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             ..
         } = view
         else {
-            debug!(
-                issuer_request_id = %issuer_request_id,
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "Redemption no longer in AlpacaCalled state, skipping"
             );
             return Ok(());
@@ -98,8 +95,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
         let alpaca_account = self.lookup_account_for_recovery(wallet).await?;
 
-        info!(
-            issuer_request_id = %issuer_request_id,
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering AlpacaCalled redemption - resuming polling"
         );
 
@@ -139,8 +135,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         issuer_request_id: IssuerRedemptionRequestId,
         tokenization_request_id: TokenizationRequestId,
     ) -> Result<(), JournalManagerError> {
-        info!(
-            issuer_request_id = %issuer_request_id,
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
             tokenization_request_id = %tokenization_request_id,
             "Starting journal polling for redemption"
         );
@@ -157,8 +152,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                     .await;
             }
 
-            debug!(
-                issuer_request_id = %issuer_request_id,
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 tokenization_request_id = %tokenization_request_id.0,
                 poll_interval = ?poll_interval,
                 elapsed = ?start_time.elapsed(),
@@ -315,8 +309,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
         issuer_request_id: &IssuerRedemptionRequestId,
         elapsed: Duration,
     ) -> Result<(), JournalManagerError> {
-        warn!(
-            issuer_request_id = %issuer_request_id,
+        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
             elapsed = ?elapsed,
             max_duration = ?self.max_duration,
             "Polling timeout reached, marking redemption as failed"
@@ -358,8 +351,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
 
                 match status {
                     RedeemRequestStatus::Completed => {
-                        info!(
-                            issuer_request_id = %issuer_request_id,
+                        info!(target: "redemption", issuer_request_id = %issuer_request_id,
                             tokenization_request_id = %tokenization_request_id,
                             elapsed = ?elapsed,
                             "Alpaca journal completed, confirming completion"
@@ -375,16 +367,14 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                             )
                             .await?;
 
-                        info!(
-                            issuer_request_id = %issuer_request_id,
+                        info!(target: "redemption", issuer_request_id = %issuer_request_id,
                             "ConfirmAlpacaComplete command executed successfully"
                         );
 
                         Ok(false)
                     }
                     RedeemRequestStatus::Rejected => {
-                        warn!(
-                            issuer_request_id = %issuer_request_id,
+                        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                             tokenization_request_id = %tokenization_request_id,
                             "Alpaca journal rejected, marking redemption as failed"
                         );
@@ -406,8 +396,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                         })
                     }
                     RedeemRequestStatus::Pending => {
-                        info!(
-                            issuer_request_id = %issuer_request_id,
+                        info!(target: "redemption", issuer_request_id = %issuer_request_id,
                             tokenization_request_id = %tokenization_request_id,
                             status = "pending",
                             next_poll_in = ?poll_interval,
@@ -418,8 +407,7 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
                 }
             }
             Err(err) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     tokenization_request_id = %tokenization_request_id,
                     error = %err,
                     next_poll_in = ?poll_interval,

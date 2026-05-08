@@ -11,7 +11,7 @@ use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::account::view::AccountViewError;
@@ -366,6 +366,7 @@ impl Mint {
             }
             Err(err) => {
                 warn!(
+                    target: "mint",
                     issuer_request_id = %issuer_request_id,
                     error = %err,
                     "On-chain deposit failed"
@@ -395,6 +396,7 @@ impl Mint {
         now: DateTime<Utc>,
     ) -> Result<Vec<MintEvent>, MintError> {
         info!(
+            target: "mint",
             issuer_request_id = %issuer_request_id,
             tx_hash = %result.tx_hash,
             receipt_id = %result.receipt_id,
@@ -416,6 +418,7 @@ impl Mint {
             .await
         {
             warn!(
+                target: "mint",
                 issuer_request_id = %issuer_request_id,
                 error = %err,
                 "Failed to register minted receipt \
@@ -473,6 +476,7 @@ impl Mint {
         services.alpaca.send_mint_callback(callback_request).await?;
 
         info!(
+            target: "mint",
             issuer_request_id = %issuer_request_id,
             "Alpaca callback succeeded"
         );
@@ -659,6 +663,7 @@ impl Mint {
         let completion_event = match mint_result {
             Ok(result) => {
                 info!(
+                    target: "mint",
                     issuer_request_id = %issuer_request_id,
                     tx_hash = %result.tx_hash,
                     "Recovery mint succeeded"
@@ -675,6 +680,7 @@ impl Mint {
             }
             Err(err) => {
                 warn!(
+                    target: "mint",
                     issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Recovery mint failed"
@@ -703,11 +709,12 @@ impl Mint {
             .find_by_issuer_request_id(vault, issuer_request_id)
             .await?
         else {
-            info!(issuer_request_id = %issuer_request_id, "No receipt found, retrying mint");
+            debug!(target: "mint", issuer_request_id = %issuer_request_id, "No receipt found, retrying mint");
             return Ok(None);
         };
 
         info!(
+            target: "mint",
             issuer_request_id = %issuer_request_id,
             receipt_id = %receipt.receipt_id,
             "Found existing receipt, recording recovery"

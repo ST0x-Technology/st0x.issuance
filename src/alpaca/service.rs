@@ -150,7 +150,7 @@ impl AlpacaService for RealAlpacaService {
             self.account_id
         );
 
-        debug!(%url, method = "POST", "Sending mint callback to Alpaca");
+        debug!(target: "alpaca", %url, method = "POST", "Sending mint callback to Alpaca");
 
         (|| async {
             let response = self
@@ -185,7 +185,8 @@ impl AlpacaService for RealAlpacaService {
         )
         .when(|e: &AlpacaError| e.is_retryable())
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::warn!(
+            tracing::debug!(
+                target: "alpaca",
                 "Alpaca API call failed with {err}, retrying after {dur:?}"
             );
         })
@@ -202,7 +203,7 @@ impl AlpacaService for RealAlpacaService {
             self.account_id
         );
 
-        debug!(%url, method = "POST", "Calling Alpaca redeem endpoint");
+        debug!(target: "alpaca", %url, method = "POST", "Calling Alpaca redeem endpoint");
 
         let response = self
             .client
@@ -221,6 +222,7 @@ impl AlpacaService for RealAlpacaService {
                 let body = response.text().await?;
                 serde_json::from_str(&body).map_err(|e| {
                     tracing::error!(
+                        target: "alpaca",
                         %body,
                         error = %e,
                         "Failed to parse Alpaca redeem response"
@@ -250,7 +252,7 @@ impl AlpacaService for RealAlpacaService {
             self.account_id
         );
 
-        debug!(%url, method = "GET", "Polling Alpaca request status");
+        debug!(target: "alpaca", %url, method = "GET", "Polling Alpaca request status");
 
         (|| async {
             let response = self
@@ -270,6 +272,7 @@ impl AlpacaService for RealAlpacaService {
                     let requests: Vec<TokenizationRequest> =
                         serde_json::from_str(&body).map_err(|e| {
                             tracing::error!(
+                                target: "alpaca",
                                 %body,
                                 error = %e,
                                 "Failed to parse Alpaca requests list response"
@@ -309,7 +312,8 @@ impl AlpacaService for RealAlpacaService {
         )
         .when(|e: &AlpacaError| e.is_retryable())
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::warn!(
+            tracing::debug!(
+                target: "alpaca",
                 "Alpaca poll request status API call failed with {err}, retrying after {dur:?}"
             );
         })

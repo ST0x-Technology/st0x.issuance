@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, stream};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
@@ -84,8 +84,7 @@ where
             return Ok(ReconcileResult { checked: 0, mismatches: 0 });
         }
 
-        info!(
-            receipt_count = receipts.len(),
+        info!(target: "receipt", receipt_count = receipts.len(),
             vault = %self.vault,
             "Reconciling receipt balances with on-chain state"
         );
@@ -112,8 +111,7 @@ where
                     checked += 1;
                 }
                 Err(err) => {
-                    debug!(
-                        vault = %self.vault,
+                    debug!(target: "receipt", vault = %self.vault,
                         error = %err,
                         "Failed to reconcile receipt"
                     );
@@ -122,8 +120,7 @@ where
             }
         }
 
-        info!(
-            checked,
+        info!(target: "receipt", checked,
             mismatches,
             errors,
             vault = %self.vault,
@@ -150,16 +147,14 @@ where
         let on_chain_shares = Shares::from(on_chain_balance);
 
         if on_chain_shares == aggregate_balance {
-            debug!(
-                receipt_id = %receipt_id,
+            trace!(target: "receipt", receipt_id = %receipt_id,
                 balance = %aggregate_balance,
                 "Receipt balance matches on-chain"
             );
             return Ok(false);
         }
 
-        debug!(
-            receipt_id = %receipt_id,
+        trace!(target: "receipt", receipt_id = %receipt_id,
             aggregate_balance = %aggregate_balance,
             on_chain_balance = %on_chain_shares,
             "Balance mismatch detected"
@@ -222,8 +217,7 @@ pub(crate) async fn run_startup_reconciliation<
                 total_mismatches += result.mismatches;
 
                 if result.mismatches > 0 {
-                    debug!(
-                        vault = %vault,
+                    debug!(target: "receipt", vault = %vault,
                         checked = result.checked,
                         mismatches = result.mismatches,
                         "Receipt reconciliation found mismatches"
@@ -231,8 +225,7 @@ pub(crate) async fn run_startup_reconciliation<
                 }
             }
             Err(err) => {
-                debug!(
-                    vault = %vault,
+                debug!(target: "receipt", vault = %vault,
                     receipt_contract = %receipt_contract,
                     error = %err,
                     "Receipt reconciliation failed for vault"
@@ -244,8 +237,7 @@ pub(crate) async fn run_startup_reconciliation<
     }
 
     if total_mismatches > 0 || failed_vaults > 0 {
-        info!(
-            total_checked,
+        info!(target: "receipt", total_checked,
             total_mismatches, failed_vaults, "Receipt reconciliation complete"
         );
     }

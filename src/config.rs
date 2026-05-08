@@ -276,9 +276,37 @@ pub enum ConfigError {
     ChainIdMismatch { configured: u64, from_rpc: u64 },
 }
 
+/// Domain target categories used in `target:` on all tracing macros.
+/// The default `EnvFilter` must include these so logs are not silenced.
+const DOMAIN_TARGETS: &[&str] = &[
+    "startup",
+    "mint",
+    "redemption",
+    "receipt",
+    "account",
+    "asset",
+    "alpaca",
+    "auth",
+    "fireblocks",
+    "admin",
+    "vault",
+];
+
+/// Builds a default `EnvFilter` string that includes both the crate module
+/// path and all custom domain targets at the given level.
+pub(crate) fn default_log_filter(level: Level) -> String {
+    let mut parts = vec![format!("st0x_issuance={level}")];
+
+    for target in DOMAIN_TARGETS {
+        parts.push(format!("{target}={level}"));
+    }
+
+    parts.join(",")
+}
+
 pub fn setup_tracing(log_level: &LogLevel) {
     let level: Level = log_level.into();
-    let default_filter = format!("st0x_issuance={level}");
+    let default_filter = default_log_filter(level);
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

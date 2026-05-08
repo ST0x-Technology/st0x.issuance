@@ -356,6 +356,7 @@ impl OaSchemaCache {
             Err(error) => {
                 // Don't cache transient failures — allow retry on next call
                 warn!(
+                    target: "vault",
                     %vault,
                     %error,
                     "failed to fetch OA schema hash from subgraph, \

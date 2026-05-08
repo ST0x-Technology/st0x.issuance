@@ -132,7 +132,7 @@ impl HyperDxConfig {
         let telemetry_layer =
             tracing_opentelemetry::layer().with_tracer(tracer);
 
-        let default_filter = format!("st0x_issuance={}", self.log_level);
+        let default_filter = crate::config::default_log_filter(self.log_level);
 
         let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.clone().into());

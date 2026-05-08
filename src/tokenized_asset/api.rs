@@ -37,7 +37,7 @@ pub(crate) async fn get_tokenized_asset(
     )
     .await
     .map_err(|err| {
-        error!(error = %err, "Failed to load tokenized asset");
+        error!(target: "asset", error = %err, "Failed to load tokenized asset");
         Status::InternalServerError
     })?;
 
@@ -80,7 +80,7 @@ pub(crate) async fn list_tokenized_assets(
 ) -> Result<Json<TokenizedAssetsListResponse>, rocket::http::Status> {
     let views =
         super::view::list_enabled_assets(pool.inner()).await.map_err(|e| {
-            error!("Failed to list enabled assets: {e}");
+            error!(target: "asset", "Failed to list enabled assets: {e}");
             rocket::http::Status::InternalServerError
         })?;
 
@@ -140,7 +140,7 @@ pub(crate) async fn add_tokenized_asset(
             _ => Err(err),
         })
         .map_err(|err| {
-            error!("Failed to add tokenized asset: {err}");
+            error!(target: "asset", "Failed to add tokenized asset: {err}");
             Status::InternalServerError
         })?;
 

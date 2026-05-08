@@ -811,8 +811,40 @@ impl LocalEvm {
     }
 }
 
+/// Maps `module_path!()` to the domain target used in `target:` on
+/// tracing macros. Falls back to the module path itself for modules
+/// that don't use custom targets.
+#[cfg(test)]
+pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
+    let module = module.strip_suffix("::tests").unwrap_or(module);
+
+    if module.contains("::mint") {
+        "mint"
+    } else if module.contains("::redemption") {
+        "redemption"
+    } else if module.contains("::receipt_inventory") {
+        "receipt"
+    } else if module.contains("::account") {
+        "account"
+    } else if module.contains("::tokenized_asset") {
+        "asset"
+    } else if module.contains("::alpaca") {
+        "alpaca"
+    } else if module.contains("::auth") {
+        "auth"
+    } else if module.contains("::fireblocks") {
+        "fireblocks"
+    } else if module.contains("::admin") {
+        "admin"
+    } else if module.contains("::vault") {
+        "vault"
+    } else {
+        "startup"
+    }
+}
+
 /// Checks whether any log line at the given level, scoped to the
-/// caller's module, contains all snippets.
+/// caller's domain target, contains all snippets.
 #[cfg(test)]
 macro_rules! logs_contain_at {
     ($level:expr, $snippets:expr) => {
@@ -821,7 +853,7 @@ macro_rules! logs_contain_at {
 }
 
 /// Counts log lines at the given level, scoped to the caller's
-/// module, that contain all snippets.
+/// domain target, that contain all snippets.
 #[cfg(test)]
 macro_rules! log_count_at {
     ($level:expr, $snippets:expr) => {{
@@ -829,8 +861,8 @@ macro_rules! log_count_at {
             let buf = tracing_test::internal::global_buf().lock().unwrap();
             String::from_utf8_lossy(&buf).into_owned()
         };
-        let scope = module_path!();
-        let scope = scope.strip_suffix("::tests").unwrap_or(scope);
+        let target =
+            $crate::test_utils::domain_target_for_module(module_path!());
         let level_str = match $level {
             tracing::Level::TRACE => "TRACE",
             tracing::Level::DEBUG => "DEBUG",
@@ -841,7 +873,7 @@ macro_rules! log_count_at {
         let snippets: &[&str] = $snippets;
         logs.lines()
             .filter(|line| {
-                line.contains(scope)
+                line.contains(target)
                     && line.contains(level_str)
                     && snippets.iter().all(|snippet| line.contains(snippet))
             })

@@ -82,8 +82,7 @@ async fn drive_recovery<ES>(
 
         match result {
             Ok(()) => {
-                debug!(
-                    issuer_request_id = %issuer_request_id,
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     attempt,
                     "Recovery step succeeded, continuing"
                 );
@@ -91,16 +90,14 @@ async fn drive_recovery<ES>(
             Err(AggregateError::UserError(MintError::NotRecoverable {
                 current_state,
             })) => {
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "mint", issuer_request_id = %issuer_request_id,
                     current_state,
                     "Mint recovery complete"
                 );
                 return;
             }
             Err(err) => {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Mint recovery failed"
                 );
@@ -109,8 +106,7 @@ async fn drive_recovery<ES>(
         }
     }
 
-    error!(
-        issuer_request_id = %issuer_request_id,
+    error!(target: "mint", issuer_request_id = %issuer_request_id,
         aggregate_id,
         max_attempts = MAX_RECOVERY_ATTEMPTS,
         "Mint recovery exceeded maximum attempts without reaching terminal state"

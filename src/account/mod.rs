@@ -219,8 +219,7 @@ impl Aggregate for Account {
                 let Self::Registered { client_id, email, registered_at } =
                     self.clone()
                 else {
-                    error!(
-                        event = "LinkedToAlpaca",
+                    error!(target: "account", event = "LinkedToAlpaca",
                         alpaca_account = %alpaca_account.0,
                         state = ?self,
                         "event applied to non-Registered state"
@@ -241,8 +240,7 @@ impl Aggregate for Account {
             AccountEvent::WalletWhitelisted { wallet, .. } => {
                 let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self
                 else {
-                    error!(
-                        event = "WalletWhitelisted",
+                    error!(target: "account", event = "WalletWhitelisted",
                         wallet = %wallet,
                         state = ?self,
                         "event applied to non-LinkedToAlpaca state"
@@ -256,8 +254,7 @@ impl Aggregate for Account {
             AccountEvent::WalletUnwhitelisted { wallet, .. } => {
                 let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self
                 else {
-                    error!(
-                        event = "WalletUnwhitelisted",
+                    error!(target: "account", event = "WalletUnwhitelisted",
                         wallet = %wallet,
                         state = ?self,
                         "event applied to non-LinkedToAlpaca state"

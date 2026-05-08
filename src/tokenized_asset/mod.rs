@@ -106,15 +106,13 @@ impl Aggregate for TokenizedAsset {
                 Self::Added { vault: current_vault, .. }
                     if *current_vault == vault =>
                 {
-                    tracing::debug!(
-                        underlying = %underlying.0,
+                    tracing::debug!(target: "asset", underlying = %underlying.0,
                         "Asset already added with same vault, skipping"
                     );
                     Ok(vec![])
                 }
                 Self::Added { vault: current_vault, .. } => {
-                    tracing::info!(
-                        underlying = %underlying.0,
+                    tracing::info!(target: "asset", underlying = %underlying.0,
                         previous_vault = %current_vault,
                         new_vault = %vault,
                         "Updating vault address for asset"
@@ -126,8 +124,7 @@ impl Aggregate for TokenizedAsset {
                     }])
                 }
                 Self::NotAdded => {
-                    tracing::info!(
-                        underlying = %underlying.0,
+                    tracing::info!(target: "asset", underlying = %underlying.0,
                         vault = %vault,
                         "Adding new tokenized asset"
                     );

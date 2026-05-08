@@ -58,7 +58,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
         };
 
         let message = self.to_string();
-        error!("{message}");
+        error!(target: "account", "{message}");
 
         rocket::Response::build()
             .status(status)
@@ -122,7 +122,7 @@ fn map_cqrs_error_to_status(
         AggregateError::UserError(_) => Status::BadRequest,
         AggregateError::AggregateConflict => Status::Conflict,
         _ => {
-            error!("CQRS execute error: {err}");
+            error!(target: "account", "CQRS execute error: {err}");
             Status::InternalServerError
         }
     }

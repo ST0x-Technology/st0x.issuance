@@ -371,8 +371,7 @@ pub(crate) fn determine_source(
         match rain_meta::decode_receipt_meta(receipt_information) {
             Ok(bytes) => bytes,
             Err(err) => {
-                warn!(
-                    error = %err,
+                warn!(target: "receipt", error = %err,
                     data_len = receipt_information.len(),
                     data_prefix = %alloy::hex::encode(
                         &receipt_information[..receipt_information.len().min(32)]

@@ -149,8 +149,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         }
         let client = builder.build()?;
 
-        debug!(
-            vault_account_id = %config.vault_account_id.as_str(),
+        debug!(target: "fireblocks", vault_account_id = %config.vault_account_id.as_str(),
             chain_asset_ids = ?config.chain_asset_ids,
             %chain_id,
             "Fireblocks vault service initialized"
@@ -253,8 +252,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                 // the response body which contains the actual error message and
                 // code. Debug preserves the full ResponseContent including the
                 // body and typed error entity.
-                warn!(
-                    error = ?err,
+                warn!(target: "fireblocks", error = ?err,
                     %contract_address,
                     %external_tx_id,
                     "Fireblocks create_transaction failed"
@@ -278,7 +276,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
         &self,
         tx_id: &str,
     ) -> Result<B256, FireblocksVaultError> {
-        debug!(fireblocks_tx_id = %tx_id, "Polling Fireblocks CONTRACT_CALL transaction...");
+        debug!(target: "fireblocks", fireblocks_tx_id = %tx_id, "Polling Fireblocks CONTRACT_CALL transaction...");
 
         let result = self
             .client
@@ -287,8 +285,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                 Duration::from_secs(600),
                 Duration::from_millis(500),
                 |tx| {
-                    debug!(
-                        fireblocks_tx_id = %tx_id,
+                    debug!(target: "fireblocks", fireblocks_tx_id = %tx_id,
                         status = ?tx.status,
                         "Polling Fireblocks transaction"
                     );
@@ -298,8 +295,7 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
 
         if result.status != TransactionStatus::Completed {
             if is_still_pending(result.status) {
-                warn!(
-                    fireblocks_tx_id = %tx_id,
+                warn!(target: "fireblocks", fireblocks_tx_id = %tx_id,
                     status = ?result.status,
                     "Polling timed out but transaction may still confirm on-chain"
                 );

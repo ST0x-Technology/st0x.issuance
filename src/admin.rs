@@ -87,8 +87,7 @@ async fn load_reprocess_context(
 ) -> Result<ReprocessContext, Status> {
     let events =
         event_store.load_events(aggregate_id).await.map_err(|err| {
-            error!(
-                aggregate_id = aggregate_id,
+            error!(target: "admin", aggregate_id = aggregate_id,
                 error = %err,
                 "Failed to load redemption events"
             );
@@ -157,8 +156,7 @@ async fn load_reprocess_context(
     }
 
     let Some(metadata) = metadata else {
-        error!(
-            aggregate_id = aggregate_id,
+        error!(target: "admin", aggregate_id = aggregate_id,
             "No Detected event found in redemption event history"
         );
         return Err(Status::InternalServerError);
@@ -237,16 +235,14 @@ async fn recover_pre_alpaca(
     )
     .await
     .map_err(|err| {
-        error!(
-            aggregate_id = %aggregate_id,
+        error!(target: "admin", aggregate_id = %aggregate_id,
             error = %err,
             "Failed to recover redemption (pre-Alpaca)"
         );
         map_redemption_error(&err)
     })?;
 
-    info!(
-        aggregate_id = %aggregate_id,
+    info!(target: "admin", aggregate_id = %aggregate_id,
         "Redemption recovered from Failed to Detected"
     );
 
@@ -289,8 +285,7 @@ async fn recover_post_alpaca(
         .poll_request_status(&alpaca_data.tokenization_request_id)
         .await
         .map_err(|err| {
-            error!(
-                aggregate_id = %aggregate_id,
+            error!(target: "admin", aggregate_id = %aggregate_id,
                 tokenization_request_id = %alpaca_data.tokenization_request_id.0,
                 error = %err,
                 "Failed to poll Alpaca for journal status"
@@ -317,8 +312,7 @@ async fn recover_post_alpaca(
                 || req_quantity != &alpaca_data.alpaca_quantity
                 || req_wallet != &metadata.wallet
             {
-                error!(
-                    aggregate_id = %aggregate_id,
+                error!(target: "admin", aggregate_id = %aggregate_id,
                     "Alpaca response fields do not match redemption metadata"
                 );
                 return Err(Status::InternalServerError);
@@ -326,8 +320,7 @@ async fn recover_post_alpaca(
             (status, updated_at)
         }
         TokenizationRequest::Mint { .. } => {
-            error!(
-                aggregate_id = %aggregate_id,
+            error!(target: "admin", aggregate_id = %aggregate_id,
                 "Alpaca returned Mint request for a redemption tokenization_request_id"
             );
             return Err(Status::InternalServerError);
@@ -337,16 +330,14 @@ async fn recover_post_alpaca(
     match status {
         RedeemRequestStatus::Completed => {}
         RedeemRequestStatus::Pending => {
-            info!(
-                aggregate_id = %aggregate_id,
+            info!(target: "admin", aggregate_id = %aggregate_id,
                 tokenization_request_id = %alpaca_data.tokenization_request_id.0,
                 "Cannot recover: Alpaca journal still pending"
             );
             return Err(Status::UnprocessableEntity);
         }
         RedeemRequestStatus::Rejected => {
-            info!(
-                aggregate_id = %aggregate_id,
+            info!(target: "admin", aggregate_id = %aggregate_id,
                 tokenization_request_id = %alpaca_data.tokenization_request_id.0,
                 "Cannot recover: Alpaca journal was rejected"
             );
@@ -364,8 +355,7 @@ async fn recover_post_alpaca(
                     block_number,
                 })) => {
                     if bf_data.planned_burns.is_empty() {
-                        warn!(
-                            aggregate_id = %aggregate_id,
+                        warn!(target: "admin", aggregate_id = %aggregate_id,
                             fireblocks_tx_id = %fb_tx_id,
                             tx_hash = ?tx_hash,
                             "Pre-enrichment BurningFailed event has no planned_burns — \
@@ -374,8 +364,7 @@ async fn recover_post_alpaca(
                         );
                     }
 
-                    info!(
-                        aggregate_id = %aggregate_id,
+                    info!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
                         tx_hash = ?tx_hash,
                         "Fireblocks tx already completed on-chain, recording existing burn"
@@ -393,8 +382,7 @@ async fn recover_post_alpaca(
                     )
                     .await
                     .map_err(|err| {
-                        error!(
-                            aggregate_id = %aggregate_id,
+                        error!(target: "admin", aggregate_id = %aggregate_id,
                             error = %err,
                             "Failed to record existing burn"
                         );
@@ -411,16 +399,14 @@ async fn recover_post_alpaca(
                     }));
                 }
                 Ok(Some(FireblocksTxStatus::Pending)) => {
-                    info!(
-                        aggregate_id = %aggregate_id,
+                    info!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
                         "Fireblocks tx still pending, cannot recover yet"
                     );
                     return Err(Status::UnprocessableEntity);
                 }
                 Ok(Some(FireblocksTxStatus::Failed { status: fb_status })) => {
-                    info!(
-                        aggregate_id = %aggregate_id,
+                    info!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
                         fireblocks_status = %fb_status,
                         "Fireblocks tx failed, proceeding with ResumeBurn"
@@ -431,8 +417,7 @@ async fn recover_post_alpaca(
                     // Non-Fireblocks backend, fall through to ResumeBurn
                 }
                 Err(err) => {
-                    error!(
-                        aggregate_id = %aggregate_id,
+                    error!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
                         error = %err,
                         "Failed to check Fireblocks tx status"
@@ -444,8 +429,7 @@ async fn recover_post_alpaca(
     }
 
     let Some(alpaca_journal_completed_at) = alpaca_updated_at else {
-        error!(
-            aggregate_id = %aggregate_id,
+        error!(target: "admin", aggregate_id = %aggregate_id,
             "Alpaca returned completed status but updated_at is null"
         );
         return Err(Status::BadGateway);
@@ -466,16 +450,14 @@ async fn recover_post_alpaca(
     )
     .await
     .map_err(|err| {
-        error!(
-            aggregate_id = %aggregate_id,
+        error!(target: "admin", aggregate_id = %aggregate_id,
             error = %err,
             "Failed to recover redemption (post-Alpaca)"
         );
         map_redemption_error(&err)
     })?;
 
-    info!(
-        aggregate_id = %aggregate_id,
+    info!(target: "admin", aggregate_id = %aggregate_id,
         "Redemption recovered from Failed to Burning"
     );
 
@@ -530,16 +512,14 @@ pub(crate) async fn close_redemption(
     )
     .await
     .map_err(|err| {
-        error!(
-            aggregate_id = %aggregate_id,
+        error!(target: "admin", aggregate_id = %aggregate_id,
             error = %err,
             "Failed to close redemption"
         );
         map_redemption_error(&err)
     })?;
 
-    info!(
-        aggregate_id = %aggregate_id,
+    info!(target: "admin", aggregate_id = %aggregate_id,
         "Redemption closed"
     );
 
@@ -565,28 +545,31 @@ pub(crate) async fn reprocess_mint(
         .map_err(|_| Status::BadRequest)?;
 
     // Check current state via view
-    let current_state =
-        match find_by_issuer_request_id(pool.inner(), &issuer_request_id).await
-        {
-            Ok(Some(view)) => {
-                let state = match &view {
-                    MintView::NotFound => return Err(Status::NotFound),
-                    MintView::Completed { .. } => return Err(Status::Conflict),
-                    MintView::Initiated { .. } => "Initiated",
-                    MintView::JournalConfirmed { .. } => "JournalConfirmed",
-                    MintView::JournalRejected { .. } => "JournalRejected",
-                    MintView::Minting { .. } => "Minting",
-                    MintView::CallbackPending { .. } => "CallbackPending",
-                    MintView::MintingFailed { .. } => "MintingFailed",
-                };
-                state.to_string()
-            }
-            Ok(None) => return Err(Status::NotFound),
-            Err(err) => {
-                error!(error = %err, "Failed to query mint view");
-                return Err(Status::InternalServerError);
-            }
-        };
+    let current_state = match find_by_issuer_request_id(
+        pool.inner(),
+        &issuer_request_id,
+    )
+    .await
+    {
+        Ok(Some(view)) => {
+            let state = match &view {
+                MintView::NotFound => return Err(Status::NotFound),
+                MintView::Completed { .. } => return Err(Status::Conflict),
+                MintView::Initiated { .. } => "Initiated",
+                MintView::JournalConfirmed { .. } => "JournalConfirmed",
+                MintView::JournalRejected { .. } => "JournalRejected",
+                MintView::Minting { .. } => "Minting",
+                MintView::CallbackPending { .. } => "CallbackPending",
+                MintView::MintingFailed { .. } => "MintingFailed",
+            };
+            state.to_string()
+        }
+        Ok(None) => return Err(Status::NotFound),
+        Err(err) => {
+            error!(target: "admin", error = %err, "Failed to query mint view");
+            return Err(Status::InternalServerError);
+        }
+    };
 
     cqrs.execute(
         aggregate_id,
@@ -594,8 +577,7 @@ pub(crate) async fn reprocess_mint(
     )
     .await
     .map_err(|err| {
-        error!(
-            aggregate_id = aggregate_id,
+        error!(target: "admin", aggregate_id = aggregate_id,
             error = %err,
             "Failed to reprocess mint"
         );
@@ -605,8 +587,7 @@ pub(crate) async fn reprocess_mint(
         }
     })?;
 
-    info!(
-        aggregate_id = aggregate_id,
+    info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
         "Mint reprocessed successfully"
     );
@@ -629,7 +610,7 @@ pub(crate) async fn list_stuck(
 
     // Stuck redemptions (Failed and BurnFailed)
     let stuck_redemptions = find_stuck(pool.inner()).await.map_err(|err| {
-        error!(error = %err, "Failed to query stuck redemptions");
+        error!(target: "admin", error = %err, "Failed to query stuck redemptions");
         Status::InternalServerError
     })?;
 
@@ -655,7 +636,7 @@ pub(crate) async fn list_stuck(
     // Stuck mints (recoverable states)
     let recoverable_mints =
         find_all_recoverable_mints(pool.inner()).await.map_err(|err| {
-            error!(error = %err, "Failed to query recoverable mints");
+            error!(target: "admin", error = %err, "Failed to query recoverable mints");
             Status::InternalServerError
         })?;
 

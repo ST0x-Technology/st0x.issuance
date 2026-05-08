@@ -45,8 +45,7 @@ impl FromStr for IpWhitelist {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.trim().is_empty() {
-            warn!(
-                "IP whitelist is empty - all IPs will be allowed. \
+            warn!(target: "auth", "IP whitelist is empty - all IPs will be allowed. \
                  This is NOT RECOMMENDED for production."
             );
             return Ok(Self::AllowAll);

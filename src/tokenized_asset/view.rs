@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
@@ -36,7 +36,7 @@ pub(crate) enum TokenizedAssetViewError {
 pub(crate) async fn replay_tokenized_asset_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), TokenizedAssetViewError> {
-    info!(view = "tokenized_asset_view", "Rebuilding view from events");
+    debug!(target: "asset", view = "tokenized_asset_view", "Rebuilding view from events");
 
     sqlx::query!("DELETE FROM tokenized_asset_view").execute(&pool).await?;
 
@@ -53,7 +53,7 @@ pub(crate) async fn replay_tokenized_asset_view(
     let replay = QueryReplay::new(event_repo, query);
     replay.replay_all().await?;
 
-    info!(view = "tokenized_asset_view", "View rebuild complete");
+    debug!(target: "asset", view = "tokenized_asset_view", "View rebuild complete");
 
     Ok(())
 }
@@ -476,11 +476,11 @@ mod tests {
         }
 
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["Rebuilding view from events", "tokenized_asset_view"]
         ));
         assert!(logs_contain_at!(
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             &["View rebuild complete", "tokenized_asset_view"]
         ));
     }

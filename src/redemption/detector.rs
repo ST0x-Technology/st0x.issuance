@@ -5,7 +5,7 @@ use cqrs_es::{CqrsFramework, EventStore};
 use futures::StreamExt;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use super::{
@@ -93,8 +93,7 @@ where
     pub(crate) async fn run(&self) {
         loop {
             if let Err(err) = self.monitor_once().await {
-                warn!(
-                    "WebSocket monitoring error: {err}. Reconnecting in 5s..."
+                warn!(target: "redemption", "WebSocket monitoring error: {err}. Reconnecting in 5s..."
                 );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
@@ -105,7 +104,7 @@ where
     ///
     /// Returns an error if the connection fails, subscription fails, or the stream ends.
     async fn monitor_once(&self) -> Result<(), RedemptionMonitorError> {
-        info!("Connecting to WebSocket at {}", self.rpc_url);
+        debug!(target: "redemption", "Connecting to WebSocket at {}", self.rpc_url);
 
         let provider =
             ProviderBuilder::new().connect(self.rpc_url.as_str()).await?;
@@ -115,8 +114,7 @@ where
 
         let filter = vault.Transfer_filter().topic2(self.bot_wallet).filter;
 
-        info!(
-            "Subscribing to Transfer events for bot wallet {}",
+        debug!(target: "redemption", "Subscribing to Transfer events for bot wallet {}",
             self.bot_wallet
         );
 
@@ -124,11 +122,11 @@ where
 
         let mut stream = sub.into_stream();
 
-        info!("WebSocket subscription active, monitoring for redemptions");
+        debug!(target: "redemption", "WebSocket subscription active, monitoring for redemptions");
 
         while let Some(log) = stream.next().await {
             if let Err(err) = self.process_transfer_log(&log).await {
-                warn!("Failed to process transfer log: {err}");
+                warn!(target: "redemption", "Failed to process transfer log: {err}");
             }
         }
 

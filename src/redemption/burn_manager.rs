@@ -81,18 +81,17 @@ where
         let stuck_redemptions = match find_burning(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
-                error!(error = %err, "Failed to query for stuck Burning redemptions");
+                error!(target: "redemption", error = %err, "Failed to query for stuck Burning redemptions");
                 return;
             }
         };
 
         if stuck_redemptions.is_empty() {
-            info!("No Burning redemptions to recover");
+            debug!(target: "redemption", "No Burning redemptions to recover");
             return;
         }
 
-        info!(
-            count = stuck_redemptions.len(),
+        info!(target: "redemption", count = stuck_redemptions.len(),
             "Recovering stuck Burning redemptions"
         );
 
@@ -100,8 +99,7 @@ where
             if let Err(err) =
                 self.recover_single_burning(&issuer_request_id).await
             {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover Burning redemption"
                 );
@@ -117,18 +115,17 @@ where
         let failed_redemptions = match find_burn_failed(&self.view_pool).await {
             Ok(redemptions) => redemptions,
             Err(err) => {
-                error!(error = %err, "Failed to query for BurnFailed redemptions");
+                error!(target: "redemption", error = %err, "Failed to query for BurnFailed redemptions");
                 return;
             }
         };
 
         if failed_redemptions.is_empty() {
-            info!("No BurnFailed redemptions to recover");
+            debug!(target: "redemption", "No BurnFailed redemptions to recover");
             return;
         }
 
-        info!(
-            count = failed_redemptions.len(),
+        info!(target: "redemption", count = failed_redemptions.len(),
             "Recovering BurnFailed redemptions"
         );
 
@@ -136,8 +133,7 @@ where
             if let Err(err) =
                 self.recover_single_burn_failed(&issuer_request_id, &view).await
             {
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Failed to recover BurnFailed redemption"
                 );
@@ -158,8 +154,7 @@ where
             ..
         } = view
         else {
-            debug!(
-                issuer_request_id = %issuer_request_id,
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "View not in BurnFailed state, skipping"
             );
             return Ok(());
@@ -193,8 +188,7 @@ where
                  balance={on_chain_balance}, required={total_shares}"
             );
 
-            info!(
-                issuer_request_id = %issuer_request_id,
+            info!(target: "redemption", issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
                 total_shares = %total_shares,
                 "Auto-failing BurnFailed redemption with insufficient on-chain balance"
@@ -231,8 +225,7 @@ where
             })
             .collect();
 
-        debug!(
-            issuer_request_id = %issuer_request_id,
+        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
             num_receipts = burns.len(),
@@ -253,8 +246,7 @@ where
             )
             .await?;
 
-        debug!(
-            issuer_request_id = %issuer_request_id,
+        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Successfully retried burn"
         );
 
@@ -277,8 +269,7 @@ where
             ..
         } = aggregate
         else {
-            debug!(
-                issuer_request_id = %issuer_request_id,
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "Redemption no longer in Burning state, skipping"
             );
             return Ok(());
@@ -309,8 +300,7 @@ where
             .await?;
 
         if on_chain_balance < total_shares_needed {
-            warn!(
-                issuer_request_id = %issuer_request_id,
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                 on_chain_balance = %on_chain_balance,
                 burn_shares = %burn_shares,
                 dust_shares = %dust_shares,
@@ -322,8 +312,7 @@ where
             return Ok(());
         }
 
-        debug!(
-            issuer_request_id = %issuer_request_id,
+        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Recovering Burning redemption - resuming burn"
         );
 
@@ -384,8 +373,7 @@ where
                 metadata.underlying
             );
 
-            warn!(
-                issuer_request_id = %issuer_request_id,
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                 underlying = %metadata.underlying,
                 "{error_msg}"
             );
@@ -411,8 +399,7 @@ where
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
 
-        info!(
-            issuer_request_id = %issuer_request_id,
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
             underlying = %metadata.underlying,
             alpaca_quantity = %alpaca_quantity,
             dust_quantity = %dust_quantity,
@@ -452,8 +439,7 @@ where
 
         match plan {
             Ok(plan) => {
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     num_receipts = plan.allocations.len(),
                     total_burn = %plan.total_burn,
                     dust = %plan.dust,
@@ -488,8 +474,7 @@ where
             "Insufficient balance for {underlying}: required {required}, available {available}"
         );
 
-        warn!(
-            issuer_request_id = %issuer_request_id,
+        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
             %required,
             %available,
             underlying = %underlying,
@@ -508,8 +493,7 @@ where
             )
             .await?;
 
-        info!(
-            issuer_request_id = %issuer_request_id,
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
             "RecordBurnFailure command executed successfully"
         );
 
@@ -559,8 +543,7 @@ where
 
         match burn_result {
             Ok(()) => {
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "BurnTokens command executed successfully"
                 );
 
@@ -569,8 +552,7 @@ where
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
                 let fireblocks_tx_id = extract_fireblocks_tx_id(&err);
 
-                warn!(
-                    issuer_request_id = %issuer_request_id,
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     fireblocks_tx_id = ?fireblocks_tx_id,
                     "On-chain burning failed"
@@ -588,8 +570,7 @@ where
                     )
                     .await?;
 
-                info!(
-                    issuer_request_id = %issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "RecordBurnFailure command recorded"
                 );
 

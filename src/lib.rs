@@ -12,7 +12,7 @@ use sqlite_es::{
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::account::view::replay_account_view;
@@ -257,7 +257,7 @@ pub async fn initialize_rocket(
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
     let bot_wallet = config.signer.address().await?;
-    info!("Bot wallet address: {bot_wallet}");
+    info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
 
@@ -286,7 +286,7 @@ pub async fn initialize_rocket(
     // Reprojections must complete BEFORE recovery runs, so recovery queries
     // up-to-date views. Each replay clears its view table first to remove
     // stale/corrupt data, then rebuilds from the event store.
-    info!("Rebuilding all views from events");
+    debug!(target: "startup", "Rebuilding all views from events");
     replay_account_view(pool.clone()).await?;
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
@@ -321,7 +321,8 @@ pub async fn initialize_rocket(
     )
     .await
     {
-        warn!(
+        error!(
+            target: "receipt",
             error = %error,
             "Startup reconciliation failed — receipt balances may be stale \
              until the next withdraw event triggers reconciliation"
@@ -633,12 +634,14 @@ fn spawn_all_redemption_detectors(
     bot_wallet: Address,
 ) {
     info!(
+        target: "redemption",
         vault_count = vault_configs.len(),
         "Spawning redemption detectors for all vaults"
     );
 
     for config in vault_configs {
         debug!(
+            target: "redemption",
             vault = %config.vault,
             bot_wallet = %bot_wallet,
             "Spawning redemption detector for vault"
@@ -671,7 +674,7 @@ fn spawn_redemption_detector(
     managers: RedemptionManagers,
     bot_wallet: Address,
 ) {
-    info!(bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
+    debug!(target: "redemption", bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
 
     let detector_config =
         RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
@@ -692,29 +695,29 @@ fn spawn_redemption_detector(
 }
 
 async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_cqrs: &MintCqrs) {
-    info!("Running mint recovery");
+    info!(target: "mint", "Running mint recovery");
 
     let recoverable_mints = match find_all_recoverable_mints(pool).await {
         Ok(mints) => mints,
         Err(err) => {
-            error!(error = %err, "Failed to query recoverable mints");
+            error!(target: "mint", error = %err, "Failed to query recoverable mints");
             return;
         }
     };
 
     if recoverable_mints.is_empty() {
-        info!("No mints to recover");
+        debug!(target: "mint", "No mints to recover");
         return;
     }
 
     let count = recoverable_mints.len();
-    info!(count, "Recovering mints");
+    debug!(target: "mint", count, "Recovering mints");
 
     for (issuer_request_id, _view) in recoverable_mints {
         recover_mint(mint_cqrs, issuer_request_id).await;
     }
 
-    info!(count, "Mint recovery complete");
+    debug!(target: "mint", count, "Mint recovery complete");
 }
 
 async fn run_redemption_recovery(
@@ -726,7 +729,7 @@ async fn run_redemption_recovery(
     >,
     burn: &BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
 ) {
-    info!("Running redemption recovery");
+    info!(target: "redemption", "Running redemption recovery");
 
     redeem_call.recover_detected_redemptions().await;
     journal.recover_alpaca_called_redemptions().await;
@@ -755,11 +758,12 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
     let assets = list_enabled_assets(pool).await?;
 
     if assets.is_empty() {
-        info!("No enabled tokenized assets found, skipping receipt backfill");
+        info!(target: "receipt", "No enabled tokenized assets found, skipping receipt backfill");
         return Ok(vec![]);
     }
 
     info!(
+        target: "receipt",
         asset_count = assets.len(),
         "Running receipt backfill for all enabled assets"
     );
@@ -814,6 +818,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     )?;
 
     info!(
+        target: "receipt",
         underlying,
         vault = %vault,
         receipt_contract = %receipt_contract,
@@ -833,6 +838,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     let result = backfiller.backfill_receipts(from_block).await?;
 
     info!(
+        target: "receipt",
         underlying,
         vault = %vault,
         processed = result.processed_count,
@@ -872,7 +878,8 @@ async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
         backfill_start_block,
     )?;
 
-    debug!(
+    trace!(
+        target: "receipt",
         vault = %config.vault,
         receipt_contract = %config.receipt_contract,
         from_block,
@@ -889,7 +896,8 @@ async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
 
     let result = backfiller.backfill_receipts(from_block).await?;
 
-    debug!(
+    trace!(
+        target: "receipt",
         vault = %config.vault,
         processed = result.processed_count,
         skipped_zero_balance = result.skipped_zero_balance,
@@ -931,6 +939,7 @@ fn spawn_periodic_receipt_backfills<P>(
                 .await
                 {
                     warn!(
+                        target: "receipt",
                         error = %error,
                         vault = %config.vault,
                         "Periodic receipt backfill failed; next run will resume \
@@ -953,11 +962,12 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
     backfill_start_block: u64,
 ) -> Result<(), anyhow::Error> {
     if vault_configs.is_empty() {
-        info!("No enabled vaults, skipping transfer backfill");
+        info!(target: "redemption", "No enabled vaults, skipping transfer backfill");
         return Ok(());
     }
 
     info!(
+        target: "redemption",
         vault_count = vault_configs.len(),
         "Running transfer backfill for all vaults"
     );
@@ -973,6 +983,7 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
             Err(error) => {
                 failed_count += 1;
                 warn!(
+                    target: "redemption",
                     error = %error,
                     vault = %config.vault,
                     "Transfer backfill failed for vault; continuing with \
@@ -983,6 +994,7 @@ async fn run_all_transfer_backfills<P: Provider + Clone>(
         };
 
         debug!(
+            target: "redemption",
             vault = %config.vault,
             detected = result.detected_count,
             skipped_mint = result.skipped_mint,
@@ -1021,6 +1033,7 @@ fn spawn_all_transfer_backfills<P>(
                 Ok(()) => return,
                 Err(error) => {
                     error!(
+                        target: "redemption",
                         error = %error,
                         retry_after_secs =
                             TRANSFER_BACKFILL_RETRY_INTERVAL.as_secs(),
@@ -1048,12 +1061,14 @@ fn spawn_all_receipt_monitors<P, ITN>(
     ITN: ItnReceiptHandler + Clone + 'static,
 {
     info!(
+        target: "receipt",
         vault_count = vault_configs.len(),
         "Spawning receipt monitors for all vaults"
     );
 
     for config in vault_configs {
-        info!(
+        debug!(
+            target: "receipt",
             vault = %config.vault,
             receipt_contract = %config.receipt_contract,
             bot_wallet = %bot_wallet,

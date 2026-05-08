@@ -6,7 +6,7 @@ use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{info, trace};
 
 use super::monitor::{
     TransferDirection, transfer_batch_filter, transfer_single_filter,
@@ -120,8 +120,7 @@ where
         let current_block = self.provider.get_block_number().await?;
 
         if from_block > current_block {
-            info!(
-                from_block,
+            info!(target: "receipt", from_block,
                 current_block,
                 "Backfill skipped: from_block is ahead of current block"
             );
@@ -132,8 +131,7 @@ where
             });
         }
 
-        info!(
-            receipt_contract = %self.receipt_contract,
+        trace!(target: "receipt", receipt_contract = %self.receipt_contract,
             bot_wallet = %self.bot_wallet,
             from_block,
             to_block = current_block,
@@ -147,8 +145,7 @@ where
         ))
         .then(|(chunk_from, chunk_to)| async move {
             let logs = self.fetch_logs_for_range(chunk_from, chunk_to).await?;
-            debug!(
-                chunk_from,
+            trace!(target: "receipt", chunk_from,
                 chunk_to,
                 logs_found = logs.len(),
                 "Processed block range"
@@ -193,8 +190,7 @@ where
             )
             .await?;
 
-        info!(
-            processed_count,
+        trace!(target: "receipt", processed_count,
             skipped_zero_balance,
             checkpoint_block = current_block,
             "Receipt backfill complete"
@@ -388,8 +384,7 @@ where
             )
             .await?;
 
-        debug!(
-            receipt_id = %discovery.receipt_id,
+        trace!(target: "receipt", receipt_id = %discovery.receipt_id,
             balance = %current_balance,
             "Processed receipt"
         );
@@ -555,14 +550,14 @@ mod tests {
         let test = "backfill_discovers_receipt_from_historic_deposit";
         assert!(
             logs_contain_at!(
-                tracing::Level::DEBUG,
+                tracing::Level::TRACE,
                 &[test, "Processed block range"]
             ),
             "Expected DEBUG log for block range processing"
         );
         assert!(
             logs_contain_at!(
-                tracing::Level::DEBUG,
+                tracing::Level::TRACE,
                 &[test, "Processed receipt"]
             ),
             "Expected DEBUG log for processed receipt"
@@ -701,14 +696,14 @@ mod tests {
         let test = "backfill_skips_zero_balance_receipts";
         assert!(
             logs_contain_at!(
-                tracing::Level::DEBUG,
+                tracing::Level::TRACE,
                 &[test, "Processed block range"]
             ),
             "Expected DEBUG log for block range processing"
         );
         assert!(
             !logs_contain_at!(
-                tracing::Level::DEBUG,
+                tracing::Level::TRACE,
                 &[test, "Processed receipt"]
             ),
             "Should NOT log processed receipt when all receipts have zero balance"
@@ -898,7 +893,7 @@ mod tests {
 
         assert!(
             logs_contain_at!(
-                tracing::Level::INFO,
+                tracing::Level::TRACE,
                 &[
                     "backfill_emits_checkpoint_after_processing",
                     "Receipt backfill complete"
