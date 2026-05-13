@@ -110,14 +110,15 @@ pub(crate) trait VaultService: Send + Sync {
 }
 
 /// Status of a Fireblocks transaction, as returned by `check_fireblocks_tx`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum FireblocksTxStatus {
     /// Transaction completed on-chain.
     Completed { tx_hash: B256, block_number: u64 },
     /// Transaction is still pending (submitted, confirming, etc.).
     Pending,
     /// Transaction reached a terminal failure status.
-    Failed { status: String },
+    Failed { detail: String },
 }
 
 /// Result of a successful on-chain minting operation.

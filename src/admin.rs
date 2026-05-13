@@ -408,10 +408,10 @@ async fn recover_post_alpaca(
                     );
                     return Err(Status::UnprocessableEntity);
                 }
-                Ok(Some(FireblocksTxStatus::Failed { status: fb_status })) => {
+                Ok(Some(FireblocksTxStatus::Failed { detail: fb_detail })) => {
                     info!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
-                        fireblocks_status = %fb_status,
+                        fireblocks_status = %fb_detail,
                         "Fireblocks tx failed, proceeding with ResumeBurn"
                     );
                     // Fall through to ResumeBurn below
@@ -762,6 +762,50 @@ pub(crate) async fn list_stuck(
     }
 
     Ok(Json(StuckResponse { stuck }))
+}
+
+/// Response for the Fireblocks transaction status lookup endpoint.
+#[derive(Debug, Serialize)]
+pub(crate) struct FireblocksTxResponse {
+    fireblocks_tx_id: String,
+    #[serde(flatten)]
+    status: FireblocksTxStatus,
+}
+
+/// Admin endpoint to look up a Fireblocks transaction status.
+///
+/// Useful for checking orphaned transactions that were submitted but never
+/// recorded in the event store (e.g. due to recovery timeout).
+#[tracing::instrument(skip(_auth, vault_service))]
+#[get("/admin/fireblocks/tx/<fireblocks_tx_id>")]
+pub(crate) async fn check_fireblocks_tx(
+    _auth: InternalAuth,
+    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    fireblocks_tx_id: &str,
+) -> Result<Json<FireblocksTxResponse>, Status> {
+    let result = vault_service
+        .check_fireblocks_tx(fireblocks_tx_id)
+        .await
+        .map_err(|err| {
+            error!(target: "admin",
+                fireblocks_tx_id = %fireblocks_tx_id,
+                error = %err,
+                "Failed to check Fireblocks transaction"
+            );
+            Status::BadGateway
+        })?;
+
+    let Some(fb_status) = result else {
+        // Non-Fireblocks backend — check_fireblocks_tx returns None.
+        return Err(Status::NotFound);
+    };
+
+    let response = FireblocksTxResponse {
+        fireblocks_tx_id: fireblocks_tx_id.to_string(),
+        status: fb_status,
+    };
+
+    Ok(Json(response))
 }
 
 #[cfg(test)]

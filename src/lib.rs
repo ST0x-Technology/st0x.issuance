@@ -448,6 +448,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::reprocess_mint,
                 admin::close_mint,
                 admin::list_stuck,
+                admin::check_fireblocks_tx,
             ],
         )
         .register("/", catchers::json_catchers())

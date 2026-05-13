@@ -824,7 +824,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 // Verify EVM execution succeeded — a mined tx can still be a revert.
                 if !receipt.status() {
                     return Ok(Some(FireblocksTxStatus::Failed {
-                        status: format!(
+                        detail: format!(
                             "EVM reverted (Fireblocks Completed, tx {tx_hash})"
                         ),
                     }));
@@ -834,7 +834,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             }
             status if is_still_pending(status) => FireblocksTxStatus::Pending,
             status => {
-                FireblocksTxStatus::Failed { status: format!("{status:?}") }
+                FireblocksTxStatus::Failed { detail: format!("{status:?}") }
             }
         };
 
