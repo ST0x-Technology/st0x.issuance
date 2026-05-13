@@ -1,26 +1,14 @@
-[workspace]
-members = [".", "crates/sqlite-es"]
-resolver = "2"
+[package]
+name = "st0x-issuance"
+version = "0.1.0"
+edition = "2024"
 
-[workspace.lints.rust]
-unsafe_code = "forbid"
-
-[workspace.lints.clippy]
-unwrap_used = "deny"
-enum_glob_use = "allow"
-
-# `priority = -1` allow for allowing lints enabled by a group to be re-disabled
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-
-doc_markdown = "allow"
-items_after_statements = "allow"
-redundant_pub_crate = "allow"
-
-[workspace.dependencies]
-async-trait = "0.1.89"
+[dependencies]
+event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", branch = "docs/examples" }
+sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", branch = "docs/examples" }
 cqrs-es = "0.4.12"
-rocket = "0.5.1"
+async-trait = "0.1.89"
+rocket = { version = "0.5.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.8.6", features = [
@@ -32,24 +20,8 @@ sqlx = { version = "0.8.6", features = [
 ] }
 thiserror = "2.0.17"
 tracing = "0.1.41"
-
-[package]
-name = "st0x-issuance"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-rocket = { workspace = true, features = ["json"] }
-serde.workspace = true
-serde_json.workspace = true
-sqlx.workspace = true
-tracing.workspace = true
-sqlite-es = { path = "crates/sqlite-es" }
 chrono = { version = "0.4.42", features = ["serde"] }
-thiserror.workspace = true
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
-cqrs-es.workspace = true
-async-trait.workspace = true
 clap = { version = "4.5.49", features = ["derive", "env"] }
 alloy = { version = "1.0.41", features = [
   "provider-ws",
@@ -80,9 +52,6 @@ fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", bran
 ciborium = "0.2.2"
 flate2 = "1.1.9"
 
-[lints]
-workspace = true
-
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"
 alloy-sol-types = "1.4.1"
@@ -94,3 +63,18 @@ rust_decimal_macros = "1.40.0"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["macros"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+enum_glob_use = "allow"
+
+# `priority = -1` allow for allowing lints enabled by a group to be re-disabled
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+doc_markdown = "allow"
+items_after_statements = "allow"
+redundant_pub_crate = "allow"
