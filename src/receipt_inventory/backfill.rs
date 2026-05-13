@@ -1,21 +1,20 @@
 use alloy::primitives::{Address, Bytes, TxHash};
-use alloy::rpc::types::Log;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
+use async_trait::async_trait;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use itertools::Itertools;
 use std::sync::Arc;
 use tracing::{info, trace};
 
-use super::monitor::{
-    TransferDirection, transfer_batch_filter, transfer_single_filter,
-};
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares, determine_source,
+    ReceiptInventoryError, ReceiptSource, Shares, determine_source,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
+use crate::mint::IssuerMintRequestId;
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
@@ -43,21 +42,27 @@ fn block_ranges(
 ///
 /// This handles receipts minted outside our system (e.g., manual operations)
 /// and receipts transferred to the bot wallet from other addresses.
-pub(crate) struct ReceiptBackfiller<ProviderType, ReceiptInventoryStore>
-where
+pub(crate) struct ReceiptBackfiller<
+    ProviderType,
+    ReceiptInventoryStore,
+    Handler,
+> where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler,
 {
     provider: ProviderType,
     receipt_contract: Address,
     bot_wallet: Address,
     vault: Address,
     cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    handler: Handler,
 }
 
 #[derive(Debug)]
 pub(crate) struct BackfillResult {
     pub(crate) processed_count: u64,
     pub(crate) skipped_zero_balance: u64,
+    pub(crate) reconciled_count: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,16 +75,19 @@ pub(crate) enum BackfillError {
     MissingTxHash,
     #[error("Missing block number in log")]
     MissingBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
     #[error("CQRS error: {0}")]
     Aggregate(#[from] AggregateError<ReceiptInventoryError>),
 }
 
-impl<ProviderType, ReceiptInventoryStore>
-    ReceiptBackfiller<ProviderType, ReceiptInventoryStore>
+impl<ProviderType, ReceiptInventoryStore, Handler>
+    ReceiptBackfiller<ProviderType, ReceiptInventoryStore, Handler>
 where
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler,
 {
     pub(crate) const fn new(
         provider: ProviderType,
@@ -87,16 +95,18 @@ where
         bot_wallet: Address,
         vault: Address,
         cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        handler: Handler,
     ) -> Self {
-        Self { provider, receipt_contract, bot_wallet, vault, cqrs }
+        Self { provider, receipt_contract, bot_wallet, vault, cqrs, handler }
     }
 }
 
-impl<ProviderType, ReceiptInventoryStore>
-    ReceiptBackfiller<ProviderType, ReceiptInventoryStore>
+impl<ProviderType, ReceiptInventoryStore, Handler>
+    ReceiptBackfiller<ProviderType, ReceiptInventoryStore, Handler>
 where
     ProviderType: alloy::providers::Provider + Clone + Send + Sync,
     ReceiptInventoryStore: EventStore<ReceiptInventory>,
+    Handler: ItnReceiptHandler,
 {
     /// Scans historic Deposit and ERC-1155 transfer events to discover
     /// receipts the bot owns.
@@ -128,6 +138,7 @@ where
             return Ok(BackfillResult {
                 processed_count: 0,
                 skipped_zero_balance: 0,
+                reconciled_count: 0,
             });
         }
 
@@ -138,27 +149,28 @@ where
             "Starting receipt backfill"
         );
 
-        let all_logs: Vec<Log> = stream::iter(block_ranges(
-            from_block,
-            current_block,
-            BLOCK_CHUNK_SIZE,
-        ))
-        .then(|(chunk_from, chunk_to)| async move {
-            let logs = self.fetch_logs_for_range(chunk_from, chunk_to).await?;
+        let mut all_discovery_logs: Vec<Log> = Vec::new();
+        let mut all_reconciliation_ids: Vec<ReceiptId> = Vec::new();
+
+        for (chunk_from, chunk_to) in
+            block_ranges(from_block, current_block, BLOCK_CHUNK_SIZE)
+        {
+            let fetched =
+                self.fetch_logs_for_range(chunk_from, chunk_to).await?;
+
             trace!(target: "receipt", chunk_from,
                 chunk_to,
-                logs_found = logs.len(),
+                discovery_logs = fetched.discovery_logs.len(),
+                reconciliation_ids = fetched.reconciliation_receipt_ids.len(),
                 "Processed block range"
             );
-            Ok::<_, BackfillError>(logs)
-        })
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
 
-        let discoveries = all_logs
+            all_discovery_logs.extend(fetched.discovery_logs);
+            all_reconciliation_ids.extend(fetched.reconciliation_receipt_ids);
+        }
+
+        // Process discovery logs (Deposit + inbound transfers)
+        let discoveries = all_discovery_logs
             .iter()
             .map(Self::parse_log)
             .collect::<Result<Vec<_>, _>>()?
@@ -181,6 +193,16 @@ where
                 })
             })?;
 
+        // Process reconciliation events (Withdraw + outbound transfers)
+        let unique_reconciliation_ids: Vec<_> =
+            all_reconciliation_ids.into_iter().unique().collect();
+
+        let reconciled_count = u64::try_from(unique_reconciliation_ids.len())?;
+
+        for receipt_id in unique_reconciliation_ids {
+            self.reconcile_receipt(receipt_id).await?;
+        }
+
         self.cqrs
             .execute(
                 &self.vault.to_string(),
@@ -192,24 +214,32 @@ where
 
         trace!(target: "receipt", processed_count,
             skipped_zero_balance,
+            reconciled_count,
             checkpoint_block = current_block,
             "Receipt backfill complete"
         );
 
-        Ok(BackfillResult { processed_count, skipped_zero_balance })
+        Ok(BackfillResult {
+            processed_count,
+            skipped_zero_balance,
+            reconciled_count,
+        })
     }
 
+    /// Fetches and categorizes logs for a block range into discovery logs
+    /// (Deposit + inbound transfers) and reconciliation logs (Withdraw +
+    /// outbound transfers).
     async fn fetch_logs_for_range(
         &self,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<Log>, BackfillError> {
+    ) -> Result<FetchedLogs, BackfillError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(self.vault, &self.provider);
 
-        // Query Deposit events where owner (receiver) is the bot wallet.
-        // Deposit event: (sender, owner, assets, shares, id, receiptInformation)
-        // owner is not indexed, so we filter client-side after fetching.
+        // --- Discovery logs: Deposit + inbound transfers ---
+
+        // Deposit events (owner is not indexed, so we filter client-side).
         let deposit_filter = vault_contract
             .Deposit_filter()
             .from_block(from_block)
@@ -218,7 +248,7 @@ where
 
         let deposit_logs = self.provider.get_logs(&deposit_filter).await?;
 
-        let mut filtered: Vec<Log> = deposit_logs
+        let mut discovery_logs: Vec<Log> = deposit_logs
             .into_iter()
             .filter_map(|log| {
                 match OffchainAssetReceiptVault::Deposit::decode_log(&log.inner)
@@ -232,10 +262,8 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Also scan ERC-1155 TransferSingle and TransferBatch events on the
-        // Receipt contract for inbound transfers to the bot wallet.
-        // Topic3 (to) is indexed, so we filter at the RPC level.
-        let transfer_single_logs = self
+        // Inbound ERC-1155 transfers (topic3 = to = bot_wallet).
+        let transfer_single_in = self
             .provider
             .get_logs(
                 &transfer_single_filter(
@@ -248,7 +276,7 @@ where
             )
             .await?;
 
-        let transfer_batch_logs = self
+        let transfer_batch_in = self
             .provider
             .get_logs(
                 &transfer_batch_filter(
@@ -261,25 +289,86 @@ where
             )
             .await?;
 
-        // Sanity guard: topic filtering already restricts to inbound (to == bot_wallet),
-        // but we still skip mint transfers (from == address(0)) since Deposit covers those.
-        for log in transfer_single_logs {
+        for log in transfer_single_in {
             let event = Receipt::TransferSingle::decode_log(&log.inner)?;
-
             if event.to == self.bot_wallet && !event.from.is_zero() {
-                filtered.push(log);
+                discovery_logs.push(log);
             }
         }
 
-        for log in transfer_batch_logs {
+        for log in transfer_batch_in {
             let event = Receipt::TransferBatch::decode_log(&log.inner)?;
-
             if event.to == self.bot_wallet && !event.from.is_zero() {
-                filtered.push(log);
+                discovery_logs.push(log);
             }
         }
 
-        Ok(filtered)
+        // --- Reconciliation logs: Withdraw + outbound transfers ---
+
+        let mut reconciliation_receipt_ids: Vec<ReceiptId> = Vec::new();
+
+        // Withdraw events (owner is not indexed, filter client-side).
+        let withdraw_filter = vault_contract
+            .Withdraw_filter()
+            .from_block(from_block)
+            .to_block(to_block)
+            .filter;
+
+        let withdraw_logs = self.provider.get_logs(&withdraw_filter).await?;
+
+        for log in withdraw_logs {
+            let event =
+                OffchainAssetReceiptVault::Withdraw::decode_log(&log.inner)?;
+            if event.owner == self.bot_wallet {
+                reconciliation_receipt_ids.push(ReceiptId::from(event.id));
+            }
+        }
+
+        // Outbound ERC-1155 transfers (topic2 = from = bot_wallet).
+        let transfer_single_out = self
+            .provider
+            .get_logs(
+                &transfer_single_filter(
+                    self.receipt_contract,
+                    self.bot_wallet,
+                    TransferDirection::Outbound,
+                )
+                .from_block(from_block)
+                .to_block(to_block),
+            )
+            .await?;
+
+        let transfer_batch_out = self
+            .provider
+            .get_logs(
+                &transfer_batch_filter(
+                    self.receipt_contract,
+                    self.bot_wallet,
+                    TransferDirection::Outbound,
+                )
+                .from_block(from_block)
+                .to_block(to_block),
+            )
+            .await?;
+
+        for log in transfer_single_out {
+            let event = Receipt::TransferSingle::decode_log(&log.inner)?;
+            if event.from == self.bot_wallet && !event.to.is_zero() {
+                reconciliation_receipt_ids.push(ReceiptId::from(event.id));
+            }
+        }
+
+        for log in transfer_batch_out {
+            let event = Receipt::TransferBatch::decode_log(&log.inner)?;
+            if event.from == self.bot_wallet && !event.to.is_zero() {
+                for receipt_id_raw in &event.ids {
+                    reconciliation_receipt_ids
+                        .push(ReceiptId::from(*receipt_id_raw));
+                }
+            }
+        }
+
+        Ok(FetchedLogs { discovery_logs, reconciliation_receipt_ids })
     }
 
     /// Parses a log into one or more `ReceiptDiscovery` entries.
@@ -364,7 +453,7 @@ where
                     balance: Shares::from(current_balance),
                     block_number: discovery.block_number,
                     tx_hash: discovery.tx_hash,
-                    source,
+                    source: source.clone(),
                     receipt_info: receipt_info.map(Box::new),
                     receipt_info_bytes,
                 },
@@ -389,8 +478,50 @@ where
             "Processed receipt"
         );
 
+        if let ReceiptSource::Itn { issuer_request_id } = source {
+            self.handler
+                .on_itn_receipt_discovered(issuer_request_id, discovery.tx_hash)
+                .await;
+        }
+
         Ok(ProcessOutcome::Processed)
     }
+
+    /// Queries the on-chain balance of a receipt and reconciles the aggregate.
+    async fn reconcile_receipt(
+        &self,
+        receipt_id: ReceiptId,
+    ) -> Result<(), BackfillError> {
+        let receipt_contract =
+            Receipt::new(self.receipt_contract, &self.provider);
+
+        let on_chain_balance = receipt_contract
+            .balanceOf(self.bot_wallet, receipt_id.inner())
+            .call()
+            .await?;
+
+        self.cqrs
+            .execute(
+                &self.vault.to_string(),
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id,
+                    on_chain_balance: Shares::from(on_chain_balance),
+                },
+            )
+            .await?;
+
+        trace!(target: "receipt", receipt_id = %receipt_id,
+            on_chain_balance = %on_chain_balance,
+            "Receipt balance reconciled"
+        );
+
+        Ok(())
+    }
+}
+
+struct FetchedLogs {
+    discovery_logs: Vec<Log>,
+    reconciliation_receipt_ids: Vec<ReceiptId>,
 }
 
 struct ReceiptDiscovery {
@@ -403,6 +534,94 @@ struct ReceiptDiscovery {
 enum ProcessOutcome {
     Processed,
     ZeroBalance,
+}
+
+/// Called when the receipt backfiller discovers an ITN receipt (a receipt
+/// with a valid `issuer_request_id` in its receiptInformation).
+///
+/// Production implementation triggers mint recovery for the associated mint.
+/// The `tx_hash` is the on-chain transaction that created the receipt,
+/// serving as compiler-enforced evidence that the mint succeeded on-chain.
+#[async_trait]
+pub(crate) trait ItnReceiptHandler: Send + Sync {
+    async fn on_itn_receipt_discovered(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
+    );
+}
+
+#[async_trait]
+impl<T: ItnReceiptHandler + Sync> ItnReceiptHandler for &T {
+    async fn on_itn_receipt_discovered(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: TxHash,
+    ) {
+        (*self).on_itn_receipt_discovered(issuer_request_id, tx_hash).await;
+    }
+}
+
+/// No-op implementation of `ItnReceiptHandler` for contexts where ITN
+/// receipt discovery does not need to trigger any action (e.g., startup
+/// backfill, which runs before recovery handles stuck mints separately).
+pub(crate) struct NoOpItnHandler;
+
+#[async_trait]
+impl ItnReceiptHandler for NoOpItnHandler {
+    async fn on_itn_receipt_discovered(
+        &self,
+        _issuer_request_id: IssuerMintRequestId,
+        _tx_hash: TxHash,
+    ) {
+    }
+}
+
+/// Direction of token transfer relative to the bot wallet.
+///
+/// ERC-1155 TransferSingle/TransferBatch events have indexed `from` (topic2)
+/// and `to` (topic3) fields. Using directional filters reduces RPC payload
+/// by filtering at the node level rather than client-side.
+#[derive(Clone, Copy)]
+pub(crate) enum TransferDirection {
+    /// Tokens received: `to == bot_wallet` (topic3)
+    Inbound,
+    /// Tokens sent: `from == bot_wallet` (topic2)
+    Outbound,
+}
+
+/// Builds a log filter for ERC-1155 TransferSingle events on the given
+/// contract, filtered by indexed topic for the specified direction.
+pub(crate) fn transfer_single_filter(
+    receipt_contract: Address,
+    bot_wallet: Address,
+    direction: TransferDirection,
+) -> Filter {
+    let base = Filter::new()
+        .address(receipt_contract)
+        .event_signature(Receipt::TransferSingle::SIGNATURE_HASH);
+
+    match direction {
+        TransferDirection::Inbound => base.topic3(bot_wallet.into_word()),
+        TransferDirection::Outbound => base.topic2(bot_wallet.into_word()),
+    }
+}
+
+/// Builds a log filter for ERC-1155 TransferBatch events on the given
+/// contract, filtered by indexed topic for the specified direction.
+pub(crate) fn transfer_batch_filter(
+    receipt_contract: Address,
+    bot_wallet: Address,
+    direction: TransferDirection,
+) -> Filter {
+    let base = Filter::new()
+        .address(receipt_contract)
+        .event_signature(Receipt::TransferBatch::SIGNATURE_HASH);
+
+    match direction {
+        TransferDirection::Inbound => base.topic3(bot_wallet.into_word()),
+        TransferDirection::Outbound => base.topic2(bot_wallet.into_word()),
+    }
 }
 
 #[cfg(test)]
@@ -420,7 +639,7 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::ReceiptBackfiller;
+    use super::{NoOpItnHandler, ReceiptBackfiller};
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
@@ -481,11 +700,23 @@ mod tests {
         Arc::new(CqrsFramework::new(MemStore::default(), vec![], ()))
     }
 
-    /// Pushes empty responses for the TransferSingle and TransferBatch
-    /// get_logs calls that the backfiller now makes.
-    fn push_empty_transfer_logs(asserter: &Asserter) {
-        asserter.push_success(&Vec::<Log>::new());
-        asserter.push_success(&Vec::<Log>::new());
+    /// Pushes empty responses for the inbound transfer, withdraw, and
+    /// outbound transfer `get_logs` calls that the backfiller makes beyond
+    /// the Deposit query. Order matches `fetch_logs_for_range`:
+    /// inbound TransferSingle, inbound TransferBatch, Withdraw,
+    /// outbound TransferSingle, outbound TransferBatch.
+    fn push_empty_non_deposit_logs(asserter: &Asserter) {
+        for _ in 0..5 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+    }
+
+    /// Pushes empty responses for the 3 reconciliation queries
+    /// (Withdraw, outbound TransferSingle, outbound TransferBatch).
+    fn push_empty_reconciliation_logs(asserter: &Asserter) {
+        for _ in 0..3 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
     }
 
     fn setup_cqrs_with_store()
@@ -526,7 +757,7 @@ mod tests {
         asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
-        push_empty_transfer_logs(&asserter);
+        push_empty_non_deposit_logs(&asserter);
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -540,6 +771,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -595,7 +827,7 @@ mod tests {
         asserter1.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter1.push_success(&vec![deposit_log.clone()]);
-        push_empty_transfer_logs(&asserter1);
+        push_empty_non_deposit_logs(&asserter1);
         // eth_call (balanceOf)
         asserter1.push_success(&balance.to_be_bytes::<32>());
 
@@ -609,6 +841,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs.clone(),
+            NoOpItnHandler,
         );
 
         let result1 = backfiller1.backfill_receipts(0).await.unwrap();
@@ -621,7 +854,7 @@ mod tests {
         asserter2.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter2.push_success(&vec![deposit_log]);
-        push_empty_transfer_logs(&asserter2);
+        push_empty_non_deposit_logs(&asserter2);
         // eth_call (balanceOf)
         asserter2.push_success(&balance.to_be_bytes::<32>());
 
@@ -635,6 +868,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result2 = backfiller2.backfill_receipts(0).await.unwrap();
@@ -672,7 +906,7 @@ mod tests {
         asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
-        push_empty_transfer_logs(&asserter);
+        push_empty_non_deposit_logs(&asserter);
         // eth_call (balanceOf) - zero because receipt was fully burned
         asserter.push_success(&U256::ZERO.to_be_bytes::<32>());
 
@@ -686,6 +920,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -741,7 +976,7 @@ mod tests {
         asserter.push_success(&U256::from(checkpoint_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
-        push_empty_transfer_logs(&asserter);
+        push_empty_non_deposit_logs(&asserter);
         // eth_call (balanceOf) - returns current balance, not original deposit
         asserter.push_success(&current_balance.to_be_bytes::<32>());
 
@@ -755,6 +990,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -814,7 +1050,7 @@ mod tests {
         asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter) - both deposits returned, filtered client-side
         asserter.push_success(&vec![deposit_for_bot, deposit_for_other]);
-        push_empty_transfer_logs(&asserter);
+        push_empty_non_deposit_logs(&asserter);
         // eth_call (balanceOf) - only called for bot's receipt
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -828,6 +1064,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -866,7 +1103,7 @@ mod tests {
         asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
-        push_empty_transfer_logs(&asserter);
+        push_empty_non_deposit_logs(&asserter);
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -880,6 +1117,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         backfiller.backfill_receipts(0).await.unwrap();
@@ -900,6 +1138,102 @@ mod tests {
                 ]
             ),
             "Expected INFO log for backfill completion"
+        );
+    }
+
+    /// Verifies that `transfer_single_filter` and `transfer_batch_filter`
+    /// bind `bot_wallet` to the correct ERC-1155 indexed topic slot:
+    ///   Inbound  -> topic3 (to)
+    ///   Outbound -> topic2 (from)
+    ///
+    /// A flipped index would silently miss all relevant transfer events
+    /// while still compiling, so this regression test is load-bearing.
+    #[test]
+    fn transfer_filters_use_correct_topic_indices() {
+        use alloy::primitives::address;
+        use alloy::rpc::types::Filter;
+
+        use super::{
+            TransferDirection, transfer_batch_filter, transfer_single_filter,
+        };
+        use crate::bindings::Receipt;
+
+        let receipt_contract =
+            address!("0x1111111111111111111111111111111111111111");
+        let bot_wallet = address!("0x2222222222222222222222222222222222222222");
+        let wallet_word = bot_wallet.into_word();
+
+        let assert_topic_placement =
+            |filter: &Filter, expect_topic2: bool, label: &str| {
+                let topics = &filter.topics;
+
+                if expect_topic2 {
+                    assert!(
+                        topics[2].matches(&wallet_word),
+                        "{label}: expected topic2 to contain bot_wallet"
+                    );
+                    assert!(
+                        topics[3].is_empty(),
+                        "{label}: expected topic3 to be empty"
+                    );
+                } else {
+                    assert!(
+                        topics[2].is_empty(),
+                        "{label}: expected topic2 to be empty"
+                    );
+                    assert!(
+                        topics[3].matches(&wallet_word),
+                        "{label}: expected topic3 to contain bot_wallet"
+                    );
+                }
+
+                assert!(
+                    !topics[0].is_empty(),
+                    "{label}: expected topic0 (event signature) to be set"
+                );
+            };
+
+        let single_in = transfer_single_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Inbound,
+        );
+        assert_topic_placement(&single_in, false, "TransferSingle Inbound");
+
+        let single_out = transfer_single_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Outbound,
+        );
+        assert_topic_placement(&single_out, true, "TransferSingle Outbound");
+
+        let batch_in = transfer_batch_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Inbound,
+        );
+        assert_topic_placement(&batch_in, false, "TransferBatch Inbound");
+
+        let batch_out = transfer_batch_filter(
+            receipt_contract,
+            bot_wallet,
+            TransferDirection::Outbound,
+        );
+        assert_topic_placement(&batch_out, true, "TransferBatch Outbound");
+
+        assert_ne!(
+            single_in.topics[0], batch_in.topics[0],
+            "TransferSingle and TransferBatch should have different signatures"
+        );
+
+        assert!(
+            single_in.topics[0]
+                .matches(&Receipt::TransferSingle::SIGNATURE_HASH),
+            "TransferSingle filter should use TransferSingle signature"
+        );
+        assert!(
+            batch_in.topics[0].matches(&Receipt::TransferBatch::SIGNATURE_HASH),
+            "TransferBatch filter should use TransferBatch signature"
         );
     }
 
@@ -1010,6 +1344,7 @@ mod tests {
         asserter.push_success(&vec![transfer_log]);
         // eth_getLogs (TransferBatch filter) - no batch transfers
         asserter.push_success(&Vec::<Log>::new());
+        push_empty_reconciliation_logs(&asserter);
         // eth_call (balanceOf)
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1023,6 +1358,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -1093,6 +1429,7 @@ mod tests {
         asserter.push_success(&vec![outbound_log, mint_log]);
         // eth_getLogs (TransferBatch filter) - no batch transfers
         asserter.push_success(&Vec::<Log>::new());
+        push_empty_reconciliation_logs(&asserter);
         // No balanceOf calls since both transfers are filtered
 
         let provider = ProviderBuilder::new()
@@ -1105,6 +1442,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -1174,6 +1512,7 @@ mod tests {
         asserter.push_success(&vec![transfer_log]);
         // eth_getLogs (TransferBatch filter)
         asserter.push_success(&Vec::<Log>::new());
+        push_empty_reconciliation_logs(&asserter);
         // eth_call (balanceOf) — only one call since deduplicated
         asserter.push_success(&balance.to_be_bytes::<32>());
 
@@ -1187,6 +1526,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();
@@ -1271,6 +1611,7 @@ mod tests {
         asserter.push_success(&vec![transfer_log]);
         // eth_getLogs (TransferBatch filter) — none
         asserter.push_success(&Vec::<Log>::new());
+        push_empty_reconciliation_logs(&asserter);
         // eth_call (balanceOf) — returns the new higher balance
         asserter.push_success(&new_on_chain_balance.to_be_bytes::<32>());
 
@@ -1284,6 +1625,7 @@ mod tests {
             bot_wallet,
             vault,
             cqrs,
+            NoOpItnHandler,
         );
 
         let result = backfiller.backfill_receipts(0).await.unwrap();

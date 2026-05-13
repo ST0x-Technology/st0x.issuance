@@ -172,8 +172,8 @@ async fn test_inbound_receipt_transfer_discovered_by_monitor()
         .get_receipt()
         .await?;
 
-    // Give monitor time to detect TransferSingle and process
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give poller time to detect TransferSingle and process
+    tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Verify: receipt was discovered in the event store
     let events = receipt_events(&db_url).await;
@@ -288,8 +288,8 @@ async fn test_outbound_receipt_transfer_reconciles_balance()
         .get_receipt()
         .await?;
 
-    // Give monitor time to detect outbound TransferSingle and reconcile
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give poller time to detect outbound TransferSingle and reconcile
+    tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Verify: balance was reconciled (should see BalanceReconciled + Depleted events)
     let events_after = receipt_events(&db_url).await;
@@ -369,8 +369,8 @@ async fn test_mint_transfer_not_double_counted()
     let amount = U256::from(25) * one_share;
     let (receipt_id, shares) = evm.mint_directly(amount, bot_wallet).await?;
 
-    // Give monitor time to process both events
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give poller time to process both events
+    tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Verify: exactly 1 Discovered event (not 2 from double-counting)
     let events = receipt_events(&db_url).await;
@@ -571,8 +571,8 @@ async fn test_burn_transfer_not_double_reconciled()
     // Burn the receipt via withdraw — emits Withdraw AND TransferSingle(to=0x0)
     evm.withdraw_directly(receipt_id, shares, bot_wallet).await?;
 
-    // Give monitor time to process both events
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give poller time to process both events
+    tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Verify: exactly 1 BalanceReconciled and 1 Depleted (from Withdraw handler only)
     let events = receipt_events(&db_url).await;
@@ -694,8 +694,8 @@ async fn test_unrelated_transfer_ignored()
         .get_receipt()
         .await?;
 
-    // Give monitor time to (not) process
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give poller time to (not) process
+    tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Verify: no Discovered events at all (the Deposit was for wallet_a, not bot,
     // and the transfer was between wallet_a and wallet_b, not involving bot)

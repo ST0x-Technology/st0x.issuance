@@ -3,10 +3,10 @@ mod event;
 pub(crate) mod upcaster;
 pub(crate) mod view;
 
-pub(crate) mod backfill;
 pub(crate) mod burn_manager;
-pub(crate) mod detector;
 pub(crate) mod journal_manager;
+pub(crate) mod poll_checkpoint;
+pub(crate) mod poller;
 pub(crate) mod redeem_call_manager;
 #[cfg(test)]
 pub(crate) mod test_utils;

@@ -2,7 +2,6 @@ pub(crate) mod backfill;
 pub(crate) mod burn_tracking;
 mod cmd;
 mod event;
-pub(crate) mod monitor;
 pub(crate) mod reconcile;
 pub(crate) mod view;
 
@@ -20,15 +19,13 @@ use tracing::warn;
 use crate::mint::IssuerMintRequestId;
 use crate::vault::ReceiptInformation;
 use crate::vault::rain_meta;
+pub(crate) use backfill::ItnReceiptHandler;
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
     BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
-pub(crate) use monitor::{
-    ItnReceiptHandler, ReceiptMonitor, ReceiptMonitorConfig,
-};
 pub(crate) use view::ReceiptInventoryView;
 
 /// Receipt data recovered from the inventory for mint recovery.

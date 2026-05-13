@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use cqrs_es::{AggregateContext, EventStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -13,7 +13,6 @@ use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
-use url::Url;
 
 use crate::account::view::replay_account_view;
 use crate::account::{Account, AccountView};
@@ -24,19 +23,18 @@ use crate::mint::{
     recovery::{MintRecoveryHandler, recover_mint},
     replay_mint_view,
 };
-use crate::receipt_inventory::backfill::ReceiptBackfiller;
+use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
 use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
-    ReceiptInventoryView, ReceiptMonitor, ReceiptMonitorConfig,
-    burn_tracking::replay_receipt_burns_view,
+    ReceiptInventoryView, burn_tracking::replay_receipt_burns_view,
 };
 use crate::redemption::{
     Redemption, RedemptionView,
-    backfill::TransferBackfiller,
     burn_manager::BurnManager,
-    detector::{RedemptionDetector, RedemptionDetectorConfig},
     journal_manager::JournalManager,
+    poll_checkpoint::TransferPollCheckpoint,
+    poller::{TransferPoller, TransferPollerConfig},
     redeem_call_manager::RedeemCallManager,
     replay_redemption_view,
     upcaster::create_tokens_burned_upcaster,
@@ -124,8 +122,7 @@ impl std::fmt::Display for Quantity {
 /// Quantities with more decimals must be truncated before sending to Alpaca.
 pub(crate) const ALPACA_MAX_DECIMALS: u32 = 9;
 
-const RECEIPT_BACKFILL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const TRANSFER_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
@@ -329,25 +326,6 @@ pub async fn initialize_rocket(
         );
     }
 
-    let transfer_backfiller = TransferBackfiller {
-        provider: blockchain_setup.http_provider.clone(),
-        bot_wallet,
-        cqrs: redemption_cqrs.clone(),
-        event_store: redemption_event_store.clone(),
-        pool: pool.clone(),
-        redeem_call_manager: managers.redeem_call.clone(),
-        journal_manager: managers.journal.clone(),
-        burn_manager: managers.burn.clone(),
-    };
-
-    spawn_all_receipt_monitors(
-        &config.rpc_url,
-        &vault_configs,
-        &receipt_inventory.cqrs,
-        bot_wallet,
-        &MintRecoveryHandler::new(mint.cqrs.clone()),
-    );
-
     // Recovery runs with a timeout before the HTTP server starts. If it
     // completes within the timeout, there is no race with incoming requests.
     // If it hangs (e.g., Fireblocks call), it is cancelled and stuck
@@ -355,29 +333,51 @@ pub async fn initialize_rocket(
     run_recovery_with_timeout(&pool, &mint.cqrs, &managers).await;
 
     spawn_periodic_receipt_backfills(
-        blockchain_setup.http_provider,
+        blockchain_setup.http_provider.clone(),
         vault_configs.clone(),
         receipt_inventory.cqrs.clone(),
         receipt_inventory.event_store.clone(),
         bot_wallet,
         config.backfill_start_block,
+        MintRecoveryHandler::new(mint.cqrs.clone()),
     );
 
-    spawn_all_transfer_backfills(
-        vault_configs.clone(),
-        transfer_backfiller,
-        config.backfill_start_block,
-    );
+    {
+        let vaults: Vec<Address> =
+            vault_configs.iter().map(|config| config.vault).collect();
 
-    spawn_all_redemption_detectors(
-        &config.rpc_url,
-        &vault_configs,
-        &redemption_cqrs,
-        &redemption_event_store,
-        &pool,
-        &managers,
-        bot_wallet,
-    );
+        info!(
+            target: "redemption",
+            vault_count = vaults.len(),
+            "Spawning transfer poller (eth_getLogs across all vaults)"
+        );
+
+        let checkpoint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let checkpoint_store = Arc::new(PersistedEventStore::new_event_store(
+            SqliteEventRepository::new(pool.clone()),
+        ));
+
+        seed_checkpoint_from_legacy(&pool, &checkpoint_cqrs).await;
+
+        let poller = TransferPoller::new(TransferPollerConfig {
+            provider: blockchain_setup.http_provider,
+            bot_wallet,
+            vaults,
+            backfill_start_block: config.backfill_start_block,
+            cqrs: redemption_cqrs.clone(),
+            event_store: redemption_event_store.clone(),
+            pool: pool.clone(),
+            checkpoint_cqrs,
+            checkpoint_store,
+            redeem_call_manager: managers.redeem_call.clone(),
+            journal_manager: managers.journal.clone(),
+            burn_manager: managers.burn.clone(),
+        });
+
+        tokio::spawn(async move {
+            poller.run().await;
+        });
+    }
 
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
@@ -617,79 +617,6 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
-/// Spawns redemption detectors for ALL enabled vaults.
-fn spawn_all_redemption_detectors(
-    rpc_url: &Url,
-    vault_configs: &[VaultBackfillConfig],
-    redemption_cqrs: &Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: &Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: &Pool<Sqlite>,
-    managers: &RedemptionManagers,
-    bot_wallet: Address,
-) {
-    info!(
-        target: "redemption",
-        vault_count = vault_configs.len(),
-        "Spawning redemption detectors for all vaults"
-    );
-
-    for config in vault_configs {
-        debug!(
-            target: "redemption",
-            vault = %config.vault,
-            bot_wallet = %bot_wallet,
-            "Spawning redemption detector for vault"
-        );
-
-        spawn_redemption_detector(
-            rpc_url.clone(),
-            config.vault,
-            redemption_cqrs.clone(),
-            redemption_event_store.clone(),
-            pool.clone(),
-            RedemptionManagers {
-                redeem_call: managers.redeem_call.clone(),
-                journal: managers.journal.clone(),
-                burn: managers.burn.clone(),
-            },
-            bot_wallet,
-        );
-    }
-}
-
-fn spawn_redemption_detector(
-    rpc_url: Url,
-    vault: Address,
-    redemption_cqrs: Arc<SqliteCqrs<Redemption>>,
-    redemption_event_store: Arc<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    pool: Pool<Sqlite>,
-    managers: RedemptionManagers,
-    bot_wallet: Address,
-) {
-    debug!(target: "redemption", bot_wallet = %bot_wallet, "Spawning WebSocket monitoring task");
-
-    let detector_config =
-        RedemptionDetectorConfig { rpc_url, vault, bot_wallet };
-
-    let detector = RedemptionDetector::new(
-        detector_config,
-        redemption_cqrs,
-        redemption_event_store,
-        pool,
-        managers.redeem_call,
-        managers.journal,
-        managers.burn,
-    );
-
-    tokio::spawn(async move {
-        detector.run().await;
-    });
-}
-
 async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_cqrs: &MintCqrs) {
     info!(target: "mint", "Running mint recovery");
 
@@ -873,6 +800,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         bot_wallet,
         vault,
         receipt_inventory_cqrs.clone(),
+        NoOpItnHandler,
     );
 
     let result = backfiller.backfill_receipts(from_block).await?;
@@ -901,13 +829,17 @@ fn next_receipt_backfill_block(
     })
 }
 
-async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
+async fn run_periodic_receipt_backfill_for_config<
+    P: Provider + Clone,
+    H: ItnReceiptHandler,
+>(
     provider: &P,
     config: VaultBackfillConfig,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
     receipt_inventory_event_store: &ReceiptInventoryEventStore,
     bot_wallet: Address,
     backfill_start_block: u64,
+    handler: &H,
 ) -> Result<(), anyhow::Error> {
     let aggregate_context = receipt_inventory_event_store
         .load_aggregate(&config.vault.to_string())
@@ -932,6 +864,7 @@ async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
         bot_wallet,
         config.vault,
         receipt_inventory_cqrs.clone(),
+        handler,
     );
 
     let result = backfiller.backfill_receipts(from_block).await?;
@@ -941,28 +874,32 @@ async fn run_periodic_receipt_backfill_for_config<P: Provider + Clone>(
         vault = %config.vault,
         processed = result.processed_count,
         skipped_zero_balance = result.skipped_zero_balance,
+        reconciled = result.reconciled_count,
         "Periodic receipt backfill complete for vault"
     );
 
     Ok(())
 }
 
-fn spawn_periodic_receipt_backfills<P>(
+fn spawn_periodic_receipt_backfills<P, H>(
     provider: P,
     vault_configs: Vec<VaultBackfillConfig>,
     receipt_inventory_cqrs: ReceiptInventoryCqrs,
     receipt_inventory_event_store: ReceiptInventoryEventStore,
     bot_wallet: Address,
     backfill_start_block: u64,
+    handler: H,
 ) where
     P: Provider + Clone + Send + Sync + 'static,
+    H: ItnReceiptHandler + 'static,
 {
     tokio::spawn(async move {
-        tokio::time::sleep(RECEIPT_BACKFILL_REFRESH_INTERVAL).await;
-
-        let mut interval =
-            tokio::time::interval(RECEIPT_BACKFILL_REFRESH_INTERVAL);
+        let mut interval = tokio::time::interval(RECEIPT_POLL_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Skip the first tick (fires immediately) — the startup backfill
+        // already ran during initialization, so we wait for the first
+        // real interval before polling again.
+        interval.tick().await;
 
         loop {
             interval.tick().await;
@@ -975,6 +912,7 @@ fn spawn_periodic_receipt_backfills<P>(
                     &receipt_inventory_event_store,
                     bot_wallet,
                     backfill_start_block,
+                    &handler,
                 )
                 .await
                 {
@@ -991,178 +929,72 @@ fn spawn_periodic_receipt_backfills<P>(
     });
 }
 
-/// Runs transfer backfill for all enabled vaults.
+/// Seeds the `TransferPollCheckpoint` aggregate from the legacy per-vault
+/// `redemption_backfill_checkpoints` table. Uses `MIN(last_processed_block)`
+/// across all vaults so the unified poller doesn't skip any blocks on upgrade.
 ///
-/// Scans historic Transfer events to detect redemptions that occurred while the
-/// service was down. A failure for one vault is logged and does not prevent
-/// later vaults from being attempted in the same pass.
-async fn run_all_transfer_backfills<P: Provider + Clone>(
-    vault_configs: &[VaultBackfillConfig],
-    backfiller: &TransferBackfiller<P, SqliteEventStore<Redemption>>,
-    backfill_start_block: u64,
-) -> Result<(), anyhow::Error> {
-    if vault_configs.is_empty() {
-        info!(target: "redemption", "No enabled vaults, skipping transfer backfill");
-        return Ok(());
-    }
+/// This is a one-time migration path: once the aggregate has events, this
+/// function is a no-op.
+async fn seed_checkpoint_from_legacy(
+    pool: &Pool<Sqlite>,
+    checkpoint_cqrs: &SqliteCqrs<TransferPollCheckpoint>,
+) {
+    use crate::redemption::poll_checkpoint::TransferPollCheckpointCommand;
 
-    info!(
-        target: "redemption",
-        vault_count = vault_configs.len(),
-        "Running transfer backfill for all vaults"
-    );
+    let row = sqlx::query_as::<_, (i64,)>(
+        "
+        SELECT MIN(last_processed_block)
+        FROM redemption_backfill_checkpoints
+        HAVING COUNT(*) > 0
+        ",
+    )
+    .fetch_optional(pool)
+    .await;
 
-    let mut failed_count = 0u64;
-
-    for config in vault_configs {
-        let result = match backfiller
-            .backfill_transfers(config.vault, backfill_start_block)
-            .await
-        {
-            Ok(result) => result,
+    let block_number = match row {
+        Ok(Some((block,))) => match u64::try_from(block) {
+            Ok(block_number) => block_number,
             Err(error) => {
-                failed_count += 1;
                 warn!(
                     target: "redemption",
                     error = %error,
-                    vault = %config.vault,
-                    "Transfer backfill failed for vault; continuing with \
-                     remaining vaults"
+                    "Failed to convert legacy checkpoint block number"
                 );
-                continue;
+                return;
             }
-        };
-
-        debug!(
-            target: "redemption",
-            vault = %config.vault,
-            detected = result.detected_count,
-            skipped_mint = result.skipped_mint,
-            skipped_no_account = result.skipped_no_account,
-            "Transfer backfill complete for vault"
-        );
-    }
-
-    if failed_count > 0 {
-        return Err(anyhow::anyhow!(
-            "transfer backfill failed for {failed_count} vault(s)"
-        ));
-    }
-
-    Ok(())
-}
-
-/// Starts transfer backfill in the background so HTTP startup is not blocked by
-/// catch-up scans. Progress is checkpointed per vault by the backfiller.
-fn spawn_all_transfer_backfills<P>(
-    vault_configs: Vec<VaultBackfillConfig>,
-    backfiller: TransferBackfiller<P, SqliteEventStore<Redemption>>,
-    backfill_start_block: u64,
-) where
-    P: Provider + Clone + Send + Sync + 'static,
-{
-    tokio::spawn(async move {
-        loop {
-            match run_all_transfer_backfills(
-                &vault_configs,
-                &backfiller,
-                backfill_start_block,
-            )
-            .await
-            {
-                Ok(()) => return,
-                Err(error) => {
-                    error!(
-                        target: "redemption",
-                        error = %error,
-                        retry_after_secs =
-                            TRANSFER_BACKFILL_RETRY_INTERVAL.as_secs(),
-                        "Transfer backfill pass failed; redemption detector \
-                         remains live and the background task will retry from \
-                         the last checkpoint"
-                    );
-                }
-            }
-
-            tokio::time::sleep(TRANSFER_BACKFILL_RETRY_INTERVAL).await;
+        },
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                target: "redemption",
+                error = %error,
+                "Failed to read legacy backfill checkpoints"
+            );
+            return;
         }
-    });
-}
+    };
 
-/// Spawns one receipt monitor per vault, each with its own WebSocket
-/// connection. This avoids hitting per-connection subscription limits
-/// (each monitor creates 6 subscriptions) regardless of how many assets
-/// are added.
-fn spawn_all_receipt_monitors<ITN>(
-    rpc_url: &Url,
-    vault_configs: &[VaultBackfillConfig],
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    bot_wallet: Address,
-    handler: &ITN,
-) where
-    ITN: ItnReceiptHandler + Clone + 'static,
-{
-    info!(
-        target: "receipt",
-        vault_count = vault_configs.len(),
-        "Spawning receipt monitors (one WSS connection per vault)"
-    );
-
-    for config in vault_configs {
-        debug!(
-            target: "receipt",
-            vault = %config.vault,
-            receipt_contract = %config.receipt_contract,
-            bot_wallet = %bot_wallet,
-            "Spawning receipt monitor for vault"
+    // Advance is idempotent — if the aggregate already has a higher
+    // checkpoint (from a prior seed or normal operation), this is a no-op.
+    if let Err(error) = checkpoint_cqrs
+        .execute(
+            TransferPollCheckpoint::AGGREGATE_ID,
+            TransferPollCheckpointCommand::Advance { block_number },
+        )
+        .await
+    {
+        warn!(
+            target: "redemption",
+            error = %error,
+            block_number,
+            "Failed to seed checkpoint from legacy table"
         );
-
-        let rpc_url = rpc_url.clone();
-        let cqrs = receipt_inventory_cqrs.clone();
-        let handler = handler.clone();
-        let monitor_config = ReceiptMonitorConfig {
-            vault: config.vault,
-            receipt_contract: config.receipt_contract,
-            bot_wallet,
-        };
-
-        tokio::spawn(async move {
-            loop {
-                let provider = match ProviderBuilder::new()
-                    .connect(rpc_url.as_str())
-                    .await
-                {
-                    Ok(provider) => provider,
-                    Err(err) => {
-                        warn!(
-                            target: "receipt",
-                            vault = %monitor_config.vault,
-                            error = %err,
-                            "Failed to connect WSS for receipt monitor, retrying in 5s"
-                        );
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
-
-                let monitor = ReceiptMonitor::new(
-                    provider,
-                    monitor_config,
-                    cqrs.clone(),
-                    handler.clone(),
-                );
-
-                monitor.run().await;
-
-                warn!(
-                    target: "receipt",
-                    vault = %monitor_config.vault,
-                    retry_after_secs = 5,
-                    "Receipt monitor exited; reconnecting after backoff"
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+    } else {
+        info!(
+            target: "redemption",
+            block_number,
+            "Seeded transfer poll checkpoint from legacy backfill table"
+        );
     }
 }
 

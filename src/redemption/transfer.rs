@@ -54,6 +54,22 @@ pub(crate) enum TransferProcessingError {
     NoMatchingAsset { vault: Address },
 }
 
+impl TransferProcessingError {
+    /// Returns `true` for errors that will never succeed on retry (decode
+    /// failures, missing log fields, no matching asset). These should be
+    /// skipped rather than retried to avoid freezing the checkpoint.
+    pub(crate) const fn is_non_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::SolTypes(_)
+                | Self::MissingTxHash
+                | Self::MissingBlockNumber
+                | Self::QuantityConversion(_)
+                | Self::NoMatchingAsset { .. }
+        )
+    }
+}
+
 /// Decodes a Transfer log, looks up account and asset, and executes
 /// `RedemptionCommand::Detect`. Idempotent — returns `AlreadyDetected` on
 /// duplicate.
