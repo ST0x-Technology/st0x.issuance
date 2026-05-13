@@ -1,13 +1,12 @@
-use alloy::primitives::{Address, U256, b256};
+use alloy::primitives::{Address, Bytes, U256, b256};
 use async_trait::async_trait;
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, VaultError, VaultService,
+    ReceiptInformation, SubmittedTx, VaultError, VaultService,
 };
 
 #[cfg(test)]
@@ -28,6 +27,8 @@ enum MockBehavior {
     Success,
     #[cfg(test)]
     Failure,
+    #[cfg(test)]
+    SubmitFailure,
 }
 
 /// Mock blockchain service for testing.
@@ -42,6 +43,10 @@ pub(crate) struct MockVaultService {
     mint_delay_ms: u64,
     call_count: Arc<AtomicUsize>,
     multi_burn_call_count: Arc<AtomicUsize>,
+    /// Cached MintResult from submit_mint for retrieval in confirm_mint.
+    pending_mint_result: Arc<Mutex<Option<MintResult>>>,
+    /// Cached MultiBurnResult from submit_burn for retrieval in confirm_burn.
+    pending_burn_result: Arc<Mutex<Option<MultiBurnResult>>>,
     #[cfg(test)]
     last_call: Arc<Mutex<Option<MintTokensCall>>>,
     #[cfg(test)]
@@ -58,6 +63,8 @@ impl MockVaultService {
             mint_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            pending_mint_result: Arc::new(Mutex::new(None)),
+            pending_burn_result: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             last_call: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -74,6 +81,23 @@ impl MockVaultService {
             mint_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            pending_mint_result: Arc::new(Mutex::new(None)),
+            pending_burn_result: Arc::new(Mutex::new(None)),
+            last_call: Arc::new(Mutex::new(None)),
+            share_balance: Arc::new(Mutex::new(U256::MAX)),
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_submit_failure() -> Self {
+        Self {
+            behavior: MockBehavior::SubmitFailure,
+            mint_delay_ms: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            pending_mint_result: Arc::new(Mutex::new(None)),
+            pending_burn_result: Arc::new(Mutex::new(None)),
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
@@ -112,6 +136,8 @@ impl MockVaultService {
         self.call_count.store(0, Ordering::Relaxed);
         self.multi_burn_call_count.store(0, Ordering::Relaxed);
         *self.last_call.lock().unwrap() = None;
+        *self.pending_mint_result.lock().unwrap() = None;
+        *self.pending_burn_result.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -121,17 +147,28 @@ impl MockVaultService {
     }
 }
 
+const MOCK_MINT_TX_HASH: alloy::primitives::B256 =
+    b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+
+const MOCK_BURN_TX_HASH: alloy::primitives::B256 =
+    b256!("0x4545454545454545454545454545454545454545454545454545454545454545");
+
 #[async_trait]
 impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
-    async fn mint_and_transfer_shares(
+    async fn submit_mint(
         &self,
         vault: Address,
         assets: U256,
         bot: Address,
         _user: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitFailure) {
+            return Err(VaultError::InvalidReceipt);
+        }
+
         if self.mint_delay_ms > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 self.mint_delay_ms,
@@ -151,25 +188,77 @@ impl VaultService for MockVaultService {
             });
         }
 
+        // Pre-compute the MintResult for confirm_mint to return.
+        let receipt_info_bytes = match receipt_info.encode(Some(
+            "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm",
+        )) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(VaultError::ReceiptEncode(err));
+            }
+        };
+
+        *self
+            .pending_mint_result
+            .lock()
+            .expect("pending_mint_result mutex poisoned") = Some(MintResult {
+            tx_hash: MOCK_MINT_TX_HASH,
+            receipt_id: U256::from(1),
+            shares_minted: assets,
+            gas_used: 21000,
+            block_number: 1000,
+            receipt_info_bytes,
+        });
+
+        Ok(SubmittedTx {
+            external_tx_id: "mock-mint".to_string(),
+            fireblocks_tx_id: "mock-fb-mint".to_string(),
+        })
+    }
+
+    async fn confirm_mint(
+        &self,
+        _fireblocks_tx_id: &str,
+    ) -> Result<MintResult, VaultError> {
         match &self.behavior {
             MockBehavior::Success => {
-                let receipt_info_bytes = receipt_info.encode(Some(
-                    "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm",
-                ))?;
+                let result = self
+                    .pending_mint_result
+                    .lock()
+                    .expect("pending_mint_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(|| MintResult {
+                        tx_hash: MOCK_MINT_TX_HASH,
+                        receipt_id: U256::from(1),
+                        shares_minted: U256::ZERO,
+                        gas_used: 21000,
+                        block_number: 1000,
+                        receipt_info_bytes: Bytes::new(),
+                    });
 
-                Ok(MintResult {
-                    tx_hash: b256!(
-                        "0x4242424242424242424242424242424242424242424242424242424242424242"
-                    ),
-                    receipt_id: U256::from(1),
-                    shares_minted: assets,
-                    gas_used: 21000,
-                    block_number: 1000,
-                    receipt_info_bytes,
-                })
+                Ok(result)
             }
             #[cfg(test)]
             MockBehavior::Failure => Err(VaultError::InvalidReceipt),
+            #[cfg(test)]
+            MockBehavior::SubmitFailure => {
+                // SubmitFailure only affects submit_*, not confirm_*.
+                // If confirm is somehow called, return the cached result.
+                let result = self
+                    .pending_mint_result
+                    .lock()
+                    .expect("pending_mint_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(|| MintResult {
+                        tx_hash: MOCK_MINT_TX_HASH,
+                        receipt_id: U256::from(1),
+                        shares_minted: U256::ZERO,
+                        gas_used: 21000,
+                        block_number: 1000,
+                        receipt_info_bytes: Bytes::new(),
+                    });
+                Ok(result)
+            }
         }
     }
 
@@ -188,10 +277,15 @@ impl VaultService for MockVaultService {
         }
     }
 
-    async fn burn_multiple_receipts(
+    async fn submit_burn(
         &self,
         params: MultiBurnParams,
-    ) -> Result<MultiBurnResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitFailure) {
+            return Err(VaultError::InvalidReceipt);
+        }
+
         self.multi_burn_call_count.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
@@ -199,29 +293,74 @@ impl VaultService for MockVaultService {
             *self.last_multi_burn_params.lock().unwrap() = Some(params.clone());
         }
 
+        // Pre-compute the MultiBurnResult for confirm_burn to return.
+        let burns = params
+            .burns
+            .into_iter()
+            .map(|entry| MultiBurnResultEntry {
+                receipt_id: entry.receipt_id,
+                shares_burned: entry.burn_shares,
+            })
+            .collect();
+
+        *self
+            .pending_burn_result
+            .lock()
+            .expect("pending_burn_result mutex poisoned") =
+            Some(MultiBurnResult {
+                tx_hash: MOCK_BURN_TX_HASH,
+                burns,
+                dust_returned: params.dust_shares,
+                gas_used: 50000,
+                block_number: 5000,
+            });
+
+        Ok(SubmittedTx {
+            external_tx_id: "mock-burn".to_string(),
+            fireblocks_tx_id: "mock-fb-burn".to_string(),
+        })
+    }
+
+    async fn confirm_burn(
+        &self,
+        _fireblocks_tx_id: &str,
+        dust_shares: U256,
+    ) -> Result<MultiBurnResult, VaultError> {
         match &self.behavior {
             MockBehavior::Success => {
-                let burns = params
-                    .burns
-                    .into_iter()
-                    .map(|entry| MultiBurnResultEntry {
-                        receipt_id: entry.receipt_id,
-                        shares_burned: entry.burn_shares,
-                    })
-                    .collect();
+                let result = self
+                    .pending_burn_result
+                    .lock()
+                    .expect("pending_burn_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(|| MultiBurnResult {
+                        tx_hash: MOCK_BURN_TX_HASH,
+                        burns: vec![],
+                        dust_returned: dust_shares,
+                        gas_used: 50000,
+                        block_number: 5000,
+                    });
 
-                Ok(MultiBurnResult {
-                    tx_hash: b256!(
-                        "0x4545454545454545454545454545454545454545454545454545454545454545"
-                    ),
-                    burns,
-                    dust_returned: params.dust_shares,
-                    gas_used: 50000,
-                    block_number: 5000,
-                })
+                Ok(result)
             }
             #[cfg(test)]
             MockBehavior::Failure => Err(VaultError::InvalidReceipt),
+            #[cfg(test)]
+            MockBehavior::SubmitFailure => {
+                let result = self
+                    .pending_burn_result
+                    .lock()
+                    .expect("pending_burn_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(|| MultiBurnResult {
+                        tx_hash: MOCK_BURN_TX_HASH,
+                        burns: vec![],
+                        dust_returned: dust_shares,
+                        gas_used: 50000,
+                        block_number: 5000,
+                    });
+                Ok(result)
+            }
         }
     }
 }
@@ -262,7 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_success_returns_mint_result() {
+    async fn test_submit_and_confirm_mint_success() {
         let mock = MockVaultService::new_success();
         let vault = test_vault();
         let assets = U256::from(1000);
@@ -271,26 +410,24 @@ mod tests {
             address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        let result = mock
-            .mint_and_transfer_shares(
-                vault,
-                assets,
-                bot_wallet,
-                user_wallet,
-                receipt_info,
-            )
-            .await;
+        let submitted = mock
+            .submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
+            .await
+            .unwrap();
 
-        assert!(result.is_ok());
-        let mint_result = result.unwrap();
-        assert_eq!(mint_result.receipt_id, U256::from(1));
-        assert_eq!(mint_result.shares_minted, assets);
-        assert_eq!(mint_result.gas_used, 21000);
-        assert_eq!(mint_result.block_number, 1000);
+        assert_eq!(submitted.external_tx_id, "mock-mint");
+
+        let result =
+            mock.confirm_mint(&submitted.fireblocks_tx_id).await.unwrap();
+
+        assert_eq!(result.receipt_id, U256::from(1));
+        assert_eq!(result.shares_minted, assets);
+        assert_eq!(result.gas_used, 21000);
+        assert_eq!(result.block_number, 1000);
     }
 
     #[tokio::test]
-    async fn test_new_failure_returns_error() {
+    async fn test_confirm_mint_failure() {
         let mock = MockVaultService::new_failure();
         let vault = test_vault();
         let assets = U256::from(1000);
@@ -299,18 +436,15 @@ mod tests {
             address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        let result = mock
-            .mint_and_transfer_shares(
-                vault,
-                assets,
-                bot_wallet,
-                user_wallet,
-                receipt_info,
-            )
-            .await;
+        // Submit always succeeds
+        let submitted = mock
+            .submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VaultError::InvalidReceipt));
+        // Confirm returns the failure
+        let result = mock.confirm_mint(&submitted.fireblocks_tx_id).await;
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
     }
 
     #[tokio::test]
@@ -324,7 +458,7 @@ mod tests {
 
         assert_eq!(mock.get_call_count(), 0);
 
-        mock.mint_and_transfer_shares(
+        mock.submit_mint(
             vault,
             assets,
             bot_wallet,
@@ -334,17 +468,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(mock.get_call_count(), 1);
-
-        mock.mint_and_transfer_shares(
-            vault,
-            assets,
-            bot_wallet,
-            user_wallet,
-            test_receipt_info(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(mock.get_call_count(), 2);
     }
 
     #[tokio::test]
@@ -359,7 +482,7 @@ mod tests {
 
         assert!(mock.get_last_call().is_none());
 
-        mock.mint_and_transfer_shares(
+        mock.submit_mint(
             vault,
             assets,
             bot_wallet,
@@ -394,15 +517,9 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let start = tokio::time::Instant::now();
-        mock.mint_and_transfer_shares(
-            vault,
-            assets,
-            bot_wallet,
-            user_wallet,
-            receipt_info,
-        )
-        .await
-        .unwrap();
+        mock.submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() >= u128::from(delay_ms));
@@ -418,7 +535,7 @@ mod tests {
             address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        mock.mint_and_transfer_shares(
+        mock.submit_mint(
             vault,
             assets,
             bot_wallet,
@@ -427,17 +544,8 @@ mod tests {
         )
         .await
         .unwrap();
-        mock.mint_and_transfer_shares(
-            vault,
-            assets,
-            bot_wallet,
-            user_wallet,
-            receipt_info,
-        )
-        .await
-        .unwrap();
 
-        assert_eq!(mock.get_call_count(), 2);
+        assert_eq!(mock.get_call_count(), 1);
         assert!(mock.get_last_call().is_some());
 
         mock.reset();
@@ -447,6 +555,9 @@ mod tests {
     }
 
     fn test_multi_burn_params() -> MultiBurnParams {
+        let detected_tx_hash = b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        );
         MultiBurnParams {
             vault: test_vault(),
             burns: vec![MultiBurnEntry {
@@ -458,10 +569,25 @@ mod tests {
             dust_shares: U256::from(10),
             owner: test_receiver(),
             user: address!("0x2222222222222222222222222222222222222222"),
-            issuer_request_id: IssuerRedemptionRequestId::new(b256!(
-                "0xabababababababababababababababababababababababababababababababab"
-            )),
+            issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
+            detected_tx_hash,
         }
+    }
+
+    #[tokio::test]
+    async fn test_submit_and_confirm_burn_success() {
+        let mock = MockVaultService::new_success();
+        let params = test_multi_burn_params();
+        let dust = params.dust_shares;
+
+        let submitted = mock.submit_burn(params).await.unwrap();
+        assert_eq!(submitted.external_tx_id, "mock-burn");
+
+        let result =
+            mock.confirm_burn(&submitted.fireblocks_tx_id, dust).await.unwrap();
+
+        assert_eq!(result.burns.len(), 1);
+        assert_eq!(result.dust_returned, dust);
     }
 
     #[tokio::test]
@@ -470,10 +596,10 @@ mod tests {
 
         assert_eq!(mock.get_multi_burn_call_count(), 0);
 
-        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        mock.submit_burn(test_multi_burn_params()).await.unwrap();
         assert_eq!(mock.get_multi_burn_call_count(), 1);
 
-        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        mock.submit_burn(test_multi_burn_params()).await.unwrap();
         assert_eq!(mock.get_multi_burn_call_count(), 2);
     }
 
@@ -481,13 +607,43 @@ mod tests {
     async fn test_reset_clears_multi_burn_state() {
         let mock = MockVaultService::new_success();
 
-        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
-        mock.burn_multiple_receipts(test_multi_burn_params()).await.unwrap();
+        mock.submit_burn(test_multi_burn_params()).await.unwrap();
+        mock.submit_burn(test_multi_burn_params()).await.unwrap();
 
         assert_eq!(mock.get_multi_burn_call_count(), 2);
 
         mock.reset();
 
         assert_eq!(mock.get_multi_burn_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_submit_mint_failure() {
+        let mock = MockVaultService::new_submit_failure();
+        let result = mock
+            .submit_mint(
+                test_vault(),
+                U256::from(1000),
+                test_receiver(),
+                address!("0x1111111111111111111111111111111111111111"),
+                test_receipt_info(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(VaultError::InvalidReceipt)),
+            "Expected InvalidReceipt, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_burn_failure() {
+        let mock = MockVaultService::new_submit_failure();
+        let result = mock.submit_burn(test_multi_burn_params()).await;
+
+        assert!(
+            matches!(result, Err(VaultError::InvalidReceipt)),
+            "Expected InvalidReceipt, got {result:?}"
+        );
     }
 }

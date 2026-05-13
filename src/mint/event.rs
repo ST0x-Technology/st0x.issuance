@@ -69,6 +69,16 @@ pub(crate) enum MintEvent {
         closed_at: DateTime<Utc>,
     },
 
+    /// Transaction submitted to the signing backend (Fireblocks or local).
+    /// Persists the backend transaction ID so that polling can resume after
+    /// a restart without resubmitting (which would double-mint).
+    FireblocksSubmitted {
+        issuer_request_id: IssuerMintRequestId,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+        submitted_at: DateTime<Utc>,
+    },
+
     /// Indicates that a mint retry has started during recovery.
     MintRetryStarted {
         issuer_request_id: IssuerMintRequestId,
@@ -105,6 +115,9 @@ impl DomainEvent for MintEvent {
                 "MintEvent::ExistingMintRecovered".to_string()
             }
             Self::MintClosed { .. } => "MintEvent::MintClosed".to_string(),
+            Self::FireblocksSubmitted { .. } => {
+                "MintEvent::FireblocksSubmitted".to_string()
+            }
             Self::MintRetryStarted { .. } => {
                 "MintEvent::MintRetryStarted".to_string()
             }

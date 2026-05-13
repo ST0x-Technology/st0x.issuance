@@ -26,12 +26,31 @@ pub(crate) enum MintCommand {
         reason: String,
     },
 
-    /// Executes the on-chain deposit (minting) operation.
+    /// Records the intent to mint, transitioning from `JournalConfirmed` to
+    /// `Minting` state. Pure state transition — no network call or vault lookup.
     ///
-    /// Calls the vault service to deposit, producing `MintingStarted`
-    /// followed by either `TokensMinted` or `MintingFailed`.
+    /// Produces `MintingStarted`. The actual submission to the signing backend
+    /// is handled by the subsequent `SubmitMint` command.
     Deposit {
         issuer_request_id: IssuerMintRequestId,
+    },
+
+    /// Submits the on-chain deposit (minting) transaction to the signing backend.
+    ///
+    /// Requires `Minting` state (set by prior `Deposit` command). Performs vault
+    /// lookup, builds receipt info, and calls `submit_mint()`. Produces
+    /// `FireblocksSubmitted` on success or `MintingFailed` on failure.
+    SubmitMint {
+        issuer_request_id: IssuerMintRequestId,
+    },
+
+    /// Confirms a previously submitted mint transaction.
+    ///
+    /// Polls the signing backend for the transaction identified by
+    /// `fireblocks_tx_id`, then produces `TokensMinted` or `MintingFailed`.
+    ConfirmMint {
+        issuer_request_id: IssuerMintRequestId,
+        fireblocks_tx_id: String,
     },
 
     /// Sends the callback to Alpaca to confirm mint completion.

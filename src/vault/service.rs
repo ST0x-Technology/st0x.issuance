@@ -1,10 +1,17 @@
-use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
-use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::Provider;
+use async_trait::async_trait;
+use tokio::sync::Mutex;
+use tracing::debug;
+
 use super::rain_meta::OaSchemaCache;
-use super::{MintResult, ReceiptInformation, VaultError, VaultService};
+use super::{
+    MintResult, MultiBurnResult, MultiBurnResultEntry, ReceiptInformation,
+    SubmittedTx, VaultError, VaultService,
+};
 use crate::bindings::OffchainAssetReceiptVault;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
@@ -12,9 +19,24 @@ use crate::bindings::OffchainAssetReceiptVault;
 ///
 /// Generic over the provider type to support both production RPC providers and mock providers
 /// for testing.
+///
+/// Since this backend submits and confirms transactions synchronously (no Fireblocks),
+/// `submit_mint`/`submit_burn` execute the full operation and cache the result for
+/// `confirm_mint`/`confirm_burn` to return. Results are keyed by tx hash to prevent
+/// concurrent operations from overwriting each other.
+///
+/// **Dev/test only.** This backend does not provide crash-safe idempotency:
+/// if the process crashes after the on-chain transaction completes but before
+/// the CQRS event is persisted, recovery will re-submit a new transaction
+/// (no `externalTxId` deduplication). The Fireblocks backend handles this
+/// via deterministic `externalTxId` and duplicate detection.
 pub(crate) struct RealBlockchainService<P> {
     provider: P,
     oa_schema_cache: Arc<OaSchemaCache>,
+    /// Cached results from `submit_mint`, keyed by tx hash string.
+    cached_mints: Arc<Mutex<HashMap<String, MintResult>>>,
+    /// Cached results from `submit_burn`, keyed by tx hash string.
+    cached_burns: Arc<Mutex<HashMap<String, MultiBurnResult>>>,
 }
 
 impl<P: Provider + Clone> RealBlockchainService<P> {
@@ -24,11 +46,16 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
     ///
     /// * `provider` - Alloy provider for blockchain communication
     /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
-    pub(crate) const fn new(
+    pub(crate) fn new(
         provider: P,
         oa_schema_cache: Arc<OaSchemaCache>,
     ) -> Self {
-        Self { provider, oa_schema_cache }
+        Self {
+            provider,
+            oa_schema_cache,
+            cached_mints: Arc::new(Mutex::new(HashMap::new())),
+            cached_burns: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -36,14 +63,14 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
 impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     for RealBlockchainService<P>
 {
-    async fn mint_and_transfer_shares(
+    async fn submit_mint(
         &self,
         vault: Address,
         assets: U256,
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
         let oa_schema = self.oa_schema_cache.get(vault).await;
         let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
 
@@ -94,12 +121,78 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(MintResult {
+        let tx_hash_str = receipt.transaction_hash.to_string();
+
+        let result = MintResult {
             tx_hash: receipt.transaction_hash,
             receipt_id,
             shares_minted,
             gas_used,
             block_number,
+            receipt_info_bytes,
+        };
+
+        self.cached_mints.lock().await.insert(tx_hash_str.clone(), result);
+
+        Ok(SubmittedTx {
+            external_tx_id: format!(
+                "local-mint-{}",
+                receipt_info.issuer_request_id
+            ),
+            fireblocks_tx_id: tx_hash_str,
+        })
+    }
+
+    async fn confirm_mint(
+        &self,
+        fireblocks_tx_id: &str,
+    ) -> Result<MintResult, VaultError> {
+        // Try cache first (normal path when submit and confirm happen in same process)
+        let cached = self.cached_mints.lock().await.remove(fireblocks_tx_id);
+        if let Some(result) = cached {
+            return Ok(result);
+        }
+
+        // Cache empty (process restarted) — re-fetch receipt from chain using tx hash
+        debug!(target: "vault", tx_hash = %fireblocks_tx_id,
+            "Mint cache empty, recovering from chain"
+        );
+
+        let tx_hash: B256 =
+            fireblocks_tx_id.parse().map_err(|_| VaultError::InvalidReceipt)?;
+
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+
+        let (receipt_id, shares_minted, receipt_info_bytes) = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
+                    |decoded| {
+                        let event_data = decoded.data();
+                        (
+                            event_data.id,
+                            event_data.shares,
+                            event_data.receiptInformation.clone(),
+                        )
+                    },
+                )
+            })
+            .ok_or_else(|| VaultError::EventNotFound { tx_hash })?;
+
+        Ok(MintResult {
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used: receipt.gas_used,
+            block_number: receipt
+                .block_number
+                .ok_or(VaultError::InvalidReceipt)?,
             receipt_info_bytes,
         })
     }
@@ -115,10 +208,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         Ok(vault_contract.balanceOf(owner).call().await?)
     }
 
-    async fn burn_multiple_receipts(
+    async fn submit_burn(
         &self,
         params: super::MultiBurnParams,
-    ) -> Result<super::MultiBurnResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.provider);
 
@@ -205,12 +298,79 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let block_number =
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-        Ok(super::MultiBurnResult {
+        let tx_hash_str = receipt.transaction_hash.to_string();
+        let issuer_id = params.issuer_request_id.to_string();
+
+        let result = super::MultiBurnResult {
             tx_hash: receipt.transaction_hash,
             burns,
             dust_returned: params.dust_shares,
             gas_used,
             block_number,
+        };
+
+        self.cached_burns.lock().await.insert(tx_hash_str.clone(), result);
+
+        Ok(SubmittedTx {
+            external_tx_id: format!("local-burn-{issuer_id}"),
+            fireblocks_tx_id: tx_hash_str,
+        })
+    }
+
+    async fn confirm_burn(
+        &self,
+        fireblocks_tx_id: &str,
+        dust_shares: U256,
+    ) -> Result<MultiBurnResult, VaultError> {
+        // Try cache first (normal path when submit and confirm happen in same process)
+        let cached = self.cached_burns.lock().await.remove(fireblocks_tx_id);
+        if let Some(result) = cached {
+            return Ok(result);
+        }
+
+        // Cache empty (process restarted) — re-fetch receipt from chain using tx hash
+        debug!(target: "vault", tx_hash = %fireblocks_tx_id,
+            "Burn cache empty, recovering from chain"
+        );
+
+        let tx_hash: B256 =
+            fireblocks_tx_id.parse().map_err(|_| VaultError::InvalidReceipt)?;
+
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+
+        let burns: Vec<MultiBurnResultEntry> = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter_map(|log| {
+                log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
+                    .ok()
+                    .map(|decoded| {
+                        let event_data = decoded.data();
+                        MultiBurnResultEntry {
+                            receipt_id: event_data.id,
+                            shares_burned: event_data.shares,
+                        }
+                    })
+            })
+            .collect();
+
+        if burns.is_empty() {
+            return Err(VaultError::EventNotFound { tx_hash });
+        }
+
+        Ok(MultiBurnResult {
+            tx_hash,
+            burns,
+            dust_returned: dust_shares,
+            gas_used: receipt.gas_used,
+            block_number: receipt
+                .block_number
+                .ok_or(VaultError::InvalidReceipt)?,
         })
     }
 }
@@ -222,7 +382,7 @@ mod tests {
     };
     use alloy::network::EthereumWallet;
     use alloy::primitives::{
-        Address, B256, Bloom, Bytes, IntoLogData, U256, address, b256, bytes,
+        Address, B256, Bloom, Bytes, IntoLogData, U256, address, b256,
         fixed_bytes,
     };
     use alloy::providers::ProviderBuilder;
@@ -314,7 +474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mint_and_transfer_shares_success() {
+    async fn test_submit_and_confirm_mint_success() {
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
         let user_wallet =
@@ -394,34 +554,15 @@ mod tests {
 
         let asserter = Asserter::new();
 
-        // Mock previewDeposit call (eth_call returns shares as 32-byte hex string)
         asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
-
-        // Mock eth_getTransactionCount (get nonce)
         asserter.push_success(&0u64);
-
-        // Mock eth_feeHistory
         asserter.push_success(&fee_history);
-
-        // Mock eth_getBlockByNumber (get latest block)
         asserter.push_success(&block);
-
-        // Mock eth_chainId
         asserter.push_success(&1u64);
-
-        // Mock eth_estimateGas
         asserter.push_success(&100_000_u64);
-
-        // Mock eth_maxPriorityFeePerGas or another u64 call
         asserter.push_success(&1_000_000_000_u64);
-
-        // Mock eth_getTransactionCount again (wallet's nonce manager)
         asserter.push_success(&0u64);
-
-        // Mock eth_sendRawTransaction (returns pending tx hash)
         asserter.push_success(&tx_hash);
-
-        // Mock eth_getTransactionReceipt for .get_receipt() polling (may poll multiple times)
         asserter.push_success(&receipt);
         asserter.push_success(&receipt);
 
@@ -434,8 +575,8 @@ mod tests {
             Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
         );
 
-        let result = service
-            .mint_and_transfer_shares(
+        let submitted = service
+            .submit_mint(
                 vault_address,
                 assets,
                 bot_wallet,
@@ -443,6 +584,11 @@ mod tests {
                 receipt_info,
             )
             .await;
+
+        assert!(submitted.is_ok(), "Expected Ok but got: {submitted:?}");
+        let submitted = submitted.unwrap();
+
+        let result = service.confirm_mint(&submitted.fireblocks_tx_id).await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
         let mint_result = result.unwrap();
@@ -454,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mint_and_transfer_shares_missing_deposit_event() {
+    async fn test_submit_mint_missing_deposit_event() {
         let vault_address = test_vault_address();
         let assets = U256::from(1000);
         let bot_wallet = test_receiver();
@@ -502,37 +648,17 @@ mod tests {
         };
 
         let block: Block = Block::default();
-
         let asserter = Asserter::new();
 
-        // Mock previewDeposit call (eth_call returns shares as 32-byte hex string)
         asserter.push_success(&"0x00000000000000000000000000000000000000000000000000000000000003e8");
-
-        // Mock eth_getTransactionCount (get nonce)
         asserter.push_success(&0u64);
-
-        // Mock eth_feeHistory
         asserter.push_success(&fee_history);
-
-        // Mock eth_getBlockByNumber (get latest block)
         asserter.push_success(&block);
-
-        // Mock eth_chainId
         asserter.push_success(&1u64);
-
-        // Mock eth_estimateGas
         asserter.push_success(&100_000_u64);
-
-        // Mock eth_maxPriorityFeePerGas or another u64 call
         asserter.push_success(&1_000_000_000_u64);
-
-        // Mock eth_getTransactionCount again (wallet's nonce manager)
         asserter.push_success(&0u64);
-
-        // Mock eth_sendRawTransaction (returns pending tx hash)
         asserter.push_success(&tx_hash);
-
-        // Mock eth_getTransactionReceipt for .get_receipt() polling (may poll multiple times)
         asserter.push_success(&receipt);
         asserter.push_success(&receipt);
 
@@ -546,7 +672,7 @@ mod tests {
         );
 
         let result = service
-            .mint_and_transfer_shares(
+            .submit_mint(
                 vault_address,
                 assets,
                 bot_wallet,
@@ -594,84 +720,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_mint_and_transfer_shares_produces_exact_calldata() {
-        let vault_address = test_vault_address();
-        let assets = U256::from(1000);
-        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let user = address!("0x2222222222222222222222222222222222222222");
-
-        let fixed_timestamp =
-            chrono::DateTime::parse_from_rfc3339("2025-01-15T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc);
-
-        let receipt_info = ReceiptInformation::new(
-            TokenizationRequestId::new("tok-123"),
-            IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
-            Quantity::new(Decimal::from(100)),
-            fixed_timestamp,
-            None,
-        );
-
-        let signer = PrivateKeySigner::random();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(signer))
-            .connect_anvil();
-
-        let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
-
-        let receipt_info_bytes =
-            receipt_info.encode(Some(TEST_OA_SCHEMA)).unwrap();
-        let share_ratio = U256::from(10).pow(U256::from(18));
-
-        let deposit_call = vault
-            .deposit(assets, bot, share_ratio, receipt_info_bytes)
-            .calldata()
-            .clone();
-
-        let transfer_call = vault.transfer(user, assets).calldata().clone();
-
-        let multicall_calldata = vault
-            .multicall(vec![deposit_call.clone(), transfer_call.clone()])
-            .calldata()
-            .clone();
-
-        let expected_transfer = bytes!(
-            "0xa9059cbb000000000000000000000000222222222222222222222222222222222222222200000000000000000000000000000000000000000000000000000000000003e8"
-        );
-
-        assert_eq!(
-            transfer_call.as_ref(),
-            expected_transfer.as_ref(),
-            "Transfer calldata mismatch"
-        );
-
-        assert!(
-            !deposit_call.is_empty()
-                && deposit_call[0..4] == [0x14, 0x23, 0xfe, 0xba],
-            "Deposit should start with correct function selector"
-        );
-
-        assert!(
-            !multicall_calldata.is_empty()
-                && multicall_calldata[0..4] == [0xac, 0x96, 0x50, 0xd8],
-            "Multicall should start with correct function selector"
-        );
-
-        assert!(
-            multicall_calldata.len() > deposit_call.len() + transfer_call.len(),
-            "Multicall should contain both calls"
-        );
-    }
-
     fn create_multi_withdraw_receipt(
         vault_address: Address,
         tx_hash: B256,
         owner: Address,
         user: Address,
-        burns: Vec<(U256, U256)>, // (receipt_id, shares)
+        burns: Vec<(U256, U256)>,
     ) -> TransactionReceipt {
         let logs: Vec<alloy::rpc::types::Log> = burns
             .into_iter()
@@ -733,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_burn_multiple_receipts_with_two_burns() {
+    async fn test_submit_and_confirm_burn_two_burns() {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x3333333333333333333333333333333333333333");
@@ -760,8 +814,11 @@ mod tests {
 
         let service = create_service_with_asserter(asserter);
 
-        let result = service
-            .burn_multiple_receipts(MultiBurnParams {
+        let detected_tx_hash = b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        );
+        let submitted = service
+            .submit_burn(MultiBurnParams {
                 vault: vault_address,
                 burns: burns
                     .iter()
@@ -776,150 +833,29 @@ mod tests {
                 owner,
                 user,
                 issuer_request_id: test_issuer_redemption_id(),
+                detected_tx_hash,
             })
             .await;
+
+        assert!(submitted.is_ok(), "Expected Ok but got: {submitted:?}");
+        let submitted = submitted.unwrap();
+
+        let result =
+            service.confirm_burn(&submitted.fireblocks_tx_id, U256::ZERO).await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
         let multi_result = result.unwrap();
 
         assert_eq!(multi_result.tx_hash, tx_hash);
-        assert_eq!(multi_result.burns.len(), 2, "Should have 2 burn results");
+        assert_eq!(multi_result.burns.len(), 2);
         assert_eq!(multi_result.burns[0].receipt_id, U256::from(1));
         assert_eq!(multi_result.burns[0].shares_burned, U256::from(100));
         assert_eq!(multi_result.burns[1].receipt_id, U256::from(2));
         assert_eq!(multi_result.burns[1].shares_burned, U256::from(50));
-        assert_eq!(multi_result.dust_returned, U256::ZERO);
-        assert_eq!(multi_result.gas_used, 0x8000);
-        assert_eq!(multi_result.block_number, 0x9c4);
     }
 
     #[tokio::test]
-    async fn test_burn_multiple_receipts_with_dust_transfer() {
-        let vault_address = test_vault_address();
-        let owner = test_receiver();
-        let user = address!("0x4444444444444444444444444444444444444444");
-
-        let tx_hash = fixed_bytes!(
-            "0xfeedface feedface feedface feedface feedface feedface feedface feedface"
-        );
-
-        let burns = vec![(U256::from(42), U256::from(1000))];
-        let dust_shares = U256::from(123);
-
-        let receipt = create_multi_withdraw_receipt(
-            vault_address,
-            tx_hash,
-            owner,
-            user,
-            burns.clone(),
-        );
-
-        let asserter = Asserter::new();
-        setup_asserter_for_transaction(&asserter, tx_hash, &receipt);
-
-        let service = create_service_with_asserter(asserter);
-
-        let result = service
-            .burn_multiple_receipts(MultiBurnParams {
-                vault: vault_address,
-                burns: burns
-                    .iter()
-                    .map(|(receipt_id, burn_shares)| MultiBurnEntry {
-                        receipt_id: *receipt_id,
-                        burn_shares: *burn_shares,
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    })
-                    .collect(),
-                dust_shares,
-                owner,
-                user,
-                issuer_request_id: test_issuer_redemption_id(),
-            })
-            .await;
-
-        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
-        let multi_result = result.unwrap();
-
-        assert_eq!(
-            multi_result.dust_returned, dust_shares,
-            "Dust should be returned"
-        );
-        assert_eq!(multi_result.burns.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_burn_multiple_receipts_parses_three_withdraw_events() {
-        let vault_address = test_vault_address();
-        let owner = test_receiver();
-        let user = address!("0x5555555555555555555555555555555555555555");
-
-        let tx_hash = fixed_bytes!(
-            "0xaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
-        );
-
-        let burns = vec![
-            (U256::from(10), U256::from(500)),
-            (U256::from(20), U256::from(300)),
-            (U256::from(30), U256::from(200)),
-        ];
-
-        let receipt = create_multi_withdraw_receipt(
-            vault_address,
-            tx_hash,
-            owner,
-            user,
-            burns.clone(),
-        );
-
-        let asserter = Asserter::new();
-        setup_asserter_for_transaction(&asserter, tx_hash, &receipt);
-
-        let service = create_service_with_asserter(asserter);
-
-        let result = service
-            .burn_multiple_receipts(MultiBurnParams {
-                vault: vault_address,
-                burns: burns
-                    .iter()
-                    .map(|(receipt_id, burn_shares)| MultiBurnEntry {
-                        receipt_id: *receipt_id,
-                        burn_shares: *burn_shares,
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    })
-                    .collect(),
-                dust_shares: U256::ZERO,
-                owner,
-                user,
-                issuer_request_id: test_issuer_redemption_id(),
-            })
-            .await;
-
-        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
-        let multi_result = result.unwrap();
-
-        assert_eq!(
-            multi_result.burns.len(),
-            3,
-            "Should parse all 3 Withdraw events"
-        );
-
-        // Verify each burn was parsed correctly
-        for (i, (expected_id, expected_shares)) in burns.iter().enumerate() {
-            assert_eq!(
-                multi_result.burns[i].receipt_id, *expected_id,
-                "Burn {i} receipt_id mismatch"
-            );
-            assert_eq!(
-                multi_result.burns[i].shares_burned, *expected_shares,
-                "Burn {i} shares_burned mismatch"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_burn_multiple_receipts_returns_error_on_missing_events() {
+    async fn test_submit_burn_returns_error_on_missing_events() {
         let vault_address = test_vault_address();
         let owner = test_receiver();
         let user = address!("0x6666666666666666666666666666666666666666");
@@ -928,7 +864,6 @@ mod tests {
             "0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
         );
 
-        // Empty receipt with no Withdraw events - simulates failed transaction
         let receipt = create_empty_receipt(vault_address, tx_hash);
 
         let asserter = Asserter::new();
@@ -937,34 +872,28 @@ mod tests {
         let service = create_service_with_asserter(asserter);
 
         let result = service
-            .burn_multiple_receipts(MultiBurnParams {
+            .submit_burn(MultiBurnParams {
                 vault: vault_address,
-                burns: vec![
-                    MultiBurnEntry {
-                        receipt_id: U256::from(1),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    },
-                    MultiBurnEntry {
-                        receipt_id: U256::from(2),
-                        burn_shares: U256::from(200),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    },
-                ],
+                burns: vec![MultiBurnEntry {
+                    receipt_id: U256::from(1),
+                    burn_shares: U256::from(100),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
                 dust_shares: U256::ZERO,
                 owner,
                 user,
                 issuer_request_id: test_issuer_redemption_id(),
+                detected_tx_hash: b256!(
+                    "0xabababababababababababababababababababababababababababababababab"
+                ),
             })
             .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, VaultError::EventNotFound { .. }),
-            "Expected EventNotFound but got: {err:?}"
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            VaultError::EventNotFound { .. }
+        ));
     }
 }

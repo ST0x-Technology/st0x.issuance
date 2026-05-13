@@ -11,7 +11,7 @@ use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 ///
 /// Each burn targets a specific ERC-1155 receipt and burns a portion
 /// (or all) of the shares associated with that receipt.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BurnRecord {
     /// The ERC-1155 receipt ID that was burned from
     pub(crate) receipt_id: U256,
@@ -101,6 +101,17 @@ pub(crate) enum RedemptionEvent {
         previous_state: String,
         reprocessed_at: DateTime<Utc>,
     },
+    /// Burn transaction submitted to the signing backend.
+    /// Persists the backend transaction ID so polling can resume after a restart.
+    BurnFireblocksSubmitted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+        /// Planned burns at the time of submission (for recovery use).
+        planned_burns: Vec<BurnRecord>,
+        submitted_at: DateTime<Utc>,
+    },
+
     /// Existing on-chain burn discovered during recovery via Fireblocks tx lookup.
     /// Mirrors mint's `ExistingMintRecovered` — the burn already landed on-chain
     /// but the bot failed to record it (e.g., Fireblocks polling timeout).
@@ -170,6 +181,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnResumed { .. } => {
                 "RedemptionEvent::BurnResumed".to_string()
+            }
+            Self::BurnFireblocksSubmitted { .. } => {
+                "RedemptionEvent::BurnFireblocksSubmitted".to_string()
             }
             Self::ExistingBurnRecovered { .. } => {
                 "RedemptionEvent::ExistingBurnRecovered".to_string()

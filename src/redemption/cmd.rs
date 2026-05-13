@@ -37,8 +37,8 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     },
-    /// Burns tokens on-chain from one or more receipts, returns dust to user.
-    /// Uses multicall to atomically execute all burns in a single transaction.
+    /// Submits burn transaction to the signing backend.
+    /// Produces `BurnFireblocksSubmitted` on success, or the caller records failure.
     BurnTokens {
         issuer_request_id: IssuerRedemptionRequestId,
         vault: Address,
@@ -48,6 +48,14 @@ pub(crate) enum RedemptionCommand {
         dust_shares: U256,
         owner: Address,
     },
+
+    /// Confirms a previously submitted burn transaction.
+    /// Polls the signing backend and produces `TokensBurned` or error.
+    ConfirmBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        fireblocks_tx_id: String,
+        dust_shares: U256,
+    },
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
@@ -55,19 +63,6 @@ pub(crate) enum RedemptionCommand {
         fireblocks_tx_id: Option<String>,
         /// Planned burns at the time of failure.
         planned_burns: Vec<super::BurnRecord>,
-    },
-    /// Retries a failed burn operation.
-    /// Only valid from Failed state after a BurningFailed event.
-    RetryBurn {
-        issuer_request_id: IssuerRedemptionRequestId,
-        vault: Address,
-        /// Burns to execute (receipt_id + amount for each)
-        burns: Vec<MultiBurnEntry>,
-        /// Dust to return to user
-        dust_shares: U256,
-        owner: Address,
-        /// Wallet to return dust to (from view metadata)
-        user_wallet: Address,
     },
     /// Resets a failed redemption back to Detected state for reprocessing.
     /// Only valid from `Failed` state — post-Alpaca states have dedicated

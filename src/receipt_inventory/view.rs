@@ -118,7 +118,8 @@ impl View<Mint> for ReceiptInventoryView {
             | MintEvent::MintCompleted { .. }
             | MintEvent::ExistingMintRecovered { .. }
             | MintEvent::MintRetryStarted { .. }
-            | MintEvent::MintClosed { .. } => {}
+            | MintEvent::MintClosed { .. }
+            | MintEvent::FireblocksSubmitted { .. } => {}
         }
     }
 }

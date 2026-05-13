@@ -145,6 +145,18 @@ pub(crate) enum Redemption {
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
     },
+    /// Burn transaction submitted to signing backend, awaiting on-chain confirmation.
+    BurnSubmitted {
+        metadata: RedemptionMetadata,
+        tokenization_request_id: TokenizationRequestId,
+        alpaca_quantity: Quantity,
+        dust_quantity: Quantity,
+        called_at: DateTime<Utc>,
+        alpaca_journal_completed_at: DateTime<Utc>,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+        planned_burns: Vec<event::BurnRecord>,
+    },
     Completed {
         issuer_request_id: IssuerRedemptionRequestId,
         burn_tx_hash: B256,
@@ -204,17 +216,21 @@ impl Redemption {
         match self {
             Self::Detected { metadata }
             | Self::AlpacaCalled { metadata, .. }
-            | Self::Burning { metadata, .. } => Some(metadata),
+            | Self::Burning { metadata, .. }
+            | Self::BurnSubmitted { metadata, .. } => Some(metadata),
             _ => None,
         }
     }
 
     /// Returns the quantity sent to Alpaca (truncated to 9 decimals).
-    /// Only available in AlpacaCalled and Burning states.
+    /// Only available in AlpacaCalled, Burning, and BurnSubmitted states.
     pub(crate) const fn alpaca_quantity(&self) -> Option<&Quantity> {
         match self {
             Self::AlpacaCalled { alpaca_quantity, .. }
-            | Self::Burning { alpaca_quantity, .. } => Some(alpaca_quantity),
+            | Self::Burning { alpaca_quantity, .. }
+            | Self::BurnSubmitted { alpaca_quantity, .. } => {
+                Some(alpaca_quantity)
+            }
             _ => None,
         }
     }
@@ -225,6 +241,7 @@ impl Redemption {
             Self::Detected { .. } => "Detected",
             Self::AlpacaCalled { .. } => "AlpacaCalled",
             Self::Burning { .. } => "Burning",
+            Self::BurnSubmitted { .. } => "BurnSubmitted",
             Self::Completed { .. } => "Completed",
             Self::Failed { .. } => "Failed",
             Self::Closed { .. } => "Closed",
@@ -305,6 +322,7 @@ impl Redemption {
             Self::Detected { .. }
                 | Self::AlpacaCalled { .. }
                 | Self::Burning { .. }
+                | Self::BurnSubmitted { .. }
                 | Self::Failed { .. }
         ) {
             return Err(RedemptionError::InvalidState {
@@ -321,6 +339,8 @@ impl Redemption {
         }])
     }
 
+    /// Submits the burn transaction to the signing backend.
+    /// Produces `BurnFireblocksSubmitted` on success; failure is propagated to caller.
     async fn handle_burn_tokens(
         &self,
         services: &Arc<dyn VaultService>,
@@ -336,16 +356,61 @@ impl Redemption {
 
         let user_wallet = metadata.wallet;
 
-        let result = services
-            .burn_multiple_receipts(MultiBurnParams {
+        let planned_burns: Vec<BurnRecord> = input
+            .burns
+            .iter()
+            .map(|entry| BurnRecord {
+                receipt_id: entry.receipt_id,
+                shares_burned: entry.burn_shares,
+            })
+            .collect();
+
+        let submitted = services
+            .submit_burn(MultiBurnParams {
                 vault: input.vault,
                 burns: input.burns,
                 dust_shares: input.dust_shares,
                 owner: input.owner,
                 user: user_wallet,
                 issuer_request_id: issuer_request_id.clone(),
+                detected_tx_hash: metadata.detected_tx_hash,
             })
             .await?;
+
+        Ok(vec![RedemptionEvent::BurnFireblocksSubmitted {
+            issuer_request_id,
+            external_tx_id: submitted.external_tx_id,
+            fireblocks_tx_id: submitted.fireblocks_tx_id,
+            planned_burns,
+            submitted_at: Utc::now(),
+        }])
+    }
+
+    /// Confirms a previously submitted burn transaction.
+    async fn handle_confirm_burn(
+        &self,
+        services: &Arc<dyn VaultService>,
+        issuer_request_id: IssuerRedemptionRequestId,
+        fireblocks_tx_id: String,
+        dust_shares: U256,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let Self::BurnSubmitted { fireblocks_tx_id: stored_tx_id, .. } = self
+        else {
+            return Err(RedemptionError::InvalidState {
+                expected: "BurnSubmitted".to_string(),
+                found: self.state_name().to_string(),
+            });
+        };
+
+        if *stored_tx_id != fireblocks_tx_id {
+            return Err(RedemptionError::FireblocksTxIdMismatch {
+                expected: stored_tx_id.clone(),
+                provided: fireblocks_tx_id,
+            });
+        }
+
+        let result =
+            services.confirm_burn(&fireblocks_tx_id, dust_shares).await?;
 
         let burns = result
             .burns
@@ -374,9 +439,9 @@ impl Redemption {
         fireblocks_tx_id: Option<String>,
         planned_burns: Vec<BurnRecord>,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if !matches!(self, Self::Burning { .. }) {
+        if !matches!(self, Self::Burning { .. } | Self::BurnSubmitted { .. }) {
             return Err(RedemptionError::InvalidState {
-                expected: "Burning".to_string(),
+                expected: "Burning or BurnSubmitted".to_string(),
                 found: self.state_name().to_string(),
             });
         }
@@ -387,51 +452,6 @@ impl Redemption {
             failed_at: Utc::now(),
             fireblocks_tx_id,
             planned_burns,
-        }])
-    }
-
-    async fn handle_retry_burn(
-        &self,
-        services: &Arc<dyn VaultService>,
-        issuer_request_id: IssuerRedemptionRequestId,
-        input: BurnInput,
-        user_wallet: Address,
-    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        if !matches!(self, Self::Failed { .. }) {
-            return Err(RedemptionError::InvalidState {
-                expected: "Failed".to_string(),
-                found: self.state_name().to_string(),
-            });
-        }
-
-        let result = services
-            .burn_multiple_receipts(MultiBurnParams {
-                vault: input.vault,
-                burns: input.burns,
-                dust_shares: input.dust_shares,
-                owner: input.owner,
-                user: user_wallet,
-                issuer_request_id: issuer_request_id.clone(),
-            })
-            .await?;
-
-        let burns = result
-            .burns
-            .into_iter()
-            .map(|b| BurnRecord {
-                receipt_id: b.receipt_id,
-                shares_burned: b.shares_burned,
-            })
-            .collect();
-
-        Ok(vec![RedemptionEvent::TokensBurned {
-            issuer_request_id,
-            tx_hash: result.tx_hash,
-            burns,
-            dust_returned: result.dust_returned,
-            gas_used: result.gas_used,
-            block_number: result.block_number,
-            burned_at: Utc::now(),
         }])
     }
 
@@ -650,6 +670,10 @@ pub(crate) enum RedemptionError {
     AlreadyCompleted { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
+    #[error(
+        "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
+    )]
+    FireblocksTxIdMismatch { expected: String, provided: String },
 }
 
 impl PartialEq for RedemptionError {
@@ -668,6 +692,10 @@ impl PartialEq for RedemptionError {
                 Self::InvalidState { expected: e2, found: f2 },
             ) => e1 == e2 && f1 == f2,
             (Self::Vault(a), Self::Vault(b)) => a.to_string() == b.to_string(),
+            (
+                Self::FireblocksTxIdMismatch { expected: e1, provided: p1 },
+                Self::FireblocksTxIdMismatch { expected: e2, provided: p2 },
+            ) => e1 == e2 && p1 == p2,
             _ => false,
         }
     }
@@ -742,6 +770,19 @@ impl Aggregate for Redemption {
                 )
                 .await
             }
+            RedemptionCommand::ConfirmBurn {
+                issuer_request_id,
+                fireblocks_tx_id,
+                dust_shares,
+            } => {
+                self.handle_confirm_burn(
+                    services,
+                    issuer_request_id,
+                    fireblocks_tx_id,
+                    dust_shares,
+                )
+                .await
+            }
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error,
@@ -753,22 +794,6 @@ impl Aggregate for Redemption {
                 fireblocks_tx_id,
                 planned_burns,
             ),
-            RedemptionCommand::RetryBurn {
-                issuer_request_id,
-                vault,
-                burns,
-                dust_shares,
-                owner,
-                user_wallet,
-            } => {
-                self.handle_retry_burn(
-                    services,
-                    issuer_request_id,
-                    BurnInput { vault, burns, dust_shares, owner },
-                    user_wallet,
-                )
-                .await
-            }
             RedemptionCommand::RecordExistingBurn {
                 issuer_request_id,
                 fireblocks_tx_id,
@@ -890,6 +915,37 @@ impl Aggregate for Redemption {
                     &issuer_request_id,
                     alpaca_journal_completed_at,
                 );
+            }
+            RedemptionEvent::BurnFireblocksSubmitted {
+                issuer_request_id: _,
+                external_tx_id,
+                fireblocks_tx_id,
+                planned_burns,
+                submitted_at: _,
+            } => {
+                let Self::Burning {
+                    metadata,
+                    tokenization_request_id,
+                    alpaca_quantity,
+                    dust_quantity,
+                    called_at,
+                    alpaca_journal_completed_at,
+                } = self.clone()
+                else {
+                    return;
+                };
+
+                *self = Self::BurnSubmitted {
+                    metadata,
+                    tokenization_request_id,
+                    alpaca_quantity,
+                    dust_quantity,
+                    called_at,
+                    alpaca_journal_completed_at,
+                    external_tx_id,
+                    fireblocks_tx_id,
+                    planned_burns,
+                };
             }
             RedemptionEvent::BurnResumed {
                 issuer_request_id,
@@ -1478,21 +1534,22 @@ mod tests {
         let events = validator.inspect_result().unwrap();
         assert_eq!(events.len(), 1);
 
-        let RedemptionEvent::TokensBurned {
+        let RedemptionEvent::BurnFireblocksSubmitted {
             issuer_request_id: event_id,
-            burns,
-            burned_at,
+            planned_burns,
             ..
         } = &events[0]
         else {
-            panic!("Expected TokensBurned event, got {:?}", &events[0]);
+            panic!(
+                "Expected BurnFireblocksSubmitted event, got {:?}",
+                &events[0]
+            );
         };
 
         assert_eq!(event_id, &issuer_request_id);
-        assert_eq!(burns.len(), 1);
-        assert_eq!(burns[0].receipt_id, receipt_id);
-        assert_eq!(burns[0].shares_burned, burn_shares);
-        assert!(burned_at.timestamp() > 0);
+        assert_eq!(planned_burns.len(), 1);
+        assert_eq!(planned_burns[0].receipt_id, receipt_id);
+        assert_eq!(planned_burns[0].shares_burned, burn_shares);
     }
 
     #[test]
@@ -1603,7 +1660,7 @@ mod tests {
                 planned_burns: vec![],
             })
             .then_expect_error(RedemptionError::InvalidState {
-                expected: "Burning".to_string(),
+                expected: "Burning or BurnSubmitted".to_string(),
                 found: "Uninitialized".to_string(),
             });
     }

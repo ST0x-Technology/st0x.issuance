@@ -23,7 +23,7 @@ use crate::receipt_inventory::{
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{MintResult, ReceiptInformation, VaultService};
+use crate::vault::{ReceiptInformation, VaultService};
 
 pub use api::MintResponse;
 
@@ -139,6 +139,24 @@ pub(crate) enum Mint {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
     },
+    /// Transaction submitted to signing backend, awaiting on-chain confirmation.
+    /// The `fireblocks_tx_id` enables recovery: on restart, the bot resumes
+    /// polling this transaction instead of resubmitting (which would double-mint).
+    FireblocksSubmitted {
+        issuer_request_id: IssuerMintRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        minting_started_at: DateTime<Utc>,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+    },
     CallbackPending {
         issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -207,6 +225,18 @@ impl Default for Mint {
     }
 }
 
+/// Groups mint submission parameters to keep `execute_mint_submission` under
+/// the clippy argument limit.
+struct MintSubmissionInput<'a> {
+    issuer_request_id: IssuerMintRequestId,
+    tokenization_request_id: &'a TokenizationRequestId,
+    quantity: &'a Quantity,
+    underlying: &'a UnderlyingSymbol,
+    wallet: Address,
+    journal_confirmed_at: DateTime<Utc>,
+    receipt_note: Option<&'a str>,
+}
+
 impl Mint {
     const fn state_name(&self) -> &'static str {
         match self {
@@ -215,6 +245,7 @@ impl Mint {
             Self::JournalConfirmed { .. } => "JournalConfirmed",
             Self::JournalRejected { .. } => "JournalRejected",
             Self::Minting { .. } => "Minting",
+            Self::FireblocksSubmitted { .. } => "FireblocksSubmitted",
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
             Self::Completed { .. } => "Completed",
@@ -241,6 +272,7 @@ impl Mint {
             | Self::JournalConfirmed { tokenization_request_id, .. }
             | Self::JournalRejected { tokenization_request_id, .. }
             | Self::Minting { tokenization_request_id, .. }
+            | Self::FireblocksSubmitted { tokenization_request_id, .. }
             | Self::CallbackPending { tokenization_request_id, .. }
             | Self::MintingFailed { tokenization_request_id, .. }
             | Self::Completed { tokenization_request_id, .. } => {
@@ -307,12 +339,36 @@ impl Mint {
         Ok(())
     }
 
-    async fn handle_deposit(
+    /// Records the intent to mint by transitioning from `JournalConfirmed`
+    /// to `Minting` state. Pure state transition — no network call.
+    fn handle_deposit(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let Self::JournalConfirmed { issuer_request_id: expected_id, .. } =
+            self
+        else {
+            return Err(MintError::NotInJournalConfirmedState {
+                current_state: self.state_name().to_string(),
+            });
+        };
+
+        Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
+
+        Ok(vec![MintEvent::MintingStarted {
+            issuer_request_id,
+            started_at: Utc::now(),
+        }])
+    }
+
+    /// Submits the on-chain mint transaction to the signing backend.
+    /// Requires `Minting` state (set by prior `Deposit` command).
+    async fn handle_submit_mint(
         &self,
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
     ) -> Result<Vec<MintEvent>, MintError> {
-        let Self::JournalConfirmed {
+        let Self::Minting {
             issuer_request_id: expected_id,
             tokenization_request_id,
             quantity,
@@ -322,13 +378,45 @@ impl Mint {
             ..
         } = self
         else {
-            return Err(MintError::NotInJournalConfirmedState {
+            return Err(MintError::NotInMintingState {
                 current_state: self.state_name().to_string(),
             });
         };
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
+        let event = Self::execute_mint_submission(
+            services,
+            MintSubmissionInput {
+                issuer_request_id,
+                tokenization_request_id,
+                quantity,
+                underlying,
+                wallet: *wallet,
+                journal_confirmed_at: *journal_confirmed_at,
+                receipt_note: None,
+            },
+        )
+        .await?;
+
+        Ok(vec![event])
+    }
+
+    /// Shared submission logic: vault lookup, receipt info, submit_mint call.
+    /// Returns a single `FireblocksSubmitted` or `MintingFailed` event.
+    async fn execute_mint_submission(
+        services: &MintServices,
+        input: MintSubmissionInput<'_>,
+    ) -> Result<MintEvent, MintError> {
+        let MintSubmissionInput {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            wallet,
+            journal_confirmed_at,
+            receipt_note,
+        } = input;
         let vault = find_vault_by_underlying(&services.pool, underlying)
             .await?
             .ok_or_else(|| MintError::AssetNotFound {
@@ -342,111 +430,178 @@ impl Mint {
             issuer_request_id.clone(),
             underlying.clone(),
             quantity.clone(),
-            *journal_confirmed_at,
-            None,
+            journal_confirmed_at,
+            receipt_note.map(String::from),
         );
 
         let now = Utc::now();
 
         match services
             .vault
-            .mint_and_transfer_shares(
-                vault,
-                assets,
-                services.bot,
-                *wallet,
-                receipt_info.clone(),
-            )
+            .submit_mint(vault, assets, services.bot, wallet, receipt_info)
             .await
         {
-            Ok(result) => {
-                Self::on_deposit_success(
-                    services,
-                    vault,
-                    &issuer_request_id,
-                    &result,
-                    receipt_info,
-                    now,
-                )
-                .await
+            Ok(submitted) => {
+                info!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    external_tx_id = %submitted.external_tx_id,
+                    fireblocks_tx_id = %submitted.fireblocks_tx_id,
+                    "Mint transaction submitted to signing backend"
+                );
+
+                Ok(MintEvent::FireblocksSubmitted {
+                    issuer_request_id,
+                    external_tx_id: submitted.external_tx_id,
+                    fireblocks_tx_id: submitted.fireblocks_tx_id,
+                    submitted_at: now,
+                })
             }
             Err(err) => {
                 warn!(
                     target: "mint",
                     issuer_request_id = %issuer_request_id,
                     error = %err,
-                    "On-chain deposit failed"
+                    "Mint submission failed"
                 );
 
-                Ok(vec![
-                    MintEvent::MintingStarted {
-                        issuer_request_id: issuer_request_id.clone(),
-                        started_at: now,
-                    },
-                    MintEvent::MintingFailed {
-                        issuer_request_id,
-                        error: err.to_string(),
-                        failed_at: now,
-                    },
-                ])
+                Ok(MintEvent::MintingFailed {
+                    issuer_request_id,
+                    error: err.to_string(),
+                    failed_at: now,
+                })
             }
         }
     }
 
-    async fn on_deposit_success(
+    /// Confirms a previously submitted mint transaction by polling the backend.
+    /// Produces `TokensMinted` on success, or `MintingFailed` on failure.
+    async fn handle_confirm_mint(
+        &self,
         services: &MintServices,
-        vault: Address,
-        issuer_request_id: &IssuerMintRequestId,
-        result: &MintResult,
-        receipt_info: ReceiptInformation,
-        now: DateTime<Utc>,
+        issuer_request_id: IssuerMintRequestId,
+        fireblocks_tx_id: String,
     ) -> Result<Vec<MintEvent>, MintError> {
-        info!(
-            target: "mint",
-            issuer_request_id = %issuer_request_id,
-            tx_hash = %result.tx_hash,
-            receipt_id = %result.receipt_id,
-            shares_minted = %result.shares_minted,
-            "On-chain deposit succeeded"
-        );
+        let Self::FireblocksSubmitted {
+            issuer_request_id: expected_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            journal_confirmed_at,
+            fireblocks_tx_id: stored_tx_id,
+            ..
+        } = self
+        else {
+            return Err(MintError::NotInFireblocksSubmittedState {
+                current_state: self.state_name().to_string(),
+            });
+        };
 
-        if let Err(err) = services
-            .receipts
-            .register_minted_receipt(MintedReceiptParams {
-                vault,
-                receipt_id: ReceiptId::from(result.receipt_id),
-                shares: Shares::from(result.shares_minted),
-                block_number: result.block_number,
-                tx_hash: result.tx_hash,
-                receipt_info,
-                receipt_info_bytes: result.receipt_info_bytes.clone(),
-            })
-            .await
-        {
-            warn!(
-                target: "mint",
-                issuer_request_id = %issuer_request_id,
-                error = %err,
-                "Failed to register minted receipt \
-                 (monitor/backfill will discover it)"
-            );
+        Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
+
+        if *stored_tx_id != fireblocks_tx_id {
+            return Err(MintError::FireblocksTxIdMismatch {
+                expected: stored_tx_id.clone(),
+                provided: fireblocks_tx_id,
+            });
         }
 
-        Ok(vec![
-            MintEvent::MintingStarted {
-                issuer_request_id: issuer_request_id.clone(),
-                started_at: now,
-            },
-            MintEvent::TokensMinted {
-                issuer_request_id: issuer_request_id.clone(),
-                tx_hash: result.tx_hash,
-                receipt_id: result.receipt_id,
-                shares_minted: result.shares_minted,
-                gas_used: result.gas_used,
-                block_number: result.block_number,
-                minted_at: now,
-            },
-        ])
+        let now = Utc::now();
+
+        match services.vault.confirm_mint(&fireblocks_tx_id).await {
+            Ok(result) => {
+                info!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %result.tx_hash,
+                    receipt_id = %result.receipt_id,
+                    shares_minted = %result.shares_minted,
+                    "On-chain deposit confirmed"
+                );
+
+                // Best-effort receipt registration — vault lookup failure
+                // must not prevent TokensMinted from being emitted.
+                match find_vault_by_underlying(&services.pool, underlying).await
+                {
+                    Ok(Some(vault)) => {
+                        let receipt_info = ReceiptInformation::new(
+                            tokenization_request_id.clone(),
+                            issuer_request_id.clone(),
+                            underlying.clone(),
+                            quantity.clone(),
+                            *journal_confirmed_at,
+                            None,
+                        );
+
+                        if let Err(err) = services
+                            .receipts
+                            .register_minted_receipt(MintedReceiptParams {
+                                vault,
+                                receipt_id: ReceiptId::from(result.receipt_id),
+                                shares: Shares::from(result.shares_minted),
+                                block_number: result.block_number,
+                                tx_hash: result.tx_hash,
+                                receipt_info,
+                                receipt_info_bytes: result
+                                    .receipt_info_bytes
+                                    .clone(),
+                            })
+                            .await
+                        {
+                            warn!(
+                                target: "mint",
+                                issuer_request_id = %issuer_request_id,
+                                error = %err,
+                                "Failed to register minted receipt \
+                                 (monitor/backfill will discover it)"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %issuer_request_id,
+                            underlying = %underlying,
+                            "Vault not found for receipt registration \
+                             (monitor/backfill will discover it)"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %issuer_request_id,
+                            error = %err,
+                            "Vault lookup failed for receipt registration \
+                             (monitor/backfill will discover it)"
+                        );
+                    }
+                }
+
+                Ok(vec![MintEvent::TokensMinted {
+                    issuer_request_id,
+                    tx_hash: result.tx_hash,
+                    receipt_id: result.receipt_id,
+                    shares_minted: result.shares_minted,
+                    gas_used: result.gas_used,
+                    block_number: result.block_number,
+                    minted_at: now,
+                }])
+            }
+            Err(err) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "On-chain deposit confirmation failed"
+                );
+
+                Ok(vec![MintEvent::MintingFailed {
+                    issuer_request_id,
+                    error: err.to_string(),
+                    failed_at: now,
+                }])
+            }
+        }
     }
 
     async fn handle_send_callback(
@@ -500,12 +655,41 @@ impl Mint {
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::JournalConfirmed { .. } => {
-                self.handle_deposit(services, issuer_request_id).await
+                // Emit MintingStarted (intent). drive_recovery will call
+                // Recover again, which hits the Minting arm to submit.
+                self.handle_deposit(issuer_request_id)
             }
-            Self::Minting { .. } | Self::MintingFailed { .. } => {
+            Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+                self.handle_confirm_mint(
+                    services,
+                    issuer_request_id,
+                    fireblocks_tx_id.clone(),
+                )
+                .await
+            }
+            Self::MintingFailed { .. } => {
+                // Extract the fireblocks_tx_id from the predecessor if
+                // the tx was already submitted (avoids resubmission).
+                let known_tx_id = match self.non_failed_predecessor() {
+                    Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+                        Some(fireblocks_tx_id.clone())
+                    }
+                    _ => None,
+                };
+
                 self.handle_recover_incomplete(
                     services,
                     issuer_request_id,
+                    None,
+                    known_tx_id,
+                )
+                .await
+            }
+            Self::Minting { .. } => {
+                self.handle_recover_incomplete(
+                    services,
+                    issuer_request_id,
+                    None,
                     None,
                 )
                 .await
@@ -542,14 +726,22 @@ impl Mint {
             Self::MintingFailed { .. }
                 if matches!(
                     self.non_failed_predecessor(),
-                    Self::Minting { .. }
+                    Self::Minting { .. } | Self::FireblocksSubmitted { .. }
                 ) =>
             {
+                let known_tx_id = match self.non_failed_predecessor() {
+                    Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+                        Some(fireblocks_tx_id.clone())
+                    }
+                    _ => None,
+                };
+
                 let deposit_events = self
                     .handle_recover_incomplete(
                         services,
                         issuer_request_id.clone(),
                         Some(tx_hash),
+                        known_tx_id,
                     )
                     .await?;
 
@@ -593,6 +785,7 @@ impl Mint {
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
         receipt_tx_hash: Option<TxHash>,
+        known_fireblocks_tx_id: Option<String>,
     ) -> Result<Vec<MintEvent>, MintError> {
         let (Self::Minting {
             issuer_request_id: expected_id,
@@ -655,53 +848,107 @@ impl Mint {
                 }
             });
 
-        let mint_result = services
-            .vault
-            .mint_and_transfer_shares(
-                vault,
-                quantity.to_u256_with_18_decimals()?,
-                services.bot,
-                *wallet,
-                receipt_info,
-            )
-            .await;
+        if let Some(tx_id) = known_fireblocks_tx_id {
+            // Known tx_id from a prior submission: go straight to confirm.
+            info!(
+                target: "mint",
+                issuer_request_id = %issuer_request_id,
+                fireblocks_tx_id = %tx_id,
+                "Resuming confirmation of previously submitted mint"
+            );
 
-        let completion_event = match mint_result {
-            Ok(result) => {
-                info!(
-                    target: "mint",
-                    issuer_request_id = %issuer_request_id,
-                    tx_hash = %result.tx_hash,
-                    "Recovery mint succeeded"
-                );
-                MintEvent::TokensMinted {
-                    issuer_request_id,
-                    tx_hash: result.tx_hash,
-                    receipt_id: result.receipt_id,
-                    shares_minted: result.shares_minted,
-                    gas_used: result.gas_used,
-                    block_number: result.block_number,
-                    minted_at: now,
+            return match services.vault.confirm_mint(&tx_id).await {
+                Ok(result) => {
+                    info!(
+                        target: "mint",
+                        issuer_request_id = %issuer_request_id,
+                        tx_hash = %result.tx_hash,
+                        "Recovery mint succeeded"
+                    );
+
+                    // Best-effort receipt registration
+                    if let Err(err) = services
+                        .receipts
+                        .register_minted_receipt(MintedReceiptParams {
+                            vault,
+                            receipt_id: ReceiptId::from(result.receipt_id),
+                            shares: Shares::from(result.shares_minted),
+                            block_number: result.block_number,
+                            tx_hash: result.tx_hash,
+                            receipt_info: receipt_info.clone(),
+                            receipt_info_bytes: result
+                                .receipt_info_bytes
+                                .clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %issuer_request_id,
+                            error = %err,
+                            "Failed to register recovered receipt \
+                             (monitor/backfill will discover it)"
+                        );
+                    }
+
+                    let minted = MintEvent::TokensMinted {
+                        issuer_request_id,
+                        tx_hash: result.tx_hash,
+                        receipt_id: result.receipt_id,
+                        shares_minted: result.shares_minted,
+                        gas_used: result.gas_used,
+                        block_number: result.block_number,
+                        minted_at: now,
+                    };
+
+                    Ok(retry_event
+                        .into_iter()
+                        .chain(std::iter::once(minted))
+                        .collect())
                 }
-            }
-            Err(err) => {
-                warn!(
-                    target: "mint",
-                    issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Recovery mint failed"
-                );
-                MintEvent::MintingFailed {
-                    issuer_request_id,
-                    error: err.to_string(),
-                    failed_at: now,
+                Err(err) => {
+                    warn!(
+                        target: "mint",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Recovery mint confirmation failed — \
+                         preserving fireblocks_tx_id for next retry"
+                    );
+
+                    // Do NOT emit MintRetryStarted here — that would
+                    // move the aggregate from MintingFailed to Minting,
+                    // losing the FireblocksSubmitted predecessor and its
+                    // fireblocks_tx_id. Instead, re-emit MintingFailed
+                    // which keeps the existing predecessor chain intact.
+                    Ok(vec![MintEvent::MintingFailed {
+                        issuer_request_id,
+                        error: err.to_string(),
+                        failed_at: now,
+                    }])
                 }
-            }
-        };
+            };
+        }
+
+        // No prior tx_id: submit and persist FireblocksSubmitted.
+        // Don't confirm here — let the next recovery pass handle
+        // ConfirmMint from the FireblocksSubmitted state.
+        let submission_event = Self::execute_mint_submission(
+            services,
+            MintSubmissionInput {
+                issuer_request_id,
+                tokenization_request_id,
+                quantity,
+                underlying,
+                wallet: *wallet,
+                journal_confirmed_at: *journal_confirmed_at,
+                receipt_note: Some("Recovery mint"),
+            },
+        )
+        .await?;
 
         Ok(retry_event
             .into_iter()
-            .chain(std::iter::once(completion_event))
+            .chain(std::iter::once(submission_event))
             .collect())
     }
 
@@ -833,14 +1080,11 @@ impl Mint {
         };
     }
 
-    fn apply_tokens_minted(
+    fn apply_fireblocks_submitted(
         &mut self,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        gas_used: Option<u64>,
-        block_number: u64,
-        minted_at: DateTime<Utc>,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+        _submitted_at: DateTime<Utc>,
     ) {
         let Self::Minting {
             issuer_request_id,
@@ -853,8 +1097,64 @@ impl Mint {
             wallet,
             initiated_at,
             journal_confirmed_at,
-            ..
+            minting_started_at,
         } = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::FireblocksSubmitted {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+            external_tx_id,
+            fireblocks_tx_id,
+        };
+    }
+
+    fn apply_tokens_minted(
+        &mut self,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: Option<u64>,
+        block_number: u64,
+        minted_at: DateTime<Utc>,
+    ) {
+        let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
+        | Self::FireblocksSubmitted {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }) = self.clone()
         else {
             return;
         };
@@ -886,7 +1186,7 @@ impl Mint {
     ) {
         let failed_from = Box::new(self.clone());
 
-        let Self::Minting {
+        let (Self::Minting {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -898,7 +1198,20 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             ..
-        } = self.clone()
+        }
+        | Self::FireblocksSubmitted {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }) = self.clone()
         else {
             return;
         };
@@ -973,6 +1286,19 @@ impl Mint {
         recovered_at: DateTime<Utc>,
     ) {
         let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
+        | Self::FireblocksSubmitted {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -1131,7 +1457,21 @@ impl Aggregate for Mint {
                 self.handle_reject_journal(issuer_request_id, reason)
             }
             MintCommand::Deposit { issuer_request_id } => {
-                self.handle_deposit(services, issuer_request_id).await
+                self.handle_deposit(issuer_request_id)
+            }
+            MintCommand::SubmitMint { issuer_request_id } => {
+                self.handle_submit_mint(services, issuer_request_id).await
+            }
+            MintCommand::ConfirmMint {
+                issuer_request_id,
+                fireblocks_tx_id,
+            } => {
+                self.handle_confirm_mint(
+                    services,
+                    issuer_request_id,
+                    fireblocks_tx_id,
+                )
+                .await
             }
             MintCommand::SendCallback { issuer_request_id } => {
                 self.handle_send_callback(services, issuer_request_id).await
@@ -1228,6 +1568,18 @@ impl Aggregate for Mint {
                 block_number,
                 recovered_at,
             ),
+            MintEvent::FireblocksSubmitted {
+                issuer_request_id: _,
+                external_tx_id,
+                fireblocks_tx_id,
+                submitted_at,
+            } => {
+                self.apply_fireblocks_submitted(
+                    external_tx_id,
+                    fireblocks_tx_id,
+                    submitted_at,
+                );
+            }
             MintEvent::MintRetryStarted {
                 issuer_request_id: _,
                 started_at,
@@ -1259,18 +1611,28 @@ pub(crate) enum MintError {
     )]
     NotInCallbackPendingState { current_state: String },
     #[error(
+        "Mint not in FireblocksSubmitted state. Current state: {current_state}"
+    )]
+    NotInFireblocksSubmittedState { current_state: String },
+    #[error(
         "Issuer request ID mismatch. Expected: {expected}, provided: {provided}"
     )]
     IssuerMintRequestIdMismatch {
         expected: IssuerMintRequestId,
         provided: IssuerMintRequestId,
     },
+    #[error("Mint not in Minting state. Current state: {current_state}")]
+    NotInMintingState { current_state: String },
     #[error(
         "Mint not in Minting or MintingFailed state. Current state: {current_state}"
     )]
     NotInMintingOrMintingFailedState { current_state: String },
     #[error("Mint not in recoverable state. Current state: {current_state}")]
     NotRecoverable { current_state: String },
+    #[error(
+        "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
+    )]
+    FireblocksTxIdMismatch { expected: String, provided: String },
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: UnderlyingSymbol },
     #[error("Quantity conversion: {0}")]
@@ -1504,6 +1866,7 @@ pub(crate) mod tests {
                     MintEvent::JournalConfirmed { .. }
                     | MintEvent::JournalRejected { .. }
                     | MintEvent::MintingStarted { .. }
+                    | MintEvent::FireblocksSubmitted { .. }
                     | MintEvent::TokensMinted { .. }
                     | MintEvent::MintingFailed { .. }
                     | MintEvent::MintCompleted { .. }
@@ -2348,10 +2711,49 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
+        // Deposit records intent (emits MintingStarted)
         cqrs.execute(
             &data.issuer_request_id.to_string(),
             MintCommand::Deposit {
                 issuer_request_id: data.issuer_request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // SubmitMint does the network call (emits FireblocksSubmitted)
+        cqrs.execute(
+            &data.issuer_request_id.to_string(),
+            MintCommand::SubmitMint {
+                issuer_request_id: data.issuer_request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Load the fireblocks_tx_id from the aggregate state
+        let ctx = store
+            .load_aggregate(&data.issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } =
+            ctx.aggregate()
+        else {
+            panic!(
+                "Expected FireblocksSubmitted state after SubmitMint, got {:?}",
+                ctx.aggregate()
+            );
+        };
+
+        let fb_tx_id = fireblocks_tx_id.clone();
+
+        // ConfirmMint polls the backend (emits TokensMinted)
+        cqrs.execute(
+            &data.issuer_request_id.to_string(),
+            MintCommand::ConfirmMint {
+                issuer_request_id: data.issuer_request_id.clone(),
+                fireblocks_tx_id: fb_tx_id,
             },
         )
         .await
@@ -2382,7 +2784,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 5, "Expected 5 events in the flow");
+        assert_eq!(events.len(), 6, "Expected 6 events in the split flow");
 
         assert!(
             matches!(&events[0].payload, MintEvent::Initiated { .. }),
@@ -2397,12 +2799,16 @@ pub(crate) mod tests {
             "Third event should be MintingStarted"
         );
         assert!(
-            matches!(&events[3].payload, MintEvent::TokensMinted { .. }),
-            "Fourth event should be TokensMinted"
+            matches!(&events[3].payload, MintEvent::FireblocksSubmitted { .. }),
+            "Fourth event should be FireblocksSubmitted"
         );
         assert!(
-            matches!(&events[4].payload, MintEvent::MintCompleted { .. }),
-            "Fifth event should be MintCompleted"
+            matches!(&events[4].payload, MintEvent::TokensMinted { .. }),
+            "Fifth event should be TokensMinted"
+        );
+        assert!(
+            matches!(&events[5].payload, MintEvent::MintCompleted { .. }),
+            "Sixth event should be MintCompleted"
         );
 
         let mut view = MintView::default();

@@ -148,9 +148,18 @@ where
     ) -> Result<(), BurnManagerError> {
         let RedemptionView::BurnFailed {
             underlying,
+            token,
             wallet,
+            quantity,
             alpaca_quantity,
             dust_quantity,
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at,
+            tokenization_request_id,
+            fireblocks_tx_id,
             ..
         } = view
         else {
@@ -159,6 +168,19 @@ where
             );
             return Ok(());
         };
+
+        // If a Fireblocks tx was already submitted before failure, try to
+        // confirm it instead of resubmitting. This prevents double-burns
+        // when the failure was a transient confirmation error.
+        if let Some(fb_tx_id) = fireblocks_tx_id {
+            return self
+                .recover_burn_failed_with_existing_tx(
+                    issuer_request_id,
+                    fb_tx_id,
+                    dust_quantity,
+                )
+                .await;
+        }
 
         let vault = find_vault_by_underlying(&self.view_pool, underlying)
             .await?
@@ -204,46 +226,46 @@ where
             return Ok(());
         }
 
-        let plan = self
-            .plan_burn(
-                issuer_request_id,
-                vault,
-                underlying,
-                burn_shares,
-                dust_shares,
-            )
-            .await?;
-
-        let burns: Vec<MultiBurnEntry> = plan
-            .allocations
-            .into_iter()
-            .map(|allocation| MultiBurnEntry {
-                receipt_id: allocation.receipt.receipt_id.inner(),
-                burn_shares: allocation.burn_amount.inner(),
-                receipt_info: allocation.receipt.receipt_info,
-                receipt_info_bytes: allocation.receipt.receipt_info_bytes,
-            })
-            .collect();
-
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
-            num_receipts = burns.len(),
-            "Retrying burn for BurnFailed redemption"
+            "Retrying burn for BurnFailed redemption (no prior submission)"
         );
+
+        // Step 1: Resume the burn (Failed → Burning) so the standard
+        // two-step submit/confirm flow persists the tx ID.
+        let metadata = super::RedemptionMetadata {
+            issuer_request_id: issuer_request_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: *wallet,
+            quantity: quantity.clone(),
+            detected_tx_hash: *tx_hash,
+            block_number: *block_number,
+            detected_at: *detected_at,
+        };
 
         self.cqrs
             .execute(
                 &issuer_request_id.to_string(),
-                RedemptionCommand::RetryBurn {
+                RedemptionCommand::ResumeBurn {
                     issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns,
-                    dust_shares: plan.dust.inner(),
-                    owner: self.bot_wallet,
-                    user_wallet: *wallet,
+                    metadata,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    alpaca_quantity: alpaca_quantity.clone(),
+                    dust_quantity: dust_quantity.clone(),
+                    called_at: *called_at,
+                    alpaca_journal_completed_at: *alpaca_journal_completed_at,
                 },
             )
+            .await?;
+
+        // Step 2: Load the updated aggregate (now in Burning) and use
+        // the standard submit → persist tx ID → confirm flow.
+        let context =
+            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+
+        self.handle_burning_started(issuer_request_id, context.aggregate())
             .await?;
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
@@ -251,6 +273,91 @@ where
         );
 
         Ok(())
+    }
+
+    /// Recovers a BurnFailed redemption that has a previously submitted Fireblocks
+    /// transaction. Tries to confirm the existing transaction rather than resubmitting.
+    async fn recover_burn_failed_with_existing_tx(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        fireblocks_tx_id: &str,
+        dust_quantity: &crate::Quantity,
+    ) -> Result<(), BurnManagerError> {
+        let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
+
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            %fireblocks_tx_id,
+            "BurnFailed recovery — confirming previously submitted Fireblocks transaction"
+        );
+
+        match self
+            .vault_service
+            .confirm_burn(fireblocks_tx_id, dust_shares)
+            .await
+        {
+            Ok(result) => {
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    tx_hash = %result.tx_hash,
+                    "Previously submitted burn confirmed on-chain"
+                );
+
+                // Use actual on-chain burn data, not planned amounts —
+                // the Rain contract's withdraw math may produce slightly
+                // different values than planned (rounding in share ratios).
+                let actual_burns: Vec<super::BurnRecord> = result
+                    .burns
+                    .iter()
+                    .map(|burn| super::BurnRecord {
+                        receipt_id: burn.receipt_id,
+                        shares_burned: burn.shares_burned,
+                    })
+                    .collect();
+
+                // Safe: BurningFailed always transitions the aggregate to
+                // Failed, so RecordExistingBurn (which requires Failed) is valid.
+                self.cqrs
+                    .execute(
+                        &issuer_request_id.to_string(),
+                        RedemptionCommand::RecordExistingBurn {
+                            issuer_request_id: issuer_request_id.clone(),
+                            fireblocks_tx_id: fireblocks_tx_id.to_string(),
+                            tx_hash: result.tx_hash,
+                            planned_burns: actual_burns,
+                            block_number: result.block_number,
+                        },
+                    )
+                    .await?;
+
+                Ok(())
+            }
+            Err(err) => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    %fireblocks_tx_id,
+                    error = %err,
+                    "Failed to confirm previously submitted burn — \
+                     marking as failed to prevent infinite retry loop"
+                );
+
+                // Re-mark as failed WITHOUT preserving the fireblocks_tx_id.
+                // This moves the view from BurnFailed to Failed, so the next
+                // recovery pass does not retry the same dead transaction.
+                let reason = format!(
+                    "Fireblocks burn confirmation failed for tx {fireblocks_tx_id}: {err}"
+                );
+
+                self.cqrs
+                    .execute(
+                        &issuer_request_id.to_string(),
+                        RedemptionCommand::MarkFailed {
+                            issuer_request_id: issuer_request_id.clone(),
+                            reason,
+                        },
+                    )
+                    .await?;
+
+                Err(BurnManagerError::Vault(err))
+            }
+        }
     }
 
     async fn recover_single_burning(
@@ -262,61 +369,131 @@ where
 
         let aggregate = context.aggregate();
 
-        let Redemption::Burning {
-            metadata,
-            alpaca_quantity,
-            dust_quantity,
-            ..
-        } = aggregate
-        else {
-            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                "Redemption no longer in Burning state, skipping"
-            );
-            return Ok(());
-        };
+        match aggregate {
+            // Already submitted to Fireblocks but never confirmed — resume polling
+            Redemption::BurnSubmitted {
+                fireblocks_tx_id,
+                dust_quantity,
+                planned_burns,
+                ..
+            } => {
+                let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
 
-        let vault =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+                info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    fireblocks_tx_id = %fireblocks_tx_id,
+                    "Recovering BurnSubmitted redemption - confirming existing transaction"
+                );
+
+                let confirm_result = self
+                    .cqrs
+                    .execute(
+                        &issuer_request_id.to_string(),
+                        RedemptionCommand::ConfirmBurn {
+                            issuer_request_id: issuer_request_id.clone(),
+                            fireblocks_tx_id: fireblocks_tx_id.clone(),
+                            dust_shares,
+                        },
+                    )
+                    .await;
+
+                match confirm_result {
+                    Ok(()) => {
+                        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                            "Burn confirmed successfully during recovery"
+                        );
+                        Ok(())
+                    }
+                    Err(AggregateError::UserError(RedemptionError::Vault(
+                        err,
+                    ))) => {
+                        warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                            error = %err,
+                            "Burn confirmation failed during recovery"
+                        );
+
+                        self.cqrs
+                            .execute(
+                                &issuer_request_id.to_string(),
+                                RedemptionCommand::RecordBurnFailure {
+                                    issuer_request_id: issuer_request_id
+                                        .clone(),
+                                    error: err.to_string(),
+                                    fireblocks_tx_id: Some(
+                                        fireblocks_tx_id.clone(),
+                                    ),
+                                    planned_burns: planned_burns.clone(),
+                                },
+                            )
+                            .await?;
+
+                        Err(BurnManagerError::Vault(err))
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            }
+
+            // Still in Burning state — needs full submit + confirm flow
+            Redemption::Burning {
+                metadata,
+                alpaca_quantity,
+                dust_quantity,
+                ..
+            } => {
+                let vault = find_vault_by_underlying(
+                    &self.view_pool,
+                    &metadata.underlying,
+                )
                 .await?
-                .ok_or_else(|| BurnManagerError::AssetNotFound {
-                    underlying: metadata.underlying.clone(),
+                .ok_or_else(|| {
+                    BurnManagerError::AssetNotFound {
+                        underlying: metadata.underlying.clone(),
+                    }
                 })?;
 
-        // We need to burn alpaca_quantity and transfer dust_quantity
-        let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
-        let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
-        let total_shares_needed = burn_shares
-            .checked_add(dust_shares)
-            .ok_or(BurnManagerError::SharesOverflow)?;
+                // We need to burn alpaca_quantity and transfer dust_quantity
+                let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
+                let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
+                let total_shares_needed = burn_shares
+                    .checked_add(dust_shares)
+                    .ok_or(BurnManagerError::SharesOverflow)?;
 
-        // Check on-chain balance before attempting burn. If the bot has insufficient
-        // shares, the burn likely already succeeded on-chain but we crashed before
-        // recording it. Skip this redemption to avoid recording a false failure.
-        // Manual intervention required to resolve.
-        // TODO: Implement automatic recovery - see #88
-        let on_chain_balance = self
-            .vault_service
-            .get_share_balance(vault, self.bot_wallet)
-            .await?;
+                // Check on-chain balance before attempting burn. If the bot has insufficient
+                // shares, the burn likely already succeeded on-chain but we crashed before
+                // recording it. Skip this redemption to avoid recording a false failure.
+                // Manual intervention required to resolve.
+                // TODO: Implement automatic recovery - see #88
+                let on_chain_balance = self
+                    .vault_service
+                    .get_share_balance(vault, self.bot_wallet)
+                    .await?;
 
-        if on_chain_balance < total_shares_needed {
-            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                on_chain_balance = %on_chain_balance,
-                burn_shares = %burn_shares,
-                dust_shares = %dust_shares,
-                total_shares_needed = %total_shares_needed,
-                "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
-                 Burn likely already succeeded but was not recorded. \
-                 Skipping to avoid recording false failure."
-            );
-            return Ok(());
+                if on_chain_balance < total_shares_needed {
+                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        on_chain_balance = %on_chain_balance,
+                        burn_shares = %burn_shares,
+                        dust_shares = %dust_shares,
+                        total_shares_needed = %total_shares_needed,
+                        "MANUAL INTERVENTION REQUIRED: On-chain balance insufficient for burn recovery. \
+                         Burn likely already succeeded but was not recorded. \
+                         Skipping to avoid recording false failure."
+                    );
+                    return Ok(());
+                }
+
+                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "Recovering Burning redemption - resuming burn"
+                );
+
+                self.handle_burning_started(issuer_request_id, aggregate).await
+            }
+
+            _ => {
+                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "Redemption no longer in Burning or BurnSubmitted state, skipping"
+                );
+                Ok(())
+            }
         }
-
-        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-            "Recovering Burning redemption - resuming burn"
-        );
-
-        self.handle_burning_started(issuer_request_id, aggregate).await
     }
 
     /// Handles a `Burning` state by burning tokens on-chain.
@@ -527,7 +704,10 @@ where
             })
             .collect();
 
-        let burn_result = self
+        let dust_shares = plan.dust.inner();
+
+        // Step 1: Submit the burn transaction (emits BurnFireblocksSubmitted)
+        let submit_result = self
             .cqrs
             .execute(
                 &issuer_request_id.to_string(),
@@ -535,19 +715,17 @@ where
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
                     burns,
-                    dust_shares: plan.dust.inner(),
+                    dust_shares,
                     owner: self.bot_wallet,
                 },
             )
             .await;
 
-        match burn_result {
+        match submit_result {
             Ok(()) => {
-                info!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "BurnTokens command executed successfully"
+                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "BurnTokens submitted, confirming..."
                 );
-
-                Ok(())
             }
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
                 let fireblocks_tx_id = extract_fireblocks_tx_id(&err);
@@ -555,7 +733,7 @@ where
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     fireblocks_tx_id = ?fireblocks_tx_id,
-                    "On-chain burning failed"
+                    "Burn submission failed"
                 );
 
                 self.cqrs
@@ -570,9 +748,64 @@ where
                     )
                     .await?;
 
+                return Err(BurnManagerError::Vault(err));
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        // Step 2: Load aggregate to get the fireblocks_tx_id from BurnSubmitted state
+        let context =
+            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+
+        let Redemption::BurnSubmitted { fireblocks_tx_id, .. } =
+            context.aggregate()
+        else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: aggregate_state_name(context.aggregate())
+                    .to_string(),
+            });
+        };
+
+        let fireblocks_tx_id = fireblocks_tx_id.clone();
+
+        // Step 3: Confirm the burn (emits TokensBurned or error)
+        let confirm_result = self
+            .cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                RedemptionCommand::ConfirmBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    fireblocks_tx_id: fireblocks_tx_id.clone(),
+                    dust_shares,
+                },
+            )
+            .await;
+
+        match confirm_result {
+            Ok(()) => {
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "RecordBurnFailure command recorded"
+                    "Burn confirmed successfully"
                 );
+
+                Ok(())
+            }
+            Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "Burn confirmation failed"
+                );
+
+                self.cqrs
+                    .execute(
+                        &issuer_request_id.to_string(),
+                        RedemptionCommand::RecordBurnFailure {
+                            issuer_request_id: issuer_request_id.clone(),
+                            error: err.to_string(),
+                            fireblocks_tx_id: Some(fireblocks_tx_id),
+                            planned_burns,
+                        },
+                    )
+                    .await?;
 
                 Err(BurnManagerError::Vault(err))
             }
@@ -587,6 +820,7 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
         Redemption::Detected { .. } => "Detected",
         Redemption::AlpacaCalled { .. } => "AlpacaCalled",
         Redemption::Burning { .. } => "Burning",
+        Redemption::BurnSubmitted { .. } => "BurnSubmitted",
         Redemption::Failed { .. } => "Failed",
         Redemption::Completed { .. } => "Completed",
         Redemption::Closed { .. } => "Closed",
@@ -595,17 +829,12 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 
 /// Extracts the Fireblocks transaction ID from a `VaultError`, if the error
 /// originated from a Fireblocks error that carries a transaction ID.
-/// Matches both `TransactionFailed` (polling timeout / terminal status) and
-/// `PostSubmit` (errors after a tx was submitted and potentially completed).
 fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
     match error {
         VaultError::Fireblocks(
             crate::fireblocks::FireblocksVaultError::TransactionFailed {
                 tx_id,
                 ..
-            }
-            | crate::fireblocks::FireblocksVaultError::PostSubmit {
-                tx_id, ..
             }
             | crate::fireblocks::FireblocksVaultError::MissingTxHash { tx_id },
         ) => Some(tx_id.clone()),
@@ -1984,5 +2213,98 @@ mod tests {
                 "insufficient on-chain balance"
             ]
         ));
+    }
+
+    /// Tests that recovery from `BurnSubmitted` state (crash between submit
+    /// and confirm) successfully confirms the existing transaction without
+    /// submitting a new one.
+    #[tokio::test]
+    async fn test_recover_burn_submitted_confirms_existing_transaction() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        // Drive redemption to Burning state
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        // Issue BurnTokens directly to stop at BurnSubmitted (simulating
+        // a crash between submit and confirm). This calls submit_burn on
+        // the mock and emits BurnFireblocksSubmitted without confirming.
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::BurnTokens {
+                issuer_request_id: issuer_request_id.clone(),
+                vault,
+                burns: vec![crate::vault::MultiBurnEntry {
+                    receipt_id: uint!(99_U256),
+                    burn_shares: uint!(100_000000000000000000_U256),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
+                dust_shares: U256::ZERO,
+                owner: TEST_WALLET,
+            },
+        )
+        .await
+        .expect("BurnTokens should succeed");
+
+        // Verify aggregate is in BurnSubmitted state
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(aggregate, Redemption::BurnSubmitted { .. }),
+            "Expected BurnSubmitted state, got {aggregate:?}"
+        );
+
+        // Record submit_burn call count before recovery
+        let submits_before = vault_mock.get_multi_burn_call_count();
+
+        // Recovery should find this redemption (view is Burning, aggregate
+        // is BurnSubmitted) and confirm the existing Fireblocks transaction
+        // without submitting a new burn.
+        manager.recover_burning_redemptions().await;
+
+        // Verify: no new submit_burn calls — recovery confirmed the existing tx
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            submits_before,
+            "Recovery should confirm existing tx, not submit a new burn"
+        );
+
+        // Aggregate should now be Completed
+        let recovered = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(recovered, Redemption::Completed { .. }),
+            "Expected Completed state after recovery, got {recovered:?}"
+        );
     }
 }

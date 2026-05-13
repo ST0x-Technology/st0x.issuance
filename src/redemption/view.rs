@@ -83,6 +83,13 @@ pub(crate) enum RedemptionView {
         alpaca_journal_completed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
+        /// Fireblocks transaction ID, if a burn was already submitted before failure.
+        /// Present when the failure occurred during confirmation (after submission).
+        #[serde(default)]
+        fireblocks_tx_id: Option<String>,
+        /// Planned burns at the time of failure.
+        #[serde(default)]
+        planned_burns: Vec<super::BurnRecord>,
     },
     Closed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -176,7 +183,13 @@ impl RedemptionView {
         };
     }
 
-    fn update_burning_failed(&mut self, error: &str, failed_at: DateTime<Utc>) {
+    fn update_burning_failed(
+        &mut self,
+        error: &str,
+        failed_at: DateTime<Utc>,
+        fireblocks_tx_id: Option<&String>,
+        planned_burns: &[super::BurnRecord],
+    ) {
         let Self::Burning {
             issuer_request_id,
             tokenization_request_id,
@@ -212,6 +225,8 @@ impl RedemptionView {
             alpaca_journal_completed_at: *alpaca_journal_completed_at,
             error: error.to_string(),
             failed_at,
+            fireblocks_tx_id: fireblocks_tx_id.cloned(),
+            planned_burns: planned_burns.to_vec(),
         };
     }
 }
@@ -283,8 +298,19 @@ impl View<Redemption> for RedemptionView {
                 };
             }
 
-            RedemptionEvent::BurningFailed { error, failed_at, .. } => {
-                self.update_burning_failed(error, *failed_at);
+            RedemptionEvent::BurningFailed {
+                error,
+                failed_at,
+                fireblocks_tx_id,
+                planned_burns,
+                ..
+            } => {
+                self.update_burning_failed(
+                    error,
+                    *failed_at,
+                    fireblocks_tx_id.as_ref(),
+                    planned_burns,
+                );
             }
 
             RedemptionEvent::AlpacaJournalCompleted {
@@ -355,6 +381,10 @@ impl View<Redemption> for RedemptionView {
                     block_number: *block_number,
                     completed_at: *recovered_at,
                 };
+            }
+            RedemptionEvent::BurnFireblocksSubmitted { .. } => {
+                // View stays in Burning — BurnFireblocksSubmitted is an
+                // internal detail that doesn't change the query-facing state.
             }
             RedemptionEvent::RedemptionClosed {
                 issuer_request_id,
@@ -706,6 +736,7 @@ mod tests {
         }
 
         async fn burn_tokens(&self, id: &IssuerRedemptionRequestId) {
+            // Step 1: Submit
             self.cqrs
                 .execute(
                     &id.to_string(),
@@ -727,7 +758,20 @@ mod tests {
                     },
                 )
                 .await
-                .expect("Failed to burn tokens");
+                .expect("Failed to submit burn");
+
+            // Step 2: Confirm
+            self.cqrs
+                .execute(
+                    &id.to_string(),
+                    RedemptionCommand::ConfirmBurn {
+                        issuer_request_id: id.clone(),
+                        fireblocks_tx_id: "mock-fb-burn".to_string(),
+                        dust_shares: U256::ZERO,
+                    },
+                )
+                .await
+                .expect("Failed to confirm burn");
         }
     }
 

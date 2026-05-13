@@ -6,8 +6,10 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
+use fireblocks_sdk::apis;
 use fireblocks_sdk::apis::transactions_api::{
     CreateTransactionError, CreateTransactionParams,
+    GetTransactionByExternalIdParams,
 };
 use fireblocks_sdk::apis::whitelisted_contracts_api::GetContractsError;
 use fireblocks_sdk::models::{self, TransactionStatus};
@@ -22,7 +24,7 @@ use crate::bindings::OffchainAssetReceiptVault;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, VaultError, VaultService,
+    ReceiptInformation, SubmittedTx, VaultError, VaultService,
 };
 
 /// Fireblocks-specific errors that can occur during vault operations.
@@ -62,15 +64,10 @@ pub(crate) enum FireblocksVaultError {
     UnknownChain { chain_id: u64 },
     #[error("transaction {tx_hash} has no receipt after confirmation")]
     MissingReceipt { tx_hash: TxHash },
-    /// An error occurred after the Fireblocks transaction was submitted and
-    /// potentially completed on-chain. The `tx_id` is preserved so that
-    /// recovery can look up the transaction on Fireblocks.
-    #[error("post-submit error for Fireblocks tx {tx_id}: {source}")]
-    PostSubmit {
-        tx_id: String,
-        #[source]
-        source: Box<VaultError>,
-    },
+    #[error(
+        "failed to look up existing transaction by externalTxId: {external_tx_id}"
+    )]
+    ExternalTxIdLookupFailed { external_tx_id: String },
 }
 
 /// Fetches the vault account address from Fireblocks.
@@ -242,12 +239,23 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
             .transaction_request(tx_request)
             .build();
 
-        let create_response = self
-            .client
-            .transactions_api()
-            .create_transaction(params)
-            .await
-            .map_err(|err| {
+        let create_response =
+            self.client.transactions_api().create_transaction(params).await;
+
+        match create_response {
+            Ok(response) => {
+                response.id.ok_or(FireblocksVaultError::MissingTransactionId)
+            }
+            Err(ref err) if is_duplicate_external_tx_id_error(err) => {
+                warn!(target: "fireblocks",
+                    %external_tx_id,
+                    original_error = ?err,
+                    "Duplicate externalTxId — looking up existing transaction"
+                );
+
+                self.recover_by_external_tx_id(external_tx_id).await
+            }
+            Err(err) => {
                 // The SDK's Display impl only shows the status code, discarding
                 // the response body which contains the actual error message and
                 // code. Debug preserves the full ResponseContent including the
@@ -257,10 +265,53 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
                     %external_tx_id,
                     "Fireblocks create_transaction failed"
                 );
-                err
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Recovers a Fireblocks transaction ID by looking up the `externalTxId`.
+    ///
+    /// Called when `create_transaction` returns a duplicate `externalTxId`
+    /// rejection (HTTP 409/400). This means we previously submitted a
+    /// transaction with this ID but lost track of it (e.g., crash before
+    /// persisting the Fireblocks tx ID). We look up the existing transaction
+    /// and return its Fireblocks ID so polling can resume.
+    async fn recover_by_external_tx_id(
+        &self,
+        external_tx_id: &str,
+    ) -> Result<String, FireblocksVaultError> {
+        let params = GetTransactionByExternalIdParams {
+            external_tx_id: external_tx_id.to_string(),
+        };
+
+        let tx = self
+            .client
+            .transactions_api()
+            .get_transaction_by_external_id(params)
+            .await
+            .map_err(|err| {
+                warn!(target: "fireblocks",
+                    %external_tx_id,
+                    error = ?err,
+                    "Failed to look up transaction by externalTxId"
+                );
+                // Convert the GetTransactionByExternalIdError into our error type.
+                // The underlying error is an API/network error, so wrap generically.
+                FireblocksVaultError::ExternalTxIdLookupFailed {
+                    external_tx_id: external_tx_id.to_string(),
+                }
             })?;
 
-        create_response.id.ok_or(FireblocksVaultError::MissingTransactionId)
+        let fireblocks_tx_id = tx.id;
+
+        debug!(target: "fireblocks",
+            %external_tx_id,
+            %fireblocks_tx_id,
+            "Recovered existing Fireblocks transaction"
+        );
+
+        Ok(fireblocks_tx_id)
     }
 
     /// Polls a Fireblocks transaction until completion.
@@ -460,20 +511,20 @@ impl std::fmt::Display for VaultOperation {
 }
 
 impl VaultOperation {
-    /// Generates a unique `externalTxId` for Fireblocks transactions.
+    /// Generates a deterministic `externalTxId` for Fireblocks transactions.
     ///
-    /// Format: `{ISO8601_compact}-{operation}-{issuer_request_id}`
-    /// e.g., `20260210T083800Z-mint-5960be2e-a556-42e7-8def-ed3a354b66e6`
+    /// Format: `{operation}-{issuer_request_id}`
+    /// e.g., `mint-5960be2e-a556-42e7-8def-ed3a354b66e6`
     ///
-    /// Each call produces a unique ID (via timestamp), avoiding Fireblocks'
-    /// permanent `externalTxId` rejection on retries. The operation prefix
-    /// and issuer_request_id make the ID searchable in the Fireblocks dashboard.
+    /// The ID is stable across retries so that Fireblocks' duplicate
+    /// `externalTxId` rejection prevents double-submissions. If a retry
+    /// hits HTTP 400 for a duplicate ID, the caller can look up the
+    /// existing transaction and resume polling.
     fn external_tx_id(
         &self,
         issuer_request_id: &(impl std::fmt::Display + ?Sized),
     ) -> String {
-        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        format!("{timestamp}-{self}-{issuer_request_id}")
+        format!("{self}-{issuer_request_id}")
     }
 }
 
@@ -500,6 +551,32 @@ const fn is_still_pending(status: TransactionStatus) -> bool {
     }
 }
 
+/// Detects whether a `create_transaction` error is a duplicate `externalTxId`
+/// rejection. Fireblocks returns HTTP 409 (or sometimes 400) when a transaction
+/// with the same `externalTxId` already exists.
+fn is_duplicate_external_tx_id_error(
+    err: &apis::Error<CreateTransactionError>,
+) -> bool {
+    if let apis::Error::ResponseError(apis::ResponseContent {
+        status,
+        content,
+        ..
+    }) = err
+    {
+        // HTTP 409 Conflict is the canonical duplicate response.
+        // HTTP 400 with "externalTxId" in the body is also observed.
+        // For both, verify the body mentions the externalTxId keyword
+        // to avoid false positives from unrelated 409/400 errors.
+        if status.as_u16() == 409 || status.as_u16() == 400 {
+            let lower = content.to_lowercase();
+            return lower.contains("externaltxid")
+                || lower.contains("external_tx_id");
+        }
+    }
+
+    false
+}
+
 /// Parses a transaction hash string (with or without 0x prefix) into B256.
 fn parse_tx_hash(tx_hash_str: &str) -> Result<B256, FireblocksVaultError> {
     let tx_hash_hex = tx_hash_str.strip_prefix("0x").unwrap_or(tx_hash_str);
@@ -521,14 +598,14 @@ fn parse_tx_hash(tx_hash_str: &str) -> Result<B256, FireblocksVaultError> {
 impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     for FireblocksVaultService<P>
 {
-    async fn mint_and_transfer_shares(
+    async fn submit_mint(
         &self,
         vault: Address,
         assets: U256,
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
-    ) -> Result<MintResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
         let oa_schema = self.oa_schema_cache.get(vault).await;
         let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
 
@@ -566,7 +643,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let external_tx_id = VaultOperation::Mint
             .external_tx_id(&receipt_info.issuer_request_id);
 
-        let tx_id = self
+        let fireblocks_tx_id = self
             .submit_contract_call(
                 vault,
                 &multicall_calldata,
@@ -575,14 +652,21 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             )
             .await?;
 
+        Ok(SubmittedTx { external_tx_id, fireblocks_tx_id })
+    }
+
+    async fn confirm_mint(
+        &self,
+        fireblocks_tx_id: &str,
+    ) -> Result<MintResult, VaultError> {
         // Wait for Fireblocks to complete the transaction
-        let tx_hash = self.wait_for_completion(&tx_id).await?;
+        let tx_hash = self.wait_for_completion(fireblocks_tx_id).await?;
 
         // Fetch the receipt from our RPC provider to parse events
         let receipt = self.fetch_receipt(tx_hash).await?;
 
-        // Parse the Deposit event to get receipt_id and shares_minted
-        let (receipt_id, shares_minted) = receipt
+        // Parse the Deposit event to get receipt_id, shares_minted, and receipt_info_bytes
+        let (receipt_id, shares_minted, receipt_info_bytes) = receipt
             .inner
             .logs()
             .iter()
@@ -590,7 +674,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 log.log_decode::<OffchainAssetReceiptVault::Deposit>().ok().map(
                     |decoded| {
                         let event_data = decoded.data();
-                        (event_data.id, event_data.shares)
+                        (
+                            event_data.id,
+                            event_data.shares,
+                            event_data.receiptInformation.clone(),
+                        )
                     },
                 )
             })
@@ -610,10 +698,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         })
     }
 
-    async fn burn_multiple_receipts(
+    async fn submit_burn(
         &self,
         params: MultiBurnParams,
-    ) -> Result<MultiBurnResult, VaultError> {
+    ) -> Result<SubmittedTx, VaultError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
@@ -681,10 +769,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             params.issuer_request_id,
         );
 
+        // DEPLOYMENT NOTE: This format changed from `burn-red-{4_bytes}` to
+        // `burn-0x{full_tx_hash}`. Drain all in-flight burn transactions
+        // before deploying this change to avoid externalTxId mismatches.
         let external_tx_id =
-            VaultOperation::Burn.external_tx_id(&params.issuer_request_id);
+            VaultOperation::Burn.external_tx_id(&params.detected_tx_hash);
 
-        let tx_id = self
+        let fireblocks_tx_id = self
             .submit_contract_call(
                 params.vault,
                 &multicall_calldata,
@@ -693,21 +784,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             )
             .await?;
 
-        // Wait for Fireblocks to complete the transaction.
-        // TransactionFailed already carries tx_id, so no wrapping needed.
-        let tx_hash = self.wait_for_completion(&tx_id).await?;
+        Ok(SubmittedTx { external_tx_id, fireblocks_tx_id })
+    }
 
-        // Post-submit: any error after this point means the tx may have
-        // landed on-chain. Wrap errors with PostSubmit to preserve tx_id
-        // for recovery.
-        self.parse_burn_receipt(tx_hash, params.dust_shares).await.map_err(
-            |err| {
-                VaultError::Fireblocks(FireblocksVaultError::PostSubmit {
-                    tx_id,
-                    source: Box::new(err),
-                })
-            },
-        )
+    async fn confirm_burn(
+        &self,
+        fireblocks_tx_id: &str,
+        dust_shares: U256,
+    ) -> Result<MultiBurnResult, VaultError> {
+        let tx_hash = self.wait_for_completion(fireblocks_tx_id).await?;
+
+        self.parse_burn_receipt(tx_hash, dust_shares).await
     }
 
     async fn check_fireblocks_tx(
@@ -1072,37 +1159,35 @@ mod tests {
     }
 
     #[test]
-    fn external_tx_id_contains_operation_and_issuer_request_id() {
+    fn external_tx_id_is_deterministic() {
         let id = VaultOperation::Mint
             .external_tx_id("5960be2e-a556-42e7-8def-ed3a354b66e6");
-        assert!(
-            id.contains("mint-5960be2e-a556-42e7-8def-ed3a354b66e6"),
-            "Expected operation-issuer_request_id suffix, got {id}"
+        assert_eq!(
+            id, "mint-5960be2e-a556-42e7-8def-ed3a354b66e6",
+            "Expected deterministic operation-issuer_request_id format, got {id}"
         );
     }
 
     #[test]
-    fn external_tx_id_starts_with_iso8601_timestamp() {
-        let id =
-            VaultOperation::Burn.external_tx_id(&Uuid::new_v4().to_string());
-        assert!(
-            id.contains('T') && id.contains('Z'),
-            "Expected ISO 8601 compact timestamp, got {id}"
-        );
-        let timestamp_part = id.split('-').next().unwrap();
-        assert!(
-            timestamp_part.ends_with('Z'),
-            "Timestamp should end with Z, got {timestamp_part}"
-        );
-    }
-
-    #[test]
-    fn external_tx_id_is_unique_across_calls() {
+    fn external_tx_id_is_stable_across_calls() {
         let issuer_request_id = Uuid::new_v4().to_string();
         let id1 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
-        std::thread::sleep(std::time::Duration::from_secs(1));
         let id2 = VaultOperation::Mint.external_tx_id(&issuer_request_id);
-        assert_ne!(id1, id2, "Consecutive calls should produce unique IDs");
+        assert_eq!(
+            id1, id2,
+            "Same inputs should produce identical IDs for idempotency"
+        );
+    }
+
+    #[test]
+    fn external_tx_id_differs_by_operation() {
+        let issuer_request_id = "5960be2e-a556-42e7-8def-ed3a354b66e6";
+        let mint_id = VaultOperation::Mint.external_tx_id(issuer_request_id);
+        let burn_id = VaultOperation::Burn.external_tx_id(issuer_request_id);
+        assert_ne!(
+            mint_id, burn_id,
+            "Different operations should produce different IDs"
+        );
     }
 
     #[test]
@@ -1198,6 +1283,91 @@ mod tests {
             total_calls >= 3,
             "SDK should have polled past Confirming status \
              (expected >= 3 calls, got {total_calls})"
+        );
+    }
+
+    fn make_response_error(
+        status: u16,
+        body: &str,
+    ) -> apis::Error<CreateTransactionError> {
+        apis::Error::ResponseError(apis::ResponseContent {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            content: body.to_string(),
+            entity: None,
+        })
+    }
+
+    #[test]
+    fn duplicate_detection_http_409_with_keyword() {
+        let err = make_response_error(
+            409,
+            r#"{"message": "Duplicate externalTxId"}"#,
+        );
+        assert!(
+            is_duplicate_external_tx_id_error(&err),
+            "HTTP 409 with 'externalTxId' should be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_409_without_keyword() {
+        let err = make_response_error(409, "Some other conflict");
+        assert!(
+            !is_duplicate_external_tx_id_error(&err),
+            "HTTP 409 without keyword should not be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_400_with_external_tx_id_keyword() {
+        let err = make_response_error(
+            400,
+            r#"{"message": "A transaction with externalTxId already exists"}"#,
+        );
+        assert!(
+            is_duplicate_external_tx_id_error(&err),
+            "HTTP 400 with 'externalTxId' should be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_400_with_external_tx_id_snake_case() {
+        let err = make_response_error(
+            400,
+            r#"{"message": "Duplicate external_tx_id"}"#,
+        );
+        assert!(
+            is_duplicate_external_tx_id_error(&err),
+            "HTTP 400 with 'external_tx_id' should be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_400_without_keyword() {
+        let err = make_response_error(400, r#"{"message": "Invalid amount"}"#);
+        assert!(
+            !is_duplicate_external_tx_id_error(&err),
+            "HTTP 400 without keyword should not be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_500() {
+        let err = make_response_error(500, "Internal server error");
+        assert!(
+            !is_duplicate_external_tx_id_error(&err),
+            "HTTP 500 should not be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_non_response_error() {
+        let err: apis::Error<CreateTransactionError> = apis::Error::Serde(
+            serde_json::from_str::<String>("!!!").unwrap_err(),
+        );
+        assert!(
+            !is_duplicate_external_tx_id_error(&err),
+            "Non-ResponseError should not be detected as duplicate"
         );
     }
 }

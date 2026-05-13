@@ -540,6 +540,10 @@ impl View<Mint> for MintView {
                     *recovered_at,
                 );
             }
+            MintEvent::FireblocksSubmitted { .. } => {
+                // View stays in Minting — FireblocksSubmitted is an internal
+                // detail that doesn't change the query-facing state.
+            }
             MintEvent::MintRetryStarted { started_at, .. } => {
                 self.handle_mint_retry_started(*started_at);
             }

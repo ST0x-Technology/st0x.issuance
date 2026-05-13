@@ -1,10 +1,12 @@
 use cqrs_es::{AggregateContext, EventStore};
 use rocket::{State, post, serde::json::Json};
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::IssuerAuth;
-use crate::mint::{IssuerMintRequestId, MintCommand, TokenizationRequestId};
+use crate::mint::{
+    IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
+};
 use crate::{MintCqrs, MintEventStore};
 
 #[derive(Debug, Deserialize)]
@@ -109,8 +111,10 @@ pub(crate) async fn confirm_journal(
             }
 
             let cqrs = cqrs.inner().clone();
+            let store = event_store.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
                 cqrs,
+                store,
                 issuer_request_id,
             ));
         }
@@ -119,16 +123,23 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
-#[tracing::instrument(skip(cqrs), fields(
+#[tracing::instrument(skip(cqrs, event_store), fields(
     issuer_request_id = %issuer_request_id
 ))]
 async fn process_journal_completion(
     cqrs: MintCqrs,
+    event_store: MintEventStore,
     issuer_request_id: IssuerMintRequestId,
 ) {
+    let aggregate_id = issuer_request_id.to_string();
+
+    // Step 1: Record mint intent (Deposit → MintingStarted).
+    // Persisted BEFORE the network call so a crash between here and
+    // Step 2 leaves the aggregate in Minting (recoverable) rather
+    // than JournalConfirmed (which would lose track of the submission).
     if let Err(err) = cqrs
         .execute(
-            &issuer_request_id.to_string(),
+            &aggregate_id,
             MintCommand::Deposit {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -142,6 +153,84 @@ async fn process_journal_completion(
         return;
     }
 
+    // Step 2: Submit mint transaction (SubmitMint → FireblocksSubmitted).
+    if let Err(err) = cqrs
+        .execute(
+            &aggregate_id,
+            MintCommand::SubmitMint {
+                issuer_request_id: issuer_request_id.clone(),
+            },
+        )
+        .await
+    {
+        error!(target: "mint", issuer_request_id = %issuer_request_id,
+            error = ?err,
+            "SubmitMint command failed"
+        );
+        return;
+    }
+
+    // Step 3: Load the fireblocks_tx_id from the aggregate and confirm
+    let context = match event_store.load_aggregate(&aggregate_id).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = ?err,
+                "Failed to load aggregate after SubmitMint"
+            );
+            return;
+        }
+    };
+
+    if let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } =
+        context.aggregate()
+    {
+        if let Err(err) = cqrs
+            .execute(
+                &aggregate_id,
+                MintCommand::ConfirmMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    fireblocks_tx_id: fireblocks_tx_id.clone(),
+                },
+            )
+            .await
+        {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = ?err,
+                "ConfirmMint command failed"
+            );
+            return;
+        }
+    } else {
+        let state = context.aggregate().state_name();
+        match context.aggregate() {
+            Mint::MintingFailed { .. } => {
+                // Submission failed (e.g., transient Fireblocks error).
+                // Recovery runs at startup via run_recovery_with_timeout.
+                // In the current design, no periodic recovery loop exists,
+                // so this mint will remain stuck until the next service restart.
+                warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                    %state,
+                    "Mint submission failed — recovery will retry on next restart"
+                );
+            }
+            Mint::CallbackPending { .. } | Mint::Completed { .. } => {
+                info!(target: "mint", issuer_request_id = %issuer_request_id,
+                    %state,
+                    "Aggregate already advanced by concurrent recovery — skipping"
+                );
+            }
+            _ => {
+                error!(target: "mint", issuer_request_id = %issuer_request_id,
+                    %state,
+                    "Unexpected aggregate state after SubmitMint — ConfirmMint skipped"
+                );
+            }
+        }
+        return;
+    }
+
+    // Step 4: Send callback to Alpaca
     if let Err(err) = cqrs
         .execute(
             &issuer_request_id.to_string(),

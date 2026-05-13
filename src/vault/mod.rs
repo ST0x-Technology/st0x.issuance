@@ -19,44 +19,36 @@ pub(crate) mod service;
 /// services or mocks for testing.
 #[async_trait]
 pub(crate) trait VaultService: Send + Sync {
-    /// Atomically mints tokens and transfers shares using the vault's multicall() function.
+    /// Submits a mint transaction (deposit + share transfer) to the signing backend.
     ///
-    /// This method implements the receipt custody model by:
-    /// 1. Minting both ERC1155 receipts and ERC20 shares to the bot's wallet
-    /// 2. Immediately transferring the ERC20 shares to the user's wallet
+    /// Encodes the multicall calldata and submits it via the backend (Fireblocks
+    /// CONTRACT_CALL or direct send). Returns a [`SubmittedTx`] whose
+    /// `fireblocks_tx_id` is persisted in a CQRS event so that `confirm_mint`
+    /// can resume polling after a restart.
     ///
-    /// Both operations succeed or fail atomically in a single transaction.
-    ///
-    /// # Arguments
-    ///
-    /// * `vault` - Address of the vault contract to interact with
-    /// * `assets` - Amount of assets to deposit (18-decimal fixed-point)
-    /// * `bot` - Bot's address that will hold the receipts
-    /// * `user` - User's address that will receive the shares
-    /// * `receipt_info` - Metadata about the mint operation for on-chain audit trail
-    ///
-    /// # Returns
-    ///
-    /// On success, returns [`MintResult`] containing transaction hash, receipt ID,
-    /// shares minted, gas used, and block number.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError`] if the multicall fails, events are missing,
-    /// or RPC communication fails.
-    ///
-    /// # Implementation Note
-    ///
-    /// This relies on the 1:1 share ratio (1 asset = 1 share with 18 decimals).
-    /// The transfer amount can be pre-calculated as equal to assets, allowing
-    /// the multicall to be encoded before execution.
-    async fn mint_and_transfer_shares(
+    /// Uses a deterministic `external_tx_id` so that resubmitting the same mint
+    /// after a crash triggers Fireblocks' duplicate rejection instead of a
+    /// double-mint.
+    async fn submit_mint(
         &self,
         vault: Address,
         assets: U256,
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
+    ) -> Result<SubmittedTx, VaultError>;
+
+    /// Confirms a previously submitted mint transaction.
+    ///
+    /// Polls the signing backend until the transaction reaches a terminal state,
+    /// then fetches the on-chain receipt and parses the Deposit event.
+    ///
+    /// # Arguments
+    ///
+    /// * `fireblocks_tx_id` - Backend transaction ID from [`SubmittedTx`]
+    async fn confirm_mint(
+        &self,
+        fireblocks_tx_id: &str,
     ) -> Result<MintResult, VaultError>;
 
     /// Gets the ERC-20 share balance for an address.
@@ -92,22 +84,28 @@ pub(crate) trait VaultService: Send + Sync {
         Ok(None)
     }
 
-    /// Atomically burns tokens from multiple receipts and returns dust using multicall.
+    /// Submits a multi-receipt burn transaction to the signing backend.
     ///
-    /// This method handles redemptions that require burning from multiple receipts
-    /// when no single receipt has sufficient balance. It uses multicall to atomically:
-    /// 1. Execute N redeem() calls, one for each receipt
-    /// 2. Transfer the dust back to the user's wallet (if dust > 0)
-    ///
-    /// All operations succeed or fail atomically in a single transaction.
-    ///
-    /// # Returns
-    ///
-    /// On success, returns [`MultiBurnResult`] containing transaction details
-    /// and per-receipt burn amounts.
-    async fn burn_multiple_receipts(
+    /// Encodes the multicall calldata (N redeems + optional dust transfer)
+    /// and submits it. Returns a [`SubmittedTx`] for later confirmation.
+    async fn submit_burn(
         &self,
         params: MultiBurnParams,
+    ) -> Result<SubmittedTx, VaultError>;
+
+    /// Confirms a previously submitted burn transaction.
+    ///
+    /// Polls the signing backend until completion, then parses Withdraw events.
+    ///
+    /// # Arguments
+    ///
+    /// * `fireblocks_tx_id` - Backend transaction ID from [`SubmittedTx`]
+    /// * `dust_shares` - Amount of dust to report as returned (passed through
+    ///   from the original request since it cannot be derived from on-chain events)
+    async fn confirm_burn(
+        &self,
+        fireblocks_tx_id: &str,
+        dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError>;
 }
 
@@ -179,6 +177,9 @@ pub(crate) struct MultiBurnParams {
     pub(crate) user: Address,
     /// Redemption's issuer request ID (for Fireblocks notes/externalTxId)
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    /// Full transaction hash that triggered this redemption, used for
+    /// constructing a collision-resistant Fireblocks `externalTxId`.
+    pub(crate) detected_tx_hash: B256,
 }
 
 /// Result of a single burn within a multi-receipt burn operation.
@@ -260,6 +261,22 @@ impl ReceiptInformation {
     }
 }
 
+/// Result of submitting a transaction to the signing backend.
+///
+/// Returned by `submit_mint` and `submit_burn`. The `fireblocks_tx_id` is
+/// persisted in an intermediate CQRS event so that `confirm_mint`/`confirm_burn`
+/// can resume polling after a restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SubmittedTx {
+    /// Deterministic ID used for Fireblocks idempotency (`externalTxId`).
+    /// Format: `{operation}-{issuer_request_id}`.
+    pub(crate) external_tx_id: String,
+    /// Backend-specific transaction identifier.
+    /// For Fireblocks: the Fireblocks transaction ID.
+    /// For local backends: the on-chain transaction hash.
+    pub(crate) fireblocks_tx_id: String,
+}
+
 /// Errors that can occur when encoding receipt information.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReceiptEncodeError {
@@ -287,6 +304,12 @@ pub(crate) enum VaultError {
     /// Failed to get transaction receipt
     #[error(transparent)]
     PendingTransaction(#[from] alloy::providers::PendingTransactionError),
+    /// RPC transport error (e.g., fetching receipt by tx hash during recovery)
+    #[error(transparent)]
+    Rpc(
+        #[from]
+        alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+    ),
     /// Fireblocks vault service error
     #[error(transparent)]
     Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
