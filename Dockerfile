@@ -17,12 +17,10 @@ COPY flake.nix flake.lock ./
 RUN nix develop --command echo "Nix dev env ready"
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/sqlite-es/Cargo.toml ./crates/sqlite-es/
 
-RUN mkdir -p src crates/sqlite-es/src && \
+RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
-    touch src/lib.rs && \
-    touch crates/sqlite-es/src/lib.rs
+    touch src/lib.rs
 
 RUN nix develop --command cargo chef prepare --recipe-path recipe.json
 
