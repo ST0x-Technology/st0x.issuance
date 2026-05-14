@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use st0x_issuance::test_utils::test_alpaca_legacy_auth;
 
-pub fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock {
+pub fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock<'_> {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
 
     mock_alpaca.mock(|when, then| {
@@ -29,7 +29,9 @@ pub struct RedemptionState {
     pub wallet_address: String,
 }
 
-pub fn setup_redemption_mocks(mock_alpaca: &MockServer) -> (Mock, Mock) {
+pub fn setup_redemption_mocks(
+    mock_alpaca: &MockServer,
+) -> (Mock<'_>, Mock<'_>) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_state = Arc::new(Mutex::new(Vec::<RedemptionState>::new()));
 

@@ -51,8 +51,9 @@ pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) enum MintView {
+    #[default]
     NotFound,
     Initiated {
         issuer_request_id: IssuerMintRequestId,
@@ -159,12 +160,6 @@ pub(crate) enum MintView {
         reason: String,
         closed_at: DateTime<Utc>,
     },
-}
-
-impl Default for MintView {
-    fn default() -> Self {
-        Self::NotFound
-    }
 }
 
 impl MintView {

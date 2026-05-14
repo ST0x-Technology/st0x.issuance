@@ -101,8 +101,9 @@ impl<'q> sqlx::Encode<'q, Sqlite> for ClientId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum Account {
+    #[default]
     NotRegistered,
     Registered {
         client_id: ClientId,
@@ -117,12 +118,6 @@ pub(crate) enum Account {
         registered_at: DateTime<Utc>,
         linked_at: DateTime<Utc>,
     },
-}
-
-impl Default for Account {
-    fn default() -> Self {
-        Self::NotRegistered
-    }
 }
 
 #[async_trait]

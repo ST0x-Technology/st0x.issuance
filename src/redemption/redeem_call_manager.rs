@@ -171,13 +171,11 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         let assets = list_enabled_assets(&self.pool).await?;
 
         for view in assets {
-            if let TokenizedAssetView::Asset {
-                underlying: u, network, ..
-            } = view
+            if let TokenizedAssetView::Asset { underlying: u, network, .. } =
+                view
+                && &u == underlying
             {
-                if &u == underlying {
-                    return Ok(network);
-                }
+                return Ok(network);
             }
         }
 

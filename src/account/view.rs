@@ -47,8 +47,9 @@ pub(crate) async fn replay_account_view(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) enum AccountView {
+    #[default]
     Unavailable,
     Registered {
         client_id: ClientId,
@@ -63,12 +64,6 @@ pub(crate) enum AccountView {
         registered_at: DateTime<Utc>,
         linked_at: DateTime<Utc>,
     },
-}
-
-impl Default for AccountView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 impl View<Account> for AccountView {

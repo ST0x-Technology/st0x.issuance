@@ -14,8 +14,9 @@ use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum RedemptionView {
+    #[default]
     Unavailable,
     Detected {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -96,12 +97,6 @@ pub(crate) enum RedemptionView {
         reason: String,
         closed_at: DateTime<Utc>,
     },
-}
-
-impl Default for RedemptionView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 impl RedemptionView {

@@ -152,7 +152,7 @@ fn setup_redemption_mocks_with_qty_capture(
     mock_alpaca: &MockServer,
     user_wallet: Address,
     captured_qty: Arc<Mutex<Option<String>>>,
-) -> (Mock, Mock) {
+) -> (Mock<'_>, Mock<'_>) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));

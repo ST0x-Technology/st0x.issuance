@@ -120,8 +120,9 @@ pub(crate) struct RedemptionMetadata {
     pub(crate) detected_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Redemption {
+    #[default]
     Uninitialized,
     Detected {
         metadata: RedemptionMetadata,
@@ -172,12 +173,6 @@ pub(crate) enum Redemption {
         reason: String,
         closed_at: DateTime<Utc>,
     },
-}
-
-impl Default for Redemption {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 /// Input parameters for the BurnTokens command handler.

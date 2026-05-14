@@ -58,8 +58,9 @@ pub(crate) async fn replay_tokenized_asset_view(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetView {
+    #[default]
     Unavailable,
     Asset {
         underlying: UnderlyingSymbol,
@@ -69,12 +70,6 @@ pub(crate) enum TokenizedAssetView {
         enabled: bool,
         added_at: DateTime<Utc>,
     },
-}
-
-impl Default for TokenizedAssetView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 impl View<TokenizedAsset> for TokenizedAssetView {

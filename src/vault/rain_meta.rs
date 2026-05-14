@@ -228,10 +228,10 @@ fn extract_optional_text(map: &[(Value, Value)], key: u64) -> Option<String> {
     let key_value = Value::Integer(key.into());
 
     for (map_key, map_val) in map {
-        if map_key == &key_value {
-            if let Value::Text(text) = map_val {
-                return Some(text.clone());
-            }
+        if map_key == &key_value
+            && let Value::Text(text) = map_val
+        {
+            return Some(text.clone());
         }
     }
 
@@ -482,10 +482,11 @@ fn parse_schema_hash_from_information(
             // Key 0 contains the IPFS CID string. The comma check filters
             // out multi-hash entries (comma-separated lists), matching the
             // behavior of h20liquidity/sft-tokenisation's getAssetClasses.
-            if let Some(hash) = extract_optional_text(map, KEY_PAYLOAD) {
-                if !hash.is_empty() && !hash.contains(',') {
-                    return Ok(Some(hash));
-                }
+            if let Some(hash) = extract_optional_text(map, KEY_PAYLOAD)
+                && !hash.is_empty()
+                && !hash.contains(',')
+            {
+                return Ok(Some(hash));
             }
         }
     }
@@ -805,7 +806,7 @@ mod tests {
     ///
     /// Run with: `cargo test fetch_schema_and_encode -- --ignored`
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live Base subgraph"]
     async fn fetch_schema_and_encode_receipt_via_live_subgraph() {
         let subgraph_url = Url::parse(
             "https://api.goldsky.com/api/public/\

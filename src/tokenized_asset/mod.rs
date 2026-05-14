@@ -61,8 +61,9 @@ impl Network {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum TokenizedAsset {
+    #[default]
     NotAdded,
     Added {
         underlying: UnderlyingSymbol,
@@ -72,12 +73,6 @@ pub(crate) enum TokenizedAsset {
         enabled: bool,
         added_at: DateTime<Utc>,
     },
-}
-
-impl Default for TokenizedAsset {
-    fn default() -> Self {
-        Self::NotAdded
-    }
 }
 
 #[async_trait]

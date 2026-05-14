@@ -98,7 +98,7 @@ fn setup_redemption_mocks_with_shared_state(
     shared_issuer_id: Arc<Mutex<Option<String>>>,
     shared_tx_hash: Arc<Mutex<Option<TxHash>>>,
     poll_should_succeed: Arc<AtomicBool>,
-) -> (Mock, Mock) {
+) -> (Mock<'_>, Mock<'_>) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
 
     let shared_issuer_id_clone = Arc::clone(&shared_issuer_id);

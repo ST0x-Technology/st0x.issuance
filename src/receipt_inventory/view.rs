@@ -29,8 +29,9 @@ pub(crate) enum ReceiptInventoryViewError {
 /// issue #25.
 ///
 /// View ID: `issuer_request_id` (the Mint aggregate's aggregate_id)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) enum ReceiptInventoryView {
+    #[default]
     Unavailable,
     Pending {
         underlying: UnderlyingSymbol,
@@ -51,12 +52,6 @@ pub(crate) enum ReceiptInventoryView {
         initial_amount: U256,
         depleted_at: DateTime<Utc>,
     },
-}
-
-impl Default for ReceiptInventoryView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 impl ReceiptInventoryView {

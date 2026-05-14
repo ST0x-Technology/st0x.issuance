@@ -350,83 +350,83 @@ async fn recover_post_alpaca(
 
     // If we have a Fireblocks tx ID from a previous BurningFailed event,
     // check whether the burn actually succeeded on-chain.
-    if let Some(ref bf_data) = burning_failed {
-        if let Some(ref fb_tx_id) = bf_data.fireblocks_tx_id {
-            match vault_service.check_fireblocks_tx(fb_tx_id).await {
-                Ok(Some(FireblocksTxStatus::Completed {
-                    tx_hash,
-                    block_number,
-                })) => {
-                    if bf_data.planned_burns.is_empty() {
-                        warn!(target: "admin", aggregate_id = %aggregate_id,
-                            fireblocks_tx_id = %fb_tx_id,
-                            tx_hash = ?tx_hash,
-                            "Pre-enrichment BurningFailed event has no planned_burns — \
-                             burn records will be empty. Manual receipt inventory \
-                             reconciliation may be needed after recovery."
-                        );
-                    }
-
-                    info!(target: "admin", aggregate_id = %aggregate_id,
+    if let Some(ref bf_data) = burning_failed
+        && let Some(ref fb_tx_id) = bf_data.fireblocks_tx_id
+    {
+        match vault_service.check_fireblocks_tx(fb_tx_id).await {
+            Ok(Some(FireblocksTxStatus::Completed {
+                tx_hash,
+                block_number,
+            })) => {
+                if bf_data.planned_burns.is_empty() {
+                    warn!(target: "admin", aggregate_id = %aggregate_id,
                         fireblocks_tx_id = %fb_tx_id,
                         tx_hash = ?tx_hash,
-                        "Fireblocks tx already completed on-chain, recording existing burn"
+                        "Pre-enrichment BurningFailed event has no planned_burns — \
+                         burn records will be empty. Manual receipt inventory \
+                         reconciliation may be needed after recovery."
                     );
+                }
 
-                    cqrs.execute(
-                        &aggregate_id,
-                        RedemptionCommand::RecordExistingBurn {
-                            issuer_request_id: issuer_request_id.clone(),
-                            fireblocks_tx_id: fb_tx_id.clone(),
-                            tx_hash,
-                            planned_burns: bf_data.planned_burns.clone(),
-                            block_number,
-                        },
-                    )
-                    .await
-                    .map_err(|err| {
-                        error!(target: "admin", aggregate_id = %aggregate_id,
-                            error = %err,
-                            "Failed to record existing burn"
-                        );
-                        map_redemption_error(&err)
-                    })?;
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    fireblocks_tx_id = %fb_tx_id,
+                    tx_hash = ?tx_hash,
+                    "Fireblocks tx already completed on-chain, recording existing burn"
+                );
 
-                    return Ok(Json(ReprocessResponse {
-                        aggregate_type: AggregateKind::Redemption,
-                        aggregate_id: aggregate_id.to_string(),
-                        previous_state: "Failed".to_string(),
-                        message:
-                            "Existing on-chain burn recorded via Fireblocks tx lookup"
-                                .to_string(),
-                    }));
-                }
-                Ok(Some(FireblocksTxStatus::Pending)) => {
-                    info!(target: "admin", aggregate_id = %aggregate_id,
-                        fireblocks_tx_id = %fb_tx_id,
-                        "Fireblocks tx still pending, cannot recover yet"
-                    );
-                    return Err(Status::UnprocessableEntity);
-                }
-                Ok(Some(FireblocksTxStatus::Failed { detail: fb_detail })) => {
-                    info!(target: "admin", aggregate_id = %aggregate_id,
-                        fireblocks_tx_id = %fb_tx_id,
-                        fireblocks_status = %fb_detail,
-                        "Fireblocks tx failed, proceeding with ResumeBurn"
-                    );
-                    // Fall through to ResumeBurn below
-                }
-                Ok(None) => {
-                    // Non-Fireblocks backend, fall through to ResumeBurn
-                }
-                Err(err) => {
+                cqrs.execute(
+                    &aggregate_id,
+                    RedemptionCommand::RecordExistingBurn {
+                        issuer_request_id: issuer_request_id.clone(),
+                        fireblocks_tx_id: fb_tx_id.clone(),
+                        tx_hash,
+                        planned_burns: bf_data.planned_burns.clone(),
+                        block_number,
+                    },
+                )
+                .await
+                .map_err(|err| {
                     error!(target: "admin", aggregate_id = %aggregate_id,
-                        fireblocks_tx_id = %fb_tx_id,
                         error = %err,
-                        "Failed to check Fireblocks tx status"
+                        "Failed to record existing burn"
                     );
-                    return Err(Status::BadGateway);
-                }
+                    map_redemption_error(&err)
+                })?;
+
+                return Ok(Json(ReprocessResponse {
+                    aggregate_type: AggregateKind::Redemption,
+                    aggregate_id: aggregate_id.clone(),
+                    previous_state: "Failed".to_string(),
+                    message:
+                        "Existing on-chain burn recorded via Fireblocks tx lookup"
+                            .to_string(),
+                }));
+            }
+            Ok(Some(FireblocksTxStatus::Pending)) => {
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    fireblocks_tx_id = %fb_tx_id,
+                    "Fireblocks tx still pending, cannot recover yet"
+                );
+                return Err(Status::UnprocessableEntity);
+            }
+            Ok(Some(FireblocksTxStatus::Failed { detail: fb_detail })) => {
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    fireblocks_tx_id = %fb_tx_id,
+                    fireblocks_status = %fb_detail,
+                    "Fireblocks tx failed, proceeding with ResumeBurn"
+                );
+                // Fall through to ResumeBurn below
+            }
+            Ok(None) => {
+                // Non-Fireblocks backend, fall through to ResumeBurn
+            }
+            Err(err) => {
+                error!(target: "admin", aggregate_id = %aggregate_id,
+                    fireblocks_tx_id = %fb_tx_id,
+                    error = %err,
+                    "Failed to check Fireblocks tx status"
+                );
+                return Err(Status::BadGateway);
             }
         }
     }
@@ -466,7 +466,7 @@ async fn recover_post_alpaca(
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Redemption,
-        aggregate_id: aggregate_id.to_string(),
+        aggregate_id: aggregate_id.clone(),
         previous_state: "Failed".to_string(),
         message:
             "Recovered to Burning — burn will execute on next service restart"

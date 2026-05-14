@@ -87,8 +87,9 @@ impl std::fmt::Display for IssuerMintRequestId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum Mint {
+    #[default]
     Uninitialized,
     Initiated {
         issuer_request_id: IssuerMintRequestId,
@@ -191,7 +192,7 @@ pub(crate) enum Mint {
         /// The state the mint was in before it failed. Used to determine
         /// whether receipt-triggered recovery is safe (only when failed
         /// from `Minting`, meaning a tx was actually submitted).
-        failed_from: Box<Mint>,
+        failed_from: Box<Self>,
     },
     Completed {
         issuer_request_id: IssuerMintRequestId,
@@ -217,12 +218,6 @@ pub(crate) enum Mint {
         reason: String,
         closed_at: DateTime<Utc>,
     },
-}
-
-impl Default for Mint {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 /// Groups mint submission parameters to keep `execute_mint_submission` under
