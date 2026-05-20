@@ -14,7 +14,7 @@ use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, MintCommand, MintEvent, MintView,
     TokenizationRequestId, find_all_recoverable_mints,
-    find_by_issuer_request_id,
+    find_by_issuer_request_id, recovery::spawn_scheduled_mint_recovery,
 };
 use crate::redemption::{
     BurnRecord, IssuerRedemptionRequestId, RedemptionCommand, RedemptionError,
@@ -556,11 +556,12 @@ pub(crate) async fn close_redemption(
     }))
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool))]
+#[tracing::instrument(skip(_auth, cqrs, event_store, pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
     cqrs: &rocket::State<MintCqrs>,
+    event_store: &rocket::State<MintEventStore>,
     pool: &rocket::State<Pool<Sqlite>>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -600,7 +601,10 @@ pub(crate) async fn reprocess_mint(
 
     cqrs.execute(
         aggregate_id,
-        MintCommand::Recover { issuer_request_id: issuer_request_id.clone() },
+        MintCommand::Recover {
+            issuer_request_id: issuer_request_id.clone(),
+            mode: crate::mint::MintRecoveryMode::Manual,
+        },
     )
     .await
     .map_err(|err| {
@@ -617,6 +621,16 @@ pub(crate) async fn reprocess_mint(
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
         "Mint reprocessed successfully"
+    );
+
+    // A single manual Recover advances the mint by one step (e.g. submits the
+    // next retry, leaving it in FireblocksSubmitted). Hand it to a background
+    // scheduled-recovery task so it is driven to completion instead of
+    // stalling until the next restart or another manual reprocess.
+    spawn_scheduled_mint_recovery(
+        cqrs.inner().clone(),
+        event_store.inner().clone(),
+        issuer_request_id,
     );
 
     Ok(Json(ReprocessResponse {
@@ -1670,6 +1684,7 @@ mod tests {
             _bot: alloy::primitives::Address,
             _user: alloy::primitives::Address,
             _receipt_info: crate::vault::ReceiptInformation,
+            _external_tx_id: Option<String>,
         ) -> Result<crate::vault::SubmittedTx, crate::vault::VaultError>
         {
             unimplemented!("not used in enrichment tests")

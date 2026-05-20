@@ -19,7 +19,10 @@ use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
     Mint, MintServices, MintView, find_all_recoverable_mints,
-    recovery::{MintRecoveryHandler, recover_mint},
+    recovery::{
+        DriveOutcome, MintRecoveryHandler, recover_mint,
+        spawn_scheduled_mint_recovery,
+    },
     replay_mint_view,
 };
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
@@ -324,11 +327,16 @@ pub async fn initialize_rocket(
         );
     }
 
-    // Recovery runs with a timeout before the HTTP server starts. If it
-    // completes within the timeout, there is no race with incoming requests.
-    // If it hangs (e.g., Fireblocks call), it is cancelled and stuck
-    // aggregates are left for manual admin intervention.
-    run_recovery_with_timeout(&pool, &mint.cqrs, &managers).await;
+    // The synchronous recovery pass runs with a timeout before the HTTP server
+    // starts. Mints that need deferred or pending follow-up are handed to
+    // detached background scheduled-recovery tasks that intentionally outlive
+    // this timeout and run concurrently with request handling; their safety
+    // rests on cqrs-es optimistic concurrency and Fireblocks externalTxId
+    // idempotency, not on completing before the server is up. If the
+    // synchronous pass hangs it is cancelled and any remaining stuck aggregates
+    // are left for manual admin intervention.
+    run_recovery_with_timeout(&pool, &mint.cqrs, &mint.event_store, &managers)
+        .await;
 
     spawn_periodic_receipt_backfills(
         pool.clone(),
@@ -606,7 +614,11 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
-async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_cqrs: &MintCqrs) {
+async fn run_mint_recovery(
+    pool: &Pool<Sqlite>,
+    mint_cqrs: &MintCqrs,
+    mint_event_store: &MintEventStore,
+) {
     info!(target: "mint", "Running mint recovery");
 
     let recoverable_mints = match find_all_recoverable_mints(pool).await {
@@ -626,7 +638,25 @@ async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_cqrs: &MintCqrs) {
     debug!(target: "mint", count, "Recovering mints");
 
     for (issuer_request_id, _view) in recoverable_mints {
-        recover_mint(mint_cqrs, issuer_request_id).await;
+        // Drive one synchronous pass so mints that can finish immediately
+        // (e.g. an on-chain receipt already exists) complete before the HTTP
+        // server starts. If the pass does not reach a terminal/exhausted state
+        // — waiting on a retry window, a pending Fireblocks tx, or a transient
+        // failure — hand the mint to a background scheduled-recovery task so it
+        // keeps progressing while the service runs instead of waiting for the
+        // next restart.
+        match recover_mint(mint_cqrs, issuer_request_id.clone()).await {
+            DriveOutcome::RetryNotDue
+            | DriveOutcome::Pending
+            | DriveOutcome::Failed => {
+                spawn_scheduled_mint_recovery(
+                    mint_cqrs.clone(),
+                    mint_event_store.clone(),
+                    issuer_request_id,
+                );
+            }
+            DriveOutcome::Done | DriveOutcome::Exhausted => {}
+        }
     }
 
     debug!(target: "mint", count, "Mint recovery complete");
@@ -666,10 +696,11 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 async fn run_recovery_with_timeout(
     pool: &Pool<Sqlite>,
     mint_cqrs: &MintCqrs,
+    mint_event_store: &MintEventStore,
     managers: &RedemptionManagers,
 ) {
     let recovery = async {
-        run_mint_recovery(pool, mint_cqrs).await;
+        run_mint_recovery(pool, mint_cqrs, mint_event_store).await;
         run_redemption_recovery(
             &managers.redeem_call,
             &managers.journal,

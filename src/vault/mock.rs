@@ -163,6 +163,7 @@ impl VaultService for MockVaultService {
         bot: Address,
         _user: Address,
         receipt_info: ReceiptInformation,
+        external_tx_id: Option<String>,
     ) -> Result<SubmittedTx, VaultError> {
         #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitFailure) {
@@ -211,7 +212,8 @@ impl VaultService for MockVaultService {
         });
 
         Ok(SubmittedTx {
-            external_tx_id: "mock-mint".to_string(),
+            external_tx_id: external_tx_id
+                .unwrap_or_else(|| "mock-mint".to_string()),
             fireblocks_tx_id: "mock-fb-mint".to_string(),
         })
     }
@@ -411,7 +413,14 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let submitted = mock
-            .submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
+            .submit_mint(
+                vault,
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+                None,
+            )
             .await
             .unwrap();
 
@@ -438,7 +447,14 @@ mod tests {
 
         // Submit always succeeds
         let submitted = mock
-            .submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
+            .submit_mint(
+                vault,
+                assets,
+                bot_wallet,
+                user_wallet,
+                receipt_info,
+                None,
+            )
             .await
             .unwrap();
 
@@ -464,6 +480,7 @@ mod tests {
             bot_wallet,
             user_wallet,
             test_receipt_info(),
+            None,
         )
         .await
         .unwrap();
@@ -488,6 +505,7 @@ mod tests {
             bot_wallet,
             user_wallet,
             receipt_info.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -517,9 +535,16 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let start = tokio::time::Instant::now();
-        mock.submit_mint(vault, assets, bot_wallet, user_wallet, receipt_info)
-            .await
-            .unwrap();
+        mock.submit_mint(
+            vault,
+            assets,
+            bot_wallet,
+            user_wallet,
+            receipt_info,
+            None,
+        )
+        .await
+        .unwrap();
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() >= u128::from(delay_ms));
@@ -541,6 +566,7 @@ mod tests {
             bot_wallet,
             user_wallet,
             receipt_info.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -627,6 +653,7 @@ mod tests {
                 test_receiver(),
                 address!("0x1111111111111111111111111111111111111111"),
                 test_receipt_info(),
+                None,
             )
             .await;
 

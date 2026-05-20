@@ -70,6 +70,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
+        external_tx_id: Option<String>,
     ) -> Result<SubmittedTx, VaultError> {
         let oa_schema = self.oa_schema_cache.get(vault).await;
         let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
@@ -135,10 +136,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         self.cached_mints.lock().await.insert(tx_hash_str.clone(), result);
 
         Ok(SubmittedTx {
-            external_tx_id: format!(
-                "local-mint-{}",
-                receipt_info.issuer_request_id
-            ),
+            external_tx_id: external_tx_id.unwrap_or_else(|| {
+                format!("local-mint-{}", receipt_info.issuer_request_id)
+            }),
             fireblocks_tx_id: tx_hash_str,
         })
     }
@@ -582,6 +582,7 @@ mod tests {
                 bot_wallet,
                 user_wallet,
                 receipt_info,
+                None,
             )
             .await;
 
@@ -678,6 +679,7 @@ mod tests {
                 bot_wallet,
                 user_wallet,
                 receipt_info,
+                None,
             )
             .await;
 

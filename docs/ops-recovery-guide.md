@@ -96,8 +96,14 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
   http://localhost:8000/admin/reprocess/mint/<aggregate_id> | python3 -m json.tool
 ```
 
-This retries the on-chain deposit + Alpaca callback inline (no restart needed).
-A 409 Conflict response means it already completed — no action needed.
+This retries recovery inline (no restart needed). If the previous Fireblocks
+mint transaction terminally failed, manual reprocess submits the next
+deterministic retry transaction even after automatic retries are exhausted, and
+hands the mint to a background task that drives that submitted transaction
+through confirmation. A single reprocess is usually enough. The exception is a
+retry submitted past the automatic cap (e.g. `retry-5`): if that transaction
+also fails, the background task is exhausted and gives up, so you must reprocess
+again. A 409 Conflict response means it already completed — no action needed.
 
 ### Recovering redemptions
 

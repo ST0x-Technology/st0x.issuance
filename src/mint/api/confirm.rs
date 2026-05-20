@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use crate::auth::IssuerAuth;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
+    recovery::spawn_scheduled_mint_recovery,
 };
 use crate::{MintCqrs, MintEventStore};
 
@@ -204,13 +205,14 @@ async fn process_journal_completion(
         let state = context.aggregate().state_name();
         match context.aggregate() {
             Mint::MintingFailed { .. } => {
-                // Submission failed (e.g., transient Fireblocks error).
-                // Recovery runs at startup via run_recovery_with_timeout.
-                // In the current design, no periodic recovery loop exists,
-                // so this mint will remain stuck until the next service restart.
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     %state,
-                    "Mint submission failed — recovery will retry on next restart"
+                    "Mint submission failed — scheduling automatic recovery"
+                );
+                spawn_scheduled_mint_recovery(
+                    cqrs,
+                    event_store,
+                    issuer_request_id,
                 );
             }
             Mint::CallbackPending { .. } | Mint::Completed { .. } => {
@@ -229,7 +231,42 @@ async fn process_journal_completion(
         return;
     }
 
-    // Step 4: Send callback to Alpaca
+    let context = match event_store.load_aggregate(&aggregate_id).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = ?err,
+                "Failed to load aggregate after ConfirmMint"
+            );
+            return;
+        }
+    };
+
+    match context.aggregate() {
+        Mint::MintingFailed { .. } => {
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                "Mint confirmation failed — scheduling automatic recovery"
+            );
+            spawn_scheduled_mint_recovery(cqrs, event_store, issuer_request_id);
+            return;
+        }
+        Mint::CallbackPending { .. } => {}
+        Mint::Completed { .. } => {
+            info!(target: "mint", issuer_request_id = %issuer_request_id,
+                "Mint already completed by recovery"
+            );
+            return;
+        }
+        state => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                state = %state.state_name(),
+                "Unexpected aggregate state after ConfirmMint"
+            );
+            return;
+        }
+    }
+
+    // Step 4: Send callback to Alpaca.
     if let Err(err) = cqrs
         .execute(
             &issuer_request_id.to_string(),

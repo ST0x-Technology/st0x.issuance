@@ -616,6 +616,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
+        external_tx_id: Option<String>,
     ) -> Result<SubmittedTx, VaultError> {
         let oa_schema = self.oa_schema_cache.get(vault).await;
         let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
@@ -651,8 +652,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             receipt_info.issuer_request_id,
         );
 
-        let external_tx_id = VaultOperation::Mint
-            .external_tx_id(&receipt_info.issuer_request_id);
+        let external_tx_id = external_tx_id.unwrap_or_else(|| {
+            VaultOperation::Mint.external_tx_id(&receipt_info.issuer_request_id)
+        });
 
         let fireblocks_tx_id = self
             .submit_contract_call(

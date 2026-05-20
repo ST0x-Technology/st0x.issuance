@@ -36,6 +36,7 @@ pub(crate) trait VaultService: Send + Sync {
         bot: Address,
         user: Address,
         receipt_info: ReceiptInformation,
+        external_tx_id: Option<String>,
     ) -> Result<SubmittedTx, VaultError>;
 
     /// Confirms a previously submitted mint transaction.

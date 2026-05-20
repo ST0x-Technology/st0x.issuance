@@ -6,7 +6,7 @@ mod view;
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
@@ -23,12 +23,14 @@ use crate::receipt_inventory::{
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{ReceiptInformation, VaultService};
+use crate::vault::{
+    FireblocksTxStatus, ReceiptInformation, VaultError, VaultService,
+};
 
 pub use api::MintResponse;
 
 pub(crate) use api::{confirm_journal, initiate_mint};
-pub(crate) use cmd::MintCommand;
+pub(crate) use cmd::{MintCommand, MintRecoveryMode};
 pub(crate) use event::MintEvent;
 pub(crate) use view::{
     MintView, find_all_recoverable_mints, find_by_issuer_request_id,
@@ -189,6 +191,24 @@ pub(crate) enum Mint {
         journal_confirmed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
+        /// 1-indexed attempt number of the *next* retry, driving the automatic
+        /// delay schedule and exhaustion cap. Unlike the `external_tx_id`-
+        /// derived attempt (see `next_retry_attempt`), this advances on every
+        /// failure — including submission failures that never reached Fireblocks
+        /// (no `FireblocksSubmitted` predecessor) — so the schedule still
+        /// escalates and eventually exhausts. The `external_tx_id` is derived
+        /// separately and is reused unchanged across such failures to stay
+        /// idempotent.
+        ///
+        /// Note: when a submission finally lands after pre-acceptance failures,
+        /// the next failure re-seeds this from the new `FireblocksSubmitted`
+        /// predecessor's retry number, which can lower it (the delay schedule
+        /// then runs longer than the nominal 1m/10m/30m/1h). This only affects
+        /// schedule *duration*; the number of distinct on-chain mint
+        /// transactions stays hard-capped at four because `external_tx_id`
+        /// (and thus a new `FireblocksSubmitted`) advances only on a successful
+        /// submission. So there is no double-mint and no cap breach.
+        attempts: u32,
         /// The state the mint was in before it failed. Used to determine
         /// whether receipt-triggered recovery is safe (only when failed
         /// from `Minting`, meaning a tx was actually submitted).
@@ -230,9 +250,27 @@ struct MintSubmissionInput<'a> {
     wallet: Address,
     journal_confirmed_at: DateTime<Utc>,
     receipt_note: Option<&'a str>,
+    external_tx_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct KnownMintTx {
+    external_tx_id: String,
+    fireblocks_tx_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutomaticRetryDecision {
+    Ready,
+    Wait(std::time::Duration),
+    Exhausted,
+    NotRecoverable,
 }
 
 impl Mint {
+    pub(crate) const MAX_AUTOMATIC_MINT_RETRY_ATTEMPT: u32 = 4;
+    const RETRY_EXTERNAL_TX_MARKER: &'static str = "-retry-";
+
     const fn state_name(&self) -> &'static str {
         match self {
             Self::Uninitialized => "Uninitialized",
@@ -257,6 +295,109 @@ impl Mint {
             }
             _ => self,
         }
+    }
+
+    fn latest_known_mint_tx(&self) -> Option<KnownMintTx> {
+        match self.non_failed_predecessor() {
+            Self::FireblocksSubmitted {
+                external_tx_id,
+                fireblocks_tx_id,
+                ..
+            } => Some(KnownMintTx {
+                external_tx_id: external_tx_id.clone(),
+                fireblocks_tx_id: fireblocks_tx_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The Fireblocks transaction id currently in flight for this mint (the
+    /// latest `FireblocksSubmitted`, whether the aggregate is in that state or
+    /// `MintingFailed` with it as the non-failed predecessor). `None` when no
+    /// transaction has reached Fireblocks. Used by the scheduled-recovery loop
+    /// to give each distinct transaction its own pending-poll budget.
+    pub(crate) fn pending_fireblocks_tx_id(&self) -> Option<String> {
+        self.latest_known_mint_tx().map(|known| known.fireblocks_tx_id)
+    }
+
+    fn base_mint_external_tx_id(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> String {
+        format!("mint-{issuer_request_id}")
+    }
+
+    fn retry_mint_external_tx_id(
+        issuer_request_id: &IssuerMintRequestId,
+        attempt: u32,
+    ) -> String {
+        format!(
+            "{}{}{}",
+            Self::base_mint_external_tx_id(issuer_request_id),
+            Self::RETRY_EXTERNAL_TX_MARKER,
+            attempt,
+        )
+    }
+
+    fn retry_attempt_from_external_tx_id(external_tx_id: &str) -> Option<u32> {
+        external_tx_id
+            .rsplit_once(Self::RETRY_EXTERNAL_TX_MARKER)
+            .and_then(|(_, attempt)| attempt.parse().ok())
+    }
+
+    /// Attempt number for the *next* retry's `external_tx_id`, derived from the
+    /// latest persisted `FireblocksSubmitted` predecessor. Stays unchanged when
+    /// a submission fails before Fireblocks accepts it (no new
+    /// `FireblocksSubmitted`), so the deterministic id is reused and Fireblocks
+    /// dedupes — keeping retries idempotent. The delay/exhaustion schedule uses
+    /// the separate `MintingFailed::attempts` counter instead.
+    fn next_retry_attempt(&self) -> u32 {
+        self.latest_known_mint_tx()
+            .and_then(|known| {
+                Self::retry_attempt_from_external_tx_id(&known.external_tx_id)
+            })
+            .unwrap_or(0)
+            + 1
+    }
+
+    const fn automatic_retry_delay(attempt: u32) -> Option<ChronoDuration> {
+        match attempt {
+            1 => Some(ChronoDuration::minutes(1)),
+            2 => Some(ChronoDuration::minutes(10)),
+            3 => Some(ChronoDuration::minutes(30)),
+            4 => Some(ChronoDuration::hours(1)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn automatic_retry_decision(
+        &self,
+        now: DateTime<Utc>,
+    ) -> AutomaticRetryDecision {
+        let Self::MintingFailed { failed_at, attempts, .. } = self else {
+            return match self {
+                Self::JournalConfirmed { .. }
+                | Self::Minting { .. }
+                | Self::FireblocksSubmitted { .. }
+                | Self::CallbackPending { .. } => AutomaticRetryDecision::Ready,
+                _ => AutomaticRetryDecision::NotRecoverable,
+            };
+        };
+
+        if *attempts > Self::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT {
+            return AutomaticRetryDecision::Exhausted;
+        }
+
+        let Some(delay) = Self::automatic_retry_delay(*attempts) else {
+            return AutomaticRetryDecision::Exhausted;
+        };
+        let retry_at = *failed_at + delay;
+        if now >= retry_at {
+            return AutomaticRetryDecision::Ready;
+        }
+
+        (retry_at - now)
+            .to_std()
+            .map_or(AutomaticRetryDecision::Ready, AutomaticRetryDecision::Wait)
     }
 
     pub(crate) const fn tokenization_request_id(
@@ -390,6 +531,7 @@ impl Mint {
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: None,
+                external_tx_id: None,
             },
         )
         .await?;
@@ -411,6 +553,7 @@ impl Mint {
             wallet,
             journal_confirmed_at,
             receipt_note,
+            external_tx_id,
         } = input;
         let vault = find_vault_by_underlying(&services.pool, underlying)
             .await?
@@ -433,7 +576,14 @@ impl Mint {
 
         match services
             .vault
-            .submit_mint(vault, assets, services.bot, wallet, receipt_info)
+            .submit_mint(
+                vault,
+                assets,
+                services.bot,
+                wallet,
+                receipt_info,
+                external_tx_id,
+            )
             .await
         {
             Ok(submitted) => {
@@ -647,6 +797,7 @@ impl Mint {
         &self,
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
+        mode: MintRecoveryMode,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::JournalConfirmed { .. } => {
@@ -655,6 +806,22 @@ impl Mint {
                 self.handle_deposit(issuer_request_id)
             }
             Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+                // Non-blocking pre-check: a pending tx must pause recovery (so
+                // the scheduled loop backs off) instead of blocking in
+                // confirm_mint's long poll, which the bounded startup recovery
+                // would cancel before any follow-up is scheduled.
+                if matches!(
+                    services
+                        .vault
+                        .check_fireblocks_tx(fireblocks_tx_id)
+                        .await?,
+                    Some(FireblocksTxStatus::Pending)
+                ) {
+                    return Err(MintError::FireblocksTxStillPending {
+                        fireblocks_tx_id: fireblocks_tx_id.clone(),
+                    });
+                }
+
                 let deposit_events = self
                     .handle_confirm_mint(
                         services,
@@ -670,21 +837,18 @@ impl Mint {
                 .await
             }
             Self::MintingFailed { .. } => {
-                // Extract the fireblocks_tx_id from the predecessor if
-                // the tx was already submitted (avoids resubmission).
-                let known_tx_id = match self.non_failed_predecessor() {
-                    Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-                        Some(fireblocks_tx_id.clone())
-                    }
-                    _ => None,
-                };
+                // Preserve the previous Fireblocks tx so recovery can
+                // distinguish pending/completed transactions from terminal
+                // failures that are safe to resubmit.
+                let known_tx = self.latest_known_mint_tx();
 
                 let deposit_events = self
                     .handle_recover_incomplete(
                         services,
                         issuer_request_id.clone(),
                         None,
-                        known_tx_id,
+                        known_tx,
+                        mode,
                     )
                     .await?;
                 self.advance_through_callback(
@@ -701,6 +865,7 @@ impl Mint {
                         issuer_request_id.clone(),
                         None,
                         None,
+                        mode,
                     )
                     .await?;
                 self.advance_through_callback(
@@ -741,19 +906,15 @@ impl Mint {
                     Self::Minting { .. } | Self::FireblocksSubmitted { .. }
                 ) =>
             {
-                let known_tx_id = match self.non_failed_predecessor() {
-                    Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-                        Some(fireblocks_tx_id.clone())
-                    }
-                    _ => None,
-                };
+                let known_tx = self.latest_known_mint_tx();
 
                 let deposit_events = self
                     .handle_recover_incomplete(
                         services,
                         issuer_request_id.clone(),
                         Some(tx_hash),
-                        known_tx_id,
+                        known_tx,
+                        MintRecoveryMode::Manual,
                     )
                     .await?;
                 self.advance_through_callback(
@@ -833,7 +994,8 @@ impl Mint {
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
         receipt_tx_hash: Option<TxHash>,
-        known_fireblocks_tx_id: Option<String>,
+        known_mint_tx: Option<KnownMintTx>,
+        mode: MintRecoveryMode,
     ) -> Result<Vec<MintEvent>, MintError> {
         let (Self::Minting {
             issuer_request_id: expected_id,
@@ -887,25 +1049,68 @@ impl Mint {
         );
 
         let now = Utc::now();
-        let retry_event =
-            matches!(self, Self::MintingFailed { .. }).then(|| {
-                MintEvent::MintRetryStarted {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tx_hash: receipt_tx_hash,
-                    started_at: now,
-                }
-            });
 
-        if let Some(tx_id) = known_fireblocks_tx_id {
+        if let Some(known_tx) = known_mint_tx {
             // Known tx_id from a prior submission: go straight to confirm.
             info!(
                 target: "mint",
                 issuer_request_id = %issuer_request_id,
-                fireblocks_tx_id = %tx_id,
+                fireblocks_tx_id = %known_tx.fireblocks_tx_id,
                 "Resuming confirmation of previously submitted mint"
             );
 
-            return match services.vault.confirm_mint(&tx_id).await {
+            if let Some(status) = services
+                .vault
+                .check_fireblocks_tx(&known_tx.fireblocks_tx_id)
+                .await?
+            {
+                match status {
+                    FireblocksTxStatus::Completed { .. } => {}
+                    FireblocksTxStatus::Pending => {
+                        return Err(MintError::FireblocksTxStillPending {
+                            fireblocks_tx_id: known_tx.fireblocks_tx_id,
+                        });
+                    }
+                    FireblocksTxStatus::Failed {
+                        detail, sub_status, ..
+                    } => {
+                        warn!(
+                            target: "mint",
+                            issuer_request_id = %issuer_request_id,
+                            fireblocks_tx_id = %known_tx.fireblocks_tx_id,
+                            external_tx_id = %known_tx.external_tx_id,
+                            sub_status = sub_status.as_deref().unwrap_or(""),
+                            detail = %detail,
+                            "Previous Fireblocks mint transaction failed; \
+                             submitting retry"
+                        );
+
+                        return self
+                            .submit_recovery_mint(
+                                services,
+                                MintSubmissionInput {
+                                    issuer_request_id,
+                                    tokenization_request_id,
+                                    quantity,
+                                    underlying,
+                                    wallet: *wallet,
+                                    journal_confirmed_at: *journal_confirmed_at,
+                                    receipt_note: Some("Recovery mint"),
+                                    external_tx_id: None,
+                                },
+                                receipt_tx_hash,
+                                mode,
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            return match services
+                .vault
+                .confirm_mint(&known_tx.fireblocks_tx_id)
+                .await
+            {
                 Ok(result) => {
                     info!(
                         target: "mint",
@@ -938,6 +1143,15 @@ impl Mint {
                              (monitor/backfill will discover it)"
                         );
                     }
+
+                    let retry_event =
+                        matches!(self, Self::MintingFailed { .. }).then(|| {
+                            MintEvent::MintRetryStarted {
+                                issuer_request_id: issuer_request_id.clone(),
+                                tx_hash: receipt_tx_hash,
+                                started_at: now,
+                            }
+                        });
 
                     let minted = MintEvent::TokensMinted {
                         issuer_request_id,
@@ -980,7 +1194,7 @@ impl Mint {
         // No prior tx_id: submit and persist FireblocksSubmitted.
         // Don't confirm here — let the next recovery pass handle
         // ConfirmMint from the FireblocksSubmitted state.
-        let submission_event = Self::execute_mint_submission(
+        self.submit_recovery_mint(
             services,
             MintSubmissionInput {
                 issuer_request_id,
@@ -990,9 +1204,75 @@ impl Mint {
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: Some("Recovery mint"),
+                external_tx_id: None,
             },
+            receipt_tx_hash,
+            mode,
         )
-        .await?;
+        .await
+    }
+
+    async fn submit_recovery_mint(
+        &self,
+        services: &MintServices,
+        mut input: MintSubmissionInput<'_>,
+        receipt_tx_hash: Option<TxHash>,
+        mode: MintRecoveryMode,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let retrying_failed_mint = matches!(self, Self::MintingFailed { .. });
+        // The delay/cap gate uses the failure-count-based schedule
+        // (`automatic_retry_decision`); the external_tx_id uses the
+        // FireblocksSubmitted-derived attempt so it is reused unchanged across
+        // submission failures (Fireblocks dedupes — keeps retries idempotent).
+        if retrying_failed_mint && matches!(mode, MintRecoveryMode::Automatic) {
+            let now = Utc::now();
+            match self.automatic_retry_decision(now) {
+                AutomaticRetryDecision::Exhausted => {
+                    return Err(MintError::AutomaticRetriesExhausted {
+                        attempts: Self::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT,
+                    });
+                }
+                AutomaticRetryDecision::Wait(wait) => {
+                    let retry_at = now
+                        + ChronoDuration::from_std(wait)
+                            .map_err(|_| MintError::RetryDelayOutOfRange)?;
+                    return Err(MintError::RetryNotDue { retry_at });
+                }
+                AutomaticRetryDecision::Ready
+                | AutomaticRetryDecision::NotRecoverable => {}
+            }
+        }
+
+        let now = Utc::now();
+        let external_attempt = self.next_retry_attempt();
+        let issuer_request_id = input.issuer_request_id.clone();
+        let external_tx_id = retrying_failed_mint.then(|| {
+            Self::retry_mint_external_tx_id(
+                &issuer_request_id,
+                external_attempt,
+            )
+        });
+        input.external_tx_id = external_tx_id;
+
+        let submission_event =
+            Self::execute_mint_submission(services, input).await?;
+
+        // Only record MintRetryStarted alongside a *successful* submission.
+        // execute_mint_submission returns Ok(MintingFailed) when the backend
+        // rejects the submission; emitting MintRetryStarted in that case would
+        // move the aggregate MintingFailed -> Minting, discarding the
+        // FireblocksSubmitted predecessor (its fireblocks_tx_id and the retry
+        // counter derived from external_tx_id). Re-emitting only the failure
+        // keeps the predecessor chain intact for the next retry.
+        let retry_event = matches!(
+            (retrying_failed_mint, &submission_event),
+            (true, MintEvent::FireblocksSubmitted { .. })
+        )
+        .then(|| MintEvent::MintRetryStarted {
+            issuer_request_id,
+            tx_hash: receipt_tx_hash,
+            started_at: now,
+        });
 
         Ok(retry_event
             .into_iter()
@@ -1232,6 +1512,36 @@ impl Mint {
         error: String,
         failed_at: DateTime<Utc>,
     ) {
+        // Re-failure while already in MintingFailed (e.g. a recovery confirm
+        // or resubmission attempt failed again): refresh error/failed_at and
+        // advance the attempt counter so the delay schedule escalates and
+        // eventually exhausts, but keep the original failed_from chain (and the
+        // external_tx_id derived from it) so resubmission stays idempotent.
+        if let Self::MintingFailed {
+            error: existing_error,
+            failed_at: existing_failed_at,
+            attempts,
+            ..
+        } = self
+        {
+            *existing_error = error;
+            *existing_failed_at = failed_at;
+            *attempts += 1;
+            return;
+        }
+
+        // First failure from a live state: seed the attempt counter from the
+        // FireblocksSubmitted predecessor's retry number when present, else 1
+        // (a submission that failed before Fireblocks accepted it).
+        let attempts = match self {
+            Self::FireblocksSubmitted { external_tx_id, .. } => {
+                Self::retry_attempt_from_external_tx_id(external_tx_id)
+                    .unwrap_or(0)
+                    + 1
+            }
+            _ => 1,
+        };
+
         let failed_from = Box::new(self.clone());
 
         let (Self::Minting {
@@ -1277,6 +1587,7 @@ impl Mint {
             journal_confirmed_at,
             error,
             failed_at,
+            attempts,
             failed_from,
         };
     }
@@ -1524,8 +1835,8 @@ impl Aggregate for Mint {
             MintCommand::SendCallback { issuer_request_id } => {
                 self.handle_send_callback(services, issuer_request_id).await
             }
-            MintCommand::Recover { issuer_request_id } => {
-                self.handle_recover(services, issuer_request_id).await
+            MintCommand::Recover { issuer_request_id, mode } => {
+                self.handle_recover(services, issuer_request_id, mode).await
             }
             MintCommand::RecoverFromReceipt { issuer_request_id, tx_hash } => {
                 self.handle_recover_from_receipt(
@@ -1677,6 +1988,14 @@ pub(crate) enum MintError {
     NotInMintingOrMintingFailedState { current_state: String },
     #[error("Mint not in recoverable state. Current state: {current_state}")]
     NotRecoverable { current_state: String },
+    #[error("Automatic mint retry is not due until {retry_at}")]
+    RetryNotDue { retry_at: DateTime<Utc> },
+    #[error("Automatic mint retries exhausted after {attempts} attempts")]
+    AutomaticRetriesExhausted { attempts: u32 },
+    #[error("Fireblocks mint transaction is still pending: {fireblocks_tx_id}")]
+    FireblocksTxStillPending { fireblocks_tx_id: String },
+    #[error("Retry delay out of range")]
+    RetryDelayOutOfRange,
     #[error(
         "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
     )]
@@ -1695,12 +2014,15 @@ pub(crate) enum MintError {
     ReceiptInventoryView(#[from] ReceiptInventoryViewError),
     #[error(transparent)]
     ReceiptLookup(#[from] ReceiptLookupError),
+    #[error("Vault: {0}")]
+    Vault(#[from] VaultError),
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::primitives::{Address, B256, address, b256, uint};
-    use chrono::Utc;
+    use alloy::primitives::{Address, B256, U256, address, b256, uint};
+    use async_trait::async_trait;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
@@ -1712,25 +2034,173 @@ pub(crate) mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tracing::Level;
+    use tracing_test::traced_test;
     use uuid::Uuid;
 
     use super::{
-        ClientId, IssuerMintRequestId, Mint, MintCommand, MintError, MintEvent,
-        MintServices, MintView, Network, Quantity, TokenSymbol,
-        TokenizationRequestId, UnderlyingSymbol,
+        AutomaticRetryDecision, ClientId, IssuerMintRequestId, Mint,
+        MintCommand, MintError, MintEvent, MintRecoveryMode, MintServices,
+        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
+        UnderlyingSymbol,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+    use crate::test_utils::log_count_at;
     use crate::tokenized_asset::{
         TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
     };
     use crate::vault::mock::MockVaultService;
+    use crate::vault::{
+        FireblocksTxStatus, MintResult, MultiBurnParams, MultiBurnResult,
+        ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    };
 
     pub(super) const VAULT: Address =
         address!("0xcccccccccccccccccccccccccccccccccccccccc");
 
     pub(super) const BOT: Address =
         address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    struct TerminalFailedMintVault {
+        submitted_external_tx_id: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl TerminalFailedMintVault {
+        fn new() -> Self {
+            Self {
+                submitted_external_tx_id: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        fn submitted_external_tx_id(&self) -> Option<String> {
+            self.submitted_external_tx_id.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl VaultService for TerminalFailedMintVault {
+        async fn submit_mint(
+            &self,
+            _vault: Address,
+            _assets: U256,
+            _bot: Address,
+            _user: Address,
+            _receipt_info: ReceiptInformation,
+            external_tx_id: Option<String>,
+        ) -> Result<SubmittedTx, VaultError> {
+            let external_tx_id =
+                external_tx_id.unwrap_or_else(|| "mint-base".to_string());
+            *self.submitted_external_tx_id.lock().unwrap() =
+                Some(external_tx_id.clone());
+
+            Ok(SubmittedTx {
+                external_tx_id,
+                fireblocks_tx_id: "fb-retry".to_string(),
+            })
+        }
+
+        async fn confirm_mint(
+            &self,
+            _fireblocks_tx_id: &str,
+        ) -> Result<MintResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn get_share_balance(
+            &self,
+            _vault: Address,
+            _owner: Address,
+        ) -> Result<U256, VaultError> {
+            Ok(U256::ZERO)
+        }
+
+        async fn check_fireblocks_tx(
+            &self,
+            _fireblocks_tx_id: &str,
+        ) -> Result<Option<FireblocksTxStatus>, VaultError> {
+            Ok(Some(FireblocksTxStatus::Failed {
+                detail: "Failed".to_string(),
+                sub_status: Some("INSUFFICIENT_FUNDS_FOR_FEE".to_string()),
+                network_tx_hashes: vec![],
+            }))
+        }
+
+        async fn submit_burn(
+            &self,
+            _params: MultiBurnParams,
+        ) -> Result<SubmittedTx, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn confirm_burn(
+            &self,
+            _fireblocks_tx_id: &str,
+            _expected_dust_shares: U256,
+        ) -> Result<MultiBurnResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+    }
+
+    /// Vault whose prior Fireblocks tx is terminally failed and whose retry
+    /// submission also fails. Exercises the failed-resubmission path.
+    struct RetrySubmitFailsVault;
+
+    #[async_trait]
+    impl VaultService for RetrySubmitFailsVault {
+        async fn submit_mint(
+            &self,
+            _vault: Address,
+            _assets: U256,
+            _bot: Address,
+            _user: Address,
+            _receipt_info: ReceiptInformation,
+            _external_tx_id: Option<String>,
+        ) -> Result<SubmittedTx, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn confirm_mint(
+            &self,
+            _fireblocks_tx_id: &str,
+        ) -> Result<MintResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn get_share_balance(
+            &self,
+            _vault: Address,
+            _owner: Address,
+        ) -> Result<U256, VaultError> {
+            Ok(U256::ZERO)
+        }
+
+        async fn check_fireblocks_tx(
+            &self,
+            _fireblocks_tx_id: &str,
+        ) -> Result<Option<FireblocksTxStatus>, VaultError> {
+            Ok(Some(FireblocksTxStatus::Failed {
+                detail: "Failed".to_string(),
+                sub_status: Some("INSUFFICIENT_FUNDS_FOR_FEE".to_string()),
+                network_tx_hashes: vec![],
+            }))
+        }
+
+        async fn submit_burn(
+            &self,
+            _params: MultiBurnParams,
+        ) -> Result<SubmittedTx, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn confirm_burn(
+            &self,
+            _fireblocks_tx_id: &str,
+            _expected_dust_shares: U256,
+        ) -> Result<MultiBurnResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+    }
 
     pub(super) struct MintTestFixture {
         pub(super) mint_cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
@@ -1741,6 +2211,13 @@ pub(crate) mod tests {
 
     impl MintTestFixture {
         pub(super) async fn new() -> Self {
+            Self::new_with_vault(Arc::new(MockVaultService::new_success()))
+                .await
+        }
+
+        pub(super) async fn new_with_vault(
+            vault: Arc<dyn VaultService>,
+        ) -> Self {
             let pool = SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect(":memory:")
@@ -1782,7 +2259,7 @@ pub(crate) mod tests {
             ));
 
             let services = MintServices {
-                vault: Arc::new(MockVaultService::new_success()),
+                vault,
                 alpaca: Arc::new(MockAlpacaService::new_success()),
                 receipts: Arc::new(CqrsReceiptService::new(
                     receipt_store,
@@ -1815,6 +2292,45 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    fn minting_events_for_retry(
+        issuer_request_id: &IssuerMintRequestId,
+        external_tx_id: String,
+        failed_at: DateTime<Utc>,
+    ) -> Vec<MintEvent> {
+        vec![
+            MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok-123"),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: failed_at,
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: failed_at,
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: failed_at,
+            },
+            MintEvent::FireblocksSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id,
+                fireblocks_tx_id: "fb-failed".to_string(),
+                submitted_at: failed_at,
+            },
+            MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "terminal Fireblocks failure".to_string(),
+                failed_at,
+            },
+        ]
     }
 
     prop_compose! {
@@ -2901,6 +3417,389 @@ pub(crate) mod tests {
         assert_eq!(format!("{id}"), "alp-456");
     }
 
+    #[traced_test]
+    #[tokio::test]
+    async fn automatic_recovery_retries_terminal_failed_fireblocks_mint_after_delay()
+     {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let failed_at = Utc::now() - ChronoDuration::minutes(2);
+        let events = minting_events_for_retry(
+            &issuer_request_id,
+            format!("mint-{issuer_request_id}"),
+            failed_at,
+        );
+        let vault = Arc::new(TerminalFailedMintVault::new());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vault.submitted_external_tx_id(),
+            Some(format!("mint-{issuer_request_id}-retry-1"))
+        );
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        let Mint::FireblocksSubmitted { external_tx_id, .. } =
+            context.aggregate()
+        else {
+            panic!("Expected FireblocksSubmitted after retry");
+        };
+        assert_eq!(
+            external_tx_id,
+            &format!("mint-{issuer_request_id}-retry-1")
+        );
+
+        // A successful retry must record MintRetryStarted as the permanent
+        // audit-trail fact that recovery resubmitted the mint.
+        let stored = fixture
+            .mint_store
+            .load_events(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let retry_started = stored
+            .iter()
+            .filter(|event| {
+                matches!(event.payload, MintEvent::MintRetryStarted { .. })
+            })
+            .count();
+        assert_eq!(
+            retry_started, 1,
+            "Expected exactly one MintRetryStarted event after a retry"
+        );
+
+        // The retry-submission warning is the primary operational signal that
+        // recovery resubmitted after a terminal Fireblocks failure.
+        let test = "automatic_recovery_retries_terminal_failed_fireblocks_mint_after_delay";
+        assert_eq!(
+            log_count_at!(Level::WARN, &[test, "submitting retry"]),
+            1,
+            "Expected the retry-submission warning to be emitted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_waits_until_retry_delay_elapses() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let events = minting_events_for_retry(
+            &issuer_request_id,
+            format!("mint-{issuer_request_id}"),
+            Utc::now(),
+        );
+        let vault = Arc::new(TerminalFailedMintVault::new());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        let result = fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(cqrs_es::AggregateError::UserError(
+                    MintError::RetryNotDue { .. }
+                ))
+            ),
+            "Expected RetryNotDue, got {result:?}"
+        );
+        assert_eq!(vault.submitted_external_tx_id(), None);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn manual_reprocess_can_bypass_automatic_retry_cap() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let failed_at = Utc::now() - ChronoDuration::hours(2);
+        let events = minting_events_for_retry(
+            &issuer_request_id,
+            format!("mint-{issuer_request_id}-retry-4"),
+            failed_at,
+        );
+        let vault = Arc::new(TerminalFailedMintVault::new());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        let automatic_result = fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                automatic_result,
+                Err(cqrs_es::AggregateError::UserError(
+                    MintError::AutomaticRetriesExhausted { attempts: 4 }
+                ))
+            ),
+            "Expected AutomaticRetriesExhausted, got {automatic_result:?}"
+        );
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Manual,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vault.submitted_external_tx_id(),
+            Some(format!("mint-{issuer_request_id}-retry-5"))
+        );
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let Mint::FireblocksSubmitted { external_tx_id, .. } =
+            context.aggregate()
+        else {
+            panic!(
+                "Expected FireblocksSubmitted after manual retry, got: {}",
+                context.aggregate().state_name()
+            );
+        };
+        assert_eq!(
+            external_tx_id,
+            &format!("mint-{issuer_request_id}-retry-5")
+        );
+
+        // The manual bypass submits the next retry transaction; the automatic
+        // attempt before it was rejected by the cap and never submitted.
+        let test = "manual_reprocess_can_bypass_automatic_retry_cap";
+        let expected_external = format!("mint-{issuer_request_id}-retry-5");
+        assert_eq!(
+            log_count_at!(
+                Level::INFO,
+                &[
+                    test,
+                    "Mint transaction submitted to signing backend",
+                    expected_external.as_str(),
+                ]
+            ),
+            1,
+            "Expected the manual retry-5 submission to be logged once"
+        );
+    }
+
+    /// A retry whose *submission* fails (vs. confirmation) must not advance the
+    /// aggregate past MintingFailed: emitting MintRetryStarted there would drop
+    /// the FireblocksSubmitted predecessor and reset the retry counter to 1,
+    /// reusing a spent external_tx_id and bypassing the automatic cap.
+    #[tokio::test]
+    async fn failed_retry_submission_preserves_predecessor_and_counter() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        // Predecessor was retry attempt 1; failed 2h ago so attempt 2 is due.
+        let original_failed_at = Utc::now() - ChronoDuration::hours(2);
+        let events = minting_events_for_retry(
+            &issuer_request_id,
+            format!("mint-{issuer_request_id}-retry-1"),
+            original_failed_at,
+        );
+        let fixture =
+            MintTestFixture::new_with_vault(Arc::new(RetrySubmitFailsVault))
+                .await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let aggregate = context.aggregate();
+
+        let Mint::MintingFailed { failed_at, failed_from, .. } = aggregate
+        else {
+            panic!(
+                "Expected MintingFailed after failed resubmission, got: {}",
+                aggregate.state_name()
+            );
+        };
+        assert!(
+            matches!(failed_from.as_ref(), Mint::FireblocksSubmitted { .. }),
+            "Predecessor chain must be preserved on submission failure"
+        );
+        assert_eq!(
+            aggregate.next_retry_attempt(),
+            2,
+            "Retry counter must not reset after a failed retry submission"
+        );
+        assert!(
+            *failed_at > original_failed_at,
+            "failed_at must advance so the backoff anchor moves forward"
+        );
+
+        let stored = fixture
+            .mint_store
+            .load_events(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+        let retry_started = stored
+            .iter()
+            .filter(|event| {
+                matches!(event.payload, MintEvent::MintRetryStarted { .. })
+            })
+            .count();
+        assert_eq!(
+            retry_started, 0,
+            "A failed submission must not emit MintRetryStarted"
+        );
+    }
+
+    /// Manual recovery bypasses the not-yet-elapsed retry window, not just the
+    /// attempt cap: an operator who has fixed the underlying issue can submit
+    /// the next retry immediately instead of waiting for the automatic delay.
+    #[tokio::test]
+    async fn manual_reprocess_bypasses_retry_delay() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        // Failed just now: automatic recovery would return RetryNotDue.
+        let events = minting_events_for_retry(
+            &issuer_request_id,
+            format!("mint-{issuer_request_id}"),
+            Utc::now(),
+        );
+        let vault = Arc::new(TerminalFailedMintVault::new());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Manual,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vault.submitted_external_tx_id(),
+            Some(format!("mint-{issuer_request_id}-retry-1")),
+            "Manual recovery must submit immediately despite the unelapsed \
+             retry window"
+        );
+    }
+
+    /// Submission failures that never reach Fireblocks (no FireblocksSubmitted
+    /// predecessor) must still escalate the retry schedule and eventually
+    /// exhaust, while the external_tx_id stays at retry-1 so resubmission is
+    /// idempotent (Fireblocks dedupes a spent id rather than double-minting).
+    #[test]
+    fn pre_acceptance_failures_escalate_attempts_but_reuse_external_id() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+        let mut mint = Mint::default();
+        mint.apply(MintEvent::Initiated {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: TokenizationRequestId::new("tok-123"),
+            quantity: Quantity::new(Decimal::from(100)),
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: now,
+        });
+        mint.apply(MintEvent::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            confirmed_at: now,
+        });
+        mint.apply(MintEvent::MintingStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            started_at: now,
+        });
+
+        // failed_at far in the past so every retry window has elapsed; the
+        // decision then turns only on the escalating attempt counter.
+        let failed_at = now - ChronoDuration::hours(3);
+
+        // First submission failure from Minting: attempts = 1, retryable.
+        mint.apply(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "submission rejected".to_string(),
+            failed_at,
+        });
+        assert_eq!(
+            mint.automatic_retry_decision(Utc::now()),
+            AutomaticRetryDecision::Ready
+        );
+
+        // Three more pre-acceptance failures push attempts to 4 (still the last
+        // retryable attempt), then a fifth exhausts the automatic schedule —
+        // proving the counter escalates without a FireblocksSubmitted record.
+        for _ in 0..3 {
+            mint.apply(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        assert_eq!(
+            mint.automatic_retry_decision(Utc::now()),
+            AutomaticRetryDecision::Ready
+        );
+
+        mint.apply(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "submission rejected".to_string(),
+            failed_at,
+        });
+        assert_eq!(
+            mint.automatic_retry_decision(Utc::now()),
+            AutomaticRetryDecision::Exhausted
+        );
+
+        // The external_tx_id attempt never advanced — retries reuse retry-1.
+        assert_eq!(mint.next_retry_attempt(), 1);
+    }
+
     #[test]
     fn test_recover_from_receipt_rejects_journal_confirmed() {
         let issuer_request_id = IssuerMintRequestId::random();
@@ -3019,6 +3918,7 @@ pub(crate) mod tests {
             journal_confirmed_at: now,
             error: "some error".to_string(),
             failed_at: now,
+            attempts: 1,
             failed_from: Box::new(journal_confirmed),
         };
 

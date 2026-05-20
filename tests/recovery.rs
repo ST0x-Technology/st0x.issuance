@@ -840,12 +840,14 @@ async fn test_mint_recovery_from_minting_failed_state()
     )
     .await?;
 
-    // Event 4: MintingFailed
+    // Event 4: MintingFailed. failed_at is set well in the past so the first
+    // automatic retry window (1m) has already elapsed and recovery retries
+    // immediately rather than waiting.
     let failed_payload = json!({
         "MintingFailed": {
             "issuer_request_id": issuer_request_id,
             "error": "Simulated blockchain error",
-            "failed_at": chrono::Utc::now().to_rfc3339()
+            "failed_at": (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
         }
     });
     insert_event(

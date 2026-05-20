@@ -6,6 +6,12 @@ use super::{
     TokenizationRequestId, UnderlyingSymbol,
 };
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum MintRecoveryMode {
+    Automatic,
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MintCommand {
     Initiate {
@@ -71,6 +77,7 @@ pub(crate) enum MintCommand {
     /// - Retries sending the callback
     Recover {
         issuer_request_id: IssuerMintRequestId,
+        mode: MintRecoveryMode,
     },
 
     /// Admin-closes a mint that cannot be automatically recovered.

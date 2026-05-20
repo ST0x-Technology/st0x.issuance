@@ -10,14 +10,22 @@ is rejected with HTTP 400.
 Source:
 [Fireblocks API Idempotency](https://developers.fireblocks.com/reference/api-idempotency)
 
-Our `externalTxId` format: `mint-{issuer_request_id}` or
-`burn-{issuer_request_id}`.
+Our normal `externalTxId` format: `mint-{issuer_request_id}` or
+`burn-{issuer_request_id}`. Mint retries after a terminal Fireblocks failure use
+fresh deterministic IDs: `mint-{issuer_request_id}-retry-1`,
+`mint-{issuer_request_id}-retry-2`, etc.
 
 **Implication for recovery:** If a mint/burn transaction was submitted to
 Fireblocks but we lost track of it (e.g., process restart before polling
 completion), retrying with the same `externalTxId` will fail with HTTP 400. The
 recovery path must look up the existing Fireblocks transaction by `externalTxId`
 rather than creating a new one.
+
+**Terminal mint failures:** Once Fireblocks reports a submitted mint transaction
+as terminally failed, the bot may submit a fresh mint transaction with the next
+retry `externalTxId`. Automatic retry attempts are capped at four and delayed by
+1m, 10m, 30m, and 1h. Manual admin reprocess bypasses that cap for operator-run
+retries after the underlying issue has been fixed.
 
 ## SDK Error Handling
 

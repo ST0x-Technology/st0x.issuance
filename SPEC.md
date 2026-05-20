@@ -198,15 +198,22 @@ initial request through journal confirmation to on-chain minting and callback.
   `TokensMinted` or `MintingFailed`
 - `SendCallback { issuer_request_id }` - Send the callback to Alpaca confirming
   mint completion
-- `Recover { issuer_request_id }` - Recover a mint stuck in an incomplete state.
-  Invoked at startup by the mint recovery process for any mint in
-  `JournalConfirmed`, `Minting`, `MintingFailed`, or `CallbackPending` state.
-  Queries the receipt inventory for a receipt matching the `issuer_request_id`.
-  If a matching receipt is found, the mint already succeeded on-chain, so
-  recovery records the existing mint (`ExistingMintRecovered`) and proceeds to
-  callback. If no receipt is found, recovery retries the on-chain deposit
-  (`MintRetryStarted`). This prevents double-minting after crashes while
-  ensuring stuck mints eventually complete
+- `Recover { issuer_request_id, mode }` - Recover a mint stuck in an incomplete
+  state. Startup recovery drives any mint in `JournalConfirmed`, `Minting`,
+  `MintingFailed`, or `CallbackPending` state; at runtime, live retry scheduling
+  is triggered specifically when a mint lands in `MintingFailed` during the
+  journal-confirmation flow. Both paths hand a mint that is waiting on a retry
+  window or a pending Fireblocks transaction to a background scheduled-recovery
+  task, so retries fire on schedule without waiting for a restart. Queries the
+  receipt inventory for a receipt matching the `issuer_request_id`. If a
+  matching receipt is found, the mint already succeeded on-chain, so recovery
+  records the existing mint (`ExistingMintRecovered`) and proceeds to callback.
+  If no receipt is found and the previous Fireblocks transaction is terminally
+  failed, automatic recovery submits up to four retry transactions after 1m,
+  10m, 30m, and 1h delays. Manual admin reprocess uses the same recovery path
+  but bypasses the automatic retry cap so an operator can retry after fixing the
+  underlying cause. This prevents double-minting after crashes while ensuring
+  terminal Fireblocks failures can be retried with new `externalTxId`s
 - `RecoverFromReceipt { issuer_request_id, tx_hash }` - Recover a mint that
   failed during the minting step when an ITN receipt is discovered on-chain.
   Triggered by the receipt monitor when it finds a Deposit event with a matching
@@ -258,7 +265,22 @@ either `TokensMinted` (success) or `MintingFailed` (failure).
 `Recover` checks the receipt inventory for a receipt matching the
 `issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found and
 in `Minting` state, submits and emits `FireblocksSubmitted`. If in
-`FireblocksSubmitted` state, confirms the existing transaction.
+`FireblocksSubmitted` (or `MintingFailed` with a known prior transaction), it
+first checks the Fireblocks transaction status without blocking: a `Pending`
+status pauses recovery (so the scheduled loop backs off rather than blocking in
+a long confirmation poll), `Completed` proceeds to confirmation, and `Failed`
+submits the next retry. Retry transactions use
+`mint-{issuer_request_id}-retry-{n}` where automatic retries use n = 1..4 and
+the delay schedule is 1m, 10m, 30m, then 1h.
+
+The retry-delay/exhaustion schedule is driven by a `MintingFailed` attempt
+counter that advances on every failure — including a submission that fails
+before Fireblocks accepts it (no `FireblocksSubmitted` predecessor). In that
+case the `external_tx_id` is reused unchanged (Fireblocks deduplicates) so
+resubmission stays idempotent, while the schedule still escalates and eventually
+exhausts. A running service keeps driving deferred and pending retries via a
+background scheduled-recovery task (also spawned at startup and after a manual
+reprocess), rather than waiting for the next restart.
 
 `RecoverFromReceipt` is triggered when the receipt monitor discovers an on-chain
 receipt for a mint in `MintingFailed` state (where the predecessor was
@@ -1137,7 +1159,7 @@ stateDiagram-v2
     Minting --> MintingFailed: SubmitMint (MintingFailed)
     FireblocksSubmitted --> CallbackPending: ConfirmMint (TokensMinted)
     FireblocksSubmitted --> MintingFailed: ConfirmMint (MintingFailed)
-    MintingFailed --> FireblocksSubmitted: Recover (MintRetryStarted + FireblocksSubmitted)
+    MintingFailed --> FireblocksSubmitted: Recover after automatic retry delay, or manual reprocess (MintRetryStarted + FireblocksSubmitted)
     MintingFailed --> CallbackPending: Recover (ExistingMintRecovered)
     MintingFailed --> CallbackPending: RecoverFromReceipt (ExistingMintRecovered)
     CallbackPending --> Completed: SendCallback
@@ -1905,8 +1927,10 @@ Auto-detects the right recovery path from the event history:
 
 **Mint:** `POST /admin/reprocess/mint/<aggregate_id>`
 
-Dispatches the existing `Recover` command which already handles
-`JournalConfirmed`, `Minting`, `MintingFailed`, and `CallbackPending` states.
+Dispatches the manual `Recover` command which handles `JournalConfirmed`,
+`Minting`, `MintingFailed`, and `CallbackPending` states. Manual reprocess can
+submit the next deterministic Fireblocks retry even after automatic retries have
+exhausted.
 
 **Post-Alpaca with existing on-chain burn:** If a `BurningFailed` event carries
 a Fireblocks tx ID (enrichment added in PR #143), the endpoint queries
