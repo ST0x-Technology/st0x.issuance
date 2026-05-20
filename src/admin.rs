@@ -12,15 +12,17 @@ use crate::Quantity;
 use crate::alpaca::{AlpacaService, RedeemRequestStatus, TokenizationRequest};
 use crate::auth::InternalAuth;
 use crate::mint::{
-    IssuerMintRequestId, MintCommand, MintView, TokenizationRequestId,
-    find_all_recoverable_mints, find_by_issuer_request_id,
+    IssuerMintRequestId, MintCommand, MintEvent, MintView,
+    TokenizationRequestId, find_all_recoverable_mints,
+    find_by_issuer_request_id,
 };
 use crate::redemption::{
     BurnRecord, IssuerRedemptionRequestId, RedemptionCommand, RedemptionError,
     RedemptionEvent, RedemptionMetadata, RedemptionView, find_stuck,
 };
+use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{FireblocksTxStatus, VaultService};
-use crate::{MintCqrs, RedemptionCqrs, RedemptionEventStore};
+use crate::{MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +48,16 @@ pub(crate) struct StuckAggregate {
     state: String,
     detail: String,
     timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underlying: Option<UnderlyingSymbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantity: Option<Quantity>,
+    /// Fireblocks transaction ID associated with this aggregate's current
+    /// stuck step. For mints, sourced from the most recent
+    /// `FireblocksSubmitted` event. For redemptions, populated only on
+    /// `BurnFailed` (the view carries it for that variant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fireblocks_tx_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -655,11 +667,12 @@ pub(crate) async fn close_mint(
     }))
 }
 
-#[tracing::instrument(skip(_auth, pool))]
+#[tracing::instrument(skip(_auth, pool, mint_event_store))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
+    mint_event_store: &rocket::State<MintEventStore>,
 ) -> Result<Json<StuckResponse>, Status> {
     let mut stuck = Vec::new();
 
@@ -669,33 +682,12 @@ pub(crate) async fn list_stuck(
         Status::InternalServerError
     })?;
 
-    for (id, view) in stuck_redemptions {
-        let (tokenization_request_id, state, detail, timestamp) = match &view {
-            RedemptionView::Failed { reason, failed_at, .. } => {
-                (None, "Failed".to_string(), reason.clone(), *failed_at)
-            }
-            RedemptionView::BurnFailed {
-                tokenization_request_id,
-                error,
-                failed_at,
-                ..
-            } => (
-                Some(tokenization_request_id.clone()),
-                "BurnFailed".to_string(),
-                error.clone(),
-                *failed_at,
-            ),
-            _ => continue,
-        };
-
-        stuck.push(StuckAggregate {
-            aggregate_type: AggregateKind::Redemption,
-            aggregate_id: id.to_string(),
-            tokenization_request_id,
-            state,
-            detail,
-            timestamp,
-        });
+    for (issuer_redemption_request_id, view) in stuck_redemptions {
+        if let Some(entry) =
+            stuck_redemption_entry(&issuer_redemption_request_id, &view)
+        {
+            stuck.push(entry);
+        }
     }
 
     // Stuck mints (recoverable states)
@@ -705,63 +697,187 @@ pub(crate) async fn list_stuck(
             Status::InternalServerError
         })?;
 
-    for (id, view) in recoverable_mints {
-        let (tokenization_request_id, state, detail, timestamp) = match &view {
-            MintView::JournalConfirmed {
-                tokenization_request_id,
-                journal_confirmed_at,
-                ..
-            } => (
-                Some(tokenization_request_id.clone()),
-                "JournalConfirmed".to_string(),
-                "Waiting for deposit".to_string(),
-                *journal_confirmed_at,
-            ),
-            MintView::Minting {
-                tokenization_request_id,
-                minting_started_at,
-                ..
-            } => (
-                Some(tokenization_request_id.clone()),
-                "Minting".to_string(),
-                "Deposit in progress".to_string(),
-                *minting_started_at,
-            ),
-            MintView::MintingFailed {
-                tokenization_request_id,
-                error,
-                failed_at,
-                ..
-            } => (
-                Some(tokenization_request_id.clone()),
-                "MintingFailed".to_string(),
-                error.clone(),
-                *failed_at,
-            ),
-            MintView::CallbackPending {
-                tokenization_request_id,
-                minted_at,
-                ..
-            } => (
-                Some(tokenization_request_id.clone()),
-                "CallbackPending".to_string(),
-                "Waiting for callback".to_string(),
-                *minted_at,
-            ),
-            _ => continue,
+    for (issuer_mint_request_id, view) in recoverable_mints {
+        let Some((tokenization_request_id, state, detail, timestamp)) =
+            mint_view_summary(&view)
+        else {
+            continue;
         };
+
+        let (underlying, quantity) = mint_view_asset(&view);
+        let fireblocks_tx_id = latest_fireblocks_tx_id(
+            mint_event_store.inner(),
+            &issuer_mint_request_id.to_string(),
+        )
+        .await;
 
         stuck.push(StuckAggregate {
             aggregate_type: AggregateKind::Mint,
-            aggregate_id: id.to_string(),
+            aggregate_id: issuer_mint_request_id.to_string(),
             tokenization_request_id,
             state,
             detail,
             timestamp,
+            underlying,
+            quantity,
+            fireblocks_tx_id,
         });
     }
 
     Ok(Json(StuckResponse { stuck }))
+}
+
+fn stuck_redemption_entry(
+    issuer_redemption_request_id: &IssuerRedemptionRequestId,
+    view: &RedemptionView,
+) -> Option<StuckAggregate> {
+    let (
+        tokenization_request_id,
+        state,
+        detail,
+        timestamp,
+        underlying,
+        quantity,
+        fireblocks_tx_id,
+    ) = match view {
+        RedemptionView::Failed { reason, failed_at, .. } => (
+            None,
+            "Failed".to_string(),
+            reason.clone(),
+            *failed_at,
+            None,
+            None,
+            None,
+        ),
+        RedemptionView::BurnFailed {
+            tokenization_request_id,
+            underlying,
+            quantity,
+            error,
+            failed_at,
+            fireblocks_tx_id,
+            ..
+        } => (
+            Some(tokenization_request_id.clone()),
+            "BurnFailed".to_string(),
+            error.clone(),
+            *failed_at,
+            Some(underlying.clone()),
+            Some(quantity.clone()),
+            fireblocks_tx_id.clone(),
+        ),
+        // find_stuck only returns Failed/BurnFailed; surface any other
+        // variant as a real mismatch rather than fabricating placeholder
+        // data that could mislead operators.
+        _ => return None,
+    };
+
+    Some(StuckAggregate {
+        aggregate_type: AggregateKind::Redemption,
+        aggregate_id: issuer_redemption_request_id.to_string(),
+        tokenization_request_id,
+        state,
+        detail,
+        timestamp,
+        underlying,
+        quantity,
+        fireblocks_tx_id,
+    })
+}
+
+fn mint_view_summary(
+    view: &MintView,
+) -> Option<(Option<TokenizationRequestId>, String, String, DateTime<Utc>)> {
+    match view {
+        MintView::JournalConfirmed {
+            tokenization_request_id,
+            journal_confirmed_at,
+            ..
+        } => Some((
+            Some(tokenization_request_id.clone()),
+            "JournalConfirmed".to_string(),
+            "Waiting for deposit".to_string(),
+            *journal_confirmed_at,
+        )),
+        MintView::Minting {
+            tokenization_request_id,
+            minting_started_at,
+            ..
+        } => Some((
+            Some(tokenization_request_id.clone()),
+            "Minting".to_string(),
+            "Deposit in progress".to_string(),
+            *minting_started_at,
+        )),
+        MintView::MintingFailed {
+            tokenization_request_id,
+            error,
+            failed_at,
+            ..
+        } => Some((
+            Some(tokenization_request_id.clone()),
+            "MintingFailed".to_string(),
+            error.clone(),
+            *failed_at,
+        )),
+        MintView::CallbackPending {
+            tokenization_request_id,
+            minted_at,
+            ..
+        } => Some((
+            Some(tokenization_request_id.clone()),
+            "CallbackPending".to_string(),
+            "Waiting for callback".to_string(),
+            *minted_at,
+        )),
+        _ => None,
+    }
+}
+
+fn mint_view_asset(
+    view: &MintView,
+) -> (Option<UnderlyingSymbol>, Option<Quantity>) {
+    match view {
+        MintView::JournalConfirmed { underlying, quantity, .. }
+        | MintView::Minting { underlying, quantity, .. }
+        | MintView::MintingFailed { underlying, quantity, .. }
+        | MintView::CallbackPending { underlying, quantity, .. } => {
+            (Some(underlying.clone()), Some(quantity.clone()))
+        }
+        _ => (None, None),
+    }
+}
+
+/// Returns the `fireblocks_tx_id` from the most recent `FireblocksSubmitted`
+/// event in this mint's history, if one exists. Used to surface the in-flight
+/// Fireblocks transaction in the stuck-aggregate response so operators don't
+/// have to grep logs.
+///
+/// Returns `None` if loading events fails — the caller logs that as a warning
+/// and the stuck listing still includes the aggregate without this hint.
+async fn latest_fireblocks_tx_id(
+    event_store: &crate::SqliteEventStore<crate::mint::Mint>,
+    aggregate_id: &str,
+) -> Option<String> {
+    let events = match event_store.load_events(aggregate_id).await {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                target: "admin",
+                aggregate_id = aggregate_id,
+                error = %err,
+                "Failed to load mint events for fireblocks_tx_id lookup"
+            );
+            return None;
+        }
+    };
+
+    events.into_iter().rev().find_map(|event| match event.payload {
+        MintEvent::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+            Some(fireblocks_tx_id)
+        }
+        _ => None,
+    })
 }
 
 /// Response for the Fireblocks transaction status lookup endpoint.

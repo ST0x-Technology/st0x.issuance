@@ -141,7 +141,7 @@ mod tests {
         )
     }
 
-    fn minting_failed_events(
+    fn minting_events(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
         let now = Utc::now();
@@ -166,12 +166,38 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 started_at: now,
             },
-            MintEvent::MintingFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "timeout".to_string(),
-                failed_at: now,
-            },
         ]
+    }
+
+    fn fireblocks_submitted_events(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let now = Utc::now();
+        let mut events = minting_events(issuer_request_id);
+
+        events.push(MintEvent::FireblocksSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: format!("mint-{issuer_request_id}"),
+            fireblocks_tx_id: "fb-tx-123".to_string(),
+            submitted_at: now,
+        });
+
+        events
+    }
+
+    fn minting_failed_events(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let now = Utc::now();
+        let mut events = minting_events(issuer_request_id);
+
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "timeout".to_string(),
+            failed_at: now,
+        });
+
+        events
     }
 
     fn callback_pending_events(
@@ -276,9 +302,12 @@ mod tests {
             log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
             1,
         );
+        // A single Recover command advances MintingFailed → CallbackPending
+        // → Completed atomically via advance_through_callback, so the
+        // drive_recovery loop only needs one successful step.
         assert_eq!(
             log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            2,
+            1,
         );
     }
 
@@ -309,6 +338,126 @@ mod tests {
         );
         assert_eq!(
             log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
+            1,
+        );
+    }
+
+    /// A single `Recover` command on a mint stuck in `Minting` must reach
+    /// `Completed` in one execution when an on-chain receipt is already
+    /// present — the deposit event and the callback must be committed
+    /// together so the aggregate never lingers in `CallbackPending`.
+    #[traced_test]
+    #[tokio::test]
+    async fn single_recover_command_from_minting_reaches_completed() {
+        let issuer_request_id = test_issuer_request_id();
+        let events = minting_events(&issuer_request_id);
+        let fixture = setup_with_receipt_and_events(events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(context.aggregate(), Mint::Completed { .. }),
+            "Expected Completed state after one Recover, got: {}",
+            context.aggregate().state_name()
+        );
+        let test = "single_recover_command_from_minting_reaches_completed";
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
+            1,
+        );
+    }
+
+    /// Same invariant for the `MintingFailed` starting state.
+    #[traced_test]
+    #[tokio::test]
+    async fn single_recover_command_from_minting_failed_reaches_completed() {
+        let issuer_request_id = test_issuer_request_id();
+        let events = minting_failed_events(&issuer_request_id);
+        let fixture = setup_with_receipt_and_events(events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(context.aggregate(), Mint::Completed { .. }),
+            "Expected Completed state after one Recover, got: {}",
+            context.aggregate().state_name()
+        );
+        let test =
+            "single_recover_command_from_minting_failed_reaches_completed";
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
+            1,
+        );
+    }
+
+    /// Same invariant for the `FireblocksSubmitted` starting state — the
+    /// mock vault's `confirm_mint` succeeds, so `TokensMinted` and
+    /// `MintCompleted` must be emitted in one command.
+    #[traced_test]
+    #[tokio::test]
+    async fn single_recover_command_from_fireblocks_submitted_reaches_completed()
+     {
+        let issuer_request_id = test_issuer_request_id();
+        let events = fireblocks_submitted_events(&issuer_request_id);
+        // No pre-existing receipt — the mock confirm path produces TokensMinted.
+        let fixture = MintTestFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+
+        fixture
+            .mint_cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = fixture
+            .mint_store
+            .load_aggregate(&issuer_request_id.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(context.aggregate(), Mint::Completed { .. }),
+            "Expected Completed state after one Recover, got: {}",
+            context.aggregate().state_name()
+        );
+        let test = "single_recover_command_from_fireblocks_submitted_reaches_completed";
+        assert_eq!(
+            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
             1,
         );
     }

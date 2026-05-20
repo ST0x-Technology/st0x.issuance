@@ -655,10 +655,17 @@ impl Mint {
                 self.handle_deposit(issuer_request_id)
             }
             Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-                self.handle_confirm_mint(
+                let deposit_events = self
+                    .handle_confirm_mint(
+                        services,
+                        issuer_request_id.clone(),
+                        fireblocks_tx_id.clone(),
+                    )
+                    .await?;
+                self.advance_through_callback(
                     services,
                     issuer_request_id,
-                    fireblocks_tx_id.clone(),
+                    deposit_events,
                 )
                 .await
             }
@@ -672,20 +679,34 @@ impl Mint {
                     _ => None,
                 };
 
-                self.handle_recover_incomplete(
+                let deposit_events = self
+                    .handle_recover_incomplete(
+                        services,
+                        issuer_request_id.clone(),
+                        None,
+                        known_tx_id,
+                    )
+                    .await?;
+                self.advance_through_callback(
                     services,
                     issuer_request_id,
-                    None,
-                    known_tx_id,
+                    deposit_events,
                 )
                 .await
             }
             Self::Minting { .. } => {
-                self.handle_recover_incomplete(
+                let deposit_events = self
+                    .handle_recover_incomplete(
+                        services,
+                        issuer_request_id.clone(),
+                        None,
+                        None,
+                    )
+                    .await?;
+                self.advance_through_callback(
                     services,
                     issuer_request_id,
-                    None,
-                    None,
+                    deposit_events,
                 )
                 .await
             }
@@ -707,10 +728,6 @@ impl Mint {
     /// (when the deposit creates a new on-chain receipt). Handling
     /// `CallbackPending` here would race with the normal flow's
     /// `SendCallback` command, causing duplicate Alpaca callbacks.
-    ///
-    /// Instead, when the deposit recovery succeeds and the mint moves to
-    /// `CallbackPending`, this handler immediately sends the callback in
-    /// the same command execution, atomically advancing to `Completed`.
     async fn handle_recover_from_receipt(
         &self,
         services: &MintServices,
@@ -739,40 +756,76 @@ impl Mint {
                         known_tx_id,
                     )
                     .await?;
-
-                // If the deposit failed, return early with just the failure
-                // event — no callback should be sent.
-                let deposit_succeeded = deposit_events.iter().any(|event| {
-                    matches!(
-                        event,
-                        MintEvent::TokensMinted { .. }
-                            | MintEvent::ExistingMintRecovered { .. }
-                    )
-                });
-
-                if !deposit_succeeded {
-                    return Ok(deposit_events);
-                }
-
-                // Construct intermediate state to send callback from.
-                let mut intermediate = self.clone();
-                for event in &deposit_events {
-                    intermediate.apply(event.clone());
-                }
-
-                let callback_events = intermediate
-                    .handle_send_callback(services, issuer_request_id)
-                    .await?;
-
-                let all_events =
-                    deposit_events.into_iter().chain(callback_events).collect();
-
-                Ok(all_events)
+                self.advance_through_callback(
+                    services,
+                    issuer_request_id,
+                    deposit_events,
+                )
+                .await
             }
             _ => Err(MintError::NotRecoverable {
                 current_state: self.state_name().to_string(),
             }),
         }
+    }
+
+    /// If `deposit_events` contain a successful deposit (`TokensMinted` or
+    /// `ExistingMintRecovered`), advance through `CallbackPending` by
+    /// sending the Alpaca callback in the same command execution and
+    /// return the combined event list. Otherwise return `deposit_events`
+    /// unchanged.
+    ///
+    /// Keeps recovery atomic: a single `Recover` command takes the
+    /// aggregate from a stuck pre-callback state straight to `Completed`,
+    /// so the aggregate never lingers in `CallbackPending` between
+    /// commands and so any recovery entry-point (admin reprocess, the
+    /// boot-time loop, or receipt-discovery handler) picks up the same
+    /// advancing behavior.
+    async fn advance_through_callback(
+        &self,
+        services: &MintServices,
+        issuer_request_id: IssuerMintRequestId,
+        deposit_events: Vec<MintEvent>,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let deposit_succeeded = deposit_events.iter().any(|event| {
+            matches!(
+                event,
+                MintEvent::TokensMinted { .. }
+                    | MintEvent::ExistingMintRecovered { .. }
+            )
+        });
+
+        if !deposit_succeeded {
+            return Ok(deposit_events);
+        }
+
+        let mut intermediate = self.clone();
+        for event in &deposit_events {
+            intermediate.apply(event.clone());
+        }
+
+        // If callback delivery fails after a successful on-chain deposit,
+        // preserve the deposit events so the aggregate advances to
+        // CallbackPending. The next recovery picks up from there instead
+        // of re-running the deposit path.
+        let callback_events = match intermediate
+            .handle_send_callback(services, issuer_request_id.clone())
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "Callback failed after successful deposit; \
+                     keeping mint in CallbackPending"
+                );
+                return Ok(deposit_events);
+            }
+        };
+
+        Ok(deposit_events.into_iter().chain(callback_events).collect())
     }
 
     async fn handle_recover_incomplete(
