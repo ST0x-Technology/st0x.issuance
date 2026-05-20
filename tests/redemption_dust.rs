@@ -162,7 +162,7 @@ fn setup_redemption_mocks_with_qty_capture(
 
     let redeem_mock = mock_alpaca.mock(|when, then| {
         when.method(POST)
-            .path("/v1/accounts/test-account/tokenization/redeem")
+            .path("/v1/accounts/test-account/tokenization/callback/redeem")
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);

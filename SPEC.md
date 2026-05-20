@@ -1189,7 +1189,7 @@ sequenceDiagram
     Blockchain->>Us: Transfer event detected
     Note right of Us: DetectRedemption command<br/>Event: RedemptionDetected<br/>Status: detected
 
-    Us->>Alpaca: POST /tokenization/redeem<br/>{issuer_request_id, qty, tx_hash}
+    Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
 
@@ -1280,7 +1280,7 @@ struct TransferEvent {
 
 When we detect a redemption, we notify Alpaca.
 
-**Endpoint:** `POST /v1/accounts/{account_id}/tokenization/redeem`
+**Endpoint:** `POST /v1/accounts/{account_id}/tokenization/callback/redeem`
 
 Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
@@ -1546,7 +1546,7 @@ We call these Alpaca endpoints:
 
 1. **`POST /v1/accounts/{account_id}/tokenization/callback/mint`** - Confirm
    mint completed
-2. **`POST /v1/accounts/{account_id}/tokenization/redeem`** - Initiate
+2. **`POST /v1/accounts/{account_id}/tokenization/callback/redeem`** - Initiate
    redemption
 3. **`GET /v1/accounts/{account_id}/tokenization/requests`** - List/poll
    requests

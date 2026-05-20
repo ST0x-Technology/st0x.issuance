@@ -197,7 +197,8 @@ endpoints.
 
 - `POST /v1/accounts/{account_id}/tokenization/callback/mint` - Confirm mint
   completed
-- `POST /v1/accounts/{account_id}/tokenization/redeem` - Initiate redemption
+- `POST /v1/accounts/{account_id}/tokenization/callback/redeem` - Initiate
+  redemption
 - `GET /v1/accounts/{account_id}/tokenization/requests` - Poll request status
 
 ## Mint Flow

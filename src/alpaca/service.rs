@@ -198,7 +198,7 @@ impl AlpacaService for RealAlpacaService {
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
         let url = format!(
-            "{}/v1/accounts/{}/tokenization/redeem",
+            "{}/v1/accounts/{}/tokenization/callback/redeem",
             self.base_url.trim_end_matches('/'),
             self.account_id
         );
@@ -592,7 +592,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem")
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
                 .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
                 .header("APCA-API-KEY-ID", "test-key")
                 .header("APCA-API-SECRET-KEY", "test-secret");
@@ -646,7 +646,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
                 "issuer_request_id": "red-abcdefab",
@@ -689,7 +689,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(401).body("Unauthorized");
         });
 
@@ -716,7 +716,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(403).body("Forbidden");
         });
 
@@ -743,7 +743,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(400).body("Invalid request");
         });
 
@@ -777,7 +777,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/my-special-account/tokenization/redeem");
+                .path("/v1/accounts/my-special-account/tokenization/callback/redeem");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-789",
                 "issuer_request_id": "red-abcdefab",
@@ -819,7 +819,7 @@ mod tests {
         // Legacy auth requires both Basic auth AND the APCA headers
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem")
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
                 .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
                 .header("APCA-API-KEY-ID", "mykey")
                 .header("APCA-API-SECRET-KEY", "mysecret");
@@ -863,7 +863,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem")
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
                     "issuer_request_id": "red-abcdefab",
@@ -1340,7 +1340,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(401).body("Unauthorized");
         });
 
@@ -1368,7 +1368,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(400).body("Bad Request");
         });
 
@@ -1399,7 +1399,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(500).body("Internal Server Error");
         });
 
@@ -1645,7 +1645,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(200).body("invalid json");
         });
 
