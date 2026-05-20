@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-use cqrs_es::{AggregateContext, EventStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -33,7 +32,6 @@ use crate::redemption::{
     Redemption, RedemptionView,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
-    poll_checkpoint::TransferPollCheckpoint,
     poller::{TransferPoller, TransferPollerConfig},
     redeem_call_manager::RedeemCallManager,
     replay_redemption_view,
@@ -56,6 +54,7 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
 pub(crate) mod fireblocks;
+pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
@@ -296,7 +295,6 @@ pub async fn initialize_rocket(
         &pool,
         blockchain_setup.http_provider.clone(),
         &receipt_inventory.cqrs,
-        &receipt_inventory.event_store,
         bot_wallet,
         config.backfill_start_block,
     )
@@ -333,10 +331,10 @@ pub async fn initialize_rocket(
     run_recovery_with_timeout(&pool, &mint.cqrs, &managers).await;
 
     spawn_periodic_receipt_backfills(
+        pool.clone(),
         blockchain_setup.http_provider.clone(),
         vault_configs.clone(),
         receipt_inventory.cqrs.clone(),
-        receipt_inventory.event_store.clone(),
         bot_wallet,
         config.backfill_start_block,
         MintRecoveryHandler::new(mint.cqrs.clone()),
@@ -352,13 +350,6 @@ pub async fn initialize_rocket(
             "Spawning transfer poller (eth_getLogs across all vaults)"
         );
 
-        let checkpoint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let checkpoint_store = Arc::new(PersistedEventStore::new_event_store(
-            SqliteEventRepository::new(pool.clone()),
-        ));
-
-        seed_checkpoint_from_legacy(&pool, &checkpoint_cqrs).await;
-
         let poller = TransferPoller::new(TransferPollerConfig {
             provider: blockchain_setup.http_provider,
             bot_wallet,
@@ -367,8 +358,6 @@ pub async fn initialize_rocket(
             cqrs: redemption_cqrs.clone(),
             event_store: redemption_event_store.clone(),
             pool: pool.clone(),
-            checkpoint_cqrs,
-            checkpoint_store,
             redeem_call_manager: managers.redeem_call.clone(),
             journal_manager: managers.journal.clone(),
             burn_manager: managers.burn.clone(),
@@ -718,7 +707,6 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
     pool: &Pool<Sqlite>,
     provider: P,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
     bot_wallet: Address,
     backfill_start_block: u64,
 ) -> Result<Vec<VaultBackfillConfig>, anyhow::Error> {
@@ -745,12 +733,12 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
         let provider = provider.clone();
         async move {
             run_single_vault_backfill(
+                pool,
                 &provider,
                 vault,
                 backfill_start_block,
                 &underlying.0,
                 receipt_inventory_cqrs,
-                receipt_inventory_event_store,
                 bot_wallet,
             )
             .await
@@ -762,12 +750,12 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
 
 /// Runs receipt backfill for a single vault.
 async fn run_single_vault_backfill<P: Provider + Clone>(
+    pool: &Pool<Sqlite>,
     provider: &P,
     vault: Address,
     backfill_start_block: u64,
     underlying: &str,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
     bot_wallet: Address,
 ) -> Result<VaultBackfillConfig, anyhow::Error> {
     let vault_contract =
@@ -775,14 +763,13 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     let receipt_contract =
         Address::from(vault_contract.receipt().call().await?.0);
 
-    let aggregate_context = receipt_inventory_event_store
-        .load_aggregate(&vault.to_string())
-        .await?;
-
-    let from_block = next_receipt_backfill_block(
-        aggregate_context.aggregate().last_backfilled_block(),
-        backfill_start_block,
-    )?;
+    let last_block = crate::poll_checkpoint::load(
+        pool,
+        &crate::poll_checkpoint::receipt_backfill_name(vault),
+    )
+    .await?;
+    let from_block =
+        next_receipt_backfill_block(last_block, backfill_start_block)?;
 
     info!(
         target: "receipt",
@@ -800,6 +787,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         bot_wallet,
         vault,
         receipt_inventory_cqrs.clone(),
+        pool.clone(),
         NoOpItnHandler,
     );
 
@@ -833,22 +821,21 @@ async fn run_periodic_receipt_backfill_for_config<
     P: Provider + Clone,
     H: ItnReceiptHandler,
 >(
+    pool: &Pool<Sqlite>,
     provider: &P,
     config: VaultBackfillConfig,
     receipt_inventory_cqrs: &ReceiptInventoryCqrs,
-    receipt_inventory_event_store: &ReceiptInventoryEventStore,
     bot_wallet: Address,
     backfill_start_block: u64,
     handler: &H,
 ) -> Result<(), anyhow::Error> {
-    let aggregate_context = receipt_inventory_event_store
-        .load_aggregate(&config.vault.to_string())
-        .await?;
-
-    let from_block = next_receipt_backfill_block(
-        aggregate_context.aggregate().last_backfilled_block(),
-        backfill_start_block,
-    )?;
+    let last_block = crate::poll_checkpoint::load(
+        pool,
+        &crate::poll_checkpoint::receipt_backfill_name(config.vault),
+    )
+    .await?;
+    let from_block =
+        next_receipt_backfill_block(last_block, backfill_start_block)?;
 
     trace!(
         target: "receipt",
@@ -864,6 +851,7 @@ async fn run_periodic_receipt_backfill_for_config<
         bot_wallet,
         config.vault,
         receipt_inventory_cqrs.clone(),
+        pool.clone(),
         handler,
     );
 
@@ -882,10 +870,10 @@ async fn run_periodic_receipt_backfill_for_config<
 }
 
 fn spawn_periodic_receipt_backfills<P, H>(
+    pool: Pool<Sqlite>,
     provider: P,
     vault_configs: Vec<VaultBackfillConfig>,
     receipt_inventory_cqrs: ReceiptInventoryCqrs,
-    receipt_inventory_event_store: ReceiptInventoryEventStore,
     bot_wallet: Address,
     backfill_start_block: u64,
     handler: H,
@@ -906,10 +894,10 @@ fn spawn_periodic_receipt_backfills<P, H>(
 
             for config in &vault_configs {
                 if let Err(error) = run_periodic_receipt_backfill_for_config(
+                    &pool,
                     &provider,
                     *config,
                     &receipt_inventory_cqrs,
-                    &receipt_inventory_event_store,
                     bot_wallet,
                     backfill_start_block,
                     &handler,
@@ -927,75 +915,6 @@ fn spawn_periodic_receipt_backfills<P, H>(
             }
         }
     });
-}
-
-/// Seeds the `TransferPollCheckpoint` aggregate from the legacy per-vault
-/// `redemption_backfill_checkpoints` table. Uses `MIN(last_processed_block)`
-/// across all vaults so the unified poller doesn't skip any blocks on upgrade.
-///
-/// This is a one-time migration path: once the aggregate has events, this
-/// function is a no-op.
-async fn seed_checkpoint_from_legacy(
-    pool: &Pool<Sqlite>,
-    checkpoint_cqrs: &SqliteCqrs<TransferPollCheckpoint>,
-) {
-    use crate::redemption::poll_checkpoint::TransferPollCheckpointCommand;
-
-    let row = sqlx::query_as::<_, (i64,)>(
-        "
-        SELECT MIN(last_processed_block)
-        FROM redemption_backfill_checkpoints
-        HAVING COUNT(*) > 0
-        ",
-    )
-    .fetch_optional(pool)
-    .await;
-
-    let block_number = match row {
-        Ok(Some((block,))) => match u64::try_from(block) {
-            Ok(block_number) => block_number,
-            Err(error) => {
-                warn!(
-                    target: "redemption",
-                    error = %error,
-                    "Failed to convert legacy checkpoint block number"
-                );
-                return;
-            }
-        },
-        Ok(None) => return,
-        Err(error) => {
-            warn!(
-                target: "redemption",
-                error = %error,
-                "Failed to read legacy backfill checkpoints"
-            );
-            return;
-        }
-    };
-
-    // Advance is idempotent — if the aggregate already has a higher
-    // checkpoint (from a prior seed or normal operation), this is a no-op.
-    if let Err(error) = checkpoint_cqrs
-        .execute(
-            TransferPollCheckpoint::AGGREGATE_ID,
-            TransferPollCheckpointCommand::Advance { block_number },
-        )
-        .await
-    {
-        warn!(
-            target: "redemption",
-            error = %error,
-            block_number,
-            "Failed to seed checkpoint from legacy table"
-        );
-    } else {
-        info!(
-            target: "redemption",
-            block_number,
-            "Seeded transfer poll checkpoint from legacy backfill table"
-        );
-    }
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {

@@ -40,9 +40,6 @@ pub(crate) enum ReceiptInventoryEvent {
     Depleted {
         receipt_id: ReceiptId,
     },
-    BackfillCheckpoint {
-        block_number: u64,
-    },
 }
 
 impl DomainEvent for ReceiptInventoryEvent {
@@ -56,9 +53,6 @@ impl DomainEvent for ReceiptInventoryEvent {
             }
             Self::Depleted { .. } => {
                 "ReceiptInventoryEvent::Depleted".to_string()
-            }
-            Self::BackfillCheckpoint { .. } => {
-                "ReceiptInventoryEvent::BackfillCheckpoint".to_string()
             }
         }
     }

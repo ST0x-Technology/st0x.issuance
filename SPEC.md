@@ -488,18 +488,18 @@ recovery. Methods:
   a receipt by ITN issuer_request_id for mint recovery
 
 Receipts enter the inventory through backfill (scanning historic Deposit and
-ERC-1155 transfer events at startup from the block after
-`last_backfilled_block`), live monitoring (WebSocket subscription to Deposit and
-ERC-1155 transfer events at runtime), or direct registration after a mint. After
-startup backfill succeeds, periodic receipt backfill safely scans the small
-runtime range from the durable checkpoint to the current block and advances
-`last_backfilled_block` only after ordered range processing succeeds. Live
-monitoring processes observed logs opportunistically but does not advance the
-durable checkpoint, because WebSocket logs can arrive out of order within or
-across blocks. This prevents long-running services from restarting with a stale
-receipt checkpoint that forces a large historical scan before Rocket can serve
-requests without allowing one live log to checkpoint past another unprocessed
-log in the same block.
+ERC-1155 transfer events at startup from the block after the per-vault
+`receipt_backfill` checkpoint stored in the `poll_checkpoints` table), live
+monitoring (WebSocket subscription to Deposit and ERC-1155 transfer events at
+runtime), or direct registration after a mint. After startup backfill succeeds,
+periodic receipt backfill safely scans the small runtime range from the durable
+checkpoint to the current block and advances the checkpoint row only after
+ordered range processing succeeds. Live monitoring processes observed logs
+opportunistically but does not advance the durable checkpoint, because WebSocket
+logs can arrive out of order within or across blocks. This prevents long-running
+services from restarting with a stale receipt checkpoint that forces a large
+historical scan before Rocket can serve requests without allowing one live log
+to checkpoint past another unprocessed log in the same block.
 
 The Receipt contract is an ERC-1155 token that emits `TransferSingle` and
 `TransferBatch` events on all token movements. The receipt monitor and
@@ -529,7 +529,6 @@ aggregate balance in either direction. Reconciliation is triggered by:
 Commands:
 
 - `DiscoverReceipt` - Register a newly discovered receipt
-- `AdvanceBackfillCheckpoint` - Update the last backfilled block number
 - `ReconcileBalance { receipt_id, on_chain_balance }` - Correct aggregate
   balance to match on-chain state (both increases and decreases). No-op if
   balances match or receipt unknown
@@ -540,7 +539,12 @@ Events:
 - `BalanceReconciled { receipt_id, previous_balance, on_chain_balance }` -
   Balance changed (detected during reconciliation, either increase or decrease)
 - `Depleted` - Receipt fully consumed (balance reached zero)
-- `BackfillCheckpoint` - Backfill progress marker
+
+The per-vault receipt backfill cursor (previously `BackfillCheckpoint` events on
+this aggregate) is not domain state — it is a single mutable counter with no
+audit value, so it is persisted in the `poll_checkpoints` SQL table under the
+key `receipt_backfill:<vault_address_lowercase>`. See the polling checkpoints
+persistence section below.
 
 ## Core Functionality
 
@@ -1230,9 +1234,9 @@ The backfiller scans Transfer events on **each vault independently** to detect
 any redemption transfers that occurred while the service was down. This ensures
 no redemptions are silently missed due to downtime.
 
-Each vault is backfilled separately. The configured `backfill_start_block` is
-only the first-run seed; after a successful range, the service persists a
-per-vault `redemption_backfill_checkpoints` row and the next startup resumes at
+The configured `backfill_start_block` is only the first-run seed; after a
+successful range, the service persists a single `transfer_poll` row in the
+`poll_checkpoints` SQL table and the next startup resumes at
 `last_processed_block + 1`. The checkpoint advances only after the requested
 range succeeds, and writes are monotonic so a shorter later range cannot move
 progress backward. Idempotency is still guaranteed by the
@@ -1240,7 +1244,10 @@ progress backward. Idempotency is still guaranteed by the
 aggregate rejects duplicate detections.
 
 This mirrors the receipt backfill pattern, where per-vault checkpoints are
-tracked via the `ReceiptInventory` aggregate's `last_backfilled_block` state.
+tracked under the keys `receipt_backfill:<vault_lowercase>` in the same
+`poll_checkpoints` table. Both checkpoints are intentionally not event-sourced:
+they are single mutable values whose history has no audit worth keeping, and
+modeling them as aggregates was the root cause of the 2026-05-19 OOM (RAI-617).
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already

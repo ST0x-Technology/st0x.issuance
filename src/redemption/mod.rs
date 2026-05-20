@@ -5,7 +5,6 @@ pub(crate) mod view;
 
 pub(crate) mod burn_manager;
 pub(crate) mod journal_manager;
-pub(crate) mod poll_checkpoint;
 pub(crate) mod poller;
 pub(crate) mod redeem_call_manager;
 #[cfg(test)]

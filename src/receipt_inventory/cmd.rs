@@ -20,7 +20,4 @@ pub(crate) enum ReceiptInventoryCommand {
         receipt_id: ReceiptId,
         on_chain_balance: Shares,
     },
-    AdvanceBackfillCheckpoint {
-        block_number: u64,
-    },
 }

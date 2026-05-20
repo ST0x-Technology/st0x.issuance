@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use cqrs_es::{CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +13,6 @@ use super::{
     Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
-    poll_checkpoint::{
-        TransferPollCheckpoint, TransferPollCheckpointCommand,
-        TransferPollCheckpointError,
-    },
     redeem_call_manager::RedeemCallManager,
     transfer::{
         RedemptionFlowCtx, TransferOutcome, TransferProcessingError,
@@ -24,6 +20,7 @@ use super::{
     },
 };
 use crate::bindings;
+use crate::poll_checkpoint::{self, CheckpointError, TRANSFER_POLL};
 
 /// Interval between polling cycles when the poller is caught up to the chain
 /// head. 5 seconds is a reasonable trade-off: negligible latency (downstream
@@ -47,17 +44,16 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// - Never misses events (every block is explicitly scanned; on error the
 ///   checkpoint does not advance, so the chunk is retried next pass)
 /// - Fails visibly (if the call fails, we know and retry)
-/// - Checkpoints progress via the `TransferPollCheckpoint` aggregate
+/// - Persists progress to the `poll_checkpoints` SQL table
 ///
 /// **Operational note — adding new vaults:** The global checkpoint means a
 /// newly-added vault will only be scanned from the current checkpoint
 /// forward, not from `backfill_start_block`. When adding a new vault,
 /// either reset the checkpoint manually or restart with a lower
 /// `backfill_start_block` to cover historic blocks.
-pub(crate) struct TransferPoller<P, RedemptionStore, CheckpointStore>
+pub(crate) struct TransferPoller<P, RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    CheckpointStore: EventStore<TransferPollCheckpoint>,
 {
     provider: P,
     bot_wallet: Address,
@@ -66,19 +62,15 @@ where
     cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     event_store: Arc<RedemptionStore>,
     pool: Pool<Sqlite>,
-    checkpoint_cqrs:
-        Arc<CqrsFramework<TransferPollCheckpoint, CheckpointStore>>,
-    checkpoint_store: Arc<CheckpointStore>,
     redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     journal_manager: Arc<JournalManager<RedemptionStore>>,
     burn_manager: Arc<BurnManager<RedemptionStore>>,
 }
 
 /// Configuration for constructing a [`TransferPoller`].
-pub(crate) struct TransferPollerConfig<P, RedemptionStore, CheckpointStore>
+pub(crate) struct TransferPollerConfig<P, RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    CheckpointStore: EventStore<TransferPollCheckpoint>,
 {
     pub(crate) provider: P,
     pub(crate) bot_wallet: Address,
@@ -87,22 +79,17 @@ where
     pub(crate) cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
     pub(crate) event_store: Arc<RedemptionStore>,
     pub(crate) pool: Pool<Sqlite>,
-    pub(crate) checkpoint_cqrs:
-        Arc<CqrsFramework<TransferPollCheckpoint, CheckpointStore>>,
-    pub(crate) checkpoint_store: Arc<CheckpointStore>,
     pub(crate) redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
     pub(crate) journal_manager: Arc<JournalManager<RedemptionStore>>,
     pub(crate) burn_manager: Arc<BurnManager<RedemptionStore>>,
 }
 
-impl<P, RedemptionStore, CheckpointStore>
-    TransferPoller<P, RedemptionStore, CheckpointStore>
+impl<P, RedemptionStore> TransferPoller<P, RedemptionStore>
 where
     RedemptionStore: EventStore<Redemption>,
-    CheckpointStore: EventStore<TransferPollCheckpoint>,
 {
     pub(crate) fn new(
-        config: TransferPollerConfig<P, RedemptionStore, CheckpointStore>,
+        config: TransferPollerConfig<P, RedemptionStore>,
     ) -> Self {
         Self {
             provider: config.provider,
@@ -112,8 +99,6 @@ where
             cqrs: config.cqrs,
             event_store: config.event_store,
             pool: config.pool,
-            checkpoint_cqrs: config.checkpoint_cqrs,
-            checkpoint_store: config.checkpoint_store,
             redeem_call_manager: config.redeem_call_manager,
             journal_manager: config.journal_manager,
             burn_manager: config.burn_manager,
@@ -129,19 +114,17 @@ pub(crate) enum TransferPollError {
     Sqlx(#[from] sqlx::Error),
     #[error("Transfer processing error: {0}")]
     TransferProcessing(#[from] TransferProcessingError),
-    #[error("Checkpoint aggregate error: {0}")]
-    Checkpoint(#[from] AggregateError<TransferPollCheckpointError>),
+    #[error("Checkpoint error: {0}")]
+    Checkpoint(#[from] CheckpointError),
     #[error("Checkpoint overflow: last_processed_block={last_processed_block}")]
     CheckpointOverflow { last_processed_block: u64 },
 }
 
-impl<P, RedemptionStore, CheckpointStore>
-    TransferPoller<P, RedemptionStore, CheckpointStore>
+impl<P, RedemptionStore> TransferPoller<P, RedemptionStore>
 where
     P: Provider + Clone + Send + Sync,
     RedemptionStore: EventStore<Redemption> + 'static,
     RedemptionStore::AC: Send,
-    CheckpointStore: EventStore<TransferPollCheckpoint>,
 {
     /// Runs the polling loop forever. Never returns under normal operation.
     ///
@@ -171,12 +154,10 @@ where
             return Ok(());
         }
 
-        let checkpoint = self
-            .checkpoint_store
-            .load_aggregate(TransferPollCheckpoint::AGGREGATE_ID)
-            .await?;
+        let last_processed =
+            poll_checkpoint::load(&self.pool, TRANSFER_POLL).await?;
 
-        let cursor = match checkpoint.aggregate().last_processed_block() {
+        let cursor = match last_processed {
             None => self.backfill_start_block,
             Some(last_processed) => {
                 let next = last_processed.checked_add(1).ok_or(
@@ -225,13 +206,7 @@ where
                 self.process_log(log).await?;
             }
 
-            self.checkpoint_cqrs
-                .execute(
-                    TransferPollCheckpoint::AGGREGATE_ID,
-                    TransferPollCheckpointCommand::Advance {
-                        block_number: chunk_to,
-                    },
-                )
+            poll_checkpoint::advance(&self.pool, TRANSFER_POLL, chunk_to)
                 .await?;
         }
 
@@ -341,21 +316,17 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::{
-        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
-    };
+    use cqrs_es::{CqrsFramework, mem_store::MemStore};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use crate::alpaca::mock::MockAlpacaService;
+    use crate::poll_checkpoint::{self, TRANSFER_POLL};
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
     use crate::redemption::Redemption;
-    use crate::redemption::poll_checkpoint::{
-        TransferPollCheckpoint, TransferPollCheckpointCommand,
-    };
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
     };
@@ -365,17 +336,10 @@ mod tests {
     type TestRedemptionStore = MemStore<Redemption>;
     type TestRedemptionCqrs =
         Arc<CqrsFramework<Redemption, TestRedemptionStore>>;
-    type TestCheckpointStore = MemStore<TransferPollCheckpoint>;
-    type TestCheckpointCqrs =
-        Arc<CqrsFramework<TransferPollCheckpoint, TestCheckpointStore>>;
 
-    fn setup_test_cqrs() -> (
-        TestRedemptionCqrs,
-        Arc<TestRedemptionStore>,
-        Arc<dyn ReceiptService>,
-        TestCheckpointCqrs,
-        Arc<TestCheckpointStore>,
-    ) {
+    fn setup_test_cqrs()
+    -> (TestRedemptionCqrs, Arc<TestRedemptionStore>, Arc<dyn ReceiptService>)
+    {
         let store = Arc::new(MemStore::default());
         let receipt_inventory_store: Arc<MemStore<ReceiptInventory>> =
             Arc::new(MemStore::default());
@@ -397,29 +361,12 @@ mod tests {
                 receipt_inventory_cqrs,
             ));
 
-        let checkpoint_store = Arc::new(MemStore::default());
-        let checkpoint_cqrs = Arc::new(CqrsFramework::new(
-            (*checkpoint_store).clone(),
-            vec![],
-            (),
-        ));
-
-        (cqrs, store, receipt_service, checkpoint_cqrs, checkpoint_store)
-    }
-
-    async fn load_test_checkpoint(store: &TestCheckpointStore) -> Option<u64> {
-        let context = store
-            .load_aggregate(TransferPollCheckpoint::AGGREGATE_ID)
-            .await
-            .unwrap();
-        context.aggregate().last_processed_block()
+        (cqrs, store, receipt_service)
     }
 
     struct TestPollerSetup<P: alloy::providers::Provider + Clone> {
-        poller:
-            super::TransferPoller<P, TestRedemptionStore, TestCheckpointStore>,
-        checkpoint_store: Arc<TestCheckpointStore>,
-        checkpoint_cqrs: TestCheckpointCqrs,
+        poller: super::TransferPoller<P, TestRedemptionStore>,
+        pool: SqlitePool,
     }
 
     async fn setup_test_poller(
@@ -440,8 +387,7 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
-        let (cqrs, store, receipt_service, checkpoint_cqrs, checkpoint_store) =
-            setup_test_cqrs();
+        let (cqrs, store, receipt_service) = setup_test_cqrs();
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -484,21 +430,14 @@ mod tests {
             backfill_start_block,
             cqrs,
             event_store: store,
-            pool,
-            checkpoint_cqrs: checkpoint_cqrs.clone(),
-            checkpoint_store: checkpoint_store.clone(),
+            pool: pool.clone(),
             redeem_call_manager,
             journal_manager,
             burn_manager,
         });
 
-        TestPollerSetup { poller, checkpoint_store, checkpoint_cqrs }
+        TestPollerSetup { poller, pool }
     }
-
-    // -----------------------------------------------------------------------
-    // Checkpoint aggregate tests (unit tests live in poll_checkpoint.rs;
-    // these verify integration with the poller's setup_test_cqrs helper)
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Block range tests
@@ -567,7 +506,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            load_test_checkpoint(&setup.checkpoint_store).await,
+            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
             Some(200)
         );
 
@@ -608,7 +547,7 @@ mod tests {
 
         // Checkpoint still advances even with no detections
         assert_eq!(
-            load_test_checkpoint(&setup.checkpoint_store).await,
+            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
             Some(200)
         );
 
@@ -632,12 +571,7 @@ mod tests {
             setup_test_poller(vault, bot_wallet, None, &asserter, 50).await;
 
         // Pre-seed checkpoint at 200
-        setup
-            .checkpoint_cqrs
-            .execute(
-                TransferPollCheckpoint::AGGREGATE_ID,
-                TransferPollCheckpointCommand::Advance { block_number: 200 },
-            )
+        poll_checkpoint::advance(&setup.pool, TRANSFER_POLL, 200)
             .await
             .unwrap();
 
@@ -682,7 +616,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            load_test_checkpoint(&setup.checkpoint_store).await,
+            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
             Some(200)
         );
     }
@@ -696,8 +630,7 @@ mod tests {
 
         let pool = setup_test_db_with_asset(vault, None).await;
 
-        let (cqrs, store, receipt_service, checkpoint_cqrs, checkpoint_store) =
-            setup_test_cqrs();
+        let (cqrs, store, receipt_service) = setup_test_cqrs();
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -739,9 +672,7 @@ mod tests {
             backfill_start_block: 0,
             cqrs,
             event_store: store,
-            pool,
-            checkpoint_cqrs,
-            checkpoint_store: checkpoint_store.clone(),
+            pool: pool.clone(),
             redeem_call_manager,
             journal_manager,
             burn_manager,
@@ -750,7 +681,10 @@ mod tests {
         poller.poll_once().await.unwrap();
 
         // No checkpoint saved, no RPC calls made
-        assert_eq!(load_test_checkpoint(&checkpoint_store).await, None);
+        assert_eq!(
+            poll_checkpoint::load(&pool, TRANSFER_POLL).await.unwrap(),
+            None
+        );
     }
 
     #[traced_test]
@@ -769,7 +703,7 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         assert_eq!(
-            load_test_checkpoint(&setup.checkpoint_store).await,
+            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
             Some(200)
         );
 
@@ -794,7 +728,10 @@ mod tests {
         setup.poller.poll_once().await.unwrap();
 
         // No checkpoint saved since we skipped
-        assert_eq!(load_test_checkpoint(&setup.checkpoint_store).await, None);
+        assert_eq!(
+            poll_checkpoint::load(&setup.pool, TRANSFER_POLL).await.unwrap(),
+            None
+        );
 
         assert!(logs_contain_at!(
             tracing::Level::TRACE,

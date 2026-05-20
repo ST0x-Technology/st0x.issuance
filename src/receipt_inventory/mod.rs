@@ -315,7 +315,6 @@ pub(crate) struct ReceiptInventory {
     /// Maps issuer_request_id to receipt_id for ITN mints.
     /// Used by mint recovery to check if a mint succeeded on-chain.
     itn_receipts: HashMap<IssuerMintRequestId, ReceiptId>,
-    last_backfilled_block: Option<u64>,
 }
 
 impl ReceiptInventory {
@@ -331,10 +330,6 @@ impl ReceiptInventory {
                 receipt_info_bytes: metadata.receipt_info_bytes.clone(),
             })
             .collect()
-    }
-
-    pub(crate) const fn last_backfilled_block(&self) -> Option<u64> {
-        self.last_backfilled_block
     }
 
     /// Finds a receipt by its issuer_request_id (for ITN mints only).
@@ -463,21 +458,6 @@ impl Aggregate for ReceiptInventory {
 
                 Ok(std::iter::once(reconciled).chain(depleted).collect())
             }
-
-            ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
-                block_number,
-            } => {
-                if self
-                    .last_backfilled_block
-                    .is_some_and(|last_block| block_number <= last_block)
-                {
-                    return Ok(vec![]);
-                }
-
-                Ok(vec![ReceiptInventoryEvent::BackfillCheckpoint {
-                    block_number,
-                }])
-            }
         }
     }
 
@@ -529,13 +509,6 @@ impl Aggregate for ReceiptInventory {
                 self.itn_receipts.retain(|_, indexed_receipt_id| {
                     *indexed_receipt_id != receipt_id
                 });
-            }
-
-            ReceiptInventoryEvent::BackfillCheckpoint { block_number } => {
-                self.last_backfilled_block = Some(
-                    self.last_backfilled_block
-                        .map_or(block_number, |last| last.max(block_number)),
-                );
             }
         }
     }
@@ -680,59 +653,6 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_advance_backfill_checkpoint_emits_event() {
-        let aggregate = ReceiptInventory::default();
-
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
-                    block_number: 100,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            ReceiptInventoryEvent::BackfillCheckpoint { block_number: 100 }
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_advance_backfill_checkpoint_ignores_stale_blocks() {
-        let aggregate = ReceiptInventory {
-            last_backfilled_block: Some(100),
-            ..Default::default()
-        };
-
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
-                    block_number: 99,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert!(events.is_empty());
-
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::AdvanceBackfillCheckpoint {
-                    block_number: 100,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert!(events.is_empty());
-    }
-
     #[test]
     fn test_apply_discovered_adds_to_state() {
         let mut aggregate = ReceiptInventory::default();
@@ -869,29 +789,6 @@ mod tests {
         let receipts = aggregate.receipts_with_balance();
 
         assert!(receipts.is_empty());
-    }
-
-    #[test]
-    fn test_backfill_checkpoint_tracks_max_block_number() {
-        let mut aggregate = ReceiptInventory::default();
-
-        assert_eq!(aggregate.last_backfilled_block(), None);
-
-        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
-            block_number: 500,
-        });
-        assert_eq!(aggregate.last_backfilled_block(), Some(500));
-
-        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
-            block_number: 1000,
-        });
-        assert_eq!(aggregate.last_backfilled_block(), Some(1000));
-
-        // Earlier block doesn't decrease the max
-        aggregate.apply(ReceiptInventoryEvent::BackfillCheckpoint {
-            block_number: 750,
-        });
-        assert_eq!(aggregate.last_backfilled_block(), Some(1000));
     }
 
     #[tokio::test]
