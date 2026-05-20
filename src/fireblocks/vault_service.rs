@@ -528,6 +528,17 @@ impl VaultOperation {
     }
 }
 
+/// Serializes a `TransactionSubStatus` to its Fireblocks-wire string
+/// (e.g. `INSUFFICIENT_FUNDS`, `BLOCKED_BY_POLICY`). Relies on the SDK's serde
+/// rename rules so the output matches what Fireblocks' API surfaces.
+fn serialize_sub_status(
+    sub_status: models::TransactionSubStatus,
+) -> Option<String> {
+    serde_json::to_value(sub_status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+}
+
 /// Returns true if the transaction status indicates the transaction is still
 /// in progress and may eventually confirm on-chain. Used to distinguish
 /// "polling timed out but tx might still land" from "tx definitively failed."
@@ -809,6 +820,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             .await
             .map_err(FireblocksVaultError::from)?;
 
+        let sub_status = tx.sub_status.and_then(serialize_sub_status);
+        let network_tx_hashes = tx
+            .network_records
+            .as_ref()
+            .map(|records| {
+                records.iter().filter_map(|r| r.tx_hash.clone()).collect()
+            })
+            .unwrap_or_default();
+
         let status = match tx.status {
             TransactionStatus::Completed => {
                 let tx_hash_str = tx.tx_hash.ok_or_else(|| {
@@ -827,15 +847,19 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                         detail: format!(
                             "EVM reverted (Fireblocks Completed, tx {tx_hash})"
                         ),
+                        sub_status,
+                        network_tx_hashes,
                     }));
                 }
 
                 FireblocksTxStatus::Completed { tx_hash, block_number }
             }
             status if is_still_pending(status) => FireblocksTxStatus::Pending,
-            status => {
-                FireblocksTxStatus::Failed { detail: format!("{status:?}") }
-            }
+            status => FireblocksTxStatus::Failed {
+                detail: format!("{status:?}"),
+                sub_status,
+                network_tx_hashes,
+            },
         };
 
         Ok(Some(status))
@@ -864,6 +888,31 @@ mod tests {
 
     use super::*;
     use crate::fireblocks::config::parse_chain_asset_ids;
+
+    #[test]
+    fn serialize_sub_status_returns_fireblocks_wire_string() {
+        // Pick a few variants the SDK's serde rename rules should turn into
+        // the canonical Fireblocks API strings.
+        assert_eq!(
+            serialize_sub_status(
+                models::TransactionSubStatus::InsufficientFunds
+            )
+            .as_deref(),
+            Some("INSUFFICIENT_FUNDS"),
+        );
+        assert_eq!(
+            serialize_sub_status(models::TransactionSubStatus::BlockedByPolicy)
+                .as_deref(),
+            Some("BLOCKED_BY_POLICY"),
+        );
+        assert_eq!(
+            serialize_sub_status(
+                models::TransactionSubStatus::RejectedByBlockchain
+            )
+            .as_deref(),
+            Some("REJECTED_BY_BLOCKCHAIN"),
+        );
+    }
 
     static TEST_RSA_PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
         let mut rng = rand::thread_rng();

@@ -118,7 +118,18 @@ pub(crate) enum FireblocksTxStatus {
     /// Transaction is still pending (submitted, confirming, etc.).
     Pending,
     /// Transaction reached a terminal failure status.
-    Failed { detail: String },
+    Failed {
+        /// Top-level Fireblocks `TransactionStatus` variant (debug-formatted).
+        detail: String,
+        /// Fireblocks `subStatus` (e.g. `INSUFFICIENT_FUNDS`,
+        /// `BLOCKED_BY_POLICY`, `REJECTED_BY_BLOCKCHAIN`). This is what tells
+        /// you *why* a transaction failed; `detail` alone just says it did.
+        sub_status: Option<String>,
+        /// Per-network transaction hashes Fireblocks recorded. Useful when a
+        /// blockchain-level failure (revert, dropped tx) needs to be inspected
+        /// against an explorer.
+        network_tx_hashes: Vec<String>,
+    },
 }
 
 /// Result of a successful on-chain minting operation.

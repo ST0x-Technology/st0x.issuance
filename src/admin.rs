@@ -58,6 +58,11 @@ pub(crate) struct StuckAggregate {
     /// `BurnFailed` (the view carries it for that variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     fireblocks_tx_id: Option<String>,
+    /// Live status of the Fireblocks transaction (subStatus, network tx
+    /// hashes). Best-effort: omitted when `fireblocks_tx_id` is missing,
+    /// the backend is non-Fireblocks, or the lookup itself fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fireblocks_status: Option<FireblocksTxStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -421,10 +426,15 @@ async fn recover_post_alpaca(
                 );
                 return Err(Status::UnprocessableEntity);
             }
-            Ok(Some(FireblocksTxStatus::Failed { detail: fb_detail })) => {
+            Ok(Some(FireblocksTxStatus::Failed {
+                detail: fb_detail,
+                sub_status: fb_sub_status,
+                network_tx_hashes: _,
+            })) => {
                 info!(target: "admin", aggregate_id = %aggregate_id,
                     fireblocks_tx_id = %fb_tx_id,
                     fireblocks_status = %fb_detail,
+                    fireblocks_sub_status = ?fb_sub_status,
                     "Fireblocks tx failed, proceeding with ResumeBurn"
                 );
                 // Fall through to ResumeBurn below
@@ -667,12 +677,13 @@ pub(crate) async fn close_mint(
     }))
 }
 
-#[tracing::instrument(skip(_auth, pool, mint_event_store))]
+#[tracing::instrument(skip(_auth, pool, mint_event_store, vault_service))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
     mint_event_store: &rocket::State<MintEventStore>,
+    vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let mut stuck = Vec::new();
 
@@ -721,10 +732,43 @@ pub(crate) async fn list_stuck(
             underlying,
             quantity,
             fireblocks_tx_id,
+            fireblocks_status: None,
         });
     }
 
+    enrich_with_fireblocks_status(&mut stuck, vault_service.inner().as_ref())
+        .await;
+
     Ok(Json(StuckResponse { stuck }))
+}
+
+/// Best-effort enrichment: for every stuck entry with a `fireblocks_tx_id`,
+/// query the vault service for the live Fireblocks status (subStatus + network
+/// records) and attach it to the entry. Lookup failures and non-Fireblocks
+/// backends leave `fireblocks_status` as `None`; this is purely additive
+/// information for operators triaging stuck transactions.
+async fn enrich_with_fireblocks_status(
+    stuck: &mut [StuckAggregate],
+    vault_service: &dyn VaultService,
+) {
+    for entry in stuck.iter_mut() {
+        let Some(tx_id) = entry.fireblocks_tx_id.as_deref() else {
+            continue;
+        };
+
+        match vault_service.check_fireblocks_tx(tx_id).await {
+            Ok(Some(status)) => entry.fireblocks_status = Some(status),
+            Ok(None) => {}
+            Err(err) => {
+                warn!(target: "admin",
+                    aggregate_id = %entry.aggregate_id,
+                    fireblocks_tx_id = %tx_id,
+                    error = %err,
+                    "Failed to enrich stuck entry with Fireblocks status"
+                );
+            }
+        }
+    }
 }
 
 fn stuck_redemption_entry(
@@ -782,6 +826,7 @@ fn stuck_redemption_entry(
         underlying,
         quantity,
         fireblocks_tx_id,
+        fireblocks_status: None,
     })
 }
 
@@ -955,8 +1000,10 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-    use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
+    use crate::vault::{FireblocksTxStatus, VaultService};
+
+    use super::{AggregateKind, StuckAggregate};
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -1604,5 +1651,159 @@ mod tests {
         let body = response.into_string().await.unwrap();
         assert!(body.contains("Burning"));
         assert!(logs_contain_at!(Level::INFO, &["recovered", "Burning"]));
+    }
+
+    /// Stub VaultService that returns a pre-canned `FireblocksTxStatus` for a
+    /// specific tx id and `None` for everything else. Lets us drive
+    /// `enrich_with_fireblocks_status` without spinning up Fireblocks.
+    struct StubFireblocksVault {
+        tx_id: String,
+        response: FireblocksTxStatus,
+    }
+
+    #[async_trait]
+    impl VaultService for StubFireblocksVault {
+        async fn submit_mint(
+            &self,
+            _vault: alloy::primitives::Address,
+            _assets: alloy::primitives::U256,
+            _bot: alloy::primitives::Address,
+            _user: alloy::primitives::Address,
+            _receipt_info: crate::vault::ReceiptInformation,
+        ) -> Result<crate::vault::SubmittedTx, crate::vault::VaultError>
+        {
+            unimplemented!("not used in enrichment tests")
+        }
+
+        async fn confirm_mint(
+            &self,
+            _fireblocks_tx_id: &str,
+        ) -> Result<crate::vault::MintResult, crate::vault::VaultError>
+        {
+            unimplemented!("not used in enrichment tests")
+        }
+
+        async fn get_share_balance(
+            &self,
+            _vault: alloy::primitives::Address,
+            _owner: alloy::primitives::Address,
+        ) -> Result<alloy::primitives::U256, crate::vault::VaultError> {
+            unimplemented!("not used in enrichment tests")
+        }
+
+        async fn check_fireblocks_tx(
+            &self,
+            fireblocks_tx_id: &str,
+        ) -> Result<Option<FireblocksTxStatus>, crate::vault::VaultError>
+        {
+            if fireblocks_tx_id == self.tx_id {
+                Ok(Some(self.response.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn submit_burn(
+            &self,
+            _params: crate::vault::MultiBurnParams,
+        ) -> Result<crate::vault::SubmittedTx, crate::vault::VaultError>
+        {
+            unimplemented!("not used in enrichment tests")
+        }
+
+        async fn confirm_burn(
+            &self,
+            _fireblocks_tx_id: &str,
+            _dust_shares: alloy::primitives::U256,
+        ) -> Result<crate::vault::MultiBurnResult, crate::vault::VaultError>
+        {
+            unimplemented!("not used in enrichment tests")
+        }
+    }
+
+    fn stuck_entry(id: &str, fireblocks_tx_id: Option<&str>) -> StuckAggregate {
+        StuckAggregate {
+            aggregate_type: AggregateKind::Mint,
+            aggregate_id: id.to_string(),
+            tokenization_request_id: None,
+            state: "MintingFailed".to_string(),
+            detail: "Fireblocks transaction X reached terminal status: Failed"
+                .to_string(),
+            timestamp: Utc::now(),
+            underlying: None,
+            quantity: None,
+            fireblocks_tx_id: fireblocks_tx_id.map(str::to_owned),
+            fireblocks_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_populates_status_for_matching_tx_id() {
+        let tx_id = "a29e5027-1e44-4a66-b78b-b579e55757db";
+        let stub = StubFireblocksVault {
+            tx_id: tx_id.to_string(),
+            response: FireblocksTxStatus::Failed {
+                detail: "Failed".to_string(),
+                sub_status: Some("INSUFFICIENT_FUNDS".to_string()),
+                network_tx_hashes: vec![
+                    "0xabc0000000000000000000000000000000000000000000000000000000000001"
+                        .to_string(),
+                ],
+            },
+        };
+
+        let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
+        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+
+        match entries[0].fireblocks_status.as_ref().expect(
+            "matching tx id should produce a populated fireblocks_status",
+        ) {
+            FireblocksTxStatus::Failed {
+                detail,
+                sub_status,
+                network_tx_hashes,
+            } => {
+                assert_eq!(detail, "Failed");
+                assert_eq!(sub_status.as_deref(), Some("INSUFFICIENT_FUNDS"),);
+                assert_eq!(network_tx_hashes.len(), 1);
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_leaves_entries_without_tx_id_untouched() {
+        let stub = StubFireblocksVault {
+            tx_id: "any".to_string(),
+            response: FireblocksTxStatus::Pending,
+        };
+
+        let mut entries = vec![
+            stuck_entry("redemption-no-tx", None),
+            stuck_entry("redemption-unknown-tx", Some("unrelated-tx")),
+        ];
+
+        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+
+        // Entry without a tx id is skipped entirely.
+        assert!(entries[0].fireblocks_status.is_none());
+        // Entry with a tx id the stub doesn't recognise gets `Ok(None)` back
+        // from the vault service, which maps to a left-as-None status.
+        assert!(entries[1].fireblocks_status.is_none());
+    }
+
+    #[test]
+    fn failed_status_serializes_with_sub_status_and_network_hashes() {
+        let status = FireblocksTxStatus::Failed {
+            detail: "Failed".to_string(),
+            sub_status: Some("BLOCKED_BY_POLICY".to_string()),
+            network_tx_hashes: vec!["0xdeadbeef".to_string()],
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["detail"], "Failed");
+        assert_eq!(json["sub_status"], "BLOCKED_BY_POLICY");
+        assert_eq!(json["network_tx_hashes"][0], "0xdeadbeef");
     }
 }
