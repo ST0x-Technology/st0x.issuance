@@ -66,7 +66,7 @@ where
     T: alloy::providers::Provider,
 {
     let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(5);
+    let timeout = tokio::time::Duration::from_secs(15);
     let poll_interval = tokio::time::Duration::from_millis(100);
 
     loop {

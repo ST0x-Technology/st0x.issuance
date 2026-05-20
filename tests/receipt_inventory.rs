@@ -22,6 +22,61 @@ use st0x_issuance::{
     SignerConfig, initialize_rocket,
 };
 
+async fn wait_for_receipt_depleted(
+    db_url: &str,
+    vault: Address,
+    receipt_id: U256,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+    let poll_interval = Duration::from_millis(100);
+    let expected_receipt_id = format!("{receipt_id:#x}");
+
+    loop {
+        let events: Vec<(String,)> = sqlx::query_as(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'ReceiptInventory'
+              AND aggregate_id = ?
+              AND event_type = 'ReceiptInventoryEvent::Depleted'
+            ",
+        )
+        .bind(vault.to_string())
+        .fetch_all(&pool)
+        .await?;
+
+        let depleted = events.iter().any(|(payload,)| {
+            receipt_id_from_event_payload(payload).as_deref()
+                == Some(expected_receipt_id.as_str())
+        });
+
+        if depleted {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "Timeout waiting for receipt {expected_receipt_id} to be depleted"
+            )
+            .into());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+fn receipt_id_from_event_payload(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+
+    value["receipt_id"]
+        .as_str()
+        .or_else(|| value["Depleted"]["receipt_id"].as_str())
+        .map(ToString::to_string)
+}
+
 /// Tests that backfill checkpoint is independent from monitor discoveries.
 ///
 /// The critical scenario:
@@ -526,8 +581,7 @@ async fn test_external_burn_detected_by_withdraw_monitor()
         "Receipt A should be fully burned on-chain"
     );
 
-    // Give the monitor time to detect the Withdraw event and reconcile
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_receipt_depleted(&db_url, evm.vault_address, receipt_a_id).await?;
 
     // Step 4: Mint receipt B via API (50 shares to user)
     let link_body = harness::setup_account(&client, user_wallet).await;

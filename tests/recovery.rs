@@ -9,12 +9,65 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::time::Duration;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::{Uuid, uuid};
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+static RECOVERY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+async fn recovery_test_guard() -> MutexGuard<'static, ()> {
+    RECOVERY_TEST_LOCK.lock().await
+}
+
+async fn wait_for_event_count(
+    db_url: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
+    min_count: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+    let poll_interval = Duration::from_millis(100);
+
+    loop {
+        let count = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = ?
+              AND aggregate_id = ?
+              AND event_type = ?
+            ",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(event_type)
+        .fetch_one(&pool)
+        .await?;
+
+        if count >= min_count {
+            return Ok(count);
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "Timeout waiting for {event_type} on {aggregate_type}/{aggregate_id}; \
+                 found {count}, expected at least {min_count}"
+            )
+            .into());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
 
 async fn insert_event(
     pool: &sqlx::Pool<sqlx::Sqlite>,
@@ -127,6 +180,8 @@ async fn insert_minting_state_events(
 #[tokio::test]
 async fn test_mint_recovery_after_view_deletion()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -177,6 +232,15 @@ async fn test_mint_recovery_after_view_deletion()
         &user_provider,
     );
     harness::wait_for_shares(&vault, user_wallet).await?;
+
+    wait_for_event_count(
+        &db_url,
+        "Mint",
+        &issuer_request_id,
+        "MintEvent::MintCompleted",
+        1,
+    )
+    .await?;
 
     // "Crash" - drop the service
     drop(client1);
@@ -233,8 +297,14 @@ async fn test_mint_recovery_after_view_deletion()
     // duplicate mint, but that's a separate issue (Task 7-9 handles this).
     // For now, we just want to verify recovery FINDS the stuck mint.
 
-    // Give recovery time to run
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    wait_for_event_count(
+        &db_url,
+        "Mint",
+        &aggregate_id,
+        "MintEvent::MintingStarted",
+        1,
+    )
+    .await?;
 
     // Check if the mint progressed past JournalConfirmed
     let query_pool2 =
@@ -280,6 +350,8 @@ async fn test_mint_recovery_after_view_deletion()
 #[tokio::test]
 async fn test_mint_recovery_from_minting_state_when_receipt_exists()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -421,6 +493,8 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
 #[tokio::test]
 async fn test_mint_recovery_from_minting_state_when_no_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -518,6 +592,8 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
 #[tokio::test]
 async fn test_mint_recovery_prevents_double_mint()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -667,6 +743,8 @@ async fn test_mint_recovery_prevents_double_mint()
 #[tokio::test]
 async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -791,6 +869,8 @@ async fn test_receipt_monitor_triggers_recovery_for_failed_mint()
 #[tokio::test]
 async fn test_mint_recovery_from_minting_failed_state()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -909,6 +989,8 @@ async fn test_mint_recovery_from_minting_failed_state()
 #[tokio::test]
 async fn test_startup_clears_and_rebuilds_views()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -1028,6 +1110,8 @@ async fn test_startup_clears_and_rebuilds_views()
 #[tokio::test]
 async fn test_detected_redemption_auto_failed_when_no_account()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -1171,6 +1255,8 @@ async fn test_detected_redemption_auto_failed_when_no_account()
 #[tokio::test]
 async fn test_burn_failed_redemption_auto_failed_when_no_balance()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _recovery_test_guard = recovery_test_guard().await;
+
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
 
@@ -1286,22 +1372,13 @@ async fn test_burn_failed_redemption_auto_failed_when_no_balance()
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    // Assert: The stuck redemption should have a RedemptionFailed event
-    let verify_pool =
-        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
-
-    let failed_count = sqlx::query_scalar!(
-        r#"
-        SELECT COUNT(*) as "count: i64"
-        FROM events
-        WHERE aggregate_type = 'Redemption'
-          AND aggregate_id = 'red-baadf00d'
-          AND event_type = 'RedemptionEvent::RedemptionFailed'
-        "#
+    let failed_count = wait_for_event_count(
+        &db_url,
+        "Redemption",
+        stuck_id,
+        "RedemptionEvent::RedemptionFailed",
+        1,
     )
-    .fetch_one(&verify_pool)
     .await?;
 
     assert_eq!(
