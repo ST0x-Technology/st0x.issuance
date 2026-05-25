@@ -309,6 +309,12 @@ pub(crate) enum VaultError {
     /// Expected event (e.g., Deposit) not found in transaction logs
     #[error("Event not found in transaction: {tx_hash:?}")]
     EventNotFound { tx_hash: B256 },
+    /// Transaction was mined but reverted on-chain (status == 0).
+    ///
+    /// A reverted burn consumes no receipts, so any inventory reservation
+    /// held for it must be released.
+    #[error("Transaction reverted on-chain: {tx_hash:?}")]
+    Reverted { tx_hash: B256 },
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),

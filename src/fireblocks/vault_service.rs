@@ -392,6 +392,14 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     ) -> Result<MultiBurnResult, VaultError> {
         let receipt = self.fetch_receipt(tx_hash).await?;
 
+        // A Fireblocks transaction can report `Completed` while the EVM
+        // transaction itself reverted (e.g. ERC1155InsufficientBalance). A
+        // reverted burn consumes no receipts, so it is a definitive failure
+        // distinct from an anomalous missing-Withdraw parse error.
+        if !receipt.status() {
+            return Err(VaultError::Reverted { tx_hash });
+        }
+
         let burns: Vec<MultiBurnResultEntry> = receipt
             .inner
             .logs()
@@ -542,7 +550,7 @@ fn serialize_sub_status(
 /// Returns true if the transaction status indicates the transaction is still
 /// in progress and may eventually confirm on-chain. Used to distinguish
 /// "polling timed out but tx might still land" from "tx definitively failed."
-const fn is_still_pending(status: TransactionStatus) -> bool {
+pub(crate) const fn is_still_pending(status: TransactionStatus) -> bool {
     use TransactionStatus::*;
 
     match status {

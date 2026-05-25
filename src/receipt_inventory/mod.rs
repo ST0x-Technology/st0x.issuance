@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use cqrs_es::{
     Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore,
 };
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::mint::IssuerMintRequestId;
+use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
 use crate::vault::ReceiptInformation;
 use crate::vault::rain_meta;
 pub(crate) use backfill::ItnReceiptHandler;
@@ -81,10 +83,14 @@ impl std::fmt::Display for ReceiptId {
 ///
 /// Shares represent ownership in the vault and are minted/burned
 /// proportionally to deposited/withdrawn assets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub(crate) struct Shares(U256);
 
 impl Shares {
+    pub(crate) const ZERO: Self = Self(U256::ZERO);
+
     pub(crate) const fn new(amount: U256) -> Self {
         Self(amount)
     }
@@ -138,15 +144,79 @@ impl std::ops::Add for Shares {
 }
 
 /// Metadata about a receipt stored in the inventory.
+///
+/// `balance` mirrors the on-chain ERC-1155 balance the bot believes it holds.
+/// `reserved` tracks shares committed to submitted-but-unconfirmed burns,
+/// keyed by the redemption that submitted them. Available inventory for burn
+/// planning is `balance - sum(reserved)`. Keeping the two separate is what lets
+/// reconciliation compare against the true on-chain mirror without clobbering a
+/// pending reservation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReceiptMetadata {
     balance: Shares,
+    #[serde(default)]
+    reserved: HashMap<IssuerRedemptionRequestId, Shares>,
     tx_hash: TxHash,
     block_number: u64,
     #[serde(default)]
     receipt_info: Option<ReceiptInformation>,
     #[serde(default)]
     receipt_info_bytes: Option<Bytes>,
+}
+
+impl ReceiptMetadata {
+    /// Total shares reserved across all redemptions for this receipt.
+    fn reserved_total(&self) -> Shares {
+        Self::sum_reserved(self.reserved.values().copied())
+    }
+
+    /// Shares reserved by every redemption except `redemption`.
+    ///
+    /// Used when validating a reservation so a redemption re-reserving the same
+    /// receipt (idempotent re-delivery) does not count its own prior amount.
+    fn reserved_excluding(
+        &self,
+        redemption: &IssuerRedemptionRequestId,
+    ) -> Shares {
+        Self::sum_reserved(
+            self.reserved
+                .iter()
+                .filter(|(id, _)| *id != redemption)
+                .map(|(_, shares)| *shares),
+        )
+    }
+
+    /// Shares available for new burn planning: mirror balance minus all
+    /// outstanding reservations. Saturates to zero if reservations somehow
+    /// exceed the mirror (e.g. after an external on-chain drain).
+    fn available(&self) -> Shares {
+        self.balance.checked_sub(self.reserved_total()).unwrap_or(Shares::ZERO)
+    }
+
+    /// Shares available to `redemption` for planning: mirror balance minus
+    /// every *other* redemption's reservation. Excludes `redemption`'s own
+    /// prior reservation so a retry can re-plan its full burn against the
+    /// inventory it is entitled to; the atomic clear-and-reserve then replaces
+    /// that prior reservation.
+    fn available_excluding(
+        &self,
+        redemption: &IssuerRedemptionRequestId,
+    ) -> Shares {
+        self.balance
+            .checked_sub(self.reserved_excluding(redemption))
+            .unwrap_or(Shares::ZERO)
+    }
+
+    /// Sums reserved amounts. Each reservation was validated at `ReserveBurn`
+    /// time to be `<=` this receipt's mirror balance (a real U256 share
+    /// amount), so the sum cannot overflow U256 in practice; `saturating_add`
+    /// is a non-panicking guard for that impossible case, not a silent cap over
+    /// a real value.
+    fn sum_reserved(reserved: impl Iterator<Item = Shares>) -> Shares {
+        reserved.fold(Shares::ZERO, |acc, shares| {
+            Shares::new(acc.inner().saturating_add(shares.inner()))
+        })
+    }
 }
 
 /// Parameters for registering a newly minted receipt.
@@ -181,13 +251,43 @@ pub(crate) trait ReceiptService: Send + Sync {
     /// Returns a burn plan: which receipts to burn and how much from each.
     ///
     /// The plan satisfies the required burn amount by selecting from available
-    /// receipts in descending order of balance.
+    /// receipts in descending order of balance. Availability excludes
+    /// `redemption_issuer_request_id`'s own prior reservation, so a retry plans
+    /// against its full entitlement; the subsequent `reserve_burn` atomically
+    /// replaces that reservation.
     async fn for_burn(
         &self,
         vault: Address,
+        redemption_issuer_request_id: &IssuerRedemptionRequestId,
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError>;
+
+    async fn reserve_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+        burns: Vec<BurnRecord>,
+    ) -> Result<(), ReceiptRegistrationError>;
+
+    async fn release_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+    ) -> Result<(), ReceiptRegistrationError>;
+
+    async fn settle_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+    ) -> Result<(), ReceiptRegistrationError>;
+
+    /// Returns the redemptions that currently hold a reservation on the vault,
+    /// for startup reservation recovery.
+    async fn reserved_redemptions(
+        &self,
+        vault: Address,
+    ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>;
 
     /// Finds a receipt by its issuer_request_id (for ITN mints only).
     ///
@@ -260,13 +360,77 @@ where
     async fn for_burn(
         &self,
         vault: Address,
+        redemption_issuer_request_id: &IssuerRedemptionRequestId,
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError> {
         let context = self.store.load_aggregate(&vault.to_string()).await?;
 
-        let receipts = context.aggregate().receipts_with_balance();
+        let receipts = context
+            .aggregate()
+            .receipts_with_balance_excluding(redemption_issuer_request_id);
         plan_burn(receipts, shares_to_burn, dust)
+    }
+
+    async fn reserve_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+        burns: Vec<BurnRecord>,
+    ) -> Result<(), ReceiptRegistrationError> {
+        self.cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::ReserveBurn {
+                    redemption_issuer_request_id,
+                    burns,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn release_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+    ) -> Result<(), ReceiptRegistrationError> {
+        self.cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::ReleaseBurn {
+                    redemption_issuer_request_id,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn settle_burn(
+        &self,
+        vault: Address,
+        redemption_issuer_request_id: IssuerRedemptionRequestId,
+    ) -> Result<(), ReceiptRegistrationError> {
+        self.cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::SettleBurn {
+                    redemption_issuer_request_id,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn reserved_redemptions(
+        &self,
+        vault: Address,
+    ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError> {
+        let context = self.store.load_aggregate(&vault.to_string()).await?;
+        Ok(context.aggregate().reserved_redemptions())
     }
 
     async fn find_by_issuer_request_id(
@@ -321,15 +485,45 @@ impl ReceiptInventory {
     pub(crate) fn receipts_with_balance(&self) -> Vec<ReceiptWithBalance> {
         self.receipts
             .iter()
-            .map(|(receipt_id, metadata)| ReceiptWithBalance {
-                receipt_id: *receipt_id,
-                available_balance: metadata.balance,
-                tx_hash: metadata.tx_hash,
-                block_number: metadata.block_number,
-                receipt_info: metadata.receipt_info.clone(),
-                receipt_info_bytes: metadata.receipt_info_bytes.clone(),
+            .map(|(receipt_id, metadata)| {
+                Self::receipt_row(*receipt_id, metadata, metadata.available())
             })
             .collect()
+    }
+
+    /// Receipts with the availability `redemption` may plan against, treating
+    /// its own prior reservation as not held (see
+    /// `ReceiptMetadata::available_excluding`). Used by `for_burn` so a retry
+    /// re-plans its full burn rather than being blocked by its own reservation.
+    pub(crate) fn receipts_with_balance_excluding(
+        &self,
+        redemption: &IssuerRedemptionRequestId,
+    ) -> Vec<ReceiptWithBalance> {
+        self.receipts
+            .iter()
+            .map(|(receipt_id, metadata)| {
+                Self::receipt_row(
+                    *receipt_id,
+                    metadata,
+                    metadata.available_excluding(redemption),
+                )
+            })
+            .collect()
+    }
+
+    fn receipt_row(
+        receipt_id: ReceiptId,
+        metadata: &ReceiptMetadata,
+        available_balance: Shares,
+    ) -> ReceiptWithBalance {
+        ReceiptWithBalance {
+            receipt_id,
+            available_balance,
+            tx_hash: metadata.tx_hash,
+            block_number: metadata.block_number,
+            receipt_info: metadata.receipt_info.clone(),
+            receipt_info_bytes: metadata.receipt_info_bytes.clone(),
+        }
     }
 
     /// Finds a receipt by its issuer_request_id (for ITN mints only).
@@ -339,6 +533,70 @@ impl ReceiptInventory {
         issuer_request_id: &IssuerMintRequestId,
     ) -> Option<ReceiptId> {
         self.itn_receipts.get(issuer_request_id).copied()
+    }
+
+    /// Whether the given redemption holds a reservation on any receipt.
+    fn holds_reservation(
+        &self,
+        redemption: &IssuerRedemptionRequestId,
+    ) -> bool {
+        self.receipts
+            .values()
+            .any(|metadata| metadata.reserved.contains_key(redemption))
+    }
+
+    /// Distinct redemptions that currently hold a reservation on any receipt.
+    ///
+    /// Used by startup reservation recovery to find reservations that were
+    /// never settled or released (e.g. a crash between burn confirmation and
+    /// settlement) and resolve them against the redemption's terminal state.
+    pub(crate) fn reserved_redemptions(
+        &self,
+    ) -> Vec<IssuerRedemptionRequestId> {
+        self.receipts
+            .values()
+            .flat_map(|metadata| metadata.reserved.keys().cloned())
+            .unique()
+            .collect()
+    }
+
+    /// `Depleted` events for receipts that clearing `redemption`'s reservation
+    /// would leave at zero balance with no other reservation outstanding.
+    ///
+    /// `consume_balance` true models settlement (the mirror drops by the
+    /// reserved amount); false models release (the mirror is unchanged). This
+    /// also covers a receipt already at zero balance — preserved by the
+    /// zero-drain reconcile guard — so it is depleted once its last reservation
+    /// resolves rather than lingering empty forever.
+    fn depletions_after_clearing(
+        &self,
+        redemption: &IssuerRedemptionRequestId,
+        consume_balance: bool,
+    ) -> Vec<ReceiptInventoryEvent> {
+        self.receipts
+            .iter()
+            .filter_map(|(receipt_id, metadata)| {
+                let reserved = metadata.reserved.get(redemption)?;
+
+                // Another redemption still holds this receipt; leave it.
+                if metadata.reserved.len() > 1 {
+                    return None;
+                }
+
+                let post_balance = if consume_balance {
+                    metadata
+                        .balance
+                        .checked_sub(*reserved)
+                        .unwrap_or(Shares::ZERO)
+                } else {
+                    metadata.balance
+                };
+
+                post_balance.is_zero().then_some(
+                    ReceiptInventoryEvent::Depleted { receipt_id: *receipt_id },
+                )
+            })
+            .collect()
     }
 }
 
@@ -390,7 +648,21 @@ pub(crate) fn determine_source(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ReceiptInventoryError {}
+pub(crate) enum ReceiptInventoryError {
+    #[error("Unknown receipt {receipt_id}")]
+    UnknownReceipt { receipt_id: ReceiptId },
+    #[error(transparent)]
+    SharesOverflow(#[from] SharesOverflow),
+    #[error(
+        "Receipt {receipt_id} has insufficient balance: \
+         available={available}, required={required}"
+    )]
+    InsufficientReceiptBalance {
+        receipt_id: ReceiptId,
+        available: Shares,
+        required: Shares,
+    },
+}
 
 #[async_trait]
 impl Aggregate for ReceiptInventory {
@@ -441,22 +713,120 @@ impl Aggregate for ReceiptInventory {
                     return Ok(vec![]);
                 };
 
-                let aggregate_balance = metadata.balance;
-                if on_chain_balance == aggregate_balance {
-                    return Ok(vec![]);
+                let mirror = metadata.balance;
+                let available = metadata.available();
+
+                // While a submitted burn is pending, on-chain legitimately
+                // sits between `available` (all reservations settled) and
+                // `mirror` (none landed yet). Treat anything in that band as
+                // "no external change" so reconciliation never clobbers a
+                // reservation — settlement, not reconciliation, consumes it.
+                if (available..=mirror).contains(&on_chain_balance) {
+                    return Ok(if mirror.is_zero() {
+                        depletion_events(receipt_id, metadata)
+                    } else {
+                        vec![]
+                    });
                 }
 
                 let reconciled = ReceiptInventoryEvent::BalanceReconciled {
                     receipt_id,
-                    previous_balance: aggregate_balance,
+                    previous_balance: mirror,
                     on_chain_balance,
                 };
 
-                let depleted = on_chain_balance
-                    .is_zero()
-                    .then_some(ReceiptInventoryEvent::Depleted { receipt_id });
+                let depletion = if on_chain_balance.is_zero() {
+                    depletion_events(receipt_id, metadata)
+                } else {
+                    vec![]
+                };
 
-                Ok(std::iter::once(reconciled).chain(depleted).collect())
+                Ok(std::iter::once(reconciled).chain(depletion).collect())
+            }
+
+            ReceiptInventoryCommand::ReserveBurn {
+                redemption_issuer_request_id,
+                burns,
+            } => {
+                let required_by_receipt = required_burns_by_receipt(&burns)?;
+
+                for (receipt_id, required) in required_by_receipt {
+                    let Some(metadata) = self.receipts.get(&receipt_id) else {
+                        return Err(ReceiptInventoryError::UnknownReceipt {
+                            receipt_id,
+                        });
+                    };
+
+                    // Validate against availability excluding this redemption's
+                    // own prior reservation, matching how `for_burn` plans, so a
+                    // retry (or re-delivered ReserveBurn) does not count itself
+                    // and over-reject. The atomic clear-and-reserve apply then
+                    // replaces that prior reservation.
+                    let available = metadata
+                        .available_excluding(&redemption_issuer_request_id);
+
+                    if available < required {
+                        return Err(
+                            ReceiptInventoryError::InsufficientReceiptBalance {
+                                receipt_id,
+                                available,
+                                required,
+                            },
+                        );
+                    }
+                }
+
+                Ok(vec![ReceiptInventoryEvent::BurnReserved {
+                    redemption_issuer_request_id,
+                    burns,
+                }])
+            }
+
+            // Release restores a reservation without touching the mirror
+            // balance (the burn never consumed any shares on-chain). It is a
+            // no-op when the redemption holds no reservation, which makes it
+            // safe to call defensively before re-planning a retry. Emits
+            // Depleted for a zero-balance receipt whose last reservation this
+            // release clears.
+            ReceiptInventoryCommand::ReleaseBurn {
+                redemption_issuer_request_id,
+            } => {
+                if !self.holds_reservation(&redemption_issuer_request_id) {
+                    return Ok(vec![]);
+                }
+
+                let depletions = self.depletions_after_clearing(
+                    &redemption_issuer_request_id,
+                    false,
+                );
+
+                Ok(std::iter::once(ReceiptInventoryEvent::BurnReleased {
+                    redemption_issuer_request_id,
+                })
+                .chain(depletions)
+                .collect())
+            }
+
+            // Settle consumes a reservation after its burn confirmed on-chain:
+            // the mirror balance drops by the reserved amount. Emits Depleted
+            // for any receipt the settlement empties.
+            ReceiptInventoryCommand::SettleBurn {
+                redemption_issuer_request_id,
+            } => {
+                if !self.holds_reservation(&redemption_issuer_request_id) {
+                    return Ok(vec![]);
+                }
+
+                let depletions = self.depletions_after_clearing(
+                    &redemption_issuer_request_id,
+                    true,
+                );
+
+                Ok(std::iter::once(ReceiptInventoryEvent::BurnSettled {
+                    redemption_issuer_request_id,
+                })
+                .chain(depletions)
+                .collect())
             }
         }
     }
@@ -476,6 +846,7 @@ impl Aggregate for ReceiptInventory {
                     receipt_id,
                     ReceiptMetadata {
                         balance,
+                        reserved: HashMap::new(),
                         tx_hash,
                         block_number,
                         receipt_info: receipt_info.map(|boxed| *boxed),
@@ -492,7 +863,17 @@ impl Aggregate for ReceiptInventory {
                 on_chain_balance,
                 ..
             } => {
-                if on_chain_balance.is_zero() {
+                // Remove the receipt only when on-chain hit zero AND no
+                // reservation survives. A reserved receipt drained to zero is
+                // preserved (mirror set to zero) so a pending settle/release
+                // can still resolve the reservation rather than have it
+                // silently discarded with the receipt.
+                let has_reservation = self
+                    .receipts
+                    .get(&receipt_id)
+                    .is_some_and(|metadata| !metadata.reserved.is_empty());
+
+                if on_chain_balance.is_zero() && !has_reservation {
                     self.receipts.remove(&receipt_id);
                     self.itn_receipts.retain(|_, indexed_receipt_id| {
                         *indexed_receipt_id != receipt_id
@@ -510,8 +891,131 @@ impl Aggregate for ReceiptInventory {
                     *indexed_receipt_id != receipt_id
                 });
             }
+
+            // Atomic clear-and-reserve: a reservation is the redemption's whole
+            // current allocation, so first drop any prior reservation it held
+            // (e.g. from a retried attempt that planned different receipts),
+            // then install the new one. This makes a retry's reserve replace the
+            // redemption's reservation set in a single transaction — no stale
+            // entry can survive to be over-consumed at settle, and the balance
+            // is never returned to global availability between clear and
+            // reserve.
+            ReceiptInventoryEvent::BurnReserved {
+                redemption_issuer_request_id,
+                burns,
+            } => {
+                let reserved_by_receipt = match required_burns_by_receipt(
+                    &burns,
+                ) {
+                    Ok(reserved_by_receipt) => reserved_by_receipt,
+                    Err(err) => {
+                        warn!(target: "receipt",
+                            redemption_issuer_request_id = %redemption_issuer_request_id,
+                            error = %err,
+                            "BurnReserved burns failed to aggregate; reservation not applied"
+                        );
+                        return;
+                    }
+                };
+
+                for metadata in self.receipts.values_mut() {
+                    metadata.reserved.remove(&redemption_issuer_request_id);
+                }
+
+                for (receipt_id, reserved) in reserved_by_receipt {
+                    let Some(metadata) = self.receipts.get_mut(&receipt_id)
+                    else {
+                        warn!(target: "receipt", receipt_id = %receipt_id,
+                            redemption_issuer_request_id = %redemption_issuer_request_id,
+                            "BurnReserved for unknown receipt; reservation skipped"
+                        );
+                        continue;
+                    };
+
+                    metadata
+                        .reserved
+                        .insert(redemption_issuer_request_id.clone(), reserved);
+                }
+            }
+
+            // Release clears the redemption's reservation everywhere it is
+            // held, restoring availability without touching the mirror balance.
+            ReceiptInventoryEvent::BurnReleased {
+                redemption_issuer_request_id,
+            } => {
+                for metadata in self.receipts.values_mut() {
+                    metadata.reserved.remove(&redemption_issuer_request_id);
+                }
+            }
+
+            // Settle consumes the reservation: drop it and reduce the mirror
+            // balance by the reserved amount, since those shares left on-chain.
+            // Idempotent — a receipt with no matching reservation is skipped.
+            ReceiptInventoryEvent::BurnSettled {
+                redemption_issuer_request_id,
+            } => {
+                for (receipt_id, metadata) in &mut self.receipts {
+                    let Some(reserved) =
+                        metadata.reserved.remove(&redemption_issuer_request_id)
+                    else {
+                        continue;
+                    };
+
+                    let Some(new_balance) =
+                        metadata.balance.checked_sub(reserved)
+                    else {
+                        warn!(target: "receipt", receipt_id = %receipt_id,
+                            redemption_issuer_request_id = %redemption_issuer_request_id,
+                            balance = %metadata.balance,
+                            reserved = %reserved,
+                            "BurnSettled reservation exceeds mirror balance; clamping balance to zero"
+                        );
+                        metadata.balance = Shares::ZERO;
+                        continue;
+                    };
+
+                    metadata.balance = new_balance;
+                }
+            }
         }
     }
+}
+
+/// Decides whether a receipt that has reached zero balance should be depleted.
+///
+/// A receipt that still holds a reservation is preserved (with a WARN) instead
+/// of depleted: removing it would silently discard the reservation and turn a
+/// later settle/release into a no-op. A pending settle/release or the startup
+/// reservation recovery resolves it instead.
+fn depletion_events(
+    receipt_id: ReceiptId,
+    metadata: &ReceiptMetadata,
+) -> Vec<ReceiptInventoryEvent> {
+    if metadata.reserved.is_empty() {
+        return vec![ReceiptInventoryEvent::Depleted { receipt_id }];
+    }
+
+    warn!(target: "receipt", receipt_id = %receipt_id,
+        "Receipt reached zero balance while still holding reservations; \
+         preserving it so the reservation can resolve"
+    );
+    vec![]
+}
+
+fn required_burns_by_receipt(
+    burns: &[BurnRecord],
+) -> Result<HashMap<ReceiptId, Shares>, ReceiptInventoryError> {
+    burns.iter().try_fold(HashMap::new(), |mut required, burn| {
+        let receipt_id = ReceiptId::from(burn.receipt_id);
+        let shares = Shares::from(burn.shares_burned);
+        let current = required
+            .remove(&receipt_id)
+            .map_or(Ok(shares), |existing| existing + shares)?;
+
+        required.insert(receipt_id, current);
+
+        Ok(required)
+    })
 }
 
 #[cfg(test)]
@@ -519,8 +1023,11 @@ mod tests {
     use alloy::primitives::{Bytes, TxHash, address, b256};
     use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
     use std::sync::Arc;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::*;
+    use crate::test_utils::logs_contain_at;
 
     const TEST_OA_SCHEMA: &str =
         "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
@@ -533,9 +1040,17 @@ mod tests {
         Shares::new(U256::from(n))
     }
 
+    /// A redemption distinct from any used to reserve in these tests, so
+    /// `for_burn` planning counts (does not exclude) the reservations under
+    /// test — i.e. the "another redemption is planning" viewpoint.
+    fn planning_redemption() -> IssuerRedemptionRequestId {
+        "red-00000000".parse().unwrap()
+    }
+
     fn make_metadata(balance: u64) -> ReceiptMetadata {
         ReceiptMetadata {
             balance: make_shares(balance),
+            reserved: HashMap::new(),
             tx_hash: TxHash::ZERO,
             block_number: 0,
             receipt_info: None,
@@ -1055,6 +1570,7 @@ mod tests {
         let plan = service
             .for_burn(
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &planning_redemption(),
                 make_shares(150),
                 make_shares(0),
             )
@@ -1073,6 +1589,7 @@ mod tests {
         let plan = service
             .for_burn(
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &planning_redemption(),
                 make_shares(100),
                 make_shares(10),
             )
@@ -1092,6 +1609,7 @@ mod tests {
         let result = service
             .for_burn(
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &planning_redemption(),
                 make_shares(100),
                 make_shares(0),
             )
@@ -1111,6 +1629,7 @@ mod tests {
         let result = service
             .for_burn(
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &planning_redemption(),
                 make_shares(100),
                 make_shares(0),
             )
@@ -1130,6 +1649,7 @@ mod tests {
         let result = service
             .for_burn(
                 address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                &planning_redemption(),
                 make_shares(50),
                 make_shares(0),
             )
@@ -1149,6 +1669,7 @@ mod tests {
         let plan = service
             .for_burn(
                 address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                &planning_redemption(),
                 make_shares(100),
                 make_shares(0),
             )
@@ -1157,6 +1678,722 @@ mod tests {
 
         assert_eq!(plan.total_burn, make_shares(100));
         assert_eq!(plan.allocations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reserve_burn_removes_receipt_from_future_plans() {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 100), (2, 50)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        service
+            .reserve_burn(
+                vault,
+                "red-00000001".parse().unwrap(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(1),
+                    shares_burned: U256::from(100),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(50),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.allocations.len(), 1);
+        assert_eq!(plan.allocations[0].receipt.receipt_id, make_receipt_id(2));
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(50));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_burn_reduces_partial_receipt_balance() {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 100), (2, 50)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        service
+            .reserve_burn(
+                vault,
+                "red-00000001".parse().unwrap(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(1),
+                    shares_burned: U256::from(60),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(90),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.allocations.len(), 2);
+        assert_eq!(plan.allocations[0].receipt.receipt_id, make_receipt_id(2));
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(50));
+        assert_eq!(plan.allocations[1].receipt.receipt_id, make_receipt_id(1));
+        assert_eq!(plan.allocations[1].burn_amount, make_shares(40));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_burn_rejects_duplicate_rows_exceeding_balance() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let err = service
+            .reserve_burn(
+                vault,
+                "red-00000001".parse().unwrap(),
+                vec![
+                    BurnRecord {
+                        receipt_id: U256::from(1),
+                        shares_burned: U256::from(60),
+                    },
+                    BurnRecord {
+                        receipt_id: U256::from(1),
+                        shares_burned: U256::from(60),
+                    },
+                ],
+            )
+            .await
+            .expect_err("Duplicate receipt rows must be checked cumulatively");
+
+        assert!(matches!(
+            err,
+            ReceiptRegistrationError::Aggregate(AggregateError::UserError(
+                ReceiptInventoryError::InsufficientReceiptBalance {
+                    available,
+                    required,
+                    ..
+                }
+            )) if available == make_shares(100) && required == make_shares(120)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_release_burn_restores_reserved_balance() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(
+                vault,
+                redemption_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(1),
+                    shares_burned: U256::from(100),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let err = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(1),
+                make_shares(0),
+            )
+            .await
+            .expect_err("Fully reserved receipt should not be available");
+
+        assert!(matches!(err, BurnTrackingError::InsufficientBalance { .. }));
+
+        service.release_burn(vault, redemption_id).await.unwrap();
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plan.allocations.len(), 1);
+        assert_eq!(plan.allocations[0].receipt.receipt_id, make_receipt_id(1));
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(100));
+    }
+
+    fn burn(receipt_id: u64, shares: u64) -> BurnRecord {
+        BurnRecord {
+            receipt_id: U256::from(receipt_id),
+            shares_burned: U256::from(shares),
+        }
+    }
+
+    /// Critical regression guard for the same-receipt burn race: while a
+    /// submitted burn is pending (its shares have NOT left on-chain),
+    /// reconciliation against the unchanged on-chain balance must NOT restore
+    /// the reservation to available inventory.
+    #[tokio::test]
+    async fn test_reconcile_preserves_pending_reservation() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(42),
+            balance: make_shares(100),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+            redemption_issuer_request_id: "red-00000001".parse().unwrap(),
+            burns: vec![burn(42, 100)],
+        });
+
+        assert_eq!(
+            aggregate.receipts_with_balance()[0].available_balance,
+            make_shares(0),
+            "fully reserved receipt must be unavailable"
+        );
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "reconcile against unchanged on-chain balance must not wipe a \
+             pending reservation, got {events:?}"
+        );
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        assert_eq!(
+            aggregate.receipts_with_balance()[0].available_balance,
+            make_shares(0),
+            "reservation must remain in effect after reconcile"
+        );
+    }
+
+    /// A burn landing on-chain (on-chain drops to the available level, below
+    /// the mirror) is still inside the no-op band — settlement, not reconcile,
+    /// consumes the reservation.
+    #[tokio::test]
+    async fn test_reconcile_no_op_for_landed_unsettled_burn() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(42),
+            balance: make_shares(100),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+            redemption_issuer_request_id: "red-00000001".parse().unwrap(),
+            burns: vec![burn(42, 60)],
+        });
+
+        // available = 40, mirror = 100; the burn of 60 lands -> on-chain 40.
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(40),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "on-chain within [available, mirror] is not an external change, got {events:?}"
+        );
+    }
+
+    /// An on-chain balance below the available level is a genuine external
+    /// change (e.g. a transfer out) and must reconcile while leaving the
+    /// pending reservation intact.
+    #[tokio::test]
+    async fn test_reconcile_external_drain_below_available_reconciles() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(42),
+            balance: make_shares(100),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+            redemption_issuer_request_id: "red-00000001".parse().unwrap(),
+            burns: vec![burn(42, 30)],
+        });
+
+        // available = 70; on-chain 50 < 70 -> external drain.
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(50),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ReceiptInventoryEvent::BalanceReconciled { on_chain_balance, .. }
+                if *on_chain_balance == make_shares(50)
+        ));
+    }
+
+    /// In the anomalous case of a receipt at zero mirror balance that still
+    /// holds a reservation, an on-chain==0 reconcile must NOT deplete it: doing
+    /// so would silently drop the reservation and turn a later settle/release
+    /// into a no-op.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_reconcile_preserves_reservation_at_zero_mirror() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(42),
+            balance: make_shares(0),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate
+            .receipts
+            .get_mut(&make_receipt_id(42))
+            .unwrap()
+            .reserved
+            .insert("red-00000001".parse().unwrap(), make_shares(50));
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "must not deplete a receipt that still holds a reservation"
+        );
+        assert!(
+            aggregate.receipts.contains_key(&make_receipt_id(42)),
+            "receipt must be preserved so its reservation can still resolve"
+        );
+        assert!(logs_contain_at!(Level::WARN, &["still holding reservations"]));
+    }
+
+    /// An external drain that pushes on-chain below `available` to zero while a
+    /// reservation is outstanding must record the mirror change but NOT deplete
+    /// the receipt — depleting would silently discard the reservation.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_reconcile_zero_drain_preserves_reservation() {
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(42),
+            balance: make_shares(100),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate
+            .receipts
+            .get_mut(&make_receipt_id(42))
+            .unwrap()
+            .reserved
+            .insert("red-00000001".parse().unwrap(), make_shares(70));
+
+        // available = 30; an external drain to 0 is below it (out of band).
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "must reconcile the mirror but not deplete, got {events:?}"
+        );
+        assert!(matches!(
+            &events[0],
+            ReceiptInventoryEvent::BalanceReconciled { on_chain_balance, .. }
+                if on_chain_balance.is_zero()
+        ));
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        assert!(
+            aggregate.receipts.contains_key(&make_receipt_id(42)),
+            "receipt with an outstanding reservation must be preserved"
+        );
+        assert!(
+            !aggregate
+                .receipts
+                .get(&make_receipt_id(42))
+                .unwrap()
+                .reserved
+                .is_empty(),
+            "the reservation must survive the zero-drain reconcile"
+        );
+        assert!(logs_contain_at!(Level::WARN, &["still holding reservations"]));
+    }
+
+    #[tokio::test]
+    async fn test_settle_burn_consumes_reservation_and_reduces_mirror() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 60)])
+            .await
+            .unwrap();
+
+        service.settle_burn(vault, redemption_id).await.unwrap();
+
+        // The mirror balance itself must drop 100 -> 40 and the reservation
+        // must be cleared. Checking internals distinguishes a real settlement
+        // from merely leaving the reservation in place (which would leave the
+        // same 40 available but a stale 100 mirror).
+        let context =
+            service.store.load_aggregate(&vault.to_string()).await.unwrap();
+        let metadata = context
+            .aggregate()
+            .receipts
+            .get(&make_receipt_id(1))
+            .expect("receipt should remain after partial settlement");
+        assert_eq!(metadata.balance, make_shares(40));
+        assert!(
+            metadata.reserved.is_empty(),
+            "settlement must consume the reservation"
+        );
+
+        let err = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(41),
+                make_shares(0),
+            )
+            .await
+            .expect_err("settled shares must not be available");
+        assert!(matches!(err, BurnTrackingError::InsufficientBalance { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_settle_burn_depletes_fully_consumed_receipt() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .await
+            .unwrap();
+        service.settle_burn(vault, redemption_id).await.unwrap();
+
+        let context =
+            service.store.load_aggregate(&vault.to_string()).await.unwrap();
+        assert!(
+            context.aggregate().receipts_with_balance().is_empty(),
+            "a fully settled receipt must be depleted and removed"
+        );
+    }
+
+    /// A receipt drained to zero on-chain while reserved is preserved by the
+    /// reconcile guard; once its last reservation resolves (here via release),
+    /// it must be depleted and removed rather than linger empty forever.
+    #[tokio::test]
+    async fn test_release_depletes_zero_drained_receipt() {
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+        let mut aggregate = ReceiptInventory::default();
+        aggregate.apply(ReceiptInventoryEvent::Discovered {
+            receipt_id: make_receipt_id(1),
+            balance: make_shares(0),
+            block_number: 1,
+            tx_hash: TxHash::ZERO,
+            source: ReceiptSource::External,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        });
+        aggregate
+            .receipts
+            .get_mut(&make_receipt_id(1))
+            .unwrap()
+            .reserved
+            .insert(redemption_id.clone(), make_shares(100));
+
+        let events = aggregate
+            .handle(
+                ReceiptInventoryCommand::ReleaseBurn {
+                    redemption_issuer_request_id: redemption_id,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ReceiptInventoryEvent::Depleted { receipt_id }
+                    if *receipt_id == make_receipt_id(1)
+            )),
+            "releasing the last reservation on a zero-balance receipt must deplete it, got {events:?}"
+        );
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        assert!(
+            !aggregate.receipts.contains_key(&make_receipt_id(1)),
+            "the zero-drained receipt must be removed after depletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_release_burn_is_idempotent() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .await
+            .unwrap();
+        service.release_burn(vault, redemption_id.clone()).await.unwrap();
+        // Second release must NOT over-credit the balance.
+        service.release_burn(vault, redemption_id).await.unwrap();
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(100));
+
+        let err = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(101),
+                make_shares(0),
+            )
+            .await
+            .expect_err("double release must not inflate balance above 100");
+        assert!(matches!(err, BurnTrackingError::InsufficientBalance { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_release_burn_without_reservation_is_noop() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        service
+            .release_burn(vault, "red-00000001".parse().unwrap())
+            .await
+            .expect("releasing with no reservation must be a no-op");
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(100));
+    }
+
+    #[tokio::test]
+    async fn test_second_redemption_cannot_reserve_committed_balance() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        service
+            .reserve_burn(
+                vault,
+                "red-00000001".parse().unwrap(),
+                vec![burn(1, 60)],
+            )
+            .await
+            .unwrap();
+
+        let err = service
+            .reserve_burn(
+                vault,
+                "red-00000002".parse().unwrap(),
+                vec![burn(1, 60)],
+            )
+            .await
+            .expect_err("second redemption must not reserve committed balance");
+        assert!(matches!(
+            err,
+            ReceiptRegistrationError::Aggregate(AggregateError::UserError(
+                ReceiptInventoryError::InsufficientReceiptBalance { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_burn_is_idempotent_for_same_redemption() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 60)])
+            .await
+            .unwrap();
+        // Re-delivery of the same reservation must not double-count itself.
+        service
+            .reserve_burn(vault, redemption_id, vec![burn(1, 60)])
+            .await
+            .expect("re-reserving the same redemption must succeed");
+
+        let plan = service
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(40),
+                make_shares(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(40));
+    }
+
+    /// A retry that plans a DIFFERENT receipt must atomically replace the
+    /// redemption's prior reservation, not accumulate it — otherwise settle
+    /// (keyed only by redemption) would over-consume the stale receipt.
+    #[tokio::test]
+    async fn test_reserve_replaces_prior_reservation_atomically() {
+        let service =
+            setup_receipt_service_with_receipts(vec![(1, 100), (2, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        // First attempt reserves receipt 1; the retry reserves receipt 2.
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .await
+            .unwrap();
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(2, 100)])
+            .await
+            .unwrap();
+
+        service.settle_burn(vault, redemption_id).await.unwrap();
+
+        let context =
+            service.store.load_aggregate(&vault.to_string()).await.unwrap();
+        let aggregate = context.aggregate();
+
+        // Receipt 1's stale reservation was cleared by the retry, so settle
+        // left it untouched; only receipt 2 was consumed (and depleted).
+        let receipt_1 = aggregate
+            .receipts
+            .get(&make_receipt_id(1))
+            .expect("receipt 1 must remain untouched");
+        assert_eq!(receipt_1.balance, make_shares(100));
+        assert!(receipt_1.reserved.is_empty());
+        assert!(
+            !aggregate.receipts.contains_key(&make_receipt_id(2)),
+            "receipt 2 was settled to zero and depleted"
+        );
+    }
+
+    /// `for_burn` excludes the planning redemption's own reservation (so a retry
+    /// can re-plan its full burn) while still counting other redemptions'.
+    #[tokio::test]
+    async fn test_for_burn_excludes_own_reservation_on_retry() {
+        let service = setup_receipt_service_with_receipts(vec![(1, 100)]).await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let redemption_id: IssuerRedemptionRequestId =
+            "red-00000001".parse().unwrap();
+
+        service
+            .reserve_burn(vault, redemption_id.clone(), vec![burn(1, 100)])
+            .await
+            .unwrap();
+
+        // Another redemption sees receipt 1 fully reserved.
+        let other = service
+            .for_burn(
+                vault,
+                &"red-00000002".parse().unwrap(),
+                make_shares(100),
+                make_shares(0),
+            )
+            .await;
+        assert!(matches!(
+            other,
+            Err(BurnTrackingError::InsufficientBalance { .. })
+        ));
+
+        // The same redemption re-planning excludes its own reservation.
+        let plan = service
+            .for_burn(vault, &redemption_id, make_shares(100), make_shares(0))
+            .await
+            .unwrap();
+        assert_eq!(plan.allocations[0].burn_amount, make_shares(100));
     }
 
     use chrono::{TimeZone, Utc};
@@ -1517,7 +2754,12 @@ mod tests {
             .expect("Registration should succeed");
 
         let plan = service
-            .for_burn(vault, make_shares(50), make_shares(0))
+            .for_burn(
+                vault,
+                &planning_redemption(),
+                make_shares(50),
+                make_shares(0),
+            )
             .await
             .expect("Burn planning should succeed with registered receipt");
 

@@ -29,6 +29,15 @@ enum MockBehavior {
     Failure,
     #[cfg(test)]
     SubmitFailure,
+    /// Submit succeeds; confirm fails with a definitive on-chain revert
+    /// (`VaultError::Reverted`) — exercises the terminal-failure release path.
+    #[cfg(test)]
+    ConfirmRevert,
+    /// `submit_burn` fails with a definitive on-chain revert
+    /// (`VaultError::Reverted`), as the synchronous local backend does when a
+    /// burn mines but reverts — exercises the submit-failure release path.
+    #[cfg(test)]
+    SubmitRevert,
 }
 
 /// Mock blockchain service for testing.
@@ -93,6 +102,36 @@ impl MockVaultService {
     pub(crate) fn new_submit_failure() -> Self {
         Self {
             behavior: MockBehavior::SubmitFailure,
+            mint_delay_ms: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            pending_mint_result: Arc::new(Mutex::new(None)),
+            pending_burn_result: Arc::new(Mutex::new(None)),
+            last_call: Arc::new(Mutex::new(None)),
+            share_balance: Arc::new(Mutex::new(U256::MAX)),
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_confirm_revert() -> Self {
+        Self {
+            behavior: MockBehavior::ConfirmRevert,
+            mint_delay_ms: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+            multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            pending_mint_result: Arc::new(Mutex::new(None)),
+            pending_burn_result: Arc::new(Mutex::new(None)),
+            last_call: Arc::new(Mutex::new(None)),
+            share_balance: Arc::new(Mutex::new(U256::MAX)),
+            last_multi_burn_params: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_submit_revert() -> Self {
+        Self {
+            behavior: MockBehavior::SubmitRevert,
             mint_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
@@ -261,6 +300,10 @@ impl VaultService for MockVaultService {
                     });
                 Ok(result)
             }
+            #[cfg(test)]
+            MockBehavior::ConfirmRevert | MockBehavior::SubmitRevert => {
+                Err(VaultError::InvalidReceipt)
+            }
         }
     }
 
@@ -286,6 +329,11 @@ impl VaultService for MockVaultService {
         #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitFailure) {
             return Err(VaultError::InvalidReceipt);
+        }
+
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitRevert) {
+            return Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH });
         }
 
         self.multi_burn_call_count.fetch_add(1, Ordering::Relaxed);
@@ -349,6 +397,28 @@ impl VaultService for MockVaultService {
             MockBehavior::Failure => Err(VaultError::InvalidReceipt),
             #[cfg(test)]
             MockBehavior::SubmitFailure => {
+                let result = self
+                    .pending_burn_result
+                    .lock()
+                    .expect("pending_burn_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(|| MultiBurnResult {
+                        tx_hash: MOCK_BURN_TX_HASH,
+                        burns: vec![],
+                        dust_returned: dust_shares,
+                        gas_used: 50000,
+                        block_number: 5000,
+                    });
+                Ok(result)
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmRevert => {
+                Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH })
+            }
+            // SubmitRevert fails at submit; if confirm is somehow reached,
+            // return the cached result like the other submit-* behaviors.
+            #[cfg(test)]
+            MockBehavior::SubmitRevert => {
                 let result = self
                     .pending_burn_result
                     .lock()

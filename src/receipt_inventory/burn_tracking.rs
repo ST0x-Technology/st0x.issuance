@@ -178,7 +178,7 @@ pub(crate) fn plan_burn(
                 return None;
             }
 
-            let burn_from_this = remaining.min(receipt.available_balance);
+            let burn_from_this = (*remaining).min(receipt.available_balance);
 
             match remaining.checked_sub(burn_from_this) {
                 Some(new_remaining) => {
@@ -740,6 +740,79 @@ mod tests {
             matches!(err, BurnTrackingError::InsufficientBalance { required, available }
                 if required == burn_amount && available == Shares::new(uint!(50_000000000000000000_U256))),
             "Expected InsufficientBalance error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_spans_two_receipts_when_first_is_short_by_one_gwei() {
+        let receipts = vec![
+            ReceiptWithBalance {
+                receipt_id: ReceiptId::from(uint!(131_U256)),
+                available_balance: Shares::new(uint!(
+                    10079999999000000000_U256
+                )),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            },
+            ReceiptWithBalance {
+                receipt_id: ReceiptId::from(uint!(124_U256)),
+                available_balance: Shares::new(uint!(1000000000_U256)),
+                tx_hash: TxHash::ZERO,
+                block_number: 0,
+                receipt_info: None,
+                receipt_info_bytes: None,
+            },
+        ];
+
+        let burn_amount = Shares::new(uint!(10080000000000000000_U256));
+        let dust_amount = Shares::new(U256::ZERO);
+
+        let plan = plan_burn(receipts, burn_amount, dust_amount)
+            .expect("Plan should use both receipts to cover the remainder");
+
+        assert_eq!(plan.allocations.len(), 2);
+        assert_eq!(
+            plan.allocations[0].receipt.receipt_id,
+            ReceiptId::from(uint!(131_U256))
+        );
+        assert_eq!(
+            plan.allocations[0].burn_amount,
+            Shares::new(uint!(10079999999000000000_U256))
+        );
+        assert_eq!(
+            plan.allocations[1].receipt.receipt_id,
+            ReceiptId::from(uint!(124_U256))
+        );
+        assert_eq!(
+            plan.allocations[1].burn_amount,
+            Shares::new(uint!(1000000000_U256))
+        );
+    }
+
+    #[test]
+    fn test_plan_fails_when_single_receipt_short_by_one_gwei() {
+        let receipts = vec![ReceiptWithBalance {
+            receipt_id: ReceiptId::from(uint!(131_U256)),
+            available_balance: Shares::new(uint!(10079999999000000000_U256)),
+            tx_hash: TxHash::ZERO,
+            block_number: 0,
+            receipt_info: None,
+            receipt_info_bytes: None,
+        }];
+
+        let burn_amount = Shares::new(uint!(10080000000000000000_U256));
+        let dust_amount = Shares::new(U256::ZERO);
+
+        let err = plan_burn(receipts, burn_amount, dust_amount)
+            .expect_err("Plan should fail before Fireblocks submission");
+
+        assert!(
+            matches!(err, BurnTrackingError::InsufficientBalance { required, available }
+                if required == burn_amount
+                    && available == Shares::new(uint!(10079999999000000000_U256))),
+            "Expected one-gwei-short InsufficientBalance error, got {err:?}"
         );
     }
 

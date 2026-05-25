@@ -347,7 +347,12 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
 - `BurnFireblocksSubmitted` - Burn transaction submitted to signing backend
-  (carries `external_tx_id`, `fireblocks_tx_id`, and `planned_burns`)
+  (carries `external_tx_id`, `fireblocks_tx_id`, and `planned_burns`). The burn
+  manager reserves the `planned_burns` in the receipt inventory **before** this
+  submission, so a concurrent redemption that already committed the same receipt
+  balance fails to reserve and never submits an unbacked burn. On confirmation
+  the reservation is settled (mirror balance reduced); on a definitive
+  terminal/reverted failure it is released.
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
   success). Payload contains `burns: Vec<BurnRecord>` where each `BurnRecord`
   has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
@@ -532,10 +537,23 @@ bot_wallet) and reconcile outbound transfers (from == bot_wallet). Mint/burn
 transfers (from/to == address(0)) are filtered out since those are already
 covered by the vault's Deposit/Withdraw events.
 
+Each receipt tracks two quantities: a `balance` that mirrors the on-chain
+ERC-1155 balance the bot believes it holds, and a `reserved` map of shares
+committed to submitted-but-unconfirmed burns, keyed by the redemption that
+submitted them. **Available inventory for burn planning is
+`balance - sum(reserved)`**. Keeping the on-chain mirror and reservations
+separate is what lets reconciliation compare against the true on-chain balance
+without ever clobbering a pending reservation.
+
 Receipts leave the inventory (or have their balance corrected) through
 reconciliation — querying `balanceOf(bot_wallet, receipt_id)` on-chain and
-emitting `BalanceReconciled` when the on-chain balance differs from the
-aggregate balance in either direction. Reconciliation is triggered by:
+emitting `BalanceReconciled` when the on-chain balance falls outside the
+`[available, balance]` band. While a submitted burn is pending, on-chain
+legitimately sits anywhere in that band (it has not landed yet at `balance`;
+once it lands it drops toward `available`), so reconciliation treats those
+values as "no external change" and leaves the reservation intact. Settlement,
+not reconciliation, consumes a reservation once its burn confirms.
+Reconciliation is triggered by:
 
 - **Startup**: After receipt backfill, reconciles all receipts with positive
   aggregate balance before redemption recovery and live monitoring begin
@@ -553,16 +571,65 @@ aggregate balance in either direction. Reconciliation is triggered by:
 Commands:
 
 - `DiscoverReceipt` - Register a newly discovered receipt
-- `ReconcileBalance { receipt_id, on_chain_balance }` - Correct aggregate
-  balance to match on-chain state (both increases and decreases). No-op if
-  balances match or receipt unknown
+- `ReconcileBalance { receipt_id, on_chain_balance }` - Correct the mirror
+  balance to match on-chain state. No-op if the on-chain balance is within the
+  `[available, balance]` band (no external change while a reservation is
+  pending) or the receipt is unknown
+- `ReserveBurn { redemption_issuer_request_id, burns }` - **Atomic
+  clear-and-reserve** issued **before** submitting a burn to the signing
+  backend. It drops any prior reservation the redemption held (e.g. from a
+  retried attempt that planned different receipts) and installs the new one in a
+  single serialized transaction, validated against availability excluding the
+  redemption's own prior reservation. Because clear and reserve are one step,
+  the prior reservation is never returned to global availability (no concurrent
+  redemption can grab it) and no stale reservation can survive to be
+  over-consumed at settle. The vault inventory is a single serialized aggregate,
+  so a concurrent _different_ redemption that already committed the same balance
+  fails to reserve and never submits an unbacked burn. Burn planning
+  (`for_burn`) likewise excludes the planning redemption's own reservation, so a
+  retry re-plans its full burn
+- `ReleaseBurn { redemption_issuer_request_id }` - Clear the redemption's
+  reservation (wherever held), restoring availability without changing the
+  mirror balance (the burn consumed nothing on-chain). No-op when the redemption
+  holds no reservation. Issued **only** on a definitive terminal/reverted
+  failure; pending or ambiguous Fireblocks statuses are not released because the
+  burn may still land
+- `SettleBurn { redemption_issuer_request_id }` - Consume the redemption's
+  reservation after its burn confirmed on-chain: clear the reservation and
+  reduce the mirror balance by the reserved amount. Idempotent; emits `Depleted`
+  for any receipt the settlement empties
+
+Release and settle are keyed only by redemption; `apply` uses the stored
+`reserved` amounts, so neither carries a `burns` payload.
 
 Events:
 
 - `Discovered` - Receipt discovered with initial balance
 - `BalanceReconciled { receipt_id, previous_balance, on_chain_balance }` -
-  Balance changed (detected during reconciliation, either increase or decrease)
-- `Depleted` - Receipt fully consumed (balance reached zero)
+  Mirror balance corrected to on-chain state (external change outside the
+  reservation band). A receipt drained to zero on-chain while it still holds a
+  reservation is preserved (mirror set to zero) rather than removed, so the
+  reservation can still resolve
+- `Depleted` - Receipt fully consumed (mirror balance reached zero) with no
+  outstanding reservation
+- `BurnReserved { redemption_issuer_request_id, burns }` - Submitted burn
+  allocation removed from available inventory (recorded in `reserved`, leaving
+  the mirror balance unchanged) so concurrent redemptions cannot reuse it
+- `BurnReleased { redemption_issuer_request_id }` - Reservation cleared after a
+  definitive terminal/reverted failure, restoring availability
+- `BurnSettled { redemption_issuer_request_id }` - Reservation consumed after
+  on-chain confirmation; mirror balance reduced by the reserved amount
+
+**Startup reservation recovery** (`recover_stuck_reservations`) runs after
+redemption recovery. For each vault it enumerates the redemptions holding a
+reservation and resolves each against the redemption's terminal state: a
+`Completed` redemption is **settled** (the burn confirmed but settlement was
+missed, e.g. a crash in the confirm→settle window). All other states are left
+untouched — a definitive failure already released its reservation in the
+live/recovery paths, so a reservation surviving on a `Failed`/`Closed`
+redemption is from an _ambiguous_ failure whose burn may still have landed;
+releasing it would over-credit inventory and risk a duplicate burn, so it is
+left for on-chain settlement or manual intervention.
 
 The per-vault receipt backfill cursor (previously `BackfillCheckpoint` events on
 this aggregate) is not domain state — it is a single mutable counter with no

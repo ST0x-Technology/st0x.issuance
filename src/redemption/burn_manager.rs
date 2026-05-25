@@ -10,9 +10,11 @@ use super::view::{
 use super::{
     IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
 };
+use crate::fireblocks::{FireblocksVaultError, vault_service};
 use crate::mint::QuantityConversionError;
 use crate::receipt_inventory::{
-    BurnPlan, BurnTrackingError, ReceiptService, Shares,
+    BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
+    Shares,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
@@ -168,6 +170,105 @@ where
         self.recover_single_burning(issuer_request_id).await
     }
 
+    /// Resolves receipt reservations left dangling by a missed settlement —
+    /// e.g. a crash between burn confirmation and settlement, which
+    /// reconciliation cannot heal because a landed-but-unsettled burn sits
+    /// inside the reconcile no-op band.
+    ///
+    /// Only a `Completed` redemption's reservation is settled (mirror reduced).
+    /// Every other state is left in place: a definitive failure already released
+    /// its reservation in the live/recovery paths, so a reservation surviving on
+    /// a `Failed`/`Closed` redemption is from an *ambiguous* failure whose burn
+    /// may still have landed — releasing it would over-credit inventory and risk
+    /// a duplicate burn. In-flight redemptions are owned by the normal flow or
+    /// burn recovery. Runs at startup after redemption recovery so in-flight
+    /// `BurnSubmitted` reservations have already been confirmed-and-settled (or
+    /// left for the ambiguous case) by then.
+    pub(crate) async fn recover_stuck_reservations(&self, vaults: &[Address]) {
+        let mut stuck: Vec<(Address, IssuerRedemptionRequestId)> = Vec::new();
+
+        for vault in vaults {
+            match self.receipt_service.reserved_redemptions(*vault).await {
+                Ok(redemptions) => {
+                    stuck
+                        .extend(redemptions.into_iter().map(|id| (*vault, id)));
+                }
+                Err(error) => {
+                    warn!(target: "redemption", %vault, %error,
+                        "Failed to list reserved redemptions during reservation recovery"
+                    );
+                }
+            }
+        }
+
+        if stuck.is_empty() {
+            debug!(target: "redemption", "No reservations to recover");
+            return;
+        }
+
+        info!(target: "redemption", count = stuck.len(),
+            "Recovering reservations against redemption terminal state"
+        );
+
+        for (vault, issuer_request_id) in stuck {
+            if let Err(err) =
+                self.resolve_stuck_reservation(vault, &issuer_request_id).await
+            {
+                warn!(target: "redemption", vault = %vault,
+                    issuer_request_id = %issuer_request_id,
+                    error = %err,
+                    "Failed to resolve stuck reservation"
+                );
+            }
+        }
+    }
+
+    async fn resolve_stuck_reservation(
+        &self,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<(), BurnManagerError> {
+        use Redemption::{Completed, Uninitialized};
+
+        let context =
+            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+
+        match context.aggregate() {
+            // The burn confirmed on-chain but settlement was missed (e.g. a
+            // crash in the confirm->settle window). Settle to reduce the mirror.
+            Completed { .. } => {
+                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "Settling reservation for completed redemption"
+                );
+                self.settle_reserved_burn(vault, issuer_request_id).await;
+            }
+            // A reservation for a redemption with no events is anomalous (e.g.
+            // pruned history). Leave it for manual review rather than releasing
+            // blindly against an unknown on-chain outcome.
+            Uninitialized => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "Reservation held for an unknown redemption; left for manual review"
+                );
+            }
+            // All other states are LEFT in place. A definitive failure already
+            // released its reservation in the live/recovery paths (gated on
+            // `should_release_reserved_burn`), so a reservation surviving on a
+            // `Failed`/`Closed` redemption here is from an *ambiguous* failure
+            // whose burn may still have landed. Releasing it would over-credit
+            // inventory and risk a duplicate burn; leaving it keeps
+            // availability conservatively correct until on-chain settlement or
+            // manual intervention resolves it. In-flight states are owned by
+            // the live flow / burn recovery.
+            _ => {
+                debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    "Leaving reservation for ambiguous or in-flight redemption"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn recover_single_burn_failed(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -196,6 +297,12 @@ where
             return Ok(());
         };
 
+        let vault = find_vault_by_underlying(&self.view_pool, underlying)
+            .await?
+            .ok_or_else(|| BurnManagerError::AssetNotFound {
+                underlying: underlying.clone(),
+            })?;
+
         // If a Fireblocks tx was already submitted before failure, try to
         // confirm it instead of resubmitting. This prevents double-burns
         // when the failure was a transient confirmation error.
@@ -203,17 +310,12 @@ where
             return self
                 .recover_burn_failed_with_existing_tx(
                     issuer_request_id,
+                    vault,
                     fb_tx_id,
                     dust_quantity,
                 )
                 .await;
         }
-
-        let vault = find_vault_by_underlying(&self.view_pool, underlying)
-            .await?
-            .ok_or_else(|| BurnManagerError::AssetNotFound {
-                underlying: underlying.clone(),
-            })?;
 
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
@@ -250,6 +352,11 @@ where
 
             self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
 
+            // The burn likely already landed (on-chain balance is too low to
+            // burn again), so any reservation from a prior attempt is LEFT in
+            // place: releasing would over-credit inventory against a stale-high
+            // mirror and risk a duplicate burn. It is resolved by on-chain
+            // settlement or manual intervention.
             return Ok(());
         }
 
@@ -307,6 +414,7 @@ where
     async fn recover_burn_failed_with_existing_tx(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
         fireblocks_tx_id: &str,
         dust_quantity: &crate::Quantity,
     ) -> Result<(), BurnManagerError> {
@@ -355,6 +463,8 @@ where
                     )
                     .await?;
 
+                self.settle_reserved_burn(vault, issuer_request_id).await;
+
                 Ok(())
             }
             Err(err) => {
@@ -364,6 +474,10 @@ where
                     "Failed to confirm previously submitted burn — \
                      marking as failed to prevent infinite retry loop"
                 );
+
+                if should_release_reserved_burn(&err) {
+                    self.release_reserved_burn(vault, issuer_request_id).await;
+                }
 
                 // Re-mark as failed WITHOUT preserving the fireblocks_tx_id.
                 // This moves the view from BurnFailed to Failed, so the next
@@ -399,12 +513,24 @@ where
         match aggregate {
             // Already submitted to Fireblocks but never confirmed — resume polling
             Redemption::BurnSubmitted {
+                metadata,
                 fireblocks_tx_id,
                 dust_quantity,
                 planned_burns,
                 ..
             } => {
                 let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
+
+                let vault = find_vault_by_underlying(
+                    &self.view_pool,
+                    &metadata.underlying,
+                )
+                .await?
+                .ok_or_else(|| {
+                    BurnManagerError::AssetNotFound {
+                        underlying: metadata.underlying.clone(),
+                    }
+                })?;
 
                 info!(target: "redemption", issuer_request_id = %issuer_request_id,
                     fireblocks_tx_id = %fireblocks_tx_id,
@@ -428,6 +554,10 @@ where
                         info!(target: "redemption", issuer_request_id = %issuer_request_id,
                             "Burn confirmed successfully during recovery"
                         );
+
+                        self.settle_reserved_burn(vault, issuer_request_id)
+                            .await;
+
                         Ok(RecoveryOutcome::ExistingBurnRecorded)
                     }
                     Err(AggregateError::UserError(RedemptionError::Vault(
@@ -437,6 +567,14 @@ where
                             error = %err,
                             "Burn confirmation failed during recovery"
                         );
+
+                        if should_release_reserved_burn(&err) {
+                            self.release_reserved_burn(
+                                vault,
+                                issuer_request_id,
+                            )
+                            .await;
+                        }
 
                         self.cqrs
                             .execute(
@@ -504,6 +642,14 @@ where
                          Burn likely already succeeded but was not recorded. \
                          Skipping to avoid recording false failure."
                     );
+
+                    // The redemption stays Burning for manual review. Any
+                    // reservation from the crashed attempt is LEFT in place:
+                    // the burn likely already landed, so releasing would
+                    // over-credit inventory and risk a duplicate burn against
+                    // the stale-high mirror. Leaving it keeps availability
+                    // conservatively correct until manual intervention resolves
+                    // the redemption.
                     return Ok(RecoveryOutcome::SkippedManualIntervention);
                 }
 
@@ -617,6 +763,11 @@ where
             "Starting on-chain burning process with dust handling"
         );
 
+        // A retry plans against availability that EXCLUDES this redemption's own
+        // prior reservation (see `for_burn`), and `reserve_burn` atomically
+        // replaces that reservation — so no separate release-before-plan is
+        // needed, and the prior reservation is never returned to global
+        // availability where a concurrent redemption could grab it.
         let plan = self
             .plan_burn(
                 issuer_request_id,
@@ -641,7 +792,12 @@ where
     ) -> Result<BurnPlan, BurnManagerError> {
         let plan = self
             .receipt_service
-            .for_burn(vault, Shares::new(burn_shares), Shares::new(dust_shares))
+            .for_burn(
+                vault,
+                issuer_request_id,
+                Shares::new(burn_shares),
+                Shares::new(dust_shares),
+            )
             .await;
 
         match plan {
@@ -736,6 +892,39 @@ where
 
         let dust_shares = plan.dust.inner();
 
+        // Reserve the planned receipts BEFORE submitting to the signing
+        // backend. The vault inventory is a single serialized aggregate, so a
+        // concurrent redemption that already committed the same balance makes
+        // this reservation fail — and we must not submit an unbacked burn that
+        // would later revert on-chain with ERC1155InsufficientBalance.
+        if let Err(err) = self
+            .reserve_with_conflict_retry(
+                vault,
+                issuer_request_id,
+                planned_burns.clone(),
+            )
+            .await
+        {
+            error!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to reserve receipts before burn submission; aborting to avoid double-spend"
+            );
+
+            self.cqrs
+                .execute(
+                    &issuer_request_id.to_string(),
+                    RedemptionCommand::RecordBurnFailure {
+                        issuer_request_id: issuer_request_id.clone(),
+                        error: err.to_string(),
+                        fireblocks_tx_id: None,
+                        planned_burns,
+                    },
+                )
+                .await?;
+
+            return Err(err.into());
+        }
+
         // Step 1: Submit the burn transaction (emits BurnFireblocksSubmitted)
         let submit_result = self
             .cqrs
@@ -766,6 +955,21 @@ where
                     "Burn submission failed"
                 );
 
+                // Release only on a DEFINITIVE failure that proves no shares
+                // were consumed — a terminal Fireblocks status or an EVM revert
+                // (the local backend submits synchronously, so a revert can
+                // surface here). Otherwise RETAIN: a submit error does not prove
+                // no transaction was created (a duplicate `externalTxId` whose
+                // lookup failed, a missing transaction id, or an SDK/RPC error
+                // after the request was sent all leave a possibly-in-flight
+                // burn), and releasing could let a concurrent redemption reuse
+                // the balance and double-submit. Recovery (via the preserved
+                // `fireblocks_tx_id`) or manual intervention resolves retained
+                // reservations.
+                if should_release_reserved_burn(&err) {
+                    self.release_reserved_burn(vault, issuer_request_id).await;
+                }
+
                 self.cqrs
                     .execute(
                         &issuer_request_id.to_string(),
@@ -780,6 +984,10 @@ where
 
                 return Err(BurnManagerError::Vault(err));
             }
+            // Submission outcome is unknown (non-vault error): keep the
+            // reservation so a concurrent redemption cannot reuse the balance.
+            // A retry's atomic clear-and-reserve (ReserveBurn) replaces this
+            // redemption's reservation in one step.
             Err(err) => return Err(err.into()),
         }
 
@@ -817,6 +1025,10 @@ where
                     "Burn confirmed successfully"
                 );
 
+                // The burn landed on-chain: consume the reservation so the
+                // mirror balance drops to match.
+                self.settle_reserved_burn(vault, issuer_request_id).await;
+
                 Ok(())
             }
             Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
@@ -824,6 +1036,10 @@ where
                     error = %err,
                     "Burn confirmation failed"
                 );
+
+                if should_release_reserved_burn(&err) {
+                    self.release_reserved_burn(vault, issuer_request_id).await;
+                }
 
                 self.cqrs
                     .execute(
@@ -840,6 +1056,93 @@ where
                 Err(BurnManagerError::Vault(err))
             }
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Reserves planned burns, retrying a bounded number of times on an
+    /// optimistic-concurrency conflict.
+    ///
+    /// Concurrent redemptions for the same vault contend on the single
+    /// `ReceiptInventory` aggregate; a lost commit race is transient and should
+    /// be retried (each `execute` reloads), not treated as a terminal burn
+    /// failure the way a genuine `InsufficientReceiptBalance` is.
+    async fn reserve_with_conflict_retry(
+        &self,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        planned_burns: Vec<super::BurnRecord>,
+    ) -> Result<(), ReceiptRegistrationError> {
+        const MAX_ATTEMPTS: usize = 3;
+
+        let mut attempt = 1;
+        loop {
+            match self
+                .receipt_service
+                .reserve_burn(
+                    vault,
+                    issuer_request_id.clone(),
+                    planned_burns.clone(),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ReceiptRegistrationError::Aggregate(
+                    AggregateError::AggregateConflict,
+                )) if attempt < MAX_ATTEMPTS => {
+                    warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        attempt,
+                        "Reserve hit an optimistic-concurrency conflict; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Releases a redemption's burn reservation, restoring available inventory.
+    ///
+    /// Best-effort: a failure is logged but not propagated. A stuck reservation
+    /// is the failure mode the startup reservation recovery scan
+    /// (`recover_stuck_reservations`) exists to clean up.
+    async fn release_reserved_burn(
+        &self,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        if let Err(err) = self
+            .receipt_service
+            .release_burn(vault, issuer_request_id.clone())
+            .await
+        {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to release burn receipt reservation"
+            );
+        }
+    }
+
+    /// Settles a redemption's burn reservation after on-chain confirmation,
+    /// reducing the mirror balance by the reserved amount.
+    ///
+    /// Best-effort: a failure is logged but not propagated. A reservation left
+    /// unsettled here is recovered by the startup reservation recovery scan
+    /// (`recover_stuck_reservations`); reconciliation cannot heal it because a
+    /// landed-but-unsettled burn sits inside the reconcile no-op band.
+    async fn settle_reserved_burn(
+        &self,
+        vault: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        if let Err(err) = self
+            .receipt_service
+            .settle_burn(vault, issuer_request_id.clone())
+            .await
+        {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Failed to settle burn receipt reservation"
+            );
         }
     }
 }
@@ -872,6 +1175,20 @@ fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
     }
 }
 
+/// Whether a failed burn confirmation definitively consumed no receipts, so its
+/// inventory reservation must be released. Ambiguous pending Fireblocks statuses
+/// keep the reservation (the transaction may still land on-chain).
+const fn should_release_reserved_burn(error: &VaultError) -> bool {
+    match error {
+        VaultError::Fireblocks(FireblocksVaultError::TransactionFailed {
+            status,
+            ..
+        }) => !vault_service::is_still_pending(*status),
+        VaultError::Reverted { .. } => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BurnManagerError {
     #[error("Vault error: {0}")]
@@ -896,6 +1213,8 @@ pub(crate) enum BurnManagerError {
     AssetNotFound { underlying: UnderlyingSymbol },
     #[error("Arithmetic overflow when computing total shares needed")]
     SharesOverflow,
+    #[error("Receipt reservation error: {0}")]
+    ReceiptRegistration(#[from] ReceiptRegistrationError),
 }
 
 #[cfg(test)]
@@ -906,6 +1225,7 @@ mod tests {
         AggregateContext, EventStore,
         persist::{GenericQuery, PersistedEventStore},
     };
+    use fireblocks_sdk::models::TransactionStatus;
     use rust_decimal::Decimal;
     use sqlite_es::{
         SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
@@ -914,7 +1234,11 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::{BurnManager, BurnManagerError, Redemption, RedemptionCommand};
+    use super::{
+        BurnManager, BurnManagerError, Redemption, RedemptionCommand,
+        should_release_reserved_burn,
+    };
+    use crate::fireblocks::FireblocksVaultError;
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Network, Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
@@ -928,12 +1252,77 @@ mod tests {
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
     };
-    use crate::vault::ReceiptInformation;
-    use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
+    use crate::vault::{ReceiptInformation, VaultError, VaultService};
 
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+    fn transaction_failed(status: TransactionStatus) -> VaultError {
+        VaultError::Fireblocks(FireblocksVaultError::TransactionFailed {
+            tx_id: "tx-123".to_string(),
+            status,
+        })
+    }
+
+    #[test]
+    fn should_release_on_terminal_fireblocks_failure() {
+        for status in [
+            TransactionStatus::Failed,
+            TransactionStatus::Rejected,
+            TransactionStatus::Cancelled,
+            TransactionStatus::Blocked,
+        ] {
+            assert!(
+                should_release_reserved_burn(&transaction_failed(status)),
+                "terminal status {status:?} should release the reservation"
+            );
+        }
+    }
+
+    #[test]
+    fn should_retain_reservation_on_pending_fireblocks_status() {
+        for status in [
+            TransactionStatus::Broadcasting,
+            TransactionStatus::Confirming,
+            TransactionStatus::PendingEnrichment,
+            TransactionStatus::Submitted,
+        ] {
+            assert!(
+                !should_release_reserved_burn(&transaction_failed(status)),
+                "pending status {status:?} must keep the reservation"
+            );
+        }
+    }
+
+    #[test]
+    fn should_release_on_evm_revert() {
+        let reverted = VaultError::Reverted {
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+        };
+
+        assert!(
+            should_release_reserved_burn(&reverted),
+            "a reverted burn consumed no receipts and must release"
+        );
+    }
+
+    #[test]
+    fn should_retain_reservation_on_non_definitive_errors() {
+        let ambiguous = VaultError::EventNotFound {
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+        };
+
+        assert!(
+            !should_release_reserved_burn(&ambiguous),
+            "ambiguous parse errors must not release the reservation"
+        );
+        assert!(!should_release_reserved_burn(&VaultError::InvalidReceipt));
+    }
 
     type TestCqrs = SqliteCqrs<Redemption>;
     type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
@@ -1186,6 +1575,17 @@ mod tests {
             matches!(updated_aggregate, Redemption::Completed { .. }),
             "Expected Completed state, got {updated_aggregate:?}"
         );
+
+        // A successful burn must settle (consume) its reservation; if the
+        // settle wiring were removed the reservation would linger here.
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "successful burn must leave no dangling reservation"
+        );
     }
 
     #[tokio::test]
@@ -1424,6 +1824,196 @@ mod tests {
         assert!(
             reason.contains("Invalid receipt"),
             "Expected error message to contain 'Invalid receipt', got: {reason}"
+        );
+
+        // The confirmation failed with an ambiguous (non-terminal) error, so
+        // the reservation is intentionally RETAINED — the transaction may still
+        // land on-chain, and releasing now could let a concurrent redemption
+        // reuse shares that are about to be consumed.
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id),
+            "ambiguous burn failure must retain the reservation"
+        );
+    }
+
+    /// A burn SUBMISSION failure does not prove no transaction was created
+    /// (e.g. a duplicate externalTxId whose lookup failed), so the reservation
+    /// must be RETAINED — releasing could let a concurrent redemption reuse the
+    /// balance and double-submit.
+    #[tokio::test]
+    async fn test_burn_submission_failure_retains_reservation() {
+        let vault_mock = Arc::new(MockVaultService::new_submit_failure());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .discover_receipt(
+                vault,
+                uint!(7_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let aggregate = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(
+            matches!(result, Err(BurnManagerError::Vault(_))),
+            "Expected submission failure, got {result:?}"
+        );
+
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id),
+            "an ambiguous submission failure must retain the reservation"
+        );
+    }
+
+    /// A submission that fails with a DEFINITIVE on-chain revert
+    /// (`VaultError::Reverted`, as the synchronous local backend produces)
+    /// consumed no receipts, so the reservation must be RELEASED — unlike an
+    /// ambiguous submit failure, which is retained.
+    #[tokio::test]
+    async fn test_submit_revert_releases_reservation() {
+        let vault_mock = Arc::new(MockVaultService::new_submit_revert());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .discover_receipt(
+                vault,
+                uint!(7_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let aggregate = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(
+            matches!(result, Err(BurnManagerError::Vault(_))),
+            "Expected a revert submission failure, got {result:?}"
+        );
+
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a definitive on-chain revert at submit must release the reservation"
+        );
+    }
+
+    /// A confirmation that fails with a DEFINITIVE on-chain revert
+    /// (`VaultError::Reverted`) consumed no receipts, so the reservation must be
+    /// RELEASED (exercises the `should_release_reserved_burn`-gated release in
+    /// the confirm-failure path).
+    #[tokio::test]
+    async fn test_confirm_revert_releases_reservation() {
+        let vault_mock = Arc::new(MockVaultService::new_confirm_revert());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .discover_receipt(
+                vault,
+                uint!(7_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let aggregate = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(
+            matches!(result, Err(BurnManagerError::Vault(_))),
+            "Expected a revert confirmation failure, got {result:?}"
+        );
+
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a definitive on-chain revert must release the reservation"
         );
     }
 
@@ -2336,5 +2926,231 @@ mod tests {
             matches!(recovered, Redemption::Completed { .. }),
             "Expected Completed state after recovery, got {recovered:?}"
         );
+    }
+
+    /// Reserves `shares` on `receipt_id` for `redemption`, simulating a
+    /// reservation a missed settle/release left dangling.
+    async fn seed_stuck_reservation(
+        harness: &TestHarness,
+        vault: Address,
+        redemption: &IssuerRedemptionRequestId,
+        receipt_id: U256,
+        shares: U256,
+    ) {
+        harness
+            .receipt_inventory_cqrs
+            .execute(
+                &vault.to_string(),
+                ReceiptInventoryCommand::ReserveBurn {
+                    redemption_issuer_request_id: redemption.clone(),
+                    burns: vec![crate::redemption::BurnRecord {
+                        receipt_id,
+                        shares_burned: shares,
+                    }],
+                },
+            )
+            .await
+            .expect("seeding a reservation should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_recover_stuck_reservations_settles_completed() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            harness.pool.clone(),
+            harness.cqrs.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        // Receipt 1 funds the real burn; receipt 2 will hold the stuck
+        // reservation we simulate after completion.
+        harness
+            .discover_receipt(
+                vault,
+                uint!(1_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(2_U256),
+                uint!(50_000000000000000000_U256),
+            )
+            .await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let aggregate = create_test_redemption_in_burning_state(
+            &harness.cqrs,
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await
+            .unwrap();
+
+        seed_stuck_reservation(
+            &harness,
+            vault,
+            &issuer_request_id,
+            uint!(2_U256),
+            uint!(50_000000000000000000_U256),
+        )
+        .await;
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id)
+        );
+
+        manager.recover_stuck_reservations(&[vault]).await;
+
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "GC must settle the reservation of a completed redemption"
+        );
+    }
+
+    /// A reservation surviving on a `Failed` redemption is from an *ambiguous*
+    /// failure (definitive failures release in the live/recovery paths), so the
+    /// burn may still have landed. The GC must LEAVE it rather than release it —
+    /// releasing would over-credit inventory and risk a duplicate burn.
+    #[tokio::test]
+    async fn test_recover_stuck_reservations_leaves_failed() {
+        let vault_mock = Arc::new(MockVaultService::new_failure());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            harness.pool.clone(),
+            harness.cqrs.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(1_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        // Drive the redemption to Failed (the failing mock fails the burn).
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let aggregate = create_test_redemption_in_burning_state(
+            &harness.cqrs,
+            &harness.store,
+            &issuer_request_id,
+        )
+        .await;
+        let _ = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+        assert!(matches!(
+            load_aggregate(&harness.store, &issuer_request_id).await,
+            Redemption::Failed { .. }
+        ));
+
+        seed_stuck_reservation(
+            &harness,
+            vault,
+            &issuer_request_id,
+            uint!(1_U256),
+            uint!(40_000000000000000000_U256),
+        )
+        .await;
+
+        manager.recover_stuck_reservations(&[vault]).await;
+
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id),
+            "GC must leave an ambiguous failed redemption's reservation in place"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_stuck_reservations_warns_and_leaves_unknown() {
+        let harness = TestHarness::new().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+
+        let blockchain_service = Arc::new(MockVaultService::new_success())
+            as Arc<dyn crate::vault::VaultService>;
+        let manager = BurnManager::new(
+            blockchain_service,
+            harness.pool.clone(),
+            harness.cqrs.clone(),
+            harness.store.clone(),
+            harness.receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(1_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        // No redemption aggregate exists for this id (Uninitialized): the GC
+        // must leave the reservation in place and surface a WARN rather than
+        // releasing it blindly.
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        seed_stuck_reservation(
+            &harness,
+            vault,
+            &issuer_request_id,
+            uint!(1_U256),
+            uint!(60_000000000000000000_U256),
+        )
+        .await;
+
+        manager.recover_stuck_reservations(&[vault]).await;
+
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id),
+            "GC must leave an unknown redemption's reservation in place"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["unknown redemption"]
+        ));
     }
 }

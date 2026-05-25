@@ -270,6 +270,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let receipt =
             vault_contract.multicall(calls).send().await?.get_receipt().await?;
 
+        // The local backend executes the burn synchronously, so a mined-but-
+        // reverted transaction is a definitive no-consumption outcome here (the
+        // Fireblocks backend, which submits asynchronously, catches reverts at
+        // confirm time instead). Surface it as a definitive failure so the
+        // reservation is released rather than retained as ambiguous.
+        if !receipt.status() {
+            return Err(VaultError::Reverted {
+                tx_hash: receipt.transaction_hash,
+            });
+        }
+
         // Parse all Withdraw events from the receipt
         let burns: Vec<super::MultiBurnResultEntry> = receipt
             .inner
@@ -341,6 +352,12 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or(VaultError::InvalidReceipt)?;
+
+        // A mined-but-reverted burn consumes no receipts, so it is a definitive
+        // failure distinct from an anomalous missing-Withdraw parse error.
+        if !receipt.status() {
+            return Err(VaultError::Reverted { tx_hash });
+        }
 
         let burns: Vec<MultiBurnResultEntry> = receipt
             .inner

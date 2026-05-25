@@ -335,8 +335,17 @@ pub async fn initialize_rocket(
     // idempotency, not on completing before the server is up. If the
     // synchronous pass hangs it is cancelled and any remaining stuck aggregates
     // are left for manual admin intervention.
-    run_recovery_with_timeout(&pool, &mint.cqrs, &mint.event_store, &managers)
-        .await;
+    let vaults: Vec<Address> =
+        vault_configs.iter().map(|config| config.vault).collect();
+
+    run_recovery_with_timeout(
+        &pool,
+        &mint.cqrs,
+        &mint.event_store,
+        &managers,
+        &vaults,
+    )
+    .await;
 
     spawn_periodic_receipt_backfills(
         pool.clone(),
@@ -349,9 +358,6 @@ pub async fn initialize_rocket(
     );
 
     {
-        let vaults: Vec<Address> =
-            vault_configs.iter().map(|config| config.vault).collect();
-
         info!(
             target: "redemption",
             vault_count = vaults.len(),
@@ -674,6 +680,7 @@ async fn run_redemption_recovery(
         PersistedEventStore<SqliteEventRepository, Redemption>,
     >,
     burn: &BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    vaults: &[Address],
 ) {
     info!(target: "redemption", "Running redemption recovery");
 
@@ -681,6 +688,12 @@ async fn run_redemption_recovery(
     journal.recover_alpaca_called_redemptions().await;
     burn.recover_burning_redemptions().await;
     burn.recover_burn_failed_redemptions().await;
+    // Runs last, after the recovery passes above have re-confirmed in-flight
+    // burns. It only SETTLES reservations whose redemption confirmed
+    // (Completed) but whose settlement was missed; ambiguous/in-flight
+    // reservations are left untouched, since releasing a burn that may have
+    // landed would risk a duplicate burn.
+    burn.recover_stuck_reservations(vaults).await;
 }
 
 /// Maximum time to wait for recovery before starting the HTTP server.
@@ -702,6 +715,7 @@ async fn run_recovery_with_timeout(
     mint_cqrs: &MintCqrs,
     mint_event_store: &MintEventStore,
     managers: &RedemptionManagers,
+    vaults: &[Address],
 ) {
     let recovery = async {
         run_mint_recovery(pool, mint_cqrs, mint_event_store).await;
@@ -709,6 +723,7 @@ async fn run_recovery_with_timeout(
             &managers.redeem_call,
             &managers.journal,
             &managers.burn,
+            vaults,
         )
         .await;
     };

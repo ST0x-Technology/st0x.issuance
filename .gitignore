@@ -10,3 +10,4 @@ target/
 *.db-wal
 *.log
 claude-local-ctx/
+.claude/
