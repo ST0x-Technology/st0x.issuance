@@ -18,7 +18,7 @@ use crate::vault::ReceiptInformation;
 
 /// Tracks burn operations for a redemption.
 ///
-/// This is a cqrs-es view keyed by redemption aggregate_id (red-xxx).
+/// This is a cqrs-es view keyed by redemption aggregate_id.
 /// Each successful burn creates one record. Use GenericQuery to update.
 ///
 /// To compute available receipt balance, join with receipt_inventory_view

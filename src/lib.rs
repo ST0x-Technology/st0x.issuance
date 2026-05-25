@@ -541,7 +541,7 @@ fn setup_aggregate_cqrs(
         ));
     let redemption_query = GenericQuery::new(redemption_view_repo);
 
-    // ReceiptBurnsView tracks burns keyed by redemption aggregate_id (red-xxx).
+    // ReceiptBurnsView tracks burns keyed by redemption aggregate_id.
     // Use GenericQuery since aggregate_id = view_id is correct for this view.
     // Available balance is computed at query time by joining with receipt_inventory_view.
     let receipt_burns_repo =

@@ -1,3 +1,4 @@
+use alloy::primitives::B256;
 use chrono::{DateTime, Utc};
 use cqrs_es::{AggregateError, EventStore};
 use rocket::http::Status;
@@ -24,7 +25,7 @@ use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{FireblocksTxStatus, VaultService};
 use crate::{MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore};
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregateKind {
     Mint,
@@ -52,6 +53,12 @@ pub(crate) struct StuckAggregate {
     underlying: Option<UnderlyingSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quantity: Option<Quantity>,
+    /// Primary on-chain transaction hash for this aggregate, when known.
+    /// For redemptions this is the detected transfer tx hash. For mints this
+    /// is the successful mint tx hash, or a Fireblocks network hash when the
+    /// signing backend exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<B256>,
     /// Fireblocks transaction ID associated with this aggregate's current
     /// stuck step. For mints, sourced from the most recent
     /// `FireblocksSubmitted` event. For redemptions, populated only on
@@ -691,12 +698,19 @@ pub(crate) async fn close_mint(
     }))
 }
 
-#[tracing::instrument(skip(_auth, pool, mint_event_store, vault_service))]
+#[tracing::instrument(skip(
+    _auth,
+    pool,
+    mint_event_store,
+    redemption_event_store,
+    vault_service
+))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
     mint_event_store: &rocket::State<MintEventStore>,
+    redemption_event_store: &rocket::State<RedemptionEventStore>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let mut stuck = Vec::new();
@@ -708,9 +722,17 @@ pub(crate) async fn list_stuck(
     })?;
 
     for (issuer_redemption_request_id, view) in stuck_redemptions {
-        if let Some(entry) =
-            stuck_redemption_entry(&issuer_redemption_request_id, &view)
-        {
+        let history = redemption_history_summary(
+            redemption_event_store.inner(),
+            &issuer_redemption_request_id.to_string(),
+        )
+        .await;
+
+        if let Some(entry) = stuck_redemption_entry(
+            &issuer_redemption_request_id,
+            &view,
+            history,
+        ) {
             stuck.push(entry);
         }
     }
@@ -730,7 +752,7 @@ pub(crate) async fn list_stuck(
         };
 
         let (underlying, quantity) = mint_view_asset(&view);
-        let fireblocks_tx_id = latest_fireblocks_tx_id(
+        let mint_history = mint_history_summary(
             mint_event_store.inner(),
             &issuer_mint_request_id.to_string(),
         )
@@ -745,7 +767,8 @@ pub(crate) async fn list_stuck(
             timestamp,
             underlying,
             quantity,
-            fireblocks_tx_id,
+            tx_hash: mint_history.tx_hash,
+            fireblocks_tx_id: mint_history.fireblocks_tx_id,
             fireblocks_status: None,
         });
     }
@@ -771,7 +794,12 @@ async fn enrich_with_fireblocks_status(
         };
 
         match vault_service.check_fireblocks_tx(tx_id).await {
-            Ok(Some(status)) => entry.fireblocks_status = Some(status),
+            Ok(Some(status)) => {
+                if entry.tx_hash.is_none() {
+                    entry.tx_hash = tx_hash_from_fireblocks_status(&status);
+                }
+                entry.fireblocks_status = Some(status);
+            }
             Ok(None) => {}
             Err(err) => {
                 warn!(target: "admin",
@@ -788,6 +816,7 @@ async fn enrich_with_fireblocks_status(
 fn stuck_redemption_entry(
     issuer_redemption_request_id: &IssuerRedemptionRequestId,
     view: &RedemptionView,
+    history: RedemptionHistorySummary,
 ) -> Option<StuckAggregate> {
     let (
         tokenization_request_id,
@@ -796,21 +825,24 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        tx_hash,
         fireblocks_tx_id,
     ) = match view {
         RedemptionView::Failed { reason, failed_at, .. } => (
-            None,
+            history.tokenization_request_id,
             "Failed".to_string(),
             reason.clone(),
             *failed_at,
-            None,
-            None,
-            None,
+            history.underlying,
+            history.quantity,
+            history.tx_hash,
+            history.fireblocks_tx_id,
         ),
         RedemptionView::BurnFailed {
             tokenization_request_id,
             underlying,
             quantity,
+            tx_hash,
             error,
             failed_at,
             fireblocks_tx_id,
@@ -822,7 +854,8 @@ fn stuck_redemption_entry(
             *failed_at,
             Some(underlying.clone()),
             Some(quantity.clone()),
-            fireblocks_tx_id.clone(),
+            Some(*tx_hash),
+            fireblocks_tx_id.clone().or(history.fireblocks_tx_id),
         ),
         // find_stuck only returns Failed/BurnFailed; surface any other
         // variant as a real mismatch rather than fabricating placeholder
@@ -839,9 +872,83 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        tx_hash,
         fireblocks_tx_id,
         fireblocks_status: None,
     })
+}
+
+#[derive(Debug, Default)]
+struct RedemptionHistorySummary {
+    tokenization_request_id: Option<TokenizationRequestId>,
+    underlying: Option<UnderlyingSymbol>,
+    quantity: Option<Quantity>,
+    tx_hash: Option<B256>,
+    fireblocks_tx_id: Option<String>,
+}
+
+async fn redemption_history_summary(
+    event_store: &crate::SqliteEventStore<crate::redemption::Redemption>,
+    aggregate_id: &str,
+) -> RedemptionHistorySummary {
+    let events = match event_store.load_events(aggregate_id).await {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                target: "admin",
+                aggregate_id = aggregate_id,
+                error = %err,
+                "Failed to load redemption events for stuck metadata lookup"
+            );
+            return RedemptionHistorySummary::default();
+        }
+    };
+
+    let mut summary = RedemptionHistorySummary::default();
+    for event in events {
+        match event.payload {
+            RedemptionEvent::Detected {
+                underlying, quantity, tx_hash, ..
+            }
+            | RedemptionEvent::Reprocessed {
+                underlying,
+                quantity,
+                tx_hash,
+                ..
+            }
+            | RedemptionEvent::BurnResumed {
+                underlying,
+                quantity,
+                tx_hash,
+                ..
+            } => {
+                summary.underlying = Some(underlying);
+                summary.quantity = Some(quantity);
+                summary.tx_hash = Some(tx_hash);
+            }
+            RedemptionEvent::AlpacaCalled {
+                tokenization_request_id, ..
+            } => {
+                summary.tokenization_request_id = Some(tokenization_request_id);
+            }
+            RedemptionEvent::BurnFireblocksSubmitted {
+                fireblocks_tx_id,
+                ..
+            }
+            | RedemptionEvent::ExistingBurnRecovered {
+                fireblocks_tx_id, ..
+            }
+            | RedemptionEvent::BurningFailed {
+                fireblocks_tx_id: Some(fireblocks_tx_id),
+                ..
+            } => {
+                summary.fireblocks_tx_id = Some(fireblocks_tx_id);
+            }
+            _ => {}
+        }
+    }
+
+    summary
 }
 
 fn mint_view_summary(
@@ -907,17 +1014,17 @@ fn mint_view_asset(
     }
 }
 
-/// Returns the `fireblocks_tx_id` from the most recent `FireblocksSubmitted`
-/// event in this mint's history, if one exists. Used to surface the in-flight
-/// Fireblocks transaction in the stuck-aggregate response so operators don't
-/// have to grep logs.
-///
-/// Returns `None` if loading events fails — the caller logs that as a warning
-/// and the stuck listing still includes the aggregate without this hint.
-async fn latest_fireblocks_tx_id(
+#[derive(Debug, Default)]
+struct MintHistorySummary {
+    tx_hash: Option<B256>,
+    fireblocks_tx_id: Option<String>,
+}
+
+/// Returns the latest useful transaction hints from this mint's history.
+async fn mint_history_summary(
     event_store: &crate::SqliteEventStore<crate::mint::Mint>,
     aggregate_id: &str,
-) -> Option<String> {
+) -> MintHistorySummary {
     let events = match event_store.load_events(aggregate_id).await {
         Ok(events) => events,
         Err(err) => {
@@ -927,16 +1034,46 @@ async fn latest_fireblocks_tx_id(
                 error = %err,
                 "Failed to load mint events for fireblocks_tx_id lookup"
             );
-            return None;
+            return MintHistorySummary::default();
         }
     };
 
-    events.into_iter().rev().find_map(|event| match event.payload {
-        MintEvent::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-            Some(fireblocks_tx_id)
+    let mut summary = MintHistorySummary::default();
+    for event in events {
+        match event.payload {
+            MintEvent::TokensMinted { tx_hash, .. }
+            | MintEvent::ExistingMintRecovered { tx_hash, .. }
+            | MintEvent::MintRetryStarted { tx_hash: Some(tx_hash), .. } => {
+                summary.tx_hash = Some(tx_hash);
+            }
+            MintEvent::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+                summary.fireblocks_tx_id = Some(fireblocks_tx_id);
+            }
+            _ => {}
         }
-        _ => None,
-    })
+    }
+
+    summary
+}
+
+fn tx_hash_from_fireblocks_status(status: &FireblocksTxStatus) -> Option<B256> {
+    match status {
+        FireblocksTxStatus::Completed { tx_hash, .. } => Some(*tx_hash),
+        FireblocksTxStatus::Failed { network_tx_hashes, .. } => {
+            network_tx_hashes.iter().find_map(|tx_hash| match tx_hash.parse() {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    warn!(target: "admin",
+                        network_tx_hash = %tx_hash,
+                        error = %err,
+                        "Skipping malformed Fireblocks network_tx_hash"
+                    );
+                    None
+                }
+            })
+        }
+        FireblocksTxStatus::Pending => None,
+    }
 }
 
 /// Response for the Fireblocks transaction status lookup endpoint.
@@ -1116,6 +1253,88 @@ mod tests {
             dust_quantity: Quantity::new(Decimal::ZERO),
             called_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn failed_redemption_stuck_entry_uses_history_metadata() {
+        let metadata = test_metadata();
+        let tokenization_request_id = TokenizationRequestId::new("tok-red-1");
+        let fireblocks_tx_id = "fb-redemption-1".to_string();
+        let failed_at = Utc::now();
+        let view = RedemptionView::Failed {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            reason: "Fireblocks burn confirmation failed".to_string(),
+            failed_at,
+        };
+        let history = super::RedemptionHistorySummary {
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            underlying: Some(metadata.underlying.clone()),
+            quantity: Some(metadata.quantity.clone()),
+            tx_hash: Some(metadata.detected_tx_hash),
+            fireblocks_tx_id: Some(fireblocks_tx_id.clone()),
+        };
+
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            &view,
+            history,
+        )
+        .expect("failed redemption should produce stuck entry");
+
+        assert_eq!(entry.aggregate_type, AggregateKind::Redemption);
+        assert_eq!(entry.aggregate_id, metadata.issuer_request_id.to_string());
+        assert_eq!(
+            entry.tokenization_request_id,
+            Some(tokenization_request_id)
+        );
+        assert_eq!(entry.underlying, Some(metadata.underlying));
+        assert_eq!(entry.quantity, Some(metadata.quantity));
+        assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
+        assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
+        assert_eq!(entry.timestamp, failed_at);
+    }
+
+    #[test]
+    fn burn_failed_stuck_entry_prefers_view_metadata() {
+        let metadata = test_metadata();
+        let tokenization_request_id = TokenizationRequestId::new("tok-red-2");
+        let fireblocks_tx_id = "fb-burn-failed".to_string();
+        let failed_at = Utc::now();
+        let view = RedemptionView::BurnFailed {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            alpaca_quantity: metadata.quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            called_at: Utc::now(),
+            alpaca_journal_completed_at: Utc::now(),
+            error: "burn failed".to_string(),
+            failed_at,
+            fireblocks_tx_id: Some(fireblocks_tx_id.clone()),
+            planned_burns: vec![],
+        };
+
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            &view,
+            super::RedemptionHistorySummary::default(),
+        )
+        .expect("burn failed redemption should produce stuck entry");
+
+        assert_eq!(
+            entry.tokenization_request_id,
+            Some(tokenization_request_id)
+        );
+        assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
+        assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
+        assert_eq!(entry.underlying, Some(metadata.underlying));
+        assert_eq!(entry.quantity, Some(metadata.quantity));
     }
 
     type TestEventStore =
@@ -1747,6 +1966,7 @@ mod tests {
             timestamp: Utc::now(),
             underlying: None,
             quantity: None,
+            tx_hash: None,
             fireblocks_tx_id: fireblocks_tx_id.map(str::to_owned),
             fireblocks_status: None,
         }
@@ -1784,6 +2004,31 @@ mod tests {
             }
             other => panic!("unexpected status: {other:?}"),
         }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn enrich_warns_on_malformed_network_tx_hash() {
+        let tx_id = "a29e5027-1e44-4a66-b78b-b579e55757db";
+        let stub = StubFireblocksVault {
+            tx_id: tx_id.to_string(),
+            response: FireblocksTxStatus::Failed {
+                detail: "Failed".to_string(),
+                sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
+                network_tx_hashes: vec!["not-a-hash".to_string()],
+            },
+        };
+
+        let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
+        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+
+        // The unparseable hash must not be silently dropped: tx_hash stays
+        // None and the bad value is surfaced in a warning.
+        assert!(entries[0].tx_hash.is_none());
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["malformed Fireblocks network_tx_hash", "not-a-hash"]
+        ));
     }
 
     #[tokio::test]

@@ -289,7 +289,12 @@ mod tests {
 
         let serialized = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(serialized["issuer_request_id"], json!("red-12345678"));
+        assert_eq!(
+            serialized["issuer_request_id"],
+            json!(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            )
+        );
         assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
         assert_eq!(serialized["token_symbol"], json!("tAAPL"));
         assert_eq!(

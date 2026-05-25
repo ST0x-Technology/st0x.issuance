@@ -598,7 +598,7 @@ mod tests {
                 .header("APCA-API-SECRET-KEY", "test-secret");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
-                "issuer_request_id": "red-abcdefab",
+                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -649,7 +649,7 @@ mod tests {
                 .path("/v1/accounts/test-account/tokenization/callback/redeem");
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-456",
-                "issuer_request_id": "red-abcdefab",
+                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "rejected",
@@ -866,7 +866,7 @@ mod tests {
                 .path("/v1/accounts/test-account/tokenization/callback/redeem")
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "issuer_request_id": "red-abcdefab",
+                    "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
                     "client_id": "00000000-0000-0000-0000-000000000456",
@@ -877,7 +877,7 @@ mod tests {
                 }));
             then.status(200).json_body(serde_json::json!({
                 "tokenization_request_id": "tok-002",
-                "issuer_request_id": "red-abcdefab",
+                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                 "created_at": "2025-09-12T17:28:48.642437-04:00",
                 "type": "redeem",
                 "status": "pending",
@@ -1625,10 +1625,10 @@ mod tests {
                 issuer_request_id, status, ..
             } => {
                 assert_eq!(
-                    *issuer_request_id,
-                    IssuerRedemptionRequestId::new(b256!(
-                        "0x842331fb00000000000000000000000000000000000000000000000000000000"
-                    )),
+                    issuer_request_id,
+                    &"red-842331fb"
+                        .parse::<IssuerRedemptionRequestId>()
+                        .unwrap(),
                 );
                 assert!(matches!(status, RedeemRequestStatus::Completed));
             }

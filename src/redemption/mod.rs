@@ -25,15 +25,19 @@ use crate::mint::TokenizationRequestId;
 
 /// Issuer request ID for redemption operations.
 ///
-/// Derived from the triggering transaction hash — the first 4 bytes are
-/// extracted and serialized as `"red-{hex}"` (e.g., `"red-574378e0"`).
+/// New IDs are the full triggering transaction hash. Legacy IDs used the first
+/// 4 bytes formatted as `"red-{hex}"`; keep parsing/serializing them so
+/// historical aggregates remain operable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct IssuerRedemptionRequestId(FixedBytes<4>);
+pub(crate) enum IssuerRedemptionRequestId {
+    Full(TxHash),
+    Legacy(FixedBytes<4>),
+}
 
 impl IssuerRedemptionRequestId {
     #[must_use]
-    pub(crate) fn new(tx_hash: TxHash) -> Self {
-        Self(FixedBytes::<4>::from_slice(&tx_hash[..4]))
+    pub(crate) const fn new(tx_hash: TxHash) -> Self {
+        Self::Full(tx_hash)
     }
 
     #[cfg(test)]
@@ -44,7 +48,10 @@ impl IssuerRedemptionRequestId {
 
 impl std::fmt::Display for IssuerRedemptionRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "red-{}", hex::encode(self.0))
+        match self {
+            Self::Full(tx_hash) => write!(f, "{tx_hash:#x}"),
+            Self::Legacy(id) => write!(f, "red-{}", hex::encode(id)),
+        }
     }
 }
 
@@ -52,12 +59,16 @@ impl std::str::FromStr for IssuerRedemptionRequestId {
     type Err = IssuerRedemptionRequestIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let hex_str = s
-            .strip_prefix("red-")
-            .ok_or(IssuerRedemptionRequestIdParseError::Format)?;
+        if let Some(hex_str) = s.strip_prefix("red-") {
+            let bytes = hex::decode(hex_str)?;
+            return Ok(Self::Legacy(FixedBytes::<4>::try_from(
+                bytes.as_slice(),
+            )?));
+        }
 
-        let bytes = hex::decode(hex_str)?;
-        Ok(Self(FixedBytes::<4>::try_from(bytes.as_slice())?))
+        s.parse::<B256>()
+            .map(Self::Full)
+            .map_err(|_| IssuerRedemptionRequestIdParseError::Format)
     }
 }
 
@@ -67,7 +78,7 @@ pub(crate) enum IssuerRedemptionRequestIdParseError {
     Hex(#[from] hex::FromHexError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
-    #[error("expected 'red-' prefix")]
+    #[error("expected full 0x transaction hash or legacy 'red-' prefix")]
     Format,
 }
 
@@ -1839,35 +1850,41 @@ mod tests {
     }
 
     #[test]
-    fn test_new_extracts_first_4_bytes_of_tx_hash() {
+    fn test_new_uses_full_tx_hash() {
         let tx_hash = b256!(
-            "574378e000000000000000000000000000000000000000000000000000000000"
+            "0x574378e000000000000000000000000000000000000000000000000000000000"
         );
 
         let id = IssuerRedemptionRequestId::new(tx_hash);
 
-        assert_eq!(id.to_string(), "red-574378e0");
+        assert_eq!(
+            id.to_string(),
+            "0x574378e000000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
-    fn test_display_format_is_red_dash_hex() {
+    fn test_display_format_is_full_tx_hash() {
         let tx_hash = b256!(
-            "deadbeef00000000000000000000000000000000000000000000000000000000"
+            "0xdeadbeef00000000000000000000000000000000000000000000000000000000"
         );
 
         let id = IssuerRedemptionRequestId::new(tx_hash);
 
         let display = id.to_string();
         assert!(
-            display.starts_with("red-"),
-            "expected 'red-' prefix, got: {display}"
+            display.starts_with("0x"),
+            "expected '0x' prefix, got: {display}"
         );
         assert_eq!(
             display.len(),
-            12,
-            "expected 12 chars (red- + 8 hex), got: {display}"
+            66,
+            "expected 66 chars (0x + 64 hex), got: {display}"
         );
-        assert_eq!(display, "red-deadbeef");
+        assert_eq!(
+            display,
+            "0xdeadbeef00000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -1898,24 +1915,39 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_produces_red_hex_string() {
+    fn test_serialize_produces_full_tx_hash_string() {
         let tx_hash = b256!(
-            "574378e000000000000000000000000000000000000000000000000000000000"
+            "0x574378e000000000000000000000000000000000000000000000000000000000"
         );
 
         let id = IssuerRedemptionRequestId::new(tx_hash);
         let json = serde_json::to_string(&id).unwrap();
 
-        assert_eq!(json, "\"red-574378e0\"");
+        assert_eq!(
+            json,
+            "\"0x574378e000000000000000000000000000000000000000000000000000000000\""
+        );
     }
 
     #[test]
-    fn test_deserialize_red_hex_string() {
+    fn test_deserialize_legacy_red_hex_string() {
         let json = "\"red-574378e0\"";
 
         let id: IssuerRedemptionRequestId = serde_json::from_str(json).unwrap();
 
         assert_eq!(id.to_string(), "red-574378e0");
+    }
+
+    #[test]
+    fn test_deserialize_full_tx_hash_string() {
+        let json = "\"0x574378e000000000000000000000000000000000000000000000000000000000\"";
+
+        let id: IssuerRedemptionRequestId = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            id.to_string(),
+            "0x574378e000000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -1933,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_rejects_missing_prefix() {
+    fn test_from_str_rejects_hash_without_0x_prefix() {
         let result = "574378e0".parse::<IssuerRedemptionRequestId>();
         assert!(matches!(
             result.unwrap_err(),
@@ -2409,10 +2441,10 @@ mod tests {
         }
 
         #[test]
-        fn test_display_always_starts_with_red_prefix(id in arb_issuer_redemption_request_id()) {
+        fn test_display_always_uses_full_hash_for_new_ids(id in arb_issuer_redemption_request_id()) {
             let display = id.to_string();
-            prop_assert!(display.starts_with("red-"));
-            prop_assert_eq!(display.len(), 12);
+            prop_assert!(display.starts_with("0x"));
+            prop_assert_eq!(display.len(), 66);
         }
     }
 }

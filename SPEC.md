@@ -142,10 +142,11 @@ struct TokenizationRequestId(String);
 /// Serializes as a UUID string, e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 struct IssuerMintRequestId(Uuid);
 
-/// Redemption operations derive their issuer request ID from the first 4 bytes
-/// of the on-chain tx_hash that triggered the redemption.
-/// Serializes as "red-{hex}", e.g. "red-574378e0"
-struct IssuerRedemptionRequestId(FixedBytes<4>);
+/// Redemption operations derive their issuer request ID from the full on-chain
+/// tx_hash that triggered the redemption.
+/// Serializes as a 32-byte hash, e.g. "0x1234...abcd".
+/// Legacy "red-{first4bytes}" IDs remain readable for historical events.
+struct IssuerRedemptionRequestId(TxHash);
 
 struct ClientId(String);
 struct AlpacaAccountNumber(String);
@@ -1310,7 +1311,7 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 
 ```json
 {
-  "issuer_request_id": "red-574378e0",
+  "issuer_request_id": "0x574378e0d4f3a8b9c2e1f0a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5",
   "underlying_symbol": "AAPL",
   "token_symbol": "AAPL0x",
   "client_id": "5505-1234-ABC-4G45",
@@ -1321,12 +1322,16 @@ Where `{account_id}` is our designated tokenization account ID at Alpaca.
 }
 ```
 
+The `issuer_request_id` is the full redemption tx hash
+(`IssuerRedemptionRequestId::Full`). Redemptions recorded before this format
+still render legacy `red-{first4bytes}` IDs for their historical events.
+
 **Alpaca's Response:**
 
 ```json
 {
   "tokenization_request_id": "12345-678-90AB",
-  "issuer_request_id": "red-574378e0",
+  "issuer_request_id": "0x574378e0d4f3a8b9c2e1f0a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5",
   "created_at": "2025-09-12T17:28:48.642437-04:00",
   "type": "redeem",
   "status": "pending",
@@ -1940,7 +1945,8 @@ polling timeout scenario where burns landed on-chain but weren't recorded.
 
 **Examples:**
 
-- `POST /admin/recover/redemption/red-61e089c6`
+- `POST /admin/recover/redemption/0x61e089c6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8`
+  (legacy `red-61e089c6` IDs are also accepted for historical redemptions)
 - `POST /admin/reprocess/mint/358508d1-54eb-4e3a-b1c5-c08fb0424f82`
 
 **Status Codes:**
