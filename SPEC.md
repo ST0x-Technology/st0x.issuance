@@ -336,8 +336,9 @@ on-chain transfer through calling Alpaca to burning tokens.
   call step. Only valid from `Failed` state. Used for post-Alpaca failures where
   Alpaca has already completed the journal. The API layer polls Alpaca to verify
   journal completion before issuing this command — refuses if Pending or
-  Rejected. Emits `BurnResumed` event. Burn executes on next service restart via
-  `recover_burning_redemptions`.
+  Rejected. Emits `BurnResumed` event. The admin recovery path immediately
+  invokes burn recovery in-process so the on-chain burn does not wait for a
+  service restart.
 
 **Events:**
 
@@ -1928,7 +1929,8 @@ Auto-detects the right recovery path from the event history:
 - **Post-Alpaca failures** (`AlpacaCalled` event exists): Polls Alpaca to verify
   journal completion, then dispatches `ResumeBurn` to transition to `Burning`.
   Refuses if Alpaca journal is `Pending` or `Rejected` (to avoid burning without
-  backing). `BurnManager` executes the burn on next restart.
+  backing). `BurnManager` executes the burn immediately in the same recovery
+  request.
 
 **Mint:** `POST /admin/reprocess/mint/<aggregate_id>`
 
@@ -1956,7 +1958,8 @@ polling timeout scenario where burns landed on-chain but weren't recorded.
 - `409`: Aggregate already completed or closed (cannot recover)
 - `422`: Aggregate in a state that cannot be recovered, or Alpaca journal not
   completed (for post-Alpaca redemption recovery)
-- `502`: Failed to poll Alpaca for journal status (post-Alpaca recovery only)
+- `502`: Failed to poll Alpaca for journal status, or failed to execute the burn
+  recovery (post-Alpaca recovery only)
 
 ### Close Redemption
 

@@ -1,4 +1,5 @@
 use alloy::primitives::B256;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{AggregateError, EventStore};
 use rocket::http::Status;
@@ -17,13 +18,38 @@ use crate::mint::{
     TokenizationRequestId, find_all_recoverable_mints,
     find_by_issuer_request_id, recovery::spawn_scheduled_mint_recovery,
 };
+use crate::redemption::Redemption;
+use crate::redemption::burn_manager::{
+    BurnManager, BurnManagerError, RecoveryOutcome,
+};
 use crate::redemption::{
     BurnRecord, IssuerRedemptionRequestId, RedemptionCommand, RedemptionError,
     RedemptionEvent, RedemptionMetadata, RedemptionView, find_stuck,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{FireblocksTxStatus, VaultService};
-use crate::{MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore};
+use crate::{
+    MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore,
+    SqliteEventStore,
+};
+
+#[async_trait]
+pub(crate) trait RedemptionBurnRecovery: Send + Sync {
+    async fn execute_recovered_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<RecoveryOutcome, BurnManagerError>;
+}
+
+#[async_trait]
+impl RedemptionBurnRecovery for BurnManager<SqliteEventStore<Redemption>> {
+    async fn execute_recovered_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<RecoveryOutcome, BurnManagerError> {
+        self.recover_burning_redemption(issuer_request_id).await
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,14 +223,15 @@ async fn load_reprocess_context(
 /// Auto-detects the right recovery path from the event history:
 /// - **Pre-Alpaca failures**: Resets to `Detected` so `RedeemCallManager` re-calls Alpaca.
 /// - **Post-Alpaca failures**: Polls Alpaca to verify the journal completed, then
-///   resumes to `Burning` so `BurnManager` can execute the on-chain burn.
+///   resumes to `Burning` and invokes burn recovery immediately.
 ///   Refuses if Alpaca's journal hasn't completed (to avoid burning without backing).
 #[tracing::instrument(skip(
     _auth,
     cqrs,
     event_store,
     alpaca_service,
-    vault_service
+    vault_service,
+    burn_recovery
 ))]
 #[post("/admin/recover/redemption/<issuer_request_id>")]
 pub(crate) async fn recover_redemption(
@@ -213,6 +240,7 @@ pub(crate) async fn recover_redemption(
     event_store: &rocket::State<RedemptionEventStore>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let aggregate_id = issuer_request_id.to_string();
@@ -236,6 +264,7 @@ pub(crate) async fn recover_redemption(
         cqrs,
         alpaca_service,
         vault_service.inner(),
+        burn_recovery.inner(),
         PostAlpacaRecoveryInput {
             aggregate_id,
             issuer_request_id,
@@ -296,6 +325,7 @@ async fn recover_post_alpaca(
     cqrs: &RedemptionCqrs,
     alpaca_service: &Arc<dyn AlpacaService>,
     vault_service: &Arc<dyn VaultService>,
+    burn_recovery: &Arc<dyn RedemptionBurnRecovery>,
     input: PostAlpacaRecoveryInput,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let PostAlpacaRecoveryInput {
@@ -493,14 +523,62 @@ async fn recover_post_alpaca(
         "Redemption recovered from Failed to Burning"
     );
 
+    let outcome = burn_recovery
+        .execute_recovered_burn(&issuer_request_id)
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to execute recovered redemption burn"
+            );
+            Status::BadGateway
+        })?;
+
+    let message = report_recovery_outcome(outcome, &aggregate_id);
+
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Redemption,
         aggregate_id: aggregate_id.clone(),
         previous_state: "Failed".to_string(),
-        message:
-            "Recovered to Burning — burn will execute on next service restart"
-                .to_string(),
+        message: message.to_string(),
     }))
+}
+
+/// Logs each recovery outcome at a severity matching what actually happened and
+/// returns the operator-facing message. Only `SkippedManualIntervention` leaves
+/// the redemption unresolved, so it alone warns; the other outcomes describe
+/// their distinct resolutions without ever claiming a burn that didn't run.
+fn report_recovery_outcome(
+    outcome: RecoveryOutcome,
+    aggregate_id: &str,
+) -> &'static str {
+    match outcome {
+        RecoveryOutcome::Executed => {
+            info!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
+                "Recovered redemption and executed burn immediately"
+            );
+            "Recovered from Failed and executed burn immediately"
+        }
+        RecoveryOutcome::ExistingBurnRecorded => {
+            info!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
+                "Recovered redemption by recording a previously submitted on-chain burn"
+            );
+            "Recovered from Failed and recorded a previously submitted on-chain burn"
+        }
+        RecoveryOutcome::SkippedManualIntervention => {
+            warn!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
+                "Recovered redemption to Burning but burn was skipped; manual intervention required"
+            );
+            "Recovered to Burning but burn skipped: on-chain balance \
+             insufficient, manual intervention required"
+        }
+        RecoveryOutcome::AlreadyAdvanced => {
+            info!(target: "admin", aggregate_id = %aggregate_id, outcome = ?outcome,
+                "Redemption had already advanced past Burning; no burn executed"
+            );
+            "Redemption had already advanced past Burning; no burn executed"
+        }
+    }
 }
 
 const fn map_redemption_error(err: &AggregateError<RedemptionError>) -> Status {
@@ -1133,6 +1211,7 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -1170,6 +1249,57 @@ mod tests {
     /// `poll_request_status`. Other methods are unused in these tests.
     struct PollMockAlpaca {
         response: PollResponse,
+    }
+
+    /// Configurable result for `MockBurnRecovery`. `Fails` exercises the
+    /// endpoint's error path; the concrete `BurnManagerError` is irrelevant
+    /// since every error maps to `502`.
+    #[derive(Clone, Copy)]
+    enum MockBurnResult {
+        Succeeds(super::RecoveryOutcome),
+        Fails,
+    }
+
+    struct MockBurnRecovery {
+        calls: AtomicUsize,
+        result: MockBurnResult,
+    }
+
+    impl Default for MockBurnRecovery {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                result: MockBurnResult::Succeeds(
+                    super::RecoveryOutcome::Executed,
+                ),
+            }
+        }
+    }
+
+    impl MockBurnRecovery {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl super::RedemptionBurnRecovery for MockBurnRecovery {
+        async fn execute_recovered_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> Result<super::RecoveryOutcome, super::BurnManagerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.result {
+                MockBurnResult::Succeeds(outcome) => Ok(outcome),
+                MockBurnResult::Fails => {
+                    Err(super::BurnManagerError::SharesOverflow)
+                }
+            }
+        }
+    }
+
+    fn mock_burn_recovery() -> Arc<dyn super::RedemptionBurnRecovery> {
+        Arc::new(MockBurnRecovery::default())
     }
 
     fn redeem_response(
@@ -1446,11 +1576,15 @@ mod tests {
                 &alpaca_data,
             )),
         });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
 
         let result = recover_post_alpaca(
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &burn_recovery_state,
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1463,8 +1597,11 @@ mod tests {
 
         let response = result.expect("Expected Ok response");
         assert_eq!(response.previous_state, "Failed");
-        assert!(response.message.contains("Burning"));
+        assert!(response.message.contains("Recovered from Failed"));
+        assert!(response.message.contains("executed burn"));
+        assert_eq!(burn_recovery.calls(), 1);
         assert!(logs_contain_at!(Level::INFO, &["recovered", "Burning"]));
+        assert!(logs_contain_at!(Level::INFO, &["burn", "executed"]));
     }
 
     #[traced_test]
@@ -1484,6 +1621,7 @@ mod tests {
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &mock_burn_recovery(),
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1515,6 +1653,7 @@ mod tests {
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &mock_burn_recovery(),
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1545,6 +1684,7 @@ mod tests {
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &mock_burn_recovery(),
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1572,6 +1712,7 @@ mod tests {
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &mock_burn_recovery(),
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1614,6 +1755,7 @@ mod tests {
             &cqrs,
             &alpaca,
             &mock_vault_service(),
+            &mock_burn_recovery(),
             PostAlpacaRecoveryInput {
                 aggregate_id: metadata.issuer_request_id.to_string(),
                 issuer_request_id: metadata.issuer_request_id.clone(),
@@ -1683,6 +1825,7 @@ mod tests {
             .manage(event_store.clone())
             .manage(alpaca)
             .manage(mock_vault_service())
+            .manage(mock_burn_recovery())
             .mount("/", rocket::routes![super::recover_redemption]);
 
         (rocket, cqrs, event_store)
@@ -1811,6 +1954,66 @@ mod tests {
         assert!(logs_contain_at!(Level::INFO, &["recovered", "Detected"]));
     }
 
+    fn post_alpaca_rocket(
+        cqrs: Arc<SqliteCqrs<Redemption>>,
+        event_store: TestEventStore,
+        alpaca: Arc<dyn AlpacaService>,
+        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
+    ) -> rocket::Rocket<rocket::Build> {
+        use crate::alpaca::service::AlpacaConfig;
+        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
+        use crate::config::{Config, LogLevel};
+        use crate::fireblocks::SignerConfig;
+        use alloy::primitives::B256;
+        use url::Url;
+
+        let config = Config {
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
+            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+            signer: SignerConfig::Local(B256::ZERO),
+            backfill_start_block: 0,
+            auth: test_auth_config().unwrap(),
+            log_level: LogLevel::Debug,
+            hyperdx: None,
+            alpaca: AlpacaConfig::test_default(),
+            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+        };
+
+        rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(cqrs)
+            .manage(event_store)
+            .manage(alpaca)
+            .manage(mock_vault_service())
+            .manage(burn_recovery)
+            .mount("/", rocket::routes![super::recover_redemption])
+    }
+
+    async fn dispatch_recover_redemption(
+        rocket: rocket::Rocket<rocket::Build>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+
+        let response = client
+            .post(format!("/admin/recover/redemption/{issuer_request_id}"))
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap();
+        (status, body)
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_resumes_to_burning() {
@@ -1829,61 +2032,103 @@ mod tests {
                 &alpaca_data,
             )),
         });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
 
-        let rocket = {
-            use crate::alpaca::service::AlpacaConfig;
-            use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-            use crate::config::{Config, LogLevel};
-            use crate::fireblocks::SignerConfig;
-            use alloy::primitives::B256;
-            use url::Url;
+        let rocket =
+            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
 
-            let config = Config {
-                database_url: "sqlite::memory:".to_string(),
-                database_max_connections: 5,
-                rpc_url: Url::parse("wss://localhost:8545").unwrap(),
-                chain_id: crate::test_utils::ANVIL_CHAIN_ID,
-                signer: SignerConfig::Local(B256::ZERO),
-                backfill_start_block: 0,
-                auth: test_auth_config().unwrap(),
-                log_level: LogLevel::Debug,
-                hyperdx: None,
-                alpaca: AlpacaConfig::test_default(),
-                subgraph_url: Url::parse("http://localhost:0/subgraph")
-                    .unwrap(),
-            };
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
 
-            rocket::build()
-                .manage(config)
-                .manage(FailedAuthRateLimiter::new().unwrap())
-                .manage(cqrs)
-                .manage(event_store)
-                .manage(alpaca)
-                .manage(mock_vault_service())
-                .mount("/", rocket::routes![super::recover_redemption])
-        };
-
-        let client =
-            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
-
-        let response = client
-            .post(format!(
-                "/admin/recover/redemption/{}",
-                metadata.issuer_request_id
-            ))
-            .header(rocket::http::Header::new(
-                "X-API-KEY",
-                "test-key-12345678901234567890123456",
-            ))
-            .remote("127.0.0.1:8000".parse().unwrap())
-            .dispatch()
-            .await;
-
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.unwrap();
-        assert!(body.contains("Burning"));
+        assert_eq!(status, Status::Ok);
+        assert!(body.contains("Recovered from Failed"));
+        assert!(body.contains("executed burn"));
+        assert_eq!(burn_recovery.calls(), 1);
         assert!(logs_contain_at!(Level::INFO, &["recovered", "Burning"]));
+        assert!(logs_contain_at!(Level::INFO, &["burn", "executed"]));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_post_alpaca_recovery_reports_skipped_burn() {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // The burn was skipped (e.g. insufficient on-chain balance), so the
+        // endpoint must NOT claim the burn executed.
+        let burn_recovery = Arc::new(MockBurnRecovery {
+            result: MockBurnResult::Succeeds(
+                super::RecoveryOutcome::SkippedManualIntervention,
+            ),
+            ..Default::default()
+        });
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket =
+            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(body.contains("manual intervention required"));
+        assert!(!body.contains("executed burn"));
+        assert_eq!(burn_recovery.calls(), 1);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["burn was skipped", "manual intervention required"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_post_alpaca_recovery_burn_failure_returns_502() {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        // The burn execution itself fails, which must surface as a 502 so the
+        // operator knows the recovery did not complete.
+        let burn_recovery = Arc::new(MockBurnRecovery {
+            result: MockBurnResult::Fails,
+            ..Default::default()
+        });
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket =
+            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::BadGateway);
+        assert_eq!(burn_recovery.calls(), 1);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["Failed to execute recovered redemption burn"]
+        ));
     }
 
     /// Stub VaultService that returns a pre-canned `FireblocksTxStatus` for a

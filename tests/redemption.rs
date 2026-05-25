@@ -458,7 +458,10 @@ async fn test_redemption_recovery_after_restart()
     let link_body = harness::setup_account(&client, user_wallet).await;
     let shares_minted =
         perform_mint_flow(&client, &evm, user_wallet, &link_body).await?;
-    mint_callback_mock.assert();
+    // The bot sends the mint callback asynchronously after the on-chain mint,
+    // so `wait_for_shares` (inside `perform_mint_flow`) can return before the
+    // callback lands. Poll for the hit instead of asserting synchronously.
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     // Setup user provider for transfer
     let user_wallet_instance = EthereumWallet::from(user_signer.clone());

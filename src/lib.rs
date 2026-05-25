@@ -387,6 +387,8 @@ pub async fn initialize_rocket(
         redemption_cqrs,
         redemption_event_store,
         alpaca_service,
+        burn_recovery: managers.burn.clone()
+            as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_service: vault_service_for_rocket,
     }))
 }
@@ -402,6 +404,7 @@ struct RocketState {
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
     alpaca_service: Arc<dyn AlpacaService>,
+    burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
     vault_service: Arc<dyn vault::VaultService>,
 }
 
@@ -426,6 +429,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.redemption_cqrs)
         .manage(state.redemption_event_store)
         .manage(state.alpaca_service)
+        .manage(state.burn_recovery)
         .manage(state.vault_service)
         .manage(state.pool)
         .mount(

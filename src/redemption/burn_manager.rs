@@ -20,6 +20,26 @@ use crate::tokenized_asset::view::{
 };
 use crate::vault::{MultiBurnEntry, VaultError, VaultService};
 
+/// Outcome of recovering a single redemption stuck in a burning state.
+///
+/// Recovery can legitimately finish without executing a burn — the redemption
+/// may have already advanced, or the bot's on-chain balance may be too low to
+/// burn safely. Callers must distinguish these no-ops from an actual burn so
+/// they don't report success while the redemption is still unresolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryOutcome {
+    /// A fresh burn was submitted on-chain for a `Burning` redemption.
+    Executed,
+    /// A previously submitted Fireblocks burn was confirmed and recorded.
+    ExistingBurnRecorded,
+    /// Burn skipped: the bot's on-chain balance is insufficient, so the burn
+    /// likely already landed but was never recorded. Needs manual review.
+    SkippedManualIntervention,
+    /// The redemption already advanced past `Burning`/`BurnSubmitted`; there
+    /// was nothing to burn.
+    AlreadyAdvanced,
+}
+
 /// Orchestrates the on-chain burning process in response to `AlpacaJournalCompleted` events.
 ///
 /// The manager reacts to `AlpacaJournalCompleted` events by querying for a suitable receipt,
@@ -139,6 +159,13 @@ where
                 );
             }
         }
+    }
+
+    pub(crate) async fn recover_burning_redemption(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Result<RecoveryOutcome, BurnManagerError> {
+        self.recover_single_burning(issuer_request_id).await
     }
 
     async fn recover_single_burn_failed(
@@ -363,7 +390,7 @@ where
     async fn recover_single_burning(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Result<(), BurnManagerError> {
+    ) -> Result<RecoveryOutcome, BurnManagerError> {
         let context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
@@ -401,7 +428,7 @@ where
                         info!(target: "redemption", issuer_request_id = %issuer_request_id,
                             "Burn confirmed successfully during recovery"
                         );
-                        Ok(())
+                        Ok(RecoveryOutcome::ExistingBurnRecorded)
                     }
                     Err(AggregateError::UserError(RedemptionError::Vault(
                         err,
@@ -477,21 +504,24 @@ where
                          Burn likely already succeeded but was not recorded. \
                          Skipping to avoid recording false failure."
                     );
-                    return Ok(());
+                    return Ok(RecoveryOutcome::SkippedManualIntervention);
                 }
 
                 debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "Recovering Burning redemption - resuming burn"
                 );
 
-                self.handle_burning_started(issuer_request_id, aggregate).await
+                self.handle_burning_started(issuer_request_id, aggregate)
+                    .await?;
+
+                Ok(RecoveryOutcome::Executed)
             }
 
             _ => {
                 debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                     "Redemption no longer in Burning or BurnSubmitted state, skipping"
                 );
-                Ok(())
+                Ok(RecoveryOutcome::AlreadyAdvanced)
             }
         }
     }
