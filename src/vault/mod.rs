@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::mint::{
     IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
-use crate::redemption::IssuerRedemptionRequestId;
+use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
 
 pub(crate) mod mock;
 pub(crate) mod rain_meta;
@@ -193,6 +193,10 @@ pub(crate) struct MultiBurnParams {
     /// Full transaction hash that triggered this redemption, used for
     /// constructing a collision-resistant Fireblocks `externalTxId`.
     pub(crate) detected_tx_hash: B256,
+    /// Optional deterministic `externalTxId` override for replacement burn
+    /// retries after a previously accepted Fireblocks transaction failed.
+    #[serde(default)]
+    pub(crate) external_tx_id: Option<BurnExternalTxId>,
 }
 
 /// Result of a single burn within a multi-receipt burn operation.

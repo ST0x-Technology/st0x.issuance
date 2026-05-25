@@ -750,6 +750,7 @@ mod tests {
                         owner: address!(
                             "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
                         ),
+                        external_tx_id: None,
                     },
                 )
                 .await
@@ -1920,6 +1921,7 @@ mod tests {
                 dust_quantity: dust_quantity.clone(),
                 called_at,
                 alpaca_journal_completed_at,
+                external_tx_id: None,
                 resumed_at: Utc::now(),
             },
             metadata: HashMap::default(),

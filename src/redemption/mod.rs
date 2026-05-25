@@ -107,6 +107,45 @@ impl<'de> Deserialize<'de> for IssuerRedemptionRequestId {
         s.parse().map_err(serde::de::Error::custom)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct BurnExternalTxId(String);
+
+impl BurnExternalTxId {
+    pub(crate) const fn from_string(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn base(detected_tx_hash: &B256) -> Self {
+        Self(format!("burn-{detected_tx_hash}"))
+    }
+
+    pub(crate) fn retry(detected_tx_hash: &B256, attempt: u32) -> Self {
+        Self(format!(
+            "{}{}{}",
+            Self::base(detected_tx_hash),
+            Redemption::BURN_RETRY_EXTERNAL_TX_MARKER,
+            attempt,
+        ))
+    }
+
+    pub(crate) fn retry_attempt(&self) -> Option<u32> {
+        self.0
+            .rsplit_once(Redemption::BURN_RETRY_EXTERNAL_TX_MARKER)
+            .and_then(|(_, attempt)| attempt.parse().ok())
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BurnExternalTxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
 use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
@@ -155,6 +194,8 @@ pub(crate) enum Redemption {
         dust_quantity: Quantity,
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
+        #[serde(default)]
+        external_tx_id: Option<BurnExternalTxId>,
     },
     /// Burn transaction submitted to signing backend, awaiting on-chain confirmation.
     BurnSubmitted {
@@ -164,7 +205,7 @@ pub(crate) enum Redemption {
         dust_quantity: Quantity,
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
-        external_tx_id: String,
+        external_tx_id: BurnExternalTxId,
         fireblocks_tx_id: String,
         planned_burns: Vec<event::BurnRecord>,
     },
@@ -194,6 +235,7 @@ struct BurnInput {
     burns: Vec<MultiBurnEntry>,
     dust_shares: U256,
     owner: Address,
+    external_tx_id: Option<BurnExternalTxId>,
 }
 
 struct DetectInput {
@@ -214,9 +256,39 @@ struct ResumeBurnInput {
     dust_quantity: Quantity,
     called_at: DateTime<Utc>,
     alpaca_journal_completed_at: DateTime<Utc>,
+    external_tx_id: Option<BurnExternalTxId>,
 }
 
 impl Redemption {
+    const BURN_RETRY_EXTERNAL_TX_MARKER: &'static str = "-retry-";
+
+    pub(crate) fn retry_burn_external_tx_id_typed(
+        detected_tx_hash: &B256,
+        attempt: u32,
+    ) -> BurnExternalTxId {
+        BurnExternalTxId::retry(detected_tx_hash, attempt)
+    }
+
+    pub(crate) fn retry_attempt_from_burn_external_tx_id(
+        external_tx_id: &BurnExternalTxId,
+    ) -> Option<u32> {
+        external_tx_id.retry_attempt()
+    }
+
+    pub(crate) fn next_burn_retry_external_tx_id(
+        detected_tx_hash: &B256,
+        latest_external_tx_id: &BurnExternalTxId,
+    ) -> Result<BurnExternalTxId, RedemptionError> {
+        let attempt =
+            Self::retry_attempt_from_burn_external_tx_id(latest_external_tx_id)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| RedemptionError::RetryAttemptOverflow {
+                    latest_external_tx_id: latest_external_tx_id.clone(),
+                })?;
+        Ok(Self::retry_burn_external_tx_id_typed(detected_tx_hash, attempt))
+    }
+
     pub(crate) const fn metadata(&self) -> Option<&RedemptionMetadata> {
         match self {
             Self::Detected { metadata }
@@ -379,12 +451,15 @@ impl Redemption {
                 user: user_wallet,
                 issuer_request_id: issuer_request_id.clone(),
                 detected_tx_hash: metadata.detected_tx_hash,
+                external_tx_id: input.external_tx_id,
             })
             .await?;
 
         Ok(vec![RedemptionEvent::BurnFireblocksSubmitted {
             issuer_request_id,
-            external_tx_id: submitted.external_tx_id,
+            external_tx_id: BurnExternalTxId::from_string(
+                submitted.external_tx_id,
+            ),
             fireblocks_tx_id: submitted.fireblocks_tx_id,
             planned_burns,
             submitted_at: Utc::now(),
@@ -530,6 +605,7 @@ impl Redemption {
             dust_quantity: input.dust_quantity,
             called_at: input.called_at,
             alpaca_journal_completed_at: input.alpaca_journal_completed_at,
+            external_tx_id: input.external_tx_id,
             resumed_at: Utc::now(),
         }])
     }
@@ -659,8 +735,31 @@ impl Redemption {
             dust_quantity: dust_quantity.clone(),
             called_at: *called_at,
             alpaca_journal_completed_at,
+            external_tx_id: None,
         };
     }
+}
+
+pub(crate) fn next_burn_retry_external_tx_id_from_history<'a>(
+    detected_tx_hash: &B256,
+    events: impl DoubleEndedIterator<Item = &'a RedemptionEvent>,
+) -> Result<Option<BurnExternalTxId>, RedemptionError> {
+    events
+        .rev()
+        .find_map(|event| match event {
+            RedemptionEvent::BurnResumed {
+                external_tx_id: Some(external_tx_id),
+                ..
+            } => Some(Ok(external_tx_id.clone())),
+            RedemptionEvent::BurnFireblocksSubmitted {
+                external_tx_id, ..
+            } => Some(Redemption::next_burn_retry_external_tx_id(
+                detected_tx_hash,
+                external_tx_id,
+            )),
+            _ => None,
+        })
+        .transpose()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -679,6 +778,10 @@ pub(crate) enum RedemptionError {
         "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
     )]
     FireblocksTxIdMismatch { expected: String, provided: String },
+    #[error(
+        "Burn retry attempt counter overflowed for external tx id: {latest_external_tx_id}"
+    )]
+    RetryAttemptOverflow { latest_external_tx_id: BurnExternalTxId },
 }
 
 impl PartialEq for RedemptionError {
@@ -701,6 +804,10 @@ impl PartialEq for RedemptionError {
                 Self::FireblocksTxIdMismatch { expected: e1, provided: p1 },
                 Self::FireblocksTxIdMismatch { expected: e2, provided: p2 },
             ) => e1 == e2 && p1 == p2,
+            (
+                Self::RetryAttemptOverflow { latest_external_tx_id: a },
+                Self::RetryAttemptOverflow { latest_external_tx_id: b },
+            ) => a == b,
             _ => false,
         }
     }
@@ -767,11 +874,18 @@ impl Aggregate for Redemption {
                 burns,
                 dust_shares,
                 owner,
+                external_tx_id,
             } => {
                 self.handle_burn_tokens(
                     services,
                     issuer_request_id,
-                    BurnInput { vault, burns, dust_shares, owner },
+                    BurnInput {
+                        vault,
+                        burns,
+                        dust_shares,
+                        owner,
+                        external_tx_id,
+                    },
                 )
                 .await
             }
@@ -827,6 +941,7 @@ impl Aggregate for Redemption {
                 dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
+                external_tx_id,
             } => self.handle_resume_burn(ResumeBurnInput {
                 issuer_request_id,
                 metadata,
@@ -835,6 +950,7 @@ impl Aggregate for Redemption {
                 dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
+                external_tx_id,
             }),
         }
     }
@@ -935,6 +1051,7 @@ impl Aggregate for Redemption {
                     dust_quantity,
                     called_at,
                     alpaca_journal_completed_at,
+                    external_tx_id: _,
                 } = self.clone()
                 else {
                     return;
@@ -966,6 +1083,7 @@ impl Aggregate for Redemption {
                 dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
+                external_tx_id,
                 ..
             } => {
                 *self = Self::Burning {
@@ -984,6 +1102,7 @@ impl Aggregate for Redemption {
                     dust_quantity,
                     called_at,
                     alpaca_journal_completed_at,
+                    external_tx_id,
                 };
             }
             RedemptionEvent::TokensBurned {
@@ -1031,8 +1150,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionError, RedemptionEvent, RedemptionMetadata,
+        BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, Redemption,
+        RedemptionCommand, RedemptionError, RedemptionEvent,
+        RedemptionMetadata, next_burn_retry_external_tx_id_from_history,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -1043,6 +1163,81 @@ mod tests {
 
     fn mock_services() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
+    }
+
+    #[test]
+    fn test_next_burn_retry_external_tx_id_advances_from_submission() {
+        let detected_tx_hash = b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        let events = [RedemptionEvent::BurnFireblocksSubmitted {
+            issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
+            external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
+            fireblocks_tx_id: "fb-1".to_string(),
+            planned_burns: vec![],
+            submitted_at: Utc::now(),
+        }];
+
+        let next = next_burn_retry_external_tx_id_from_history(
+            &detected_tx_hash,
+            events.iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            next,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &detected_tx_hash,
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn test_next_burn_retry_external_tx_id_reuses_unaccepted_retry() {
+        let detected_tx_hash = b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let retry_external_tx_id =
+            Redemption::retry_burn_external_tx_id_typed(&detected_tx_hash, 1);
+        let events = [
+            RedemptionEvent::BurnFireblocksSubmitted {
+                issuer_request_id: IssuerRedemptionRequestId::new(
+                    detected_tx_hash,
+                ),
+                external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
+                fireblocks_tx_id: "fb-1".to_string(),
+                planned_burns: vec![],
+                submitted_at: Utc::now(),
+            },
+            RedemptionEvent::BurnResumed {
+                issuer_request_id: IssuerRedemptionRequestId::new(
+                    detected_tx_hash,
+                ),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(1)),
+                tx_hash: detected_tx_hash,
+                block_number: 1,
+                detected_at: Utc::now(),
+                tokenization_request_id: TokenizationRequestId::new("tok-1"),
+                alpaca_quantity: Quantity::new(Decimal::from(1)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+                alpaca_journal_completed_at: Utc::now(),
+                external_tx_id: Some(retry_external_tx_id.clone()),
+                resumed_at: Utc::now(),
+            },
+        ];
+
+        let next = next_burn_retry_external_tx_id_from_history(
+            &detected_tx_hash,
+            events.iter(),
+        )
+        .unwrap();
+
+        assert_eq!(next, Some(retry_external_tx_id));
     }
 
     #[test]
@@ -1431,6 +1626,7 @@ mod tests {
                 dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
+                external_tx_id: None,
             }
         );
     }
@@ -1534,6 +1730,7 @@ mod tests {
                 }],
                 dust_shares: U256::ZERO,
                 owner,
+                external_tx_id: None,
             });
 
         let events = validator.inspect_result().unwrap();
@@ -1587,6 +1784,7 @@ mod tests {
                 }],
                 dust_shares: U256::ZERO,
                 owner: address!("0x1111111111111111111111111111111111111111"),
+                external_tx_id: None,
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Burning".to_string(),
@@ -2248,6 +2446,7 @@ mod tests {
             dust_quantity: Quantity::new(Decimal::ZERO),
             called_at: Utc::now(),
             alpaca_journal_completed_at: Utc::now(),
+            external_tx_id: None,
         }
     }
 
@@ -2417,6 +2616,7 @@ mod tests {
             dust_quantity: Quantity::new(Decimal::ZERO),
             called_at: Utc::now(),
             alpaca_journal_completed_at: journal_completed_at,
+            external_tx_id: None,
             resumed_at: Utc::now(),
         });
 

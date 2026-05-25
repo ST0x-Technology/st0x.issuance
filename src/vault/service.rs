@@ -13,6 +13,7 @@ use super::{
     SubmittedTx, VaultError, VaultService,
 };
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::redemption::BurnExternalTxId;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -310,8 +311,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
         let tx_hash_str = receipt.transaction_hash.to_string();
-        let issuer_id = params.issuer_request_id.to_string();
-
         let result = super::MultiBurnResult {
             tx_hash: receipt.transaction_hash,
             burns,
@@ -323,7 +322,12 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         self.cached_burns.lock().await.insert(tx_hash_str.clone(), result);
 
         Ok(SubmittedTx {
-            external_tx_id: format!("local-burn-{issuer_id}"),
+            external_tx_id: params
+                .external_tx_id
+                .unwrap_or_else(|| {
+                    BurnExternalTxId::base(&params.detected_tx_hash)
+                })
+                .into_string(),
             fireblocks_tx_id: tx_hash_str,
         })
     }
@@ -415,7 +419,7 @@ mod tests {
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::redemption::IssuerRedemptionRequestId;
+    use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
         MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
@@ -853,6 +857,7 @@ mod tests {
                 user,
                 issuer_request_id: test_issuer_redemption_id(),
                 detected_tx_hash,
+                external_tx_id: None,
             })
             .await;
 
@@ -871,6 +876,65 @@ mod tests {
         assert_eq!(multi_result.burns[0].shares_burned, U256::from(100));
         assert_eq!(multi_result.burns[1].receipt_id, U256::from(2));
         assert_eq!(multi_result.burns[1].shares_burned, U256::from(50));
+    }
+
+    #[tokio::test]
+    async fn test_submit_burn_propagates_external_tx_id_override() {
+        let vault_address = test_vault_address();
+        let owner = test_receiver();
+        let user = address!("0x3333333333333333333333333333333333333333");
+
+        let tx_hash = fixed_bytes!(
+            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+
+        let burns = vec![(U256::from(1), U256::from(100))];
+
+        let receipt = create_multi_withdraw_receipt(
+            vault_address,
+            tx_hash,
+            owner,
+            user,
+            burns.clone(),
+        );
+
+        let asserter = Asserter::new();
+        setup_asserter_for_transaction(&asserter, tx_hash, &receipt);
+
+        let service = create_service_with_asserter(asserter);
+
+        let detected_tx_hash = b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        );
+        let override_id = "burn-0xabab-retry-2".to_string();
+
+        let submitted = service
+            .submit_burn(MultiBurnParams {
+                vault: vault_address,
+                burns: burns
+                    .iter()
+                    .map(|(receipt_id, burn_shares)| MultiBurnEntry {
+                        receipt_id: *receipt_id,
+                        burn_shares: *burn_shares,
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    })
+                    .collect(),
+                dust_shares: U256::ZERO,
+                owner,
+                user,
+                issuer_request_id: test_issuer_redemption_id(),
+                detected_tx_hash,
+                external_tx_id: Some(BurnExternalTxId::from_string(
+                    override_id.clone(),
+                )),
+            })
+            .await
+            .expect("submit_burn should succeed");
+
+        // A caller-provided externalTxId (used for replacement burn retries)
+        // must propagate verbatim rather than be replaced by the local default.
+        assert_eq!(submitted.external_tx_id, override_id);
     }
 
     #[tokio::test]
@@ -906,6 +970,7 @@ mod tests {
                 detected_tx_hash: b256!(
                     "0xabababababababababababababababababababababababababababababababab"
                 ),
+                external_tx_id: None,
             })
             .await;
 

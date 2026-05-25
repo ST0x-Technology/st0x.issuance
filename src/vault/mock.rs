@@ -5,9 +5,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    FireblocksTxStatus, MintResult, MultiBurnParams, MultiBurnResult,
+    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
+    VaultService,
 };
+use crate::redemption::BurnExternalTxId;
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -62,6 +64,10 @@ pub(crate) struct MockVaultService {
     share_balance: Arc<Mutex<U256>>,
     #[cfg(test)]
     last_multi_burn_params: Arc<Mutex<Option<MultiBurnParams>>>,
+    /// Status returned by `check_fireblocks_tx`. `None` mirrors the trait
+    /// default (no Fireblocks state), exercising the non-Fireblocks path.
+    #[cfg(test)]
+    fireblocks_tx_status: Arc<Mutex<Option<FireblocksTxStatus>>>,
 }
 
 impl MockVaultService {
@@ -80,6 +86,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             #[cfg(test)]
             last_multi_burn_params: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fireblocks_tx_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -95,6 +103,7 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
+            fireblocks_tx_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -110,6 +119,7 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
+            fireblocks_tx_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -125,6 +135,7 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
+            fireblocks_tx_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -140,6 +151,7 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
+            fireblocks_tx_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -182,6 +194,15 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn with_share_balance(self, balance: U256) -> Self {
         *self.share_balance.lock().unwrap() = balance;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fireblocks_tx_status(
+        self,
+        status: FireblocksTxStatus,
+    ) -> Self {
+        *self.fireblocks_tx_status.lock().unwrap() = Some(status);
         self
     }
 }
@@ -322,6 +343,20 @@ impl VaultService for MockVaultService {
         }
     }
 
+    async fn check_fireblocks_tx(
+        &self,
+        _fireblocks_tx_id: &str,
+    ) -> Result<Option<FireblocksTxStatus>, VaultError> {
+        #[cfg(test)]
+        {
+            Ok(self.fireblocks_tx_status.lock().unwrap().clone())
+        }
+        #[cfg(not(test))]
+        {
+            Ok(None)
+        }
+    }
+
     async fn submit_burn(
         &self,
         params: MultiBurnParams,
@@ -366,7 +401,10 @@ impl VaultService for MockVaultService {
             });
 
         Ok(SubmittedTx {
-            external_tx_id: "mock-burn".to_string(),
+            external_tx_id: params.external_tx_id.map_or_else(
+                || "mock-burn".to_string(),
+                BurnExternalTxId::into_string,
+            ),
             fireblocks_tx_id: "mock-fb-burn".to_string(),
         })
     }
@@ -667,6 +705,7 @@ mod tests {
             user: address!("0x2222222222222222222222222222222222222222"),
             issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
             detected_tx_hash,
+            external_tx_id: None,
         }
     }
 

@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
-use super::IssuerRedemptionRequestId;
+use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::Quantity;
 use crate::mint::TokenizationRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
@@ -47,6 +47,11 @@ pub(crate) enum RedemptionCommand {
         /// Dust to return to user
         dust_shares: U256,
         owner: Address,
+        /// Optional deterministic Fireblocks `externalTxId` override.
+        /// Used when retrying a replacement burn after a prior accepted
+        /// Fireblocks burn terminally failed.
+        #[serde(default)]
+        external_tx_id: Option<BurnExternalTxId>,
     },
 
     /// Confirms a previously submitted burn transaction.
@@ -102,5 +107,10 @@ pub(crate) enum RedemptionCommand {
         called_at: chrono::DateTime<chrono::Utc>,
         /// Alpaca's `updated_at` for the completed journal.
         alpaca_journal_completed_at: chrono::DateTime<chrono::Utc>,
+        /// Optional deterministic Fireblocks `externalTxId` for the next burn
+        /// submission. Persisted through `BurnResumed` so a retry submission
+        /// that fails before Fireblocks accepts it can be retried idempotently.
+        #[serde(default)]
+        external_tx_id: Option<BurnExternalTxId>,
     },
 }

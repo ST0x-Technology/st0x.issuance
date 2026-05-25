@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use super::IssuerRedemptionRequestId;
+use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
@@ -105,7 +105,7 @@ pub(crate) enum RedemptionEvent {
     /// Persists the backend transaction ID so polling can resume after a restart.
     BurnFireblocksSubmitted {
         issuer_request_id: IssuerRedemptionRequestId,
-        external_tx_id: String,
+        external_tx_id: BurnExternalTxId,
         fireblocks_tx_id: String,
         /// Planned burns at the time of submission (for recovery use).
         planned_burns: Vec<BurnRecord>,
@@ -150,6 +150,10 @@ pub(crate) enum RedemptionEvent {
         /// Alpaca's `updated_at` for the completed journal — the closest
         /// approximation we have to the actual journal completion time.
         alpaca_journal_completed_at: DateTime<Utc>,
+        /// Optional deterministic Fireblocks `externalTxId` for the next burn
+        /// submission. Old events did not carry this field.
+        #[serde(default)]
+        external_tx_id: Option<BurnExternalTxId>,
         resumed_at: DateTime<Utc>,
     },
 }
@@ -382,5 +386,36 @@ mod tests {
         assert_eq!(dust_returned, U256::ZERO);
         assert_eq!(burns.len(), 1);
         assert_eq!(burns[0].receipt_id, uint!(0x42_U256));
+    }
+
+    /// Tests that old BurnResumed events without external_tx_id default to None.
+    #[test]
+    fn test_backwards_compat_burn_resumed_without_external_tx_id() {
+        let json = r#"{
+            "BurnResumed": {
+                "issuer_request_id": "red-abcdef12",
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "quantity": "1",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "block_number": 1,
+                "detected_at": "2025-01-01T00:00:00Z",
+                "tokenization_request_id": "tok-1",
+                "alpaca_quantity": "1",
+                "dust_quantity": "0",
+                "called_at": "2025-01-01T00:00:00Z",
+                "alpaca_journal_completed_at": "2025-01-01T00:00:00Z",
+                "resumed_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::BurnResumed { external_tx_id, .. } = event else {
+            panic!("Expected BurnResumed variant");
+        };
+
+        assert_eq!(external_tx_id, None);
     }
 }

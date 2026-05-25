@@ -21,6 +21,7 @@ use super::config::{
     FireblocksVaultAccountId,
 };
 use crate::bindings::OffchainAssetReceiptVault;
+use crate::redemption::BurnExternalTxId;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
@@ -584,12 +585,20 @@ fn is_duplicate_external_tx_id_error(
     {
         // HTTP 409 Conflict is the canonical duplicate response.
         // HTTP 400 with "externalTxId" in the body is also observed.
-        // For both, verify the body mentions the externalTxId keyword
-        // to avoid false positives from unrelated 409/400 errors.
+        // Require BOTH an externalTxId mention AND explicit duplicate
+        // semantics: an unrelated 409/400 that merely references the field
+        // (e.g. a validation error) must not be misrouted into the
+        // externalTxId recovery lookup, which would mask the real error.
         if status.as_u16() == 409 || status.as_u16() == 400 {
             let lower = content.to_lowercase();
-            return lower.contains("externaltxid")
-                || lower.contains("external_tx_id");
+            let mentions_external_id = lower.contains("externaltxid")
+                || lower.contains("external_tx_id")
+                || lower.contains("external tx id");
+            let indicates_duplicate = lower.contains("already exists")
+                || lower.contains("duplicate")
+                || lower.contains(r#""code":1438"#);
+
+            return mentions_external_id && indicates_duplicate;
         }
     }
 
@@ -793,19 +802,25 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         // DEPLOYMENT NOTE: This format changed from `burn-red-{4_bytes}` to
         // `burn-0x{full_tx_hash}`. Drain all in-flight burn transactions
         // before deploying this change to avoid externalTxId mismatches.
-        let external_tx_id =
-            VaultOperation::Burn.external_tx_id(&params.detected_tx_hash);
+        let external_tx_id = params.external_tx_id.unwrap_or_else(|| {
+            BurnExternalTxId::from_string(
+                VaultOperation::Burn.external_tx_id(&params.detected_tx_hash),
+            )
+        });
 
         let fireblocks_tx_id = self
             .submit_contract_call(
                 params.vault,
                 &multicall_calldata,
                 &note,
-                &external_tx_id,
+                &external_tx_id.to_string(),
             )
             .await?;
 
-        Ok(SubmittedTx { external_tx_id, fireblocks_tx_id })
+        Ok(SubmittedTx {
+            external_tx_id: external_tx_id.into_string(),
+            fireblocks_tx_id,
+        })
     }
 
     async fn confirm_burn(
@@ -1402,11 +1417,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_detection_http_400_with_external_tx_id_words() {
+        let err = make_response_error(
+            400,
+            r#"{"message":"The external tx id that was provided in the request, already exists","code":1438}"#,
+        );
+        assert!(
+            is_duplicate_external_tx_id_error(&err),
+            "HTTP 400 with 'external tx id' words should be detected as duplicate"
+        );
+    }
+
+    #[test]
     fn duplicate_detection_http_400_without_keyword() {
         let err = make_response_error(400, r#"{"message": "Invalid amount"}"#);
         assert!(
             !is_duplicate_external_tx_id_error(&err),
             "HTTP 400 without keyword should not be detected as duplicate"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_http_400_external_tx_id_without_duplicate_semantics()
+    {
+        let err = make_response_error(
+            400,
+            r#"{"message": "externalTxId exceeds the maximum allowed length"}"#,
+        );
+        assert!(
+            !is_duplicate_external_tx_id_error(&err),
+            "HTTP 400 that mentions externalTxId but does not indicate a \
+             duplicate must not be misrouted into the recovery lookup"
         );
     }
 

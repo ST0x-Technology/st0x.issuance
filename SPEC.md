@@ -331,14 +331,18 @@ on-chain transfer through calling Alpaca to burning tokens.
   and timestamp for audit trail. The existing recovery logic then picks it up
   naturally from `Detected` state.
 - `ResumeBurn { issuer_request_id, metadata, tokenization_request_id,
-  alpaca_quantity, dust_quantity, called_at }` -
+  alpaca_quantity, dust_quantity, called_at, alpaca_journal_completed_at,
+  external_tx_id }` -
   Resume a failed redemption directly to `Burning` state, bypassing the Alpaca
   call step. Only valid from `Failed` state. Used for post-Alpaca failures where
   Alpaca has already completed the journal. The API layer polls Alpaca to verify
   journal completion before issuing this command — refuses if Pending or
-  Rejected. Emits `BurnResumed` event. The admin recovery path immediately
-  invokes burn recovery in-process so the on-chain burn does not wait for a
-  service restart.
+  Rejected. If the failed redemption already has a terminal failed Fireblocks
+  burn, `external_tx_id` is set to the next deterministic retry id:
+  `burn-{detected_tx_hash}-retry-{n}`. If a retry submission fails before
+  Fireblocks accepts it, recovery reuses the same retry id. Emits `BurnResumed`
+  event. The admin recovery path immediately invokes burn recovery in-process so
+  the on-chain burn does not wait for a service restart.
 
 **Events:**
 
@@ -367,8 +371,9 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `BurnResumed` - Redemption resumed directly to `Burning` state from `Failed`.
   Carries the original `RedemptionMetadata`, `tokenization_request_id`,
   `alpaca_quantity`, `dust_quantity`, `called_at` (from the original
-  `AlpacaCalled` event), and `resumed_at` timestamp. Used for post-Alpaca
-  recovery where the journal already completed.
+  `AlpacaCalled` event), `alpaca_journal_completed_at`, optional retry
+  `external_tx_id`, and `resumed_at` timestamp. Used for post-Alpaca recovery
+  where the journal already completed.
 
 **Command -> Event Mappings:**
 

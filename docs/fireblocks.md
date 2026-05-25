@@ -10,10 +10,12 @@ is rejected with HTTP 400.
 Source:
 [Fireblocks API Idempotency](https://developers.fireblocks.com/reference/api-idempotency)
 
-Our normal `externalTxId` format: `mint-{issuer_request_id}` or
-`burn-{issuer_request_id}`. Mint retries after a terminal Fireblocks failure use
-fresh deterministic IDs: `mint-{issuer_request_id}-retry-1`,
-`mint-{issuer_request_id}-retry-2`, etc.
+Our normal `externalTxId` format: `mint-{issuer_request_id}` for mints and
+`burn-{detected_tx_hash}` for redemption burns. Mint retries after a terminal
+Fireblocks failure use fresh deterministic IDs:
+`mint-{issuer_request_id}-retry-1`, `mint-{issuer_request_id}-retry-2`, etc.
+Burn retries use the same pattern on the detected transfer hash:
+`burn-{detected_tx_hash}-retry-1`, `burn-{detected_tx_hash}-retry-2`, etc.
 
 **Implication for recovery:** If a mint/burn transaction was submitted to
 Fireblocks but we lost track of it (e.g., process restart before polling
@@ -26,6 +28,12 @@ as terminally failed, the bot may submit a fresh mint transaction with the next
 retry `externalTxId`. Automatic retry attempts are capped at four and delayed by
 1m, 10m, 30m, and 1h. Manual admin reprocess bypasses that cap for operator-run
 retries after the underlying issue has been fixed.
+
+**Terminal burn failures:** Once Fireblocks reports a submitted burn transaction
+as terminally failed, redemption recovery may submit a replacement burn with the
+next retry `externalTxId`. If a retry submission fails before Fireblocks accepts
+it, the same retry `externalTxId` is reused on the next recovery attempt so the
+replacement submission remains idempotent.
 
 ## SDK Error Handling
 

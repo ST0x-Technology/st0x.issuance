@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -8,7 +8,8 @@ use super::view::{
     RedemptionView, RedemptionViewError, find_burn_failed, find_burning,
 };
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+    BurnExternalTxId, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+    RedemptionError, next_burn_retry_external_tx_id_from_history,
 };
 use crate::fireblocks::{FireblocksVaultError, vault_service};
 use crate::mint::QuantityConversionError;
@@ -20,7 +21,9 @@ use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
-use crate::vault::{MultiBurnEntry, VaultError, VaultService};
+use crate::vault::{
+    FireblocksTxStatus, MultiBurnEntry, VaultError, VaultService,
+};
 
 /// Outcome of recovering a single redemption stuck in a burning state.
 ///
@@ -303,19 +306,57 @@ where
                 underlying: underlying.clone(),
             })?;
 
-        // If a Fireblocks tx was already submitted before failure, try to
-        // confirm it instead of resubmitting. This prevents double-burns
-        // when the failure was a transient confirmation error.
-        if let Some(fb_tx_id) = fireblocks_tx_id {
-            return self
-                .recover_burn_failed_with_existing_tx(
-                    issuer_request_id,
-                    vault,
-                    fb_tx_id,
-                    dust_quantity,
-                )
-                .await;
-        }
+        // If a Fireblocks tx was already submitted before failure, inspect it
+        // before deciding whether to confirm, wait, or submit a replacement.
+        let retry_external_tx_id = if let Some(fb_tx_id) = fireblocks_tx_id {
+            match self.vault_service.check_fireblocks_tx(fb_tx_id).await? {
+                // Completed: the tx landed on-chain. None: non-Fireblocks
+                // backend with no status to inspect. Both confirm/record the
+                // existing tx rather than resubmit.
+                Some(FireblocksTxStatus::Completed { .. }) | None => {
+                    return self
+                        .recover_burn_failed_with_existing_tx(
+                            issuer_request_id,
+                            vault,
+                            fb_tx_id,
+                            dust_quantity,
+                        )
+                        .await;
+                }
+                Some(FireblocksTxStatus::Pending) => {
+                    info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        fireblocks_tx_id = %fb_tx_id,
+                        "BurnFailed recovery found pending Fireblocks transaction; leaving for a later recovery pass"
+                    );
+                    return Ok(());
+                }
+                Some(FireblocksTxStatus::Failed { .. }) => {
+                    let retry_external_tx_id = Some(
+                        self.next_burn_retry_external_tx_id(
+                            issuer_request_id,
+                            tx_hash,
+                        )
+                        .await?
+                        .unwrap_or_else(|| {
+                            Redemption::retry_burn_external_tx_id_typed(
+                                tx_hash, 1,
+                            )
+                        }),
+                    );
+
+                    info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        fireblocks_tx_id = %fb_tx_id,
+                        retry_external_tx_id = ?retry_external_tx_id,
+                        "BurnFailed recovery found terminal failed Fireblocks transaction; submitting replacement burn"
+                    );
+
+                    retry_external_tx_id
+                }
+            }
+        } else {
+            self.next_burn_retry_external_tx_id(issuer_request_id, tx_hash)
+                .await?
+        };
 
         let burn_shares = alpaca_quantity.to_u256_with_18_decimals()?;
         let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
@@ -363,7 +404,7 @@ where
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_shares = %burn_shares,
             dust_shares = %dust_shares,
-            "Retrying burn for BurnFailed redemption (no prior submission)"
+            "Retrying burn for BurnFailed redemption"
         );
 
         // Step 1: Resume the burn (Failed → Burning) so the standard
@@ -390,6 +431,7 @@ where
                     dust_quantity: dust_quantity.clone(),
                     called_at: *called_at,
                     alpaca_journal_completed_at: *alpaca_journal_completed_at,
+                    external_tx_id: retry_external_tx_id,
                 },
             )
             .await?;
@@ -602,6 +644,7 @@ where
                 metadata,
                 alpaca_quantity,
                 dust_quantity,
+                external_tx_id,
                 ..
             } => {
                 let vault = find_vault_by_underlying(
@@ -654,6 +697,7 @@ where
                 }
 
                 debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    external_tx_id = ?external_tx_id,
                     "Recovering Burning redemption - resuming burn"
                 );
 
@@ -709,6 +753,7 @@ where
             metadata,
             alpaca_quantity,
             dust_quantity,
+            external_tx_id,
             ..
         } = aggregate
         else {
@@ -778,8 +823,27 @@ where
             )
             .await?;
 
-        self.execute_burn_and_record_result(issuer_request_id, vault, plan)
-            .await
+        self.execute_burn_and_record_result(
+            issuer_request_id,
+            vault,
+            plan,
+            external_tx_id.clone(),
+        )
+        .await
+    }
+
+    async fn next_burn_retry_external_tx_id(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        detected_tx_hash: &B256,
+    ) -> Result<Option<BurnExternalTxId>, BurnManagerError> {
+        let events =
+            self.store.load_events(&issuer_request_id.to_string()).await?;
+
+        Ok(next_burn_retry_external_tx_id_from_history(
+            detected_tx_hash,
+            events.iter().map(|event| &event.payload),
+        )?)
     }
 
     async fn plan_burn(
@@ -868,6 +932,7 @@ where
         issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
         plan: BurnPlan,
+        external_tx_id: Option<BurnExternalTxId>,
     ) -> Result<(), BurnManagerError> {
         let burns: Vec<MultiBurnEntry> = plan
             .allocations
@@ -936,6 +1001,7 @@ where
                     burns,
                     dust_shares,
                     owner: self.bot_wallet,
+                    external_tx_id,
                 },
             )
             .await;
@@ -1197,6 +1263,8 @@ pub(crate) enum BurnManagerError {
     Sqlx(#[from] sqlx::Error),
     #[error("CQRS error: {0}")]
     Cqrs(#[from] AggregateError<RedemptionError>),
+    #[error("Redemption error: {0}")]
+    Redemption(#[from] RedemptionError),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]
@@ -1234,6 +1302,8 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
+    use crate::redemption::BurnExternalTxId;
+
     use super::{
         BurnManager, BurnManagerError, Redemption, RedemptionCommand,
         should_release_reserved_burn,
@@ -1253,7 +1323,10 @@ mod tests {
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{ReceiptInformation, VaultError, VaultService};
+    use crate::vault::{
+        FireblocksTxStatus, MultiBurnEntry, ReceiptInformation, VaultError,
+        VaultService,
+    };
 
     const TEST_WALLET: Address =
         address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
@@ -1586,6 +1659,111 @@ mod tests {
                 .is_empty(),
             "successful burn must leave no dangling reservation"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_handle_burning_started_passes_retry_external_tx_id() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let retry_external_tx_id =
+            BurnExternalTxId::from_string("burn-0xabc-retry-1".to_string());
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(42_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        // Thread the retry externalTxId through a real persisted BurnResumed
+        // event (Failed → Burning) so we verify the full apply path, not an
+        // in-memory mutation.
+        let burning = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let Redemption::Burning {
+            metadata,
+            tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
+            called_at,
+            alpaca_journal_completed_at,
+            ..
+        } = burning
+        else {
+            panic!("Expected Burning state, got {burning:?}");
+        };
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "burn failed".to_string(),
+                fireblocks_tx_id: None,
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("RecordBurnFailure failed");
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::ResumeBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id: Some(retry_external_tx_id.clone()),
+            },
+        )
+        .await
+        .expect("ResumeBurn failed");
+
+        let aggregate = load_aggregate(store, &issuer_request_id).await;
+
+        let result = manager
+            .handle_burning_started(&issuer_request_id, &aggregate)
+            .await;
+
+        assert!(result.is_ok(), "Expected success, got error: {result:?}");
+
+        let params = vault_mock
+            .get_last_multi_burn_params()
+            .expect("Expected multi_burn to have been called");
+
+        assert_eq!(params.external_tx_id, Some(retry_external_tx_id));
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Starting on-chain burning process"]
+        ));
     }
 
     #[tokio::test]
@@ -2685,6 +2863,374 @@ mod tests {
         );
     }
 
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_burn_failed_retries_with_fresh_id_on_terminal_fireblocks_failure()
+     {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_fireblocks_tx_status(
+                FireblocksTxStatus::Failed {
+                    detail: "FAILED".to_string(),
+                    sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
+                    network_tx_hashes: vec![],
+                },
+            ),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let burning = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let Redemption::Burning { metadata, .. } = &burning else {
+            panic!("Expected Burning state, got {burning:?}");
+        };
+        let detected_tx_hash = metadata.detected_tx_hash;
+
+        // Fail with a recorded Fireblocks tx ID so recovery inspects it.
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Terminal Fireblocks failure".to_string(),
+                fireblocks_tx_id: Some("fb-failed-123".to_string()),
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        // The terminal Fireblocks failure must trigger a replacement burn.
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            1,
+            "Should submit a replacement burn on terminal Fireblocks failure"
+        );
+
+        // The replacement burn must carry a fresh deterministic retry id, since
+        // Fireblocks rejects reusing the original externalTxId.
+        let params = vault_mock
+            .get_last_multi_burn_params()
+            .expect("Expected replacement burn to have been submitted");
+
+        assert_eq!(
+            params.external_tx_id,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &detected_tx_hash,
+                1
+            )),
+            "Replacement burn must use retry-1 externalTxId"
+        );
+
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated_aggregate, Redemption::Completed { .. }),
+            "Expected Completed state after recovery, got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["terminal failed Fireblocks transaction", "replacement burn"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_recover_burn_failed_escalates_retry_id_from_prior_submission()
+    {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_fireblocks_tx_status(
+                FireblocksTxStatus::Failed {
+                    detail: "FAILED".to_string(),
+                    sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
+                    network_tx_hashes: vec![],
+                },
+            ),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let burning = create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let Redemption::Burning { metadata, .. } = &burning else {
+            panic!("Expected Burning state, got {burning:?}");
+        };
+        let detected_tx_hash = metadata.detected_tx_hash;
+        let prior_retry_id =
+            Redemption::retry_burn_external_tx_id_typed(&detected_tx_hash, 1);
+
+        // Seed a prior replacement burn submission (retry-1) into history so
+        // recovery must derive the next id by scanning history, not via the
+        // no-prior-submission fallback (which would yield retry-1).
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::BurnTokens {
+                issuer_request_id: issuer_request_id.clone(),
+                vault,
+                burns: vec![MultiBurnEntry {
+                    receipt_id: uint!(99_U256),
+                    burn_shares: uint!(100_000000000000000000_U256),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
+                dust_shares: uint!(0_U256),
+                owner: TEST_WALLET,
+                external_tx_id: Some(prior_retry_id),
+            },
+        )
+        .await
+        .expect("Failed to seed prior burn submission");
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Replacement burn terminally failed".to_string(),
+                fireblocks_tx_id: Some("mock-fb-burn".to_string()),
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        // The next replacement burn must escalate to retry-2, proving the id is
+        // derived from the recorded submission rather than the retry-1 fallback.
+        let params = vault_mock
+            .get_last_multi_burn_params()
+            .expect("Expected replacement burn to have been submitted");
+
+        assert_eq!(
+            params.external_tx_id,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &detected_tx_hash,
+                2
+            )),
+            "Replacement burn must escalate to retry-2 from the prior retry-1 submission"
+        );
+
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated_aggregate, Redemption::Completed { .. }),
+            "Expected Completed state after recovery, got {updated_aggregate:?}"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_burn_failed_leaves_pending_fireblocks_tx_untouched() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_fireblocks_tx_status(FireblocksTxStatus::Pending),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Recorded failure while tx still pending".to_string(),
+                fireblocks_tx_id: Some("fb-pending-123".to_string()),
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        // A pending Fireblocks tx might still land on-chain, so recovery must
+        // not submit a replacement burn (would risk a double burn).
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            0,
+            "Should not submit a burn while the Fireblocks tx is pending"
+        );
+
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated_aggregate, Redemption::Failed { .. }),
+            "Expected Failed state to be left unchanged, got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["pending Fireblocks transaction", "later recovery pass"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_burn_failed_records_existing_burn_on_completed_tx() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success().with_fireblocks_tx_status(
+                FireblocksTxStatus::Completed {
+                    tx_hash: b256!(
+                        "0x4545454545454545454545454545454545454545454545454545454545454545"
+                    ),
+                    block_number: 5000,
+                },
+            ),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        harness
+            .discover_receipt(
+                vault,
+                uint!(99_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        cqrs.execute(
+            &issuer_request_id.to_string(),
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "Recorded failure though tx actually completed"
+                    .to_string(),
+                fireblocks_tx_id: Some("fb-completed-123".to_string()),
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("Failed to record burn failure");
+
+        manager.recover_burn_failed_redemptions().await;
+
+        // A completed Fireblocks tx must be recorded, never resubmitted.
+        assert_eq!(
+            vault_mock.get_multi_burn_call_count(),
+            0,
+            "Should not submit a replacement burn when the prior tx completed"
+        );
+
+        let updated_aggregate = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated_aggregate, Redemption::Completed { .. }),
+            "Expected Completed state after recording existing burn, got {updated_aggregate:?}"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["confirming previously submitted Fireblocks transaction"]
+        ));
+    }
+
     #[tokio::test]
     async fn test_recover_burn_failed_skips_when_balance_insufficient() {
         let harness = setup_test_environment().await;
@@ -2893,6 +3439,7 @@ mod tests {
                 }],
                 dust_shares: U256::ZERO,
                 owner: TEST_WALLET,
+                external_tx_id: None,
             },
         )
         .await

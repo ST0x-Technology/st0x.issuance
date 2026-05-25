@@ -23,8 +23,9 @@ use crate::redemption::burn_manager::{
     BurnManager, BurnManagerError, RecoveryOutcome,
 };
 use crate::redemption::{
-    BurnRecord, IssuerRedemptionRequestId, RedemptionCommand, RedemptionError,
-    RedemptionEvent, RedemptionMetadata, RedemptionView, find_stuck,
+    BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, RedemptionCommand,
+    RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
+    find_stuck, next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{FireblocksTxStatus, VaultService};
@@ -125,6 +126,9 @@ struct ReprocessContext {
     alpaca_called: Option<AlpacaCalledData>,
     /// Data from the most recent BurningFailed event, if one exists.
     burning_failed: Option<BurningFailedData>,
+    /// Replacement Fireblocks externalTxId for a retry burn, when event
+    /// history shows a prior accepted burn or an unaccepted retry attempt.
+    burn_retry_external_tx_id: Option<BurnExternalTxId>,
 }
 
 /// Loads all events for a redemption and extracts:
@@ -215,7 +219,25 @@ async fn load_reprocess_context(
         return Err(Status::InternalServerError);
     };
 
-    Ok(ReprocessContext { metadata, alpaca_called, burning_failed })
+    let burn_retry_external_tx_id =
+        next_burn_retry_external_tx_id_from_history(
+            &metadata.detected_tx_hash,
+            events.iter().map(|event| &event.payload),
+        )
+        .map_err(|error| {
+            error!(target: "admin", aggregate_id = aggregate_id,
+                %error,
+                "Failed to compute next burn retry external tx id"
+            );
+            Status::InternalServerError
+        })?;
+
+    Ok(ReprocessContext {
+        metadata,
+        alpaca_called,
+        burning_failed,
+        burn_retry_external_tx_id,
+    })
 }
 
 /// Unified recovery endpoint for stuck redemptions.
@@ -271,6 +293,7 @@ pub(crate) async fn recover_redemption(
             metadata: context.metadata,
             alpaca_data,
             burning_failed: context.burning_failed,
+            burn_retry_external_tx_id: context.burn_retry_external_tx_id,
         },
     )
     .await
@@ -319,6 +342,7 @@ struct PostAlpacaRecoveryInput {
     metadata: RedemptionMetadata,
     alpaca_data: AlpacaCalledData,
     burning_failed: Option<BurningFailedData>,
+    burn_retry_external_tx_id: Option<BurnExternalTxId>,
 }
 
 async fn recover_post_alpaca(
@@ -334,6 +358,7 @@ async fn recover_post_alpaca(
         metadata,
         alpaca_data,
         burning_failed,
+        burn_retry_external_tx_id,
     } = input;
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
@@ -402,93 +427,24 @@ async fn recover_post_alpaca(
         }
     }
 
-    // If we have a Fireblocks tx ID from a previous BurningFailed event,
-    // check whether the burn actually succeeded on-chain.
-    if let Some(ref bf_data) = burning_failed
-        && let Some(ref fb_tx_id) = bf_data.fireblocks_tx_id
+    // If a Fireblocks tx ID was recorded on a previous BurningFailed event,
+    // inspect it before deciding whether to record the existing burn or resume.
+    let burn_retry_external_tx_id = match inspect_prior_fireblocks_burn(
+        cqrs,
+        vault_service,
+        &aggregate_id,
+        &issuer_request_id,
+        &metadata.detected_tx_hash,
+        burning_failed.as_ref(),
+        burn_retry_external_tx_id,
+    )
+    .await?
     {
-        match vault_service.check_fireblocks_tx(fb_tx_id).await {
-            Ok(Some(FireblocksTxStatus::Completed {
-                tx_hash,
-                block_number,
-            })) => {
-                if bf_data.planned_burns.is_empty() {
-                    warn!(target: "admin", aggregate_id = %aggregate_id,
-                        fireblocks_tx_id = %fb_tx_id,
-                        tx_hash = ?tx_hash,
-                        "Pre-enrichment BurningFailed event has no planned_burns — \
-                         burn records will be empty. Manual receipt inventory \
-                         reconciliation may be needed after recovery."
-                    );
-                }
-
-                info!(target: "admin", aggregate_id = %aggregate_id,
-                    fireblocks_tx_id = %fb_tx_id,
-                    tx_hash = ?tx_hash,
-                    "Fireblocks tx already completed on-chain, recording existing burn"
-                );
-
-                cqrs.execute(
-                    &aggregate_id,
-                    RedemptionCommand::RecordExistingBurn {
-                        issuer_request_id: issuer_request_id.clone(),
-                        fireblocks_tx_id: fb_tx_id.clone(),
-                        tx_hash,
-                        planned_burns: bf_data.planned_burns.clone(),
-                        block_number,
-                    },
-                )
-                .await
-                .map_err(|err| {
-                    error!(target: "admin", aggregate_id = %aggregate_id,
-                        error = %err,
-                        "Failed to record existing burn"
-                    );
-                    map_redemption_error(&err)
-                })?;
-
-                return Ok(Json(ReprocessResponse {
-                    aggregate_type: AggregateKind::Redemption,
-                    aggregate_id: aggregate_id.clone(),
-                    previous_state: "Failed".to_string(),
-                    message:
-                        "Existing on-chain burn recorded via Fireblocks tx lookup"
-                            .to_string(),
-                }));
-            }
-            Ok(Some(FireblocksTxStatus::Pending)) => {
-                info!(target: "admin", aggregate_id = %aggregate_id,
-                    fireblocks_tx_id = %fb_tx_id,
-                    "Fireblocks tx still pending, cannot recover yet"
-                );
-                return Err(Status::UnprocessableEntity);
-            }
-            Ok(Some(FireblocksTxStatus::Failed {
-                detail: fb_detail,
-                sub_status: fb_sub_status,
-                network_tx_hashes: _,
-            })) => {
-                info!(target: "admin", aggregate_id = %aggregate_id,
-                    fireblocks_tx_id = %fb_tx_id,
-                    fireblocks_status = %fb_detail,
-                    fireblocks_sub_status = ?fb_sub_status,
-                    "Fireblocks tx failed, proceeding with ResumeBurn"
-                );
-                // Fall through to ResumeBurn below
-            }
-            Ok(None) => {
-                // Non-Fireblocks backend, fall through to ResumeBurn
-            }
-            Err(err) => {
-                error!(target: "admin", aggregate_id = %aggregate_id,
-                    fireblocks_tx_id = %fb_tx_id,
-                    error = %err,
-                    "Failed to check Fireblocks tx status"
-                );
-                return Err(Status::BadGateway);
-            }
+        PriorBurnDisposition::AlreadyRecorded(response) => {
+            return Ok(Json(response));
         }
-    }
+        PriorBurnDisposition::ResumeWith(external_tx_id) => external_tx_id,
+    };
 
     let Some(alpaca_journal_completed_at) = alpaca_updated_at else {
         error!(target: "admin", aggregate_id = %aggregate_id,
@@ -508,6 +464,7 @@ async fn recover_post_alpaca(
             dust_quantity: alpaca_data.dust_quantity,
             called_at: alpaca_data.called_at,
             alpaca_journal_completed_at,
+            external_tx_id: burn_retry_external_tx_id,
         },
     )
     .await
@@ -542,6 +499,132 @@ async fn recover_post_alpaca(
         previous_state: "Failed".to_string(),
         message: message.to_string(),
     }))
+}
+
+/// Outcome of inspecting a prior Fireblocks burn on a failed redemption.
+enum PriorBurnDisposition {
+    /// The prior burn already completed on-chain and was recorded; the caller
+    /// should return this response directly.
+    AlreadyRecorded(ReprocessResponse),
+    /// No conclusive prior burn — resume with this (possibly fallback) retry
+    /// `externalTxId`.
+    ResumeWith(Option<BurnExternalTxId>),
+}
+
+/// Inspects the Fireblocks tx (if any) from a previous `BurningFailed` event to
+/// decide whether the on-chain burn already succeeded (record it), is still
+/// pending (cannot recover yet), or terminally failed (resume with a fresh
+/// replacement `externalTxId`).
+async fn inspect_prior_fireblocks_burn(
+    cqrs: &RedemptionCqrs,
+    vault_service: &Arc<dyn VaultService>,
+    aggregate_id: &str,
+    issuer_request_id: &IssuerRedemptionRequestId,
+    detected_tx_hash: &B256,
+    burning_failed: Option<&BurningFailedData>,
+    burn_retry_external_tx_id: Option<BurnExternalTxId>,
+) -> Result<PriorBurnDisposition, Status> {
+    let Some(bf_data) = burning_failed else {
+        return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
+    };
+    let Some(fb_tx_id) = bf_data.fireblocks_tx_id.as_ref() else {
+        return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
+    };
+
+    match vault_service.check_fireblocks_tx(fb_tx_id).await {
+        Ok(Some(FireblocksTxStatus::Completed { tx_hash, block_number })) => {
+            if bf_data.planned_burns.is_empty() {
+                warn!(target: "admin", aggregate_id = %aggregate_id,
+                    fireblocks_tx_id = %fb_tx_id,
+                    tx_hash = ?tx_hash,
+                    "Pre-enrichment BurningFailed event has no planned_burns — \
+                     burn records will be empty. Manual receipt inventory \
+                     reconciliation may be needed after recovery."
+                );
+            }
+
+            info!(target: "admin", aggregate_id = %aggregate_id,
+                fireblocks_tx_id = %fb_tx_id,
+                tx_hash = ?tx_hash,
+                "Fireblocks tx already completed on-chain, recording existing burn"
+            );
+
+            cqrs.execute(
+                aggregate_id,
+                RedemptionCommand::RecordExistingBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    fireblocks_tx_id: fb_tx_id.clone(),
+                    tx_hash,
+                    planned_burns: bf_data.planned_burns.clone(),
+                    block_number,
+                },
+            )
+            .await
+            .map_err(|err| {
+                error!(target: "admin", aggregate_id = %aggregate_id,
+                    error = %err,
+                    "Failed to record existing burn"
+                );
+                map_redemption_error(&err)
+            })?;
+
+            Ok(PriorBurnDisposition::AlreadyRecorded(ReprocessResponse {
+                aggregate_type: AggregateKind::Redemption,
+                aggregate_id: aggregate_id.to_string(),
+                previous_state: "Failed".to_string(),
+                message:
+                    "Existing on-chain burn recorded via Fireblocks tx lookup"
+                        .to_string(),
+            }))
+        }
+        Ok(Some(FireblocksTxStatus::Pending)) => {
+            info!(target: "admin", aggregate_id = %aggregate_id,
+                fireblocks_tx_id = %fb_tx_id,
+                "Fireblocks tx still pending, cannot recover yet"
+            );
+            Err(Status::UnprocessableEntity)
+        }
+        Ok(Some(FireblocksTxStatus::Failed {
+            detail: fb_detail,
+            sub_status: fb_sub_status,
+            network_tx_hashes: _,
+        })) => {
+            // The terminally failed Fireblocks tx permanently reserves its
+            // externalTxId, so the replacement burn must never reuse the base
+            // id. When event history has no recorded retry id (e.g.
+            // pre-enrichment BurningFailed events without a
+            // BurnFireblocksSubmitted event), fall back to retry-1 — mirror of
+            // the startup recovery path in BurnManager.
+            let retry_external_tx_id =
+                burn_retry_external_tx_id.or_else(|| {
+                    Some(Redemption::retry_burn_external_tx_id_typed(
+                        detected_tx_hash,
+                        1,
+                    ))
+                });
+
+            info!(target: "admin", aggregate_id = %aggregate_id,
+                fireblocks_tx_id = %fb_tx_id,
+                fireblocks_status = %fb_detail,
+                fireblocks_sub_status = ?fb_sub_status,
+                retry_external_tx_id = ?retry_external_tx_id,
+                "Fireblocks tx failed, proceeding with ResumeBurn"
+            );
+
+            Ok(PriorBurnDisposition::ResumeWith(retry_external_tx_id))
+        }
+        Ok(None) => {
+            Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id))
+        }
+        Err(err) => {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                fireblocks_tx_id = %fb_tx_id,
+                error = %err,
+                "Failed to check Fireblocks tx status"
+            );
+            Err(Status::BadGateway)
+        }
+    }
 }
 
 /// Logs each recovery outcome at a severity matching what actually happened and
@@ -1200,10 +1283,11 @@ pub(crate) async fn check_fireblocks_tx(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{Address, U256, address, b256};
     use async_trait::async_trait;
     use chrono::Utc;
     use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+    use cqrs_es::{AggregateContext, EventStore};
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlite_es::{
@@ -1216,14 +1300,15 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
-        recover_post_alpaca,
+        AlpacaCalledData, BurningFailedData, PostAlpacaRecoveryInput,
+        load_reprocess_context, recover_post_alpaca,
     };
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionMetadata, RedemptionView,
@@ -1231,7 +1316,7 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{FireblocksTxStatus, VaultService};
+    use crate::vault::{FireblocksTxStatus, MultiBurnEntry, VaultService};
 
     use super::{AggregateKind, StuckAggregate};
 
@@ -1564,6 +1649,113 @@ mod tests {
         (cqrs, event_store, metadata, alpaca_data)
     }
 
+    #[tokio::test]
+    async fn test_load_reprocess_context_derives_retry_id_from_history() {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+
+        let metadata = test_metadata();
+        let alpaca_data = test_alpaca_data();
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        // Drive the redemption through a real burn submission that then fails,
+        // so event history carries a BurnFireblocksSubmitted event the
+        // derivation must scan — rather than injecting the retry id directly.
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::Detect {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                underlying: metadata.underlying.clone(),
+                token: metadata.token.clone(),
+                wallet: metadata.wallet,
+                quantity: metadata.quantity.clone(),
+                tx_hash: metadata.detected_tx_hash,
+                block_number: metadata.block_number,
+            },
+        )
+        .await
+        .expect("Detect failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                tokenization_request_id: alpaca_data
+                    .tokenization_request_id
+                    .clone(),
+                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                dust_quantity: alpaca_data.dust_quantity.clone(),
+            },
+        )
+        .await
+        .expect("RecordAlpacaCall failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::ConfirmAlpacaComplete {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+            },
+        )
+        .await
+        .expect("ConfirmAlpacaComplete failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::BurnTokens {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                vault: address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+                burns: vec![MultiBurnEntry {
+                    receipt_id: U256::from(99),
+                    burn_shares: U256::from(100),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
+                dust_shares: U256::ZERO,
+                owner: Address::ZERO,
+                external_tx_id: Some(BurnExternalTxId::base(
+                    &metadata.detected_tx_hash,
+                )),
+            },
+        )
+        .await
+        .expect("BurnTokens failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::RecordBurnFailure {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                error: "burn terminally failed".to_string(),
+                fireblocks_tx_id: Some("mock-fb-burn".to_string()),
+                planned_burns: vec![],
+            },
+        )
+        .await
+        .expect("RecordBurnFailure failed");
+
+        let context = load_reprocess_context(&event_store, &aggregate_id)
+            .await
+            .expect("load_reprocess_context failed");
+
+        // The base BurnFireblocksSubmitted in history must advance the derived
+        // id to retry-1, proving the derivation is wired into
+        // load_reprocess_context rather than the retry id being injected.
+        assert_eq!(
+            context.burn_retry_external_tx_id,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &metadata.detected_tx_hash,
+                1
+            ))
+        );
+
+        let burning_failed = context
+            .burning_failed
+            .expect("expected BurningFailed data in context");
+        assert_eq!(
+            burning_failed.fireblocks_tx_id,
+            Some("mock-fb-burn".to_string())
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_completed_succeeds() {
@@ -1591,6 +1783,7 @@ mod tests {
                 metadata: metadata.clone(),
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
@@ -1602,6 +1795,128 @@ mod tests {
         assert_eq!(burn_recovery.calls(), 1);
         assert!(logs_contain_at!(Level::INFO, &["recovered", "Burning"]));
         assert!(logs_contain_at!(Level::INFO, &["burn", "executed"]));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_post_alpaca_persists_retry_external_tx_id() {
+        let (cqrs, event_store, metadata, alpaca_data) =
+            setup_failed_redemption().await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let retry_external_tx_id =
+            BurnExternalTxId::from_string("burn-0xabc-retry-1".to_string());
+
+        let result = recover_post_alpaca(
+            &cqrs,
+            &alpaca,
+            &mock_vault_service(),
+            &mock_burn_recovery(),
+            PostAlpacaRecoveryInput {
+                aggregate_id: metadata.issuer_request_id.to_string(),
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                metadata: metadata.clone(),
+                alpaca_data,
+                burning_failed: None,
+                burn_retry_external_tx_id: Some(retry_external_tx_id.clone()),
+            },
+        )
+        .await;
+
+        result.expect("Expected Ok response");
+
+        let context = event_store
+            .load_aggregate(&metadata.issuer_request_id.to_string())
+            .await
+            .expect("Expected aggregate to load");
+
+        let Redemption::Burning { external_tx_id, .. } = context.aggregate()
+        else {
+            panic!("Expected Burning state, got {:?}", context.aggregate());
+        };
+
+        assert_eq!(external_tx_id, &Some(retry_external_tx_id));
+
+        assert!(logs_contain_at!(Level::INFO, &["recovered", "Burning"]));
+        assert!(logs_contain_at!(Level::INFO, &["burn", "executed"]));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_post_alpaca_uses_retry_id_fallback_on_terminal_failure()
+     {
+        let (cqrs, event_store, metadata, alpaca_data) =
+            setup_failed_redemption().await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success().with_fireblocks_tx_status(
+                FireblocksTxStatus::Failed {
+                    detail: "FAILED".to_string(),
+                    sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
+                    network_tx_hashes: vec![],
+                },
+            ),
+        );
+
+        let result = recover_post_alpaca(
+            &cqrs,
+            &alpaca,
+            &vault,
+            &mock_burn_recovery(),
+            PostAlpacaRecoveryInput {
+                aggregate_id: metadata.issuer_request_id.to_string(),
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                metadata: metadata.clone(),
+                alpaca_data,
+                // Pre-enrichment failure: a Fireblocks tx exists but history
+                // carries no recorded retry id.
+                burning_failed: Some(BurningFailedData {
+                    fireblocks_tx_id: Some("fb-terminal-1".to_string()),
+                    planned_burns: vec![],
+                }),
+                burn_retry_external_tx_id: None,
+            },
+        )
+        .await;
+
+        result.expect("Expected Ok response");
+
+        let context = event_store
+            .load_aggregate(&metadata.issuer_request_id.to_string())
+            .await
+            .expect("Expected aggregate to load");
+
+        let Redemption::Burning { external_tx_id, .. } = context.aggregate()
+        else {
+            panic!("Expected Burning state, got {:?}", context.aggregate());
+        };
+
+        // The terminally failed Fireblocks tx permanently blocks the base
+        // externalTxId, so recovery must fall back to retry-1 rather than
+        // reuse it.
+        assert_eq!(
+            external_tx_id,
+            &Some(Redemption::retry_burn_external_tx_id_typed(
+                &metadata.detected_tx_hash,
+                1
+            ))
+        );
+
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Fireblocks tx failed", "ResumeBurn"]
+        ));
     }
 
     #[traced_test]
@@ -1628,6 +1943,7 @@ mod tests {
                 metadata,
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
@@ -1660,6 +1976,7 @@ mod tests {
                 metadata,
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
@@ -1691,6 +2008,7 @@ mod tests {
                 metadata,
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
@@ -1719,6 +2037,7 @@ mod tests {
                 metadata,
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
@@ -1762,6 +2081,7 @@ mod tests {
                 metadata,
                 alpaca_data,
                 burning_failed: None,
+                burn_retry_external_tx_id: None,
             },
         )
         .await;
