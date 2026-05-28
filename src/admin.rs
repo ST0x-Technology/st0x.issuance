@@ -15,8 +15,8 @@ use crate::alpaca::{AlpacaService, RedeemRequestStatus, TokenizationRequest};
 use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, MintCommand, MintEvent, MintView,
-    TokenizationRequestId, find_all_recoverable_mints,
-    find_by_issuer_request_id, recovery::spawn_scheduled_mint_recovery,
+    TokenizationRequestId, find_by_issuer_request_id,
+    find_stuck as find_stuck_mints, recovery::spawn_scheduled_mint_recovery,
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -25,7 +25,8 @@ use crate::redemption::burn_manager::{
 use crate::redemption::{
     BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, RedemptionCommand,
     RedemptionError, RedemptionEvent, RedemptionMetadata, RedemptionView,
-    find_stuck, next_burn_retry_external_tx_id_from_history,
+    find_stuck as find_stuck_redemptions,
+    next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{FireblocksTxStatus, VaultService};
@@ -859,6 +860,13 @@ pub(crate) async fn close_mint(
     }))
 }
 
+/// In-progress states that haven't transitioned in this long are reported as
+/// stuck. Most state transitions take seconds (a few minutes at most for a
+/// Fireblocks confirmation), so anything older than this either deadlocked or
+/// was silently skipped by recovery (e.g. `RecoveryOutcome::SkippedManualIntervention`
+/// leaves a redemption in `Burning` indefinitely with no terminal event).
+const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
+
 #[tracing::instrument(skip(
     _auth,
     pool,
@@ -874,43 +882,48 @@ pub(crate) async fn list_stuck(
     redemption_event_store: &rocket::State<RedemptionEventStore>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
+    let now = Utc::now();
     let mut stuck = Vec::new();
 
-    // Stuck redemptions (Failed and BurnFailed)
-    let stuck_redemptions = find_stuck(pool.inner()).await.map_err(|err| {
-        error!(target: "admin", error = %err, "Failed to query stuck redemptions");
-        Status::InternalServerError
-    })?;
+    let stuck_redemptions =
+        find_stuck_redemptions(pool.inner()).await.map_err(|err| {
+            error!(target: "admin", error = %err, "Failed to query stuck redemptions");
+            Status::InternalServerError
+        })?;
 
     for (issuer_redemption_request_id, view) in stuck_redemptions {
+        let Some((class, timestamp)) = redemption_stuck_info(&view) else {
+            continue;
+        };
+        if !is_stuck(class, timestamp, now) {
+            continue;
+        }
+
         let history = redemption_history_summary(
             redemption_event_store.inner(),
             &issuer_redemption_request_id.to_string(),
         )
         .await;
 
-        if let Some(entry) = stuck_redemption_entry(
-            &issuer_redemption_request_id,
-            &view,
-            history,
-        ) {
+        if let Some(entry) =
+            stuck_redemption_entry(&issuer_redemption_request_id, view, history)
+        {
             stuck.push(entry);
         }
     }
 
-    // Stuck mints (recoverable states)
-    let recoverable_mints =
-        find_all_recoverable_mints(pool.inner()).await.map_err(|err| {
-            error!(target: "admin", error = %err, "Failed to query recoverable mints");
-            Status::InternalServerError
-        })?;
+    let stuck_mints = find_stuck_mints(pool.inner()).await.map_err(|err| {
+        error!(target: "admin", error = %err, "Failed to query stuck mints");
+        Status::InternalServerError
+    })?;
 
-    for (issuer_mint_request_id, view) in recoverable_mints {
-        let Some((tokenization_request_id, state, detail, timestamp)) =
-            mint_view_summary(&view)
-        else {
+    for (issuer_mint_request_id, view) in stuck_mints {
+        let Some(summary) = mint_view_summary(&view) else {
             continue;
         };
+        if !is_stuck(summary.class, summary.timestamp, now) {
+            continue;
+        }
 
         let (underlying, quantity) = mint_view_asset(&view);
         let mint_history = mint_history_summary(
@@ -922,10 +935,10 @@ pub(crate) async fn list_stuck(
         stuck.push(StuckAggregate {
             aggregate_type: AggregateKind::Mint,
             aggregate_id: issuer_mint_request_id.to_string(),
-            tokenization_request_id,
-            state,
-            detail,
-            timestamp,
+            tokenization_request_id: summary.tokenization_request_id,
+            state: summary.state,
+            detail: summary.detail,
+            timestamp: summary.timestamp,
             underlying,
             quantity,
             tx_hash: mint_history.tx_hash,
@@ -938,6 +951,61 @@ pub(crate) async fn list_stuck(
         .await;
 
     Ok(Json(StuckResponse { stuck }))
+}
+
+/// Classification of a non-terminal view used to decide whether it counts as
+/// stuck right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StuckClass {
+    /// Aggregate is mid-flow. Only counts as stuck once it sits in this state
+    /// longer than [`STUCK_THRESHOLD`].
+    InProgress,
+    /// Aggregate landed in a terminal-failure state. Always counts as stuck
+    /// regardless of age — these never self-resolve.
+    TerminalFail,
+}
+
+fn is_stuck(
+    class: StuckClass,
+    timestamp: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    match class {
+        StuckClass::TerminalFail => true,
+        StuckClass::InProgress => {
+            now.signed_duration_since(timestamp) >= STUCK_THRESHOLD
+        }
+    }
+}
+
+/// Returns the stuck-classification and state-entered timestamp for a view
+/// the operator may need to act on, or `None` for terminal/Unavailable
+/// variants that never appear in `/admin/stuck`. Fusing the classification
+/// and timestamp into a single `Option` keeps the type system enforcing
+/// that callers never observe a timestamp without a class, eliminating the
+/// possibility of a sentinel value on a financial admin path.
+const fn redemption_stuck_info(
+    view: &RedemptionView,
+) -> Option<(StuckClass, DateTime<Utc>)> {
+    use StuckClass::{InProgress, TerminalFail};
+    match view {
+        RedemptionView::Detected { detected_entered_at, .. } => {
+            Some((InProgress, *detected_entered_at))
+        }
+        RedemptionView::AlpacaCalled { called_at, .. } => {
+            Some((InProgress, *called_at))
+        }
+        RedemptionView::Burning { burning_entered_at, .. } => {
+            Some((InProgress, *burning_entered_at))
+        }
+        RedemptionView::Failed { failed_at, .. }
+        | RedemptionView::BurnFailed { failed_at, .. } => {
+            Some((TerminalFail, *failed_at))
+        }
+        RedemptionView::Unavailable
+        | RedemptionView::Completed { .. }
+        | RedemptionView::Closed { .. } => None,
+    }
 }
 
 /// Best-effort enrichment: for every stuck entry with a `fireblocks_tx_id`,
@@ -976,7 +1044,7 @@ async fn enrich_with_fireblocks_status(
 
 fn stuck_redemption_entry(
     issuer_redemption_request_id: &IssuerRedemptionRequestId,
-    view: &RedemptionView,
+    view: RedemptionView,
     history: RedemptionHistorySummary,
 ) -> Option<StuckAggregate> {
     let (
@@ -989,11 +1057,72 @@ fn stuck_redemption_entry(
         tx_hash,
         fireblocks_tx_id,
     ) = match view {
+        RedemptionView::Detected {
+            underlying,
+            quantity,
+            tx_hash,
+            detected_entered_at,
+            ..
+        } => (
+            None,
+            "Detected".to_string(),
+            "Waiting to call Alpaca".to_string(),
+            detected_entered_at,
+            Some(underlying),
+            Some(quantity),
+            Some(tx_hash),
+            history.fireblocks_tx_id,
+        ),
+        RedemptionView::AlpacaCalled {
+            tokenization_request_id,
+            underlying,
+            quantity,
+            tx_hash,
+            called_at,
+            ..
+        } => (
+            Some(tokenization_request_id),
+            "AlpacaCalled".to_string(),
+            "Waiting for Alpaca journal".to_string(),
+            called_at,
+            Some(underlying),
+            Some(quantity),
+            Some(tx_hash),
+            history.fireblocks_tx_id,
+        ),
+        RedemptionView::Burning {
+            tokenization_request_id,
+            underlying,
+            quantity,
+            tx_hash,
+            burning_entered_at,
+            ..
+        } => {
+            // BurnFireblocksSubmitted intentionally leaves the view in
+            // Burning. The detail string is what operators read first, so
+            // distinguish pre- vs post-submission by whether a Fireblocks
+            // tx id has been recorded in event history.
+            let detail = if history.fireblocks_tx_id.is_some() {
+                "Waiting for burn confirmation".to_string()
+            } else {
+                "Waiting for burn submission".to_string()
+            };
+            (
+                Some(tokenization_request_id),
+                "Burning".to_string(),
+                detail,
+                burning_entered_at,
+                Some(underlying),
+                Some(quantity),
+                Some(tx_hash),
+                history.fireblocks_tx_id,
+            )
+        }
         RedemptionView::Failed { reason, failed_at, .. } => (
             history.tokenization_request_id,
             "Failed".to_string(),
-            reason.clone(),
-            *failed_at,
+            reason,
+            failed_at,
             history.underlying,
             history.quantity,
             history.tx_hash,
@@ -1009,19 +1138,20 @@ fn stuck_redemption_entry(
             fireblocks_tx_id,
             ..
         } => (
-            Some(tokenization_request_id.clone()),
+            Some(tokenization_request_id),
             "BurnFailed".to_string(),
-            error.clone(),
-            *failed_at,
-            Some(underlying.clone()),
-            Some(quantity.clone()),
-            Some(*tx_hash),
-            fireblocks_tx_id.clone().or(history.fireblocks_tx_id),
+            error,
+            failed_at,
+            Some(underlying),
+            Some(quantity),
+            Some(tx_hash),
+            fireblocks_tx_id.or(history.fireblocks_tx_id),
         ),
-        // find_stuck only returns Failed/BurnFailed; surface any other
-        // variant as a real mismatch rather than fabricating placeholder
-        // data that could mislead operators.
-        _ => return None,
+        // Terminal/Unavailable variants never reach here — list_stuck gates
+        // on redemption_stuck_info which returns None for them.
+        RedemptionView::Unavailable
+        | RedemptionView::Completed { .. }
+        | RedemptionView::Closed { .. } => return None,
     };
 
     Some(StuckAggregate {
@@ -1065,13 +1195,29 @@ async fn redemption_history_summary(
         }
     };
 
+    redemption_history_summary_from_events(
+        events.into_iter().map(|event| event.payload),
+    )
+}
+
+/// Pure reduce: builds a `RedemptionHistorySummary` from an ordered sequence
+/// of `RedemptionEvent`s. Split out from `redemption_history_summary` so the
+/// branching (especially the Reprocess/Resume fireblocks-id reset) is
+/// unit-testable without an event store.
+fn redemption_history_summary_from_events(
+    events: impl IntoIterator<Item = RedemptionEvent>,
+) -> RedemptionHistorySummary {
     let mut summary = RedemptionHistorySummary::default();
     for event in events {
-        match event.payload {
+        match event {
             RedemptionEvent::Detected {
                 underlying, quantity, tx_hash, ..
+            } => {
+                summary.underlying = Some(underlying);
+                summary.quantity = Some(quantity);
+                summary.tx_hash = Some(tx_hash);
             }
-            | RedemptionEvent::Reprocessed {
+            RedemptionEvent::Reprocessed {
                 underlying,
                 quantity,
                 tx_hash,
@@ -1086,6 +1232,12 @@ async fn redemption_history_summary(
                 summary.underlying = Some(underlying);
                 summary.quantity = Some(quantity);
                 summary.tx_hash = Some(tx_hash);
+                // Reprocess/Resume starts a fresh attempt — any prior
+                // Fireblocks submission belongs to the previous attempt
+                // and must not bleed into the current Burning row's
+                // operator-facing detail. A subsequent
+                // `BurnFireblocksSubmitted` re-sets the field.
+                summary.fireblocks_tx_id = None;
             }
             RedemptionEvent::AlpacaCalled {
                 tokenization_request_id, ..
@@ -1112,52 +1264,90 @@ async fn redemption_history_summary(
     summary
 }
 
-fn mint_view_summary(
-    view: &MintView,
-) -> Option<(Option<TokenizationRequestId>, String, String, DateTime<Utc>)> {
+/// Projection of a non-terminal `MintView` used to populate a `StuckAggregate`.
+/// Two adjacent `String` slots (`state`, `detail`) would be position-swappable
+/// in a tuple; the named struct prevents that.
+#[derive(Debug)]
+struct MintStuckSummary {
+    class: StuckClass,
+    tokenization_request_id: Option<TokenizationRequestId>,
+    state: String,
+    detail: String,
+    timestamp: DateTime<Utc>,
+}
+
+fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
+    use StuckClass::{InProgress, TerminalFail};
     match view {
+        MintView::Initiated {
+            tokenization_request_id, initiated_at, ..
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "Initiated".to_string(),
+            detail: "Waiting for journal confirmation".to_string(),
+            timestamp: *initiated_at,
+        }),
         MintView::JournalConfirmed {
             tokenization_request_id,
             journal_confirmed_at,
             ..
-        } => Some((
-            Some(tokenization_request_id.clone()),
-            "JournalConfirmed".to_string(),
-            "Waiting for deposit".to_string(),
-            *journal_confirmed_at,
-        )),
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "JournalConfirmed".to_string(),
+            detail: "Waiting for deposit".to_string(),
+            timestamp: *journal_confirmed_at,
+        }),
+        MintView::JournalRejected {
+            tokenization_request_id,
+            reason,
+            rejected_at,
+            ..
+        } => Some(MintStuckSummary {
+            class: TerminalFail,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "JournalRejected".to_string(),
+            detail: reason.clone(),
+            timestamp: *rejected_at,
+        }),
         MintView::Minting {
             tokenization_request_id,
             minting_started_at,
             ..
-        } => Some((
-            Some(tokenization_request_id.clone()),
-            "Minting".to_string(),
-            "Deposit in progress".to_string(),
-            *minting_started_at,
-        )),
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "Minting".to_string(),
+            detail: "Deposit in progress".to_string(),
+            timestamp: *minting_started_at,
+        }),
         MintView::MintingFailed {
             tokenization_request_id,
             error,
             failed_at,
             ..
-        } => Some((
-            Some(tokenization_request_id.clone()),
-            "MintingFailed".to_string(),
-            error.clone(),
-            *failed_at,
-        )),
+        } => Some(MintStuckSummary {
+            class: TerminalFail,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "MintingFailed".to_string(),
+            detail: error.clone(),
+            timestamp: *failed_at,
+        }),
         MintView::CallbackPending {
             tokenization_request_id,
             minted_at,
             ..
-        } => Some((
-            Some(tokenization_request_id.clone()),
-            "CallbackPending".to_string(),
-            "Waiting for callback".to_string(),
-            *minted_at,
-        )),
-        _ => None,
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "CallbackPending".to_string(),
+            detail: "Waiting for callback".to_string(),
+            timestamp: *minted_at,
+        }),
+        MintView::NotFound
+        | MintView::Completed { .. }
+        | MintView::Closed { .. } => None,
     }
 }
 
@@ -1165,13 +1355,17 @@ fn mint_view_asset(
     view: &MintView,
 ) -> (Option<UnderlyingSymbol>, Option<Quantity>) {
     match view {
-        MintView::JournalConfirmed { underlying, quantity, .. }
+        MintView::Initiated { underlying, quantity, .. }
+        | MintView::JournalConfirmed { underlying, quantity, .. }
+        | MintView::JournalRejected { underlying, quantity, .. }
         | MintView::Minting { underlying, quantity, .. }
         | MintView::MintingFailed { underlying, quantity, .. }
         | MintView::CallbackPending { underlying, quantity, .. } => {
             (Some(underlying.clone()), Some(quantity.clone()))
         }
-        _ => (None, None),
+        MintView::NotFound
+        | MintView::Completed { .. }
+        | MintView::Closed { .. } => (None, None),
     }
 }
 
@@ -1491,7 +1685,7 @@ mod tests {
 
         let entry = super::stuck_redemption_entry(
             &metadata.issuer_request_id,
-            &view,
+            view,
             history,
         )
         .expect("failed redemption should produce stuck entry");
@@ -1537,7 +1731,7 @@ mod tests {
 
         let entry = super::stuck_redemption_entry(
             &metadata.issuer_request_id,
-            &view,
+            view,
             super::RedemptionHistorySummary::default(),
         )
         .expect("burn failed redemption should produce stuck entry");
@@ -2630,5 +2824,606 @@ mod tests {
         assert_eq!(json["detail"], "Failed");
         assert_eq!(json["sub_status"], "BLOCKED_BY_POLICY");
         assert_eq!(json["network_tx_hashes"][0], "0xdeadbeef");
+    }
+
+    #[test]
+    fn is_stuck_terminal_fail_always_true_regardless_of_age() {
+        let now = Utc::now();
+        let just_now = now;
+        let long_ago = now - chrono::Duration::days(30);
+
+        assert!(super::is_stuck(
+            super::StuckClass::TerminalFail,
+            just_now,
+            now
+        ));
+        assert!(super::is_stuck(
+            super::StuckClass::TerminalFail,
+            long_ago,
+            now
+        ));
+    }
+
+    #[test]
+    fn is_stuck_in_progress_uses_one_hour_threshold() {
+        let now = Utc::now();
+
+        // Just under threshold — not stuck yet.
+        let fresh = now - chrono::Duration::minutes(59);
+        assert!(!super::is_stuck(super::StuckClass::InProgress, fresh, now));
+
+        // Exactly at threshold — stuck.
+        let at_threshold = now - super::STUCK_THRESHOLD;
+        assert!(super::is_stuck(
+            super::StuckClass::InProgress,
+            at_threshold,
+            now
+        ));
+
+        // Older than threshold — stuck.
+        let old = now - chrono::Duration::hours(13);
+        assert!(super::is_stuck(super::StuckClass::InProgress, old, now));
+    }
+
+    #[test]
+    fn redemption_stuck_info_classifies_and_timestamps_each_variant() {
+        use super::RedemptionView::{
+            AlpacaCalled, BurnFailed, Burning, Closed, Completed, Detected,
+            Failed, Unavailable,
+        };
+        use super::StuckClass::{InProgress, TerminalFail};
+
+        let metadata = test_metadata();
+        let issuer = metadata.issuer_request_id.clone();
+        let underlying = metadata.underlying.clone();
+        let token = metadata.token.clone();
+        let quantity = metadata.quantity.clone();
+        let tx_hash = metadata.detected_tx_hash;
+        let block_number = metadata.block_number;
+        let detected_at = metadata.detected_at;
+        let called_at = Utc::now();
+        let burning_entered_at = Utc::now();
+        let failed_at = Utc::now();
+        let burn_failed_at = Utc::now();
+        let tok_id = TokenizationRequestId::new("tok-1");
+
+        // Detected → InProgress with detected_entered_at. Use a distinct
+        // (later) value than detected_at so the projection unambiguously
+        // selects detected_entered_at — this is the post-reprocess clock.
+        let detected_entered_at = detected_at + chrono::Duration::days(7);
+        let detected = Detected {
+            issuer_request_id: issuer.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: metadata.wallet,
+            quantity: quantity.clone(),
+            tx_hash,
+            block_number,
+            detected_at,
+            detected_entered_at,
+        };
+        assert_eq!(
+            super::redemption_stuck_info(&detected),
+            Some((InProgress, detected_entered_at))
+        );
+
+        // AlpacaCalled → InProgress with called_at.
+        let alpaca_called = AlpacaCalled {
+            issuer_request_id: issuer.clone(),
+            tokenization_request_id: tok_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: metadata.wallet,
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+        };
+        assert_eq!(
+            super::redemption_stuck_info(&alpaca_called),
+            Some((InProgress, called_at))
+        );
+
+        // Burning → InProgress with burning_entered_at (NOT
+        // alpaca_journal_completed_at, which would lag for resumed
+        // redemptions). Use a distinct journal-completion time to make the
+        // distinction observable.
+        let burning = Burning {
+            issuer_request_id: issuer.clone(),
+            tokenization_request_id: tok_id.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            wallet: metadata.wallet,
+            alpaca_quantity: quantity.clone(),
+            quantity: quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at: detected_at,
+            burning_entered_at,
+        };
+        assert_eq!(
+            super::redemption_stuck_info(&burning),
+            Some((InProgress, burning_entered_at))
+        );
+
+        // Failed → TerminalFail with failed_at.
+        let failed = Failed {
+            issuer_request_id: issuer.clone(),
+            reason: "x".to_string(),
+            failed_at,
+        };
+        assert_eq!(
+            super::redemption_stuck_info(&failed),
+            Some((TerminalFail, failed_at))
+        );
+
+        // BurnFailed → TerminalFail with failed_at. Exercises the exact
+        // variant that motivated this PR (the original red-79631d72 /
+        // red-742f9f3a incident).
+        let burn_failed = BurnFailed {
+            issuer_request_id: issuer.clone(),
+            tokenization_request_id: tok_id,
+            underlying,
+            token,
+            wallet: metadata.wallet,
+            quantity: quantity.clone(),
+            alpaca_quantity: quantity,
+            dust_quantity: Quantity::default(),
+            tx_hash,
+            block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at: detected_at,
+            error: "burn failed".to_string(),
+            failed_at: burn_failed_at,
+            fireblocks_tx_id: None,
+            planned_burns: vec![],
+        };
+        assert_eq!(
+            super::redemption_stuck_info(&burn_failed),
+            Some((TerminalFail, burn_failed_at))
+        );
+
+        // Terminal/Unavailable do not appear.
+        assert_eq!(super::redemption_stuck_info(&Unavailable), None);
+        assert_eq!(
+            super::redemption_stuck_info(&Completed {
+                issuer_request_id: issuer.clone(),
+                burn_tx_hash: tx_hash,
+                block_number,
+                completed_at: failed_at,
+            }),
+            None
+        );
+        assert_eq!(
+            super::redemption_stuck_info(&Closed {
+                issuer_request_id: issuer,
+                reason: "x".to_string(),
+                closed_at: failed_at,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn stuck_redemption_entry_handles_in_progress_variants() {
+        let metadata = test_metadata();
+        let detected_at = metadata.detected_at;
+
+        // Use distinct timestamps so the projection unambiguously selects
+        // detected_entered_at (the post-reprocess clock) over detected_at.
+        let detected_entered_at = detected_at + chrono::Duration::days(3);
+        let detected_view = RedemptionView::Detected {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at,
+            detected_entered_at,
+        };
+
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            detected_view,
+            super::RedemptionHistorySummary::default(),
+        )
+        .expect("Detected view should produce a stuck entry");
+
+        assert_eq!(entry.aggregate_type, AggregateKind::Redemption);
+        assert_eq!(entry.state, "Detected");
+        assert_eq!(entry.detail, "Waiting to call Alpaca");
+        assert_eq!(entry.timestamp, detected_entered_at);
+        assert_eq!(entry.tokenization_request_id, None);
+        assert_eq!(entry.underlying, Some(metadata.underlying.clone()));
+        assert_eq!(entry.quantity, Some(metadata.quantity.clone()));
+        assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
+
+        let called_at = Utc::now();
+        let tok_id = TokenizationRequestId::new("tok-progress");
+        let alpaca_called_view = RedemptionView::AlpacaCalled {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: tok_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            alpaca_quantity: metadata.quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at,
+            called_at,
+        };
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            alpaca_called_view,
+            super::RedemptionHistorySummary::default(),
+        )
+        .expect("AlpacaCalled view should produce a stuck entry");
+        assert_eq!(entry.state, "AlpacaCalled");
+        assert_eq!(entry.detail, "Waiting for Alpaca journal");
+        assert_eq!(entry.timestamp, called_at);
+        assert_eq!(entry.tokenization_request_id, Some(tok_id.clone()));
+
+        // Use distinct timestamps so the projection unambiguously selects
+        // burning_entered_at (the post-resume clock) over
+        // alpaca_journal_completed_at.
+        let journal_completed_at = Utc::now() - chrono::Duration::days(7);
+        let burning_entered_at = Utc::now();
+        let burning_view = RedemptionView::Burning {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: tok_id.clone(),
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            alpaca_quantity: metadata.quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at: journal_completed_at,
+            burning_entered_at,
+        };
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            burning_view,
+            super::RedemptionHistorySummary::default(),
+        )
+        .expect("Burning view should produce a stuck entry");
+        assert_eq!(entry.state, "Burning");
+        // No prior submission recorded → pre-submission detail.
+        assert_eq!(entry.detail, "Waiting for burn submission");
+        assert_eq!(entry.timestamp, burning_entered_at);
+        assert_eq!(entry.tokenization_request_id, Some(tok_id.clone()));
+
+        // Same Burning view, but history shows a prior Fireblocks
+        // submission — the detail should flip to "Waiting for burn
+        // confirmation" so operators don't see misleading "submission"
+        // text on a post-submission row. BurnFireblocksSubmitted leaves
+        // the view in Burning, so this branch is the only signal.
+        let burning_view_with_history = RedemptionView::Burning {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: tok_id,
+            underlying: metadata.underlying.clone(),
+            token: metadata.token.clone(),
+            wallet: metadata.wallet,
+            quantity: metadata.quantity.clone(),
+            alpaca_quantity: metadata.quantity.clone(),
+            dust_quantity: Quantity::default(),
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at,
+            called_at,
+            alpaca_journal_completed_at: journal_completed_at,
+            burning_entered_at,
+        };
+        let history_with_fb = super::RedemptionHistorySummary {
+            fireblocks_tx_id: Some("fb-tx-burn-1".to_string()),
+            ..super::RedemptionHistorySummary::default()
+        };
+        let entry = super::stuck_redemption_entry(
+            &metadata.issuer_request_id,
+            burning_view_with_history,
+            history_with_fb,
+        )
+        .expect("Burning view should produce a stuck entry");
+        assert_eq!(entry.state, "Burning");
+        assert_eq!(entry.detail, "Waiting for burn confirmation");
+        assert_eq!(entry.fireblocks_tx_id, Some("fb-tx-burn-1".to_string()));
+    }
+
+    #[test]
+    fn mint_view_summary_classifies_and_timestamps_each_variant() {
+        use super::StuckClass::{InProgress, TerminalFail};
+        use crate::mint::{ClientId, MintView, Network};
+
+        let issuer_request_id = crate::mint::IssuerMintRequestId::random();
+        let tokenization_request_id = TokenizationRequestId::new("alp-stuck-1");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let network = Network::new("base");
+        let client_id = ClientId::new();
+        let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let quantity = crate::mint::Quantity::new(Decimal::from(100));
+        let initiated_at = Utc::now() - chrono::Duration::hours(3);
+        let journal_confirmed_at = Utc::now() - chrono::Duration::hours(2);
+        let rejected_at = Utc::now() - chrono::Duration::hours(1);
+        let minting_started_at = Utc::now() - chrono::Duration::minutes(45);
+        let minted_at = Utc::now() - chrono::Duration::minutes(30);
+        let failed_at = Utc::now() - chrono::Duration::minutes(15);
+
+        let initiated = MintView::Initiated {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+        };
+        let s = super::mint_view_summary(&initiated)
+            .expect("Initiated should produce a summary");
+        assert_eq!(s.class, InProgress);
+        assert_eq!(s.state, "Initiated");
+        assert_eq!(s.detail, "Waiting for journal confirmation");
+        assert_eq!(s.timestamp, initiated_at);
+        assert_eq!(
+            s.tokenization_request_id,
+            Some(tokenization_request_id.clone())
+        );
+
+        let confirmed = MintView::JournalConfirmed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+        };
+        let s = super::mint_view_summary(&confirmed)
+            .expect("JournalConfirmed should produce a summary");
+        assert_eq!(s.class, InProgress);
+        assert_eq!(s.state, "JournalConfirmed");
+        assert_eq!(s.detail, "Waiting for deposit");
+        assert_eq!(s.timestamp, journal_confirmed_at);
+
+        let rejected = MintView::JournalRejected {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+            reason: "Alpaca rejected".to_string(),
+            rejected_at,
+        };
+        let s = super::mint_view_summary(&rejected)
+            .expect("JournalRejected should produce a summary");
+        assert_eq!(s.class, TerminalFail);
+        assert_eq!(s.state, "JournalRejected");
+        assert_eq!(s.detail, "Alpaca rejected");
+        assert_eq!(s.timestamp, rejected_at);
+
+        let minting = MintView::Minting {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+        };
+        let s = super::mint_view_summary(&minting).unwrap();
+        assert_eq!(s.class, InProgress);
+        assert_eq!(s.state, "Minting");
+        assert_eq!(s.detail, "Deposit in progress");
+        assert_eq!(s.timestamp, minting_started_at);
+
+        let callback_pending = MintView::CallbackPending {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            quantity: quantity.clone(),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: network.clone(),
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            receipt_id: U256::from(1u64),
+            shares_minted: U256::from(100u64),
+            gas_used: None,
+            block_number: 1,
+            minted_at,
+        };
+        let s = super::mint_view_summary(&callback_pending).unwrap();
+        assert_eq!(s.class, InProgress);
+        assert_eq!(s.state, "CallbackPending");
+        assert_eq!(s.detail, "Waiting for callback");
+        assert_eq!(s.timestamp, minted_at);
+
+        let minting_failed = MintView::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            error: "deposit failed".to_string(),
+            failed_at,
+        };
+        let s = super::mint_view_summary(&minting_failed).unwrap();
+        assert_eq!(s.class, TerminalFail);
+        assert_eq!(s.state, "MintingFailed");
+        assert_eq!(s.detail, "deposit failed");
+        assert_eq!(s.timestamp, failed_at);
+
+        // Terminal/NotFound do not produce a summary.
+        assert!(super::mint_view_summary(&MintView::NotFound).is_none());
+        assert!(
+            super::mint_view_summary(&MintView::Completed {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("alp-completed"),
+                quantity: crate::mint::Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                client_id: ClientId::new(),
+                wallet: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+                initiated_at: failed_at,
+                journal_confirmed_at: failed_at,
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: U256::from(2u64),
+                shares_minted: U256::from(100u64),
+                gas_used: None,
+                block_number: 1,
+                minted_at: failed_at,
+                completed_at: failed_at,
+            })
+            .is_none(),
+            "Completed must not produce a stuck summary"
+        );
+        assert!(
+            super::mint_view_summary(&MintView::Closed {
+                issuer_request_id,
+                reason: "closed by admin".to_string(),
+                closed_at: failed_at,
+            })
+            .is_none()
+        );
+    }
+
+    /// Regression: an iter-3 fix branches the Burning detail string on
+    /// `history.fireblocks_tx_id.is_some()`. Without the iter-4 fix to
+    /// `redemption_history_summary`, a previously-failed Fireblocks tx
+    /// would survive across a `BurnResumed` and mislabel the freshly
+    /// resumed (but not-yet-submitted) Burning row as "Waiting for burn
+    /// confirmation".
+    #[test]
+    fn redemption_history_summary_clears_fireblocks_tx_id_on_burn_resumed() {
+        use crate::redemption::{BurnExternalTxId, RedemptionEvent};
+
+        let issuer = IssuerRedemptionRequestId::random();
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let quantity = Quantity::new(Decimal::from(100));
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+        let now = Utc::now();
+        let tok_id = TokenizationRequestId::new("tok-resume-1");
+
+        // Sequence: a full Burning attempt that failed during Fireblocks
+        // confirmation, then operator-initiated BurnResumed putting us
+        // back into Burning with NO new submission yet.
+        let events = vec![
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer.clone(),
+                underlying: underlying.clone(),
+                token: token.clone(),
+                wallet,
+                quantity: quantity.clone(),
+                tx_hash,
+                block_number: 1,
+                detected_at: now,
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer.clone(),
+                tokenization_request_id: tok_id.clone(),
+                alpaca_quantity: quantity.clone(),
+                dust_quantity: Quantity::default(),
+                called_at: now,
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: issuer.clone(),
+                alpaca_journal_completed_at: now,
+            },
+            RedemptionEvent::BurnFireblocksSubmitted {
+                issuer_request_id: issuer.clone(),
+                external_tx_id: BurnExternalTxId::from_string(format!(
+                    "burn-{tx_hash}"
+                )),
+                fireblocks_tx_id: "fb-old-attempt".to_string(),
+                planned_burns: vec![],
+                submitted_at: now,
+            },
+            RedemptionEvent::BurningFailed {
+                issuer_request_id: issuer.clone(),
+                error: "fireblocks failed".to_string(),
+                failed_at: now,
+                fireblocks_tx_id: Some("fb-old-attempt".to_string()),
+                planned_burns: vec![],
+            },
+            RedemptionEvent::RedemptionFailed {
+                issuer_request_id: issuer.clone(),
+                reason: "burn failed".to_string(),
+                failed_at: now,
+            },
+            // Operator resumes the burn — no new BurnFireblocksSubmitted
+            // has happened yet.
+            RedemptionEvent::BurnResumed {
+                issuer_request_id: issuer,
+                underlying,
+                token,
+                wallet,
+                quantity,
+                tx_hash,
+                block_number: 1,
+                detected_at: now,
+                tokenization_request_id: tok_id.clone(),
+                alpaca_quantity: Quantity::default(),
+                dust_quantity: Quantity::default(),
+                called_at: now,
+                alpaca_journal_completed_at: now,
+                external_tx_id: None,
+                resumed_at: now,
+            },
+        ];
+
+        let summary = super::redemption_history_summary_from_events(events);
+
+        // BurnResumed must clear the prior failed Fireblocks tx id so the
+        // stuck-row detail string reflects "Waiting for burn submission"
+        // (not "Waiting for burn confirmation") for the new attempt.
+        assert_eq!(
+            summary.fireblocks_tx_id, None,
+            "BurnResumed must clear prior fireblocks_tx_id from summary"
+        );
+        // tokenization_request_id is preserved (it doesn't reset).
+        assert_eq!(summary.tokenization_request_id, Some(tok_id));
     }
 }

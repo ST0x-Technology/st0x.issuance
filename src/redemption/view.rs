@@ -27,6 +27,12 @@ pub(crate) enum RedemptionView {
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
+        /// When the view most recently entered `Detected`. Matches
+        /// `detected_at` on first detection; updated to `reprocessed_at`
+        /// when `Reprocessed` re-enters this state, so admin triage and the
+        /// staleness gate reflect the latest entry rather than the
+        /// original detection.
+        detected_entered_at: DateTime<Utc>,
     },
     AlpacaCalled {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -56,6 +62,12 @@ pub(crate) enum RedemptionView {
         detected_at: DateTime<Utc>,
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
+        /// When the view most recently entered `Burning`. Matches
+        /// `alpaca_journal_completed_at` on the happy path; updated to
+        /// `resumed_at` when `BurnResumed` re-enters this state, so admin
+        /// triage and the staleness gate reflect the latest entry rather than
+        /// the original journal completion.
+        burning_entered_at: DateTime<Utc>,
     },
     Completed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -175,6 +187,7 @@ impl RedemptionView {
             detected_at: *detected_at,
             called_at: *called_at,
             alpaca_journal_completed_at,
+            burning_entered_at: alpaca_journal_completed_at,
         };
     }
 
@@ -199,6 +212,7 @@ impl RedemptionView {
             detected_at,
             called_at,
             alpaca_journal_completed_at,
+            burning_entered_at: _,
         } = self
         else {
             return;
@@ -238,8 +252,20 @@ impl View<Redemption> for RedemptionView {
                 tx_hash,
                 block_number,
                 detected_at,
+            } => {
+                *self = Self::Detected {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: underlying.clone(),
+                    token: token.clone(),
+                    wallet: *wallet,
+                    quantity: quantity.clone(),
+                    tx_hash: *tx_hash,
+                    block_number: *block_number,
+                    detected_at: *detected_at,
+                    detected_entered_at: *detected_at,
+                };
             }
-            | RedemptionEvent::Reprocessed {
+            RedemptionEvent::Reprocessed {
                 issuer_request_id,
                 underlying,
                 token,
@@ -248,6 +274,7 @@ impl View<Redemption> for RedemptionView {
                 tx_hash,
                 block_number,
                 detected_at,
+                reprocessed_at,
                 ..
             } => {
                 *self = Self::Detected {
@@ -259,6 +286,7 @@ impl View<Redemption> for RedemptionView {
                     tx_hash: *tx_hash,
                     block_number: *block_number,
                     detected_at: *detected_at,
+                    detected_entered_at: *reprocessed_at,
                 };
             }
             RedemptionEvent::AlpacaCalled {
@@ -331,6 +359,7 @@ impl View<Redemption> for RedemptionView {
                 dust_quantity,
                 called_at,
                 alpaca_journal_completed_at,
+                resumed_at,
                 ..
             } => {
                 *self = Self::Burning {
@@ -347,6 +376,7 @@ impl View<Redemption> for RedemptionView {
                     detected_at: *detected_at,
                     called_at: *called_at,
                     alpaca_journal_completed_at: *alpaca_journal_completed_at,
+                    burning_entered_at: *resumed_at,
                 };
             }
             RedemptionEvent::TokensBurned {
@@ -544,10 +574,12 @@ pub(crate) async fn find_burn_failed(
         .collect()
 }
 
-/// Finds all redemptions in Failed or BurnFailed states.
+/// Finds all redemptions that are not in a terminal state.
 ///
-/// These are redemptions that have terminally failed and need manual
-/// intervention via the reprocess endpoint.
+/// Returns every redemption whose view sits in `Detected`, `AlpacaCalled`,
+/// `Burning`, `Failed`, or `BurnFailed` — i.e. anything that hasn't reached
+/// `Completed` or `Closed`. Callers (`/admin/stuck`) apply the staleness gate
+/// and decide which entries the operator must act on.
 pub(crate) async fn find_stuck(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
@@ -556,8 +588,11 @@ pub(crate) async fn find_stuck(
         r#"
         SELECT view_id as "view_id!: String", payload as "payload!: String"
         FROM redemption_view
-        WHERE json_extract(payload, '$.Failed') IS NOT NULL
-           OR json_extract(payload, '$.BurnFailed') IS NOT NULL
+        WHERE json_extract(payload, '$.Detected')     IS NOT NULL
+           OR json_extract(payload, '$.AlpacaCalled') IS NOT NULL
+           OR json_extract(payload, '$.Burning')      IS NOT NULL
+           OR json_extract(payload, '$.Failed')       IS NOT NULL
+           OR json_extract(payload, '$.BurnFailed')   IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -819,6 +854,7 @@ mod tests {
             tx_hash: view_tx_hash,
             block_number: view_block_number,
             detected_at: view_detected_at,
+            detected_entered_at: view_detected_entered_at,
         } = view
         else {
             panic!("Expected Detected view, got {view:?}");
@@ -832,6 +868,9 @@ mod tests {
         assert_eq!(view_tx_hash, tx_hash);
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_detected_at, detected_at);
+        // On first Detection, detected_entered_at mirrors detected_at — the
+        // view has not yet been reprocessed.
+        assert_eq!(view_detected_entered_at, detected_at);
     }
 
     #[test]
@@ -988,6 +1027,7 @@ mod tests {
             detected_at: view_detected_at,
             called_at: view_called_at,
             alpaca_journal_completed_at: view_alpaca_journal_completed_at,
+            burning_entered_at: view_burning_entered_at,
         } = view
         else {
             panic!("Expected Burning view, got {view:?}");
@@ -1009,6 +1049,10 @@ mod tests {
             view_alpaca_journal_completed_at,
             alpaca_journal_completed_at
         );
+        // On the AlpacaJournalCompleted (happy) path, burning_entered_at
+        // mirrors alpaca_journal_completed_at — the view has not yet been
+        // resumed.
+        assert_eq!(view_burning_entered_at, alpaca_journal_completed_at);
     }
 
     #[test]
@@ -1694,11 +1738,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_stuck_returns_failed_and_burn_failed() {
+    async fn test_find_stuck_returns_all_non_terminal_variants() {
         let harness = TestHarness::new().await;
         let TestHarness { pool, cqrs } = &harness;
 
-        // Detected — not stuck
+        // Detected — stuck candidate (in-progress)
         let detected_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
@@ -1711,7 +1755,36 @@ mod tests {
             )
             .await;
 
-        // Failed (AlpacaCallFailed) — stuck
+        // AlpacaCalled — stuck candidate (in-progress)
+        let alpaca_called_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &alpaca_called_id,
+                "GOOG",
+                address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+                30,
+                b256!("0x4444444444444444444444444444444444444444444444444444444444444444"),
+                11111,
+            )
+            .await;
+        harness.call_alpaca(&alpaca_called_id, "tok-alp-called").await;
+
+        // Burning — stuck candidate (in-progress)
+        let burning_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &burning_id,
+                "MSFT",
+                address!("0xdddddddddddddddddddddddddddddddddddddddd"),
+                40,
+                b256!("0x5555555555555555555555555555555555555555555555555555555555555555"),
+                22222,
+            )
+            .await;
+        harness.call_alpaca(&burning_id, "tok-burning").await;
+        harness.confirm_alpaca_complete(&burning_id).await;
+
+        // Failed (AlpacaCallFailed) — stuck (terminal fail)
         let failed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
@@ -1775,27 +1848,64 @@ mod tests {
         harness.confirm_alpaca_complete(&completed_id).await;
         harness.burn_tokens(&completed_id).await;
 
+        // Closed — not stuck (admin close path). CloseRedemption requires
+        // the aggregate to be Failed first.
+        let closed_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(
+                &closed_id,
+                "NFLX",
+                address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                10,
+                b256!("0x6666666666666666666666666666666666666666666666666666666666666666"),
+                33333,
+            )
+            .await;
+        cqrs.execute(
+            &closed_id.to_string(),
+            RedemptionCommand::RecordAlpacaFailure {
+                issuer_request_id: closed_id.clone(),
+                error: "alpaca down".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to fail redemption before close");
+        cqrs.execute(
+            &closed_id.to_string(),
+            RedemptionCommand::CloseRedemption {
+                issuer_request_id: closed_id.clone(),
+                reason: "closed by admin".to_string(),
+            },
+        )
+        .await
+        .expect("Failed to close redemption");
+
         let result = find_stuck(pool).await.unwrap();
 
-        assert_eq!(result.len(), 2, "Expected 2 stuck (Failed + BurnFailed)");
-
         let ids: Vec<_> = result.iter().map(|(id, _)| id.clone()).collect();
-        assert!(ids.contains(&failed_id), "Should include Failed redemption");
-        assert!(
-            ids.contains(&burn_failed_id),
-            "Should include BurnFailed redemption"
+        assert_eq!(
+            result.len(),
+            5,
+            "Expected 5 non-terminal redemptions, got ids: {ids:?}"
         );
+        assert!(ids.contains(&detected_id));
+        assert!(ids.contains(&alpaca_called_id));
+        assert!(ids.contains(&burning_id));
+        assert!(ids.contains(&failed_id));
+        assert!(ids.contains(&burn_failed_id));
+        assert!(!ids.contains(&completed_id), "Completed must be filtered out");
+        assert!(!ids.contains(&closed_id), "Closed must be filtered out");
     }
 
     #[tokio::test]
-    async fn test_find_stuck_returns_empty_when_none_stuck() {
+    async fn test_find_stuck_returns_empty_when_only_completed() {
         let harness = TestHarness::new().await;
         let TestHarness { pool, .. } = &harness;
 
-        let detected_id = IssuerRedemptionRequestId::random();
+        let completed_id = IssuerRedemptionRequestId::random();
         harness
             .detect_redemption(
-                &detected_id,
+                &completed_id,
                 "AAPL",
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 100,
@@ -1803,6 +1913,9 @@ mod tests {
                 12345,
             )
             .await;
+        harness.call_alpaca(&completed_id, "tok-only-completed").await;
+        harness.confirm_alpaca_complete(&completed_id).await;
+        harness.burn_tokens(&completed_id).await;
 
         let result = find_stuck(pool).await.unwrap();
         assert!(result.is_empty());
@@ -1852,7 +1965,9 @@ mod tests {
 
         assert!(matches!(view, RedemptionView::Failed { .. }));
 
-        // Reprocess back to Detected
+        // Reprocess back to Detected. Use a reprocessed_at distinct from
+        // detected_at so the projection's distinction is observable.
+        let reprocessed_at = detected_at + chrono::Duration::days(2);
         view.update(&make_detected_envelope(
             &id,
             3,
@@ -1866,13 +1981,15 @@ mod tests {
                 block_number,
                 detected_at,
                 previous_state: "Failed".to_string(),
-                reprocessed_at: Utc::now(),
+                reprocessed_at,
             },
         ));
 
         let RedemptionView::Detected {
             issuer_request_id: view_id,
             underlying: view_underlying,
+            detected_at: view_detected_at,
+            detected_entered_at: view_detected_entered_at,
             ..
         } = view
         else {
@@ -1881,6 +1998,11 @@ mod tests {
 
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_underlying, underlying);
+        // Reprocessed preserves the original detected_at for audit, but
+        // updates detected_entered_at to reprocessed_at so the staleness
+        // gate (and admin triage timestamp) reflects the most recent entry.
+        assert_eq!(view_detected_at, detected_at);
+        assert_eq!(view_detected_entered_at, reprocessed_at);
     }
 
     #[test]
@@ -1904,6 +2026,7 @@ mod tests {
         let called_at = Utc::now();
         let alpaca_journal_completed_at = Utc::now();
 
+        let resumed_at = Utc::now();
         view.update(&EventEnvelope::<Redemption> {
             aggregate_id: issuer_request_id.to_string(),
             sequence: 1,
@@ -1922,7 +2045,7 @@ mod tests {
                 called_at,
                 alpaca_journal_completed_at,
                 external_tx_id: None,
-                resumed_at: Utc::now(),
+                resumed_at,
             },
             metadata: HashMap::default(),
         });
@@ -1941,6 +2064,7 @@ mod tests {
             detected_at: view_detected_at,
             called_at: view_called_at,
             alpaca_journal_completed_at: view_journal_completed_at,
+            burning_entered_at: view_burning_entered_at,
         } = view
         else {
             panic!("Expected Burning view after BurnResumed, got {view:?}");
@@ -1959,6 +2083,9 @@ mod tests {
         assert_eq!(view_detected_at, detected_at);
         assert_eq!(view_called_at, called_at);
         assert_eq!(view_journal_completed_at, alpaca_journal_completed_at);
+        // BurnResumed re-enters Burning, so burning_entered_at tracks
+        // resumed_at — NOT the (older) alpaca_journal_completed_at.
+        assert_eq!(view_burning_entered_at, resumed_at);
     }
 
     #[test]

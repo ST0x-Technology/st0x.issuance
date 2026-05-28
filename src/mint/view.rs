@@ -560,7 +560,7 @@ pub(crate) async fn find_by_issuer_request_id(
     let issuer_request_id_str = issuer_request_id.to_string();
     let row = sqlx::query!(
         r#"
-        SELECT payload as "payload: String"
+        SELECT payload as "payload!: String"
         FROM mint_view
         WHERE view_id = ?
         "#,
@@ -586,12 +586,47 @@ pub(crate) async fn find_all_recoverable_mints(
 ) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
     let rows = sqlx::query!(
         r#"
-        SELECT view_id as "view_id!: String", payload as "payload: String"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
         FROM mint_view
         WHERE json_extract(payload, '$.JournalConfirmed') IS NOT NULL
            OR json_extract(payload, '$.Minting') IS NOT NULL
            OR json_extract(payload, '$.MintingFailed') IS NOT NULL
            OR json_extract(payload, '$.CallbackPending') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let view: MintView = serde_json::from_str(&row.payload)?;
+            let id = Uuid::parse_str(&row.view_id)?;
+            Ok((IssuerMintRequestId::new(id), view))
+        })
+        .collect()
+}
+
+/// Finds all mints that are not in a terminal state.
+///
+/// Returns every mint whose view sits in `Initiated`, `JournalConfirmed`,
+/// `JournalRejected`, `Minting`, `CallbackPending`, or `MintingFailed` — i.e.
+/// anything that hasn't reached `Completed` or `Closed`. Callers
+/// (`/admin/stuck`) apply the staleness gate and decide which entries the
+/// operator must act on. Differs from `find_all_recoverable_mints`, which is
+/// limited to the states the automated recovery loop knows how to drive.
+pub(crate) async fn find_stuck(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
+        FROM mint_view
+        WHERE json_extract(payload, '$.Initiated')        IS NOT NULL
+           OR json_extract(payload, '$.JournalConfirmed') IS NOT NULL
+           OR json_extract(payload, '$.JournalRejected')  IS NOT NULL
+           OR json_extract(payload, '$.Minting')          IS NOT NULL
+           OR json_extract(payload, '$.CallbackPending')  IS NOT NULL
+           OR json_extract(payload, '$.MintingFailed')    IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -1923,6 +1958,138 @@ mod tests {
     async fn test_find_all_recoverable_mints_returns_empty_when_none() {
         let pool = setup_test_db().await;
         let results = find_all_recoverable_mints(&pool).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_stuck_returns_all_non_terminal_variants() {
+        let harness = TestHarness::new().await;
+        let now = Utc::now();
+
+        // Seed the 4 recoverable variants (JournalConfirmed, Minting,
+        // MintingFailed, CallbackPending).
+        let recoverable_ids = seed_recoverable_mint_views(&harness).await;
+
+        // Seed Initiated and JournalRejected (non-terminal-but-not-recoverable).
+        let initiated_fields = test_mint_fields();
+        let initiated_id = initiated_fields.issuer_request_id.clone();
+        harness
+            .insert_view(
+                &initiated_id,
+                &MintView::Initiated {
+                    issuer_request_id: initiated_fields.issuer_request_id,
+                    tokenization_request_id: initiated_fields
+                        .tokenization_request_id,
+                    quantity: initiated_fields.quantity,
+                    underlying: initiated_fields.underlying,
+                    token: initiated_fields.token,
+                    network: initiated_fields.network,
+                    client_id: initiated_fields.client_id,
+                    wallet: initiated_fields.wallet,
+                    initiated_at: initiated_fields.initiated_at,
+                },
+            )
+            .await;
+
+        let rejected_fields = test_mint_fields();
+        let rejected_id = rejected_fields.issuer_request_id.clone();
+        harness
+            .insert_view(
+                &rejected_id,
+                &MintView::JournalRejected {
+                    issuer_request_id: rejected_fields.issuer_request_id,
+                    tokenization_request_id: rejected_fields
+                        .tokenization_request_id,
+                    quantity: rejected_fields.quantity,
+                    underlying: rejected_fields.underlying,
+                    token: rejected_fields.token,
+                    network: rejected_fields.network,
+                    client_id: rejected_fields.client_id,
+                    wallet: rejected_fields.wallet,
+                    initiated_at: rejected_fields.initiated_at,
+                    reason: "Alpaca rejected the journal".to_string(),
+                    rejected_at: now,
+                },
+            )
+            .await;
+
+        // Seed a Completed mint that must NOT appear.
+        let completed_fields = test_mint_fields();
+        let completed_id = completed_fields.issuer_request_id.clone();
+        harness.insert_view(&completed_id, &MintView::Completed {
+            issuer_request_id: completed_fields.issuer_request_id,
+            tokenization_request_id: completed_fields.tokenization_request_id,
+            quantity: completed_fields.quantity,
+            underlying: completed_fields.underlying,
+            token: completed_fields.token,
+            network: completed_fields.network,
+            client_id: completed_fields.client_id,
+            wallet: completed_fields.wallet,
+            initiated_at: completed_fields.initiated_at,
+            journal_confirmed_at: now,
+            tx_hash: b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
+            receipt_id: uint!(2_U256),
+            shares_minted: uint!(100_000000000000000000_U256),
+            gas_used: Some(50000),
+            block_number: 1001,
+            minted_at: now,
+            completed_at: now,
+        }).await;
+
+        // Seed a Closed mint that must NOT appear.
+        let closed_fields = test_mint_fields();
+        let closed_id = closed_fields.issuer_request_id.clone();
+        harness
+            .insert_view(
+                &closed_id,
+                &MintView::Closed {
+                    issuer_request_id: closed_fields.issuer_request_id,
+                    reason: "closed by admin".to_string(),
+                    closed_at: now,
+                },
+            )
+            .await;
+
+        let results = find_stuck(&harness.pool).await.unwrap();
+        let result_ids: Vec<_> =
+            results.iter().map(|(id, _)| id.clone()).collect();
+
+        assert_eq!(
+            results.len(),
+            6,
+            "Expected 6 non-terminal mints, got ids: {result_ids:?}"
+        );
+        for id in &recoverable_ids {
+            assert!(result_ids.contains(id), "Should include {id}");
+        }
+        assert!(result_ids.contains(&initiated_id), "Should include Initiated");
+        assert!(
+            result_ids.contains(&rejected_id),
+            "Should include JournalRejected"
+        );
+        assert!(
+            !result_ids.contains(&completed_id),
+            "Completed must be filtered out"
+        );
+        assert!(
+            !result_ids.contains(&closed_id),
+            "Closed must be filtered out"
+        );
+
+        let state_names: Vec<_> =
+            results.iter().map(|(_, view)| view.state_name()).collect();
+        assert!(state_names.contains(&"Initiated"));
+        assert!(state_names.contains(&"JournalConfirmed"));
+        assert!(state_names.contains(&"JournalRejected"));
+        assert!(state_names.contains(&"Minting"));
+        assert!(state_names.contains(&"MintingFailed"));
+        assert!(state_names.contains(&"CallbackPending"));
+    }
+
+    #[tokio::test]
+    async fn test_find_stuck_returns_empty_when_none() {
+        let pool = setup_test_db().await;
+        let results = find_stuck(&pool).await.unwrap();
         assert!(results.is_empty());
     }
 }

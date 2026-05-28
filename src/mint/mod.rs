@@ -34,7 +34,7 @@ pub(crate) use cmd::{MintCommand, MintRecoveryMode};
 pub(crate) use event::MintEvent;
 pub(crate) use view::{
     MintView, find_all_recoverable_mints, find_by_issuer_request_id,
-    replay_mint_view,
+    find_stuck, replay_mint_view,
 };
 
 /// Services required by the Mint aggregate for command handling.
