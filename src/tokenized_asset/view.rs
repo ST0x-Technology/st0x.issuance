@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay, ViewRepository};
+use cqrs_es::persist::ViewRepository;
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
@@ -12,6 +12,7 @@ use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
     TokenizedAssetEvent, UnderlyingSymbol,
 };
+use crate::replay::{ReplayError, replay_all_or_fail};
 
 pub(crate) type TokenizedAssetViewRepo =
     Arc<SqliteViewRepository<TokenizedAssetView, TokenizedAsset>>;
@@ -24,15 +25,15 @@ pub(crate) enum TokenizedAssetViewError {
     Deserialization(#[from] serde_json::Error),
     #[error("Persistence error: {0}")]
     Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] cqrs_es::AggregateError<TokenizedAssetError>),
+    #[error("Replay error: {0}")]
+    Replay(#[from] ReplayError<TokenizedAssetError>),
 }
 
 /// Replays all `TokenizedAsset` events through the `tokenized_asset_view`.
 ///
-/// Uses `QueryReplay` to re-project the view from existing events in the event store.
-/// This is used at startup to ensure the view is in sync with events after manual
-/// event store modifications or schema changes.
+/// Re-projects the view from existing events in the event store. This is used at
+/// startup to ensure the view is in sync with events after manual event store
+/// modifications or schema changes.
 pub(crate) async fn replay_tokenized_asset_view(
     pool: Pool<Sqlite>,
 ) -> Result<(), TokenizedAssetViewError> {
@@ -47,11 +48,8 @@ pub(crate) async fn replay_tokenized_asset_view(
         pool.clone(),
         "tokenized_asset_view".to_string(),
     ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
 
     debug!(target: "asset", view = "tokenized_asset_view", "View rebuild complete");
 

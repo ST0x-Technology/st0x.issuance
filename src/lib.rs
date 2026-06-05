@@ -60,6 +60,7 @@ pub(crate) mod config;
 pub(crate) mod fireblocks;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
+pub(crate) mod replay;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 

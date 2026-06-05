@@ -1,6 +1,5 @@
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
@@ -9,6 +8,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::mint::{Mint, MintError, MintEvent};
+use crate::replay::{ReplayError, replay_all_or_fail};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
@@ -31,13 +31,13 @@ pub(crate) enum ReceiptInventoryReplayError {
     Database(#[from] sqlx::Error),
 
     #[error("Replay error: {0}")]
-    Replay(#[from] cqrs_es::AggregateError<MintError>),
+    Replay(#[from] ReplayError<MintError>),
 }
 
 /// Replays all `Mint` events through the `receipt_inventory_view`.
 ///
-/// Uses `QueryReplay` to re-project the view from existing events in the event
-/// store. This runs at startup so receipts activated through historical
+/// Re-projects the view from existing events in the event store. This runs at
+/// startup so receipts activated through historical
 /// `MintEvent::ExistingMintRecovered` events — which earlier code ignored —
 /// are rebuilt as `Active` instead of left stale in `Pending`.
 pub(crate) async fn replay_receipt_inventory_view(
@@ -52,11 +52,8 @@ pub(crate) async fn replay_receipt_inventory_view(
             pool.clone(),
             "receipt_inventory_view".to_string(),
         ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
 
     debug!(target: "receipt", "Receipt inventory view rebuild complete");
 

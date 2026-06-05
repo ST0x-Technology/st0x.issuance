@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, B256};
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay};
-use cqrs_es::{AggregateError, EventEnvelope, View};
+use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
@@ -11,7 +10,9 @@ use tracing::debug;
 
 use super::IssuerRedemptionRequestId;
 use crate::mint::{Quantity, TokenizationRequestId};
+use crate::redemption::upcaster::create_tokens_burned_upcaster;
 use crate::redemption::{Redemption, RedemptionError, RedemptionEvent};
+use crate::replay::{ReplayError, replay_all_or_fail};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -449,13 +450,13 @@ pub(crate) enum RedemptionViewError {
     #[error(transparent)]
     IssuerRequestIdParse(#[from] super::IssuerRedemptionRequestIdParseError),
     #[error("Replay error: {0}")]
-    Replay(#[from] AggregateError<RedemptionError>),
+    Replay(#[from] ReplayError<RedemptionError>),
 }
 
 /// Replays all `Redemption` events through the `redemption_view`.
 ///
-/// Uses `QueryReplay` to re-project the view from existing events in the event store.
-/// This is used at startup to ensure the view includes new fields (alpaca_quantity,
+/// Re-projects the view from existing events in the event store. This is used at
+/// startup to ensure the view includes new fields (alpaca_quantity,
 /// dust_quantity) that were added after the original events were stored.
 pub async fn replay_redemption_view(
     pool: Pool<Sqlite>,
@@ -469,11 +470,13 @@ pub async fn replay_redemption_view(
             pool.clone(),
             "redemption_view".to_string(),
         ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(
+        event_repo,
+        view_repo,
+        vec![create_tokens_burned_upcaster()],
+    )
+    .await?;
 
     debug!(target: "redemption", "Redemption view rebuild complete");
 

@@ -1,6 +1,5 @@
 use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
@@ -10,9 +9,10 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    ClientId, IssuerMintRequestId, Mint, MintEvent, Network, Quantity,
-    TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Mint, MintError, MintEvent, Network,
+    Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
+use crate::replay::{ReplayError, replay_all_or_fail};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MintViewError {
@@ -21,16 +21,16 @@ pub(crate) enum MintViewError {
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
     #[error("Replay error: {0}")]
-    Replay(#[from] cqrs_es::AggregateError<super::MintError>),
+    Replay(#[from] ReplayError<MintError>),
     #[error("UUID parse error: {0}")]
     Uuid(#[from] uuid::Error),
 }
 
 /// Replays all `Mint` events through the `mint_view`.
 ///
-/// Uses `QueryReplay` to re-project the view from existing events in the event store.
-/// This is used at startup to ensure the view is in sync with events after manual
-/// event store modifications or schema changes.
+/// Re-projects the view from existing events in the event store. This is used at
+/// startup to ensure the view is in sync with events after manual event store
+/// modifications or schema changes.
 pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
     debug!(target: "mint", "Rebuilding mint view from events");
 
@@ -40,11 +40,8 @@ pub async fn replay_mint_view(pool: Pool<Sqlite>) -> Result<(), MintViewError> {
         pool.clone(),
         "mint_view".to_string(),
     ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
 
     debug!(target: "mint", "Mint view rebuild complete");
 

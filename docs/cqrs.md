@@ -108,24 +108,28 @@ impl View<MyAggregate> for MyView {
 }
 ```
 
-## Re-projecting Views with QueryReplay
+## Re-projecting Views with `replay_all_or_fail`
 
-When you add a new view or need to rebuild an existing one from events, use
-`QueryReplay`:
+When you add a new view or need to rebuild an existing one from events, use the
+shared `crate::replay::replay_all_or_fail` helper:
 
 ```rust
-use cqrs_es::persist::QueryReplay;
+use crate::replay::replay_all_or_fail;
 
 pub async fn replay_my_view(pool: Pool<Sqlite>) -> Result<(), MyError> {
+    // Clear the target view first so the rebuild starts from a clean slate.
+    sqlx::query!("DELETE FROM my_view").execute(&pool).await?;
+
     let view_repo = Arc::new(SqliteViewRepository::<MyView, MyAggregate>::new(
         pool.clone(),
         "my_view".to_string(),
     ));
-    let query = GenericQuery::new(view_repo);
     let event_repo = SqliteEventRepository::new(pool);
 
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    // Pass the SAME upcasters registered on this aggregate's live event store
+    // (`vec![]` if it registers none) — otherwise legacy event versions the
+    // live store upcasts successfully would deserialize-fail here.
+    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
 
     Ok(())
 }
@@ -134,6 +138,14 @@ pub async fn replay_my_view(pool: Pool<Sqlite>) -> Result<(), MyError> {
 This replays ALL events through the view's `update()` method, rebuilding the
 entire view from scratch. It's idempotent - running it multiple times produces
 the same result.
+
+**Do NOT call `QueryReplay::replay_all()` directly.** Without an installed error
+handler, `cqrs-es` delivers per-event failures (deserialization, stream reads,
+view writes) to an optional handler and **silently drops them when none is set**
+— `replay_all()` then returns `Ok(())` regardless, leaving a view partially or
+fully un-rebuilt while startup reports success. `replay_all_or_fail` installs
+collecting handlers on both silent-drop points and fails fast with a typed
+`ReplayError::EventsDropped` instead.
 
 **Call replay at startup** to ensure views are up-to-date with any schema
 changes.

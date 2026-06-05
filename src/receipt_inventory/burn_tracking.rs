@@ -1,6 +1,5 @@
 use alloy::primitives::{Bytes, TxHash, U256};
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{AggregateError, EventEnvelope, View};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -11,9 +10,11 @@ use tracing::debug;
 
 use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
 use crate::redemption::IssuerRedemptionRequestId;
+use crate::redemption::upcaster::create_tokens_burned_upcaster;
 use crate::redemption::{
     BurnRecord, Redemption, RedemptionError, RedemptionEvent,
 };
+use crate::replay::{ReplayError, replay_all_or_fail};
 use crate::vault::ReceiptInformation;
 
 /// Tracks burn operations for a redemption.
@@ -74,7 +75,7 @@ pub(crate) enum BurnTrackingError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Replay error: {0}")]
-    Replay(#[from] AggregateError<RedemptionError>),
+    Replay(#[from] ReplayError<RedemptionError>),
     #[error("ReceiptInventory aggregate error: {0}")]
     ReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error(
@@ -201,8 +202,8 @@ pub(crate) fn plan_burn(
 
 /// Replays all `Redemption` events through the `receipt_burns_view`.
 ///
-/// Uses `QueryReplay` to re-project the view from existing events in the event store.
-/// This is used at startup to recover view state after the view schema was added.
+/// Re-projects the view from existing events in the event store. This is used at
+/// startup to recover view state after the view schema was added.
 ///
 /// # Errors
 ///
@@ -219,11 +220,13 @@ pub(crate) async fn replay_receipt_burns_view(
             pool.clone(),
             "receipt_burns_view".to_string(),
         ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(
+        event_repo,
+        view_repo,
+        vec![create_tokens_burned_upcaster()],
+    )
+    .await?;
 
     debug!(target: "receipt", "Receipt burns view rebuild complete");
 
@@ -233,6 +236,7 @@ pub(crate) async fn replay_receipt_burns_view(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{U256, address, b256, uint};
+    use cqrs_es::persist::GenericQuery;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;

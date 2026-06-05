@@ -1,6 +1,5 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
@@ -11,6 +10,7 @@ use tracing::debug;
 use super::{
     Account, AccountError, AccountEvent, AlpacaAccountNumber, ClientId, Email,
 };
+use crate::replay::{ReplayError, replay_all_or_fail};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccountViewError {
@@ -20,8 +20,8 @@ pub(crate) enum AccountViewError {
     Deserialization(#[from] serde_json::Error),
     #[error("Persistence error: {0}")]
     Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] cqrs_es::AggregateError<AccountError>),
+    #[error("Replay error: {0}")]
+    Replay(#[from] ReplayError<AccountError>),
 }
 
 pub(crate) async fn replay_account_view(
@@ -36,11 +36,8 @@ pub(crate) async fn replay_account_view(
             pool.clone(),
             "account_view".to_string(),
         ));
-    let query = GenericQuery::new(view_repo);
-
     let event_repo = SqliteEventRepository::new(pool);
-    let replay = QueryReplay::new(event_repo, query);
-    replay.replay_all().await?;
+    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
 
     debug!(target: "account", "Account view rebuild complete");
 
