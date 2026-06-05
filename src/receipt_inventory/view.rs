@@ -1,9 +1,14 @@
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::{GenericQuery, QueryReplay};
 use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
+use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
+use tracing::debug;
 
-use crate::mint::{Mint, MintEvent};
+use crate::mint::{Mint, MintError, MintEvent};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
@@ -13,6 +18,49 @@ pub(crate) enum ReceiptInventoryViewError {
 
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+}
+
+/// Errors raised while rebuilding the `receipt_inventory_view` from events.
+///
+/// Kept separate from [`ReceiptInventoryViewError`] because `MintError` already
+/// embeds that type; holding `AggregateError<MintError>` here instead avoids a
+/// recursive type cycle through the replay path.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReceiptInventoryReplayError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("Replay error: {0}")]
+    Replay(#[from] cqrs_es::AggregateError<MintError>),
+}
+
+/// Replays all `Mint` events through the `receipt_inventory_view`.
+///
+/// Uses `QueryReplay` to re-project the view from existing events in the event
+/// store. This runs at startup so receipts activated through historical
+/// `MintEvent::ExistingMintRecovered` events — which earlier code ignored —
+/// are rebuilt as `Active` instead of left stale in `Pending`.
+pub(crate) async fn replay_receipt_inventory_view(
+    pool: Pool<Sqlite>,
+) -> Result<(), ReceiptInventoryReplayError> {
+    debug!(target: "receipt", "Rebuilding receipt inventory view from events");
+
+    sqlx::query!("DELETE FROM receipt_inventory_view").execute(&pool).await?;
+
+    let view_repo =
+        Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+            pool.clone(),
+            "receipt_inventory_view".to_string(),
+        ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    debug!(target: "receipt", "Receipt inventory view rebuild complete");
+
+    Ok(())
 }
 
 /// Tracks the lifecycle of ERC-1155 receipt tokens from minting through burning.
@@ -106,12 +154,23 @@ impl View<Mint> for ReceiptInventoryView {
                     *minted_at,
                 );
             }
+            MintEvent::ExistingMintRecovered {
+                receipt_id,
+                shares_minted,
+                recovered_at,
+                ..
+            } => {
+                *self = self.clone().with_tokens_minted(
+                    *receipt_id,
+                    *shares_minted,
+                    *recovered_at,
+                );
+            }
             MintEvent::JournalConfirmed { .. }
             | MintEvent::JournalRejected { .. }
             | MintEvent::MintingStarted { .. }
             | MintEvent::MintingFailed { .. }
             | MintEvent::MintCompleted { .. }
-            | MintEvent::ExistingMintRecovered { .. }
             | MintEvent::MintRetryStarted { .. }
             | MintEvent::MintClosed { .. }
             | MintEvent::FireblocksSubmitted { .. } => {}
@@ -124,14 +183,35 @@ mod tests {
     use alloy::primitives::{address, b256, uint};
     use chrono::Utc;
     use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
+    use sqlite_es::SqliteViewRepository;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::mint::{
         ClientId, IssuerMintRequestId, Mint, MintEvent, Network, Quantity,
         TokenizationRequestId,
     };
+    use crate::test_utils::logs_contain_at;
+
+    async fn setup_test_db() -> Pool<Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
 
     #[test]
     fn test_unavailable_to_pending_on_mint_initiated() {
@@ -321,6 +401,289 @@ mod tests {
         assert_eq!(initial_amount, shares_minted);
         assert_eq!(current_balance, shares_minted);
         assert_eq!(view_minted_at, minted_at);
+    }
+
+    #[test]
+    fn test_view_activates_receipt_on_existing_mint_recovered() {
+        let underlying = UnderlyingSymbol::new("MSTR");
+        let token = TokenSymbol::new("tMSTR");
+        let receipt_id = uint!(136_U256);
+        let shares_minted = uint!(4_028802626000000000_U256);
+        let recovered_at = Utc::now();
+
+        let mut view = ReceiptInventoryView::Pending {
+            underlying: underlying.clone(),
+            token: token.clone(),
+        };
+
+        let event = MintEvent::ExistingMintRecovered {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tx_hash: b256!(
+                "0xaff33e27ec0a4232eb2c172fac9a86f794d6551d969b301d734b9ca8511f1e07"
+            ),
+            receipt_id,
+            shares_minted,
+            block_number: 46_337_116,
+            recovered_at,
+        };
+
+        let envelope: EventEnvelope<Mint> = EventEnvelope {
+            aggregate_id: "iss-recovered".to_string(),
+            sequence: 6,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        view.update(&envelope);
+
+        let ReceiptInventoryView::Active {
+            receipt_id: view_receipt_id,
+            underlying: view_underlying,
+            token: view_token,
+            initial_amount,
+            current_balance,
+            minted_at,
+        } = view
+        else {
+            panic!("Expected Active variant, got {view:?}");
+        };
+
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(initial_amount, shares_minted);
+        assert_eq!(current_balance, shares_minted);
+        assert_eq!(minted_at, recovered_at);
+    }
+
+    #[test]
+    fn test_view_recovers_through_full_initiated_then_recovered_sequence() {
+        let underlying = UnderlyingSymbol::new("MSTR");
+        let token = TokenSymbol::new("tMSTR");
+        let receipt_id = uint!(136_U256);
+        let shares_minted = uint!(4_028802626000000000_U256);
+        let recovered_at = Utc::now();
+
+        let mut view = ReceiptInventoryView::default();
+        assert!(matches!(view, ReceiptInventoryView::Unavailable));
+
+        let initiated = MintEvent::Initiated {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tokenization_request_id: TokenizationRequestId::new(
+                "alp-recovered",
+            ),
+            quantity: Quantity::new(Decimal::from(4)),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: Network::new("base"),
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: Utc::now(),
+        };
+
+        view.update(&EventEnvelope::<Mint> {
+            aggregate_id: "iss-recovered".to_string(),
+            sequence: 1,
+            payload: initiated,
+            metadata: HashMap::new(),
+        });
+
+        assert!(matches!(view, ReceiptInventoryView::Pending { .. }));
+
+        let recovered = MintEvent::ExistingMintRecovered {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tx_hash: b256!(
+                "0xaff33e27ec0a4232eb2c172fac9a86f794d6551d969b301d734b9ca8511f1e07"
+            ),
+            receipt_id,
+            shares_minted,
+            block_number: 46_337_116,
+            recovered_at,
+        };
+
+        view.update(&EventEnvelope::<Mint> {
+            aggregate_id: "iss-recovered".to_string(),
+            sequence: 2,
+            payload: recovered,
+            metadata: HashMap::new(),
+        });
+
+        let ReceiptInventoryView::Active {
+            receipt_id: view_receipt_id,
+            underlying: view_underlying,
+            token: view_token,
+            initial_amount,
+            current_balance,
+            minted_at,
+        } = view
+        else {
+            panic!("Expected Active variant, got {view:?}");
+        };
+
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(initial_amount, shares_minted);
+        assert_eq!(current_balance, shares_minted);
+        assert_eq!(minted_at, recovered_at);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_replay_activates_recovered_receipt() {
+        let pool = setup_test_db().await;
+
+        let aggregate_id = "iss-replay-recovered";
+        let underlying = UnderlyingSymbol::new("MSTR");
+        let token = TokenSymbol::new("tMSTR");
+        let receipt_id = uint!(136_U256);
+        let shares_minted = uint!(4_028802626000000000_U256);
+
+        let initiated = MintEvent::Initiated {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tokenization_request_id: TokenizationRequestId::new("alp-replay"),
+            quantity: Quantity::new(Decimal::from(4)),
+            underlying: underlying.clone(),
+            token: token.clone(),
+            network: Network::new("base"),
+            client_id: ClientId::new(),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            initiated_at: Utc::now(),
+        };
+        let initiated_payload = serde_json::to_string(&initiated).unwrap();
+
+        let recovered_at = Utc::now();
+        let recovered = MintEvent::ExistingMintRecovered {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tx_hash: b256!(
+                "0xaff33e27ec0a4232eb2c172fac9a86f794d6551d969b301d734b9ca8511f1e07"
+            ),
+            receipt_id,
+            shares_minted,
+            block_number: 46_337_116,
+            recovered_at,
+        };
+        let recovered_payload = serde_json::to_string(&recovered).unwrap();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 1, 'MintEvent::Initiated', '1.0', ?, '{}')
+            "#,
+            aggregate_id,
+            initiated_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 2, 'MintEvent::ExistingMintRecovered', '1.0', ?, '{}')
+            "#,
+            aggregate_id,
+            recovered_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed a stale `Pending` row to reproduce the production bug: a recovered
+        // mint whose receipt was left in `Pending` because earlier code ignored
+        // `ExistingMintRecovered`. The replay must overwrite it with `Active`.
+        let stale_payload =
+            serde_json::to_string(&ReceiptInventoryView::Pending {
+                underlying: underlying.clone(),
+                token: token.clone(),
+            })
+            .unwrap();
+        sqlx::query!(
+            "
+            INSERT INTO receipt_inventory_view (view_id, version, payload)
+            VALUES (?, 2, ?)
+            ",
+            aggregate_id,
+            stale_payload
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let view_repo =
+            Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
+                pool.clone(),
+                "receipt_inventory_view".to_string(),
+            ));
+        let query = GenericQuery::new(view_repo);
+
+        let stale_view = query
+            .load(aggregate_id)
+            .await
+            .expect("Stale view row should load before replay");
+        assert!(
+            matches!(stale_view, ReceiptInventoryView::Pending { .. }),
+            "View should be stale Pending before replay, got {stale_view:?}"
+        );
+
+        replay_receipt_inventory_view(pool.clone())
+            .await
+            .expect("Replay should succeed");
+
+        let view = query
+            .load(aggregate_id)
+            .await
+            .expect("View should be populated after replay");
+
+        let ReceiptInventoryView::Active {
+            receipt_id: view_receipt_id,
+            underlying: view_underlying,
+            token: view_token,
+            initial_amount,
+            current_balance,
+            minted_at,
+        } = view
+        else {
+            panic!("Expected Active variant after replay, got {view:?}");
+        };
+
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(view_token, token);
+        assert_eq!(initial_amount, shares_minted);
+        assert_eq!(current_balance, shares_minted);
+        assert_eq!(minted_at, recovered_at);
+
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Rebuilding receipt inventory view from events"]
+            ),
+            "Expected DEBUG log on replay start"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Receipt inventory view rebuild complete"]
+            ),
+            "Expected DEBUG log on replay completion"
+        );
     }
 
     #[test]

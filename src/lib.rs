@@ -30,6 +30,7 @@ use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
     ReceiptInventoryView, burn_tracking::replay_receipt_burns_view,
+    replay_receipt_inventory_view,
 };
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -299,6 +300,7 @@ pub async fn initialize_rocket(
     replay_account_view(pool.clone()).await?;
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
+    replay_receipt_inventory_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 

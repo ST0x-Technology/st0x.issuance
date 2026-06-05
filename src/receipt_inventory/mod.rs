@@ -28,7 +28,7 @@ pub(crate) use burn_tracking::{
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
-pub(crate) use view::ReceiptInventoryView;
+pub(crate) use view::{ReceiptInventoryView, replay_receipt_inventory_view};
 
 /// Receipt data recovered from the inventory for mint recovery.
 #[derive(Debug, Clone)]
