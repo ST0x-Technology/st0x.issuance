@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
-use cqrs_es::{CqrsFramework, EventStore};
+use event_sorcery::Store;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,53 +51,39 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// forward, not from `backfill_start_block`. When adding a new vault,
 /// either reset the checkpoint manually or restart with a lower
 /// `backfill_start_block` to cover historic blocks.
-pub(crate) struct TransferPoller<P, RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
+pub(crate) struct TransferPoller<P> {
     provider: P,
     bot_wallet: Address,
     vaults: Vec<Address>,
     backfill_start_block: u64,
-    cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
-    event_store: Arc<RedemptionStore>,
+    store: Arc<Store<Redemption>>,
     pool: Pool<Sqlite>,
-    redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
-    journal_manager: Arc<JournalManager<RedemptionStore>>,
-    burn_manager: Arc<BurnManager<RedemptionStore>>,
+    redeem_call_manager: Arc<RedeemCallManager>,
+    journal_manager: Arc<JournalManager>,
+    burn_manager: Arc<BurnManager>,
 }
 
 /// Configuration for constructing a [`TransferPoller`].
-pub(crate) struct TransferPollerConfig<P, RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
+pub(crate) struct TransferPollerConfig<P> {
     pub(crate) provider: P,
     pub(crate) bot_wallet: Address,
     pub(crate) vaults: Vec<Address>,
     pub(crate) backfill_start_block: u64,
-    pub(crate) cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
-    pub(crate) event_store: Arc<RedemptionStore>,
+    pub(crate) store: Arc<Store<Redemption>>,
     pub(crate) pool: Pool<Sqlite>,
-    pub(crate) redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
-    pub(crate) journal_manager: Arc<JournalManager<RedemptionStore>>,
-    pub(crate) burn_manager: Arc<BurnManager<RedemptionStore>>,
+    pub(crate) redeem_call_manager: Arc<RedeemCallManager>,
+    pub(crate) journal_manager: Arc<JournalManager>,
+    pub(crate) burn_manager: Arc<BurnManager>,
 }
 
-impl<P, RedemptionStore> TransferPoller<P, RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
-    pub(crate) fn new(
-        config: TransferPollerConfig<P, RedemptionStore>,
-    ) -> Self {
+impl<P> TransferPoller<P> {
+    pub(crate) fn new(config: TransferPollerConfig<P>) -> Self {
         Self {
             provider: config.provider,
             bot_wallet: config.bot_wallet,
             vaults: config.vaults,
             backfill_start_block: config.backfill_start_block,
-            cqrs: config.cqrs,
-            event_store: config.event_store,
+            store: config.store,
             pool: config.pool,
             redeem_call_manager: config.redeem_call_manager,
             journal_manager: config.journal_manager,
@@ -120,11 +106,9 @@ pub(crate) enum TransferPollError {
     CheckpointOverflow { last_processed_block: u64 },
 }
 
-impl<P, RedemptionStore> TransferPoller<P, RedemptionStore>
+impl<P> TransferPoller<P>
 where
     P: Provider + Clone + Send + Sync,
-    RedemptionStore: EventStore<Redemption> + 'static,
-    RedemptionStore::AC: Send,
 {
     /// Runs the polling loop forever. Never returns under normal operation.
     ///
@@ -246,7 +230,7 @@ where
         let vault = log.address();
 
         let outcome =
-            match detect_transfer(log, vault, &self.cqrs, &self.pool).await {
+            match detect_transfer(log, vault, &self.store, &self.pool).await {
                 Ok(outcome) => outcome,
                 Err(err) if err.is_non_transient() => {
                     warn!(
@@ -273,7 +257,7 @@ where
                     alpaca_account,
                     network,
                     RedemptionFlowCtx {
-                        event_store: self.event_store.clone(),
+                        store: self.store.clone(),
                         redeem_call_manager: self.redeem_call_manager.clone(),
                         journal_manager: self.journal_manager.clone(),
                         burn_manager: self.burn_manager.clone(),
@@ -316,8 +300,7 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::{CqrsFramework, mem_store::MemStore};
-    use event_sorcery::test_store;
+    use event_sorcery::{Store, test_store};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
@@ -334,34 +317,25 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::vault::mock::MockVaultService;
 
-    type TestRedemptionStore = MemStore<Redemption>;
-    type TestRedemptionCqrs =
-        Arc<CqrsFramework<Redemption, TestRedemptionStore>>;
-
-    /// `pool` must already have migrations applied — the receipt store writes
-    /// to the `events` table on first command dispatch.
-    fn setup_test_cqrs(
+    /// `pool` must already have migrations applied — the stores write to the
+    /// `events` table on first command dispatch.
+    fn setup_test_store(
         pool: &SqlitePool,
-    ) -> (TestRedemptionCqrs, Arc<TestRedemptionStore>, Arc<dyn ReceiptService>)
-    {
-        let store = Arc::new(MemStore::default());
+    ) -> (Arc<Store<Redemption>>, Arc<dyn ReceiptService>) {
         let receipt_store =
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
-        let cqrs = Arc::new(CqrsFramework::new(
-            (*store).clone(),
-            vec![],
-            vault_service,
-        ));
+        let store =
+            Arc::new(test_store::<Redemption>(pool.clone(), vault_service));
         let receipt_service: Arc<dyn ReceiptService> =
             Arc::new(CqrsReceiptService::new(receipt_store));
 
-        (cqrs, store, receipt_service)
+        (store, receipt_service)
     }
 
     struct TestPollerSetup<P: alloy::providers::Provider + Clone> {
-        poller: super::TransferPoller<P, TestRedemptionStore>,
+        poller: super::TransferPoller<P>,
         pool: SqlitePool,
     }
 
@@ -383,14 +357,13 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
-        let (cqrs, store, receipt_service) = setup_test_cqrs(&pool);
+        let (store, receipt_service) = setup_test_store(&pool);
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let redeem_call_manager = Arc::new(
             crate::redemption::redeem_call_manager::RedeemCallManager::new(
                 alpaca_service.clone(),
-                cqrs.clone(),
                 store.clone(),
                 pool.clone(),
             ),
@@ -398,7 +371,6 @@ mod tests {
         let journal_manager =
             Arc::new(crate::redemption::journal_manager::JournalManager::new(
                 alpaca_service,
-                cqrs.clone(),
                 store.clone(),
                 pool.clone(),
             ));
@@ -409,7 +381,6 @@ mod tests {
             Arc::new(crate::redemption::burn_manager::BurnManager::new(
                 vault_service,
                 pool.clone(),
-                cqrs.clone(),
                 store.clone(),
                 receipt_service,
                 bot_wallet,
@@ -424,8 +395,7 @@ mod tests {
             bot_wallet,
             vaults: vec![vault],
             backfill_start_block,
-            cqrs,
-            event_store: store,
+            store,
             pool: pool.clone(),
             redeem_call_manager,
             journal_manager,
@@ -626,14 +596,13 @@ mod tests {
 
         let pool = setup_test_db_with_asset(vault, None).await;
 
-        let (cqrs, store, receipt_service) = setup_test_cqrs(&pool);
+        let (store, receipt_service) = setup_test_store(&pool);
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
         let redeem_call_manager = Arc::new(
             crate::redemption::redeem_call_manager::RedeemCallManager::new(
                 alpaca_service.clone(),
-                cqrs.clone(),
                 store.clone(),
                 pool.clone(),
             ),
@@ -641,7 +610,6 @@ mod tests {
         let journal_manager =
             Arc::new(crate::redemption::journal_manager::JournalManager::new(
                 alpaca_service,
-                cqrs.clone(),
                 store.clone(),
                 pool.clone(),
             ));
@@ -651,7 +619,6 @@ mod tests {
             Arc::new(crate::redemption::burn_manager::BurnManager::new(
                 vault_service,
                 pool.clone(),
-                cqrs.clone(),
                 store.clone(),
                 receipt_service,
                 bot_wallet,
@@ -666,8 +633,7 @@ mod tests {
             bot_wallet,
             vaults: vec![],
             backfill_start_block: 0,
-            cqrs,
-            event_store: store,
+            store,
             pool: pool.clone(),
             redeem_call_manager,
             journal_manager,
