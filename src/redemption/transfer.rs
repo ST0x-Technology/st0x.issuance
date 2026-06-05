@@ -1,12 +1,13 @@
 use alloy::primitives::Address;
 use alloy::sol_types::SolEvent;
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use cqrs_es::AggregateError;
+use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand,
     burn_manager::BurnManager, journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
 };
@@ -45,13 +46,23 @@ pub(crate) enum TransferProcessingError {
     #[error("Quantity conversion error: {0}")]
     QuantityConversion(#[from] QuantityConversionError),
     #[error("CQRS error: {0}")]
-    Aggregate(#[from] cqrs_es::AggregateError<RedemptionError>),
+    Aggregate(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Account view error: {0}")]
     AccountView(#[from] AccountViewError),
     #[error("Tokenized asset view error: {0}")]
     TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("No asset found for vault {vault}")]
     NoMatchingAsset { vault: Address },
+}
+
+// `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
+// Redemption aggregate), so it's boxed to keep `TransferProcessingError` small.
+impl From<AggregateError<LifecycleError<Redemption>>>
+    for TransferProcessingError
+{
+    fn from(error: AggregateError<LifecycleError<Redemption>>) -> Self {
+        Self::Aggregate(Box::new(error))
+    }
 }
 
 impl TransferProcessingError {
@@ -73,15 +84,12 @@ impl TransferProcessingError {
 /// Decodes a Transfer log, looks up account and asset, and executes
 /// `RedemptionCommand::Detect`. Idempotent — returns `AlreadyDetected` on
 /// duplicate.
-pub(crate) async fn detect_transfer<RedemptionStore>(
+pub(crate) async fn detect_transfer(
     log: &alloy::rpc::types::Log,
     vault: Address,
-    cqrs: &CqrsFramework<Redemption, RedemptionStore>,
+    store: &Store<Redemption>,
     pool: &Pool<Sqlite>,
-) -> Result<TransferOutcome, TransferProcessingError>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
+) -> Result<TransferOutcome, TransferProcessingError> {
     let transfer_event =
         bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
 
@@ -126,9 +134,9 @@ where
         block_number,
     };
 
-    match cqrs.execute(&issuer_request_id.to_string(), command).await {
+    match store.send(&issuer_request_id, command).await {
         Ok(()) => {}
-        Err(AggregateError::UserError(_)) => {
+        Err(AggregateError::UserError(LifecycleError::Apply(_))) => {
             debug!(target: "redemption", %issuer_request_id,
                 "Transfer already detected"
             );
@@ -151,35 +159,31 @@ where
 }
 
 /// Dependencies for driving the post-detection redemption flow.
-pub(crate) struct RedemptionFlowCtx<RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
-    pub(crate) event_store: Arc<RedemptionStore>,
-    pub(crate) redeem_call_manager: Arc<RedeemCallManager<RedemptionStore>>,
-    pub(crate) journal_manager: Arc<JournalManager<RedemptionStore>>,
-    pub(crate) burn_manager: Arc<BurnManager<RedemptionStore>>,
+pub(crate) struct RedemptionFlowCtx {
+    pub(crate) store: Arc<Store<Redemption>>,
+    pub(crate) redeem_call_manager: Arc<RedeemCallManager>,
+    pub(crate) journal_manager: Arc<JournalManager>,
+    pub(crate) burn_manager: Arc<BurnManager>,
 }
 
 /// Drives the post-detection redemption flow: Alpaca call, journal polling,
 /// and burn. Errors are logged but do not propagate — the detection is already
 /// recorded.
-pub(crate) async fn drive_redemption_flow<RedemptionStore>(
+pub(crate) async fn drive_redemption_flow(
     issuer_request_id: IssuerRedemptionRequestId,
     client_id: ClientId,
     alpaca_account: AlpacaAccountNumber,
     network: Network,
-    deps: RedemptionFlowCtx<RedemptionStore>,
-) where
-    RedemptionStore: EventStore<Redemption> + 'static,
-    RedemptionStore::AC: Send,
-{
-    let mut aggregate_ctx = match deps
-        .event_store
-        .load_aggregate(&issuer_request_id.to_string())
-        .await
-    {
-        Ok(ctx) => ctx,
+    deps: RedemptionFlowCtx,
+) {
+    let redemption = match deps.store.load(&issuer_request_id).await {
+        Ok(Some(redemption)) => redemption,
+        Ok(None) => {
+            warn!(target: "redemption", %issuer_request_id,
+                "Redemption not found after detection"
+            );
+            return;
+        }
         Err(err) => {
             warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
@@ -194,7 +198,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         .handle_redemption_detected(
             &alpaca_account,
             &issuer_request_id,
-            aggregate_ctx.aggregate(),
+            &redemption,
             client_id,
             network,
         )
@@ -207,12 +211,14 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         return;
     }
 
-    let mut aggregate_ctx = match deps
-        .event_store
-        .load_aggregate(&issuer_request_id.to_string())
-        .await
-    {
-        Ok(ctx) => ctx,
+    let redemption = match deps.store.load(&issuer_request_id).await {
+        Ok(Some(redemption)) => redemption,
+        Ok(None) => {
+            warn!(target: "redemption", %issuer_request_id,
+                "Redemption not found after redeem call"
+            );
+            return;
+        }
         Err(err) => {
             warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
@@ -222,11 +228,10 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         }
     };
 
-    let Redemption::AlpacaCalled { tokenization_request_id, .. } =
-        aggregate_ctx.aggregate()
+    let Redemption::AlpacaCalled { tokenization_request_id, .. } = &redemption
     else {
         debug!(target: "redemption", %issuer_request_id,
-            aggregate_state = ?aggregate_ctx.aggregate(),
+            aggregate_state = ?redemption,
             "Aggregate not in AlpacaCalled state after redeem call"
         );
         return;
@@ -251,12 +256,14 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
             return;
         }
 
-        let mut aggregate_ctx = match deps
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-        {
-            Ok(ctx) => ctx,
+        let redemption = match deps.store.load(&issuer_request_id).await {
+            Ok(Some(redemption)) => redemption,
+            Ok(None) => {
+                warn!(target: "redemption", %issuer_request_id,
+                    "Redemption not found after journal completion"
+                );
+                return;
+            }
             Err(err) => {
                 warn!(target: "redemption", %issuer_request_id,
                     error = ?err,
@@ -266,13 +273,10 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
             }
         };
 
-        if matches!(aggregate_ctx.aggregate(), Redemption::Burning { .. }) {
+        if matches!(redemption, Redemption::Burning { .. }) {
             if let Err(err) = deps
                 .burn_manager
-                .handle_burning_started(
-                    &issuer_request_id,
-                    aggregate_ctx.aggregate(),
-                )
+                .handle_burning_started(&issuer_request_id, &redemption)
                 .await
             {
                 warn!(target: "redemption", %issuer_request_id,
@@ -282,7 +286,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
             }
         } else {
             debug!(target: "redemption", %issuer_request_id,
-                aggregate_state = ?aggregate_ctx.aggregate(),
+                aggregate_state = ?redemption,
                 "Aggregate not in Burning state after journal completion"
             );
         }
@@ -314,9 +318,8 @@ async fn find_matching_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address, b256};
-    use cqrs_es::{
-        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
-    };
+    use event_sorcery::{Store, test_store};
+    use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
@@ -328,19 +331,11 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::vault::mock::MockVaultService;
 
-    type TestStore = MemStore<Redemption>;
-    type TestCqrs = CqrsFramework<Redemption, TestStore>;
-
-    fn setup_test_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
-        let store = Arc::new(MemStore::default());
+    fn setup_test_store(pool: &SqlitePool) -> Arc<Store<Redemption>> {
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
-        let cqrs = Arc::new(CqrsFramework::new(
-            (*store).clone(),
-            vec![],
-            vault_service,
-        ));
-        (cqrs, store)
+
+        Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
     }
 
     #[traced_test]
@@ -350,8 +345,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
         let tx_hash = b256!(
@@ -362,7 +357,7 @@ mod tests {
             vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
         );
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         let outcome = result.expect("Expected success");
         assert!(
@@ -371,14 +366,11 @@ mod tests {
         );
 
         if let TransferOutcome::Detected { issuer_request_id, .. } = outcome {
-            let mut context = store
-                .load_aggregate(&issuer_request_id.to_string())
-                .await
-                .unwrap();
+            let redemption =
+                store.load(&issuer_request_id).await.unwrap().unwrap();
             assert!(
-                matches!(context.aggregate(), Redemption::Detected { .. }),
-                "Expected Detected state, got {:?}",
-                context.aggregate()
+                matches!(redemption, Redemption::Detected { .. }),
+                "Expected Detected state, got {redemption:?}"
             );
         }
 
@@ -394,8 +386,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
         let tx_hash = b256!(
@@ -411,7 +403,7 @@ mod tests {
             12345,
         );
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedMint)),
@@ -430,8 +422,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
 
         let mut log = create_transfer_log(
             vault,
@@ -445,7 +437,7 @@ mod tests {
         );
         log.transaction_hash = None;
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingTxHash)),
@@ -459,8 +451,8 @@ mod tests {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
 
         let mut log = create_transfer_log(
             vault,
@@ -474,7 +466,7 @@ mod tests {
         );
         log.block_number = None;
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingBlockNumber)),
@@ -491,8 +483,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(wrong_vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
 
@@ -507,7 +499,7 @@ mod tests {
             12345,
         );
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         assert!(
             matches!(
@@ -526,8 +518,8 @@ mod tests {
         let unknown_wallet =
             address!("0x1111111111111111111111111111111111111111");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, None).await;
+        let store = setup_test_store(&pool);
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
 
@@ -542,7 +534,7 @@ mod tests {
             12345,
         );
 
-        let result = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let result = detect_transfer(&log, vault, &store, &pool).await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedNoAccount)),
@@ -562,8 +554,8 @@ mod tests {
         let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let ap_wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let (cqrs, _store) = setup_test_cqrs();
         let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
 
         let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
         let tx_hash = b256!(
@@ -574,13 +566,13 @@ mod tests {
             vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
         );
 
-        let first = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let first = detect_transfer(&log, vault, &store, &pool).await;
         assert!(
             matches!(first, Ok(TransferOutcome::Detected { .. })),
             "First detection should succeed, got {first:?}"
         );
 
-        let second = detect_transfer(&log, vault, &cqrs, &pool).await;
+        let second = detect_transfer(&log, vault, &store, &pool).await;
         assert!(
             matches!(second, Ok(TransferOutcome::AlreadyDetected)),
             "Second detection should return AlreadyDetected, got {second:?}"

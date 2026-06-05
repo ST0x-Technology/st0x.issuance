@@ -1,26 +1,24 @@
 use alloy::primitives::{Bytes, TxHash, U256};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{AggregateError, EventEnvelope, View};
+use cqrs_es::AggregateError;
+use event_sorcery::{EntityList, Never, Reactor, deps};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
-use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tracing::debug;
+use sqlx::{Pool, Sqlite, SqlitePool};
+use tracing::{debug, warn};
 
 use super::{ReceiptId, ReceiptInventoryError, Shares, SharesOverflow};
 use crate::redemption::IssuerRedemptionRequestId;
-use crate::redemption::upcaster::create_tokens_burned_upcaster;
 use crate::redemption::{
-    BurnRecord, Redemption, RedemptionError, RedemptionEvent,
+    BurnRecord, Redemption, RedemptionEvent, TokensBurnedData,
 };
-use crate::replay::{ReplayError, replay_all_or_fail};
 use crate::vault::ReceiptInformation;
 
 /// Tracks burn operations for a redemption.
 ///
-/// This is a cqrs-es view keyed by redemption aggregate_id.
-/// Each successful burn creates one record. Use GenericQuery to update.
+/// Keyed by redemption aggregate_id and maintained by `ReceiptBurnsViewReactor`.
+/// Each successful burn records the receipts that were burned for a redemption.
 ///
 /// To compute available receipt balance, join with receipt_inventory_view
 /// on receipt_id and subtract sum of burns from initial_amount.
@@ -38,35 +36,146 @@ pub(crate) enum ReceiptBurnsView {
     },
 }
 
-impl View<Redemption> for ReceiptBurnsView {
-    fn update(&mut self, event: &EventEnvelope<Redemption>) {
-        match &event.payload {
-            RedemptionEvent::TokensBurned {
+impl ReceiptBurnsView {
+    fn apply(self, event: &RedemptionEvent) -> Self {
+        match event {
+            RedemptionEvent::TokensBurned(TokensBurnedData {
                 issuer_request_id,
                 burns,
                 burned_at,
                 ..
-            } => {
-                *self = Self::Burned {
-                    redemption_issuer_request_id: issuer_request_id.clone(),
-                    burns: burns.clone(),
-                    burned_at: *burned_at,
-                };
-            }
+            }) => Self::Burned {
+                redemption_issuer_request_id: issuer_request_id.clone(),
+                burns: burns.clone(),
+                burned_at: *burned_at,
+            },
             RedemptionEvent::ExistingBurnRecovered {
                 issuer_request_id,
                 burns,
                 recovered_at,
                 ..
-            } => {
-                *self = Self::Burned {
-                    redemption_issuer_request_id: issuer_request_id.clone(),
-                    burns: burns.clone(),
-                    burned_at: *recovered_at,
-                };
-            }
-            _ => {}
+            } => Self::Burned {
+                redemption_issuer_request_id: issuer_request_id.clone(),
+                burns: burns.clone(),
+                burned_at: *recovered_at,
+            },
+            _ => self,
         }
+    }
+}
+
+deps!(ReceiptBurnsViewReactor, [Redemption]);
+
+/// Maintains the `receipt_burns_view` table from the `Redemption` event stream.
+///
+/// Each completed burn (or recovered existing burn) records the receipts that
+/// were burned for a redemption, keyed by the redemption's aggregate_id. The
+/// view is kept up to date by an explicit reactor because event-sorcery allows
+/// only one canonical `Table` projection per aggregate, and `Redemption` has
+/// none (its `Materialized` type is `Nil`).
+pub(crate) struct ReceiptBurnsViewReactor {
+    pool: SqlitePool,
+}
+
+impl ReceiptBurnsViewReactor {
+    pub(crate) const fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    async fn project(
+        &self,
+        id: &IssuerRedemptionRequestId,
+        event: &RedemptionEvent,
+    ) {
+        // Only burn-completion events transition the view; skip the rest to
+        // avoid a pointless read-write cycle.
+        if !matches!(
+            event,
+            RedemptionEvent::TokensBurned(_)
+                | RedemptionEvent::ExistingBurnRecovered { .. }
+        ) {
+            return;
+        }
+
+        let view_id = id.to_string();
+
+        let current = match self.load(&view_id).await {
+            Ok(view) => view,
+            Err(error) => {
+                warn!(target: "receipt", view_id, error = %error,
+                    "Failed to load receipt burns view; skipping update"
+                );
+                return;
+            }
+        };
+
+        let updated = current.apply(event);
+
+        if let Err(error) = self.upsert(&view_id, &updated).await {
+            warn!(target: "receipt", view_id, error = %error,
+                "Failed to write receipt burns view"
+            );
+        }
+    }
+
+    async fn load(
+        &self,
+        view_id: &str,
+    ) -> Result<ReceiptBurnsView, BurnTrackingError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT payload as "payload!: String"
+            FROM receipt_burns_view
+            WHERE view_id = ?
+            "#,
+            view_id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(serde_json::from_str(&row.payload)?),
+            None => Ok(ReceiptBurnsView::Unavailable),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        view_id: &str,
+        view: &ReceiptBurnsView,
+    ) -> Result<(), BurnTrackingError> {
+        let payload = serde_json::to_string(view)?;
+
+        sqlx::query!(
+            "
+            INSERT INTO receipt_burns_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ON CONFLICT(view_id) DO UPDATE SET
+                version = version + 1,
+                payload = ?
+            ",
+            view_id,
+            payload,
+            payload
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Reactor for ReceiptBurnsViewReactor {
+    type Error = Never;
+
+    async fn react(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+    ) -> Result<(), Self::Error> {
+        let (id, redemption_event) = event.into_inner();
+        self.project(&id, &redemption_event).await;
+        Ok(())
     }
 }
 
@@ -74,8 +183,12 @@ impl View<Redemption> for ReceiptBurnsView {
 pub(crate) enum BurnTrackingError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Replay error: {0}")]
-    Replay(#[from] ReplayError<RedemptionError>),
+    #[error("JSON deserialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    IssuerRequestIdParse(
+        #[from] crate::redemption::IssuerRedemptionRequestIdParseError,
+    ),
     #[error("ReceiptInventory aggregate error: {0}")]
     ReceiptInventory(#[from] AggregateError<ReceiptInventoryError>),
     #[error(
@@ -200,33 +313,41 @@ pub(crate) fn plan_burn(
     Ok(BurnPlan { allocations, total_burn, dust })
 }
 
-/// Replays all `Redemption` events through the `receipt_burns_view`.
+/// Rebuilds the `receipt_burns_view` table from the `Redemption` event stream.
 ///
-/// Re-projects the view from existing events in the event store. This is used at
-/// startup to recover view state after the view schema was added.
-///
-/// # Errors
-///
-/// Returns `BurnTrackingError::Replay` if event replay fails.
-pub(crate) async fn replay_receipt_burns_view(
-    pool: Pool<Sqlite>,
+/// Clears the table, then replays every stored `Redemption` event in
+/// `(aggregate_id, sequence)` order through the same projection the live
+/// `ReceiptBurnsViewReactor` uses. Folding events in that order reproduces the
+/// incremental projection, so the rebuilt table matches what live reactions
+/// would have produced. Used at startup to recover view state after the view
+/// schema was added.
+pub(crate) async fn rebuild_receipt_burns_view(
+    pool: &Pool<Sqlite>,
 ) -> Result<(), BurnTrackingError> {
     debug!(target: "receipt", "Rebuilding receipt burns view from events");
 
-    sqlx::query!("DELETE FROM receipt_burns_view").execute(&pool).await?;
+    sqlx::query!("DELETE FROM receipt_burns_view").execute(pool).await?;
 
-    let view_repo =
-        Arc::new(SqliteViewRepository::<ReceiptBurnsView, Redemption>::new(
-            pool.clone(),
-            "receipt_burns_view".to_string(),
-        ));
-    let event_repo = SqliteEventRepository::new(pool);
-    replay_all_or_fail(
-        event_repo,
-        view_repo,
-        vec![create_tokens_burned_upcaster()],
+    let reactor = ReceiptBurnsViewReactor::new(pool.clone());
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            aggregate_id as "aggregate_id!: String",
+            payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Redemption'
+        ORDER BY aggregate_id, sequence
+        "#
     )
+    .fetch_all(pool)
     .await?;
+
+    for row in rows {
+        let id = row.aggregate_id.parse::<IssuerRedemptionRequestId>()?;
+        let event = serde_json::from_str::<RedemptionEvent>(&row.payload)?;
+        reactor.project(&id, &event).await;
+    }
 
     debug!(target: "receipt", "Receipt burns view rebuild complete");
 
@@ -236,16 +357,18 @@ pub(crate) async fn replay_receipt_burns_view(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{U256, address, b256, uint};
-    use cqrs_es::persist::GenericQuery;
+    use event_sorcery::ReactorHarness;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::collections::HashMap;
 
     use super::*;
     use crate::mint::{Quantity, TokenizationRequestId};
-    use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
+    use crate::redemption::{
+        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionEvent,
+        TokensBurnedData,
+    };
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
 
     async fn setup_test_db() -> Pool<Sqlite> {
@@ -263,41 +386,70 @@ mod tests {
         pool
     }
 
-    #[test]
-    fn test_view_updates_on_tokens_burned() {
-        let mut view = ReceiptBurnsView::default();
-        assert!(matches!(view, ReceiptBurnsView::Unavailable));
+    /// Reads back the projected burns view for `id`, deserializing the row the
+    /// reactor wrote. Returns `Unavailable` when no row exists yet.
+    async fn load_view(
+        pool: &SqlitePool,
+        id: &IssuerRedemptionRequestId,
+    ) -> ReceiptBurnsView {
+        let view_id = id.to_string();
+        let row = sqlx::query!(
+            r#"
+            SELECT payload as "payload!: String"
+            FROM receipt_burns_view
+            WHERE view_id = ?
+            "#,
+            view_id
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("Failed to query receipt burns view");
+
+        match row {
+            Some(row) => serde_json::from_str(&row.payload)
+                .expect("Failed to deserialize receipt burns view"),
+            None => ReceiptBurnsView::Unavailable,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_view_updates_on_tokens_burned() {
+        let pool = setup_test_db().await;
+        let harness =
+            ReactorHarness::new(ReceiptBurnsViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: issuer_request_id.clone(),
-            tx_hash: b256!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            burns: vec![BurnRecord {
-                receipt_id: uint!(42_U256),
-                shares_burned: uint!(100_000000000000000000_U256),
-            }],
-            dust_returned: U256::ZERO,
-            gas_used: 50000,
-            block_number: 1000,
-            burned_at: Utc::now(),
-        };
+        assert!(matches!(
+            load_view(&pool, &issuer_request_id).await,
+            ReceiptBurnsView::Unavailable
+        ));
 
-        let envelope = EventEnvelope {
-            aggregate_id: "red-456".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
+        harness
+            .receive::<Redemption>(
+                issuer_request_id.clone(),
+                RedemptionEvent::TokensBurned(TokensBurnedData {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    burns: vec![BurnRecord {
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(100_000000000000000000_U256),
+                    }],
+                    dust_returned: U256::ZERO,
+                    gas_used: 50000,
+                    block_number: 1000,
+                    burned_at: Utc::now(),
+                }),
+            )
+            .await
+            .unwrap();
 
         let ReceiptBurnsView::Burned {
             redemption_issuer_request_id,
             burns,
             ..
-        } = view
+        } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burned variant");
         };
@@ -308,40 +460,43 @@ mod tests {
         assert_eq!(burns[0].shares_burned, uint!(100_000000000000000000_U256));
     }
 
-    #[test]
-    fn test_view_updates_on_existing_burn_recovered() {
-        let mut view = ReceiptBurnsView::default();
-        assert!(matches!(view, ReceiptBurnsView::Unavailable));
+    #[tokio::test]
+    async fn test_view_updates_on_existing_burn_recovered() {
+        let pool = setup_test_db().await;
+        let harness =
+            ReactorHarness::new(ReceiptBurnsViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let event = RedemptionEvent::ExistingBurnRecovered {
-            issuer_request_id: issuer_request_id.clone(),
-            fireblocks_tx_id: "fb-tx-123".to_string(),
-            tx_hash: b256!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            burns: vec![BurnRecord {
-                receipt_id: uint!(42_U256),
-                shares_burned: uint!(100_000000000000000000_U256),
-            }],
-            block_number: 1000,
-            recovered_at: Utc::now(),
-        };
+        assert!(matches!(
+            load_view(&pool, &issuer_request_id).await,
+            ReceiptBurnsView::Unavailable
+        ));
 
-        let envelope = EventEnvelope {
-            aggregate_id: "red-789".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
+        harness
+            .receive::<Redemption>(
+                issuer_request_id.clone(),
+                RedemptionEvent::ExistingBurnRecovered {
+                    issuer_request_id: issuer_request_id.clone(),
+                    fireblocks_tx_id: "fb-tx-123".to_string(),
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    burns: vec![BurnRecord {
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(100_000000000000000000_U256),
+                    }],
+                    block_number: 1000,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
 
         let ReceiptBurnsView::Burned {
             redemption_issuer_request_id,
             burns,
             ..
-        } = view
+        } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burned variant");
         };
@@ -352,9 +507,11 @@ mod tests {
         assert_eq!(burns[0].shares_burned, uint!(100_000000000000000000_U256));
     }
 
-    #[test]
-    fn test_view_ignores_other_events() {
-        let mut view = ReceiptBurnsView::default();
+    #[tokio::test]
+    async fn test_view_ignores_other_events() {
+        let pool = setup_test_db().await;
+        let harness =
+            ReactorHarness::new(ReceiptBurnsViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let events = vec![
@@ -378,7 +535,7 @@ mod tests {
                 called_at: Utc::now(),
             },
             RedemptionEvent::BurningFailed {
-                issuer_request_id,
+                issuer_request_id: issuer_request_id.clone(),
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
                 fireblocks_tx_id: None,
@@ -387,17 +544,17 @@ mod tests {
         ];
 
         for event in events {
-            let envelope = EventEnvelope {
-                aggregate_id: "red-123".to_string(),
-                sequence: 1,
-                payload: event,
-                metadata: HashMap::new(),
-            };
-            view.update(&envelope);
+            harness
+                .receive::<Redemption>(issuer_request_id.clone(), event)
+                .await
+                .unwrap();
         }
 
         assert!(
-            matches!(view, ReceiptBurnsView::Unavailable),
+            matches!(
+                load_view(&pool, &issuer_request_id).await,
+                ReceiptBurnsView::Unavailable
+            ),
             "View should remain Unavailable for non-burn events"
         );
     }
@@ -411,12 +568,13 @@ mod tests {
     async fn test_reproject_burns_from_events_populates_view() {
         let pool = setup_test_db().await;
 
-        let aggregate_id = "red-reproject-123";
+        let id = IssuerRedemptionRequestId::random();
+        let aggregate_id = id.to_string();
         let receipt_id = uint!(42_U256);
         let shares_burned = uint!(100_000000000000000000_U256);
 
-        let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRedemptionRequestId::random(),
+        let event = RedemptionEvent::TokensBurned(TokensBurnedData {
+            issuer_request_id: id.clone(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -425,7 +583,7 @@ mod tests {
             gas_used: 50000,
             block_number: 1000,
             burned_at: Utc::now(),
-        };
+        });
 
         let payload = serde_json::to_string(&event).unwrap();
         sqlx::query!(
@@ -448,33 +606,22 @@ mod tests {
         .await
         .unwrap();
 
-        let view_repo = Arc::new(SqliteViewRepository::<
-            ReceiptBurnsView,
-            Redemption,
-        >::new(
-            pool.clone(),
-            "receipt_burns_view".to_string(),
-        ));
-        let query = GenericQuery::new(view_repo);
-
         // Verify view is initially empty
         assert!(
-            query.load(aggregate_id).await.is_none(),
+            matches!(
+                load_view(&pool, &id).await,
+                ReceiptBurnsView::Unavailable
+            ),
             "View should be empty before re-projection"
         );
 
-        // Run replay
-        replay_receipt_burns_view(pool.clone())
+        rebuild_receipt_burns_view(&pool)
             .await
-            .expect("Replay should succeed");
+            .expect("Rebuild should succeed");
 
-        // Verify view is now populated via GenericQuery
-        let view = query
-            .load(aggregate_id)
-            .await
-            .expect("View should have been populated after replay");
-
-        let ReceiptBurnsView::Burned { burns, .. } = view else {
+        let ReceiptBurnsView::Burned { burns, .. } =
+            load_view(&pool, &id).await
+        else {
             panic!("Expected Burned variant");
         };
 
@@ -489,10 +636,14 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Insert multiple TokensBurned events for different redemptions
-        for i in 1_u64..=3 {
-            let aggregate_id = format!("red-multi-{i}");
-            let event = RedemptionEvent::TokensBurned {
-                issuer_request_id: IssuerRedemptionRequestId::random(),
+        let ids: Vec<IssuerRedemptionRequestId> =
+            (1_u64..=3).map(|_| IssuerRedemptionRequestId::random()).collect();
+
+        for (index, id) in ids.iter().enumerate() {
+            let i = index as u64 + 1;
+            let aggregate_id = id.to_string();
+            let event = RedemptionEvent::TokensBurned(TokensBurnedData {
+                issuer_request_id: id.clone(),
                 tx_hash: b256!(
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ),
@@ -504,7 +655,7 @@ mod tests {
                 gas_used: 50000,
                 block_number: 1000 + i,
                 burned_at: Utc::now(),
-            };
+            });
 
             let payload = serde_json::to_string(&event).unwrap();
             sqlx::query!(
@@ -520,28 +671,16 @@ mod tests {
             .unwrap();
         }
 
-        replay_receipt_burns_view(pool.clone())
+        rebuild_receipt_burns_view(&pool)
             .await
-            .expect("Replay should succeed");
+            .expect("Rebuild should succeed");
 
-        // Verify all three burns were projected via GenericQuery
-        let view_repo = Arc::new(SqliteViewRepository::<
-            ReceiptBurnsView,
-            Redemption,
-        >::new(
-            pool.clone(),
-            "receipt_burns_view".to_string(),
-        ));
-        let query = GenericQuery::new(view_repo);
-
-        for i in 1_u64..=3 {
-            let aggregate_id = format!("red-multi-{i}");
-            let view = query.load(&aggregate_id).await.unwrap_or_else(|| {
-                panic!("View should exist for {aggregate_id}")
-            });
-
-            let ReceiptBurnsView::Burned { burns, .. } = view else {
-                panic!("Expected Burned variant for {aggregate_id}");
+        for (index, id) in ids.iter().enumerate() {
+            let i = index as u64 + 1;
+            let ReceiptBurnsView::Burned { burns, .. } =
+                load_view(&pool, id).await
+            else {
+                panic!("Expected Burned variant for {id}");
             };
 
             assert_eq!(burns.len(), 1);
@@ -555,12 +694,13 @@ mod tests {
     async fn test_reproject_burns_is_idempotent() {
         let pool = setup_test_db().await;
 
-        let aggregate_id = "red-idempotent-123";
+        let id = IssuerRedemptionRequestId::random();
+        let aggregate_id = id.to_string();
         let receipt_id = uint!(42_U256);
         let shares_burned = uint!(100_000000000000000000_U256);
 
-        let event = RedemptionEvent::TokensBurned {
-            issuer_request_id: IssuerRedemptionRequestId::random(),
+        let event = RedemptionEvent::TokensBurned(TokensBurnedData {
+            issuer_request_id: id.clone(),
             tx_hash: b256!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -569,7 +709,7 @@ mod tests {
             gas_used: 50000,
             block_number: 1000,
             burned_at: Utc::now(),
-        };
+        });
 
         let payload = serde_json::to_string(&event).unwrap();
         sqlx::query!(
@@ -592,31 +732,18 @@ mod tests {
         .await
         .unwrap();
 
-        // Run replay twice
-        replay_receipt_burns_view(pool.clone())
+        // Run rebuild twice
+        rebuild_receipt_burns_view(&pool)
             .await
-            .expect("First replay should succeed");
+            .expect("First rebuild should succeed");
 
-        replay_receipt_burns_view(pool.clone())
+        rebuild_receipt_burns_view(&pool)
             .await
-            .expect("Second replay should succeed");
+            .expect("Second rebuild should succeed");
 
-        // Verify view still has correct data via GenericQuery
-        let view_repo = Arc::new(SqliteViewRepository::<
-            ReceiptBurnsView,
-            Redemption,
-        >::new(
-            pool.clone(),
-            "receipt_burns_view".to_string(),
-        ));
-        let query = GenericQuery::new(view_repo);
-
-        let view = query
-            .load(aggregate_id)
-            .await
-            .expect("View should exist after replay");
-
-        let ReceiptBurnsView::Burned { burns, .. } = view else {
+        let ReceiptBurnsView::Burned { burns, .. } =
+            load_view(&pool, &id).await
+        else {
             panic!("Expected Burned variant");
         };
 
