@@ -1,7 +1,7 @@
 use alloy::primitives::B256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{AggregateError, EventStore};
+use cqrs_es::{Aggregate, AggregateError, EventStore};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
@@ -29,7 +29,9 @@ use crate::redemption::{
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
-use crate::vault::{FireblocksTxStatus, VaultService};
+use crate::vault::{
+    BurnVerification, FireblocksTxStatus, VaultError, VaultService,
+};
 use crate::{
     MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore,
     SqliteEventStore,
@@ -41,6 +43,16 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError>;
+
+    /// Terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose burn
+    /// already landed on-chain, after verifying `burn_tx_hash` against the
+    /// chain. Returns the on-chain verification for the admin response.
+    async fn force_complete_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        reason: String,
+    ) -> Result<BurnVerification, BurnManagerError>;
 }
 
 #[async_trait]
@@ -50,6 +62,15 @@ impl RedemptionBurnRecovery for BurnManager<SqliteEventStore<Redemption>> {
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
         self.recover_burning_redemption(issuer_request_id).await
+    }
+
+    async fn force_complete_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        reason: String,
+    ) -> Result<BurnVerification, BurnManagerError> {
+        self.force_complete_burn(issuer_request_id, burn_tx_hash, reason).await
     }
 }
 
@@ -680,10 +701,15 @@ pub(crate) struct CloseRedemptionRequest {
     reason: String,
 }
 
-/// Admin endpoint to close a failed redemption that cannot be automatically recovered.
+/// Admin endpoint to close a redemption that cannot be automatically recovered.
 ///
-/// Only valid from `Failed` state. Closed redemptions do not appear in stuck queries.
-#[tracing::instrument(skip(_auth, cqrs))]
+/// Valid from `Failed`, `Burning`, or `BurnSubmitted` — the honest terminal
+/// path for a redemption whose burn is not verifiable on-chain (e.g. a
+/// `Failed -> Burning` recovery regression, or an ambiguous case pending
+/// off-chain reconciliation). For a redemption whose burn *did* land on-chain,
+/// use `/admin/force-complete/redemption` instead. Closed redemptions do not
+/// appear in stuck queries.
+#[tracing::instrument(skip(_auth, cqrs, event_store))]
 #[post(
     "/admin/close/redemption/<issuer_request_id>",
     format = "json",
@@ -692,6 +718,7 @@ pub(crate) struct CloseRedemptionRequest {
 pub(crate) async fn close_redemption(
     _auth: InternalAuth,
     cqrs: &rocket::State<RedemptionCqrs>,
+    event_store: &rocket::State<RedemptionEventStore>,
     issuer_request_id: IssuerRedemptionRequestId,
     body: Json<CloseRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -713,16 +740,140 @@ pub(crate) async fn close_redemption(
         map_redemption_error(&err)
     })?;
 
+    let previous_state =
+        redemption_state_before_last_event(event_store.inner(), &aggregate_id)
+            .await?;
+
     info!(target: "admin", aggregate_id = %aggregate_id,
+        previous_state = %previous_state,
         "Redemption closed"
     );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Redemption,
         aggregate_id,
-        previous_state: "Failed".to_string(),
+        previous_state,
         message: "Redemption closed by admin".to_string(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ForceCompleteRedemptionRequest {
+    /// On-chain transaction hash that burned the redemption's shares. Verified
+    /// against the chain before the redemption is terminalized.
+    burn_tx_hash: B256,
+    /// Operator-supplied audit reason recorded with the terminal event.
+    reason: String,
+}
+
+/// Admin endpoint to terminalize a redemption stuck in `Burning`/`BurnSubmitted`
+/// whose burn already landed on-chain but was never recorded.
+///
+/// The supplied `burn_tx_hash` is verified on-chain (the receipt must have
+/// succeeded and contain a real `Transfer(bot_wallet -> 0x0)` of the vault's
+/// shares) before the redemption is moved to `Completed`, recording the proving
+/// tx hash for audit. Ambiguous cases with no verifiable on-chain burn are
+/// rejected (`422`) — use `/admin/close/redemption` for those.
+#[tracing::instrument(skip(_auth, event_store, burn_recovery))]
+#[post(
+    "/admin/force-complete/redemption/<issuer_request_id>",
+    format = "json",
+    data = "<body>"
+)]
+pub(crate) async fn force_complete_redemption(
+    _auth: InternalAuth,
+    event_store: &rocket::State<RedemptionEventStore>,
+    burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    body: Json<ForceCompleteRedemptionRequest>,
+) -> Result<Json<ReprocessResponse>, Status> {
+    let aggregate_id = issuer_request_id.to_string();
+    let ForceCompleteRedemptionRequest { burn_tx_hash, reason } =
+        body.into_inner();
+
+    let verification = burn_recovery
+        .force_complete_burn(&issuer_request_id, burn_tx_hash, reason)
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to force-complete redemption"
+            );
+            map_burn_manager_error(&err)
+        })?;
+
+    let previous_state =
+        redemption_state_before_last_event(event_store.inner(), &aggregate_id)
+            .await?;
+
+    info!(target: "admin", aggregate_id = %aggregate_id,
+        burn_tx_hash = ?burn_tx_hash,
+        block_number = verification.block_number,
+        previous_state = %previous_state,
+        "Redemption force-completed"
+    );
+
+    Ok(Json(ReprocessResponse {
+        aggregate_type: AggregateKind::Redemption,
+        aggregate_id,
+        previous_state,
+        message: format!(
+            "Force-completed: burn verified on-chain at block {} ({} shares)",
+            verification.block_number, verification.shares_burned
+        ),
+    }))
+}
+
+/// Reconstructs a redemption's state immediately *before* its most recent event
+/// — the state the just-applied terminal command transitioned from — for admin
+/// response/audit reporting.
+///
+/// Read *after* the terminal command commits, not as a preflight load, so it
+/// cannot report a state the command never observed: background recovery and the
+/// transfer poller can advance the aggregate between a preflight read and the
+/// command. Both terminal admin commands (`CloseRedemption`, `ForceCompleteBurn`)
+/// append exactly one event, so replaying every event except the last yields the
+/// pre-transition state. An aggregate with no prior events resolves to
+/// `Uninitialized`.
+async fn redemption_state_before_last_event(
+    event_store: &RedemptionEventStore,
+    aggregate_id: &str,
+) -> Result<String, Status> {
+    let events =
+        event_store.load_events(aggregate_id).await.map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to load redemption events"
+            );
+            Status::InternalServerError
+        })?;
+
+    let mut prior = Redemption::default();
+    let pre_terminal = events.len().saturating_sub(1);
+    for envelope in events.into_iter().take(pre_terminal) {
+        prior.apply(envelope.payload);
+    }
+
+    Ok(prior.state_name().to_string())
+}
+
+/// Maps a burn-manager failure to an HTTP status for the force-complete
+/// endpoint. A bad operator-supplied hash or wrong aggregate state is a client
+/// error (`422`); an on-chain/RPC failure is `502`; anything else is `500`.
+const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
+    match err {
+        BurnManagerError::Vault(
+            VaultError::InvalidReceipt
+            | VaultError::NotABurn { .. }
+            | VaultError::Reverted { .. },
+        )
+        | BurnManagerError::InvalidAggregateState { .. }
+        | BurnManagerError::Cqrs(AggregateError::UserError(_)) => {
+            Status::UnprocessableEntity
+        }
+        BurnManagerError::Vault(_) => Status::BadGateway,
+        _ => Status::InternalServerError,
+    }
 }
 
 #[tracing::instrument(skip(_auth, cqrs, event_store, pool))]
@@ -1539,9 +1690,20 @@ mod tests {
         Fails,
     }
 
+    /// Configurable result for `MockBurnRecovery::force_complete_burn`.
+    #[derive(Clone, Copy)]
+    enum MockForceResult {
+        /// On-chain verification succeeded; report this block number.
+        Verified,
+        /// The operator-supplied hash is not a verifiable burn.
+        NotABurn,
+    }
+
     struct MockBurnRecovery {
         calls: AtomicUsize,
         result: MockBurnResult,
+        force_calls: AtomicUsize,
+        force_result: MockForceResult,
     }
 
     impl Default for MockBurnRecovery {
@@ -1551,6 +1713,8 @@ mod tests {
                 result: MockBurnResult::Succeeds(
                     super::RecoveryOutcome::Executed,
                 ),
+                force_calls: AtomicUsize::new(0),
+                force_result: MockForceResult::Verified,
             }
         }
     }
@@ -1558,6 +1722,10 @@ mod tests {
     impl MockBurnRecovery {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        fn force_calls(&self) -> usize {
+            self.force_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -1572,6 +1740,26 @@ mod tests {
                 MockBurnResult::Succeeds(outcome) => Ok(outcome),
                 MockBurnResult::Fails => {
                     Err(super::BurnManagerError::SharesOverflow)
+                }
+            }
+        }
+
+        async fn force_complete_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+            burn_tx_hash: alloy::primitives::B256,
+            _reason: String,
+        ) -> Result<super::BurnVerification, super::BurnManagerError> {
+            self.force_calls.fetch_add(1, Ordering::Relaxed);
+            match self.force_result {
+                MockForceResult::Verified => Ok(super::BurnVerification {
+                    block_number: 45_989_009,
+                    shares_burned: alloy::primitives::U256::from(17u64),
+                }),
+                MockForceResult::NotABurn => {
+                    Err(super::BurnManagerError::Vault(
+                        super::VaultError::NotABurn { tx_hash: burn_tx_hash },
+                    ))
                 }
             }
         }
@@ -2647,6 +2835,214 @@ mod tests {
         ));
     }
 
+    /// Drives a redemption to `Burning` state (post-journal, pre-burn) — the
+    /// state stuck redemptions wedge in.
+    async fn setup_burning(
+        cqrs: &Arc<SqliteCqrs<Redemption>>,
+    ) -> RedemptionMetadata {
+        let metadata = test_metadata();
+        let alpaca_data = test_alpaca_data();
+        let aggregate_id = metadata.issuer_request_id.to_string();
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::Detect {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                underlying: metadata.underlying.clone(),
+                token: metadata.token.clone(),
+                wallet: metadata.wallet,
+                quantity: metadata.quantity.clone(),
+                tx_hash: metadata.detected_tx_hash,
+                block_number: metadata.block_number,
+            },
+        )
+        .await
+        .expect("Detect failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::RecordAlpacaCall {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                tokenization_request_id: alpaca_data
+                    .tokenization_request_id
+                    .clone(),
+                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                dust_quantity: alpaca_data.dust_quantity.clone(),
+            },
+        )
+        .await
+        .expect("RecordAlpacaCall failed");
+
+        cqrs.execute(
+            &aggregate_id,
+            RedemptionCommand::ConfirmAlpacaComplete {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+            },
+        )
+        .await
+        .expect("ConfirmAlpacaComplete failed");
+
+        metadata
+    }
+
+    fn force_complete_rocket(
+        event_store: TestEventStore,
+        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
+    ) -> rocket::Rocket<rocket::Build> {
+        use crate::alpaca::service::AlpacaConfig;
+        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
+        use crate::config::{Config, LogLevel};
+        use crate::fireblocks::SignerConfig;
+        use alloy::primitives::B256;
+        use url::Url;
+
+        let config = Config {
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            rpc_url: Url::parse("wss://localhost:8545").unwrap(),
+            chain_id: crate::test_utils::ANVIL_CHAIN_ID,
+            signer: SignerConfig::Local(B256::ZERO),
+            backfill_start_block: 0,
+            auth: test_auth_config().unwrap(),
+            log_level: LogLevel::Debug,
+            hyperdx: None,
+            alpaca: AlpacaConfig::test_default(),
+            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+        };
+
+        rocket::build()
+            .manage(config)
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(event_store)
+            .manage(burn_recovery)
+            .mount("/", rocket::routes![super::force_complete_redemption])
+    }
+
+    async fn dispatch_force_complete(
+        rocket: rocket::Rocket<rocket::Build>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        body: &str,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+
+        let response = client
+            .post(format!(
+                "/admin/force-complete/redemption/{issuer_request_id}"
+            ))
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(body)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap();
+        (status, body)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_force_complete_records_verified_burn() {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let metadata = setup_burning(&cqrs).await;
+
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket = force_complete_rocket(event_store, burn_recovery_state);
+        let body = r#"{"burn_tx_hash":"0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf","reason":"burn confirmed on-chain"}"#;
+
+        let (status, body) =
+            dispatch_force_complete(rocket, &metadata.issuer_request_id, body)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        // Response reports the proven block and the true previous state.
+        assert!(body.contains("Force-completed"), "body: {body}");
+        assert!(body.contains("45989009"), "body: {body}");
+        assert!(body.contains("Burning"), "body: {body}");
+        assert_eq!(burn_recovery.force_calls(), 1);
+        assert!(logs_contain_at!(Level::INFO, &["Redemption force-completed"]));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_force_complete_unverifiable_returns_422() {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let metadata = setup_burning(&cqrs).await;
+
+        // Verification fails: the operator-supplied hash is not a burn.
+        let burn_recovery = Arc::new(MockBurnRecovery {
+            force_result: MockForceResult::NotABurn,
+            ..Default::default()
+        });
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket = force_complete_rocket(event_store, burn_recovery_state);
+        let body = r#"{"burn_tx_hash":"0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf","reason":"not actually a burn"}"#;
+
+        let (status, _body) =
+            dispatch_force_complete(rocket, &metadata.issuer_request_id, body)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(burn_recovery.force_calls(), 1);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["Failed to force-complete redemption"]
+        ));
+    }
+
+    #[test]
+    fn map_burn_manager_error_classifies_statuses() {
+        use super::map_burn_manager_error;
+
+        let tx = alloy::primitives::B256::ZERO;
+
+        assert_eq!(
+            map_burn_manager_error(&super::BurnManagerError::Vault(
+                super::VaultError::NotABurn { tx_hash: tx }
+            )),
+            Status::UnprocessableEntity
+        );
+        assert_eq!(
+            map_burn_manager_error(&super::BurnManagerError::Vault(
+                super::VaultError::Reverted { tx_hash: tx }
+            )),
+            Status::UnprocessableEntity
+        );
+        assert_eq!(
+            map_burn_manager_error(
+                &super::BurnManagerError::InvalidAggregateState {
+                    current_state: "Completed".to_string()
+                }
+            ),
+            Status::UnprocessableEntity
+        );
+        // A hash that resolves to no receipt (or one that doesn't prove a burn)
+        // is an unverifiable operator-supplied input, not an upstream failure.
+        assert_eq!(
+            map_burn_manager_error(&super::BurnManagerError::Vault(
+                super::VaultError::InvalidReceipt
+            )),
+            Status::UnprocessableEntity
+        );
+        assert_eq!(
+            map_burn_manager_error(&super::BurnManagerError::SharesOverflow),
+            Status::InternalServerError
+        );
+    }
+
     /// Stub VaultService that returns a pre-canned `FireblocksTxStatus` for a
     /// specific tx id and `None` for everything else. Lets us drive
     /// `enrich_with_fireblocks_status` without spinning up Fireblocks.
@@ -2711,6 +3107,16 @@ mod tests {
             _fireblocks_tx_id: &str,
             _dust_shares: alloy::primitives::U256,
         ) -> Result<crate::vault::MultiBurnResult, crate::vault::VaultError>
+        {
+            unimplemented!("not used in enrichment tests")
+        }
+
+        async fn verify_burn_tx(
+            &self,
+            _vault: alloy::primitives::Address,
+            _owner: alloy::primitives::Address,
+            _tx_hash: alloy::primitives::B256,
+        ) -> Result<crate::vault::BurnVerification, crate::vault::VaultError>
         {
             unimplemented!("not used in enrichment tests")
         }

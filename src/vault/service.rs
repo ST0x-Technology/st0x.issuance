@@ -9,8 +9,9 @@ use tracing::debug;
 
 use super::rain_meta::OaSchemaCache;
 use super::{
-    MintResult, MultiBurnResult, MultiBurnResultEntry, ReceiptInformation,
-    SubmittedTx, VaultError, VaultService,
+    BurnVerification, MintResult, MultiBurnResult, MultiBurnResultEntry,
+    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    verify_burn_in_receipt,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
@@ -393,6 +394,21 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
                 .block_number
                 .ok_or(VaultError::InvalidReceipt)?,
         })
+    }
+
+    async fn verify_burn_tx(
+        &self,
+        vault: Address,
+        owner: Address,
+        tx_hash: B256,
+    ) -> Result<BurnVerification, VaultError> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+
+        verify_burn_in_receipt(&receipt, vault, owner, tx_hash)
     }
 }
 

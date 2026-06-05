@@ -88,10 +88,21 @@ pub(crate) enum RedemptionCommand {
         planned_burns: Vec<super::BurnRecord>,
         block_number: u64,
     },
-    /// Admin-closes a failed redemption that cannot be automatically recovered.
-    /// Only valid from `Failed` state.
+    /// Admin-closes a redemption that cannot be automatically recovered.
+    /// Valid from `Failed`, `Burning`, or `BurnSubmitted`. The honest terminal
+    /// path for a redemption whose burn is not verifiable on-chain.
     CloseRedemption {
         issuer_request_id: IssuerRedemptionRequestId,
+        reason: String,
+    },
+    /// Admin-terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose
+    /// burn already landed on-chain. The admin layer verifies `burn_tx_hash`
+    /// on-chain before issuing this command; the aggregate records it as the
+    /// proving tx hash and transitions to `Completed`.
+    ForceCompleteBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        block_number: u64,
         reason: String,
     },
     /// Resumes a post-Alpaca failed redemption directly to Burning state.

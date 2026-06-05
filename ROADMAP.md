@@ -250,8 +250,14 @@ Bug fixes and improvements that don't fit into the original phases.
       MintView silently drops ExistingMintRecovered and MintCompleted events
       from MintingFailed state
   - **PR:** [#127](https://github.com/ST0x-Technology/st0x.issuance/pull/127)
-- [ ] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
+- [x] [#88](https://github.com/ST0x-Technology/st0x.issuance/issues/88) - Add
       automatic recovery for burns detected as already completed on-chain
+  - Closed NOT_PLANNED on GitHub; revived and resolved as
+    [RAI-799](https://linear.app/makeitrain/issue/RAI-799). Resolved via admin
+    paths rather than fully-automatic recovery: `force-complete` records an
+    on-chain-verified burn tx (terminalizes to `Completed`), and `close` (now
+    valid from `Burning`) handles ambiguous cases.
+  - **PR:** [#169](https://github.com/ST0x-Technology/st0x.issuance/pull/169)
 - [ ] [#110](https://github.com/ST0x-Technology/st0x.issuance/issues/110) -
       IssuerRedemptionRequestId has 4-byte ID space with collision risk at scale
 - [x] [#111](https://github.com/ST0x-Technology/st0x.issuance/issues/111) -

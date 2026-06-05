@@ -422,6 +422,20 @@ impl View<Redemption> for RedemptionView {
                     closed_at: *closed_at,
                 };
             }
+            RedemptionEvent::BurnForceCompleted {
+                issuer_request_id,
+                burn_tx_hash,
+                block_number,
+                completed_at,
+                ..
+            } => {
+                *self = Self::Completed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    burn_tx_hash: *burn_tx_hash,
+                    block_number: *block_number,
+                    completed_at: *completed_at,
+                };
+            }
         }
     }
 }
@@ -2160,5 +2174,46 @@ mod tests {
         assert_eq!(view_id, issuer_request_id);
         assert_eq!(view_reason, reason);
         assert_eq!(view_closed_at, closed_at);
+    }
+
+    #[test]
+    fn test_burn_force_completed_projects_to_completed() {
+        let mut view = RedemptionView::default();
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let burn_tx_hash = b256!(
+            "0x6666666666666666666666666666666666666666666666666666666666666666"
+        );
+        let block_number = 88888;
+        let completed_at = Utc::now();
+
+        view.update(&EventEnvelope::<Redemption> {
+            aggregate_id: issuer_request_id.to_string(),
+            sequence: 1,
+            payload: RedemptionEvent::BurnForceCompleted {
+                issuer_request_id: issuer_request_id.clone(),
+                burn_tx_hash,
+                block_number,
+                reason: "admin recovery".to_string(),
+                completed_at,
+            },
+            metadata: HashMap::default(),
+        });
+
+        let RedemptionView::Completed {
+            issuer_request_id: view_id,
+            burn_tx_hash: view_tx_hash,
+            block_number: view_block_number,
+            completed_at: view_completed_at,
+        } = view
+        else {
+            panic!(
+                "Expected Completed view after BurnForceCompleted, got {view:?}"
+            );
+        };
+
+        assert_eq!(view_id, issuer_request_id);
+        assert_eq!(view_tx_hash, burn_tx_hash);
+        assert_eq!(view_block_number, block_number);
+        assert_eq!(view_completed_at, completed_at);
     }
 }

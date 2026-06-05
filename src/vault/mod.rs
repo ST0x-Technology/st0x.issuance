@@ -1,8 +1,10 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::bindings::OffchainAssetReceiptVault;
 use crate::mint::{
     IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
 };
@@ -108,6 +110,83 @@ pub(crate) trait VaultService: Send + Sync {
         fireblocks_tx_id: &str,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError>;
+
+    /// Verifies an operator-supplied burn transaction hash on-chain.
+    ///
+    /// Fetches the receipt for `tx_hash` and confirms it proves a burn of
+    /// `vault` shares by `owner` — a successful transaction emitting at least
+    /// one `Transfer(owner -> 0x0)` from the vault share token. Used by the
+    /// admin force-complete path to terminalize a redemption stuck in `Burning`
+    /// whose burn already landed on-chain but was never recorded.
+    async fn verify_burn_tx(
+        &self,
+        vault: Address,
+        owner: Address,
+        tx_hash: B256,
+    ) -> Result<BurnVerification, VaultError>;
+}
+
+/// Proof that a burn transaction landed on-chain, returned by
+/// [`VaultService::verify_burn_tx`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BurnVerification {
+    /// Block number the burn transaction was included in.
+    pub(crate) block_number: u64,
+    /// Total shares burned by the owner in this transaction (sum of all
+    /// matching `Transfer(owner -> 0x0)` events). Reported for audit logging;
+    /// the operator is responsible for confirming the amount off-chain.
+    pub(crate) shares_burned: U256,
+}
+
+/// Verifies that `receipt` proves `owner` burned shares of the `vault` share
+/// token (one or more `Transfer(owner -> 0x0)` events emitted by `vault`).
+///
+/// A burn emits an ERC-20 `Transfer(owner, address(0), shares)` from the vault
+/// share token. Reference chain: `redeem()` -> `ReceiptVault._withdraw()` ->
+/// `_burn(owner, shares)` -> `ERC20Upgradeable._update(owner, 0x0, shares)`
+/// emits `Transfer(owner, 0x0, shares)`. Mirrors the mint-skip check in
+/// `redemption/transfer.rs`, which treats `from == 0x0` as a mint.
+pub(crate) fn verify_burn_in_receipt(
+    receipt: &TransactionReceipt,
+    vault: Address,
+    owner: Address,
+    tx_hash: B256,
+) -> Result<BurnVerification, VaultError> {
+    if !receipt.status() {
+        return Err(VaultError::Reverted { tx_hash });
+    }
+
+    let mut shares_burned = U256::ZERO;
+    let mut found_burn = false;
+
+    for log in receipt.inner.logs() {
+        if log.address() != vault {
+            continue;
+        }
+
+        let Ok(decoded) =
+            log.log_decode::<OffchainAssetReceiptVault::Transfer>()
+        else {
+            continue;
+        };
+
+        let transfer = decoded.data();
+        if transfer.from == owner && transfer.to == Address::ZERO {
+            found_burn = true;
+            shares_burned = shares_burned
+                .checked_add(transfer.value)
+                .ok_or(VaultError::InvalidReceipt)?;
+        }
+    }
+
+    if !found_burn {
+        return Err(VaultError::NotABurn { tx_hash });
+    }
+
+    let block_number =
+        receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+
+    Ok(BurnVerification { block_number, shares_burned })
 }
 
 /// Status of a Fireblocks transaction, as returned by `check_fireblocks_tx`.
@@ -319,6 +398,11 @@ pub(crate) enum VaultError {
     /// held for it must be released.
     #[error("Transaction reverted on-chain: {tx_hash:?}")]
     Reverted { tx_hash: B256 },
+    /// Transaction was mined and succeeded but does not prove the expected
+    /// burn — it contains no `Transfer(owner -> 0x0)` of the vault's shares.
+    /// The operator-supplied hash cannot terminalize the redemption.
+    #[error("Transaction is not a burn of the expected shares: {tx_hash:?}")]
+    NotABurn { tx_hash: B256 },
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
@@ -340,6 +424,7 @@ pub(crate) enum VaultError {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
@@ -413,5 +498,150 @@ mod tests {
             serde_json::from_slice(&json_bytes).unwrap();
 
         assert!(decoded["notes"].is_null());
+    }
+
+    const BOT_WALLET: Address = alloy::primitives::address!(
+        "0x1111111111111111111111111111111111111111"
+    );
+    const VAULT: Address = alloy::primitives::address!(
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    const BURN_TX: B256 = alloy::primitives::b256!(
+        "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+    );
+
+    /// Builds a receipt containing the given `(contract, from, to, value)`
+    /// Transfer events, with the given on-chain success status.
+    fn transfer_receipt(
+        success: bool,
+        block_number: u64,
+        transfers: Vec<(Address, Address, Address, U256)>,
+    ) -> TransactionReceipt {
+        use alloy::consensus::{
+            Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
+        };
+        use alloy::primitives::{Bloom, IntoLogData};
+
+        let logs: Vec<alloy::rpc::types::Log> = transfers
+            .into_iter()
+            .enumerate()
+            .map(|(index, (contract, from, to, value))| {
+                let transfer =
+                    OffchainAssetReceiptVault::Transfer { from, to, value };
+
+                alloy::rpc::types::Log {
+                    inner: alloy::primitives::Log {
+                        address: contract,
+                        data: transfer.into_log_data(),
+                    },
+                    block_hash: None,
+                    block_number: Some(block_number),
+                    block_timestamp: None,
+                    transaction_hash: Some(BURN_TX),
+                    transaction_index: Some(0),
+                    log_index: Some(index as u64),
+                    removed: false,
+                }
+            })
+            .collect();
+
+        let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
+            status: Eip658Value::Eip658(success),
+            cumulative_gas_used: 0x8000,
+            logs,
+        };
+
+        TransactionReceipt {
+            transaction_hash: BURN_TX,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: Some(block_number),
+            from: BOT_WALLET,
+            to: Some(VAULT),
+            gas_used: 0x8000,
+            effective_gas_price: 0,
+            contract_address: None,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_accepts_owner_to_zero_transfer() {
+        let receipt = transfer_receipt(
+            true,
+            45_989_009,
+            vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
+        );
+
+        let verification =
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+                .unwrap();
+
+        assert_eq!(verification.block_number, 45_989_009);
+        assert_eq!(verification.shares_burned, U256::from(17u64));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_sums_multiple_burns_ignoring_noise() {
+        let other = address!("0x2222222222222222222222222222222222222222");
+        let other_vault =
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![
+                // A genuine burn by the bot on this vault.
+                (VAULT, BOT_WALLET, Address::ZERO, U256::from(10u64)),
+                // A second burn fragment by the bot on this vault.
+                (VAULT, BOT_WALLET, Address::ZERO, U256::from(5u64)),
+                // Burn by someone else — ignored.
+                (VAULT, other, Address::ZERO, U256::from(99u64)),
+                // Bot transfer to a user (not a burn) — ignored.
+                (VAULT, BOT_WALLET, other, U256::from(99u64)),
+                // Burn on a different vault — ignored.
+                (other_vault, BOT_WALLET, Address::ZERO, U256::from(99u64)),
+            ],
+        );
+
+        let verification =
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+                .unwrap();
+
+        assert_eq!(verification.shares_burned, U256::from(15u64));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_reverted_tx() {
+        let receipt = transfer_receipt(
+            false,
+            100,
+            vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
+        );
+
+        let err = verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+            .unwrap_err();
+
+        assert!(matches!(err, VaultError::Reverted { .. }));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_rejects_non_burn_tx() {
+        let user = address!("0x3333333333333333333333333333333333333333");
+        // Successful tx, but the bot only transferred to a user — no burn.
+        let receipt = transfer_receipt(
+            true,
+            100,
+            vec![(VAULT, BOT_WALLET, user, U256::from(17u64))],
+        );
+
+        let err = verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+            .unwrap_err();
+
+        assert!(matches!(err, VaultError::NotABurn { .. }));
     }
 }

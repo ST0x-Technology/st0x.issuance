@@ -130,6 +130,19 @@ pub(crate) enum RedemptionEvent {
         reason: String,
         closed_at: DateTime<Utc>,
     },
+    /// Admin-recorded terminal success for a redemption stuck in
+    /// `Burning`/`BurnSubmitted` whose burn already landed on-chain but was
+    /// never recorded (e.g. a crash between the burn and `TokensBurned`). The
+    /// admin layer verifies `burn_tx_hash` on-chain before this event is
+    /// emitted. Transitions to `Completed`, recording the proving tx hash for
+    /// audit.
+    BurnForceCompleted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        block_number: u64,
+        reason: String,
+        completed_at: DateTime<Utc>,
+    },
     /// Post-Alpaca failed redemption resumed directly to Burning state.
     /// Used when Alpaca was already called and the journal eventually completed,
     /// but the bot had already timed out and marked the redemption as Failed.
@@ -195,6 +208,9 @@ impl DomainEvent for RedemptionEvent {
             Self::RedemptionClosed { .. } => {
                 "RedemptionEvent::RedemptionClosed".to_string()
             }
+            Self::BurnForceCompleted { .. } => {
+                "RedemptionEvent::BurnForceCompleted".to_string()
+            }
         }
     }
 
@@ -251,6 +267,22 @@ mod tests {
 
         assert_eq!(event.event_type(), "RedemptionEvent::TokensBurned");
         assert_eq!(event.event_version(), "2.0");
+    }
+
+    #[test]
+    fn test_burn_force_completed_event_type() {
+        let event = RedemptionEvent::BurnForceCompleted {
+            issuer_request_id: test_redemption_id(),
+            burn_tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            block_number: 1000,
+            reason: "admin recovery".to_string(),
+            completed_at: Utc::now(),
+        };
+
+        assert_eq!(event.event_type(), "RedemptionEvent::BurnForceCompleted");
+        assert_eq!(event.event_version(), "1.0");
     }
 
     #[test]

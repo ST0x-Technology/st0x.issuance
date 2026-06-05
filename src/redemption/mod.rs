@@ -312,7 +312,7 @@ impl Redemption {
         }
     }
 
-    const fn state_name(&self) -> &'static str {
+    pub(crate) const fn state_name(&self) -> &'static str {
         match self {
             Self::Uninitialized => "Uninitialized",
             Self::Detected { .. } => "Detected",
@@ -640,27 +640,71 @@ impl Redemption {
         }])
     }
 
+    /// Admin-closes a redemption that cannot be auto-recovered. Valid from
+    /// `Failed`, `Burning`, or `BurnSubmitted` — the honest terminal path for a
+    /// redemption whose burn cannot/should not be re-submitted and is not
+    /// verifiable on-chain. Widening beyond `Failed` covers redemptions stuck in
+    /// `Burning` (including the `Failed -> Burning` recovery regression, which
+    /// would otherwise strand a previously-closeable redemption).
     fn handle_close_redemption(
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Self::Failed { .. } = self else {
+        if !matches!(
+            self,
+            Self::Failed { .. }
+                | Self::Burning { .. }
+                | Self::BurnSubmitted { .. }
+        ) {
             return Err(match self {
                 Self::Completed { .. } | Self::Closed { .. } => {
                     RedemptionError::AlreadyCompleted { issuer_request_id }
                 }
                 _ => RedemptionError::InvalidState {
-                    expected: "Failed".to_string(),
+                    expected: "Failed, Burning, or BurnSubmitted".to_string(),
                     found: self.state_name().to_string(),
                 },
             });
-        };
+        }
 
         Ok(vec![RedemptionEvent::RedemptionClosed {
             issuer_request_id,
             reason,
             closed_at: Utc::now(),
+        }])
+    }
+
+    /// Admin-terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose
+    /// burn already landed on-chain but was never recorded. The admin layer
+    /// verifies `burn_tx_hash` on-chain before issuing this command, so the
+    /// aggregate trusts the supplied tx hash and block number and records the
+    /// proving terminal event, transitioning to `Completed`.
+    fn handle_force_complete_burn(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        block_number: u64,
+        reason: String,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::Burning { .. } | Self::BurnSubmitted { .. }) {
+            return Err(match self {
+                Self::Completed { .. } | Self::Closed { .. } => {
+                    RedemptionError::AlreadyCompleted { issuer_request_id }
+                }
+                _ => RedemptionError::InvalidState {
+                    expected: "Burning or BurnSubmitted".to_string(),
+                    found: self.state_name().to_string(),
+                },
+            });
+        }
+
+        Ok(vec![RedemptionEvent::BurnForceCompleted {
+            issuer_request_id,
+            burn_tx_hash,
+            block_number,
+            reason,
+            completed_at: Utc::now(),
         }])
     }
 
@@ -930,6 +974,17 @@ impl Aggregate for Redemption {
                 issuer_request_id,
                 reason,
             } => self.handle_close_redemption(issuer_request_id, reason),
+            RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash,
+                block_number,
+                reason,
+            } => self.handle_force_complete_burn(
+                issuer_request_id,
+                burn_tx_hash,
+                block_number,
+                reason,
+            ),
             RedemptionCommand::Reprocess { issuer_request_id, metadata } => {
                 self.handle_reprocess(issuer_request_id, metadata)
             }
@@ -1135,6 +1190,18 @@ impl Aggregate for Redemption {
                 closed_at,
             } => {
                 *self = Self::Closed { issuer_request_id, reason, closed_at };
+            }
+            RedemptionEvent::BurnForceCompleted {
+                issuer_request_id,
+                burn_tx_hash,
+                completed_at,
+                ..
+            } => {
+                *self = Self::Completed {
+                    issuer_request_id,
+                    burn_tx_hash,
+                    completed_at,
+                };
             }
         }
     }
@@ -1861,6 +1928,289 @@ mod tests {
                 error: "Some error".to_string(),
                 fireblocks_tx_id: None,
                 planned_burns: vec![],
+            })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Burning or BurnSubmitted".to_string(),
+                found: "Uninitialized".to_string(),
+            });
+    }
+
+    /// Events that drive a redemption into the `Burning` state, for tests that
+    /// exercise admin terminalization paths (close / force-complete).
+    fn burning_given_events(
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Vec<RedemptionEvent> {
+        vec![
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("ARKK"),
+                token: TokenSymbol::new("tARKK"),
+                wallet: address!("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+                quantity: Quantity::new(Decimal::from(17)),
+                tx_hash: b256!(
+                    "0x4444444444444444444444444444444444444444444444444444444444444444"
+                ),
+                block_number: 45_000_000,
+                detected_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-arkk-799",
+                ),
+                alpaca_quantity: Quantity::new(Decimal::from(17)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: issuer_request_id.clone(),
+                alpaca_journal_completed_at: Utc::now(),
+            },
+        ]
+    }
+
+    fn burn_submitted_given_events(
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Vec<RedemptionEvent> {
+        let mut events = burning_given_events(issuer_request_id);
+        events.push(RedemptionEvent::BurnFireblocksSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&b256!(
+                "0x4444444444444444444444444444444444444444444444444444444444444444"
+            )),
+            fireblocks_tx_id: "fb-799".to_string(),
+            planned_burns: vec![],
+            submitted_at: Utc::now(),
+        });
+        events
+    }
+
+    #[test]
+    fn test_close_redemption_from_burning_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let reason = "QQQM share accounting unverified".to_string();
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(burning_given_events(&issuer_request_id))
+            .when(RedemptionCommand::CloseRedemption {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: reason.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::RedemptionClosed {
+            issuer_request_id: event_id,
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected RedemptionClosed event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_reason, &reason);
+    }
+
+    #[test]
+    fn test_close_redemption_from_failed_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let mut given = burning_given_events(&issuer_request_id);
+        given.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "burn reverted".to_string(),
+            failed_at: Utc::now(),
+            fireblocks_tx_id: None,
+            planned_burns: vec![],
+        });
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(given)
+            .when(RedemptionCommand::CloseRedemption {
+                issuer_request_id,
+                reason: "unrecoverable".to_string(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], RedemptionEvent::RedemptionClosed { .. }));
+    }
+
+    #[test]
+    fn test_close_redemption_from_burn_submitted_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let reason = "submitted burn unverifiable on-chain".to_string();
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(burn_submitted_given_events(&issuer_request_id))
+            .when(RedemptionCommand::CloseRedemption {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: reason.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::RedemptionClosed {
+            issuer_request_id: event_id,
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected RedemptionClosed event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_reason, &reason);
+    }
+
+    #[test]
+    fn test_close_redemption_from_detected_fails() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        RedemptionTestFramework::with(mock_services())
+            .given(vec![RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("ARKK"),
+                token: TokenSymbol::new("tARKK"),
+                wallet: address!(
+                    "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                ),
+                quantity: Quantity::new(Decimal::from(17)),
+                tx_hash: b256!(
+                    "0x4444444444444444444444444444444444444444444444444444444444444444"
+                ),
+                block_number: 45_000_000,
+                detected_at: Utc::now(),
+            }])
+            .when(RedemptionCommand::CloseRedemption {
+                issuer_request_id,
+                reason: "too early".to_string(),
+            })
+            .then_expect_error(RedemptionError::InvalidState {
+                expected: "Failed, Burning, or BurnSubmitted".to_string(),
+                found: "Detected".to_string(),
+            });
+    }
+
+    #[test]
+    fn test_force_complete_burn_from_burning_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let burn_tx_hash = b256!(
+            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+        );
+        let block_number = 45_989_009;
+        let reason = "burn confirmed on-chain, unrecorded".to_string();
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(burning_given_events(&issuer_request_id))
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                burn_tx_hash,
+                block_number,
+                reason: reason.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::BurnForceCompleted {
+            issuer_request_id: event_id,
+            burn_tx_hash: event_tx_hash,
+            block_number: event_block,
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BurnForceCompleted event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_tx_hash, &burn_tx_hash);
+        assert_eq!(event_block, &block_number);
+        assert_eq!(event_reason, &reason);
+    }
+
+    #[test]
+    fn test_force_complete_burn_from_burn_submitted_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let burn_tx_hash = b256!(
+            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+        );
+        let block_number = 45_989_009;
+        let reason = "submitted burn confirmed on-chain".to_string();
+
+        let validator = RedemptionTestFramework::with(mock_services())
+            .given(burn_submitted_given_events(&issuer_request_id))
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                burn_tx_hash,
+                block_number,
+                reason: reason.clone(),
+            });
+
+        let events = validator.inspect_result().unwrap();
+        assert_eq!(events.len(), 1);
+
+        let RedemptionEvent::BurnForceCompleted {
+            issuer_request_id: event_id,
+            burn_tx_hash: event_tx_hash,
+            block_number: event_block,
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BurnForceCompleted event, got {:?}", &events[0]);
+        };
+
+        assert_eq!(event_id, &issuer_request_id);
+        assert_eq!(event_tx_hash, &burn_tx_hash);
+        assert_eq!(event_block, &block_number);
+        assert_eq!(event_reason, &reason);
+    }
+
+    #[test]
+    fn test_force_complete_burn_transitions_to_completed() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let burn_tx_hash = b256!(
+            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+        );
+
+        let mut redemption = Redemption::default();
+        for event in burning_given_events(&issuer_request_id) {
+            redemption.apply(event);
+        }
+
+        redemption.apply(RedemptionEvent::BurnForceCompleted {
+            issuer_request_id,
+            burn_tx_hash,
+            block_number: 45_989_009,
+            reason: "verified".to_string(),
+            completed_at: Utc::now(),
+        });
+
+        let Redemption::Completed { burn_tx_hash: stored, .. } = redemption
+        else {
+            panic!("Expected Completed state, got {}", redemption.state_name());
+        };
+
+        assert_eq!(stored, burn_tx_hash);
+    }
+
+    #[test]
+    fn test_force_complete_burn_from_wrong_state_fails() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        RedemptionTestFramework::with(mock_services())
+            .given_no_previous_events()
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: b256!(
+                    "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+                ),
+                block_number: 45_989_009,
+                reason: "nope".to_string(),
             })
             .then_expect_error(RedemptionError::InvalidState {
                 expected: "Burning or BurnSubmitted".to_string(),

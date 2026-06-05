@@ -1,13 +1,13 @@
-use alloy::primitives::{Address, Bytes, U256, b256};
+use alloy::primitives::{Address, B256, Bytes, U256, b256};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    FireblocksTxStatus, MintResult, MultiBurnParams, MultiBurnResult,
-    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
-    VaultService,
+    BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
+    MultiBurnResult, MultiBurnResultEntry, ReceiptInformation, SubmittedTx,
+    VaultError, VaultService,
 };
 use crate::redemption::BurnExternalTxId;
 
@@ -42,6 +42,29 @@ enum MockBehavior {
     SubmitRevert,
 }
 
+/// Configured outcome for `verify_burn_tx` in tests, exercising the admin
+/// force-complete path's on-chain verification of an operator-supplied tx hash.
+#[cfg(test)]
+#[derive(Clone)]
+enum MockVerifyBurn {
+    /// The tx proves a burn: return this block number and shares burned.
+    Verified { block_number: u64, shares_burned: U256 },
+    /// The tx succeeded but contains no matching burn.
+    NotABurn,
+    /// The tx reverted on-chain.
+    Reverted,
+}
+
+#[cfg(test)]
+impl Default for MockVerifyBurn {
+    fn default() -> Self {
+        Self::Verified {
+            block_number: 45_989_009,
+            shares_burned: U256::from(1u8),
+        }
+    }
+}
+
 /// Mock blockchain service for testing.
 ///
 /// This mock is NOT behind `#[cfg(test)]` because `setup_test_rocket()` (used by E2E tests
@@ -68,6 +91,10 @@ pub(crate) struct MockVaultService {
     /// default (no Fireblocks state), exercising the non-Fireblocks path.
     #[cfg(test)]
     fireblocks_tx_status: Arc<Mutex<Option<FireblocksTxStatus>>>,
+    /// Outcome returned by `verify_burn_tx`. Defaults to a successful
+    /// verification, exercising the admin force-complete happy path.
+    #[cfg(test)]
+    verify_burn: Arc<Mutex<MockVerifyBurn>>,
 }
 
 impl MockVaultService {
@@ -88,6 +115,8 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fireblocks_tx_status: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
         }
     }
 
@@ -104,6 +133,7 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             fireblocks_tx_status: Arc::new(Mutex::new(None)),
+            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
         }
     }
 
@@ -120,6 +150,7 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             fireblocks_tx_status: Arc::new(Mutex::new(None)),
+            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
         }
     }
 
@@ -136,6 +167,7 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             fireblocks_tx_status: Arc::new(Mutex::new(None)),
+            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
         }
     }
 
@@ -152,6 +184,7 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             fireblocks_tx_status: Arc::new(Mutex::new(None)),
+            verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
         }
     }
 
@@ -194,6 +227,35 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn with_share_balance(self, balance: U256) -> Self {
         *self.share_balance.lock().unwrap() = balance;
+        self
+    }
+
+    /// Configures `verify_burn_tx` to report the operator-supplied tx as a
+    /// burn of `shares_burned` at `block_number`.
+    #[cfg(test)]
+    pub(crate) fn with_verified_burn(
+        self,
+        block_number: u64,
+        shares_burned: U256,
+    ) -> Self {
+        *self.verify_burn.lock().unwrap() =
+            MockVerifyBurn::Verified { block_number, shares_burned };
+        self
+    }
+
+    /// Configures `verify_burn_tx` to report the operator-supplied tx as not a
+    /// burn (succeeded on-chain but no matching `Transfer(owner -> 0x0)`).
+    #[cfg(test)]
+    pub(crate) fn with_unverifiable_burn(self) -> Self {
+        *self.verify_burn.lock().unwrap() = MockVerifyBurn::NotABurn;
+        self
+    }
+
+    /// Configures `verify_burn_tx` to report the operator-supplied tx as
+    /// reverted on-chain.
+    #[cfg(test)]
+    pub(crate) fn with_reverted_burn(self) -> Self {
+        *self.verify_burn.lock().unwrap() = MockVerifyBurn::Reverted;
         self
     }
 
@@ -471,6 +533,35 @@ impl VaultService for MockVaultService {
                     });
                 Ok(result)
             }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    async fn verify_burn_tx(
+        &self,
+        _vault: Address,
+        _owner: Address,
+        tx_hash: B256,
+    ) -> Result<BurnVerification, VaultError> {
+        #[cfg(test)]
+        {
+            use MockVerifyBurn::{NotABurn, Reverted, Verified};
+
+            let outcome = self.verify_burn.lock().unwrap().clone();
+            match outcome {
+                Verified { block_number, shares_burned } => {
+                    Ok(BurnVerification { block_number, shares_burned })
+                }
+                NotABurn => Err(VaultError::NotABurn { tx_hash }),
+                Reverted => Err(VaultError::Reverted { tx_hash }),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Ok(BurnVerification {
+                block_number: 0,
+                shares_burned: U256::from(1u8),
+            })
         }
     }
 }

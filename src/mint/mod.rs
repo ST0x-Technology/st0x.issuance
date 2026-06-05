@@ -2052,8 +2052,9 @@ pub(crate) mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        FireblocksTxStatus, MintResult, MultiBurnParams, MultiBurnResult,
-        ReceiptInformation, SubmittedTx, VaultError, VaultService,
+        BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
+        MultiBurnResult, ReceiptInformation, SubmittedTx, VaultError,
+        VaultService,
     };
 
     pub(super) const VAULT: Address =
@@ -2140,6 +2141,15 @@ pub(crate) mod tests {
         ) -> Result<MultiBurnResult, VaultError> {
             Err(VaultError::InvalidReceipt)
         }
+
+        async fn verify_burn_tx(
+            &self,
+            _vault: Address,
+            _owner: Address,
+            _tx_hash: B256,
+        ) -> Result<BurnVerification, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
     }
 
     /// Vault whose prior Fireblocks tx is terminally failed and whose retry
@@ -2198,6 +2208,15 @@ pub(crate) mod tests {
             _fireblocks_tx_id: &str,
             _expected_dust_shares: U256,
         ) -> Result<MultiBurnResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn verify_burn_tx(
+            &self,
+            _vault: Address,
+            _owner: Address,
+            _tx_hash: B256,
+        ) -> Result<BurnVerification, VaultError> {
             Err(VaultError::InvalidReceipt)
         }
     }

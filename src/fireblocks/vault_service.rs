@@ -24,8 +24,9 @@ use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
-    MintResult, MultiBurnParams, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
+    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
+    VaultService, verify_burn_in_receipt,
 };
 
 /// Fireblocks-specific errors that can occur during vault operations.
@@ -831,6 +832,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let tx_hash = self.wait_for_completion(fireblocks_tx_id).await?;
 
         self.parse_burn_receipt(tx_hash, dust_shares).await
+    }
+
+    async fn verify_burn_tx(
+        &self,
+        vault: Address,
+        owner: Address,
+        tx_hash: B256,
+    ) -> Result<BurnVerification, VaultError> {
+        let receipt = self.fetch_receipt(tx_hash).await?;
+
+        verify_burn_in_receipt(&receipt, vault, owner, tx_hash)
     }
 
     async fn check_fireblocks_tx(

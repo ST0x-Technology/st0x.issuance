@@ -330,7 +330,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256, uint};
+    use alloy::primitives::{Address, B256, U256, address, b256, uint};
     use chrono::Utc;
     use cqrs_es::AggregateContext;
     use rust_decimal::Decimal;
@@ -348,8 +348,9 @@ mod tests {
     };
     use crate::test_utils::log_count_at;
     use crate::vault::{
-        FireblocksTxStatus, MintResult, MultiBurnParams, MultiBurnResult,
-        ReceiptInformation, SubmittedTx, VaultError, VaultService,
+        BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
+        MultiBurnResult, ReceiptInformation, SubmittedTx, VaultError,
+        VaultService,
     };
 
     /// Vault whose Fireblocks transaction never finalizes — every status check
@@ -404,6 +405,15 @@ mod tests {
             _fireblocks_tx_id: &str,
             _expected_dust_shares: U256,
         ) -> Result<MultiBurnResult, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn verify_burn_tx(
+            &self,
+            _vault: Address,
+            _owner: Address,
+            _tx_hash: B256,
+        ) -> Result<BurnVerification, VaultError> {
             Err(VaultError::InvalidReceipt)
         }
     }

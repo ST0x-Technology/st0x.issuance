@@ -465,6 +465,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 mint::confirm_journal,
                 admin::recover_redemption,
                 admin::close_redemption,
+                admin::force_complete_redemption,
                 admin::reprocess_mint,
                 admin::close_mint,
                 admin::list_stuck,

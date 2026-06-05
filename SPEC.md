@@ -343,6 +343,26 @@ on-chain transfer through calling Alpaca to burning tokens.
   Fireblocks accepts it, recovery reuses the same retry id. Emits `BurnResumed`
   event. The admin recovery path immediately invokes burn recovery in-process so
   the on-chain burn does not wait for a service restart.
+- `CloseRedemption { issuer_request_id, reason }` - Admin-close a redemption
+  that cannot be automatically recovered, recording an operator `reason`. Valid
+  from `Failed`, `Burning`, or `BurnSubmitted`. This is the honest terminal path
+  for a redemption whose burn cannot or should not be re-submitted and is
+  **not** verifiable on-chain (e.g. a `Failed -> Burning` recovery regression
+  where no burn ever landed, or an ambiguous case pending off-chain
+  reconciliation). A held receipt reservation is **left in place** (the
+  conservative policy for `Closed`), since an ambiguous burn may still have
+  landed. Emits `RedemptionClosed`.
+- `ForceCompleteBurn { issuer_request_id, burn_tx_hash, block_number, reason }` -
+  Admin-terminalize a redemption stuck in `Burning`/`BurnSubmitted` whose burn
+  **already landed on-chain** but was never recorded (e.g. the bot crashed
+  between the burn and `TokensBurned`). The admin layer verifies the
+  operator-supplied `burn_tx_hash` on-chain first — the receipt must have
+  succeeded and contain a real burn (`Transfer(bot_wallet -> 0x0)`) of the
+  vault's shares — then records the proving tx hash and block number. The
+  receipt reservation is settled (mirror reduced) just like a normal burn
+  completion. Emits `BurnForceCompleted`, transitioning to `Completed`.
+  Ambiguous cases with no verifiable on-chain burn are **not** force-completed;
+  ops use `CloseRedemption` (or reconcile first) instead.
 
 **Events:**
 
@@ -364,6 +384,12 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `BurningFailed` - On-chain burn failed. Carries optional `fireblocks_tx_id`
   and `planned_burns` for recovery of previously submitted transactions
 - `ExistingBurnRecovered` - Existing on-chain burn discovered during recovery
+- `RedemptionClosed` - Admin-closed redemption (terminal). Carries the operator
+  `reason` and `closed_at`. Closed redemptions do not appear in stuck queries.
+- `BurnForceCompleted` - Admin-recorded terminal success for a stuck
+  `Burning`/`BurnSubmitted` redemption whose burn was verified on-chain. Carries
+  the proving `burn_tx_hash`, `block_number`, operator `reason`, and
+  `completed_at`. Transitions to `Completed` (terminal success).
 - `Reprocessed` - Redemption reset to `Detected` state for reprocessing. Carries
   the original `RedemptionMetadata`, the previous state name, and a timestamp.
   Used for audit trail — shows when and from what state a manual reprocess was
@@ -377,18 +403,20 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command -> Event Mappings:**
 
-| Command                 | Events                    | Notes                                      |
-| ----------------------- | ------------------------- | ------------------------------------------ |
-| `DetectRedemption`      | `RedemptionDetected`      | Transfer detected                          |
-| `RecordAlpacaCall`      | `AlpacaCalled`            | Alpaca API called                          |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`        | Terminal failure                           |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`  | Journal complete                           |
-| `BurnTokens`            | `BurnFireblocksSubmitted` | Submits to signing backend                 |
-| `ConfirmBurn`           | `TokensBurned`            | Confirms burn, terminal success            |
-| `RecordBurnFailure`     | `BurningFailed`           | Records failure with optional tx metadata  |
-| `RecordExistingBurn`    | `ExistingBurnRecovered`   | Recovery from Failed with known tx         |
-| `Reprocess`             | `Reprocessed`             | Reset to Detected for reprocessing         |
-| `ResumeBurn`            | `BurnResumed`             | Resume to Burning for post-Alpaca recovery |
+| Command                 | Events                    | Notes                                         |
+| ----------------------- | ------------------------- | --------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`      | Transfer detected                             |
+| `RecordAlpacaCall`      | `AlpacaCalled`            | Alpaca API called                             |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`        | Terminal failure                              |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`  | Journal complete                              |
+| `BurnTokens`            | `BurnFireblocksSubmitted` | Submits to signing backend                    |
+| `ConfirmBurn`           | `TokensBurned`            | Confirms burn, terminal success               |
+| `RecordBurnFailure`     | `BurningFailed`           | Records failure with optional tx metadata     |
+| `RecordExistingBurn`    | `ExistingBurnRecovered`   | Recovery from Failed with known tx            |
+| `Reprocess`             | `Reprocessed`             | Reset to Detected for reprocessing            |
+| `ResumeBurn`            | `BurnResumed`             | Resume to Burning for post-Alpaca recovery    |
+| `CloseRedemption`       | `RedemptionClosed`        | Admin close from Failed/Burning/BurnSubmitted |
+| `ForceCompleteBurn`     | `BurnForceCompleted`      | Admin terminalize a verified-on-chain burn    |
 
 ### Account Aggregate
 
@@ -1582,12 +1610,21 @@ stateDiagram-v2
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> Completed: RecordBurnSuccess
+    Burning --> BurnSubmitted: BurnTokens (BurnFireblocksSubmitted)
     Burning --> Failed: RecordBurnFailure / MarkFailed
+    Burning --> Completed: ForceCompleteBurn (admin, verified on-chain)
+    Burning --> Closed: CloseRedemption (admin)
+    BurnSubmitted --> Completed: ConfirmBurn (TokensBurned)
+    BurnSubmitted --> Failed: RecordBurnFailure / MarkFailed
+    BurnSubmitted --> Completed: ForceCompleteBurn (admin, verified on-chain)
+    BurnSubmitted --> Closed: CloseRedemption (admin)
     Failed --> Failed: MarkFailed (re-classify failure)
     Failed --> Detected: Reprocess (pre-Alpaca)
     Failed --> Burning: ResumeBurn (post-Alpaca)
+    Failed --> Closed: CloseRedemption (admin)
     Failed --> [*]
     Completed --> [*]
+    Closed --> [*]
 ```
 
 **Data Structures:**

@@ -22,7 +22,8 @@ use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
 use crate::vault::{
-    FireblocksTxStatus, MultiBurnEntry, VaultError, VaultService,
+    BurnVerification, FireblocksTxStatus, MultiBurnEntry, VaultError,
+    VaultService,
 };
 
 /// Outcome of recovering a single redemption stuck in a burning state.
@@ -171,6 +172,77 @@ where
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
         self.recover_single_burning(issuer_request_id).await
+    }
+
+    /// Admin-terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose
+    /// burn already landed on-chain but was never recorded (e.g. a crash
+    /// between the burn and `TokensBurned`).
+    ///
+    /// Verifies the operator-supplied `burn_tx_hash` on-chain — the receipt
+    /// must have succeeded and contain a real `Transfer(bot_wallet -> 0x0)` of
+    /// the vault's shares — before recording the proving terminal event and
+    /// transitioning the redemption to `Completed`. The held receipt
+    /// reservation is then settled (mirror reduced), exactly as a normal burn
+    /// completion would. Returns the on-chain verification so the caller can
+    /// report the proven block number and burned shares.
+    ///
+    /// Ambiguous cases with no verifiable on-chain burn fail here (`NotABurn`)
+    /// and must be resolved via `CloseRedemption` (or off-chain reconciliation)
+    /// instead — they are never silently force-completed.
+    pub(crate) async fn force_complete_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        burn_tx_hash: B256,
+        reason: String,
+    ) -> Result<BurnVerification, BurnManagerError> {
+        let context =
+            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+
+        let underlying = match context.aggregate() {
+            Redemption::Burning { metadata, .. }
+            | Redemption::BurnSubmitted { metadata, .. } => {
+                metadata.underlying.clone()
+            }
+            other => {
+                return Err(BurnManagerError::InvalidAggregateState {
+                    current_state: aggregate_state_name(other).to_string(),
+                });
+            }
+        };
+
+        let vault = find_vault_by_underlying(&self.view_pool, &underlying)
+            .await?
+            .ok_or(BurnManagerError::AssetNotFound { underlying })?;
+
+        // Verify the burn actually landed on-chain before recording a terminal
+        // success — never trust the operator-supplied hash blindly.
+        let verification = self
+            .vault_service
+            .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
+            .await?;
+
+        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+            burn_tx_hash = ?burn_tx_hash,
+            block_number = verification.block_number,
+            shares_burned = %verification.shares_burned,
+            "Force-completing stuck Burning redemption: burn verified on-chain"
+        );
+
+        self.cqrs
+            .execute(
+                &issuer_request_id.to_string(),
+                RedemptionCommand::ForceCompleteBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    burn_tx_hash,
+                    block_number: verification.block_number,
+                    reason,
+                },
+            )
+            .await?;
+
+        self.settle_reserved_burn(vault, issuer_request_id).await;
+
+        Ok(verification)
     }
 
     /// Resolves receipt reservations left dangling by a missed settlement —
@@ -668,8 +740,8 @@ where
                 // Check on-chain balance before attempting burn. If the bot has insufficient
                 // shares, the burn likely already succeeded on-chain but we crashed before
                 // recording it. Skip this redemption to avoid recording a false failure.
-                // Manual intervention required to resolve.
-                // TODO: Implement automatic recovery - see #88
+                // Resolve manually via the admin `force-complete` endpoint (records the
+                // verified burn tx) for landed burns, or `close` for ambiguous cases.
                 let on_chain_balance = self
                     .vault_service
                     .get_share_balance(vault, self.bot_wallet)
@@ -1315,8 +1387,8 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
-    use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionView;
+    use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::tokenized_asset::{
@@ -1659,6 +1731,251 @@ mod tests {
                 .is_empty(),
             "successful burn must leave no dangling reservation"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_force_complete_burn_records_verified_burn() {
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burn(45_989_009, uint!(17_U256)),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        // Seed a held reservation so the test fails if force-complete stops
+        // settling inventory after terminalizing the aggregate.
+        harness
+            .discover_receipt(
+                vault,
+                uint!(42_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+        receipt_service
+            .reserve_burn(
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: uint!(42_U256),
+                    shares_burned: uint!(17_U256),
+                }],
+            )
+            .await
+            .expect("seeding reservation should succeed");
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![issuer_request_id.clone()],
+            "reservation should be held before force-complete"
+        );
+
+        let burn_tx_hash = b256!(
+            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+        );
+
+        let verification = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                burn_tx_hash,
+                "burn confirmed on-chain".to_string(),
+            )
+            .await
+            .expect("force-complete should succeed");
+
+        // Block number and shares are taken from the on-chain verification,
+        // not the operator.
+        assert_eq!(verification.block_number, 45_989_009);
+        assert_eq!(verification.shares_burned, uint!(17_U256));
+
+        let updated = load_aggregate(store, &issuer_request_id).await;
+        let Redemption::Completed { burn_tx_hash: recorded, .. } = updated
+        else {
+            panic!("Expected Completed state, got {updated:?}");
+        };
+        assert_eq!(recorded, burn_tx_hash);
+
+        // Force-complete must settle (consume) the held reservation; if the
+        // settle wiring were removed the reservation would linger here.
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "force-complete must leave no dangling reservation"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Force-completing stuck Burning redemption", "verified on-chain"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_force_complete_burn_rejects_unverifiable_burn() {
+        let vault_mock =
+            Arc::new(MockVaultService::new_success().with_unverifiable_burn());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                b256!(
+                    "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+                ),
+                "operator hash is not a burn".to_string(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            BurnManagerError::Vault(VaultError::NotABurn { .. })
+        ));
+
+        // An unverifiable hash must NOT terminalize — the redemption stays
+        // Burning for manual reconciliation.
+        let updated = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated, Redemption::Burning { .. }),
+            "Expected Burning state, got {updated:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_complete_burn_rejects_reverted_tx() {
+        let vault_mock =
+            Arc::new(MockVaultService::new_success().with_reverted_burn());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(
+            cqrs,
+            store,
+            &issuer_request_id,
+        )
+        .await;
+
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                b256!(
+                    "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+                ),
+                "operator hash reverted".to_string(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            BurnManagerError::Vault(VaultError::Reverted { .. })
+        ));
+
+        let updated = load_aggregate(store, &issuer_request_id).await;
+        assert!(
+            matches!(updated, Redemption::Burning { .. }),
+            "Expected Burning state, got {updated:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_complete_burn_rejects_non_burning_state() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+
+        let blockchain_service: Arc<dyn crate::vault::VaultService> =
+            vault_mock.clone();
+        let manager = BurnManager::new(
+            blockchain_service,
+            pool.clone(),
+            cqrs.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+
+        // An unknown redemption is Uninitialized — force-complete must refuse
+        // before ever touching the chain.
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                b256!(
+                    "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+                ),
+                "wrong state".to_string(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            BurnManagerError::InvalidAggregateState { .. }
+        ));
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
     }
 
     #[traced_test]
