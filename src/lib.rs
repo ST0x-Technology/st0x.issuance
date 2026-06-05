@@ -42,8 +42,7 @@ use crate::redemption::{
     upcaster::create_tokens_burned_upcaster,
 };
 use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetView, TokenizedAssetViewRepo,
-    view::{list_enabled_assets, replay_tokenized_asset_view},
+    TokenizedAsset, TokenizedAssetView, view::list_enabled_assets,
 };
 
 pub mod account;
@@ -72,8 +71,6 @@ pub use config::{Config, LogLevel, setup_tracing};
 pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
-
-pub(crate) type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
 
 pub(crate) type MintCqrs = Arc<SqliteCqrs<Mint>>;
 pub(crate) type MintEventStore =
@@ -258,8 +255,8 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let BasicCqrsSetup { tokenized_asset_cqrs, tokenized_asset_view_repo } =
-        setup_basic_cqrs(&pool);
+    let (tokenized_asset_store, _tokenized_asset_projection) =
+        StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
     let (account_store, _account_projection) =
         StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
@@ -297,7 +294,6 @@ pub async fn initialize_rocket(
     // up-to-date views. Each replay clears its view table first to remove
     // stale/corrupt data, then rebuilds from the event store.
     debug!(target: "startup", "Rebuilding all views from events");
-    replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_receipt_inventory_view(pool.clone()).await?;
     replay_redemption_view(pool.clone()).await?;
@@ -399,8 +395,7 @@ pub async fn initialize_rocket(
         config,
         pool,
         account_store,
-        tokenized_asset_cqrs,
-        tokenized_asset_view_repo,
+        tokenized_asset_store,
         mint,
         redemption_cqrs,
         redemption_event_store,
@@ -416,8 +411,7 @@ struct RocketState {
     rate_limiter: FailedAuthRateLimiter,
     pool: Pool<Sqlite>,
     account_store: Arc<Store<Account>>,
-    tokenized_asset_cqrs: TokenizedAssetCqrs,
-    tokenized_asset_view_repo: TokenizedAssetViewRepo,
+    tokenized_asset_store: Arc<Store<TokenizedAsset>>,
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
@@ -440,8 +434,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.config)
         .manage(state.rate_limiter)
         .manage(state.account_store)
-        .manage(state.tokenized_asset_cqrs)
-        .manage(state.tokenized_asset_view_repo)
+        .manage(state.tokenized_asset_store)
         .manage(state.mint.cqrs)
         .manage(state.mint.event_store)
         .manage(state.redemption_cqrs)
@@ -472,25 +465,6 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
             ],
         )
         .register("/", catchers::json_catchers())
-}
-
-struct BasicCqrsSetup {
-    tokenized_asset_cqrs: TokenizedAssetCqrs,
-    tokenized_asset_view_repo: TokenizedAssetViewRepo,
-}
-
-fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
-    let tokenized_asset_view_repo: TokenizedAssetViewRepo =
-        Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-    let tokenized_asset_query =
-        GenericQuery::new(tokenized_asset_view_repo.clone());
-    let tokenized_asset_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
-
-    BasicCqrsSetup { tokenized_asset_cqrs, tokenized_asset_view_repo }
 }
 
 fn setup_aggregate_cqrs(
@@ -772,29 +746,24 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
         "Running receipt backfill for all enabled assets"
     );
 
-    stream::iter(assets.into_iter().filter_map(|asset| match asset {
-        TokenizedAssetView::Asset { vault, underlying, .. } => {
-            Some((vault, underlying))
-        }
-        TokenizedAssetView::Unavailable => None,
-    }))
-    .then(|(vault, underlying)| {
-        let provider = provider.clone();
-        async move {
-            run_single_vault_backfill(
-                pool,
-                &provider,
-                vault,
-                backfill_start_block,
-                &underlying.0,
-                receipt_inventory_cqrs,
-                bot_wallet,
-            )
-            .await
-        }
-    })
-    .try_collect()
-    .await
+    stream::iter(assets)
+        .then(|TokenizedAssetView { vault, underlying, .. }| {
+            let provider = provider.clone();
+            async move {
+                run_single_vault_backfill(
+                    pool,
+                    &provider,
+                    vault,
+                    backfill_start_block,
+                    &underlying.0,
+                    receipt_inventory_cqrs,
+                    bot_wallet,
+                )
+                .await
+            }
+        })
+        .try_collect()
+        .await
 }
 
 /// Runs receipt backfill for a single vault.

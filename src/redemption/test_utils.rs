@@ -3,11 +3,8 @@ use alloy::primitives::{
 };
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
-use cqrs_es::persist::GenericQuery;
 use event_sorcery::StoreBuilder;
-use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
-use std::sync::Arc;
 
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
@@ -15,7 +12,7 @@ use crate::account::{
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    UnderlyingSymbol, view::TokenizedAssetView,
+    UnderlyingSymbol,
 };
 
 /// Creates an in-memory SQLite database with migrations applied, a seeded
@@ -32,23 +29,19 @@ pub(crate) async fn setup_test_db_with_asset(
         .await
         .expect("Failed to run migrations");
 
-    let asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-    let asset_query = GenericQuery::new(asset_view_repo);
-    let asset_cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+    let (asset_store, _asset_projection) =
+        StoreBuilder::<TokenizedAsset>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
 
     let underlying = UnderlyingSymbol::new("AAPL");
     let token = TokenSymbol::new("tAAPL");
     let network = Network::new("base");
 
-    asset_cqrs
-        .execute(
-            &underlying.0,
+    asset_store
+        .send(
+            &underlying,
             TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
                 token,

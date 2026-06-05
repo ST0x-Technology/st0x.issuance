@@ -6,6 +6,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
+use crate::MintCqrs;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
@@ -18,11 +19,8 @@ use crate::mint::{
     Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol,
 };
 use crate::receipt_inventory::CqrsReceiptService;
-use crate::tokenized_asset::{
-    TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
-};
+use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
-use crate::{MintCqrs, TokenizedAssetCqrs};
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -52,7 +50,7 @@ pub(crate) fn create_test_event_store(
 pub(crate) struct TestHarness {
     pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
     pub(crate) account_store: Arc<Store<Account>>,
-    pub(crate) asset_cqrs: TokenizedAssetCqrs,
+    pub(crate) asset_store: Arc<Store<TokenizedAsset>>,
     pub(crate) mint_cqrs: MintCqrs,
 }
 
@@ -75,20 +73,11 @@ impl TestHarness {
                 .await
                 .expect("Failed to build account store");
 
-        let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
-        let tokenized_asset_query =
-            GenericQuery::new(tokenized_asset_view_repo);
-        let asset_cqrs = sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(tokenized_asset_query)],
-            (),
-        );
+        let (asset_store, _asset_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build tokenized asset store");
 
         let receipt_inventory_event_store = {
             let event_repo = SqliteEventRepository::new(pool.clone());
@@ -121,7 +110,7 @@ impl TestHarness {
             mint_services,
         ));
 
-        Self { pool, account_store, asset_cqrs, mint_cqrs }
+        Self { pool, account_store, asset_store, mint_cqrs }
     }
 }
 
@@ -177,8 +166,8 @@ impl TestHarness {
             vault,
         };
 
-        self.asset_cqrs
-            .execute(&underlying.0, asset_cmd)
+        self.asset_store
+            .send(&underlying, asset_cmd)
             .await
             .expect("Failed to add asset");
 

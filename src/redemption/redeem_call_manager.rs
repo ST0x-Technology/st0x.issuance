@@ -15,7 +15,7 @@ use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
-use crate::tokenized_asset::{Network, TokenizedAssetView, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
 pub(crate) struct RedeemCallManager<ES: EventStore<Redemption>> {
     alpaca_service: Arc<dyn AlpacaService>,
@@ -172,18 +172,13 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
     ) -> Result<Network, RedeemCallManagerError> {
         let assets = list_enabled_assets(&self.pool).await?;
 
-        for view in assets {
-            if let TokenizedAssetView::Asset { underlying: u, network, .. } =
-                view
-                && &u == underlying
-            {
-                return Ok(network);
-            }
-        }
-
-        Err(RedeemCallManagerError::AssetNotFound {
-            underlying: underlying.clone(),
-        })
+        assets
+            .into_iter()
+            .find(|asset| &asset.underlying == underlying)
+            .map(|asset| asset.network)
+            .ok_or_else(|| RedeemCallManagerError::AssetNotFound {
+                underlying: underlying.clone(),
+            })
     }
 
     #[tracing::instrument(skip(self, aggregate), fields(
@@ -324,9 +319,7 @@ mod tests {
     };
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
-    use sqlite_es::{
-        SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
-    };
+    use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use tracing_test::traced_test;
@@ -344,7 +337,6 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetView,
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
@@ -364,7 +356,7 @@ mod tests {
         redemption_store: Arc<RedemptionStore>,
         redemption_cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
         account_store: Arc<Store<Account>>,
-        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+        asset_store: Arc<Store<TokenizedAsset>>,
     }
 
     impl TestHarness {
@@ -407,23 +399,18 @@ mod tests {
                     .await
                     .expect("Failed to build account store");
 
-            let asset_view_repo = Arc::new(SqliteViewRepository::<
-                TokenizedAssetView,
-                TokenizedAsset,
-            >::new(
-                pool.clone(),
-                "tokenized_asset_view".to_string(),
-            ));
-            let asset_query = GenericQuery::new(asset_view_repo);
-            let asset_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+            let (asset_store, _asset_projection) =
+                StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build tokenized asset store");
 
             Self {
                 pool,
                 redemption_store,
                 redemption_cqrs,
                 account_store,
-                asset_cqrs,
+                asset_store,
             }
         }
 
@@ -462,9 +449,9 @@ mod tests {
             underlying: &UnderlyingSymbol,
             network: &Network,
         ) {
-            self.asset_cqrs
-                .execute(
-                    &underlying.0,
+            self.asset_store
+                .send(
+                    underlying,
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),

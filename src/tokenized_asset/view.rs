@@ -1,21 +1,9 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::ViewRepository;
-use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tracing::debug;
 
-use super::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetError,
-    TokenizedAssetEvent, UnderlyingSymbol,
-};
-use crate::replay::{ReplayError, replay_all_or_fail};
-
-pub(crate) type TokenizedAssetViewRepo =
-    Arc<SqliteViewRepository<TokenizedAssetView, TokenizedAsset>>;
+use super::{Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenizedAssetViewError {
@@ -23,82 +11,24 @@ pub(crate) enum TokenizedAssetViewError {
     Database(#[from] sqlx::Error),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
-    #[error("Persistence error: {0}")]
-    Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Replay error: {0}")]
-    Replay(#[from] ReplayError<TokenizedAssetError>),
 }
 
-/// Replays all `TokenizedAsset` events through the `tokenized_asset_view`.
+/// Read model for a tokenized asset, projected from the
+/// `tokenized_asset_view` table.
 ///
-/// Re-projects the view from existing events in the event store. This is used at
-/// startup to ensure the view is in sync with events after manual event store
-/// modifications or schema changes.
-pub(crate) async fn replay_tokenized_asset_view(
-    pool: Pool<Sqlite>,
-) -> Result<(), TokenizedAssetViewError> {
-    debug!(target: "asset", view = "tokenized_asset_view", "Rebuilding view from events");
-
-    sqlx::query!("DELETE FROM tokenized_asset_view").execute(&pool).await?;
-
-    let view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-    let event_repo = SqliteEventRepository::new(pool);
-    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
-
-    debug!(target: "asset", view = "tokenized_asset_view", "View rebuild complete");
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub(crate) enum TokenizedAssetView {
-    #[default]
-    Unavailable,
-    Asset {
-        underlying: UnderlyingSymbol,
-        token: TokenSymbol,
-        network: Network,
-        vault: Address,
-        enabled: bool,
-        added_at: DateTime<Utc>,
-    },
-}
-
-impl View<TokenizedAsset> for TokenizedAssetView {
-    fn update(&mut self, event: &EventEnvelope<TokenizedAsset>) {
-        match &event.payload {
-            TokenizedAssetEvent::Added {
-                underlying,
-                token,
-                network,
-                vault,
-                added_at,
-            } => {
-                *self = Self::Asset {
-                    underlying: underlying.clone(),
-                    token: token.clone(),
-                    network: network.clone(),
-                    vault: *vault,
-                    enabled: true,
-                    added_at: *added_at,
-                };
-            }
-            TokenizedAssetEvent::VaultAddressUpdated {
-                vault: new_vault,
-                ..
-            } => {
-                if let Self::Asset { vault, .. } = self {
-                    *vault = *new_vault;
-                }
-            }
-        }
-    }
+/// `tokenized_asset_view` stores the event-sorcery
+/// `Lifecycle<TokenizedAsset>` payload (`{"Live": {...}}`). The query helpers
+/// extract the `$.Live` sub-object, which mirrors this struct field-for-field,
+/// so it deserializes straight into `TokenizedAssetView`. Non-live rows have a
+/// NULL `$.Live` and are treated as "not found".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct TokenizedAssetView {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) token: TokenSymbol,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) enabled: bool,
+    pub(crate) added_at: DateTime<Utc>,
 }
 
 pub(crate) async fn list_enabled_assets(
@@ -106,20 +36,18 @@ pub(crate) async fn list_enabled_assets(
 ) -> Result<Vec<TokenizedAssetView>, TokenizedAssetViewError> {
     let rows = sqlx::query!(
         r#"
-        SELECT payload as "payload: String"
+        SELECT json_extract(payload, '$.Live') as "live: String"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Asset.enabled') = 1
+        WHERE json_extract(payload, '$.Live.enabled') = 1
         "#
     )
     .fetch_all(pool)
     .await?;
 
-    let views: Vec<TokenizedAssetView> = rows
-        .into_iter()
-        .map(|row| serde_json::from_str(&row.payload))
-        .collect::<Result<_, _>>()?;
-
-    Ok(views)
+    rows.into_iter()
+        .filter_map(|row| row.live)
+        .map(|live| serde_json::from_str(&live).map_err(Into::into))
+        .collect()
 }
 
 /// Loads the full tokenized asset view for a given underlying symbol.
@@ -127,10 +55,27 @@ pub(crate) async fn list_enabled_assets(
 /// Returns `Ok(Some(view))` if the asset exists, `Ok(None)` if not found,
 /// or an error on database failure.
 pub(crate) async fn load_asset_by_underlying(
-    repo: &TokenizedAssetViewRepo,
+    pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
 ) -> Result<Option<TokenizedAssetView>, TokenizedAssetViewError> {
-    Ok(repo.load(&underlying.0).await?)
+    let row = sqlx::query!(
+        r#"
+        SELECT json_extract(payload, '$.Live') as "live: String"
+        FROM tokenized_asset_view
+        WHERE view_id = ?
+        "#,
+        underlying.0
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(live) = row.and_then(|row| row.live) else {
+        return Ok(None);
+    };
+
+    let view: TokenizedAssetView = serde_json::from_str(&live)?;
+
+    Ok(Some(view))
 }
 
 /// Finds the vault address for a given underlying symbol.
@@ -141,39 +86,28 @@ pub(crate) async fn find_vault_by_underlying(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
 ) -> Result<Option<Address>, TokenizedAssetViewError> {
-    let repo = SqliteViewRepository::<TokenizedAssetView, TokenizedAsset>::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    );
-
-    let view = repo.load(&underlying.0).await?;
-
-    match view {
-        Some(TokenizedAssetView::Asset { vault, enabled: true, .. }) => {
-            Ok(Some(vault))
-        }
-        _ => Ok(None),
-    }
+    Ok(load_asset_by_underlying(pool, underlying)
+        .await?
+        .and_then(|asset| asset.enabled.then_some(asset.vault)))
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use cqrs_es::EventEnvelope;
-    use cqrs_es::persist::GenericQuery;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+    use event_sorcery::{Store, StoreBuilder};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
+    };
 
     struct TestHarness {
         pool: Pool<Sqlite>,
-        cqrs: SqliteCqrs<TokenizedAsset>,
+        store: Arc<Store<TokenizedAsset>>,
     }
 
     impl TestHarness {
@@ -189,26 +123,23 @@ mod tests {
                 .await
                 .expect("Failed to run migrations");
 
-            let view_repo = Arc::new(SqliteViewRepository::<
-                TokenizedAssetView,
-                TokenizedAsset,
-            >::new(
-                pool.clone(),
-                "tokenized_asset_view".to_string(),
-            ));
-            let query = GenericQuery::new(view_repo);
-            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+            let (store, _projection) =
+                StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build tokenized asset store");
 
-            Self { pool, cqrs }
+            Self { pool, store }
         }
 
         async fn add_asset(&self, underlying: &str, vault: Address) {
-            self.cqrs
-                .execute(
-                    underlying,
+            let underlying = UnderlyingSymbol::new(underlying);
+            self.store
+                .send(
+                    &underlying,
                     TokenizedAssetCommand::Add {
-                        underlying: UnderlyingSymbol::new(underlying),
-                        token: TokenSymbol::new(format!("t{underlying}")),
+                        underlying: underlying.clone(),
+                        token: TokenSymbol::new(format!("t{}", underlying.0)),
                         network: Network::new("base"),
                         vault,
                     },
@@ -216,110 +147,6 @@ mod tests {
                 .await
                 .expect("Failed to add asset");
         }
-    }
-
-    #[test]
-    fn test_view_update_from_asset_added_event() {
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let added_at = Utc::now();
-
-        let event = TokenizedAssetEvent::Added {
-            underlying: underlying.clone(),
-            token: token.clone(),
-            network: network.clone(),
-            vault,
-            added_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: underlying.0.clone(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = TokenizedAssetView::default();
-
-        assert!(matches!(view, TokenizedAssetView::Unavailable));
-
-        view.update(&envelope);
-
-        let TokenizedAssetView::Asset {
-            underlying: view_underlying,
-            token: view_token,
-            network: view_network,
-            vault: view_vault,
-            enabled,
-            added_at: view_added_at,
-        } = view
-        else {
-            panic!("Expected Asset, got Unavailable")
-        };
-
-        assert_eq!(view_underlying, underlying);
-        assert_eq!(view_token, token);
-        assert_eq!(view_network, network);
-        assert_eq!(view_vault, vault);
-        assert!(enabled);
-        assert_eq!(view_added_at, added_at);
-    }
-
-    #[test]
-    fn test_view_update_from_vault_address_updated_event() {
-        let underlying = UnderlyingSymbol::new("AAPL");
-        let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
-        let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let added_at = Utc::now();
-        let updated_at = Utc::now();
-
-        let mut view = TokenizedAssetView::Asset {
-            underlying: underlying.clone(),
-            token: token.clone(),
-            network: network.clone(),
-            vault: vault_a,
-            enabled: true,
-            added_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: underlying.0.clone(),
-            sequence: 2,
-            payload: TokenizedAssetEvent::VaultAddressUpdated {
-                vault: vault_b,
-                previous_vault: vault_a,
-                updated_at,
-            },
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let TokenizedAssetView::Asset {
-            underlying: view_underlying,
-            token: view_token,
-            network: view_network,
-            vault: view_vault,
-            enabled,
-            added_at: view_added_at,
-        } = view
-        else {
-            panic!("Expected Asset, got Unavailable")
-        };
-
-        assert_eq!(view_vault, vault_b, "Vault should be updated to vault B");
-        assert_eq!(
-            view_underlying, underlying,
-            "Underlying should be preserved"
-        );
-        assert_eq!(view_token, token, "Token should be preserved");
-        assert_eq!(view_network, network, "Network should be preserved");
-        assert!(enabled, "Enabled should be preserved");
-        assert_eq!(view_added_at, added_at, "Added-at should be preserved");
     }
 
     #[tokio::test]
@@ -345,15 +172,8 @@ mod tests {
 
         assert_eq!(result.len(), 2);
 
-        let underlyings: Vec<_> = result
-            .iter()
-            .filter_map(|v| match v {
-                TokenizedAssetView::Asset { underlying, .. } => {
-                    Some(underlying.0.as_str())
-                }
-                TokenizedAssetView::Unavailable => None,
-            })
-            .collect();
+        let underlyings: Vec<_> =
+            result.iter().map(|asset| asset.underlying.0.as_str()).collect();
 
         assert!(underlyings.contains(&"AAPL"));
         assert!(underlyings.contains(&"TSLA"));
@@ -400,9 +220,14 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    // Proves the tokenized_asset_view-to-lifecycle migration is data-safe:
+    // after the view table is cleared (as the migration's DROP TABLE does), a
+    // fresh `StoreBuilder::build` rebuilds every row from the event log via
+    // catch_up.
     #[traced_test]
     #[tokio::test]
-    async fn test_replay_rebuilds_view_from_events() {
+    async fn build_rebuilds_tokenized_asset_view_from_events_after_view_cleared()
+     {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -416,7 +241,7 @@ mod tests {
 
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-        // Seed only the events table — no view row
+        // Seed only the events table — no view row.
         let event_payload =
             serde_json::to_string(&TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
@@ -446,35 +271,86 @@ mod tests {
         .await
         .unwrap();
 
-        // View should be empty before replay
+        // View should be empty before the store catches up.
         let before = list_enabled_assets(&pool).await.unwrap();
-        assert!(before.is_empty(), "View should be empty before replay");
+        assert!(before.is_empty(), "View should be empty before rebuild");
 
-        // Replay rebuilds the view from events
-        replay_tokenized_asset_view(pool.clone()).await.unwrap();
+        // Building the store rebuilds the view from the event log via catch_up.
+        let (_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build tokenized asset store");
 
         let after = list_enabled_assets(&pool).await.unwrap();
         assert_eq!(after.len(), 1);
 
-        match &after[0] {
-            TokenizedAssetView::Asset {
-                underlying, vault: view_vault, ..
-            } => {
-                assert_eq!(underlying.0, "AAPL");
-                assert_eq!(*view_vault, vault);
-            }
-            TokenizedAssetView::Unavailable => {
-                panic!("Expected Asset after replay, got Unavailable")
-            }
-        }
+        assert_eq!(after[0].underlying.0, "AAPL");
+        assert_eq!(after[0].vault, vault);
 
+        // The catch-up log is emitted by event-sorcery under target "cqrs"
+        // (not this module's "asset" domain target); the macro's domain filter
+        // matches because #[traced_test] prefixes each line with this test
+        // function's span name, which contains "asset". Including "cqrs" in
+        // the snippets pins the assertion to the actual emitter.
         assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["Rebuilding view from events", "tokenized_asset_view"]
+            tracing::Level::INFO,
+            &["cqrs", "View caught up successfully", "AAPL"]
         ));
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["View rebuild complete", "tokenized_asset_view"]
+    }
+
+    #[tokio::test]
+    async fn test_load_asset_by_underlying_errors_on_malformed_payload() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        // Well-formed JSON whose `$.Live` value is not a valid
+        // TokenizedAssetView — only reachable via external DB manipulation,
+        // since the projection always writes the Lifecycle payload. The load
+        // must surface a deserialization error rather than masking the row as
+        // not-found.
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{\"Live\": {\"bad_field\": 1}}')
+            ",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let result =
+            load_asset_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            TokenizedAssetViewError::Deserialization(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_find_vault_by_underlying_reflects_vault_update() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        let vault_a = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let vault_b = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        harness.add_asset("AAPL", vault_a).await;
+        // Re-adding with a different vault emits VaultAddressUpdated, which the
+        // projection must apply to the view row.
+        harness.add_asset("AAPL", vault_b).await;
+
+        let result =
+            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await
+                .expect("Query should succeed");
+
+        assert_eq!(
+            result,
+            Some(vault_b),
+            "view must reflect the updated vault after VaultAddressUpdated"
+        );
     }
 }
