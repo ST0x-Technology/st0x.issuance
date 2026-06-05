@@ -44,9 +44,11 @@ impl Email {
 
         Ok(Self(email))
     }
+}
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
+impl std::fmt::Display for Email {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -131,6 +133,13 @@ impl EventSourced for Account {
     const PROJECTION: Table = Table("account_view");
     const SCHEMA_VERSION: u64 = 1;
 
+    // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
+    // and event-sorcery hardwires snapshot-every-N with no off switch, so
+    // usize::MAX makes the next-snapshot threshold unreachable. The proper
+    // fix is for event-sorcery to take the snapshot policy explicitly from
+    // the consumer, including the option to disable snapshotting entirely.
+    const SNAPSHOT_SIZE: usize = usize::MAX;
+
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
             AccountEvent::Registered { client_id, email, registered_at } => {
@@ -146,47 +155,57 @@ impl EventSourced for Account {
         }
     }
 
+    // Matches on the event first with exhaustive arms (no catch-all), so a
+    // new `AccountEvent` variant is a compile error here instead of silently
+    // becoming an `UnexpectedEvent` lifecycle failure.
     fn evolve(
         entity: &Self,
         event: &Self::Event,
     ) -> Result<Option<Self>, Self::Error> {
-        match (entity, event) {
-            (
-                Self::Registered { client_id, email, registered_at },
-                AccountEvent::LinkedToAlpaca { alpaca_account, linked_at },
-            ) => Ok(Some(Self::LinkedToAlpaca {
-                client_id: *client_id,
-                email: email.clone(),
-                alpaca_account: alpaca_account.clone(),
-                whitelisted_wallets: Vec::new(),
-                registered_at: *registered_at,
-                linked_at: *linked_at,
-            })),
-            (
-                Self::LinkedToAlpaca { .. },
-                AccountEvent::WalletWhitelisted { wallet, .. },
-            ) => {
-                let mut next = entity.clone();
-                if let Self::LinkedToAlpaca { whitelisted_wallets, .. } =
-                    &mut next
-                {
-                    whitelisted_wallets.push(*wallet);
+        match event {
+            AccountEvent::Registered { .. } => Ok(None),
+            AccountEvent::LinkedToAlpaca { alpaca_account, linked_at } => {
+                match entity {
+                    Self::Registered { client_id, email, registered_at } => {
+                        Ok(Some(Self::LinkedToAlpaca {
+                            client_id: *client_id,
+                            email: email.clone(),
+                            alpaca_account: alpaca_account.clone(),
+                            whitelisted_wallets: Vec::new(),
+                            registered_at: *registered_at,
+                            linked_at: *linked_at,
+                        }))
+                    }
+                    Self::LinkedToAlpaca { .. } => Ok(None),
                 }
-                Ok(Some(next))
             }
-            (
-                Self::LinkedToAlpaca { .. },
-                AccountEvent::WalletUnwhitelisted { wallet, .. },
-            ) => {
-                let mut next = entity.clone();
-                if let Self::LinkedToAlpaca { whitelisted_wallets, .. } =
-                    &mut next
-                {
-                    whitelisted_wallets.retain(|existing| existing != wallet);
+            AccountEvent::WalletWhitelisted { wallet, .. } => match entity {
+                Self::LinkedToAlpaca { .. } => {
+                    let mut next = entity.clone();
+                    if let Self::LinkedToAlpaca {
+                        whitelisted_wallets, ..
+                    } = &mut next
+                    {
+                        whitelisted_wallets.push(*wallet);
+                    }
+                    Ok(Some(next))
                 }
-                Ok(Some(next))
-            }
-            _ => Ok(None),
+                Self::Registered { .. } => Ok(None),
+            },
+            AccountEvent::WalletUnwhitelisted { wallet, .. } => match entity {
+                Self::LinkedToAlpaca { .. } => {
+                    let mut next = entity.clone();
+                    if let Self::LinkedToAlpaca {
+                        whitelisted_wallets, ..
+                    } = &mut next
+                    {
+                        whitelisted_wallets
+                            .retain(|existing| existing != wallet);
+                    }
+                    Ok(Some(next))
+                }
+                Self::Registered { .. } => Ok(None),
+            },
         }
     }
 
@@ -217,9 +236,7 @@ impl EventSourced for Account {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             AccountCommand::Register { email, .. } => {
-                Err(AccountError::AccountAlreadyRegistered {
-                    email: email.as_str().to_string(),
-                })
+                Err(AccountError::AccountAlreadyRegistered { email })
             }
             AccountCommand::LinkToAlpaca { alpaca_account } => match self {
                 Self::Registered { .. } => {
@@ -267,7 +284,7 @@ pub(crate) enum AccountError {
     #[error("Invalid email format: {email}")]
     InvalidEmail { email: String },
     #[error("Account already registered for email: {email}")]
-    AccountAlreadyRegistered { email: String },
+    AccountAlreadyRegistered { email: Email },
     #[error("Account is not registered")]
     NotRegistered,
     #[error("Account is already linked to Alpaca")]
@@ -280,12 +297,15 @@ pub(crate) enum AccountError {
 mod tests {
     use alloy::primitives::address;
     use event_sorcery::{LifecycleError, TestHarness, replay};
+    use tracing::Level;
+    use tracing_test::traced_test;
     use uuid::Uuid;
 
     use super::{
         Account, AccountCommand, AccountError, AccountEvent,
         AlpacaAccountNumber, ClientId, Email,
     };
+    use crate::test_utils::logs_contain_at;
 
     #[tokio::test]
     async fn test_register_creates_new_account() {
@@ -333,7 +353,7 @@ mod tests {
             err,
             LifecycleError::Apply(AccountError::AccountAlreadyRegistered {
                 email,
-            }) if email == "user@example.com"
+            }) if email.to_string() == "user@example.com"
         ));
     }
 
@@ -832,8 +852,13 @@ mod tests {
         );
     }
 
+    // The lifecycle-failure log is emitted by event-sorcery under target
+    // "cqrs"; the logs_contain_at! domain filter ("account") matches because
+    // #[traced_test] stamps each line with this test function's span name,
+    // which contains "account".
+    #[traced_test]
     #[test]
-    fn test_apply_wallet_whitelisted_to_non_linked_returns_error() {
+    fn test_apply_wallet_whitelisted_to_non_linked_account_returns_error() {
         let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
         let wallet = address!("0x1111111111111111111111111111111111111111");
@@ -852,10 +877,15 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["cqrs", "lifecycle failed during evolve"]
+        ));
     }
 
+    #[traced_test]
     #[test]
-    fn test_apply_wallet_unwhitelisted_to_non_linked_returns_error() {
+    fn test_apply_wallet_unwhitelisted_to_non_linked_account_returns_error() {
         let client_id = ClientId::new();
         let email = Email("user@example.com".to_string());
         let wallet = address!("0x1111111111111111111111111111111111111111");
@@ -874,5 +904,9 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &["cqrs", "lifecycle failed during evolve"]
+        ));
     }
 }

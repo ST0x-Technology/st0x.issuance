@@ -12,11 +12,9 @@ use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-use event_sorcery::StoreBuilder;
+use event_sorcery::{Store, StoreBuilder};
 use rocket::routes;
-use sqlite_es::{
-    SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
-};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
@@ -35,7 +33,7 @@ use crate::mint::{Mint, MintServices, MintView};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    TokenizedAssetView, UnderlyingSymbol,
+    UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
 
@@ -100,18 +98,9 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let (account_store, _account_projection) =
         StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
-    // Setup TokenizedAsset CQRS
-    let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
-        TokenizedAssetView,
-        TokenizedAsset,
-    >::new(
-        pool.clone(),
-        "tokenized_asset_view".to_string(),
-    ));
-
-    let tokenized_asset_query = GenericQuery::new(tokenized_asset_view_repo);
-    let tokenized_asset_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
+    // Setup TokenizedAsset store (event-sorcery)
+    let (tokenized_asset_store, _tokenized_asset_projection) =
+        StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
     // Setup ReceiptInventory (needed by MintServices for receipt lookups and registration)
     let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
@@ -156,7 +145,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     >::new_event_store(mint_event_repo));
 
     // Seed initial assets
-    seed_test_assets(&tokenized_asset_cqrs).await?;
+    seed_test_assets(&tokenized_asset_store).await?;
 
     let rate_limiter = FailedAuthRateLimiter::new()?;
 
@@ -164,7 +153,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     Ok(rocket::build()
         .manage(test_config()?)
         .manage(account_store)
-        .manage(tokenized_asset_cqrs)
+        .manage(tokenized_asset_store)
         .manage(mint_cqrs)
         .manage(mint_event_store)
         .manage(rate_limiter)
@@ -181,7 +170,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
 }
 
 async fn seed_test_assets(
-    cqrs: &SqliteCqrs<TokenizedAsset>,
+    store: &Store<TokenizedAsset>,
 ) -> Result<(), anyhow::Error> {
     let assets = vec![
         (
@@ -199,15 +188,16 @@ async fn seed_test_assets(
     ];
 
     for (underlying, token, network, vault) in assets {
+        let underlying = UnderlyingSymbol::new(underlying);
         let command = TokenizedAssetCommand::Add {
-            underlying: UnderlyingSymbol::new(underlying),
+            underlying: underlying.clone(),
             token: TokenSymbol::new(token),
             network: Network::new(network),
             vault,
         };
 
-        match cqrs.execute(underlying, command).await {
-            Ok(()) | Err(cqrs_es::AggregateError::AggregateConflict) => {}
+        match store.send(&underlying, command).await {
+            Ok(()) | Err(event_sorcery::AggregateError::AggregateConflict) => {}
             Err(err) => {
                 return Err(err.into());
             }

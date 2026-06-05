@@ -108,12 +108,20 @@ pub(crate) async fn register_account(
     if let Err(err) = store.send(&client_id, register_command).await {
         // Release the claim so a transient failure doesn't permanently block
         // re-registration of this email.
-        let _ = sqlx::query!(
+        if let Err(rollback_err) = sqlx::query!(
             "DELETE FROM account_emails WHERE email = ?",
             request.email.0
         )
         .execute(pool.inner())
-        .await;
+        .await
+        {
+            error!(target: "account", email = %request.email.0,
+                error = %rollback_err,
+                "Failed to release the email claim after a failed \
+                 registration; the email stays claimed (every retry gets 409) \
+                 until its account_emails row is deleted manually"
+            );
+        }
         return Err(map_cqrs_error_to_status(&err));
     }
 
@@ -255,6 +263,8 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use sqlx::sqlite::SqlitePoolOptions;
+    use tracing::Level;
+    use tracing_test::traced_test;
     use url::Url;
 
     use super::*;
@@ -263,6 +273,7 @@ mod tests {
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
     use crate::fireblocks::SignerConfig;
+    use crate::test_utils::logs_contain_at;
 
     fn test_config() -> Config {
         Config {
@@ -670,7 +681,7 @@ mod tests {
         };
 
         assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email.as_str(), email);
+        assert_eq!(view_email.to_string(), email);
         assert_eq!(view_alpaca_account.0, alpaca_account);
         assert!(whitelisted_wallets.is_empty());
     }
@@ -828,7 +839,85 @@ mod tests {
         };
 
         assert_eq!(client_id, response_body.client_id);
-        assert_eq!(view_email.as_str(), email);
+        assert_eq!(view_email.to_string(), email);
+    }
+
+    // When the Registered event fails to commit AND the compensating claim
+    // release also fails, the handler must log the orphaned claim loudly —
+    // the email stays 409-claimed until the row is deleted manually. The
+    // event-store failure is induced by dropping the events table; the
+    // release failure by a trigger blocking deletes on account_emails.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_register_account_logs_when_claim_release_fails() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+        sqlx::query("DROP TABLE events")
+            .execute(&pool)
+            .await
+            .expect("Failed to drop events table");
+        sqlx::query(
+            "
+            CREATE TRIGGER block_email_release
+            BEFORE DELETE ON account_emails
+            BEGIN
+                SELECT RAISE(ABORT, 'release blocked');
+            END
+            ",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create delete-blocking trigger");
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_store)
+            .manage(pool.clone())
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(
+                serde_json::json!({ "email": "orphan@example.com" })
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::InternalServerError);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to release the email claim",
+                "orphan@example.com",
+                "deleted manually"
+            ]
+        ));
     }
 
     #[tokio::test]
