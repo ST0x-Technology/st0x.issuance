@@ -63,6 +63,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(B256::ZERO),
         backfill_start_block: 0,
+        receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
         hyperdx: None,

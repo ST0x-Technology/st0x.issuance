@@ -290,6 +290,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
+        receipt_poll_interval: Duration::from_millis(500),
         auth: AuthConfig {
             issuer_api_key: "test-key-12345678901234567890123456"
                 .parse()

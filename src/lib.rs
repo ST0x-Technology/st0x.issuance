@@ -124,7 +124,17 @@ impl std::fmt::Display for Quantity {
 /// Quantities with more decimals must be truncated before sending to Alpaca.
 pub(crate) const ALPACA_MAX_DECIMALS: u32 = 9;
 
-const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Interval between periodic receipt-inventory reconciliation passes.
+///
+/// Receipts are registered directly by the mint flow on completion (see
+/// `register_minted_receipt`); this periodic backfill is a reconciliation
+/// safety-net that catches any the direct path missed. Receipts only change
+/// on mint/burn, and each pass issues several `eth_getLogs` per vault, so a
+/// tight interval wastes RPC budget. 60s keeps recovery latency low while
+/// cutting steady-state dRPC cost ~12x versus the previous 5s. Redemption
+/// detection latency is unaffected — that is driven by the separate transfer
+/// poller (see `redemption::poller`), which is unchanged.
+pub(crate) const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Quantity {
     pub(crate) const fn new(value: Decimal) -> Self {
@@ -347,15 +357,16 @@ pub async fn initialize_rocket(
     )
     .await;
 
-    spawn_periodic_receipt_backfills(
-        pool.clone(),
-        blockchain_setup.http_provider.clone(),
-        vault_configs.clone(),
-        receipt_inventory.cqrs.clone(),
+    spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
+        pool: pool.clone(),
+        provider: blockchain_setup.http_provider.clone(),
+        vault_configs: vault_configs.clone(),
+        receipt_inventory_cqrs: receipt_inventory.cqrs.clone(),
         bot_wallet,
-        config.backfill_start_block,
-        MintRecoveryHandler::new(mint.cqrs.clone()),
-    );
+        backfill_start_block: config.backfill_start_block,
+        receipt_poll_interval: config.receipt_poll_interval,
+        handler: MintRecoveryHandler::new(mint.cqrs.clone()),
+    });
 
     {
         info!(
@@ -841,7 +852,8 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         NoOpItnHandler,
     );
 
-    let result = backfiller.backfill_receipts(from_block).await?;
+    let head_block = provider.get_block_number().await?;
+    let result = backfiller.backfill_receipts(from_block, head_block).await?;
 
     info!(
         target: "receipt",
@@ -867,25 +879,34 @@ fn next_receipt_backfill_block(
     })
 }
 
-async fn run_periodic_receipt_backfill_for_config<
-    P: Provider + Clone,
-    H: ItnReceiptHandler,
->(
-    pool: &Pool<Sqlite>,
-    provider: &P,
-    config: VaultBackfillConfig,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+/// Dependencies shared by every vault in a single periodic receipt-backfill
+/// pass. Constant across the pass; only `config` varies per vault. `head_block`
+/// is fetched once per pass and passed separately to each per-vault call.
+struct PeriodicBackfillCtx<'a, P, H> {
+    pool: &'a Pool<Sqlite>,
+    provider: &'a P,
+    receipt_inventory_cqrs: &'a ReceiptInventoryCqrs,
     bot_wallet: Address,
     backfill_start_block: u64,
-    handler: &H,
-) -> Result<(), anyhow::Error> {
+    handler: &'a H,
+}
+
+async fn run_periodic_receipt_backfill_for_config<P, H>(
+    ctx: &PeriodicBackfillCtx<'_, P, H>,
+    config: VaultBackfillConfig,
+    head_block: u64,
+) -> Result<(), anyhow::Error>
+where
+    P: Provider + Clone,
+    H: ItnReceiptHandler,
+{
     let last_block = crate::poll_checkpoint::load(
-        pool,
+        ctx.pool,
         &crate::poll_checkpoint::receipt_backfill_name(config.vault),
     )
     .await?;
     let from_block =
-        next_receipt_backfill_block(last_block, backfill_start_block)?;
+        next_receipt_backfill_block(last_block, ctx.backfill_start_block)?;
 
     trace!(
         target: "receipt",
@@ -896,16 +917,16 @@ async fn run_periodic_receipt_backfill_for_config<
     );
 
     let backfiller = ReceiptBackfiller::new(
-        provider.clone(),
+        ctx.provider.clone(),
         config.receipt_contract,
-        bot_wallet,
+        ctx.bot_wallet,
         config.vault,
-        receipt_inventory_cqrs.clone(),
-        pool.clone(),
-        handler,
+        ctx.receipt_inventory_cqrs.clone(),
+        ctx.pool.clone(),
+        ctx.handler,
     );
 
-    let result = backfiller.backfill_receipts(from_block).await?;
+    let result = backfiller.backfill_receipts(from_block, head_block).await?;
 
     trace!(
         target: "receipt",
@@ -919,20 +940,57 @@ async fn run_periodic_receipt_backfill_for_config<
     Ok(())
 }
 
-fn spawn_periodic_receipt_backfills<P, H>(
+/// Owned dependencies needed to spawn the periodic receipt-backfill task.
+/// Bundled to keep the spawn signature within argument limits; the spawned
+/// task moves these in and borrows them into a `PeriodicBackfillCtx` per pass.
+struct PeriodicBackfillSpawn<P, H> {
     pool: Pool<Sqlite>,
     provider: P,
     vault_configs: Vec<VaultBackfillConfig>,
     receipt_inventory_cqrs: ReceiptInventoryCqrs,
     bot_wallet: Address,
     backfill_start_block: u64,
+    receipt_poll_interval: Duration,
     handler: H,
-) where
+}
+
+fn spawn_periodic_receipt_backfills<P, H>(spawn: PeriodicBackfillSpawn<P, H>)
+where
     P: Provider + Clone + Send + Sync + 'static,
     H: ItnReceiptHandler + 'static,
 {
+    let PeriodicBackfillSpawn {
+        pool,
+        provider,
+        vault_configs,
+        receipt_inventory_cqrs,
+        bot_wallet,
+        backfill_start_block,
+        receipt_poll_interval,
+        handler,
+    } = spawn;
+
+    // With no vaults there is nothing to reconcile, so avoid spawning a task
+    // that would fetch the chain head every interval for no work.
+    if vault_configs.is_empty() {
+        debug!(
+            target: "receipt",
+            "No vaults configured; skipping periodic receipt backfill"
+        );
+        return;
+    }
+
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(RECEIPT_POLL_INTERVAL);
+        let ctx = PeriodicBackfillCtx {
+            pool: &pool,
+            provider: &provider,
+            receipt_inventory_cqrs: &receipt_inventory_cqrs,
+            bot_wallet,
+            backfill_start_block,
+            handler: &handler,
+        };
+
+        let mut interval = tokio::time::interval(receipt_poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Skip the first tick (fires immediately) — the startup backfill
         // already ran during initialization, so we wait for the first
@@ -942,15 +1000,26 @@ fn spawn_periodic_receipt_backfills<P, H>(
         loop {
             interval.tick().await;
 
+            // Fetch the chain head once per pass and reuse it for every vault.
+            // The receipt backfill scans the same block range across all
+            // vaults, so a single `eth_blockNumber` per pass replaces one call
+            // per vault.
+            let head_block = match provider.get_block_number().await {
+                Ok(head_block) => head_block,
+                Err(error) => {
+                    warn!(
+                        target: "receipt",
+                        error = %error,
+                        "Failed to fetch chain head; skipping this receipt \
+                         backfill pass"
+                    );
+                    continue;
+                }
+            };
+
             for config in &vault_configs {
                 if let Err(error) = run_periodic_receipt_backfill_for_config(
-                    &pool,
-                    &provider,
-                    *config,
-                    &receipt_inventory_cqrs,
-                    bot_wallet,
-                    backfill_start_block,
-                    &handler,
+                    &ctx, *config, head_block,
                 )
                 .await
                 {

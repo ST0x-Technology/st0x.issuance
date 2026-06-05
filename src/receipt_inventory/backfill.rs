@@ -135,14 +135,19 @@ where
     /// previous checkpoint via
     /// `poll_checkpoint::load(pool, &receipt_backfill_name(vault))`.
     ///
+    /// `head_block` is the chain head to scan up to. The caller fetches it so
+    /// a single `eth_blockNumber` can be shared across every vault in one
+    /// reconciliation pass rather than one call per vault.
+    ///
     /// Queries are chunked to avoid RPC response size limits.
     ///
     /// This is idempotent - running multiple times produces the same result.
     pub(crate) async fn backfill_receipts(
         &self,
         from_block: u64,
+        head_block: u64,
     ) -> Result<BackfillResult, BackfillError> {
-        let current_block = self.provider.get_block_number().await?;
+        let current_block = head_block;
 
         if from_block > current_block {
             info!(target: "receipt", from_block,
@@ -787,8 +792,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
@@ -809,7 +812,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 1);
         assert_eq!(result.skipped_zero_balance, 0);
@@ -858,7 +862,6 @@ mod tests {
 
         // First run
         let asserter1 = Asserter::new();
-        asserter1.push_success(&U256::from(current_block));
         asserter1.push_success(&vec![deposit_log.clone()]);
         push_empty_non_deposit_logs(&asserter1);
         asserter1.push_success(&balance.to_be_bytes::<32>());
@@ -877,7 +880,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result1 = backfiller1.backfill_receipts(0).await.unwrap();
+        let result1 =
+            backfiller1.backfill_receipts(0, current_block).await.unwrap();
         assert_eq!(result1.processed_count, 1);
 
         // After the first run the aggregate has exactly one Discovered event
@@ -902,7 +906,6 @@ mod tests {
 
         // Second run with the same deposit log: command must be idempotent.
         let asserter2 = Asserter::new();
-        asserter2.push_success(&U256::from(current_block));
         asserter2.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter2);
         asserter2.push_success(&balance.to_be_bytes::<32>());
@@ -921,7 +924,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result2 = backfiller2.backfill_receipts(0).await.unwrap();
+        let result2 =
+            backfiller2.backfill_receipts(0, current_block).await.unwrap();
         assert_eq!(result2.processed_count, 1);
 
         // After the second run the aggregate still has exactly one receipt
@@ -973,8 +977,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 300u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
@@ -995,7 +997,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 0);
         assert_eq!(result.skipped_zero_balance, 1);
@@ -1042,10 +1045,8 @@ mod tests {
         });
 
         let asserter = Asserter::new();
-        let checkpoint_block = 400u64;
+        let current_block = 400u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(checkpoint_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
@@ -1066,7 +1067,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 1);
 
@@ -1119,8 +1121,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter) - both deposits returned, filtered client-side
         asserter.push_success(&vec![deposit_for_bot, deposit_for_other]);
         push_empty_non_deposit_logs(&asserter);
@@ -1141,7 +1141,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 1);
     }
@@ -1173,8 +1174,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 150u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         push_empty_non_deposit_logs(&asserter);
@@ -1195,7 +1194,7 @@ mod tests {
             NoOpItnHandler,
         );
 
-        backfiller.backfill_receipts(0).await.unwrap();
+        backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         let recorded = poll_checkpoint::load(
             &pool,
@@ -1416,8 +1415,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter) - no deposits
         asserter.push_success(&Vec::<Log>::new());
         // eth_getLogs (TransferSingle filter) - one inbound transfer
@@ -1442,7 +1439,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 1);
         assert_eq!(result.skipped_zero_balance, 0);
@@ -1502,8 +1500,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter) - no deposits
         asserter.push_success(&Vec::<Log>::new());
         // eth_getLogs (TransferSingle filter) - outbound + mint transfers
@@ -1527,7 +1523,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(
             result.processed_count, 0,
@@ -1586,8 +1583,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter)
         asserter.push_success(&vec![deposit_log]);
         // eth_getLogs (TransferSingle filter)
@@ -1612,7 +1607,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         // Should only process once despite appearing in both Deposit and Transfer
         assert_eq!(result.processed_count, 1);
@@ -1686,8 +1682,6 @@ mod tests {
         let asserter = Asserter::new();
         let current_block = 200u64;
 
-        // eth_blockNumber
-        asserter.push_success(&U256::from(current_block));
         // eth_getLogs (Deposit filter) — no deposits
         asserter.push_success(&Vec::<Log>::new());
         // eth_getLogs (TransferSingle filter) — one inbound transfer
@@ -1712,7 +1706,8 @@ mod tests {
             NoOpItnHandler,
         );
 
-        let result = backfiller.backfill_receipts(0).await.unwrap();
+        let result =
+            backfiller.backfill_receipts(0, current_block).await.unwrap();
         assert_eq!(result.processed_count, 1);
 
         // Verify balance was reconciled upward from 500 to 750

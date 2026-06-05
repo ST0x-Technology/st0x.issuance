@@ -2,6 +2,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Level;
 use url::Url;
 
@@ -34,6 +35,10 @@ pub struct Config {
     pub chain_id: u64,
     pub signer: SignerConfig,
     pub backfill_start_block: u64,
+    /// Interval between periodic receipt-backfill passes. Defaults to
+    /// `RECEIPT_POLL_INTERVAL` in production; tests lower it so they don't
+    /// have to wait a full production interval for a reconciliation pass.
+    pub receipt_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
     pub hyperdx: Option<HyperDxConfig>,
@@ -196,6 +201,7 @@ impl Env {
             chain_id: self.chain_id,
             signer,
             backfill_start_block: self.backfill_start_block,
+            receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
             hyperdx,

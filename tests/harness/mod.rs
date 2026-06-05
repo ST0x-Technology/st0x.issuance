@@ -361,6 +361,7 @@ pub fn create_config_with_db(
             chain_id: ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(evm.private_key),
             backfill_start_block: 0,
+            receipt_poll_interval: tokio::time::Duration::from_millis(500),
             auth: AuthConfig {
                 issuer_api_key: "test-key-12345678901234567890123456"
                     .parse()
