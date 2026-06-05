@@ -2,6 +2,7 @@ use alloy::primitives::B256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, AggregateError, EventStore};
+use event_sorcery::Store;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
@@ -14,7 +15,7 @@ use crate::Quantity;
 use crate::alpaca::{AlpacaService, RedeemRequestStatus, TokenizationRequest};
 use crate::auth::InternalAuth;
 use crate::mint::{
-    IssuerMintRequestId, MintCommand, MintEvent, MintView,
+    IssuerMintRequestId, Mint, MintCommand, MintEvent, MintView,
     TokenizationRequestId, find_by_issuer_request_id,
     find_stuck as find_stuck_mints, recovery::spawn_scheduled_mint_recovery,
 };
@@ -32,10 +33,7 @@ use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
     BurnVerification, FireblocksTxStatus, VaultError, VaultService,
 };
-use crate::{
-    MintCqrs, MintEventStore, RedemptionCqrs, RedemptionEventStore,
-    SqliteEventStore,
-};
+use crate::{RedemptionCqrs, RedemptionEventStore, SqliteEventStore};
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -876,12 +874,11 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     }
 }
 
-#[tracing::instrument(skip(_auth, cqrs, event_store, pool))]
+#[tracing::instrument(skip(_auth, store, pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
-    cqrs: &rocket::State<MintCqrs>,
-    event_store: &rocket::State<MintEventStore>,
+    store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -907,6 +904,7 @@ pub(crate) async fn reprocess_mint(
                 MintView::JournalConfirmed { .. } => "JournalConfirmed",
                 MintView::JournalRejected { .. } => "JournalRejected",
                 MintView::Minting { .. } => "Minting",
+                MintView::FireblocksSubmitted { .. } => "FireblocksSubmitted",
                 MintView::CallbackPending { .. } => "CallbackPending",
                 MintView::MintingFailed { .. } => "MintingFailed",
             };
@@ -919,24 +917,25 @@ pub(crate) async fn reprocess_mint(
         }
     };
 
-    cqrs.execute(
-        aggregate_id,
-        MintCommand::Recover {
-            issuer_request_id: issuer_request_id.clone(),
-            mode: crate::mint::MintRecoveryMode::Manual,
-        },
-    )
-    .await
-    .map_err(|err| {
-        error!(target: "admin", aggregate_id = aggregate_id,
-            error = %err,
-            "Failed to reprocess mint"
-        );
-        match err {
-            AggregateError::UserError(_) => Status::UnprocessableEntity,
-            _ => Status::InternalServerError,
-        }
-    })?;
+    store
+        .send(
+            &issuer_request_id,
+            MintCommand::Recover {
+                issuer_request_id: issuer_request_id.clone(),
+                mode: crate::mint::MintRecoveryMode::Manual,
+            },
+        )
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = aggregate_id,
+                error = %err,
+                "Failed to reprocess mint"
+            );
+            match err {
+                AggregateError::UserError(_) => Status::UnprocessableEntity,
+                _ => Status::InternalServerError,
+            }
+        })?;
 
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
@@ -947,11 +946,7 @@ pub(crate) async fn reprocess_mint(
     // next retry, leaving it in FireblocksSubmitted). Hand it to a background
     // scheduled-recovery task so it is driven to completion instead of
     // stalling until the next restart or another manual reprocess.
-    spawn_scheduled_mint_recovery(
-        cqrs.inner().clone(),
-        event_store.inner().clone(),
-        issuer_request_id,
-    );
+    spawn_scheduled_mint_recovery(store.inner().clone(), issuer_request_id);
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,
@@ -969,11 +964,11 @@ pub(crate) struct CloseMintRequest {
 /// Admin endpoint to close a mint that cannot be automatically recovered.
 ///
 /// Valid from any non-terminal state. Closed mints do not appear in stuck queries.
-#[tracing::instrument(skip(_auth, cqrs))]
+#[tracing::instrument(skip(_auth, store))]
 #[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
 pub(crate) async fn close_mint(
     _auth: InternalAuth,
-    cqrs: &rocket::State<MintCqrs>,
+    store: &rocket::State<Arc<Store<Mint>>>,
     aggregate_id: &str,
     body: Json<CloseMintRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -982,24 +977,25 @@ pub(crate) async fn close_mint(
         .map(IssuerMintRequestId::new)
         .map_err(|_| Status::BadRequest)?;
 
-    cqrs.execute(
-        aggregate_id,
-        MintCommand::CloseMint {
-            issuer_request_id: issuer_request_id.clone(),
-            reason: body.into_inner().reason,
-        },
-    )
-    .await
-    .map_err(|err| {
-        error!(target: "admin", aggregate_id = %aggregate_id,
-            error = %err,
-            "Failed to close mint"
-        );
-        match err {
-            AggregateError::UserError(_) => Status::UnprocessableEntity,
-            _ => Status::InternalServerError,
-        }
-    })?;
+    store
+        .send(
+            &issuer_request_id,
+            MintCommand::CloseMint {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: body.into_inner().reason,
+            },
+        )
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to close mint"
+            );
+            match err {
+                AggregateError::UserError(_) => Status::UnprocessableEntity,
+                _ => Status::InternalServerError,
+            }
+        })?;
 
     info!(target: "admin", aggregate_id = %aggregate_id, "Mint closed");
 
@@ -1021,7 +1017,6 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 #[tracing::instrument(skip(
     _auth,
     pool,
-    mint_event_store,
     redemption_event_store,
     vault_service
 ))]
@@ -1029,7 +1024,6 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-    mint_event_store: &rocket::State<MintEventStore>,
     redemption_event_store: &rocket::State<RedemptionEventStore>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
@@ -1077,11 +1071,8 @@ pub(crate) async fn list_stuck(
         }
 
         let (underlying, quantity) = mint_view_asset(&view);
-        let mint_history = mint_history_summary(
-            mint_event_store.inner(),
-            &issuer_mint_request_id.to_string(),
-        )
-        .await;
+        let mint_history =
+            mint_history_summary(pool.inner(), &issuer_mint_request_id).await;
 
         stuck.push(StuckAggregate {
             aggregate_type: AggregateKind::Mint,
@@ -1473,6 +1464,17 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
             detail: "Deposit in progress".to_string(),
             timestamp: *minting_started_at,
         }),
+        MintView::FireblocksSubmitted {
+            tokenization_request_id,
+            minting_started_at,
+            ..
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "FireblocksSubmitted".to_string(),
+            detail: "Awaiting on-chain confirmation".to_string(),
+            timestamp: *minting_started_at,
+        }),
         MintView::MintingFailed {
             tokenization_request_id,
             error,
@@ -1510,6 +1512,7 @@ fn mint_view_asset(
         | MintView::JournalConfirmed { underlying, quantity, .. }
         | MintView::JournalRejected { underlying, quantity, .. }
         | MintView::Minting { underlying, quantity, .. }
+        | MintView::FireblocksSubmitted { underlying, quantity, .. }
         | MintView::MintingFailed { underlying, quantity, .. }
         | MintView::CallbackPending { underlying, quantity, .. } => {
             (Some(underlying.clone()), Some(quantity.clone()))
@@ -1527,16 +1530,32 @@ struct MintHistorySummary {
 }
 
 /// Returns the latest useful transaction hints from this mint's history.
+///
+/// Reads the raw `MintEvent` payloads straight from the `events` table.
+/// `event_sorcery::Store` exposes no event-log read, so the history is loaded
+/// with a direct query rather than through the aggregate store.
 async fn mint_history_summary(
-    event_store: &crate::SqliteEventStore<crate::mint::Mint>,
-    aggregate_id: &str,
+    pool: &Pool<Sqlite>,
+    issuer_request_id: &IssuerMintRequestId,
 ) -> MintHistorySummary {
-    let events = match event_store.load_events(aggregate_id).await {
-        Ok(events) => events,
+    let aggregate_id = issuer_request_id.to_string();
+    let rows = match sqlx::query!(
+        r#"
+        SELECT payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Mint' AND aggregate_id = ?
+        ORDER BY sequence
+        "#,
+        aggregate_id
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
         Err(err) => {
             warn!(
                 target: "admin",
-                aggregate_id = aggregate_id,
+                aggregate_id = %aggregate_id,
                 error = %err,
                 "Failed to load mint events for fireblocks_tx_id lookup"
             );
@@ -1544,9 +1563,35 @@ async fn mint_history_summary(
         }
     };
 
+    let events = match rows
+        .into_iter()
+        .map(|row| serde_json::from_str::<MintEvent>(&row.payload))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                target: "admin",
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to deserialize mint events for fireblocks_tx_id lookup"
+            );
+            return MintHistorySummary::default();
+        }
+    };
+
+    mint_history_summary_from_events(events)
+}
+
+/// Pure reduce: builds a [`MintHistorySummary`] from an ordered sequence of
+/// `MintEvent`s. Split out from `mint_history_summary` so the fold is
+/// unit-testable without an event store or database.
+fn mint_history_summary_from_events(
+    events: impl IntoIterator<Item = MintEvent>,
+) -> MintHistorySummary {
     let mut summary = MintHistorySummary::default();
     for event in events {
-        match event.payload {
+        match event {
             MintEvent::TokensMinted { tx_hash, .. }
             | MintEvent::ExistingMintRecovered { tx_hash, .. }
             | MintEvent::MintRetryStarted { tx_hash: Some(tx_hash), .. } => {

@@ -1,8 +1,8 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::Utc;
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
-use sqlite_es::SqliteCqrs;
+use cqrs_es::AggregateError;
+use event_sorcery::{LifecycleError, Store};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -12,18 +12,17 @@ use super::{
     MintRecoveryMode,
 };
 use crate::receipt_inventory::ItnReceiptHandler;
-use crate::{MintCqrs, MintEventStore};
 
 /// Production handler that triggers mint recovery when an ITN receipt is
 /// discovered by the receipt monitor.
 #[derive(Clone)]
 pub(crate) struct MintRecoveryHandler {
-    mint_cqrs: Arc<SqliteCqrs<Mint>>,
+    mint_store: Arc<Store<Mint>>,
 }
 
 impl MintRecoveryHandler {
-    pub(crate) const fn new(mint_cqrs: Arc<SqliteCqrs<Mint>>) -> Self {
-        Self { mint_cqrs }
+    pub(crate) const fn new(mint_store: Arc<Store<Mint>>) -> Self {
+        Self { mint_store }
     }
 }
 
@@ -34,9 +33,9 @@ impl ItnReceiptHandler for MintRecoveryHandler {
         issuer_request_id: IssuerMintRequestId,
         tx_hash: TxHash,
     ) {
-        let mint_cqrs = self.mint_cqrs.clone();
+        let mint_store = self.mint_store.clone();
         tokio::spawn(async move {
-            drive_recovery(&mint_cqrs, issuer_request_id, |id| {
+            drive_recovery(&mint_store, issuer_request_id, |id| {
                 MintCommand::RecoverFromReceipt {
                     issuer_request_id: id,
                     tx_hash,
@@ -64,14 +63,11 @@ pub(crate) enum DriveOutcome {
 }
 
 /// Drives a mint through recovery to completion using `MintCommand::Recover`.
-pub(crate) async fn recover_mint<ES>(
-    mint_cqrs: &CqrsFramework<Mint, ES>,
+pub(crate) async fn recover_mint(
+    mint_store: &Store<Mint>,
     issuer_request_id: IssuerMintRequestId,
-) -> DriveOutcome
-where
-    ES: EventStore<Mint>,
-{
-    drive_recovery(mint_cqrs, issuer_request_id, |id| MintCommand::Recover {
+) -> DriveOutcome {
+    drive_recovery(mint_store, issuer_request_id, |id| MintCommand::Recover {
         issuer_request_id: id,
         mode: MintRecoveryMode::Automatic,
     })
@@ -104,14 +100,12 @@ const MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS: usize = 8;
 const MAX_SCHEDULED_RECOVERY_PENDING_POLLS: usize = 360;
 
 pub(crate) fn spawn_scheduled_mint_recovery(
-    mint_cqrs: MintCqrs,
-    event_store: MintEventStore,
+    mint_store: Arc<Store<Mint>>,
     issuer_request_id: IssuerMintRequestId,
 ) {
     tokio::spawn(async move {
         recover_mint_until_automatic_budget_exhausted(
-            mint_cqrs.as_ref(),
-            event_store.as_ref(),
+            mint_store.as_ref(),
             issuer_request_id,
             SCHEDULED_RECOVERY_BACKOFF,
             MAX_SCHEDULED_RECOVERY_PENDING_POLLS,
@@ -120,25 +114,29 @@ pub(crate) fn spawn_scheduled_mint_recovery(
     });
 }
 
-async fn recover_mint_until_automatic_budget_exhausted<ES>(
-    mint_cqrs: &CqrsFramework<Mint, ES>,
-    event_store: &ES,
+async fn recover_mint_until_automatic_budget_exhausted(
+    mint_store: &Store<Mint>,
     issuer_request_id: IssuerMintRequestId,
     backoff: Duration,
     max_pending_polls: usize,
-) where
-    ES: EventStore<Mint>,
-{
-    let aggregate_id = issuer_request_id.to_string();
+) {
     let mut retry_wakeups = 0;
     let mut failure_backoffs = 0;
     let mut pending_polls = 0;
     let mut polled_tx_id: Option<String> = None;
 
     loop {
-        let mut context = match event_store.load_aggregate(&aggregate_id).await
-        {
-            Ok(context) => context,
+        let mint = match mint_store.load(&issuer_request_id).await {
+            Ok(Some(mint)) => mint,
+            // A missing mint cannot be recovered — the same outcome the old
+            // default (`Uninitialized`) aggregate produced via
+            // `AutomaticRetryDecision::NotRecoverable`.
+            Ok(None) => {
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                    "Mint not found for scheduled recovery"
+                );
+                return;
+            }
             Err(err) => {
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     error = %err,
@@ -152,15 +150,16 @@ async fn recover_mint_until_automatic_budget_exhausted<ES>(
         // budget: when recovery advances to a new submitted tx, reset the
         // counter so a healthy retry is not abandoned because a prior tx
         // already spent the budget.
-        let current_tx_id = context.aggregate().pending_fireblocks_tx_id();
+        let current_tx_id = mint.pending_fireblocks_tx_id();
         if current_tx_id != polled_tx_id {
             pending_polls = 0;
             polled_tx_id = current_tx_id;
         }
 
-        match context.aggregate().automatic_retry_decision(Utc::now()) {
+        match mint.automatic_retry_decision(Utc::now()) {
             AutomaticRetryDecision::Ready => {
-                match recover_mint(mint_cqrs, issuer_request_id.clone()).await {
+                match recover_mint(mint_store, issuer_request_id.clone()).await
+                {
                     DriveOutcome::Done | DriveOutcome::Exhausted => return,
                     // A still-pending Fireblocks tx is healthy; poll it on a
                     // generous budget separate from transient failures.
@@ -252,19 +251,14 @@ const MAX_RECOVERY_ATTEMPTS: usize = 10;
 ///
 /// Bounded to [`MAX_RECOVERY_ATTEMPTS`] iterations to prevent infinite
 /// spinning if a command returns `Ok(())` without advancing state.
-async fn drive_recovery<ES>(
-    mint_cqrs: &CqrsFramework<Mint, ES>,
+async fn drive_recovery(
+    mint_store: &Store<Mint>,
     issuer_request_id: IssuerMintRequestId,
     make_command: impl Fn(IssuerMintRequestId) -> MintCommand,
-) -> DriveOutcome
-where
-    ES: EventStore<Mint>,
-{
-    let aggregate_id = issuer_request_id.to_string();
-
+) -> DriveOutcome {
     for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
-        let result = mint_cqrs
-            .execute(&aggregate_id, make_command(issuer_request_id.clone()))
+        let result = mint_store
+            .send(&issuer_request_id, make_command(issuer_request_id.clone()))
             .await;
 
         match result {
@@ -274,36 +268,36 @@ where
                     "Recovery step succeeded, continuing"
                 );
             }
-            Err(AggregateError::UserError(MintError::NotRecoverable {
-                current_state,
-            })) => {
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                MintError::NotRecoverable { current_state },
+            ))) => {
                 info!(target: "mint", issuer_request_id = %issuer_request_id,
                     current_state,
                     "Mint recovery complete"
                 );
                 return DriveOutcome::Done;
             }
-            Err(AggregateError::UserError(MintError::RetryNotDue {
-                retry_at,
-            })) => {
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                MintError::RetryNotDue { retry_at },
+            ))) => {
                 info!(target: "mint", issuer_request_id = %issuer_request_id,
                     %retry_at,
                     "Mint recovery paused until retry window"
                 );
                 return DriveOutcome::RetryNotDue;
             }
-            Err(AggregateError::UserError(
+            Err(AggregateError::UserError(LifecycleError::Apply(
                 MintError::AutomaticRetriesExhausted { attempts },
-            )) => {
+            ))) => {
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     attempts,
                     "Automatic mint retries exhausted"
                 );
                 return DriveOutcome::Exhausted;
             }
-            Err(AggregateError::UserError(
+            Err(AggregateError::UserError(LifecycleError::Apply(
                 MintError::FireblocksTxStillPending { fireblocks_tx_id },
-            )) => {
+            ))) => {
                 info!(target: "mint", issuer_request_id = %issuer_request_id,
                     fireblocks_tx_id,
                     "Mint recovery paused while Fireblocks transaction is pending"
@@ -321,7 +315,7 @@ where
     }
 
     error!(target: "mint", issuer_request_id = %issuer_request_id,
-        aggregate_id,
+        aggregate_id = %issuer_request_id,
         max_attempts = MAX_RECOVERY_ATTEMPTS,
         "Mint recovery exceeded maximum attempts without reaching terminal state"
     );
@@ -333,26 +327,142 @@ where
 mod tests {
     use alloy::primitives::{Address, B256, U256, address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::AggregateContext;
+    use event_sorcery::{StoreBuilder, test_store};
     use rust_decimal::Decimal;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::mint::tests::{MintTestFixture, VAULT};
+    use crate::alpaca::mock::MockAlpacaService;
+    use crate::mint::tests::{BOT, VAULT};
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
-        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, MintServices, Network,
+        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::receipt_inventory::{
-        ReceiptId, ReceiptInventoryCommand, ReceiptSource, Shares,
+        CqrsReceiptService, ReceiptId, ReceiptInventory,
+        ReceiptInventoryCommand, ReceiptSource, Shares,
     };
     use crate::test_utils::log_count_at;
+    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
         MultiBurnResult, ReceiptInformation, SubmittedTx, VaultError,
         VaultService,
     };
+
+    /// Builds a real event-sorcery [`Store<Mint>`] backed by an in-memory
+    /// SQLite pool, wired with the same services the production recovery flow
+    /// uses (vault, Alpaca, receipt inventory). The [`TokenizedAsset`]
+    /// projection is populated with the AAPL -> [`VAULT`] mapping so the
+    /// recovery vault lookup (`find_vault_by_underlying`) resolves.
+    struct MintRecoveryFixture {
+        mint_store: Arc<Store<Mint>>,
+        receipt_store: Arc<Store<ReceiptInventory>>,
+        pool: sqlx::SqlitePool,
+    }
+
+    impl MintRecoveryFixture {
+        async fn new() -> Self {
+            Self::new_with_vault(Arc::new(MockVaultService::new_success()))
+                .await
+        }
+
+        async fn new_with_vault(vault: Arc<dyn VaultService>) -> Self {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .unwrap();
+
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+            let (asset_store, _asset_projection) =
+                StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                    .build(())
+                    .await
+                    .unwrap();
+
+            asset_store
+                .send(
+                    &UnderlyingSymbol::new("AAPL"),
+                    TokenizedAssetCommand::Add {
+                        underlying: UnderlyingSymbol::new("AAPL"),
+                        token: TokenSymbol::new("tAAPL"),
+                        network: Network::new("base"),
+                        vault: VAULT,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let receipt_store =
+                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+
+            let services = MintServices {
+                vault,
+                alpaca: Arc::new(MockAlpacaService::new_success()),
+                receipts: Arc::new(CqrsReceiptService::new(
+                    receipt_store.clone(),
+                )),
+                pool: pool.clone(),
+                bot: BOT,
+            };
+
+            let mint_store =
+                Arc::new(test_store::<Mint>(pool.clone(), services));
+
+            Self { mint_store, receipt_store, pool }
+        }
+
+        /// Seeds the event store with raw `Mint` events, putting the aggregate
+        /// directly into the desired lifecycle state. Mirrors the e2e
+        /// setup-phase pattern of writing rows to the `events` table; the
+        /// running service then reacts to them during the scenario.
+        async fn seed_mint_events(
+            &self,
+            issuer_request_id: &IssuerMintRequestId,
+            events: Vec<MintEvent>,
+        ) {
+            let aggregate_id = issuer_request_id.to_string();
+
+            for (offset, event) in events.into_iter().enumerate() {
+                let sequence = i64::try_from(offset).unwrap() + 1;
+                let payload = serde_json::to_value(&event).unwrap();
+                let variant = payload
+                    .as_object()
+                    .and_then(|map| map.keys().next())
+                    .expect("MintEvent serializes as an externally-tagged enum")
+                    .clone();
+                let event_type = format!("MintEvent::{variant}");
+                let payload_str = payload.to_string();
+
+                sqlx::query(
+                    "
+                    INSERT INTO events (
+                        aggregate_type,
+                        aggregate_id,
+                        sequence,
+                        event_type,
+                        event_version,
+                        payload,
+                        metadata
+                    )
+                    VALUES ('Mint', ?, ?, ?, '1.0', ?, '{}')
+                    ",
+                )
+                .bind(&aggregate_id)
+                .bind(sequence)
+                .bind(&event_type)
+                .bind(&payload_str)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
 
     /// Vault whose Fireblocks transaction never finalizes — every status check
     /// returns `Pending`. Used to exercise the scheduled-recovery backoff.
@@ -535,9 +645,9 @@ mod tests {
 
     async fn setup_with_receipt_and_events(
         events: Vec<MintEvent>,
-    ) -> MintTestFixture {
+    ) -> MintRecoveryFixture {
         let issuer_request_id = test_issuer_request_id();
-        let fixture = MintTestFixture::new().await;
+        let fixture = MintRecoveryFixture::new().await;
 
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
@@ -571,7 +681,7 @@ mod tests {
             .await
             .unwrap();
 
-        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
 
         fixture
     }
@@ -583,18 +693,16 @@ mod tests {
         let events = minting_failed_events(&issuer_request_id);
         let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
+            .await;
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
         let test = "minting_failed_with_receipt_recovers_to_completed";
         assert_eq!(
@@ -617,18 +725,16 @@ mod tests {
         let events = callback_pending_events(&issuer_request_id);
         let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
+            .await;
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
         let test = "callback_pending_recovers_to_completed";
         assert_eq!(
@@ -653,9 +759,9 @@ mod tests {
         let fixture = setup_with_receipt_and_events(events).await;
 
         fixture
-            .mint_cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+            .mint_store
+            .send(
+                &issuer_request_id,
                 MintCommand::Recover {
                     issuer_request_id: issuer_request_id.clone(),
                     mode: MintRecoveryMode::Automatic,
@@ -664,16 +770,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state after one Recover, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
         let test = "single_recover_command_from_minting_reaches_completed";
         assert_eq!(
@@ -691,9 +794,9 @@ mod tests {
         let fixture = setup_with_receipt_and_events(events).await;
 
         fixture
-            .mint_cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+            .mint_store
+            .send(
+                &issuer_request_id,
                 MintCommand::Recover {
                     issuer_request_id: issuer_request_id.clone(),
                     mode: MintRecoveryMode::Automatic,
@@ -702,16 +805,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state after one Recover, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
         let test =
             "single_recover_command_from_minting_failed_reaches_completed";
@@ -731,13 +831,13 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
         let events = fireblocks_submitted_events(&issuer_request_id);
         // No pre-existing receipt — the mock confirm path produces TokensMinted.
-        let fixture = MintTestFixture::new().await;
-        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
 
         fixture
-            .mint_cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+            .mint_store
+            .send(
+                &issuer_request_id,
                 MintCommand::Recover {
                     issuer_request_id: issuer_request_id.clone(),
                     mode: MintRecoveryMode::Automatic,
@@ -746,16 +846,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state after one Recover, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
         let test = "single_recover_command_from_fireblocks_submitted_reaches_completed";
         assert_eq!(
@@ -771,18 +868,16 @@ mod tests {
         let events = completed_events(&issuer_request_id);
         let fixture = setup_with_receipt_and_events(events).await;
 
-        recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
+        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
+            .await;
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
-            matches!(context.aggregate(), Mint::Completed { .. }),
+            matches!(mint, Mint::Completed { .. }),
             "Expected Completed state, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
 
         let test = "completed_mint_returns_cleanly";
@@ -798,11 +893,12 @@ mod tests {
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
         let events = fireblocks_failed_events(&issuer_request_id, failed_at);
         let fixture =
-            MintTestFixture::new_with_vault(Arc::new(PendingMintVault)).await;
-        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
+                .await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let outcome =
-            recover_mint(fixture.mint_cqrs.as_ref(), issuer_request_id).await;
+            recover_mint(fixture.mint_store.as_ref(), issuer_request_id).await;
 
         assert_eq!(outcome, DriveOutcome::Pending);
     }
@@ -819,14 +915,14 @@ mod tests {
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
         let events = fireblocks_failed_events(&issuer_request_id, failed_at);
         let fixture =
-            MintTestFixture::new_with_vault(Arc::new(PendingMintVault)).await;
-        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
+            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
+                .await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let backoff = Duration::from_millis(5);
         let max_pending_polls = 8;
         let start = tokio::time::Instant::now();
         recover_mint_until_automatic_budget_exhausted(
-            fixture.mint_cqrs.as_ref(),
             fixture.mint_store.as_ref(),
             issuer_request_id.clone(),
             backoff,
@@ -842,15 +938,12 @@ mod tests {
              poll, elapsed={elapsed:?}"
         );
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(
-            matches!(context.aggregate(), Mint::MintingFailed { .. }),
+            matches!(mint, Mint::MintingFailed { .. }),
             "Mint stays MintingFailed while the tx remains pending, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
 
         let test = "scheduled_recovery_backs_off_while_fireblocks_tx_pending";
@@ -871,24 +964,24 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
         let events = fireblocks_submitted_events(&issuer_request_id);
         let fixture =
-            MintTestFixture::new_with_vault(Arc::new(PendingMintVault)).await;
-        fixture.seed_mint_events(&issuer_request_id.to_string(), events).await;
-
-        let outcome =
-            recover_mint(fixture.mint_cqrs.as_ref(), issuer_request_id.clone())
+            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
                 .await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let outcome = recover_mint(
+            fixture.mint_store.as_ref(),
+            issuer_request_id.clone(),
+        )
+        .await;
 
         assert_eq!(outcome, DriveOutcome::Pending);
 
-        let mut context = fixture
-            .mint_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await
-            .unwrap();
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(
-            matches!(context.aggregate(), Mint::FireblocksSubmitted { .. }),
+            matches!(mint, Mint::FireblocksSubmitted { .. }),
             "A pending tx must leave the mint in FireblocksSubmitted, got: {}",
-            context.aggregate().state_name()
+            mint.state_name()
         );
     }
 }
