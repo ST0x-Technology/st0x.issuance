@@ -126,7 +126,6 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::mint::{Mint, MintView};
     use crate::redemption::upcaster::create_tokens_burned_upcaster;
     use crate::redemption::{Redemption, RedemptionView};
     use crate::test_utils::logs_contain_at;
@@ -220,21 +219,23 @@ mod tests {
     async fn replay_fails_fast_on_malformed_event() {
         let pool = migrated_pool().await;
 
-        // A Mint event whose payload cannot deserialize into MintEvent, so the
-        // stream delivers a per-event error the handler must surface.
+        // A Redemption event whose payload cannot deserialize into
+        // RedemptionEvent, so the stream delivers a per-event error the handler
+        // must surface.
         seed_event(
             &pool,
-            "Mint",
-            "MintEvent::Garbage",
+            "Redemption",
+            "RedemptionEvent::Garbage",
             "1.0",
             r#"{"NonexistentVariant":{}}"#,
         )
         .await;
 
-        let view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-            pool.clone(),
-            "mint_view".to_string(),
-        ));
+        let view_repo =
+            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
         let event_repo = SqliteEventRepository::new(pool);
 
         let error = replay_all_or_fail(event_repo, view_repo, vec![])
@@ -360,20 +361,22 @@ mod tests {
     async fn replay_succeeds_on_empty_store() {
         let pool = migrated_pool().await;
 
-        let view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-            pool.clone(),
-            "mint_view".to_string(),
-        ));
+        let view_repo =
+            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
         let event_repo = SqliteEventRepository::new(pool.clone());
 
         replay_all_or_fail(event_repo, view_repo, vec![])
             .await
             .expect("an empty event store is not a replay failure");
 
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mint_view")
-            .fetch_one(&pool)
-            .await
-            .expect("mint_view should be queryable");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM redemption_view")
+                .fetch_one(&pool)
+                .await
+                .expect("redemption_view should be queryable");
         assert_eq!(
             rows, 0,
             "a replay over no events must leave the view empty"
@@ -497,10 +500,11 @@ mod tests {
             .await
             .expect("Failed to drop events");
 
-        let view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-            pool.clone(),
-            "mint_view".to_string(),
-        ));
+        let view_repo =
+            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
+                pool.clone(),
+                "redemption_view".to_string(),
+            ));
         let event_repo = SqliteEventRepository::new(pool);
 
         let error = replay_all_or_fail(event_repo, view_repo, vec![])

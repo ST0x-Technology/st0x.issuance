@@ -1,12 +1,9 @@
 use alloy::primitives::{Address, B256, address};
-use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use event_sorcery::{Store, StoreBuilder, test_store};
-use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
-use crate::MintCqrs;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
@@ -15,9 +12,7 @@ use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::{
-    Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol,
-};
+use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
@@ -40,18 +35,11 @@ pub(crate) fn test_config() -> Config {
     }
 }
 
-pub(crate) fn create_test_event_store(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-) -> Arc<PersistedEventStore<SqliteEventRepository, Mint>> {
-    let event_repo = SqliteEventRepository::new(pool.clone());
-    Arc::new(PersistedEventStore::new_event_store(event_repo))
-}
-
 pub(crate) struct TestHarness {
     pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
     pub(crate) account_store: Arc<Store<Account>>,
     pub(crate) asset_store: Arc<Store<TokenizedAsset>>,
-    pub(crate) mint_cqrs: MintCqrs,
+    pub(crate) mint_store: Arc<Store<Mint>>,
 }
 
 impl TestHarness {
@@ -93,19 +81,13 @@ impl TestHarness {
             )),
         };
 
-        let mint_view_repo =
-            Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-                pool.clone(),
-                "mint_view".to_string(),
-            ));
-        let mint_query = GenericQuery::new(mint_view_repo);
-        let mint_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(mint_query)],
-            mint_services,
-        ));
+        let (mint_store, _mint_projection) =
+            StoreBuilder::<Mint>::new(pool.clone())
+                .build(mint_services)
+                .await
+                .expect("Failed to build mint store");
 
-        Self { pool, account_store, asset_store, mint_cqrs }
+        Self { pool, account_store, asset_store, mint_store }
     }
 }
 
