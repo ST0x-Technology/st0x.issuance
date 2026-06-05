@@ -79,9 +79,6 @@ pub(crate) type MintEventStore =
 pub(crate) type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
 pub(crate) type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
-type ReceiptInventoryCqrs = Arc<SqliteCqrs<ReceiptInventory>>;
-type ReceiptInventoryEventStore =
-    Arc<PersistedEventStore<SqliteEventRepository, ReceiptInventory>>;
 
 pub(crate) type SqliteEventStore<A> =
     PersistedEventStore<SqliteEventRepository, A>;
@@ -90,12 +87,6 @@ struct AggregateCqrsSetup {
     mint: MintDeps,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
-    receipt_inventory: ReceiptInventoryDeps,
-}
-
-struct ReceiptInventoryDeps {
-    cqrs: ReceiptInventoryCqrs,
-    event_store: ReceiptInventoryEventStore,
 }
 
 struct MintDeps {
@@ -261,6 +252,9 @@ pub async fn initialize_rocket(
     let (account_store, _account_projection) =
         StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
+    let receipt_inventory_store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
+
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
     let bot_wallet = config.signer.address().await?;
@@ -268,24 +262,21 @@ pub async fn initialize_rocket(
 
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
 
-    let AggregateCqrsSetup {
-        mint,
-        redemption_cqrs,
-        redemption_event_store,
-        receipt_inventory,
-    } = setup_aggregate_cqrs(
-        &pool,
-        blockchain_setup.vault_service.clone(),
-        alpaca_service.clone(),
-        bot_wallet,
-    );
+    let AggregateCqrsSetup { mint, redemption_cqrs, redemption_event_store } =
+        setup_aggregate_cqrs(
+            &pool,
+            &receipt_inventory_store,
+            blockchain_setup.vault_service.clone(),
+            alpaca_service.clone(),
+            bot_wallet,
+        );
 
     let managers = setup_redemption_managers(
         &config,
         blockchain_setup.vault_service,
         &redemption_cqrs,
         &redemption_event_store,
-        &receipt_inventory,
+        &receipt_inventory_store,
         &pool,
         bot_wallet,
     )?;
@@ -304,7 +295,7 @@ pub async fn initialize_rocket(
     let vault_configs = run_all_receipt_backfills(
         &pool,
         blockchain_setup.http_provider.clone(),
-        &receipt_inventory.cqrs,
+        &receipt_inventory_store,
         bot_wallet,
         config.backfill_start_block,
     )
@@ -320,8 +311,7 @@ pub async fn initialize_rocket(
     if let Err(error) = run_startup_reconciliation(
         blockchain_setup.http_provider.clone(),
         &vault_receipt_pairs,
-        &receipt_inventory.cqrs,
-        receipt_inventory.event_store.as_ref(),
+        &receipt_inventory_store,
         bot_wallet,
     )
     .await
@@ -358,7 +348,7 @@ pub async fn initialize_rocket(
         pool: pool.clone(),
         provider: blockchain_setup.http_provider.clone(),
         vault_configs: vault_configs.clone(),
-        receipt_inventory_cqrs: receipt_inventory.cqrs.clone(),
+        receipt_inventory_store: receipt_inventory_store.clone(),
         bot_wallet,
         backfill_start_block: config.backfill_start_block,
         receipt_poll_interval: config.receipt_poll_interval,
@@ -469,23 +459,14 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
 
 fn setup_aggregate_cqrs(
     pool: &Pool<Sqlite>,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     vault_service: Arc<dyn vault::VaultService>,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
 ) -> AggregateCqrsSetup {
-    // Create receipt inventory first since MintServices depends on it
-    let receipt_inventory_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-    let receipt_inventory_event_store =
-        Arc::new(PersistedEventStore::new_event_store(
-            SqliteEventRepository::new(pool.clone()),
-        ));
-
     // Create MintServices with all dependencies
-    let receipt_service = Arc::new(CqrsReceiptService::new(
-        receipt_inventory_event_store.clone(),
-        receipt_inventory_cqrs.clone(),
-    ));
+    let receipt_service =
+        Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
     let mint_services = MintServices {
         vault: vault_service.clone(),
         alpaca: alpaca_service,
@@ -550,10 +531,6 @@ fn setup_aggregate_cqrs(
         mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
         redemption_cqrs,
         redemption_event_store,
-        receipt_inventory: ReceiptInventoryDeps {
-            cqrs: receipt_inventory_cqrs,
-            event_store: receipt_inventory_event_store,
-        },
     }
 }
 
@@ -562,7 +539,7 @@ fn setup_redemption_managers(
     blockchain_service: Arc<dyn vault::VaultService>,
     redemption_cqrs: &RedemptionCqrs,
     redemption_event_store: &RedemptionEventStore,
-    receipt_inventory: &ReceiptInventoryDeps,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
 ) -> Result<RedemptionManagers, anyhow::Error> {
@@ -580,10 +557,8 @@ fn setup_redemption_managers(
         pool.clone(),
     ));
 
-    let receipt_service = Arc::new(CqrsReceiptService::new(
-        receipt_inventory.event_store.clone(),
-        receipt_inventory.cqrs.clone(),
-    ));
+    let receipt_service =
+        Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
 
     let burn = Arc::new(BurnManager::new(
         blockchain_service,
@@ -729,7 +704,7 @@ struct VaultBackfillConfig {
 async fn run_all_receipt_backfills<P: Provider + Clone>(
     pool: &Pool<Sqlite>,
     provider: P,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
     backfill_start_block: u64,
 ) -> Result<Vec<VaultBackfillConfig>, anyhow::Error> {
@@ -756,7 +731,7 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
                     vault,
                     backfill_start_block,
                     &underlying.0,
-                    receipt_inventory_cqrs,
+                    receipt_inventory_store,
                     bot_wallet,
                 )
                 .await
@@ -773,7 +748,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     vault: Address,
     backfill_start_block: u64,
     underlying: &str,
-    receipt_inventory_cqrs: &ReceiptInventoryCqrs,
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
 ) -> Result<VaultBackfillConfig, anyhow::Error> {
     let vault_contract =
@@ -804,7 +779,7 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         receipt_contract,
         bot_wallet,
         vault,
-        receipt_inventory_cqrs.clone(),
+        receipt_inventory_store.clone(),
         pool.clone(),
         NoOpItnHandler,
     );
@@ -842,7 +817,7 @@ fn next_receipt_backfill_block(
 struct PeriodicBackfillCtx<'a, P, H> {
     pool: &'a Pool<Sqlite>,
     provider: &'a P,
-    receipt_inventory_cqrs: &'a ReceiptInventoryCqrs,
+    receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
     backfill_start_block: u64,
     handler: &'a H,
@@ -878,7 +853,7 @@ where
         config.receipt_contract,
         ctx.bot_wallet,
         config.vault,
-        ctx.receipt_inventory_cqrs.clone(),
+        ctx.receipt_inventory_store.clone(),
         ctx.pool.clone(),
         ctx.handler,
     );
@@ -904,7 +879,7 @@ struct PeriodicBackfillSpawn<P, H> {
     pool: Pool<Sqlite>,
     provider: P,
     vault_configs: Vec<VaultBackfillConfig>,
-    receipt_inventory_cqrs: ReceiptInventoryCqrs,
+    receipt_inventory_store: Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
     backfill_start_block: u64,
     receipt_poll_interval: Duration,
@@ -920,7 +895,7 @@ where
         pool,
         provider,
         vault_configs,
-        receipt_inventory_cqrs,
+        receipt_inventory_store,
         bot_wallet,
         backfill_start_block,
         receipt_poll_interval,
@@ -941,7 +916,7 @@ where
         let ctx = PeriodicBackfillCtx {
             pool: &pool,
             provider: &provider,
-            receipt_inventory_cqrs: &receipt_inventory_cqrs,
+            receipt_inventory_store: &receipt_inventory_store,
             bot_wallet,
             backfill_start_block,
             handler: &handler,
