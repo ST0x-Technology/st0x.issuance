@@ -103,14 +103,8 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
     // Setup ReceiptInventory (needed by MintServices for receipt lookups and registration)
-    let receipt_inventory_event_store = Arc::new(PersistedEventStore::<
-        SqliteEventRepository,
-        ReceiptInventory,
-    >::new_event_store(
-        SqliteEventRepository::new(pool.clone()),
-    ));
-    let receipt_inventory_cqrs =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+    let receipt_inventory_store =
+        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
     // Create mock services for Mint aggregate
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -119,10 +113,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         alpaca: Arc::new(MockAlpacaService::new_success()),
         pool: pool.clone(),
         bot,
-        receipts: Arc::new(CqrsReceiptService::new(
-            receipt_inventory_event_store.clone(),
-            receipt_inventory_cqrs,
-        )),
+        receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
     };
 
     // Setup Mint CQRS
