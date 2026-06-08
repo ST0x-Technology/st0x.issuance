@@ -2953,6 +2953,23 @@ mod tests {
         let (cqrs, event_store) = setup_cqrs(&pool);
         let metadata = setup_burning(&cqrs).await;
 
+        // Production's `force_complete_burn` appends `BurnForceCompleted` before
+        // the endpoint reads the prior state; the mock can't, so append it here
+        // to reproduce the real on-disk shape (terminal event =
+        // `BurnForceCompleted`, so `redemption_state_before_last_event` resolves
+        // to `Burning`).
+        cqrs.execute(
+            &metadata.issuer_request_id.to_string(),
+            RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                burn_tx_hash: alloy::primitives::B256::ZERO,
+                block_number: 45_989_009,
+                reason: "burn confirmed on-chain".to_string(),
+            },
+        )
+        .await
+        .expect("ForceCompleteBurn failed");
+
         let burn_recovery = Arc::new(MockBurnRecovery::default());
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
