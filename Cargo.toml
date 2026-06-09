@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", branch = "docs/examples" }
-sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", branch = "docs/examples" }
+event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git" }
+sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git" }
 cqrs-es = "0.4.12"
 async-trait = "0.1.89"
 rocket = { version = "0.5.1", features = ["json"] }
@@ -55,6 +55,9 @@ flate2 = "1.1.9"
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"
 alloy-sol-types = "1.4.1"
+event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", features = [
+  "test-support",
+] }
 httpmock = "0.8.2"
 proptest = "1.10.0"
 rand = "0.8"

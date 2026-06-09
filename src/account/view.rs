@@ -1,16 +1,9 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
-use cqrs_es::{EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::{Pool, Sqlite};
-use std::sync::Arc;
-use tracing::debug;
 
-use super::{
-    Account, AccountError, AccountEvent, AlpacaAccountNumber, ClientId, Email,
-};
-use crate::replay::{ReplayError, replay_all_or_fail};
+use super::{AlpacaAccountNumber, ClientId, Email};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccountViewError {
@@ -18,36 +11,17 @@ pub(crate) enum AccountViewError {
     Database(#[from] sqlx::Error),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
-    #[error("Persistence error: {0}")]
-    Persistence(#[from] cqrs_es::persist::PersistenceError),
-    #[error("Replay error: {0}")]
-    Replay(#[from] ReplayError<AccountError>),
 }
 
-pub(crate) async fn replay_account_view(
-    pool: Pool<Sqlite>,
-) -> Result<(), AccountViewError> {
-    debug!(target: "account", "Rebuilding account view from events");
-
-    sqlx::query!("DELETE FROM account_view").execute(&pool).await?;
-
-    let view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
-    let event_repo = SqliteEventRepository::new(pool);
-    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
-
-    debug!(target: "account", "Account view rebuild complete");
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// Read model for an account, projected from the `account_view` table.
+///
+/// `account_view` stores the event-sorcery `Lifecycle<Account>` payload
+/// (`{"Live": {...}}`). The `find_by_*` queries extract the `$.Live` sub-object,
+/// which mirrors these variants field-for-field, so it deserializes straight
+/// into `AccountView`. Non-live rows (`Uninitialized` / `Failed`) have a NULL
+/// `$.Live` and are treated as "not found".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum AccountView {
-    #[default]
-    Unavailable,
     Registered {
         client_id: ClientId,
         email: Email,
@@ -63,47 +37,6 @@ pub(crate) enum AccountView {
     },
 }
 
-impl View<Account> for AccountView {
-    fn update(&mut self, event: &EventEnvelope<Account>) {
-        match &event.payload {
-            AccountEvent::Registered { client_id, email, registered_at } => {
-                *self = Self::Registered {
-                    client_id: *client_id,
-                    email: email.clone(),
-                    registered_at: *registered_at,
-                };
-            }
-
-            AccountEvent::LinkedToAlpaca { alpaca_account, linked_at } => {
-                if let Self::Registered { client_id, email, registered_at } =
-                    self.clone()
-                {
-                    *self = Self::LinkedToAlpaca {
-                        client_id,
-                        email,
-                        alpaca_account: alpaca_account.clone(),
-                        whitelisted_wallets: Vec::new(),
-                        registered_at,
-                        linked_at: *linked_at,
-                    };
-                }
-            }
-
-            AccountEvent::WalletWhitelisted { wallet, .. } => {
-                if let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self {
-                    whitelisted_wallets.push(*wallet);
-                }
-            }
-
-            AccountEvent::WalletUnwhitelisted { wallet, .. } => {
-                if let Self::LinkedToAlpaca { whitelisted_wallets, .. } = self {
-                    whitelisted_wallets.retain(|w| w != wallet);
-                }
-            }
-        }
-    }
-}
-
 pub(crate) async fn find_by_client_id(
     pool: &Pool<Sqlite>,
     client_id: &ClientId,
@@ -111,10 +44,10 @@ pub(crate) async fn find_by_client_id(
     let client_id_str = client_id.to_string();
     let row = sqlx::query!(
         r#"
-        SELECT payload as "payload: String"
+        SELECT json_extract(payload, '$.Live') as "live: String"
         FROM account_view
-        WHERE json_extract(payload, '$.Registered.client_id') = ?
-           OR json_extract(payload, '$.LinkedToAlpaca.client_id') = ?
+        WHERE json_extract(payload, '$.Live.Registered.client_id') = ?
+           OR json_extract(payload, '$.Live.LinkedToAlpaca.client_id') = ?
         "#,
         client_id_str,
         client_id_str
@@ -122,11 +55,11 @@ pub(crate) async fn find_by_client_id(
     .fetch_optional(pool)
     .await?;
 
-    let Some(row) = row else {
+    let Some(live) = row.and_then(|row| row.live) else {
         return Ok(None);
     };
 
-    let view: AccountView = serde_json::from_str(&row.payload)?;
+    let view: AccountView = serde_json::from_str(&live)?;
 
     Ok(Some(view))
 }
@@ -137,10 +70,10 @@ pub(crate) async fn find_by_email(
 ) -> Result<Option<AccountView>, AccountViewError> {
     let row = sqlx::query!(
         r#"
-        SELECT payload as "payload: String"
+        SELECT json_extract(payload, '$.Live') as "live: String"
         FROM account_view
-        WHERE json_extract(payload, '$.Registered.email') = ?
-           OR json_extract(payload, '$.LinkedToAlpaca.email') = ?
+        WHERE json_extract(payload, '$.Live.Registered.email') = ?
+           OR json_extract(payload, '$.Live.LinkedToAlpaca.email') = ?
         "#,
         email.0,
         email.0
@@ -148,11 +81,11 @@ pub(crate) async fn find_by_email(
     .fetch_optional(pool)
     .await?;
 
-    let Some(row) = row else {
+    let Some(live) = row.and_then(|row| row.live) else {
         return Ok(None);
     };
 
-    let view: AccountView = serde_json::from_str(&row.payload)?;
+    let view: AccountView = serde_json::from_str(&live)?;
 
     Ok(Some(view))
 }
@@ -164,11 +97,11 @@ pub(crate) async fn find_by_wallet(
     let wallet_str = format!("{wallet:#x}");
     let row = sqlx::query!(
         r#"
-        SELECT payload as "payload: String"
+        SELECT json_extract(payload, '$.Live') as "live: String"
         FROM account_view
         WHERE EXISTS(
             SELECT 1
-            FROM json_each(payload, '$.LinkedToAlpaca.whitelisted_wallets')
+            FROM json_each(payload, '$.Live.LinkedToAlpaca.whitelisted_wallets')
             WHERE value = ?
         )
         "#,
@@ -177,11 +110,11 @@ pub(crate) async fn find_by_wallet(
     .fetch_optional(pool)
     .await?;
 
-    let Some(row) = row else {
+    let Some(live) = row.and_then(|row| row.live) else {
         return Ok(None);
     };
 
-    let view: AccountView = serde_json::from_str(&row.payload)?;
+    let view: AccountView = serde_json::from_str(&live)?;
 
     Ok(Some(view))
 }
@@ -189,11 +122,8 @@ pub(crate) async fn find_by_wallet(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use cqrs_es::EventEnvelope;
-    use cqrs_es::persist::GenericQuery;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+    use event_sorcery::{Store, StoreBuilder};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -202,7 +132,7 @@ mod tests {
 
     struct TestHarness {
         pool: Pool<Sqlite>,
-        cqrs: SqliteCqrs<Account>,
+        store: Arc<Store<Account>>,
     }
 
     impl TestHarness {
@@ -218,23 +148,18 @@ mod tests {
                 .await
                 .expect("Failed to run migrations");
 
-            let view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
-            let query = GenericQuery::new(view_repo);
-            let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(query)], ());
+            let (store, _projection) =
+                StoreBuilder::<Account>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build account store");
 
-            Self { pool, cqrs }
+            Self { pool, store }
         }
 
         async fn register_account(&self, client_id: ClientId, email: Email) {
-            self.cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::Register { client_id, email },
-                )
+            self.store
+                .send(&client_id, AccountCommand::Register { client_id, email })
                 .await
                 .expect("Failed to register account");
         }
@@ -244,13 +169,24 @@ mod tests {
             client_id: &ClientId,
             alpaca_account: AlpacaAccountNumber,
         ) {
-            self.cqrs
-                .execute(
-                    &client_id.to_string(),
+            self.store
+                .send(
+                    client_id,
                     AccountCommand::LinkToAlpaca { alpaca_account },
                 )
                 .await
                 .expect("Failed to link to Alpaca");
+        }
+
+        async fn whitelist_wallet(
+            &self,
+            client_id: &ClientId,
+            wallet: Address,
+        ) {
+            self.store
+                .send(client_id, AccountCommand::WhitelistWallet { wallet })
+                .await
+                .expect("Failed to whitelist wallet");
         }
     }
 
@@ -267,94 +203,6 @@ mod tests {
             .expect("Failed to run migrations");
 
         pool
-    }
-
-    #[test]
-    fn test_view_update_from_registered_event() {
-        let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
-        let registered_at = Utc::now();
-
-        let event = AccountEvent::Registered {
-            client_id,
-            email: email.clone(),
-            registered_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: email.as_str().to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = AccountView::default();
-
-        assert!(matches!(view, AccountView::Unavailable));
-
-        view.update(&envelope);
-
-        let AccountView::Registered {
-            client_id: view_client_id,
-            email: view_email,
-            registered_at: view_registered_at,
-        } = view
-        else {
-            panic!("Expected Registered, got {view:?}")
-        };
-
-        assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email, email);
-        assert_eq!(view_registered_at, registered_at);
-    }
-
-    #[test]
-    fn test_view_update_from_linked_to_alpaca_event() {
-        let client_id = ClientId::new();
-        let email = Email("user@example.com".to_string());
-        let registered_at = Utc::now();
-
-        let mut view = AccountView::Registered {
-            client_id,
-            email: email.clone(),
-            registered_at,
-        };
-
-        let alpaca_account = AlpacaAccountNumber("ALPACA123".to_string());
-        let linked_at = Utc::now();
-
-        let event = AccountEvent::LinkedToAlpaca {
-            alpaca_account: alpaca_account.clone(),
-            linked_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: client_id.to_string(),
-            sequence: 2,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let AccountView::LinkedToAlpaca {
-            client_id: view_client_id,
-            email: view_email,
-            alpaca_account: view_alpaca,
-            whitelisted_wallets,
-            registered_at: view_registered_at,
-            linked_at: view_linked_at,
-        } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
-        };
-
-        assert_eq!(view_client_id, client_id);
-        assert_eq!(view_email, email);
-        assert_eq!(view_alpaca, alpaca_account);
-        assert!(whitelisted_wallets.is_empty());
-        assert_eq!(view_registered_at, registered_at);
-        assert_eq!(view_linked_at, linked_at);
     }
 
     #[tokio::test]
@@ -474,115 +322,118 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_view_update_from_wallet_whitelisted_event() {
-        let mut view = AccountView::LinkedToAlpaca {
-            client_id: ClientId(Uuid::new_v4()),
-            email: Email("user@example.com".to_string()),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            whitelisted_wallets: Vec::new(),
-            registered_at: Utc::now(),
-            linked_at: Utc::now(),
-        };
+    #[tokio::test]
+    async fn test_find_by_wallet_returns_linked_account() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
 
+        let client_id = ClientId::new();
+        let email = Email("wallet@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA-W".to_string());
         let wallet = address!("0x1111111111111111111111111111111111111111");
 
-        let event = AccountEvent::WalletWhitelisted {
-            wallet,
-            whitelisted_at: Utc::now(),
-        };
+        harness.register_account(client_id, email).await;
+        harness.link_to_alpaca(&client_id, alpaca_account).await;
+        harness.whitelist_wallet(&client_id, wallet).await;
 
-        let envelope = EventEnvelope {
-            aggregate_id: "user@example.com".to_string(),
-            sequence: 3,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        let view = find_by_wallet(pool, &wallet)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
 
-        view.update(&envelope);
-
-        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        let AccountView::LinkedToAlpaca {
+            client_id: found_client_id,
+            whitelisted_wallets,
+            ..
+        } = view
         else {
             panic!("Expected LinkedToAlpaca, got {view:?}")
         };
 
-        assert_eq!(whitelisted_wallets.len(), 1);
-        assert_eq!(whitelisted_wallets[0], wallet);
+        assert_eq!(found_client_id, client_id);
+        assert!(whitelisted_wallets.contains(&wallet));
     }
 
-    #[test]
-    fn test_view_update_from_wallet_unwhitelisted_event() {
-        let wallet = address!("0x1111111111111111111111111111111111111111");
+    #[tokio::test]
+    async fn test_find_by_wallet_returns_none_for_unknown_wallet() {
+        let pool = setup_test_db().await;
 
-        let mut view = AccountView::LinkedToAlpaca {
-            client_id: ClientId(Uuid::new_v4()),
-            email: Email("user@example.com".to_string()),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            whitelisted_wallets: vec![wallet],
-            registered_at: Utc::now(),
-            linked_at: Utc::now(),
-        };
+        let wallet = address!("0x9999999999999999999999999999999999999999");
 
-        let event = AccountEvent::WalletUnwhitelisted {
-            wallet,
-            unwhitelisted_at: Utc::now(),
-        };
+        let result =
+            find_by_wallet(&pool, &wallet).await.expect("Query should succeed");
 
-        let envelope = EventEnvelope {
-            aggregate_id: "user@example.com".to_string(),
-            sequence: 4,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
-        else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
-        };
-
-        assert!(
-            whitelisted_wallets.is_empty(),
-            "Wallet should be removed after unwhitelisting"
-        );
+        assert!(result.is_none());
     }
 
-    #[test]
-    fn test_view_update_unwhitelist_absent_wallet_is_noop() {
-        let wallet = address!("0x1111111111111111111111111111111111111111");
+    // Proves the account_view-to-lifecycle migration is data-safe: after the
+    // view table is cleared (as the migration's DROP TABLE does), a fresh
+    // `StoreBuilder::build` rebuilds every row from the event log via catch_up.
+    #[tokio::test]
+    async fn build_rebuilds_account_view_from_events_after_view_cleared() {
+        let pool = setup_test_db().await;
 
-        let mut view = AccountView::LinkedToAlpaca {
-            client_id: ClientId(Uuid::new_v4()),
-            email: Email("user@example.com".to_string()),
-            alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
-            whitelisted_wallets: Vec::new(),
-            registered_at: Utc::now(),
-            linked_at: Utc::now(),
-        };
+        let client_id = ClientId::new();
+        let email = Email("rebuild@example.com".to_string());
+        let alpaca_account = AlpacaAccountNumber("ALPACA-R".to_string());
+        let wallet = address!("0x2222222222222222222222222222222222222222");
 
-        let event = AccountEvent::WalletUnwhitelisted {
-            wallet,
-            unwhitelisted_at: Utc::now(),
-        };
+        {
+            let (store, _projection) =
+                StoreBuilder::<Account>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build account store");
+            store
+                .send(
+                    &client_id,
+                    AccountCommand::Register {
+                        client_id,
+                        email: email.clone(),
+                    },
+                )
+                .await
+                .expect("Failed to register account");
+            store
+                .send(
+                    &client_id,
+                    AccountCommand::LinkToAlpaca { alpaca_account },
+                )
+                .await
+                .expect("Failed to link to Alpaca");
+            store
+                .send(&client_id, AccountCommand::WhitelistWallet { wallet })
+                .await
+                .expect("Failed to whitelist wallet");
+        }
 
-        let envelope = EventEnvelope {
-            aggregate_id: "user@example.com".to_string(),
-            sequence: 4,
-            payload: event,
-            metadata: HashMap::new(),
-        };
+        // The migration drops account_view; simulate that, then rebuild from
+        // the event log.
+        sqlx::query("DELETE FROM account_view")
+            .execute(&pool)
+            .await
+            .expect("Failed to clear account_view");
 
-        view.update(&envelope);
+        let (_store, _projection) = StoreBuilder::<Account>::new(pool.clone())
+            .build(())
+            .await
+            .expect("Failed to rebuild account store");
 
-        let AccountView::LinkedToAlpaca { whitelisted_wallets, .. } = view
+        let by_email = find_by_email(&pool, &email)
+            .await
+            .expect("Query should succeed")
+            .expect("View should be rebuilt from events");
+        assert!(matches!(by_email, AccountView::LinkedToAlpaca { .. }));
+
+        let by_wallet = find_by_wallet(&pool, &wallet)
+            .await
+            .expect("Query should succeed")
+            .expect("View should be rebuilt from events");
+        let AccountView::LinkedToAlpaca { client_id: found_client_id, .. } =
+            by_wallet
         else {
-            panic!("Expected LinkedToAlpaca, got {view:?}")
+            panic!("Expected LinkedToAlpaca, got {by_wallet:?}")
         };
-
-        assert!(
-            whitelisted_wallets.is_empty(),
-            "Wallets should remain empty after unwhitelisting absent wallet"
-        );
+        assert_eq!(found_client_id, client_id);
     }
 }

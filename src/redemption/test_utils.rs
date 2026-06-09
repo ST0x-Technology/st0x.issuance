@@ -4,11 +4,11 @@ use alloy::primitives::{
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use cqrs_es::persist::GenericQuery;
+use event_sorcery::StoreBuilder;
 use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-use crate::account::view::AccountView;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
@@ -60,30 +60,20 @@ pub(crate) async fn setup_test_db_with_asset(
         .unwrap();
 
     if let Some(wallet) = ap_wallet {
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let client_id = ClientId::new();
         let email = Email::new("test@example.com".to_string()).unwrap();
 
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::Register { client_id, email },
-            )
+        account_store
+            .send(&client_id, AccountCommand::Register { client_id, email })
             .await
             .unwrap();
 
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
+        account_store
+            .send(
+                &client_id,
                 AccountCommand::LinkToAlpaca {
                     alpaca_account: AlpacaAccountNumber(
                         "ALPACA123".to_string(),
@@ -93,11 +83,8 @@ pub(crate) async fn setup_test_db_with_asset(
             .await
             .unwrap();
 
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::WhitelistWallet { wallet },
-            )
+        account_store
+            .send(&client_id, AccountCommand::WhitelistWallet { wallet })
             .await
             .unwrap();
     }

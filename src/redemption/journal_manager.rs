@@ -121,7 +121,9 @@ impl<ES: EventStore<Redemption>> JournalManager<ES> {
             AccountView::LinkedToAlpaca { alpaca_account, .. } => {
                 Ok(alpaca_account)
             }
-            _ => Err(JournalManagerError::AccountNotLinked { wallet: *wallet }),
+            AccountView::Registered { .. } => {
+                Err(JournalManagerError::AccountNotLinked { wallet: *wallet })
+            }
         }
     }
 
@@ -452,6 +454,7 @@ mod tests {
     use async_trait::async_trait;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{Aggregate, EventStore};
+    use event_sorcery::StoreBuilder;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -460,7 +463,9 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{JournalManager, JournalManagerError};
-    use crate::account::{AccountView, AlpacaAccountNumber, ClientId, Email};
+    use crate::account::{
+        Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
+    };
     use crate::alpaca::{
         AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
     };
@@ -1083,27 +1088,36 @@ mod tests {
         wallet: Address,
         alpaca_account: &AlpacaAccountNumber,
     ) {
-        let view = AccountView::LinkedToAlpaca {
-            client_id: ClientId::new(),
-            email: Email::new("test@example.com".to_string()).unwrap(),
-            alpaca_account: alpaca_account.clone(),
-            whitelisted_wallets: vec![wallet],
-            registered_at: chrono::Utc::now(),
-            linked_at: chrono::Utc::now(),
-        };
-        let payload = serde_json::to_string(&view).unwrap();
-        let view_id = format!("{wallet:?}");
-        sqlx::query!(
-            r#"
-            INSERT INTO account_view (view_id, version, payload)
-            VALUES ($1, 1, $2)
-            "#,
-            view_id,
-            payload
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+        let client_id = ClientId::new();
+
+        account_store
+            .send(
+                &client_id,
+                AccountCommand::Register {
+                    client_id,
+                    email: Email::new("test@example.com".to_string()).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        account_store
+            .send(
+                &client_id,
+                AccountCommand::LinkToAlpaca {
+                    alpaca_account: alpaca_account.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        account_store
+            .send(&client_id, AccountCommand::WhitelistWallet { wallet })
+            .await
+            .unwrap();
     }
 
     async fn insert_redemption_view(

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{AlpacaAccountNumber, ClientId, Email};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AccountEvent {
     Registered {
         client_id: ClientId,

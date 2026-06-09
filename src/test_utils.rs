@@ -12,6 +12,7 @@ use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use event_sorcery::StoreBuilder;
 use rocket::routes;
 use sqlite_es::{
     SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
@@ -20,7 +21,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
-use crate::account::{Account, AccountView};
+use crate::account::Account;
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
@@ -95,16 +96,9 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    // Setup Account CQRS
-    let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
-
-    let account_query = GenericQuery::new(account_view_repo);
-    let account_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+    // Setup Account store (event-sorcery)
+    let (account_store, _account_projection) =
+        StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
     // Setup TokenizedAsset CQRS
     let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
@@ -169,7 +163,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     // Build rocket
     Ok(rocket::build()
         .manage(test_config()?)
-        .manage(account_cqrs)
+        .manage(account_store)
         .manage(tokenized_asset_cqrs)
         .manage(mint_cqrs)
         .manage(mint_event_store)

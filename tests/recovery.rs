@@ -331,10 +331,7 @@ async fn test_mint_recovery_after_view_deletion()
         final_event_count.count
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Mint callback should be hit at least once"
-    );
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }
@@ -475,10 +472,7 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         "User should have same shares (no double mint)"
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Mint callback should be hit at least once"
-    );
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }
@@ -574,10 +568,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
          Recovery for Minting state (no receipt) not implemented."
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Mint callback should be hit at least once"
-    );
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }
@@ -719,10 +710,7 @@ async fn test_mint_recovery_prevents_double_mint()
          Before: {shares_before}, After: {shares_after}"
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Mint callback should be hit at least once"
-    );
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }
@@ -968,10 +956,7 @@ async fn test_mint_recovery_from_minting_failed_state()
          Recovery for MintingFailed state not implemented."
     );
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Mint callback should be hit at least once"
-    );
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }
@@ -1232,10 +1217,10 @@ async fn test_detected_redemption_auto_failed_when_no_account()
 
     harness::wait_for_shares(&vault, user_wallet).await?;
 
-    assert!(
-        mint_callback_mock.calls_async().await >= 1,
-        "Service should still be able to process new mints after auto-failing orphaned redemption"
-    );
+    // The mint's on-chain deposit and the Alpaca callback run in a background
+    // task after confirm returns; wait_for_shares only guarantees the deposit,
+    // so poll for the callback rather than asserting it has already fired.
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }

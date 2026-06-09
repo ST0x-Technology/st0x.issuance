@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use cqrs_es::AggregateError;
+use event_sorcery::{AggregateError, LifecycleError, Store};
 use rocket::Request;
 use rocket::http::Status;
 use rocket::request::FromParam;
@@ -7,13 +7,13 @@ use rocket::response::Responder;
 use rocket::serde::json::Json;
 use rocket::{delete, post};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 
 use super::{
-    AccountCommand, AccountError, AccountView, AlpacaAccountNumber, ClientId,
-    Email, view::AccountViewError, view::find_by_client_id,
-    view::find_by_email,
+    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
+    view::AccountViewError, view::find_by_client_id, view::find_by_email,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
@@ -42,7 +42,7 @@ pub(crate) enum ApiError {
     #[error("Account view error: {0}")]
     AccountView(#[from] AccountViewError),
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<AccountError>),
+    Aggregate(#[from] AggregateError<LifecycleError<Account>>),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -77,33 +77,43 @@ pub struct RegisterAccountResponse {
     pub client_id: ClientId,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(email = %request.email.0))]
+#[tracing::instrument(skip(_auth, store, pool), fields(email = %request.email.0))]
 #[post("/accounts", format = "json", data = "<request>")]
 pub(crate) async fn register_account(
     _auth: InternalAuth,
-    cqrs: &rocket::State<crate::AccountCqrs>,
+    store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<RegisterAccountRequest>,
 ) -> Result<Json<RegisterAccountResponse>, rocket::http::Status> {
-    if let Some(view) = find_by_email(pool.inner(), &request.email)
-        .await
-        .map_err(|_| rocket::http::Status::InternalServerError)?
-    {
-        match view {
-            AccountView::Registered { .. }
-            | AccountView::LinkedToAlpaca { .. } => {
-                return Err(rocket::http::Status::Conflict);
-            }
-            AccountView::Unavailable => {}
-        }
+    // Atomically claim the email before committing any event. The unique PK on
+    // account_emails rejects a concurrent or repeat registration race-free,
+    // unlike the account_view index whose violation the projection swallows
+    // after the event has already committed.
+    let claimed = sqlx::query!(
+        "INSERT OR IGNORE INTO account_emails (email) VALUES (?)",
+        request.email.0
+    )
+    .execute(pool.inner())
+    .await
+    .map_err(|_| rocket::http::Status::InternalServerError)?;
+
+    if claimed.rows_affected() == 0 {
+        return Err(rocket::http::Status::Conflict);
     }
 
     let client_id = ClientId::new();
     let register_command =
         AccountCommand::Register { client_id, email: request.email.clone() };
 
-    let aggregate_id = client_id.to_string();
-    if let Err(err) = cqrs.execute(&aggregate_id, register_command).await {
+    if let Err(err) = store.send(&client_id, register_command).await {
+        // Release the claim so a transient failure doesn't permanently block
+        // re-registration of this email.
+        let _ = sqlx::query!(
+            "DELETE FROM account_emails WHERE email = ?",
+            request.email.0
+        )
+        .execute(pool.inner())
+        .await;
         return Err(map_cqrs_error_to_status(&err));
     }
 
@@ -111,7 +121,7 @@ pub(crate) async fn register_account(
 }
 
 fn map_cqrs_error_to_status(
-    err: &AggregateError<super::AccountError>,
+    err: &AggregateError<LifecycleError<Account>>,
 ) -> Status {
     match err {
         AggregateError::DatabaseConnectionError(inner)
@@ -139,14 +149,14 @@ pub struct AccountLinkResponse {
     pub client_id: ClientId,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, store, pool), fields(
     email = %request.email.0,
     account = %request.account.0
 ))]
 #[post("/accounts/connect", format = "json", data = "<request>")]
 pub(crate) async fn connect_account(
     _auth: IssuerAuth,
-    cqrs: &rocket::State<crate::AccountCqrs>,
+    store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<AccountLinkRequest>,
 ) -> Result<Json<AccountLinkResponse>, rocket::http::Status> {
@@ -160,17 +170,14 @@ pub(crate) async fn connect_account(
         AccountView::LinkedToAlpaca { .. } => {
             return Err(rocket::http::Status::Conflict);
         }
-        AccountView::Unavailable => {
-            return Err(rocket::http::Status::NotFound);
-        }
     };
 
     let link_command = AccountCommand::LinkToAlpaca {
         alpaca_account: request.account.clone(),
     };
 
-    let aggregate_id = client_id.to_string();
-    cqrs.execute(&aggregate_id, link_command)
+    store
+        .send(&client_id, link_command)
         .await
         .map_err(|_| rocket::http::Status::InternalServerError)?;
 
@@ -187,14 +194,14 @@ pub struct WhitelistWalletResponse {
     pub success: bool,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, store, pool), fields(
     client_id = %client_id,
     wallet = ?request.wallet
 ))]
 #[post("/accounts/<client_id>/wallets", format = "json", data = "<request>")]
 pub(crate) async fn whitelist_wallet(
     _auth: InternalAuth,
-    cqrs: &rocket::State<crate::AccountCqrs>,
+    store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
     request: Json<WhitelistWalletRequest>,
@@ -209,20 +216,19 @@ pub(crate) async fn whitelist_wallet(
 
     let command = AccountCommand::WhitelistWallet { wallet: request.wallet };
 
-    let aggregate_id = client_id.0.to_string();
-    cqrs.execute(&aggregate_id, command).await?;
+    store.send(&client_id, command).await?;
 
     Ok(Json(WhitelistWalletResponse { success: true }))
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, store, pool), fields(
     client_id = %client_id,
     wallet = %wallet.0
 ))]
 #[delete("/accounts/<client_id>/wallets/<wallet>")]
 pub(crate) async fn unwhitelist_wallet(
     _auth: InternalAuth,
-    cqrs: &rocket::State<crate::AccountCqrs>,
+    store: &rocket::State<Arc<Store<Account>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     client_id: ClientId,
     wallet: WalletParam,
@@ -237,8 +243,7 @@ pub(crate) async fn unwhitelist_wallet(
 
     let command = AccountCommand::UnwhitelistWallet { wallet: wallet.0 };
 
-    let aggregate_id = client_id.0.to_string();
-    cqrs.execute(&aggregate_id, command).await?;
+    store.send(&client_id, command).await?;
 
     Ok(Json(WhitelistWalletResponse { success: true }))
 }
@@ -246,12 +251,10 @@ pub(crate) async fn unwhitelist_wallet(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, address};
-    use cqrs_es::persist::GenericQuery;
+    use event_sorcery::StoreBuilder;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
     use url::Url;
 
     use super::*;
@@ -280,19 +283,27 @@ mod tests {
     }
 
     async fn register_account(
-        cqrs: &crate::AccountCqrs,
+        store: &Arc<Store<Account>>,
+        pool: &sqlx::Pool<sqlx::Sqlite>,
         email: &str,
     ) -> ClientId {
         let client_id = ClientId::new();
+
+        sqlx::query!(
+            "INSERT OR IGNORE INTO account_emails (email) VALUES (?)",
+            email
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to claim email");
+
         let email =
             Email::new(email.to_string()).expect("Valid email for test");
 
-        cqrs.execute(
-            &client_id.to_string(),
-            AccountCommand::Register { client_id, email },
-        )
-        .await
-        .expect("Failed to register account");
+        store
+            .send(&client_id, AccountCommand::Register { client_id, email })
+            .await
+            .expect("Failed to register account");
 
         client_id
     }
@@ -310,26 +321,18 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "customer@firm.com";
-        let client_id = register_account(&account_cqrs, email).await;
+        let client_id = register_account(&account_store, &pool, email).await;
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -375,26 +378,18 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "duplicate@example.com";
-        register_account(&account_cqrs, email).await;
+        register_account(&account_store, &pool, email).await;
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -446,23 +441,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -503,23 +490,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -560,26 +539,18 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "events@example.com";
-        let client_id = register_account(&account_cqrs, email).await;
+        let client_id = register_account(&account_store, &pool, email).await;
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
 
@@ -642,26 +613,18 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "view@example.com";
-        let client_id = register_account(&account_cqrs, email).await;
+        let client_id = register_account(&account_store, &pool, email).await;
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool.clone())
             .mount("/", routes![connect_account]);
 
@@ -725,21 +688,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -776,21 +731,13 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![connect_account]);
 
@@ -832,23 +779,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool.clone())
             .mount("/", routes![super::register_account]);
 
@@ -905,26 +844,18 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "duplicate@example.com";
-        register_account(&account_cqrs, email).await;
+        register_account(&account_store, &pool, email).await;
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![super::register_account]);
 
@@ -964,23 +895,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![super::register_account]);
 
@@ -1017,17 +940,12 @@ mod tests {
 
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-        let cqrs = sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "unique@example.com";
-        let first_client_id = register_account(&cqrs, email).await;
+        let first_client_id =
+            register_account(&account_store, &pool, email).await;
 
         let view =
             find_by_email(&pool, &Email::new(email.to_string()).unwrap())
@@ -1055,23 +973,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let email = "unwhitelist@example.com";
-        let client_id = register_account(&account_cqrs, email).await;
+        let client_id = register_account(&account_store, &pool, email).await;
 
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
+        account_store
+            .send(
+                &client_id,
                 AccountCommand::LinkToAlpaca {
                     alpaca_account: AlpacaAccountNumber(
                         "ALPACA123".to_string(),
@@ -1082,11 +992,8 @@ mod tests {
             .expect("Failed to link to Alpaca");
 
         let wallet = address!("0x1111111111111111111111111111111111111111");
-        account_cqrs
-            .execute(
-                &client_id.to_string(),
-                AccountCommand::WhitelistWallet { wallet },
-            )
+        account_store
+            .send(&client_id, AccountCommand::WhitelistWallet { wallet })
             .await
             .expect("Failed to whitelist wallet");
 
@@ -1095,7 +1002,7 @@ mod tests {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool.clone())
             .mount("/", routes![super::unwhitelist_wallet]);
 
@@ -1144,23 +1051,15 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-
-        let account_query = GenericQuery::new(account_view_repo);
-
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let rate_limiter = FailedAuthRateLimiter::new().unwrap();
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(rate_limiter)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(pool)
             .mount("/", routes![super::unwhitelist_wallet]);
 
@@ -1182,5 +1081,58 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_register_rejected_when_email_already_claimed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+        // Simulate a concurrent registration that already claimed the email (its
+        // account is not yet projected). The atomic claim must reject this
+        // registration even though find_by_email would return no account.
+        let email = "claimed@example.com";
+        sqlx::query!("INSERT INTO account_emails (email) VALUES (?)", email)
+            .execute(&pool)
+            .await
+            .expect("Failed to seed email claim");
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_store)
+            .manage(pool)
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(serde_json::json!({ "email": email }).to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Conflict);
     }
 }

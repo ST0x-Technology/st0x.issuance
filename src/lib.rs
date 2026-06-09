@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use event_sorcery::{Store, StoreBuilder};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -13,8 +14,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::account::view::replay_account_view;
-use crate::account::{Account, AccountView};
+use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
@@ -73,7 +73,6 @@ pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
 
-pub(crate) type AccountCqrs = SqliteCqrs<Account>;
 pub(crate) type TokenizedAssetCqrs = SqliteCqrs<TokenizedAsset>;
 
 pub(crate) type MintCqrs = Arc<SqliteCqrs<Mint>>;
@@ -259,11 +258,11 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let BasicCqrsSetup {
-        account_cqrs,
-        tokenized_asset_cqrs,
-        tokenized_asset_view_repo,
-    } = setup_basic_cqrs(&pool);
+    let BasicCqrsSetup { tokenized_asset_cqrs, tokenized_asset_view_repo } =
+        setup_basic_cqrs(&pool);
+
+    let (account_store, _account_projection) =
+        StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
@@ -298,7 +297,6 @@ pub async fn initialize_rocket(
     // up-to-date views. Each replay clears its view table first to remove
     // stale/corrupt data, then rebuilds from the event store.
     debug!(target: "startup", "Rebuilding all views from events");
-    replay_account_view(pool.clone()).await?;
     replay_tokenized_asset_view(pool.clone()).await?;
     replay_mint_view(pool.clone()).await?;
     replay_receipt_inventory_view(pool.clone()).await?;
@@ -400,7 +398,7 @@ pub async fn initialize_rocket(
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
-        account_cqrs,
+        account_store,
         tokenized_asset_cqrs,
         tokenized_asset_view_repo,
         mint,
@@ -417,7 +415,7 @@ struct RocketState {
     config: Config,
     rate_limiter: FailedAuthRateLimiter,
     pool: Pool<Sqlite>,
-    account_cqrs: AccountCqrs,
+    account_store: Arc<Store<Account>>,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
     mint: MintDeps,
@@ -441,7 +439,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     rocket::custom(figment)
         .manage(state.config)
         .manage(state.rate_limiter)
-        .manage(state.account_cqrs)
+        .manage(state.account_store)
         .manage(state.tokenized_asset_cqrs)
         .manage(state.tokenized_asset_view_repo)
         .manage(state.mint.cqrs)
@@ -477,21 +475,11 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
 }
 
 struct BasicCqrsSetup {
-    account_cqrs: AccountCqrs,
     tokenized_asset_cqrs: TokenizedAssetCqrs,
     tokenized_asset_view_repo: TokenizedAssetViewRepo,
 }
 
 fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
-    let account_view_repo =
-        Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-            pool.clone(),
-            "account_view".to_string(),
-        ));
-    let account_query = GenericQuery::new(account_view_repo);
-    let account_cqrs =
-        sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
-
     let tokenized_asset_view_repo: TokenizedAssetViewRepo =
         Arc::new(SqliteViewRepository::new(
             pool.clone(),
@@ -502,11 +490,7 @@ fn setup_basic_cqrs(pool: &Pool<Sqlite>) -> BasicCqrsSetup {
     let tokenized_asset_cqrs =
         sqlite_cqrs(pool.clone(), vec![Box::new(tokenized_asset_query)], ());
 
-    BasicCqrsSetup {
-        account_cqrs,
-        tokenized_asset_cqrs,
-        tokenized_asset_view_repo,
-    }
+    BasicCqrsSetup { tokenized_asset_cqrs, tokenized_asset_view_repo }
 }
 
 fn setup_aggregate_cqrs(

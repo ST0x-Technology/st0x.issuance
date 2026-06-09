@@ -1,12 +1,13 @@
 use alloy::primitives::{Address, B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use event_sorcery::{Store, StoreBuilder};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
 
 use crate::account::{
-    Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId, Email,
+    Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
@@ -21,7 +22,7 @@ use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
 };
 use crate::vault::mock::MockVaultService;
-use crate::{AccountCqrs, MintCqrs, TokenizedAssetCqrs};
+use crate::{MintCqrs, TokenizedAssetCqrs};
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -50,7 +51,7 @@ pub(crate) fn create_test_event_store(
 
 pub(crate) struct TestHarness {
     pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
-    pub(crate) account_cqrs: AccountCqrs,
+    pub(crate) account_store: Arc<Store<Account>>,
     pub(crate) asset_cqrs: TokenizedAssetCqrs,
     pub(crate) mint_cqrs: MintCqrs,
 }
@@ -68,14 +69,11 @@ impl TestHarness {
             .await
             .expect("Failed to run migrations");
 
-        let account_view_repo =
-            Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                pool.clone(),
-                "account_view".to_string(),
-            ));
-        let account_query = GenericQuery::new(account_view_repo);
-        let account_cqrs =
-            sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build account store");
 
         let tokenized_asset_view_repo = Arc::new(SqliteViewRepository::<
             TokenizedAssetView,
@@ -123,7 +121,7 @@ impl TestHarness {
             mint_services,
         ));
 
-        Self { pool, account_cqrs, asset_cqrs, mint_cqrs }
+        Self { pool, account_store, asset_cqrs, mint_cqrs }
     }
 }
 
@@ -144,9 +142,8 @@ impl TestHarness {
         let register_cmd =
             AccountCommand::Register { client_id, email: email.clone() };
 
-        let aggregate_id = client_id.to_string();
-        self.account_cqrs
-            .execute(&aggregate_id, register_cmd)
+        self.account_store
+            .send(&client_id, register_cmd)
             .await
             .expect("Failed to register account");
 
@@ -154,8 +151,8 @@ impl TestHarness {
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
         };
 
-        self.account_cqrs
-            .execute(&aggregate_id, link_cmd)
+        self.account_store
+            .send(&client_id, link_cmd)
             .await
             .expect("Failed to link account to Alpaca");
 
@@ -163,8 +160,8 @@ impl TestHarness {
 
         let whitelist_cmd = AccountCommand::WhitelistWallet { wallet };
 
-        self.account_cqrs
-            .execute(&aggregate_id, whitelist_cmd)
+        self.account_store
+            .send(&client_id, whitelist_cmd)
             .await
             .expect("Failed to whitelist wallet");
 

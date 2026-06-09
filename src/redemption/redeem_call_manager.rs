@@ -158,9 +158,11 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
             AccountView::LinkedToAlpaca {
                 client_id, alpaca_account, ..
             } => Ok((client_id, alpaca_account)),
-            _ => Err(RedeemCallManagerError::AccountNotLinked {
-                wallet: *wallet,
-            }),
+            AccountView::Registered { .. } => {
+                Err(RedeemCallManagerError::AccountNotLinked {
+                    wallet: *wallet,
+                })
+            }
         }
     }
 
@@ -320,6 +322,7 @@ mod tests {
     use cqrs_es::{
         AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
     };
+    use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
     use sqlite_es::{
         SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
@@ -330,8 +333,7 @@ mod tests {
 
     use super::{RedeemCallManager, RedeemCallManagerError};
     use crate::account::{
-        Account, AccountCommand, AccountView, AlpacaAccountNumber, ClientId,
-        Email,
+        Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::Quantity;
@@ -361,7 +363,7 @@ mod tests {
         pool: sqlx::Pool<sqlx::Sqlite>,
         redemption_store: Arc<RedemptionStore>,
         redemption_cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
-        account_cqrs: SqliteCqrs<Account>,
+        account_store: Arc<Store<Account>>,
         asset_cqrs: SqliteCqrs<TokenizedAsset>,
     }
 
@@ -399,14 +401,11 @@ mod tests {
                 vault_service,
             ));
 
-            let account_view_repo =
-                Arc::new(SqliteViewRepository::<AccountView, Account>::new(
-                    pool.clone(),
-                    "account_view".to_string(),
-                ));
-            let account_query = GenericQuery::new(account_view_repo);
-            let account_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(account_query)], ());
+            let (account_store, _account_projection) =
+                StoreBuilder::<Account>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build account store");
 
             let asset_view_repo = Arc::new(SqliteViewRepository::<
                 TokenizedAssetView,
@@ -423,7 +422,7 @@ mod tests {
                 pool,
                 redemption_store,
                 redemption_cqrs,
-                account_cqrs,
+                account_store,
                 asset_cqrs,
             }
         }
@@ -437,17 +436,14 @@ mod tests {
         ) {
             let email = Email::new(email.to_string()).unwrap();
 
-            self.account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::Register { client_id, email },
-                )
+            self.account_store
+                .send(&client_id, AccountCommand::Register { client_id, email })
                 .await
                 .expect("Failed to register account");
 
-            self.account_cqrs
-                .execute(
-                    &client_id.to_string(),
+            self.account_store
+                .send(
+                    &client_id,
                     AccountCommand::LinkToAlpaca {
                         alpaca_account: alpaca_account.clone(),
                     },
@@ -455,11 +451,8 @@ mod tests {
                 .await
                 .expect("Failed to link to Alpaca");
 
-            self.account_cqrs
-                .execute(
-                    &client_id.to_string(),
-                    AccountCommand::WhitelistWallet { wallet },
-                )
+            self.account_store
+                .send(&client_id, AccountCommand::WhitelistWallet { wallet })
                 .await
                 .expect("Failed to whitelist wallet");
         }

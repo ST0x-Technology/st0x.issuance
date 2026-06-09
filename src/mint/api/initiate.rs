@@ -121,7 +121,7 @@ mod tests {
     async fn test_initiate_mint_returns_issuer_request_id() {
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -134,9 +134,8 @@ mod tests {
         let register_cmd =
             AccountCommand::Register { client_id, email: email.clone() };
 
-        let aggregate_id = client_id.to_string();
-        account_cqrs
-            .execute(&aggregate_id, register_cmd)
+        account_store
+            .send(&client_id, register_cmd)
             .await
             .expect("Failed to register account");
 
@@ -144,8 +143,8 @@ mod tests {
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
         };
 
-        account_cqrs
-            .execute(&aggregate_id, link_cmd)
+        account_store
+            .send(&client_id, link_cmd)
             .await
             .expect("Failed to link account to Alpaca");
 
@@ -153,8 +152,8 @@ mod tests {
 
         let whitelist_cmd = AccountCommand::WhitelistWallet { wallet };
 
-        account_cqrs
-            .execute(&aggregate_id, whitelist_cmd)
+        account_store
+            .send(&client_id, whitelist_cmd)
             .await
             .expect("Failed to whitelist wallet");
 
@@ -178,7 +177,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -224,7 +223,7 @@ mod tests {
     async fn test_initiate_mint_rejects_unknown_asset() {
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -237,9 +236,8 @@ mod tests {
         let register_cmd =
             AccountCommand::Register { client_id, email: email.clone() };
 
-        let aggregate_id = client_id.to_string();
-        account_cqrs
-            .execute(&aggregate_id, register_cmd)
+        account_store
+            .send(&client_id, register_cmd)
             .await
             .expect("Failed to register account");
 
@@ -247,8 +245,8 @@ mod tests {
             alpaca_account: AlpacaAccountNumber("ALPACA123".to_string()),
         };
 
-        account_cqrs
-            .execute(&aggregate_id, link_cmd)
+        account_store
+            .send(&client_id, link_cmd)
             .await
             .expect("Failed to link account to Alpaca");
 
@@ -256,7 +254,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -304,7 +302,7 @@ mod tests {
     async fn test_initiate_mint_rejects_negative_quantity() {
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -316,7 +314,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -364,7 +362,7 @@ mod tests {
     async fn test_initiate_mint_rejects_unknown_client_id() {
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -392,7 +390,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -444,7 +442,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -454,7 +452,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool.clone())
             .mount("/", routes![initiate_mint]);
@@ -521,7 +519,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -531,7 +529,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool.clone())
             .mount("/", routes![initiate_mint]);
@@ -613,7 +611,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -623,7 +621,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -664,7 +662,7 @@ mod tests {
             harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -674,7 +672,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
@@ -797,7 +795,7 @@ mod tests {
         } = harness.setup_account_and_asset().await;
         let TestHarness {
             pool,
-            account_cqrs,
+            account_store,
             asset_cqrs: tokenized_asset_cqrs,
             mint_cqrs,
             ..
@@ -807,7 +805,7 @@ mod tests {
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(mint_cqrs)
-            .manage(account_cqrs)
+            .manage(account_store)
             .manage(tokenized_asset_cqrs)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
