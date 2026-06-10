@@ -57,7 +57,7 @@ pub(crate) async fn setup_test_db_with_asset(
             StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
 
         let client_id = ClientId::new();
-        let email = Email::new("test@example.com".to_string()).unwrap();
+        let email = Email::new("test@example.com").unwrap();
 
         account_store
             .send(&client_id, AccountCommand::Register { client_id, email })

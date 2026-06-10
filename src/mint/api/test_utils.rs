@@ -124,8 +124,7 @@ pub(crate) struct TestAccountAndAsset {
 
 impl TestHarness {
     pub(crate) async fn setup_account_and_asset(&self) -> TestAccountAndAsset {
-        let email = Email::new("test@placeholder.com".to_string())
-            .expect("Valid email");
+        let email = Email::new("test@placeholder.com").expect("Valid email");
         let client_id = ClientId::new();
 
         let register_cmd =
