@@ -28,21 +28,22 @@ pub(crate) use view::AccountView;
 pub(crate) struct Email(String);
 
 impl Email {
-    pub(crate) fn new(email: String) -> Result<Self, AccountError> {
-        let parts: Vec<&str> = email.split('@').collect();
+    pub(crate) fn new(email: &str) -> Result<Self, AccountError> {
+        let normalized = email.trim().to_lowercase();
+        let parts: Vec<&str> = normalized.split('@').collect();
 
         if parts.len() != 2 {
-            return Err(AccountError::InvalidEmail { email });
+            return Err(AccountError::InvalidEmail { email: normalized });
         }
 
         let local = parts[0];
         let domain = parts[1];
 
         if local.is_empty() || domain.is_empty() {
-            return Err(AccountError::InvalidEmail { email });
+            return Err(AccountError::InvalidEmail { email: normalized });
         }
 
-        Ok(Self(email))
+        Ok(Self(normalized))
     }
 }
 
@@ -58,7 +59,7 @@ impl<'de> Deserialize<'de> for Email {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -509,36 +510,43 @@ mod tests {
     #[test]
     fn test_email_smart_constructor_validates() {
         assert!(matches!(
-            Email::new("not-an-email".to_string()),
+            Email::new("not-an-email"),
             Err(AccountError::InvalidEmail { email }) if email == "not-an-email"
         ));
 
         assert!(matches!(
-            Email::new("@".to_string()),
+            Email::new("@"),
             Err(AccountError::InvalidEmail { email }) if email == "@"
         ));
 
         assert!(matches!(
-            Email::new("user@".to_string()),
+            Email::new("user@"),
             Err(AccountError::InvalidEmail { email }) if email == "user@"
         ));
 
         assert!(matches!(
-            Email::new("@domain".to_string()),
+            Email::new("@domain"),
             Err(AccountError::InvalidEmail { email }) if email == "@domain"
         ));
 
         assert!(matches!(
-            Email::new("user@@domain.com".to_string()),
+            Email::new("user@@domain.com"),
             Err(AccountError::InvalidEmail { email }) if email == "user@@domain.com"
         ));
 
         assert!(matches!(
-            Email::new("user@domain@com".to_string()),
+            Email::new("user@domain@com"),
             Err(AccountError::InvalidEmail { email }) if email == "user@domain@com"
         ));
 
-        assert!(Email::new("user@example.com".to_string()).is_ok());
+        assert!(Email::new("user@example.com").is_ok());
+    }
+
+    #[test]
+    fn test_email_normalizes_trim_and_lowercase() {
+        let email = Email::new("  User@Example.COM  ").unwrap();
+
+        assert_eq!(email.0, "user@example.com");
     }
 
     #[test]

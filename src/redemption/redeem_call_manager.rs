@@ -421,7 +421,7 @@ mod tests {
             alpaca_account: &AlpacaAccountNumber,
             wallet: Address,
         ) {
-            let email = Email::new(email.to_string()).unwrap();
+            let email = Email::new(email).unwrap();
 
             self.account_store
                 .send(&client_id, AccountCommand::Register { client_id, email })

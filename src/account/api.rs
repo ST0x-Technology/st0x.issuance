@@ -300,16 +300,15 @@ mod tests {
     ) -> ClientId {
         let client_id = ClientId::new();
 
+        let email = Email::new(email).expect("Valid email for test");
+
         sqlx::query!(
             "INSERT OR IGNORE INTO account_emails (email) VALUES (?)",
-            email
+            email.0
         )
         .execute(pool)
         .await
         .expect("Failed to claim email");
-
-        let email =
-            Email::new(email.to_string()).expect("Valid email for test");
 
         store
             .send(&client_id, AccountCommand::Register { client_id, email })
@@ -972,6 +971,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_duplicate_email_case_insensitive_returns_409() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+        register_account(&account_store, &pool, "User@Example.com").await;
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_store)
+            .manage(pool)
+            .mount("/", routes![super::register_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .post("/accounts")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(r#"{"email":"user@example.com"}"#)
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Conflict);
+    }
+
+    #[tokio::test]
+    async fn test_connect_account_finds_email_case_insensitively() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let (account_store, _account_projection) =
+            StoreBuilder::<Account>::new(pool.clone()).build(()).await.unwrap();
+
+        let client_id =
+            register_account(&account_store, &pool, "customer@firm.com").await;
+
+        let rate_limiter = FailedAuthRateLimiter::new().unwrap();
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(rate_limiter)
+            .manage(account_store)
+            .manage(pool)
+            .mount("/", routes![super::connect_account]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .post("/accounts/connect")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(r#"{"email":"Customer@Firm.COM","account":"ALPACA123"}"#)
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+
+        let body: serde_json::Value =
+            response.into_json().await.expect("response body");
+
+        assert_eq!(
+            body.get("client_id").and_then(|value| value.as_str()),
+            Some(client_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn test_register_invalid_email_returns_422() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1036,11 +1136,10 @@ mod tests {
         let first_client_id =
             register_account(&account_store, &pool, email).await;
 
-        let view =
-            find_by_email(&pool, &Email::new(email.to_string()).unwrap())
-                .await
-                .expect("Query should succeed")
-                .expect("View should exist");
+        let view = find_by_email(&pool, &Email::new(email).unwrap())
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
 
         let AccountView::Registered { client_id, .. } = view else {
             panic!("Expected Registered view")

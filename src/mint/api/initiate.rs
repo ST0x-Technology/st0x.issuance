@@ -127,8 +127,7 @@ mod tests {
             ..
         } = TestHarness::new().await;
 
-        let email = Email::new("test@placeholder.com".to_string())
-            .expect("Valid email");
+        let email = Email::new("test@placeholder.com").expect("Valid email");
         let client_id = ClientId::new();
 
         let register_cmd =
@@ -229,8 +228,7 @@ mod tests {
             ..
         } = TestHarness::new().await;
 
-        let email = Email::new("test@placeholder.com".to_string())
-            .expect("Valid email");
+        let email = Email::new("test@placeholder.com").expect("Valid email");
         let client_id = ClientId::new();
 
         let register_cmd =

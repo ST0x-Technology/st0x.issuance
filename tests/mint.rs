@@ -130,11 +130,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     evm.certify_vault(U256::MAX).await?;
 
     let shares_minted = perform_mint_flow(&client, &evm, user_wallet).await?;
-    assert_eq!(
-        mint_callback_mock.calls_async().await,
-        1,
-        "Mint callback must be sent exactly once"
-    );
+    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
