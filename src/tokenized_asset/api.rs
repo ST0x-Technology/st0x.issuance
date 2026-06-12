@@ -1,14 +1,15 @@
 use alloy::primitives::Address;
-use cqrs_es::AggregateError;
+use event_sorcery::{AggregateError, Store};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 use tracing::error;
 
 use super::{
-    Network, TokenSymbol, TokenizedAssetCommand, TokenizedAssetViewRepo,
+    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
@@ -22,17 +23,17 @@ pub(crate) struct TokenizedAssetDetailResponse {
     pub(crate) enabled: bool,
 }
 
-#[tracing::instrument(skip(_auth, view_repo))]
+#[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets/<underlying>")]
 pub(crate) async fn get_tokenized_asset(
     underlying: &str,
     _auth: InternalAuth,
-    view_repo: &rocket::State<TokenizedAssetViewRepo>,
+    pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
     let underlying_symbol = UnderlyingSymbol::new(underlying);
 
     let view = super::view::load_asset_by_underlying(
-        view_repo.inner(),
+        pool.inner(),
         &underlying_symbol,
     )
     .await
@@ -42,7 +43,7 @@ pub(crate) async fn get_tokenized_asset(
     })?;
 
     match view {
-        Some(TokenizedAssetView::Asset {
+        Some(TokenizedAssetView {
             underlying,
             token,
             network,
@@ -56,7 +57,7 @@ pub(crate) async fn get_tokenized_asset(
             vault,
             enabled,
         })),
-        _ => Err(Status::NotFound),
+        None => Err(Status::NotFound),
     }
 }
 
@@ -86,15 +87,12 @@ pub(crate) async fn list_tokenized_assets(
 
     let tokens = views
         .into_iter()
-        .filter_map(|view| match view {
-            TokenizedAssetView::Asset {
-                underlying, token, network, ..
-            } => Some(TokenizedAssetResponse {
+        .map(|TokenizedAssetView { underlying, token, network, .. }| {
+            TokenizedAssetResponse {
                 underlying,
                 token,
                 networks: vec![network],
-            }),
-            TokenizedAssetView::Unavailable => None,
+            }
         })
         .collect();
 
@@ -114,7 +112,7 @@ pub(crate) struct AddTokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
 }
 
-#[tracing::instrument(skip(_auth, cqrs), fields(
+#[tracing::instrument(skip(_auth, store), fields(
     underlying = %request.underlying,
     token = %request.token,
     network = %request.network,
@@ -123,7 +121,7 @@ pub(crate) struct AddTokenizedAssetResponse {
 #[post("/tokenized-assets", format = "json", data = "<request>")]
 pub(crate) async fn add_tokenized_asset(
     _auth: InternalAuth,
-    cqrs: &rocket::State<crate::TokenizedAssetCqrs>,
+    store: &rocket::State<Arc<Store<TokenizedAsset>>>,
     request: Json<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
     let command = TokenizedAssetCommand::Add {
@@ -133,7 +131,8 @@ pub(crate) async fn add_tokenized_asset(
         vault: request.vault,
     };
 
-    cqrs.execute(&request.underlying.0, command)
+    store
+        .send(&request.underlying, command)
         .await
         .or_else(|err| match err {
             AggregateError::AggregateConflict => Ok(()),
@@ -155,12 +154,10 @@ pub(crate) async fn add_tokenized_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, address};
-    use cqrs_es::persist::GenericQuery;
+    use event_sorcery::StoreBuilder;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
     use url::Url;
 
     use super::*;
@@ -201,19 +198,22 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool);
+        let store = setup_tokenized_asset_store(&pool).await;
 
-        cqrs.execute(
-            "AAPL",
-            TokenizedAssetCommand::Add {
-                underlying: UnderlyingSymbol::new("AAPL"),
-                token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
-                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            },
-        )
-        .await
-        .expect("Failed to add asset");
+        store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to add asset");
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -321,20 +321,16 @@ mod tests {
         assert_eq!(response.status(), Status::Unauthorized);
     }
 
-    fn setup_tokenized_asset_cqrs(
+    async fn setup_tokenized_asset_store(
         pool: &sqlx::Pool<sqlx::Sqlite>,
-    ) -> crate::TokenizedAssetCqrs {
-        let view_repo = Arc::new(SqliteViewRepository::<
-            TokenizedAssetView,
-            TokenizedAsset,
-        >::new(
-            pool.clone(),
-            "tokenized_asset_view".to_string(),
-        ));
+    ) -> Arc<Store<TokenizedAsset>> {
+        let (store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build tokenized asset store");
 
-        let query = GenericQuery::new(view_repo);
-
-        sqlite_cqrs(pool.clone(), vec![Box::new(query)], ())
+        store
     }
 
     #[tokio::test]
@@ -350,12 +346,12 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool);
+        let store = setup_tokenized_asset_store(&pool).await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs)
+            .manage(store)
             .manage(pool)
             .mount("/", routes![add_tokenized_asset]);
 
@@ -403,12 +399,12 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool);
+        let store = setup_tokenized_asset_store(&pool).await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs)
+            .manage(store)
             .manage(pool)
             .mount("/", routes![add_tokenized_asset]);
 
@@ -465,12 +461,12 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool);
+        let store = setup_tokenized_asset_store(&pool).await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs)
+            .manage(store)
             .manage(pool)
             .mount("/", routes![add_tokenized_asset]);
 
@@ -525,12 +521,12 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let cqrs = setup_tokenized_asset_cqrs(&pool);
+        let store = setup_tokenized_asset_store(&pool).await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs)
+            .manage(store)
             .manage(pool)
             .mount("/", routes![add_tokenized_asset]);
 

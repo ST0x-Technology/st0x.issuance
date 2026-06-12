@@ -167,8 +167,9 @@ pub async fn seed_tokenized_asset_with(
 ///
 /// Per AGENTS.md "Setup phase exception", direct event store seeding is
 /// permitted in e2e test setup phases. The tokenized asset view is rebuilt
-/// from events by `initialize_rocket` during startup (via
-/// `replay_tokenized_asset_view`), so only the event needs to be seeded.
+/// from events by `initialize_rocket` during startup (via the
+/// `TokenizedAsset` projection's catch-up in `StoreBuilder::build`), so only
+/// the event needs to be seeded.
 pub async fn preseed_tokenized_asset(
     db_url: &str,
     vault: Address,

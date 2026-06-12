@@ -1098,7 +1098,7 @@ mod tests {
                 &client_id,
                 AccountCommand::Register {
                     client_id,
-                    email: Email::new("test@example.com".to_string()).unwrap(),
+                    email: Email::new("test@example.com").unwrap(),
                 },
             )
             .await
