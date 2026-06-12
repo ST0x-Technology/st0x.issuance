@@ -886,7 +886,7 @@ mod tests {
 
         // After the first run the aggregate has exactly one Discovered event
         // and the SQL checkpoint matches the chain head.
-        let ctx_after_first =
+        let mut ctx_after_first =
             store.load_aggregate(&vault.to_string()).await.unwrap();
         assert_eq!(
             ctx_after_first.aggregate().receipts_with_balance().len(),
@@ -931,7 +931,7 @@ mod tests {
         // After the second run the aggregate still has exactly one receipt
         // (no duplicate Discovered event applied) and the checkpoint is
         // unchanged.
-        let ctx_after_second =
+        let mut ctx_after_second =
             store.load_aggregate(&vault.to_string()).await.unwrap();
         assert_eq!(
             ctx_after_second.aggregate().receipts_with_balance().len(),
@@ -1072,7 +1072,7 @@ mod tests {
 
         assert_eq!(result.processed_count, 1);
 
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
 
         assert_eq!(receipts.len(), 1);
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify the receipt was actually discovered with correct ID and balance
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
         assert_eq!(receipts.len(), 1, "Should discover exactly one receipt");
         assert_eq!(
@@ -1533,7 +1533,7 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify: aggregate has no receipts at all
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         assert!(
             ctx.aggregate().receipts_with_balance().is_empty(),
             "No receipts should be discovered from outbound/mint transfers"
@@ -1613,7 +1613,7 @@ mod tests {
         // Should only process once despite appearing in both Deposit and Transfer
         assert_eq!(result.processed_count, 1);
 
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
         assert_eq!(
             receipts.len(),
@@ -1711,7 +1711,7 @@ mod tests {
         assert_eq!(result.processed_count, 1);
 
         // Verify balance was reconciled upward from 500 to 750
-        let ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = ctx.aggregate().receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(

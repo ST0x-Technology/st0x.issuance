@@ -9,6 +9,7 @@ use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
 use cqrs_es::{
     Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore,
+    event_sink::EventSink,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -364,7 +365,7 @@ where
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError> {
-        let context = self.store.load_aggregate(&vault.to_string()).await?;
+        let mut context = self.store.load_aggregate(&vault.to_string()).await?;
 
         let receipts = context
             .aggregate()
@@ -429,7 +430,7 @@ where
         &self,
         vault: Address,
     ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError> {
-        let context = self.store.load_aggregate(&vault.to_string()).await?;
+        let mut context = self.store.load_aggregate(&vault.to_string()).await?;
         Ok(context.aggregate().reserved_redemptions())
     }
 
@@ -568,11 +569,11 @@ impl ReceiptInventory {
     /// also covers a receipt already at zero balance — preserved by the
     /// zero-drain reconcile guard — so it is depleted once its last reservation
     /// resolves rather than lingering empty forever.
-    fn depletions_after_clearing(
+    fn depletion_receipt_ids_after_clearing(
         &self,
         redemption: &IssuerRedemptionRequestId,
         consume_balance: bool,
-    ) -> Vec<ReceiptInventoryEvent> {
+    ) -> Vec<ReceiptId> {
         self.receipts
             .iter()
             .filter_map(|(receipt_id, metadata)| {
@@ -592,9 +593,7 @@ impl ReceiptInventory {
                     metadata.balance
                 };
 
-                post_balance.is_zero().then_some(
-                    ReceiptInventoryEvent::Depleted { receipt_id: *receipt_id },
-                )
+                post_balance.is_zero().then_some(*receipt_id)
             })
             .collect()
     }
@@ -664,22 +663,20 @@ pub(crate) enum ReceiptInventoryError {
     },
 }
 
-#[async_trait]
 impl Aggregate for ReceiptInventory {
     type Command = ReceiptInventoryCommand;
     type Event = ReceiptInventoryEvent;
     type Error = ReceiptInventoryError;
     type Services = ();
 
-    fn aggregate_type() -> String {
-        "ReceiptInventory".to_string()
-    }
+    const TYPE: &'static str = "ReceiptInventory";
 
     async fn handle(
-        &self,
+        &mut self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+        sink: &EventSink<Self>,
+    ) -> Result<(), Self::Error> {
         match command {
             ReceiptInventoryCommand::DiscoverReceipt {
                 receipt_id,
@@ -691,18 +688,22 @@ impl Aggregate for ReceiptInventory {
                 receipt_info_bytes,
             } => {
                 if self.receipts.contains_key(&receipt_id) {
-                    return Ok(vec![]);
+                    return Ok(());
                 }
 
-                Ok(vec![ReceiptInventoryEvent::Discovered {
-                    receipt_id,
-                    balance,
-                    block_number,
-                    tx_hash,
-                    source,
-                    receipt_info,
-                    receipt_info_bytes,
-                }])
+                sink.write(
+                    ReceiptInventoryEvent::Discovered {
+                        receipt_id,
+                        balance,
+                        block_number,
+                        tx_hash,
+                        source,
+                        receipt_info,
+                        receipt_info_bytes,
+                    },
+                    self,
+                )
+                .await;
             }
 
             ReceiptInventoryCommand::ReconcileBalance {
@@ -710,11 +711,12 @@ impl Aggregate for ReceiptInventory {
                 on_chain_balance,
             } => {
                 let Some(metadata) = self.receipts.get(&receipt_id) else {
-                    return Ok(vec![]);
+                    return Ok(());
                 };
 
                 let mirror = metadata.balance;
                 let available = metadata.available();
+                let reserved_empty = metadata.reserved.is_empty();
 
                 // While a submitted burn is pending, on-chain legitimately
                 // sits between `available` (all reservations settled) and
@@ -722,26 +724,38 @@ impl Aggregate for ReceiptInventory {
                 // "no external change" so reconciliation never clobbers a
                 // reservation — settlement, not reconciliation, consumes it.
                 if (available..=mirror).contains(&on_chain_balance) {
-                    return Ok(if mirror.is_zero() {
-                        depletion_events(receipt_id, metadata)
-                    } else {
-                        vec![]
-                    });
+                    if mirror.is_zero() {
+                        write_depletion_if_unreserved(
+                            sink,
+                            self,
+                            receipt_id,
+                            reserved_empty,
+                        )
+                        .await;
+                    }
+
+                    return Ok(());
                 }
 
-                let reconciled = ReceiptInventoryEvent::BalanceReconciled {
-                    receipt_id,
-                    previous_balance: mirror,
-                    on_chain_balance,
-                };
+                sink.write(
+                    ReceiptInventoryEvent::BalanceReconciled {
+                        receipt_id,
+                        previous_balance: mirror,
+                        on_chain_balance,
+                    },
+                    self,
+                )
+                .await;
 
-                let depletion = if on_chain_balance.is_zero() {
-                    depletion_events(receipt_id, metadata)
-                } else {
-                    vec![]
-                };
-
-                Ok(std::iter::once(reconciled).chain(depletion).collect())
+                if on_chain_balance.is_zero() {
+                    write_depletion_if_unreserved(
+                        sink,
+                        self,
+                        receipt_id,
+                        reserved_empty,
+                    )
+                    .await;
+                }
             }
 
             ReceiptInventoryCommand::ReserveBurn {
@@ -776,10 +790,14 @@ impl Aggregate for ReceiptInventory {
                     }
                 }
 
-                Ok(vec![ReceiptInventoryEvent::BurnReserved {
-                    redemption_issuer_request_id,
-                    burns,
-                }])
+                sink.write(
+                    ReceiptInventoryEvent::BurnReserved {
+                        redemption_issuer_request_id,
+                        burns,
+                    },
+                    self,
+                )
+                .await;
             }
 
             // Release restores a reservation without touching the mirror
@@ -792,19 +810,29 @@ impl Aggregate for ReceiptInventory {
                 redemption_issuer_request_id,
             } => {
                 if !self.holds_reservation(&redemption_issuer_request_id) {
-                    return Ok(vec![]);
+                    return Ok(());
                 }
 
-                let depletions = self.depletions_after_clearing(
+                let depleted = self.depletion_receipt_ids_after_clearing(
                     &redemption_issuer_request_id,
                     false,
                 );
 
-                Ok(std::iter::once(ReceiptInventoryEvent::BurnReleased {
-                    redemption_issuer_request_id,
-                })
-                .chain(depletions)
-                .collect())
+                sink.write(
+                    ReceiptInventoryEvent::BurnReleased {
+                        redemption_issuer_request_id,
+                    },
+                    self,
+                )
+                .await;
+
+                for receipt_id in depleted {
+                    sink.write(
+                        ReceiptInventoryEvent::Depleted { receipt_id },
+                        self,
+                    )
+                    .await;
+                }
             }
 
             // Settle consumes a reservation after its burn confirmed on-chain:
@@ -814,21 +842,33 @@ impl Aggregate for ReceiptInventory {
                 redemption_issuer_request_id,
             } => {
                 if !self.holds_reservation(&redemption_issuer_request_id) {
-                    return Ok(vec![]);
+                    return Ok(());
                 }
 
-                let depletions = self.depletions_after_clearing(
+                let depleted = self.depletion_receipt_ids_after_clearing(
                     &redemption_issuer_request_id,
                     true,
                 );
 
-                Ok(std::iter::once(ReceiptInventoryEvent::BurnSettled {
-                    redemption_issuer_request_id,
-                })
-                .chain(depletions)
-                .collect())
+                sink.write(
+                    ReceiptInventoryEvent::BurnSettled {
+                        redemption_issuer_request_id,
+                    },
+                    self,
+                )
+                .await;
+
+                for receipt_id in depleted {
+                    sink.write(
+                        ReceiptInventoryEvent::Depleted { receipt_id },
+                        self,
+                    )
+                    .await;
+                }
             }
         }
+
+        Ok(())
     }
 
     fn apply(&mut self, event: Self::Event) {
@@ -981,25 +1021,28 @@ impl Aggregate for ReceiptInventory {
     }
 }
 
-/// Decides whether a receipt that has reached zero balance should be depleted.
+/// Writes `Depleted` when a zero-balance receipt has no outstanding reservations.
 ///
 /// A receipt that still holds a reservation is preserved (with a WARN) instead
 /// of depleted: removing it would silently discard the reservation and turn a
 /// later settle/release into a no-op. A pending settle/release or the startup
 /// reservation recovery resolves it instead.
-fn depletion_events(
+async fn write_depletion_if_unreserved(
+    sink: &EventSink<ReceiptInventory>,
+    aggregate: &mut ReceiptInventory,
     receipt_id: ReceiptId,
-    metadata: &ReceiptMetadata,
-) -> Vec<ReceiptInventoryEvent> {
-    if metadata.reserved.is_empty() {
-        return vec![ReceiptInventoryEvent::Depleted { receipt_id }];
+    reserved_empty: bool,
+) {
+    if reserved_empty {
+        sink.write(ReceiptInventoryEvent::Depleted { receipt_id }, aggregate)
+            .await;
+        return;
     }
 
     warn!(target: "receipt", receipt_id = %receipt_id,
         "Receipt reached zero balance while still holding reservations; \
          preserving it so the reservation can resolve"
     );
-    vec![]
 }
 
 fn required_burns_by_receipt(
@@ -1093,25 +1136,33 @@ mod tests {
         }
     }
 
+    async fn handle_command(
+        aggregate: &mut ReceiptInventory,
+        command: ReceiptInventoryCommand,
+    ) -> Result<Vec<ReceiptInventoryEvent>, ReceiptInventoryError> {
+        let sink = EventSink::default();
+        aggregate.handle(command, &(), &sink).await?;
+        Ok(sink.collect().await)
+    }
+
     #[tokio::test]
     async fn test_discover_receipt_emits_discovered_event() {
-        let aggregate = ReceiptInventory::default();
+        let mut aggregate = ReceiptInventory::default();
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -1133,18 +1184,17 @@ mod tests {
         );
 
         // First discovery succeeds
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         for event in events {
@@ -1152,18 +1202,17 @@ mod tests {
         }
 
         // Second discovery is idempotent - returns Ok with no events
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(200),
-                    2000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(200),
+                2000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         assert!(events.is_empty());
     }
@@ -1257,7 +1306,8 @@ mod tests {
         .await
         .unwrap();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = context.aggregate().receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
@@ -1330,7 +1380,8 @@ mod tests {
         .await
         .unwrap();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let found =
             context.aggregate().find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, Some(make_receipt_id(42)));
@@ -1342,7 +1393,8 @@ mod tests {
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let issuer_request_id = IssuerMintRequestId::random();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let found =
             context.aggregate().find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, None);
@@ -1371,7 +1423,8 @@ mod tests {
         .await
         .unwrap();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let aggregate = context.aggregate();
 
         // External receipts should not be indexed by issuer_request_id
@@ -1405,7 +1458,8 @@ mod tests {
         .await
         .unwrap();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let aggregate = context.aggregate();
 
         // Verify the receipt is in both maps
@@ -1438,7 +1492,8 @@ mod tests {
         .await
         .unwrap();
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let aggregate = context.aggregate();
 
         // Receipt exists but not in itn_receipts
@@ -1865,16 +1920,15 @@ mod tests {
             "fully reserved receipt must be unavailable"
         );
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(100),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(100),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.is_empty(),
@@ -1914,16 +1968,15 @@ mod tests {
         });
 
         // available = 40, mirror = 100; the burn of 60 lands -> on-chain 40.
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(40),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(40),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.is_empty(),
@@ -1952,16 +2005,15 @@ mod tests {
         });
 
         // available = 70; on-chain 50 < 70 -> external drain.
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(50),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(50),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -1995,16 +2047,15 @@ mod tests {
             .reserved
             .insert("red-00000001".parse().unwrap(), make_shares(50));
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(0),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(0),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2041,16 +2092,15 @@ mod tests {
             .insert("red-00000001".parse().unwrap(), make_shares(70));
 
         // available = 30; an external drain to 0 is below it (out of band).
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(0),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(0),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             events.len(),
@@ -2101,7 +2151,7 @@ mod tests {
         // must be cleared. Checking internals distinguishes a real settlement
         // from merely leaving the reservation in place (which would leave the
         // same 40 available but a stale 100 mirror).
-        let context =
+        let mut context =
             service.store.load_aggregate(&vault.to_string()).await.unwrap();
         let metadata = context
             .aggregate()
@@ -2139,7 +2189,7 @@ mod tests {
             .unwrap();
         service.settle_burn(vault, redemption_id).await.unwrap();
 
-        let context =
+        let mut context =
             service.store.load_aggregate(&vault.to_string()).await.unwrap();
         assert!(
             context.aggregate().receipts_with_balance().is_empty(),
@@ -2171,15 +2221,14 @@ mod tests {
             .reserved
             .insert(redemption_id.clone(), make_shares(100));
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReleaseBurn {
-                    redemption_issuer_request_id: redemption_id,
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReleaseBurn {
+                redemption_issuer_request_id: redemption_id,
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.iter().any(|event| matches!(
@@ -2342,7 +2391,7 @@ mod tests {
 
         service.settle_burn(vault, redemption_id).await.unwrap();
 
-        let context =
+        let mut context =
             service.store.load_aggregate(&vault.to_string()).await.unwrap();
         let aggregate = context.aggregate();
 
@@ -2519,33 +2568,31 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         for event in events {
             aggregate.apply(event);
         }
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(100),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(100),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2560,33 +2607,31 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         for event in events {
             aggregate.apply(event);
         }
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(50),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(50),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2609,33 +2654,31 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(100),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         for event in events {
             aggregate.apply(event);
         }
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(0),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(0),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 2);
         assert!(matches!(
@@ -2653,18 +2696,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_unknown_receipt_emits_no_events() {
-        let aggregate = ReceiptInventory::default();
+        let mut aggregate = ReceiptInventory::default();
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(99),
-                    on_chain_balance: make_shares(0),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(99),
+                on_chain_balance: make_shares(0),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2679,33 +2721,31 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = aggregate
-            .handle(
-                discover_receipt_cmd(
-                    make_receipt_id(42),
-                    make_shares(50),
-                    1000,
-                    tx_hash,
-                ),
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(50),
+                1000,
+                tx_hash,
+            ),
+        )
+        .await
+        .unwrap();
 
         for event in events {
             aggregate.apply(event);
         }
 
-        let events = aggregate
-            .handle(
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: make_receipt_id(42),
-                    on_chain_balance: make_shares(100),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
+        let events = handle_command(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(42),
+                on_chain_balance: make_shares(100),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2835,7 +2875,8 @@ mod tests {
                 .expect("Registration should succeed (idempotent)");
         }
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = context.aggregate().receipts_with_balance();
 
         assert_eq!(
@@ -2871,7 +2912,8 @@ mod tests {
             .await
             .expect("Registration should succeed");
 
-        let context = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let mut context =
+            store.load_aggregate(&vault.to_string()).await.unwrap();
         let receipts = context.aggregate().receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(

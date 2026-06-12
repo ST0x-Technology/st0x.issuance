@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Table};
 use serde::{Deserialize, Serialize};
-use sqlx::{Sqlite, encode::IsNull, sqlite::SqliteArgumentValue};
+use sqlx::Encode;
+use sqlx::sqlite::SqliteArgumentsBuffer;
+use sqlx::{Sqlite, encode::IsNull};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -90,13 +92,12 @@ impl sqlx::Type<Sqlite> for ClientId {
     }
 }
 
-impl<'q> sqlx::Encode<'q, Sqlite> for ClientId {
+impl Encode<'_, Sqlite> for ClientId {
     fn encode_by_ref(
         &self,
-        args: &mut Vec<SqliteArgumentValue<'q>>,
+        args: &mut SqliteArgumentsBuffer,
     ) -> Result<IsNull, sqlx::error::BoxDynError> {
-        args.push(SqliteArgumentValue::Text(self.0.to_string().into()));
-        Ok(IsNull::No)
+        <String as Encode<'_, Sqlite>>::encode_by_ref(&self.0.to_string(), args)
     }
 }
 

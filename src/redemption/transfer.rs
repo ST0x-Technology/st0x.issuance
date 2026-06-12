@@ -174,7 +174,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
     RedemptionStore: EventStore<Redemption> + 'static,
     RedemptionStore::AC: Send,
 {
-    let aggregate_ctx = match deps
+    let mut aggregate_ctx = match deps
         .event_store
         .load_aggregate(&issuer_request_id.to_string())
         .await
@@ -207,7 +207,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
         return;
     }
 
-    let aggregate_ctx = match deps
+    let mut aggregate_ctx = match deps
         .event_store
         .load_aggregate(&issuer_request_id.to_string())
         .await
@@ -251,7 +251,7 @@ pub(crate) async fn drive_redemption_flow<RedemptionStore>(
             return;
         }
 
-        let aggregate_ctx = match deps
+        let mut aggregate_ctx = match deps
             .event_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -370,7 +370,7 @@ mod tests {
         );
 
         if let TransferOutcome::Detected { issuer_request_id, .. } = outcome {
-            let context = store
+            let mut context = store
                 .load_aggregate(&issuer_request_id.to_string())
                 .await
                 .unwrap();

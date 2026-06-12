@@ -136,7 +136,8 @@ async fn recover_mint_until_automatic_budget_exhausted<ES>(
     let mut polled_tx_id: Option<String> = None;
 
     loop {
-        let context = match event_store.load_aggregate(&aggregate_id).await {
+        let mut context = match event_store.load_aggregate(&aggregate_id).await
+        {
             Ok(context) => context,
             Err(err) => {
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -584,7 +585,7 @@ mod tests {
 
         recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -618,7 +619,7 @@ mod tests {
 
         recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -663,7 +664,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -701,7 +702,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -745,7 +746,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -772,7 +773,7 @@ mod tests {
 
         recover_mint(&fixture.mint_cqrs, issuer_request_id.clone()).await;
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -841,7 +842,7 @@ mod tests {
              poll, elapsed={elapsed:?}"
         );
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -879,7 +880,7 @@ mod tests {
 
         assert_eq!(outcome, DriveOutcome::Pending);
 
-        let context = fixture
+        let mut context = fixture
             .mint_store
             .load_aggregate(&issuer_request_id.to_string())
             .await

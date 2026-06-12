@@ -49,7 +49,7 @@ pub(crate) async fn confirm_journal(
         issuer_request_id, tokenization_request_id.0, status
     );
 
-    let mint_ctx = match event_store
+    let mut mint_ctx = match event_store
         .load_aggregate(&issuer_request_id.to_string())
         .await
     {
@@ -171,7 +171,7 @@ async fn process_journal_completion(
     }
 
     // Step 3: Load the fireblocks_tx_id from the aggregate and confirm
-    let context = match event_store.load_aggregate(&aggregate_id).await {
+    let mut context = match event_store.load_aggregate(&aggregate_id).await {
         Ok(ctx) => ctx,
         Err(err) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -231,7 +231,7 @@ async fn process_journal_completion(
         return;
     }
 
-    let context = match event_store.load_aggregate(&aggregate_id).await {
+    let mut context = match event_store.load_aggregate(&aggregate_id).await {
         Ok(ctx) => ctx,
         Err(err) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
