@@ -1,6 +1,7 @@
-use cqrs_es::{AggregateContext, EventStore};
-use rocket::{State, post, serde::json::Json};
+use event_sorcery::Store;
+use rocket::{post, serde::json::Json};
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::IssuerAuth;
@@ -8,7 +9,6 @@ use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
     recovery::spawn_scheduled_mint_recovery,
 };
-use crate::{MintCqrs, MintEventStore};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -25,7 +25,7 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, event_store), fields(
+#[tracing::instrument(skip(_auth, mint_store), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id,
     status = ?request.status
@@ -33,8 +33,7 @@ pub(crate) enum JournalStatus {
 #[post("/inkind/issuance/confirm", format = "json", data = "<request>")]
 pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
-    cqrs: &State<MintCqrs>,
-    event_store: &State<MintEventStore>,
+    mint_store: &rocket::State<Arc<Store<Mint>>>,
     request: Json<JournalConfirmationRequest>,
 ) -> rocket::http::Status {
     let JournalConfirmationRequest {
@@ -49,11 +48,14 @@ pub(crate) async fn confirm_journal(
         issuer_request_id, tokenization_request_id.0, status
     );
 
-    let mut mint_ctx = match event_store
-        .load_aggregate(&issuer_request_id.to_string())
-        .await
-    {
-        Ok(ctx) => ctx,
+    let mint = match mint_store.load(&issuer_request_id).await {
+        Ok(Some(mint)) => mint,
+        Ok(None) => {
+            error!(target: "mint", "Mint aggregate not found for issuer_request_id={}",
+                issuer_request_id
+            );
+            return rocket::http::Status::InternalServerError;
+        }
         Err(err) => {
             error!(target: "mint", "Failed to load mint aggregate for issuer_request_id={}: {}",
                 issuer_request_id, err
@@ -62,8 +64,7 @@ pub(crate) async fn confirm_journal(
         }
     };
 
-    if let Some(expected_tokenization_id) =
-        mint_ctx.aggregate().tokenization_request_id()
+    if let Some(expected_tokenization_id) = mint.tokenization_request_id()
         && &tokenization_request_id != expected_tokenization_id
     {
         error!(target: "mint", "Tokenization request ID mismatch for issuer_request_id={}. \
@@ -84,8 +85,7 @@ pub(crate) async fn confirm_journal(
                 }),
             };
 
-            if let Err(err) =
-                cqrs.execute(&issuer_request_id.to_string(), command).await
+            if let Err(err) = mint_store.send(&issuer_request_id, command).await
             {
                 error!(target: "mint", "Failed to execute journal rejection command for \
                      issuer_request_id={}: {}",
@@ -100,8 +100,7 @@ pub(crate) async fn confirm_journal(
                 issuer_request_id: issuer_request_id.clone(),
             };
 
-            if let Err(err) =
-                cqrs.execute(&issuer_request_id.to_string(), command).await
+            if let Err(err) = mint_store.send(&issuer_request_id, command).await
             {
                 error!(target: "mint", "Failed to execute journal confirmation command for \
                      issuer_request_id={}: {}",
@@ -110,11 +109,9 @@ pub(crate) async fn confirm_journal(
                 return rocket::http::Status::InternalServerError;
             }
 
-            let cqrs = cqrs.inner().clone();
-            let store = event_store.inner().clone();
+            let mint_store = mint_store.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
-                cqrs,
-                store,
+                mint_store,
                 issuer_request_id,
             ));
         }
@@ -123,23 +120,20 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
-#[tracing::instrument(skip(cqrs, event_store), fields(
+#[tracing::instrument(skip(mint_store), fields(
     issuer_request_id = %issuer_request_id
 ))]
 async fn process_journal_completion(
-    cqrs: MintCqrs,
-    event_store: MintEventStore,
+    mint_store: Arc<Store<Mint>>,
     issuer_request_id: IssuerMintRequestId,
 ) {
-    let aggregate_id = issuer_request_id.to_string();
-
     // Step 1: Record mint intent (Deposit → MintingStarted).
     // Persisted BEFORE the network call so a crash between here and
     // Step 2 leaves the aggregate in Minting (recoverable) rather
     // than JournalConfirmed (which would lose track of the submission).
-    if let Err(err) = cqrs
-        .execute(
-            &aggregate_id,
+    if let Err(err) = mint_store
+        .send(
+            &issuer_request_id,
             MintCommand::Deposit {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -154,9 +148,9 @@ async fn process_journal_completion(
     }
 
     // Step 2: Submit mint transaction (SubmitMint → FireblocksSubmitted).
-    if let Err(err) = cqrs
-        .execute(
-            &aggregate_id,
+    if let Err(err) = mint_store
+        .send(
+            &issuer_request_id,
             MintCommand::SubmitMint {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -171,8 +165,14 @@ async fn process_journal_completion(
     }
 
     // Step 3: Load the fireblocks_tx_id from the aggregate and confirm
-    let mut context = match event_store.load_aggregate(&aggregate_id).await {
-        Ok(ctx) => ctx,
+    let mint = match mint_store.load(&issuer_request_id).await {
+        Ok(Some(mint)) => mint,
+        Ok(None) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                "Mint aggregate not found after SubmitMint"
+            );
+            return;
+        }
         Err(err) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
                 error = ?err,
@@ -182,12 +182,10 @@ async fn process_journal_completion(
         }
     };
 
-    if let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } =
-        context.aggregate()
-    {
-        if let Err(err) = cqrs
-            .execute(
-                &aggregate_id,
+    if let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } = &mint {
+        if let Err(err) = mint_store
+            .send(
+                &issuer_request_id,
                 MintCommand::ConfirmMint {
                     issuer_request_id: issuer_request_id.clone(),
                     fireblocks_tx_id: fireblocks_tx_id.clone(),
@@ -202,18 +200,14 @@ async fn process_journal_completion(
             return;
         }
     } else {
-        let state = context.aggregate().state_name();
-        match context.aggregate() {
+        let state = mint.state_name();
+        match &mint {
             Mint::MintingFailed { .. } => {
                 warn!(target: "mint", issuer_request_id = %issuer_request_id,
                     %state,
                     "Mint submission failed — scheduling automatic recovery"
                 );
-                spawn_scheduled_mint_recovery(
-                    cqrs,
-                    event_store,
-                    issuer_request_id,
-                );
+                spawn_scheduled_mint_recovery(mint_store, issuer_request_id);
             }
             Mint::CallbackPending { .. } | Mint::Completed { .. } => {
                 info!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -231,8 +225,14 @@ async fn process_journal_completion(
         return;
     }
 
-    let mut context = match event_store.load_aggregate(&aggregate_id).await {
-        Ok(ctx) => ctx,
+    let mint = match mint_store.load(&issuer_request_id).await {
+        Ok(Some(mint)) => mint,
+        Ok(None) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                "Mint aggregate not found after ConfirmMint"
+            );
+            return;
+        }
         Err(err) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
                 error = ?err,
@@ -242,12 +242,12 @@ async fn process_journal_completion(
         }
     };
 
-    match context.aggregate() {
+    match &mint {
         Mint::MintingFailed { .. } => {
             warn!(target: "mint", issuer_request_id = %issuer_request_id,
                 "Mint confirmation failed — scheduling automatic recovery"
             );
-            spawn_scheduled_mint_recovery(cqrs, event_store, issuer_request_id);
+            spawn_scheduled_mint_recovery(mint_store, issuer_request_id);
             return;
         }
         Mint::CallbackPending { .. } => {}
@@ -267,9 +267,9 @@ async fn process_journal_completion(
     }
 
     // Step 4: Send callback to Alpaca.
-    if let Err(err) = cqrs
-        .execute(
-            &issuer_request_id.to_string(),
+    if let Err(err) = mint_store
+        .send(
+            &issuer_request_id,
             MintCommand::SendCallback {
                 issuer_request_id: issuer_request_id.clone(),
             },
@@ -293,7 +293,7 @@ mod tests {
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        TestAccountAndAsset, TestHarness, create_test_event_store, test_config,
+        TestAccountAndAsset, TestHarness, test_config,
     };
     use crate::mint::{
         IssuerMintRequestId, MintCommand, MintView, Quantity,
@@ -307,7 +307,7 @@ mod tests {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
 
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -323,18 +323,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -369,7 +366,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -386,18 +383,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -433,7 +427,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -450,18 +444,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -514,7 +505,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -531,18 +522,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -597,7 +585,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -614,18 +602,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -678,7 +663,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -695,18 +680,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool.clone())
             .mount("/", routes![confirm_journal]);
 
@@ -763,7 +745,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, mint_cqrs, .. } = harness;
+        let TestHarness { pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let correct_tokenization_request_id =
@@ -782,18 +764,15 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&issuer_request_id.to_string(), initiate_cmd)
+        mint_store
+            .send(&issuer_request_id, initiate_cmd)
             .await
             .expect("Failed to initiate mint");
-
-        let event_store = create_test_event_store(&pool);
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -825,15 +804,12 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
-
-        let event_store = create_test_event_store(&pool);
+        let TestHarness { pool, mint_store, .. } = TestHarness::new().await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 
@@ -864,15 +840,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
-
-        let event_store = create_test_event_store(&pool);
+        let TestHarness { pool, mint_store, .. } = TestHarness::new().await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
-            .manage(event_store)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![confirm_journal]);
 

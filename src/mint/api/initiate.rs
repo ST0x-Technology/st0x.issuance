@@ -1,8 +1,10 @@
 use alloy::primitives::Address;
+use event_sorcery::Store;
 use rocket::post;
 use rocket::serde::json::Json;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::error;
 
 use super::{
@@ -10,8 +12,8 @@ use super::{
 };
 use crate::auth::IssuerAuth;
 use crate::mint::{
-    ClientId, IssuerMintRequestId, MintCommand, MintView, Network, Quantity,
-    TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Mint, MintCommand, MintView, Network,
+    Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     view::find_by_issuer_request_id,
 };
 
@@ -30,7 +32,7 @@ pub(crate) struct MintRequest {
     pub(crate) wallet: Address,
 }
 
-#[tracing::instrument(skip(_auth, cqrs, pool), fields(
+#[tracing::instrument(skip(_auth, mint_store, pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     underlying = %request.underlying.0,
     client_id = %request.client_id,
@@ -39,7 +41,7 @@ pub(crate) struct MintRequest {
 #[post("/inkind/issuance", format = "json", data = "<request>")]
 pub(crate) async fn initiate_mint(
     _auth: IssuerAuth,
-    cqrs: &rocket::State<crate::MintCqrs>,
+    mint_store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<sqlx::Pool<sqlx::Sqlite>>,
     request: Json<MintRequest>,
 ) -> Result<Json<MintResponse>, MintApiError> {
@@ -73,17 +75,17 @@ pub(crate) async fn initiate_mint(
         wallet: request.wallet,
     };
 
-    cqrs.execute(&issuer_request_id.to_string(), command).await.map_err(
-        |error| {
-            error!(target: "mint", "Failed to execute mint command: {error}");
-            MintApiError::CommandExecutionFailed(Box::new(error))
-        },
-    )?;
+    mint_store.send(&issuer_request_id, command).await.map_err(|error| {
+        error!(target: "mint", error = %error, "Failed to execute mint command");
+        MintApiError::CommandExecutionFailed(error)
+    })?;
 
     let mint_view = find_by_issuer_request_id(pool.inner(), &issuer_request_id)
         .await
         .map_err(|error| {
-            error!(target: "mint", "Failed to find mint by issuer_request_id: {error}");
+            error!(target: "mint", error = %error,
+                "Failed to find mint by issuer_request_id"
+            );
             MintApiError::MintViewQueryFailed(error)
         })?
         .ok_or(MintApiError::MintViewNotFound)?;
@@ -123,7 +125,7 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = TestHarness::new().await;
 
@@ -175,7 +177,7 @@ mod tests {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -224,7 +226,7 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = TestHarness::new().await;
 
@@ -251,7 +253,7 @@ mod tests {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -302,7 +304,7 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = TestHarness::new().await;
 
@@ -311,7 +313,7 @@ mod tests {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -362,7 +364,7 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = TestHarness::new().await;
 
@@ -387,7 +389,7 @@ mod tests {
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -442,14 +444,14 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool.clone())
@@ -519,14 +521,14 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool.clone())
@@ -611,14 +613,14 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -662,14 +664,14 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)
@@ -720,13 +722,12 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { mint_cqrs, .. } = harness;
+        let TestHarness { mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
-        let aggregate_id = issuer_request_id.to_string();
 
         let command = MintCommand::Initiate {
-            issuer_request_id,
+            issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: TokenizationRequestId::new("alp-123"),
             quantity: Quantity::new(Decimal::from(100)),
             underlying: underlying.clone(),
@@ -736,24 +737,24 @@ mod tests {
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
         };
 
-        mint_cqrs
-            .execute(&aggregate_id, command.clone())
+        mint_store
+            .send(&issuer_request_id, command.clone())
             .await
             .expect("First execution should succeed");
 
-        let result = mint_cqrs.execute(&aggregate_id, command).await;
+        let result = mint_store.send(&issuer_request_id, command).await;
 
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_initiate_mint_without_auth_returns_401() {
-        let TestHarness { pool, mint_cqrs, .. } = TestHarness::new().await;
+        let TestHarness { pool, mint_store, .. } = TestHarness::new().await;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(pool)
             .mount("/", routes![initiate_mint]);
 
@@ -795,14 +796,14 @@ mod tests {
             pool,
             account_store,
             asset_store: tokenized_asset_store,
-            mint_cqrs,
+            mint_store,
             ..
         } = harness;
 
         let rocket = rocket::build()
             .manage(test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_cqrs)
+            .manage(mint_store)
             .manage(account_store)
             .manage(tokenized_asset_store)
             .manage(pool)

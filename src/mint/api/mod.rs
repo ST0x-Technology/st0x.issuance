@@ -1,4 +1,6 @@
 use alloy::primitives::Address;
+use cqrs_es::AggregateError;
+use event_sorcery::LifecycleError;
 use rocket::http::{ContentType, Status};
 use rocket::response::{self, Responder};
 use rocket::serde::json::Json;
@@ -6,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use super::{
-    ClientId, IssuerMintRequestId, Network, TokenSymbol, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, Mint, MintError, Network, TokenSymbol,
+    UnderlyingSymbol,
 };
 use crate::account::{AccountView, view::find_by_client_id};
 
@@ -53,7 +56,7 @@ pub(crate) enum MintApiError {
     AccountQueryFailed(#[source] crate::account::view::AccountViewError),
 
     #[error("Failed to execute mint command")]
-    CommandExecutionFailed(#[source] Box<dyn std::error::Error + Send>),
+    CommandExecutionFailed(#[source] AggregateError<LifecycleError<Mint>>),
 
     #[error("Failed to query mint view")]
     MintViewQueryFailed(#[source] super::view::MintViewError),
@@ -84,7 +87,7 @@ impl<'r> Responder<'r, 'static> for MintApiError {
                 "Insufficient Eligibility: Wallet not whitelisted for client",
             ),
             Self::CommandExecutionFailed(e) => {
-                Self::handle_command_execution_error(e.as_ref())
+                Self::handle_command_execution_error(&e)
             }
             Self::AssetQueryFailed(e) => {
                 Self::handle_query_error(&e, "Failed to query enabled assets")
@@ -115,17 +118,18 @@ impl<'r> Responder<'r, 'static> for MintApiError {
 
 impl MintApiError {
     fn handle_command_execution_error(
-        e: &(dyn std::error::Error + Send),
+        error: &AggregateError<LifecycleError<Mint>>,
     ) -> MintErrorResponse {
-        error!(target: "mint", error = %e, "Failed to execute mint command");
+        error!(target: "mint", error = %error, "Failed to execute mint command");
 
-        let error_msg = e.to_string().to_lowercase();
-        if error_msg.contains("already") || error_msg.contains("duplicate") {
-            MintErrorResponse::conflict("Mint already initiated")
-        } else {
-            MintErrorResponse::internal_server_error(
+        match error {
+            AggregateError::AggregateConflict
+            | AggregateError::UserError(LifecycleError::Apply(
+                MintError::AlreadyInitiated { .. },
+            )) => MintErrorResponse::conflict("Mint already initiated"),
+            _ => MintErrorResponse::internal_server_error(
                 "Failed to execute mint command",
-            )
+            ),
         }
     }
 
