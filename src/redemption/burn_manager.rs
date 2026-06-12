@@ -195,7 +195,7 @@ where
         burn_tx_hash: B256,
         reason: String,
     ) -> Result<BurnVerification, BurnManagerError> {
-        let context =
+        let mut context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         let underlying = match context.aggregate() {
@@ -305,7 +305,7 @@ where
     ) -> Result<(), BurnManagerError> {
         use Redemption::{Completed, Uninitialized};
 
-        let context =
+        let mut context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         match context.aggregate() {
@@ -510,7 +510,7 @@ where
 
         // Step 2: Load the updated aggregate (now in Burning) and use
         // the standard submit → persist tx ID → confirm flow.
-        let context =
+        let mut context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         self.handle_burning_started(issuer_request_id, context.aggregate())
@@ -619,7 +619,7 @@ where
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        let context =
+        let mut context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         let aggregate = context.aggregate();
@@ -1130,7 +1130,7 @@ where
         }
 
         // Step 2: Load aggregate to get the fireblocks_tx_id from BurnSubmitted state
-        let context =
+        let mut context =
             self.store.load_aggregate(&issuer_request_id.to_string()).await?;
 
         let Redemption::BurnSubmitted { fireblocks_tx_id, .. } =
@@ -1663,7 +1663,7 @@ mod tests {
         store: &TestStore,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
-        let context =
+        let mut context =
             store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
         context.aggregate().clone()
     }

@@ -2212,7 +2212,7 @@ mod tests {
 
         result.expect("Expected Ok response");
 
-        let context = event_store
+        let mut context = event_store
             .load_aggregate(&metadata.issuer_request_id.to_string())
             .await
             .expect("Expected aggregate to load");
@@ -2274,7 +2274,7 @@ mod tests {
 
         result.expect("Expected Ok response");
 
-        let context = event_store
+        let mut context = event_store
             .load_aggregate(&metadata.issuer_request_id.to_string())
             .await
             .expect("Expected aggregate to load");
