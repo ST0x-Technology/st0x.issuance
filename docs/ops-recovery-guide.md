@@ -50,14 +50,14 @@ accepting requests.
 
 ### Common failure patterns
 
-| Detail message contains                  | Cause                   | Action                                                                    |
-| ---------------------------------------- | ----------------------- | ------------------------------------------------------------------------- |
-| `error sending request for url`          | Transient network/API   | Reprocess/recover — will likely work on retry                             |
-| `reached terminal status: Failed`        | Fireblocks tx failed    | Check Fireblocks console (see below), then reprocess/recover              |
-| `sub_status: INSUFFICIENT_FUNDS_FOR_FEE` | Bot wallet out of gas   | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover |
-| `is not whitelisted in Fireblocks`       | Missing contract        | Whitelist the contract in Fireblocks, then reprocess                      |
-| `Tokenization request not found`         | Alpaca request aged out | Cannot auto-recover — see "Alpaca request not found" below                |
-| `aggregate conflict` (409 response)      | Already recovered       | No action needed — it already completed                                   |
+| Detail message contains                  | Cause                                | Action                                                                          |
+| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
+| `error sending request for url`          | Transient network/API                | Reprocess/recover — will likely work on retry                                   |
+| `reached terminal status: Failed`        | Fireblocks tx failed                 | Check Fireblocks console (see below), then reprocess/recover                    |
+| `sub_status: INSUFFICIENT_FUNDS_FOR_FEE` | Bot wallet out of gas                | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover       |
+| `is not whitelisted in Fireblocks`       | Missing contract                     | Whitelist the contract in Fireblocks, then reprocess                            |
+| `Tokenization request not found`         | Request genuinely absent from Alpaca | 404 returned by per-request GET endpoint — see "Alpaca request not found" below |
+| `aggregate conflict` (409 response)      | Already recovered                    | No action needed — it already completed                                         |
 
 The `INSUFFICIENT_FUNDS_FOR_FEE` sub-status appears in the `fireblocks_status`
 object of the `/admin/stuck` entry (the top-level `detail` just says
@@ -128,14 +128,15 @@ on-chain confirmation before responding.
 
 Possible responses:
 
-| Response message                                                           | Meaning                                                                                              |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                     |
-| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                               |
-| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold the tokens to burn — manual intervention (see "Insufficient receipt balance").  |
-| `409 Conflict`                                                             | Already recovered/completed — no action needed.                                                      |
-| `422 Unprocessable`                                                        | Alpaca journal is still `Pending`, or was `Rejected` — cannot burn. See "Alpaca request rejected".   |
-| `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited, or request not found). See below. |
+| Response message                                                           | Meaning                                                                                             |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                    |
+| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                              |
+| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold the tokens to burn — manual intervention (see "Insufficient receipt balance"). |
+| `409 Conflict`                                                             | Already recovered/completed — no action needed.                                                     |
+| `422 Unprocessable`                                                        | Alpaca journal is still `Pending`, or was `Rejected` — cannot burn. See "Alpaca request rejected".  |
+| `404 Not Found`                                                            | The tokenization request is genuinely absent from Alpaca — see "Alpaca request not found" below.    |
+| `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited or network error). See below.     |
 
 Then check `/admin/stuck` again to confirm it cleared.
 
@@ -220,18 +221,25 @@ to coordinate returning the tokens to the AP or re-initiating the redemption.
 
 ## Alpaca request not found
 
-If `/admin/recover/redemption` returns `502` and the logs show
-`Tokenization request not found`, Alpaca no longer returns the tokenization
-request (it has aged out of Alpaca's system — seen on requests more than a
-couple weeks old). Recovery re-verifies the journal with Alpaca before burning,
-so it cannot proceed even though the redemption's own event history shows the
-journal completed.
+Journal polling now uses the keyed per-request GET endpoint
+(`/v1/accounts/{acct}/tokenization/requests/{id}`), which retrieves aged
+requests that no longer appear in the list endpoint (verified 2026-06-12:
+completed requests from June 11 were absent from the list at `?limit=500` but
+returned 200 from the keyed endpoint). This means the journal loop and
+`/admin/recover` can automatically handle requests that have aged out of the
+list endpoint.
 
-These redemptions still owe a burn (the journal completed, so the AP already
-received their shares and the on-chain tokens must be burned to keep 1:1
-backing). They **cannot be cleared through the admin endpoints today** —
-escalate to engineering for a manual burn or a recovery path that trusts the
-recorded `AlpacaJournalCompleted` event, gated on an on-chain balance check.
+A genuine `Tokenization request not found` (404 from the keyed endpoint) means
+the request truly does not exist in Alpaca — not merely that it is old.
+
+If `/admin/recover/redemption` returns `404` and the logs show
+`Tokenization request not found`, Alpaca has no record of this request at all.
+Recovery re-verifies the journal before burning, so it cannot proceed.
+
+These redemptions still owe a burn. They **cannot be cleared through the admin
+endpoints** — escalate to engineering for a manual burn or a recovery path that
+trusts the recorded `AlpacaJournalCompleted` event, gated on an on-chain balance
+check.
 
 ## Quick reference
 

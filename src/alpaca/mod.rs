@@ -50,11 +50,11 @@ pub(crate) trait AlpacaService: Send + Sync {
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError>;
 
-    /// Polls Alpaca's request list endpoint to find a matching redeem entry.
+    /// Polls Alpaca's keyed request endpoint for a specific tokenization request.
     ///
-    /// Deserializes all entries as [`TokenizationRequest`] (an enum of Mint
-    /// and Redeem variants), then finds the `Redeem` variant matching the
-    /// given `tokenization_request_id`.
+    /// Calls `GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}`
+    /// and deserializes the single-object response as [`TokenizationRequest`].
+    /// Maps HTTP 404 to [`AlpacaError::RequestNotFound`].
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
@@ -132,10 +132,10 @@ pub(crate) enum RedeemRequestStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Fees(pub(crate) Decimal);
 
-/// Entry from Alpaca's tokenization request list endpoint.
+/// A tokenization request returned by Alpaca's keyed request endpoint.
 ///
-/// The endpoint returns both mint and redeem entries. This enum deserializes
-/// both variants via `#[serde(tag = "type")]`, with each variant carrying
+/// The endpoint returns a single object. This enum deserializes both Mint and
+/// Redeem variants via `#[serde(tag = "type")]`, with each variant carrying
 /// the appropriate `issuer_request_id` type.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -196,9 +196,19 @@ pub(crate) enum AlpacaError {
     /// Alpaca API returned an error response
     #[error("API error {status_code}: {body}")]
     Api { status_code: u16, body: String },
-    /// Tokenization request not found when polling status
-    #[error("Tokenization request not found: {0}")]
-    RequestNotFound(TokenizationRequestId),
+    /// HTTP 404 from the keyed endpoint. Treated as "definitively absent" for
+    /// recovery purposes (empirically verified 2026-06-12, not a published
+    /// Alpaca guarantee). `body` contains the raw 404 response for operator
+    /// diagnostics.
+    #[error("Tokenization request not found: {id}, body: {body}")]
+    RequestNotFound { id: TokenizationRequestId, body: String },
+    /// The keyed endpoint returned a request whose id differs from what was
+    /// requested — non-retryable data integrity violation.
+    #[error("Response id mismatch: requested {requested}, returned {returned}")]
+    ResponseIdMismatch {
+        requested: TokenizationRequestId,
+        returned: TokenizationRequestId,
+    },
 }
 
 impl AlpacaError {
@@ -208,9 +218,10 @@ impl AlpacaError {
             Self::Api { status_code, .. } => {
                 matches!(status_code, 500..=599 | 429)
             }
-            Self::Parse { .. } | Self::Auth(_) | Self::RequestNotFound(_) => {
-                false
-            }
+            Self::Parse { .. }
+            | Self::Auth(_)
+            | Self::RequestNotFound { .. }
+            | Self::ResponseIdMismatch { .. } => false,
         }
     }
 }

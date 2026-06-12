@@ -144,6 +144,7 @@ impl JournalManager {
         let max_duration = self.max_duration;
         let mut poll_interval = self.initial_poll_interval;
         let max_interval = self.max_interval;
+        let mut not_found_warned = false;
 
         loop {
             if start_time.elapsed() >= max_duration {
@@ -153,7 +154,7 @@ impl JournalManager {
             }
 
             debug!(target: "redemption", issuer_request_id = %issuer_request_id,
-                tokenization_request_id = %tokenization_request_id.0,
+                %tokenization_request_id,
                 poll_interval = ?poll_interval,
                 elapsed = ?start_time.elapsed(),
                 "Polling Alpaca for journal status"
@@ -171,6 +172,7 @@ impl JournalManager {
                     &tokenization_request_id,
                     start_time.elapsed(),
                     poll_interval,
+                    &mut not_found_warned,
                 )
                 .await?;
 
@@ -276,7 +278,12 @@ impl JournalManager {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<Option<Redemption>, JournalManagerError> {
-        Ok(self.store.load(issuer_request_id).await?)
+        self.store.load(issuer_request_id).await.map_err(|source| {
+            JournalManagerError::StoreLoad {
+                issuer_request_id: issuer_request_id.clone(),
+                source: Box::new(source),
+            }
+        })
     }
 
     fn check_field_match<T: PartialEq + std::fmt::Debug>(
@@ -333,12 +340,55 @@ impl JournalManager {
         tokenization_request_id: &TokenizationRequestId,
         elapsed: Duration,
         poll_interval: Duration,
+        not_found_warned: &mut bool,
     ) -> Result<bool, JournalManagerError> {
         match request_result {
             Ok(request) => {
-                let status = self
+                let status = match self
                     .validate_request_fields(&request, issuer_request_id)
-                    .await?;
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(err @ JournalManagerError::StoreLoad { .. }) => {
+                        // Transient store error — do not terminalize the redemption.
+                        // This polling session exits; the background recovery job
+                        // re-picks it on its next run.
+                        warn!(target: "redemption",
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
+                            error = %err,
+                            "Transient store error during validation, will retry"
+                        );
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        warn!(target: "redemption",
+                            issuer_request_id = %issuer_request_id,
+                            tokenization_request_id = %tokenization_request_id,
+                            error = %err,
+                            "Validation failed for Alpaca response, marking redemption as failed"
+                        );
+                        if let Err(mark_err) = self
+                            .store
+                            .send(
+                                issuer_request_id,
+                                RedemptionCommand::MarkFailed {
+                                    issuer_request_id: issuer_request_id
+                                        .clone(),
+                                    reason: err.to_string(),
+                                },
+                            )
+                            .await
+                        {
+                            error!(target: "redemption",
+                                issuer_request_id = %issuer_request_id,
+                                error = %mark_err,
+                                "Failed to mark redemption as failed after validation failure"
+                            );
+                        }
+                        return Err(err);
+                    }
+                };
 
                 match status {
                     RedeemRequestStatus::Completed => {
@@ -397,6 +447,54 @@ impl JournalManager {
                     }
                 }
             }
+            Err(AlpacaError::RequestNotFound { ref id, .. }) => {
+                if *not_found_warned {
+                    debug!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        tokenization_request_id = %id,
+                        next_poll_in = ?poll_interval,
+                        "Request not found at Alpaca keyed endpoint, will retry"
+                    );
+                } else {
+                    warn!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        tokenization_request_id = %id,
+                        next_poll_in = ?poll_interval,
+                        "Request not found at Alpaca keyed endpoint (assumed transient), will retry"
+                    );
+                    *not_found_warned = true;
+                }
+                Ok(true)
+            }
+            Err(err @ AlpacaError::ResponseIdMismatch { .. }) => {
+                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                    tokenization_request_id = %tokenization_request_id,
+                    error = %err,
+                    "Response id mismatch from Alpaca, marking redemption as failed (non-retryable)"
+                );
+
+                if let Err(mark_err) = self
+                    .store
+                    .send(
+                        issuer_request_id,
+                        RedemptionCommand::MarkFailed {
+                            issuer_request_id: issuer_request_id.clone(),
+                            reason: format!(
+                                "Alpaca response id mismatch: {err}"
+                            ),
+                        },
+                    )
+                    .await
+                {
+                    error!(target: "redemption",
+                        issuer_request_id = %issuer_request_id,
+                        error = %mark_err,
+                        "Failed to mark redemption as failed after response id mismatch"
+                    );
+                }
+
+                Err(JournalManagerError::Alpaca(err))
+            }
             Err(err) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     tokenization_request_id = %tokenization_request_id,
@@ -435,6 +533,12 @@ pub(crate) enum JournalManagerError {
     AccountNotFound { wallet: Address },
     #[error("Account not linked for wallet: {wallet}")]
     AccountNotLinked { wallet: Address },
+    #[error("Failed to load redemption {issuer_request_id}: {source}")]
+    StoreLoad {
+        issuer_request_id: IssuerRedemptionRequestId,
+        #[source]
+        source: Box<AggregateError<LifecycleError<Redemption>>>,
+    },
 }
 
 // `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
@@ -550,6 +654,8 @@ mod tests {
     enum MockResponse {
         Success(RedeemRequestStatus),
         Error { status_code: u16, body: String },
+        NotFound,
+        ResponseIdMismatch { returned_id: String },
     }
 
     struct StatefulMockAlpacaService {
@@ -564,6 +670,10 @@ mod tests {
             issuer_request_id: IssuerRedemptionRequestId,
         ) -> Self {
             Self { call_count: Mutex::new(0), responses, issuer_request_id }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.call_count.lock().unwrap()
         }
 
         fn create_mock_request(
@@ -604,7 +714,7 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            _tokenization_request_id: &TokenizationRequestId,
+            tokenization_request_id: &TokenizationRequestId,
         ) -> Result<TokenizationRequest, AlpacaError> {
             let index = {
                 let mut count = self.call_count.lock().unwrap();
@@ -627,6 +737,16 @@ mod tests {
                     Err(AlpacaError::Api {
                         status_code: *status_code,
                         body: body.clone(),
+                    })
+                }
+                MockResponse::NotFound => Err(AlpacaError::RequestNotFound {
+                    id: tokenization_request_id.clone(),
+                    body: String::new(),
+                }),
+                MockResponse::ResponseIdMismatch { returned_id } => {
+                    Err(AlpacaError::ResponseIdMismatch {
+                        requested: tokenization_request_id.clone(),
+                        returned: TokenizationRequestId::new(returned_id),
                     })
                 }
             }
@@ -825,6 +945,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
     async fn test_poll_timeout_marks_as_failed() {
         let (store, pool) = setup_test_store().await;
 
@@ -870,6 +991,13 @@ mod tests {
         assert!(
             matches!(aggregate, Redemption::Failed { .. }),
             "Expected Failed state, got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &["Polling timeout reached, marking redemption as failed"]
+            ),
+            "Expected WARN log for polling timeout"
         );
     }
 
@@ -1011,6 +1139,154 @@ mod tests {
                 "Expected quantity mismatch error, got: {reason}"
             );
         }
+    }
+
+    /// When Alpaca returns a Mint variant (or any response that fails
+    /// validation), the redemption must be terminalized as Failed so it does
+    /// not remain stuck in AlpacaCalled.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_validation_failure_terminates_as_failed() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-mint-response");
+
+        struct MintVariantMock;
+
+        #[async_trait]
+        impl AlpacaService for MintVariantMock {
+            async fn send_mint_callback(
+                &self,
+                _request: crate::alpaca::MintCallbackRequest,
+            ) -> Result<(), AlpacaError> {
+                Ok(())
+            }
+
+            async fn call_redeem_endpoint(
+                &self,
+                _request: crate::alpaca::RedeemRequest,
+            ) -> Result<crate::alpaca::RedeemResponse, AlpacaError>
+            {
+                unreachable!()
+            }
+
+            async fn poll_request_status(
+                &self,
+                _tokenization_request_id: &TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                Ok(TokenizationRequest::Mint {})
+            }
+        }
+
+        let mock = Arc::new(MintVariantMock);
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::ValidationFailed { .. })),
+            "Expected ValidationFailed error, got {result:?}"
+        );
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed state after Mint variant response, got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Validation failed for Alpaca response, marking redemption as failed"
+                ]
+            ),
+            "Expected WARN log for validation failure termination"
+        );
+    }
+
+    /// When Alpaca returns a response id that doesn't match the requested id,
+    /// the redemption must be terminalized as Failed immediately (non-retryable).
+    #[tokio::test]
+    #[traced_test]
+    async fn test_response_id_mismatch_terminates_as_failed() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-tok-requested");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::ResponseIdMismatch {
+                returned_id: "alp-tok-different".to_string(),
+            }],
+            issuer_request_id.clone(),
+        ));
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(JournalManagerError::Alpaca(
+                    AlpacaError::ResponseIdMismatch { .. }
+                ))
+            ),
+            "Expected Alpaca(ResponseIdMismatch) error, got {result:?}"
+        );
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed state after ResponseIdMismatch, got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Response id mismatch from Alpaca, marking redemption as failed"
+                ]
+            ),
+            "Expected WARN log for response id mismatch termination"
+        );
     }
 
     #[tokio::test]
@@ -1251,6 +1527,226 @@ mod tests {
         assert!(
             matches!(result, Err(JournalManagerError::AccountNotFound { .. })),
             "Expected AccountNotFound, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_poll_request_not_found_then_completed() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-not-found-then-ok");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![
+                MockResponse::NotFound,
+                MockResponse::NotFound,
+                MockResponse::Success(RedeemRequestStatus::Completed),
+            ],
+            issuer_request_id.clone(),
+        ));
+        let mock_ref = Arc::clone(&mock);
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Expected Ok after 404s then Completed, got {result:?}"
+        );
+        // First NotFound logs at WARN; subsequent ones at DEBUG.
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Request not found at Alpaca keyed endpoint (assumed transient), will retry",
+                    "alp-not-found-then-ok"
+                ]
+            ),
+            "Expected WARN log for first RequestNotFound"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &[
+                    "Request not found at Alpaca keyed endpoint, will retry",
+                    "alp-not-found-then-ok"
+                ]
+            ),
+            "Expected DEBUG log for subsequent RequestNotFound"
+        );
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Burning { .. }),
+            "Expected Burning state after ConfirmAlpacaComplete, got {aggregate:?}"
+        );
+        assert_eq!(
+            mock_ref.call_count(),
+            3,
+            "Expected exactly 3 poll calls (2 NotFound + 1 Completed)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn test_poll_request_not_found_until_timeout() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-not-found-timeout");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::NotFound],
+            issuer_request_id.clone(),
+        ));
+
+        let mut manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        manager.max_duration = std::time::Duration::from_millis(100);
+        manager.initial_poll_interval = std::time::Duration::from_millis(10);
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::Timeout { .. })),
+            "Expected Timeout error on perpetual 404, got {result:?}"
+        );
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed state after 404 timeout, got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &[
+                    "Request not found at Alpaca keyed endpoint (assumed transient), will retry"
+                ]
+            ),
+            "Expected WARN log for first RequestNotFound"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &["Polling timeout reached, marking redemption as failed"]
+            ),
+            "Expected WARN log for polling timeout"
+        );
+    }
+
+    /// Verifies that a transient store-load failure during polling does NOT
+    /// permanently terminalize the redemption (no `MarkFailed` command). The
+    /// error must propagate as `StoreLoad` for retry, leaving the redemption
+    /// intact in `AlpacaCalled`.
+    ///
+    /// The transient failure is simulated by temporarily renaming the `events`
+    /// table out from under the store, so `Store::load` fails with an
+    /// infrastructure error. The table is restored before reading the
+    /// aggregate back for assertion.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_store_load_error_does_not_mark_redemption_failed() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-store-fail-test");
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        // Hide the events table to simulate a transient SQLite/IO error on the
+        // next load during polling.
+        sqlx::query("ALTER TABLE events RENAME TO events_hidden")
+            .execute(&pool)
+            .await
+            .expect("Failed to hide events table");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::Success(RedeemRequestStatus::Completed)],
+            issuer_request_id.clone(),
+        ));
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool.clone(),
+        );
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::StoreLoad { .. })),
+            "Expected StoreLoad error, not permanent failure, got {result:?}"
+        );
+
+        // Restore the events table so we can read the aggregate back.
+        sqlx::query("ALTER TABLE events_hidden RENAME TO events")
+            .execute(&pool)
+            .await
+            .expect("Failed to restore events table");
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::AlpacaCalled { .. }),
+            "Redemption must remain in AlpacaCalled state (not Failed) after a transient store error; got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &["Transient store error during validation, will retry"]
+            ),
+            "Expected WARN log for transient store error"
         );
     }
 }

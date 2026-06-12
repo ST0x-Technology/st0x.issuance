@@ -213,7 +213,9 @@ fn setup_redemption_mocks_with_qty_capture(
 
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
-            .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
+            .path_matches(
+                r"^/v1/accounts/test-account/tokenization/requests/.+",
+            )
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
@@ -224,7 +226,7 @@ fn setup_redemption_mocks_with_qty_capture(
                     shared_issuer_id.lock().unwrap().clone();
                 let tx_hash = shared_tx_hash.lock().unwrap().clone();
 
-                let response_body = serde_json::to_string(&json!([{
+                let response_body = serde_json::to_string(&json!({
                     "tokenization_request_id": "tok-redeem-dust",
                     "issuer_request_id": issuer_request_id,
                     "created_at": "2025-09-12T17:28:48.642437-04:00",
@@ -239,7 +241,7 @@ fn setup_redemption_mocks_with_qty_capture(
                     "wallet_address": user_wallet,
                     "tx_hash": tx_hash,
                     "fees": "0.001"
-                }]))
+                }))
                 .unwrap();
 
                 httpmock::HttpMockResponse {
