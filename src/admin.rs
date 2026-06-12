@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::Quantity;
-use crate::alpaca::{AlpacaService, RedeemRequestStatus, TokenizationRequest};
+use crate::alpaca::{
+    AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+};
 use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, MintCommand, MintEvent, MintView,
@@ -389,12 +391,30 @@ async fn recover_post_alpaca(
         .poll_request_status(&alpaca_data.tokenization_request_id)
         .await
         .map_err(|err| {
+            let (status, msg) = match &err {
+                AlpacaError::RequestNotFound { .. } => (
+                    Status::NotFound,
+                    "Tokenization request not found at Alpaca (404)",
+                ),
+                AlpacaError::ResponseIdMismatch { .. } => (
+                    Status::BadGateway,
+                    "Alpaca returned a mismatched tokenization request id",
+                ),
+                AlpacaError::Reqwest(_)
+                | AlpacaError::Parse { .. }
+                | AlpacaError::Auth(_)
+                | AlpacaError::Api { .. } => (
+                    Status::BadGateway,
+                    "Failed to poll Alpaca for journal status",
+                ),
+            };
             error!(target: "admin", aggregate_id = %aggregate_id,
-                tokenization_request_id = %alpaca_data.tokenization_request_id.0,
+                tokenization_request_id = %alpaca_data.tokenization_request_id,
                 error = %err,
-                "Failed to poll Alpaca for journal status"
+                status = status.code,
+                "{msg}"
             );
-            Status::BadGateway
+            status
         })?;
 
     let (status, alpaca_updated_at) = match &request {
@@ -435,14 +455,14 @@ async fn recover_post_alpaca(
         RedeemRequestStatus::Completed => {}
         RedeemRequestStatus::Pending => {
             info!(target: "admin", aggregate_id = %aggregate_id,
-                tokenization_request_id = %alpaca_data.tokenization_request_id.0,
+                tokenization_request_id = %alpaca_data.tokenization_request_id,
                 "Cannot recover: Alpaca journal still pending"
             );
             return Err(Status::UnprocessableEntity);
         }
         RedeemRequestStatus::Rejected => {
             info!(target: "admin", aggregate_id = %aggregate_id,
-                tokenization_request_id = %alpaca_data.tokenization_request_id.0,
+                tokenization_request_id = %alpaca_data.tokenization_request_id,
                 "Cannot recover: Alpaca journal was rejected"
             );
             return Err(Status::UnprocessableEntity);
@@ -1816,8 +1836,17 @@ mod tests {
                             body: body.clone(),
                         }
                     }
-                    AlpacaError::RequestNotFound(id) => {
-                        AlpacaError::RequestNotFound(id.clone())
+                    AlpacaError::RequestNotFound { id, body } => {
+                        AlpacaError::RequestNotFound {
+                            id: id.clone(),
+                            body: body.clone(),
+                        }
+                    }
+                    AlpacaError::ResponseIdMismatch { requested, returned } => {
+                        AlpacaError::ResponseIdMismatch {
+                            requested: requested.clone(),
+                            returned: returned.clone(),
+                        }
                     }
                     AlpacaError::Auth(msg) => AlpacaError::Auth(msg.clone()),
                     _ => {
@@ -2833,6 +2862,93 @@ mod tests {
             Level::ERROR,
             &["Failed to execute recovered redemption burn"]
         ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_post_alpaca_recovery_request_not_found_returns_404()
+    {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let (metadata, _alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Error(AlpacaError::RequestNotFound {
+                id: TokenizationRequestId::new("tok-test-1"),
+                body: "not found".to_string(),
+            }),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket =
+            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(
+            status,
+            Status::NotFound,
+            "RequestNotFound from Alpaca must return 404, not 502"
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "Burn recovery must not be called"
+        );
+        assert!(
+            logs_contain_at!(Level::ERROR, &["Tokenization request not found"]),
+            "Expected error log for poll failure"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_endpoint_post_alpaca_recovery_response_id_mismatch_returns_502()
+     {
+        let pool = setup_pool().await;
+        let (cqrs, event_store) = setup_cqrs(&pool);
+        let (metadata, _alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+
+        let requested = TokenizationRequestId::new("tok-test-1");
+        let returned = TokenizationRequestId::new("tok-other-id");
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Error(AlpacaError::ResponseIdMismatch {
+                requested: requested.clone(),
+                returned: returned.clone(),
+            }),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket =
+            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(
+            status,
+            Status::BadGateway,
+            "ResponseIdMismatch from Alpaca must return 502"
+        );
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "Burn recovery must not be called"
+        );
+        assert!(
+            logs_contain_at!(
+                Level::ERROR,
+                &["mismatched tokenization request id"]
+            ),
+            "Expected error log for response id mismatch"
+        );
     }
 
     /// Drives a redemption to `Burning` state (post-journal, pre-burn) — the
