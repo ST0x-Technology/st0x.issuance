@@ -2161,12 +2161,11 @@ pub(crate) mod tests {
     use cqrs_es::View;
     use cqrs_es::{
         Aggregate, AggregateContext, CqrsFramework, EventStore,
-        event_sink::EventSink, mem_store::MemStore, persist::GenericQuery,
-        test::TestFramework,
+        event_sink::EventSink, mem_store::MemStore, test::TestFramework,
     };
+    use event_sorcery::StoreBuilder;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2183,9 +2182,7 @@ pub(crate) mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::log_count_at;
-    use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetView,
-    };
+    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
@@ -2381,22 +2378,18 @@ pub(crate) mod tests {
 
             sqlx::migrate!().run(&pool).await.unwrap();
 
-            let asset_view_repo = Arc::new(SqliteViewRepository::<
-                TokenizedAssetView,
-                TokenizedAsset,
-            >::new(
-                pool.clone(),
-                "tokenized_asset_view".to_string(),
-            ));
-            let asset_query = GenericQuery::new(asset_view_repo);
-            let asset_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+            let (asset_store, _asset_projection) =
+                StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                    .build(())
+                    .await
+                    .unwrap();
 
-            asset_cqrs
-                .execute(
-                    "AAPL",
+            let underlying = UnderlyingSymbol::new("AAPL");
+            asset_store
+                .send(
+                    &underlying,
                     TokenizedAssetCommand::Add {
-                        underlying: UnderlyingSymbol::new("AAPL"),
+                        underlying: underlying.clone(),
                         token: TokenSymbol::new("tAAPL"),
                         network: Network::new("base"),
                         vault: VAULT,
