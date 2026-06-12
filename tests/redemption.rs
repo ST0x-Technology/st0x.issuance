@@ -153,7 +153,9 @@ fn setup_redemption_mocks_with_shared_state(
 
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
-            .path_matches(r"^/v1/accounts/test-account/tokenization/requests.*")
+            .path_matches(
+                r"^/v1/accounts/test-account/tokenization/requests/tok-redeem-recovery$",
+            )
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
@@ -176,24 +178,23 @@ fn setup_redemption_mocks_with_shared_state(
                     "pending"
                 };
 
-                let response_body =
-                    serde_json::to_string(&serde_json::json!([{
-                        "tokenization_request_id": "tok-redeem-recovery",
-                        "issuer_request_id": &issuer_request_id,
-                        "created_at": "2025-09-12T17:28:48.642437-04:00",
-                        "updated_at": "2025-09-12T17:30:00.000000-04:00",
-                        "type": "redeem",
-                        "status": status,
-                        "underlying_symbol": "AAPL",
-                        "token_symbol": "tAAPL",
-                        "qty": "50",
-                        "issuer": "test-issuer",
-                        "network": "base",
-                        "wallet_address": user_wallet,
-                        "tx_hash": tx_hash,
-                        "fees": "0.5"
-                    }]))
-                    .unwrap();
+                let response_body = serde_json::to_string(&serde_json::json!({
+                    "tokenization_request_id": "tok-redeem-recovery",
+                    "issuer_request_id": &issuer_request_id,
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "updated_at": "2025-09-12T17:30:00.000000-04:00",
+                    "type": "redeem",
+                    "status": status,
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "50",
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": user_wallet,
+                    "tx_hash": tx_hash,
+                    "fees": "0.5"
+                }))
+                .unwrap();
 
                 httpmock::HttpMockResponse {
                     status: Some(200),
