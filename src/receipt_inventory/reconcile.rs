@@ -1,13 +1,14 @@
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use cqrs_es::AggregateError;
+use event_sorcery::Store;
 use futures::{StreamExt, stream};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
 
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
-    ReceiptInventoryError, Shares,
+    ReceiptInventoryError, Shares, load_inventory,
 };
 use crate::bindings::Receipt;
 
@@ -24,42 +25,36 @@ pub(crate) struct ReconcileResult {
 pub(crate) enum ReconcileError {
     #[error("Contract call error: {0}")]
     ContractCall(#[from] alloy::contract::Error),
+    // Store operations surface SQLite failures as
+    // `AggregateError::DatabaseConnectionError` inside this variant; there is
+    // no separate persistence error path.
     #[error("CQRS error: {0}")]
     Aggregate(#[from] AggregateError<ReceiptInventoryError>),
-    #[error("Persistence error: {0}")]
-    Persistence(#[from] cqrs_es::persist::PersistenceError),
 }
 
-pub(crate) struct ReceiptReconciler<Node, ReceiptInventoryStore>
-where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
-{
+pub(crate) struct ReceiptReconciler<Node> {
     provider: Node,
     receipt_contract: Address,
     bot_wallet: Address,
     vault: Address,
-    cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    store: Arc<Store<ReceiptInventory>>,
 }
 
-impl<Node, ReceiptInventoryStore> ReceiptReconciler<Node, ReceiptInventoryStore>
-where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
-{
+impl<Node> ReceiptReconciler<Node> {
     pub(crate) const fn new(
         provider: Node,
         receipt_contract: Address,
         bot_wallet: Address,
         vault: Address,
-        cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        store: Arc<Store<ReceiptInventory>>,
     ) -> Self {
-        Self { provider, receipt_contract, bot_wallet, vault, cqrs }
+        Self { provider, receipt_contract, bot_wallet, vault, store }
     }
 }
 
-impl<Node, ReceiptInventoryStore> ReceiptReconciler<Node, ReceiptInventoryStore>
+impl<Node> ReceiptReconciler<Node>
 where
     Node: Provider + Clone + Send + Sync,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
 {
     /// Reconciles receipt inventory balances with on-chain state.
     ///
@@ -68,13 +63,10 @@ where
     /// for any mismatches (emitting ExternalBurnDetected events).
     pub(crate) async fn reconcile(
         &self,
-        event_store: &ReceiptInventoryStore,
     ) -> Result<ReconcileResult, ReconcileError> {
-        let mut aggregate_context =
-            event_store.load_aggregate(&self.vault.to_string()).await?;
+        let inventory = load_inventory(&self.store, &self.vault).await?;
 
-        let receipts: Vec<_> = aggregate_context
-            .aggregate()
+        let receipts: Vec<_> = inventory
             .receipts_with_balance()
             .into_iter()
             .map(|receipt| (receipt.receipt_id, receipt.available_balance))
@@ -160,9 +152,9 @@ where
             "Balance mismatch detected"
         );
 
-        self.cqrs
-            .execute(
-                &self.vault.to_string(),
+        self.store
+            .send(
+                &self.vault,
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id,
                     on_chain_balance: on_chain_shares,
@@ -174,29 +166,25 @@ where
     }
 }
 
-pub(crate) async fn run_startup_reconciliation<
-    P: Provider + Clone,
-    ES: EventStore<ReceiptInventory>,
->(
+pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
     provider: P,
     vault_receipt_contracts: &[(Address, Address)],
-    cqrs: &Arc<CqrsFramework<ReceiptInventory, ES>>,
-    event_store: &ES,
+    store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
 ) -> Result<(), ReconcileError> {
     let results = stream::iter(vault_receipt_contracts.iter().copied())
         .then(|(vault, receipt_contract)| {
             let provider = provider.clone();
-            let cqrs = cqrs.clone();
+            let store = store.clone();
             async move {
                 let result = ReceiptReconciler::new(
                     provider,
                     receipt_contract,
                     bot_wallet,
                     vault,
-                    cqrs,
+                    store,
                 )
-                .reconcile(event_store)
+                .reconcile()
                 .await;
 
                 (vault, receipt_contract, result)
@@ -250,8 +238,8 @@ mod tests {
     use alloy::primitives::{Address, U256, b256, uint};
     use alloy::providers::ProviderBuilder;
     use alloy::sol_types::SolEvent;
-    use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{AggregateContext, CqrsFramework, EventStore};
+    use event_sorcery::test_store;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::*;
@@ -261,43 +249,48 @@ mod tests {
     };
     use crate::test_utils::LocalEvm;
 
-    type TestStore = MemStore<ReceiptInventory>;
-    type TestCqrs = CqrsFramework<ReceiptInventory, TestStore>;
-
-    fn setup_cqrs() -> (Arc<TestCqrs>, Arc<TestStore>) {
-        let store = Arc::new(MemStore::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        (cqrs, store)
+    async fn setup_store() -> Arc<Store<ReceiptInventory>> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+        Arc::new(test_store::<ReceiptInventory>(pool, ()))
     }
 
     async fn seed_receipt(
-        cqrs: &TestCqrs,
+        store: &Arc<Store<ReceiptInventory>>,
         vault: Address,
         receipt_id: U256,
         balance: U256,
     ) {
-        cqrs.execute(
-            &vault.to_string(),
-            ReceiptInventoryCommand::DiscoverReceipt {
-                receipt_id: ReceiptId::from(receipt_id),
-                balance: Shares::from(balance),
-                block_number: 1,
-                tx_hash: b256!(
-                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                ),
-                source: ReceiptSource::External,
-                receipt_info: None,
-                receipt_info_bytes: None,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(receipt_id),
+                    balance: Shares::from(balance),
+                    block_number: 1,
+                    tx_hash: b256!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_reconcile_empty_aggregate_returns_zero_counts() {
         let evm = LocalEvm::new().await.unwrap();
-        let (cqrs, store) = setup_cqrs();
+        let store = setup_store().await;
 
         let provider =
             ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
@@ -313,10 +306,10 @@ mod tests {
             receipt_contract,
             evm.wallet_address,
             evm.vault_address,
-            cqrs,
+            store,
         );
 
-        let result = reconciler.reconcile(store.as_ref()).await.unwrap();
+        let result = reconciler.reconcile().await.unwrap();
 
         assert_eq!(result.checked, 0);
         assert_eq!(result.mismatches, 0);
@@ -325,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_detects_stale_receipt_with_zero_on_chain_balance() {
         let evm = LocalEvm::new().await.unwrap();
-        let (cqrs, store) = setup_cqrs();
+        let store = setup_store().await;
 
         let provider =
             ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
@@ -340,26 +333,31 @@ mod tests {
         let stale_receipt_id = uint!(0xff_U256);
         let stale_balance =
             U256::from(100) * U256::from(10).pow(U256::from(18));
-        seed_receipt(&cqrs, evm.vault_address, stale_receipt_id, stale_balance)
-            .await;
+        seed_receipt(
+            &store,
+            evm.vault_address,
+            stale_receipt_id,
+            stale_balance,
+        )
+        .await;
 
         let reconciler = ReceiptReconciler::new(
             provider,
             receipt_contract,
             evm.wallet_address,
             evm.vault_address,
-            cqrs.clone(),
+            store.clone(),
         );
 
-        let result = reconciler.reconcile(store.as_ref()).await.unwrap();
+        let result = reconciler.reconcile().await.unwrap();
 
         assert_eq!(result.checked, 1, "Should have checked 1 receipt");
         assert_eq!(result.mismatches, 1, "Should have detected 1 mismatch");
 
         // Verify the aggregate was updated — receipt should be depleted
-        let mut context =
-            store.load_aggregate(&evm.vault_address.to_string()).await.unwrap();
-        let receipts = context.aggregate().receipts_with_balance();
+        let inventory =
+            load_inventory(&store, &evm.vault_address).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert!(
             receipts.is_empty(),
             "Stale receipt should be removed after reconciliation"
@@ -369,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_matching_balance_reports_no_mismatch() {
         let evm = LocalEvm::new().await.unwrap();
-        let (cqrs, store) = setup_cqrs();
+        let store = setup_store().await;
 
         let provider =
             ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
@@ -434,17 +432,18 @@ mod tests {
         let minted_shares = deposit_log.shares;
 
         // Seed aggregate with the same balance as on-chain
-        seed_receipt(&cqrs, evm.vault_address, receipt_id, minted_shares).await;
+        seed_receipt(&store, evm.vault_address, receipt_id, minted_shares)
+            .await;
 
         let reconciler = ReceiptReconciler::new(
             bot_provider,
             receipt_contract,
             evm.wallet_address,
             evm.vault_address,
-            cqrs,
+            store,
         );
 
-        let result = reconciler.reconcile(store.as_ref()).await.unwrap();
+        let result = reconciler.reconcile().await.unwrap();
 
         assert_eq!(result.checked, 1, "Should have checked 1 receipt");
         assert_eq!(

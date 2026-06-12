@@ -7,10 +7,8 @@ pub(crate) mod view;
 
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
-use cqrs_es::{
-    Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore,
-    event_sink::EventSink,
-};
+use cqrs_es::AggregateError;
+use event_sorcery::{EventSourced, LifecycleError, Nil, SendError, Store};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,6 +20,7 @@ use crate::mint::IssuerMintRequestId;
 use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
 use crate::vault::ReceiptInformation;
 use crate::vault::rain_meta;
+use backfill::BackfillError;
 pub(crate) use backfill::ItnReceiptHandler;
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
@@ -29,6 +28,7 @@ pub(crate) use burn_tracking::{
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
+use reconcile::ReconcileError;
 pub(crate) use view::{ReceiptInventoryView, replay_receipt_inventory_view};
 
 /// Receipt data recovered from the inventory for mint recovery.
@@ -126,7 +126,7 @@ impl std::fmt::Display for Shares {
 }
 
 /// Overflow error for Shares arithmetic.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[error("Shares overflow: {lhs} + {rhs} exceeds U256::MAX")]
 pub(crate) struct SharesOverflow {
     pub(crate) lhs: Shares,
@@ -308,41 +308,104 @@ pub(crate) enum ReceiptRegistrationError {
 }
 
 /// Implementation of ReceiptService using the ReceiptInventory aggregate.
-pub(crate) struct CqrsReceiptService<ES>
-where
-    ES: EventStore<ReceiptInventory>,
-{
-    store: Arc<ES>,
-    cqrs: Arc<CqrsFramework<ReceiptInventory, ES>>,
+pub(crate) struct CqrsReceiptService {
+    store: Arc<Store<ReceiptInventory>>,
 }
 
-impl<ES> CqrsReceiptService<ES>
-where
-    ES: EventStore<ReceiptInventory>,
-{
-    pub(crate) const fn new(
-        store: Arc<ES>,
-        cqrs: Arc<CqrsFramework<ReceiptInventory, ES>>,
-    ) -> Self {
-        Self { store, cqrs }
+impl CqrsReceiptService {
+    pub(crate) const fn new(store: Arc<Store<ReceiptInventory>>) -> Self {
+        Self { store }
+    }
+}
+
+/// Loads a vault's receipt inventory, treating an absent event stream as an
+/// empty inventory.
+///
+/// This is the single home of that domain rule: an uninitialized vault
+/// behaves exactly like a vault holding no receipts (`originate` is total for
+/// the same reason). Every read of the aggregate must go through this helper
+/// rather than re-encoding `load(..)?.unwrap_or_default()` at the call site,
+/// so a future reader cannot silently diverge on the `None` case.
+pub(crate) async fn load_inventory(
+    store: &Store<ReceiptInventory>,
+    vault: &Address,
+) -> Result<ReceiptInventory, SendError<ReceiptInventory>> {
+    Ok(store.load(vault).await?.unwrap_or_default())
+}
+
+/// Translates an `event_sorcery` send/load error back into the
+/// `AggregateError<ReceiptInventoryError>` the service contract exposes.
+///
+/// Command-handler domain errors arrive as
+/// `UserError(LifecycleError::Apply(domain))` and are unwrapped to the bare
+/// domain error; `AggregateConflict` is preserved so `BurnManager`'s
+/// optimistic-concurrency retry keeps matching it. Lifecycle errors that can
+/// only arise from event-application corruption (never from a command) are
+/// surfaced as `UnexpectedError`.
+fn to_aggregate_error(
+    error: SendError<ReceiptInventory>,
+) -> AggregateError<ReceiptInventoryError> {
+    match error {
+        AggregateError::UserError(LifecycleError::Apply(domain)) => {
+            AggregateError::UserError(domain)
+        }
+        AggregateError::UserError(lifecycle) => {
+            AggregateError::UnexpectedError(Box::new(lifecycle))
+        }
+        AggregateError::AggregateConflict => AggregateError::AggregateConflict,
+        AggregateError::DatabaseConnectionError(source) => {
+            AggregateError::DatabaseConnectionError(source)
+        }
+        AggregateError::DeserializationError(source) => {
+            AggregateError::DeserializationError(source)
+        }
+        AggregateError::UnexpectedError(source) => {
+            AggregateError::UnexpectedError(source)
+        }
+    }
+}
+
+impl From<SendError<ReceiptInventory>> for ReceiptRegistrationError {
+    fn from(error: SendError<ReceiptInventory>) -> Self {
+        to_aggregate_error(error).into()
+    }
+}
+
+impl From<SendError<ReceiptInventory>> for ReceiptLookupError {
+    fn from(error: SendError<ReceiptInventory>) -> Self {
+        to_aggregate_error(error).into()
+    }
+}
+
+impl From<SendError<ReceiptInventory>> for BurnTrackingError {
+    fn from(error: SendError<ReceiptInventory>) -> Self {
+        to_aggregate_error(error).into()
+    }
+}
+
+impl From<SendError<ReceiptInventory>> for BackfillError {
+    fn from(error: SendError<ReceiptInventory>) -> Self {
+        to_aggregate_error(error).into()
+    }
+}
+
+impl From<SendError<ReceiptInventory>> for ReconcileError {
+    fn from(error: SendError<ReceiptInventory>) -> Self {
+        to_aggregate_error(error).into()
     }
 }
 
 #[async_trait]
-impl<ES> ReceiptService for CqrsReceiptService<ES>
-where
-    ES: EventStore<ReceiptInventory> + Send + Sync,
-    ES::AC: Send,
-{
+impl ReceiptService for CqrsReceiptService {
     async fn register_minted_receipt(
         &self,
         params: MintedReceiptParams,
     ) -> Result<(), ReceiptRegistrationError> {
         let issuer_request_id = params.receipt_info.issuer_request_id.clone();
 
-        self.cqrs
-            .execute(
-                &params.vault.to_string(),
+        self.store
+            .send(
+                &params.vault,
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: params.receipt_id,
                     balance: params.shares,
@@ -365,10 +428,9 @@ where
         shares_to_burn: Shares,
         dust: Shares,
     ) -> Result<BurnPlan, BurnTrackingError> {
-        let mut context = self.store.load_aggregate(&vault.to_string()).await?;
+        let inventory = load_inventory(&self.store, &vault).await?;
 
-        let receipts = context
-            .aggregate()
+        let receipts = inventory
             .receipts_with_balance_excluding(redemption_issuer_request_id);
         plan_burn(receipts, shares_to_burn, dust)
     }
@@ -379,9 +441,9 @@ where
         redemption_issuer_request_id: IssuerRedemptionRequestId,
         burns: Vec<BurnRecord>,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.cqrs
-            .execute(
-                &vault.to_string(),
+        self.store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::ReserveBurn {
                     redemption_issuer_request_id,
                     burns,
@@ -397,9 +459,9 @@ where
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.cqrs
-            .execute(
-                &vault.to_string(),
+        self.store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::ReleaseBurn {
                     redemption_issuer_request_id,
                 },
@@ -414,9 +476,9 @@ where
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.cqrs
-            .execute(
-                &vault.to_string(),
+        self.store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::SettleBurn {
                     redemption_issuer_request_id,
                 },
@@ -430,8 +492,8 @@ where
         &self,
         vault: Address,
     ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError> {
-        let mut context = self.store.load_aggregate(&vault.to_string()).await?;
-        Ok(context.aggregate().reserved_redemptions())
+        let inventory = load_inventory(&self.store, &vault).await?;
+        Ok(inventory.reserved_redemptions())
     }
 
     async fn find_by_issuer_request_id(
@@ -439,12 +501,7 @@ where
         vault: &Address,
         issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
-        let receipt_inventory = self
-            .store
-            .load_aggregate(&vault.to_string())
-            .await?
-            .aggregate()
-            .clone();
+        let receipt_inventory = load_inventory(&self.store, vault).await?;
 
         let Some(receipt_id) =
             receipt_inventory.find_by_issuer_request_id(issuer_request_id)
@@ -569,11 +626,11 @@ impl ReceiptInventory {
     /// also covers a receipt already at zero balance — preserved by the
     /// zero-drain reconcile guard — so it is depleted once its last reservation
     /// resolves rather than lingering empty forever.
-    fn depletion_receipt_ids_after_clearing(
+    fn depletions_after_clearing(
         &self,
         redemption: &IssuerRedemptionRequestId,
         consume_balance: bool,
-    ) -> Vec<ReceiptId> {
+    ) -> Vec<ReceiptInventoryEvent> {
         self.receipts
             .iter()
             .filter_map(|(receipt_id, metadata)| {
@@ -593,7 +650,9 @@ impl ReceiptInventory {
                     metadata.balance
                 };
 
-                post_balance.is_zero().then_some(*receipt_id)
+                post_balance.is_zero().then_some(
+                    ReceiptInventoryEvent::Depleted { receipt_id: *receipt_id },
+                )
             })
             .collect()
     }
@@ -646,7 +705,7 @@ pub(crate) fn determine_source(
     )
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub(crate) enum ReceiptInventoryError {
     #[error("Unknown receipt {receipt_id}")]
     UnknownReceipt { receipt_id: ReceiptId },
@@ -663,20 +722,11 @@ pub(crate) enum ReceiptInventoryError {
     },
 }
 
-impl Aggregate for ReceiptInventory {
-    type Command = ReceiptInventoryCommand;
-    type Event = ReceiptInventoryEvent;
-    type Error = ReceiptInventoryError;
-    type Services = ();
-
-    const TYPE: &'static str = "ReceiptInventory";
-
-    async fn handle(
-        &mut self,
-        command: Self::Command,
-        _services: &Self::Services,
-        sink: &EventSink<Self>,
-    ) -> Result<(), Self::Error> {
+impl ReceiptInventory {
+    fn handle_command(
+        &self,
+        command: ReceiptInventoryCommand,
+    ) -> Result<Vec<ReceiptInventoryEvent>, ReceiptInventoryError> {
         match command {
             ReceiptInventoryCommand::DiscoverReceipt {
                 receipt_id,
@@ -688,22 +738,18 @@ impl Aggregate for ReceiptInventory {
                 receipt_info_bytes,
             } => {
                 if self.receipts.contains_key(&receipt_id) {
-                    return Ok(());
+                    return Ok(vec![]);
                 }
 
-                sink.write(
-                    ReceiptInventoryEvent::Discovered {
-                        receipt_id,
-                        balance,
-                        block_number,
-                        tx_hash,
-                        source,
-                        receipt_info,
-                        receipt_info_bytes,
-                    },
-                    self,
-                )
-                .await;
+                Ok(vec![ReceiptInventoryEvent::Discovered {
+                    receipt_id,
+                    balance,
+                    block_number,
+                    tx_hash,
+                    source,
+                    receipt_info,
+                    receipt_info_bytes,
+                }])
             }
 
             ReceiptInventoryCommand::ReconcileBalance {
@@ -711,12 +757,11 @@ impl Aggregate for ReceiptInventory {
                 on_chain_balance,
             } => {
                 let Some(metadata) = self.receipts.get(&receipt_id) else {
-                    return Ok(());
+                    return Ok(vec![]);
                 };
 
                 let mirror = metadata.balance;
                 let available = metadata.available();
-                let reserved_empty = metadata.reserved.is_empty();
 
                 // While a submitted burn is pending, on-chain legitimately
                 // sits between `available` (all reservations settled) and
@@ -724,38 +769,26 @@ impl Aggregate for ReceiptInventory {
                 // "no external change" so reconciliation never clobbers a
                 // reservation — settlement, not reconciliation, consumes it.
                 if (available..=mirror).contains(&on_chain_balance) {
-                    if mirror.is_zero() {
-                        write_depletion_if_unreserved(
-                            sink,
-                            self,
-                            receipt_id,
-                            reserved_empty,
-                        )
-                        .await;
-                    }
-
-                    return Ok(());
+                    return Ok(if mirror.is_zero() {
+                        depletion_events(receipt_id, metadata)
+                    } else {
+                        vec![]
+                    });
                 }
 
-                sink.write(
-                    ReceiptInventoryEvent::BalanceReconciled {
-                        receipt_id,
-                        previous_balance: mirror,
-                        on_chain_balance,
-                    },
-                    self,
-                )
-                .await;
+                let reconciled = ReceiptInventoryEvent::BalanceReconciled {
+                    receipt_id,
+                    previous_balance: mirror,
+                    on_chain_balance,
+                };
 
-                if on_chain_balance.is_zero() {
-                    write_depletion_if_unreserved(
-                        sink,
-                        self,
-                        receipt_id,
-                        reserved_empty,
-                    )
-                    .await;
-                }
+                let depletion = if on_chain_balance.is_zero() {
+                    depletion_events(receipt_id, metadata)
+                } else {
+                    vec![]
+                };
+
+                Ok(std::iter::once(reconciled).chain(depletion).collect())
             }
 
             ReceiptInventoryCommand::ReserveBurn {
@@ -790,14 +823,10 @@ impl Aggregate for ReceiptInventory {
                     }
                 }
 
-                sink.write(
-                    ReceiptInventoryEvent::BurnReserved {
-                        redemption_issuer_request_id,
-                        burns,
-                    },
-                    self,
-                )
-                .await;
+                Ok(vec![ReceiptInventoryEvent::BurnReserved {
+                    redemption_issuer_request_id,
+                    burns,
+                }])
             }
 
             // Release restores a reservation without touching the mirror
@@ -810,29 +839,19 @@ impl Aggregate for ReceiptInventory {
                 redemption_issuer_request_id,
             } => {
                 if !self.holds_reservation(&redemption_issuer_request_id) {
-                    return Ok(());
+                    return Ok(vec![]);
                 }
 
-                let depleted = self.depletion_receipt_ids_after_clearing(
+                let depletions = self.depletions_after_clearing(
                     &redemption_issuer_request_id,
                     false,
                 );
 
-                sink.write(
-                    ReceiptInventoryEvent::BurnReleased {
-                        redemption_issuer_request_id,
-                    },
-                    self,
-                )
-                .await;
-
-                for receipt_id in depleted {
-                    sink.write(
-                        ReceiptInventoryEvent::Depleted { receipt_id },
-                        self,
-                    )
-                    .await;
-                }
+                Ok(std::iter::once(ReceiptInventoryEvent::BurnReleased {
+                    redemption_issuer_request_id,
+                })
+                .chain(depletions)
+                .collect())
             }
 
             // Settle consumes a reservation after its burn confirmed on-chain:
@@ -842,36 +861,24 @@ impl Aggregate for ReceiptInventory {
                 redemption_issuer_request_id,
             } => {
                 if !self.holds_reservation(&redemption_issuer_request_id) {
-                    return Ok(());
+                    return Ok(vec![]);
                 }
 
-                let depleted = self.depletion_receipt_ids_after_clearing(
+                let depletions = self.depletions_after_clearing(
                     &redemption_issuer_request_id,
                     true,
                 );
 
-                sink.write(
-                    ReceiptInventoryEvent::BurnSettled {
-                        redemption_issuer_request_id,
-                    },
-                    self,
-                )
-                .await;
-
-                for receipt_id in depleted {
-                    sink.write(
-                        ReceiptInventoryEvent::Depleted { receipt_id },
-                        self,
-                    )
-                    .await;
-                }
+                Ok(std::iter::once(ReceiptInventoryEvent::BurnSettled {
+                    redemption_issuer_request_id,
+                })
+                .chain(depletions)
+                .collect())
             }
         }
-
-        Ok(())
     }
 
-    fn apply(&mut self, event: Self::Event) {
+    fn apply_event(&mut self, event: ReceiptInventoryEvent) {
         match event {
             ReceiptInventoryEvent::Discovered {
                 receipt_id,
@@ -1021,28 +1028,89 @@ impl Aggregate for ReceiptInventory {
     }
 }
 
-/// Writes `Depleted` when a zero-balance receipt has no outstanding reservations.
+#[async_trait]
+impl EventSourced for ReceiptInventory {
+    type Id = Address;
+    type Event = ReceiptInventoryEvent;
+    type Command = ReceiptInventoryCommand;
+    type Error = ReceiptInventoryError;
+    type Services = ();
+    type Materialized = Nil;
+
+    const AGGREGATE_TYPE: &'static str = "ReceiptInventory";
+    const PROJECTION: Nil = Nil;
+    const SCHEMA_VERSION: u64 = 1;
+
+    // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
+    // and event-sorcery hardwires snapshot-every-N with no off switch, so
+    // usize::MAX makes the next-snapshot threshold unreachable. The proper
+    // fix is for event-sorcery to take the snapshot policy explicitly from
+    // the consumer, including the option to disable snapshotting entirely.
+    //
+    // Replay-cost note for whoever profiles a slow mint/redemption path:
+    // without snapshots every send/load replays the vault's full event
+    // stream, and `evolve` clones the whole inventory per event (its `&Self`
+    // signature forces it), so loads cost O(events x receipts) and the
+    // per-vault stream only ever grows.
+    const SNAPSHOT_SIZE: usize = usize::MAX;
+
+    /// Originate is total: the empty `Self::default()` is both the
+    /// uninitialized seed and a valid live state, so any first event yields a
+    /// valid inventory. `Discovered` inserts a receipt; any other genesis event
+    /// applies as a no-op against the empty default (only `BurnReserved` with
+    /// burns logs a WARN), matching the old infallible replay. Returning
+    /// `None` here would make a stream whose first event isn't `Discovered`
+    /// fail to load instead of yielding an empty inventory.
+    fn originate(event: &Self::Event) -> Option<Self> {
+        let mut inventory = Self::default();
+        inventory.apply_event(event.clone());
+        Some(inventory)
+    }
+
+    fn evolve(
+        entity: &Self,
+        event: &Self::Event,
+    ) -> Result<Option<Self>, Self::Error> {
+        let mut next = entity.clone();
+        next.apply_event(event.clone());
+        Ok(Some(next))
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        Self::default().handle_command(command)
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        self.handle_command(command)
+    }
+}
+
+/// Decides whether a receipt that has reached zero balance should be depleted.
 ///
 /// A receipt that still holds a reservation is preserved (with a WARN) instead
 /// of depleted: removing it would silently discard the reservation and turn a
 /// later settle/release into a no-op. A pending settle/release or the startup
 /// reservation recovery resolves it instead.
-async fn write_depletion_if_unreserved(
-    sink: &EventSink<ReceiptInventory>,
-    aggregate: &mut ReceiptInventory,
+fn depletion_events(
     receipt_id: ReceiptId,
-    reserved_empty: bool,
-) {
-    if reserved_empty {
-        sink.write(ReceiptInventoryEvent::Depleted { receipt_id }, aggregate)
-            .await;
-        return;
+    metadata: &ReceiptMetadata,
+) -> Vec<ReceiptInventoryEvent> {
+    if metadata.reserved.is_empty() {
+        return vec![ReceiptInventoryEvent::Depleted { receipt_id }];
     }
 
     warn!(target: "receipt", receipt_id = %receipt_id,
         "Receipt reached zero balance while still holding reservations; \
          preserving it so the reservation can resolve"
     );
+    vec![]
 }
 
 fn required_burns_by_receipt(
@@ -1064,7 +1132,7 @@ fn required_burns_by_receipt(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Bytes, TxHash, address, b256};
-    use cqrs_es::{CqrsFramework, EventStore, mem_store::MemStore};
+    use event_sorcery::test_store;
     use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
@@ -1088,17 +1156,6 @@ mod tests {
     /// test — i.e. the "another redemption is planning" viewpoint.
     fn planning_redemption() -> IssuerRedemptionRequestId {
         "red-00000000".parse().unwrap()
-    }
-
-    fn make_metadata(balance: u64) -> ReceiptMetadata {
-        ReceiptMetadata {
-            balance: make_shares(balance),
-            reserved: HashMap::new(),
-            tx_hash: TxHash::ZERO,
-            block_number: 0,
-            receipt_info: None,
-            receipt_info_bytes: None,
-        }
     }
 
     fn discover_receipt_cmd(
@@ -1136,33 +1193,51 @@ mod tests {
         }
     }
 
-    async fn handle_command(
+    async fn setup_store() -> Arc<Store<ReceiptInventory>> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+        Arc::new(test_store::<ReceiptInventory>(pool, ()))
+    }
+
+    /// Runs a command against the aggregate and applies the produced events,
+    /// so test state is only ever built through the public command API.
+    async fn drive(
         aggregate: &mut ReceiptInventory,
         command: ReceiptInventoryCommand,
-    ) -> Result<Vec<ReceiptInventoryEvent>, ReceiptInventoryError> {
-        let sink = EventSink::default();
-        aggregate.handle(command, &(), &sink).await?;
-        Ok(sink.collect().await)
+    ) -> Vec<ReceiptInventoryEvent> {
+        let events = aggregate.transition(command, &()).await.unwrap();
+        for event in events.clone() {
+            aggregate.apply_event(event);
+        }
+        events
     }
 
     #[tokio::test]
     async fn test_discover_receipt_emits_discovered_event() {
-        let mut aggregate = ReceiptInventory::default();
+        let aggregate = ReceiptInventory::default();
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -1184,99 +1259,44 @@ mod tests {
         );
 
         // First discovery succeeds
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
         // Second discovery is idempotent - returns Ok with no events
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(200),
-                2000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(200),
+                    2000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(events.is_empty());
     }
 
-    #[test]
-    fn test_apply_discovered_adds_to_state() {
-        let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(42),
-            balance: make_shares(100),
-            block_number: 1000,
-            tx_hash,
-            source: ReceiptSource::External,
-            receipt_info: None,
-            receipt_info_bytes: None,
-        });
-
-        assert_eq!(aggregate.receipts.len(), 1);
-
-        assert_eq!(
-            aggregate.receipts.get(&make_receipt_id(42)).map(|m| m.balance),
-            Some(make_shares(100))
-        );
-    }
-
-    #[test]
-    fn test_apply_discovered_stores_receipt_info() {
-        let mut aggregate = ReceiptInventory::default();
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-        let issuer_request_id = IssuerMintRequestId::random();
-        let receipt_info = ReceiptInformation::new(
-            TokenizationRequestId::new("tok-test"),
-            issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
-            Quantity(Decimal::new(100, 0)),
-            Utc::now(),
-            None,
-        );
-
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(42),
-            balance: make_shares(100),
-            block_number: 1000,
-            tx_hash,
-            source: ReceiptSource::Itn { issuer_request_id },
-            receipt_info: Some(Box::new(receipt_info.clone())),
-            receipt_info_bytes: None,
-        });
-
-        let receipts = aggregate.receipts_with_balance();
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].receipt_info, Some(receipt_info));
-    }
-
     #[tokio::test]
     async fn test_discover_receipt_with_receipt_info_roundtrips() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let store = setup_store().await;
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1291,24 +1311,24 @@ mod tests {
             Some("test notes".to_string()),
         );
 
-        cqrs.execute(
-            &vault.to_string(),
-            ReceiptInventoryCommand::DiscoverReceipt {
-                receipt_id: make_receipt_id(99),
-                balance: make_shares(500),
-                block_number: 2000,
-                tx_hash,
-                source: ReceiptSource::Itn { issuer_request_id },
-                receipt_info: Some(Box::new(receipt_info.clone())),
-                receipt_info_bytes: None,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: make_receipt_id(99),
+                    balance: make_shares(500),
+                    block_number: 2000,
+                    tx_hash,
+                    source: ReceiptSource::Itn { issuer_request_id },
+                    receipt_info: Some(Box::new(receipt_info.clone())),
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = context.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].receipt_info,
@@ -1317,188 +1337,114 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_apply_depleted_removes_receipt() {
-        let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(42), make_metadata(0));
+    #[tokio::test]
+    async fn test_non_discovered_genesis_event_loads_as_empty_inventory() {
+        let store = setup_store().await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-        aggregate.apply(ReceiptInventoryEvent::Depleted {
-            receipt_id: make_receipt_id(42),
-        });
-
-        assert!(!aggregate.receipts.contains_key(&make_receipt_id(42)));
-    }
-
-    #[test]
-    fn test_receipts_with_balance_returns_all_receipts() {
-        let mut aggregate = ReceiptInventory::default();
-        aggregate.receipts.insert(make_receipt_id(1), make_metadata(100));
-        aggregate.receipts.insert(make_receipt_id(2), make_metadata(200));
-
-        let receipts = aggregate.receipts_with_balance();
-
-        assert_eq!(receipts.len(), 2);
-
-        let total: Shares = receipts
-            .iter()
-            .map(|receipt| receipt.available_balance)
-            .try_fold(Shares::new(U256::ZERO), |acc, shares| acc + shares)
+        // ReserveBurn with no burns aggregates to an empty required-by-receipt
+        // map, so it skips the receipt-existence check and emits BurnReserved as
+        // a genesis event — a non-Discovered first event on a fresh vault.
+        // originate must treat the empty default as a valid live state and yield
+        // an empty inventory, not fail the load with EventCantOriginate (every
+        // read goes through `load_inventory`, where a load error propagates
+        // instead of degrading to an empty inventory).
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::ReserveBurn {
+                    redemption_issuer_request_id: "red-00000000"
+                        .parse()
+                        .unwrap(),
+                    burns: vec![],
+                },
+            )
+            .await
             .unwrap();
-        assert_eq!(total, make_shares(300));
-    }
 
-    #[test]
-    fn test_receipts_with_balance_empty_aggregate() {
-        let aggregate = ReceiptInventory::default();
+        let inventory = store
+            .load(&vault)
+            .await
+            .expect("load must not fail on a non-Discovered genesis event")
+            .expect("a persisted stream must materialize an inventory");
 
-        let receipts = aggregate.receipts_with_balance();
-
-        assert!(receipts.is_empty());
+        assert!(
+            inventory.receipts_with_balance().is_empty(),
+            "an empty ReserveBurn must leave the inventory empty"
+        );
     }
 
     #[tokio::test]
     async fn test_find_by_issuer_request_id_returns_receipt_when_itn_receipt_exists()
      {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let store = setup_store().await;
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         let issuer_request_id = IssuerMintRequestId::random();
 
-        cqrs.execute(
-            &vault.to_string(),
-            discover_itn_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-                issuer_request_id.clone(),
-            ),
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault,
+                discover_itn_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                    issuer_request_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let found =
-            context.aggregate().find_by_issuer_request_id(&issuer_request_id);
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let found = inventory.find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, Some(make_receipt_id(42)));
     }
 
     #[tokio::test]
     async fn test_find_by_issuer_request_id_returns_none_when_not_exists() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
+        let store = setup_store().await;
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let issuer_request_id = IssuerMintRequestId::random();
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let found =
-            context.aggregate().find_by_issuer_request_id(&issuer_request_id);
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let found = inventory.find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, None);
     }
 
     #[tokio::test]
     async fn test_find_by_issuer_request_id_returns_none_for_external_receipts()
     {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
+        let store = setup_store().await;
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
         // Discover an external receipt (no issuer_request_id)
-        cqrs.execute(
-            &vault.to_string(),
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault,
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+            )
+            .await
+            .unwrap();
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let aggregate = context.aggregate();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
 
         // External receipts should not be indexed by issuer_request_id
         let random_id = IssuerMintRequestId::random();
-        assert_eq!(aggregate.find_by_issuer_request_id(&random_id), None);
+        assert_eq!(inventory.find_by_issuer_request_id(&random_id), None);
 
         // But the receipt itself should exist
-        assert_eq!(aggregate.receipts.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_itn_receipt_is_indexed_in_itn_receipts_map() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
-        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-        let issuer_request_id = IssuerMintRequestId::random();
-
-        cqrs.execute(
-            &vault.to_string(),
-            discover_itn_receipt_cmd(
-                make_receipt_id(99),
-                make_shares(500),
-                2000,
-                tx_hash,
-                issuer_request_id.clone(),
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let aggregate = context.aggregate();
-
-        // Verify the receipt is in both maps
-        assert_eq!(aggregate.receipts.len(), 1);
-        assert_eq!(aggregate.itn_receipts.len(), 1);
-        assert_eq!(
-            aggregate.itn_receipts.get(&issuer_request_id),
-            Some(&make_receipt_id(99))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_external_receipt_not_in_itn_receipts_map() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = CqrsFramework::new((*store).clone(), vec![], ());
-        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let tx_hash = b256!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-
-        cqrs.execute(
-            &vault.to_string(),
-            discover_receipt_cmd(
-                make_receipt_id(77),
-                make_shares(300),
-                1500,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let aggregate = context.aggregate();
-
-        // Receipt exists but not in itn_receipts
-        assert_eq!(aggregate.receipts.len(), 1);
-        assert_eq!(aggregate.itn_receipts.len(), 0);
+        assert_eq!(inventory.receipts.len(), 1);
     }
 
     #[test]
@@ -1591,29 +1537,61 @@ mod tests {
 
     async fn setup_receipt_service_with_receipts(
         receipts: Vec<(u64, u64)>,
-    ) -> CqrsReceiptService<MemStore<ReceiptInventory>> {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
+    ) -> CqrsReceiptService {
+        let store = setup_store().await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
         for (i, (id, balance)) in receipts.into_iter().enumerate() {
-            cqrs.execute(
-                &address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                    .to_string(),
-                discover_receipt_cmd(
-                    make_receipt_id(id),
-                    make_shares(balance),
-                    1000 + i as u64,
-                    tx_hash,
-                ),
-            )
-            .await
-            .unwrap();
+            store
+                .send(
+                    &vault,
+                    discover_receipt_cmd(
+                        make_receipt_id(id),
+                        make_shares(balance),
+                        1000 + i as u64,
+                        tx_hash,
+                    ),
+                )
+                .await
+                .unwrap();
         }
 
-        CqrsReceiptService::new(store, cqrs)
+        CqrsReceiptService::new(store)
+    }
+
+    #[test]
+    fn test_aggregate_conflict_survives_error_translation() {
+        // BurnManager::reserve_with_conflict_retry matches on
+        // ReceiptRegistrationError::Aggregate(AggregateError::AggregateConflict)
+        // to retry optimistic-concurrency conflicts on the same vault. The store
+        // surfaces those conflicts as SendError::AggregateConflict; this locks in
+        // that the translation preserves the variant rather than collapsing it
+        // into UnexpectedError, which would silently break the retry and fail
+        // concurrent redemptions terminally.
+        let translated = to_aggregate_error(
+            SendError::<ReceiptInventory>::AggregateConflict,
+        );
+        assert!(
+            matches!(translated, AggregateError::AggregateConflict),
+            "AggregateConflict must pass through to_aggregate_error unchanged"
+        );
+
+        let registration_error = ReceiptRegistrationError::from(
+            SendError::<ReceiptInventory>::AggregateConflict,
+        );
+        assert!(
+            matches!(
+                registration_error,
+                ReceiptRegistrationError::Aggregate(
+                    AggregateError::AggregateConflict
+                )
+            ),
+            "the From<SendError> conversion BurnManager relies on must \
+             preserve AggregateConflict"
+        );
     }
 
     #[tokio::test]
@@ -1900,7 +1878,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_preserves_pending_reservation() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
+        aggregate.apply_event(ReceiptInventoryEvent::Discovered {
             receipt_id: make_receipt_id(42),
             balance: make_shares(100),
             block_number: 1,
@@ -1909,7 +1887,7 @@ mod tests {
             receipt_info: None,
             receipt_info_bytes: None,
         });
-        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+        aggregate.apply_event(ReceiptInventoryEvent::BurnReserved {
             redemption_issuer_request_id: "red-00000001".parse().unwrap(),
             burns: vec![burn(42, 100)],
         });
@@ -1920,15 +1898,16 @@ mod tests {
             "fully reserved receipt must be unavailable"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(100),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.is_empty(),
@@ -1937,7 +1916,7 @@ mod tests {
         );
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
         assert_eq!(
@@ -1953,7 +1932,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_no_op_for_landed_unsettled_burn() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
+        aggregate.apply_event(ReceiptInventoryEvent::Discovered {
             receipt_id: make_receipt_id(42),
             balance: make_shares(100),
             block_number: 1,
@@ -1962,21 +1941,22 @@ mod tests {
             receipt_info: None,
             receipt_info_bytes: None,
         });
-        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+        aggregate.apply_event(ReceiptInventoryEvent::BurnReserved {
             redemption_issuer_request_id: "red-00000001".parse().unwrap(),
             burns: vec![burn(42, 60)],
         });
 
         // available = 40, mirror = 100; the burn of 60 lands -> on-chain 40.
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(40),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(40),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.is_empty(),
@@ -1990,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_external_drain_below_available_reconciles() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
+        aggregate.apply_event(ReceiptInventoryEvent::Discovered {
             receipt_id: make_receipt_id(42),
             balance: make_shares(100),
             block_number: 1,
@@ -1999,21 +1979,22 @@ mod tests {
             receipt_info: None,
             receipt_info_bytes: None,
         });
-        aggregate.apply(ReceiptInventoryEvent::BurnReserved {
+        aggregate.apply_event(ReceiptInventoryEvent::BurnReserved {
             redemption_issuer_request_id: "red-00000001".parse().unwrap(),
             burns: vec![burn(42, 30)],
         });
 
         // available = 70; on-chain 50 < 70 -> external drain.
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(50),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(50),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2030,32 +2011,42 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_reconcile_preserves_reservation_at_zero_mirror() {
+        // Given is built from events (the canonical ES setup): an out-of-band
+        // external drain (BalanceReconciled to zero on a reserved receipt)
+        // legitimately produces a zero-mirror receipt that still holds a
+        // reservation. Applying events directly — rather than driving the
+        // commands — keeps the setup WARN-free, so the WARN assertion below is
+        // attributable only to the command under test.
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
+        aggregate.apply_event(ReceiptInventoryEvent::Discovered {
             receipt_id: make_receipt_id(42),
-            balance: make_shares(0),
+            balance: make_shares(100),
             block_number: 1,
             tx_hash: TxHash::ZERO,
             source: ReceiptSource::External,
             receipt_info: None,
             receipt_info_bytes: None,
         });
-        aggregate
-            .receipts
-            .get_mut(&make_receipt_id(42))
-            .unwrap()
-            .reserved
-            .insert("red-00000001".parse().unwrap(), make_shares(50));
+        aggregate.apply_event(ReceiptInventoryEvent::BurnReserved {
+            redemption_issuer_request_id: "red-00000001".parse().unwrap(),
+            burns: vec![burn(42, 70)],
+        });
+        aggregate.apply_event(ReceiptInventoryEvent::BalanceReconciled {
+            receipt_id: make_receipt_id(42),
+            previous_balance: make_shares(100),
+            on_chain_balance: make_shares(0),
+        });
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(0),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2075,32 +2066,36 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_zero_drain_preserves_reservation() {
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(42),
-            balance: make_shares(100),
-            block_number: 1,
-            tx_hash: TxHash::ZERO,
-            source: ReceiptSource::External,
-            receipt_info: None,
-            receipt_info_bytes: None,
-        });
-        aggregate
-            .receipts
-            .get_mut(&make_receipt_id(42))
-            .unwrap()
-            .reserved
-            .insert("red-00000001".parse().unwrap(), make_shares(70));
-
-        // available = 30; an external drain to 0 is below it (out of band).
-        let events = handle_command(
+        drive(
             &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(0),
+            discover_receipt_cmd(
+                make_receipt_id(42),
+                make_shares(100),
+                1,
+                TxHash::ZERO,
+            ),
+        )
+        .await;
+        drive(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReserveBurn {
+                redemption_issuer_request_id: "red-00000001".parse().unwrap(),
+                burns: vec![burn(42, 70)],
             },
         )
-        .await
-        .unwrap();
+        .await;
+
+        // available = 30; an external drain to 0 is below it (out of band).
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             events.len(),
@@ -2114,7 +2109,7 @@ mod tests {
         ));
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
         assert!(
@@ -2151,10 +2146,8 @@ mod tests {
         // must be cleared. Checking internals distinguishes a real settlement
         // from merely leaving the reservation in place (which would leave the
         // same 40 available but a stale 100 mirror).
-        let mut context =
-            service.store.load_aggregate(&vault.to_string()).await.unwrap();
-        let metadata = context
-            .aggregate()
+        let inventory = load_inventory(&service.store, &vault).await.unwrap();
+        let metadata = inventory
             .receipts
             .get(&make_receipt_id(1))
             .expect("receipt should remain after partial settlement");
@@ -2189,10 +2182,9 @@ mod tests {
             .unwrap();
         service.settle_burn(vault, redemption_id).await.unwrap();
 
-        let mut context =
-            service.store.load_aggregate(&vault.to_string()).await.unwrap();
+        let inventory = load_inventory(&service.store, &vault).await.unwrap();
         assert!(
-            context.aggregate().receipts_with_balance().is_empty(),
+            inventory.receipts_with_balance().is_empty(),
             "a fully settled receipt must be depleted and removed"
         );
     }
@@ -2205,30 +2197,44 @@ mod tests {
         let redemption_id: IssuerRedemptionRequestId =
             "red-00000001".parse().unwrap();
         let mut aggregate = ReceiptInventory::default();
-        aggregate.apply(ReceiptInventoryEvent::Discovered {
-            receipt_id: make_receipt_id(1),
-            balance: make_shares(0),
-            block_number: 1,
-            tx_hash: TxHash::ZERO,
-            source: ReceiptSource::External,
-            receipt_info: None,
-            receipt_info_bytes: None,
-        });
-        aggregate
-            .receipts
-            .get_mut(&make_receipt_id(1))
-            .unwrap()
-            .reserved
-            .insert(redemption_id.clone(), make_shares(100));
-
-        let events = handle_command(
+        drive(
             &mut aggregate,
-            ReceiptInventoryCommand::ReleaseBurn {
-                redemption_issuer_request_id: redemption_id,
+            discover_receipt_cmd(
+                make_receipt_id(1),
+                make_shares(100),
+                1,
+                TxHash::ZERO,
+            ),
+        )
+        .await;
+        drive(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReserveBurn {
+                redemption_issuer_request_id: redemption_id.clone(),
+                burns: vec![burn(1, 70)],
             },
         )
-        .await
-        .unwrap();
+        .await;
+        // Out-of-band drain to zero: the reconcile guard preserves the
+        // reserved receipt at a zero mirror balance.
+        drive(
+            &mut aggregate,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: make_receipt_id(1),
+                on_chain_balance: make_shares(0),
+            },
+        )
+        .await;
+
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReleaseBurn {
+                    redemption_issuer_request_id: redemption_id,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.iter().any(|event| matches!(
@@ -2240,7 +2246,7 @@ mod tests {
         );
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
         assert!(
@@ -2391,20 +2397,18 @@ mod tests {
 
         service.settle_burn(vault, redemption_id).await.unwrap();
 
-        let mut context =
-            service.store.load_aggregate(&vault.to_string()).await.unwrap();
-        let aggregate = context.aggregate();
+        let inventory = load_inventory(&service.store, &vault).await.unwrap();
 
         // Receipt 1's stale reservation was cleared by the retry, so settle
         // left it untouched; only receipt 2 was consumed (and depleted).
-        let receipt_1 = aggregate
+        let receipt_1 = inventory
             .receipts
             .get(&make_receipt_id(1))
             .expect("receipt 1 must remain untouched");
         assert_eq!(receipt_1.balance, make_shares(100));
         assert!(receipt_1.reserved.is_empty());
         assert!(
-            !aggregate.receipts.contains_key(&make_receipt_id(2)),
+            !inventory.receipts.contains_key(&make_receipt_id(2)),
             "receipt 2 was settled to zero and depleted"
         );
     }
@@ -2568,31 +2572,33 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(100),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2607,31 +2613,33 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(50),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(50),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2654,31 +2662,33 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(100),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(0),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 2);
         assert!(matches!(
@@ -2696,17 +2706,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_unknown_receipt_emits_no_events() {
-        let mut aggregate = ReceiptInventory::default();
+        let aggregate = ReceiptInventory::default();
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(99),
-                on_chain_balance: make_shares(0),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(99),
+                    on_chain_balance: make_shares(0),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert!(
             events.is_empty(),
@@ -2721,31 +2732,33 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
 
-        let events = handle_command(
-            &mut aggregate,
-            discover_receipt_cmd(
-                make_receipt_id(42),
-                make_shares(50),
-                1000,
-                tx_hash,
-            ),
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                discover_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(50),
+                    1000,
+                    tx_hash,
+                ),
+                &(),
+            )
+            .await
+            .unwrap();
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
-        let events = handle_command(
-            &mut aggregate,
-            ReceiptInventoryCommand::ReconcileBalance {
-                receipt_id: make_receipt_id(42),
-                on_chain_balance: make_shares(100),
-            },
-        )
-        .await
-        .unwrap();
+        let events = aggregate
+            .transition(
+                ReceiptInventoryCommand::ReconcileBalance {
+                    receipt_id: make_receipt_id(42),
+                    on_chain_balance: make_shares(100),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2758,7 +2771,7 @@ mod tests {
         ));
 
         for event in events {
-            aggregate.apply(event);
+            aggregate.apply_event(event);
         }
 
         let receipts = aggregate.receipts_with_balance();
@@ -2768,9 +2781,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_minted_receipt_makes_receipt_available_for_burn() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let store = setup_store().await;
+        let service = CqrsReceiptService::new(store.clone());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2809,9 +2821,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_minted_receipt_is_findable_by_issuer_request_id() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let store = setup_store().await;
+        let service = CqrsReceiptService::new(store.clone());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2848,9 +2859,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_minted_receipt_is_idempotent() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let store = setup_store().await;
+        let service = CqrsReceiptService::new(store.clone());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -2875,9 +2885,8 @@ mod tests {
                 .expect("Registration should succeed (idempotent)");
         }
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = context.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
 
         assert_eq!(
             receipts.len(),
@@ -2888,9 +2897,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_minted_receipt_stores_receipt_info() {
-        let store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        let service = CqrsReceiptService::new(store.clone(), cqrs);
+        let store = setup_store().await;
+        let service = CqrsReceiptService::new(store.clone());
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let tx_hash = b256!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2912,9 +2920,8 @@ mod tests {
             .await
             .expect("Registration should succeed");
 
-        let mut context =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = context.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].receipt_info,

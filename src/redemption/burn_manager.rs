@@ -1365,7 +1365,7 @@ mod tests {
         AggregateContext, EventStore,
         persist::{GenericQuery, PersistedEventStore},
     };
-    use event_sorcery::{Store, StoreBuilder};
+    use event_sorcery::{Store, StoreBuilder, test_store};
     use fireblocks_sdk::models::TransactionStatus;
     use rust_decimal::Decimal;
     use sqlite_es::{
@@ -1476,7 +1476,7 @@ mod tests {
         cqrs: Arc<TestCqrs>,
         store: Arc<TestStore>,
         receipt_service: Arc<dyn ReceiptService>,
-        receipt_inventory_cqrs: Arc<SqliteCqrs<ReceiptInventory>>,
+        receipt_inventory_store: Arc<Store<ReceiptInventory>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
         asset_store: Arc<Store<TokenizedAsset>>,
     }
@@ -1520,11 +1520,8 @@ mod tests {
             let repo = SqliteEventRepository::new(pool.clone());
             let store = Arc::new(PersistedEventStore::new_event_store(repo));
 
-            let receipt_inventory_repo =
-                SqliteEventRepository::new(pool.clone());
-            let receipt_inventory_store = Arc::new(
-                PersistedEventStore::new_event_store(receipt_inventory_repo),
-            );
+            let receipt_inventory_store =
+                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
             let (asset_store, _asset_projection) =
                 StoreBuilder::<TokenizedAsset>::new(pool.clone())
@@ -1532,19 +1529,15 @@ mod tests {
                     .await
                     .expect("Failed to build tokenized asset store");
 
-            let receipt_inventory_cqrs =
-                Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-
             let receipt_service = Arc::new(CqrsReceiptService::new(
-                receipt_inventory_store,
-                receipt_inventory_cqrs.clone(),
+                receipt_inventory_store.clone(),
             ));
 
             Self {
                 cqrs,
                 store,
                 receipt_service,
-                receipt_inventory_cqrs,
+                receipt_inventory_store,
                 pool,
                 asset_store,
             }
@@ -1575,9 +1568,9 @@ mod tests {
             receipt_id: U256,
             balance: U256,
         ) {
-            self.receipt_inventory_cqrs
-                .execute(
-                    &vault.to_string(),
+            self.receipt_inventory_store
+                .send(
+                    &vault,
                     ReceiptInventoryCommand::DiscoverReceipt {
                         receipt_id: ReceiptId::from(receipt_id),
                         balance: Shares::from(balance),
@@ -2086,7 +2079,7 @@ mod tests {
             cqrs,
             store,
             receipt_service,
-            receipt_inventory_cqrs,
+            receipt_inventory_store,
             pool,
             ..
         } = &harness;
@@ -2115,9 +2108,9 @@ mod tests {
             None,
         );
 
-        receipt_inventory_cqrs
-            .execute(
-                &vault.to_string(),
+        receipt_inventory_store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(99_U256)),
                     balance: Shares::from(
@@ -2176,7 +2169,7 @@ mod tests {
             cqrs,
             store,
             receipt_service,
-            receipt_inventory_cqrs,
+            receipt_inventory_store,
             pool,
             ..
         } = &harness;
@@ -2207,9 +2200,9 @@ mod tests {
 
         let raw_bytes = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
 
-        receipt_inventory_cqrs
-            .execute(
-                &vault.to_string(),
+        receipt_inventory_store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(99_U256)),
                     balance: Shares::from(
@@ -3797,9 +3790,9 @@ mod tests {
         shares: U256,
     ) {
         harness
-            .receipt_inventory_cqrs
-            .execute(
-                &vault.to_string(),
+            .receipt_inventory_store
+            .send(
+                &vault,
                 ReceiptInventoryCommand::ReserveBurn {
                     redemption_issuer_request_id: redemption.clone(),
                     burns: vec![crate::redemption::BurnRecord {
