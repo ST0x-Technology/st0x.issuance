@@ -1,14 +1,10 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use event_sorcery::{Store, StoreBuilder};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use sqlite_es::{
-    SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
-};
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
@@ -27,18 +23,17 @@ use crate::mint::{
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
 use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
-    CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
-    burn_tracking::replay_receipt_burns_view,
+    CqrsReceiptService, ItnReceiptHandler, ReceiptInventory,
+    burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
 use crate::redemption::{
-    Redemption, RedemptionView,
+    Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     poller::{TransferPoller, TransferPollerConfig},
     redeem_call_manager::RedeemCallManager,
-    replay_redemption_view,
-    upcaster::create_tokens_burned_upcaster,
+    view::{RedemptionViewReactor, rebuild_redemption_view},
 };
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetView, view::list_enabled_assets,
@@ -58,7 +53,6 @@ pub(crate) mod config;
 pub(crate) mod fireblocks;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
-pub(crate) mod replay;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
 
@@ -71,23 +65,15 @@ pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
 
-pub(crate) type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
-pub(crate) type RedemptionEventStore =
-    Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
-
-pub(crate) type SqliteEventStore<A> =
-    PersistedEventStore<SqliteEventRepository, A>;
-
 struct AggregateCqrsSetup {
     mint_store: Arc<Store<Mint>>,
-    redemption_cqrs: RedemptionCqrs,
-    redemption_event_store: RedemptionEventStore,
+    redemption_store: Arc<Store<Redemption>>,
 }
 
 struct RedemptionManagers {
-    redeem_call: Arc<RedeemCallManager<SqliteEventStore<Redemption>>>,
-    journal: Arc<JournalManager<SqliteEventStore<Redemption>>>,
-    burn: Arc<BurnManager<SqliteEventStore<Redemption>>>,
+    redeem_call: Arc<RedeemCallManager>,
+    journal: Arc<JournalManager>,
+    burn: Arc<BurnManager>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,24 +238,20 @@ pub async fn initialize_rocket(
 
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
 
-    let AggregateCqrsSetup {
-        mint_store,
-        redemption_cqrs,
-        redemption_event_store,
-    } = setup_aggregate_cqrs(
-        &pool,
-        &receipt_inventory_store,
-        blockchain_setup.vault_service.clone(),
-        alpaca_service.clone(),
-        bot_wallet,
-    )
-    .await?;
+    let AggregateCqrsSetup { mint_store, redemption_store } =
+        setup_aggregate_cqrs(
+            &pool,
+            &receipt_inventory_store,
+            blockchain_setup.vault_service.clone(),
+            alpaca_service.clone(),
+            bot_wallet,
+        )
+        .await?;
 
     let managers = setup_redemption_managers(
         &config,
         blockchain_setup.vault_service,
-        &redemption_cqrs,
-        &redemption_event_store,
+        &redemption_store,
         &receipt_inventory_store,
         &pool,
         bot_wallet,
@@ -280,8 +262,8 @@ pub async fn initialize_rocket(
     // stale/corrupt data, then rebuilds from the event store.
     debug!(target: "startup", "Rebuilding all views from events");
     rebuild_receipt_inventory_view(&pool).await?;
-    replay_redemption_view(pool.clone()).await?;
-    replay_receipt_burns_view(pool.clone()).await?;
+    rebuild_redemption_view(&pool).await?;
+    rebuild_receipt_burns_view(&pool).await?;
 
     // Receipt backfill must run before recovery so that recovery can check
     // receipt inventory to detect already-minted receipts (prevents double-mints).
@@ -353,8 +335,7 @@ pub async fn initialize_rocket(
             bot_wallet,
             vaults,
             backfill_start_block: config.backfill_start_block,
-            cqrs: redemption_cqrs.clone(),
-            event_store: redemption_event_store.clone(),
+            store: redemption_store.clone(),
             pool: pool.clone(),
             redeem_call_manager: managers.redeem_call.clone(),
             journal_manager: managers.journal.clone(),
@@ -373,8 +354,7 @@ pub async fn initialize_rocket(
         account_store,
         tokenized_asset_store,
         mint_store,
-        redemption_cqrs,
-        redemption_event_store,
+        redemption_store,
         alpaca_service,
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
@@ -389,8 +369,7 @@ struct RocketState {
     account_store: Arc<Store<Account>>,
     tokenized_asset_store: Arc<Store<TokenizedAsset>>,
     mint_store: Arc<Store<Mint>>,
-    redemption_cqrs: RedemptionCqrs,
-    redemption_event_store: RedemptionEventStore,
+    redemption_store: Arc<Store<Redemption>>,
     alpaca_service: Arc<dyn AlpacaService>,
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
     vault_service: Arc<dyn vault::VaultService>,
@@ -412,8 +391,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.account_store)
         .manage(state.tokenized_asset_store)
         .manage(state.mint_store)
-        .manage(state.redemption_cqrs)
-        .manage(state.redemption_event_store)
+        .manage(state.redemption_store)
         .manage(state.alpaca_service)
         .manage(state.burn_recovery)
         .manage(state.vault_service)
@@ -475,47 +453,25 @@ async fn setup_aggregate_cqrs(
     // reads. Preserves the prior `replay_mint_view` startup behavior.
     mint_projection.rebuild_all().await?;
 
-    let redemption_view_repo =
-        Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-            pool.clone(),
-            "redemption_view".to_string(),
-        ));
-    let redemption_query = GenericQuery::new(redemption_view_repo);
+    // Redemption has no canonical Table projection (`Materialized = Nil`). Its two
+    // read models are each maintained by a reactor on the Redemption event stream:
+    // `redemption_view` (an enriched projection distinguishing BurnFailed from
+    // Failed and tracking re-entry timestamps the aggregate state discards) and
+    // `receipt_burns_view` (burns keyed by redemption aggregate_id, joined with
+    // receipt_inventory_view at query time to compute available balance).
+    let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
+        .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
+        .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
+        .build(vault_service)
+        .await?;
 
-    // ReceiptBurnsView tracks burns keyed by redemption aggregate_id.
-    // Use GenericQuery since aggregate_id = view_id is correct for this view.
-    // Available balance is computed at query time by joining with receipt_inventory_view.
-    let receipt_burns_repo =
-        Arc::new(SqliteViewRepository::<ReceiptBurnsView, Redemption>::new(
-            pool.clone(),
-            "receipt_burns_view".to_string(),
-        ));
-    let receipt_burns_query = GenericQuery::new(receipt_burns_repo);
-
-    let redemption_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(redemption_query), Box::new(receipt_burns_query)],
-        vault_service,
-    ));
-    let redemption_event_store = Arc::new(
-        PersistedEventStore::new_event_store(SqliteEventRepository::new(
-            pool.clone(),
-        ))
-        .with_upcasters(vec![create_tokens_burned_upcaster()]),
-    );
-
-    Ok(AggregateCqrsSetup {
-        mint_store,
-        redemption_cqrs,
-        redemption_event_store,
-    })
+    Ok(AggregateCqrsSetup { mint_store, redemption_store })
 }
 
 fn setup_redemption_managers(
     config: &Config,
     blockchain_service: Arc<dyn vault::VaultService>,
-    redemption_cqrs: &RedemptionCqrs,
-    redemption_event_store: &RedemptionEventStore,
+    redemption_store: &Arc<Store<Redemption>>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
@@ -523,14 +479,12 @@ fn setup_redemption_managers(
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
-        redemption_cqrs.clone(),
-        redemption_event_store.clone(),
+        redemption_store.clone(),
         pool.clone(),
     ));
     let journal = Arc::new(JournalManager::new(
         alpaca_service,
-        redemption_cqrs.clone(),
-        redemption_event_store.clone(),
+        redemption_store.clone(),
         pool.clone(),
     ));
 
@@ -540,8 +494,7 @@ fn setup_redemption_managers(
     let burn = Arc::new(BurnManager::new(
         blockchain_service,
         pool.clone(),
-        redemption_cqrs.clone(),
-        redemption_event_store.clone(),
+        redemption_store.clone(),
         receipt_service,
         bot_wallet,
     ));
@@ -593,13 +546,9 @@ async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_store: &Arc<Store<Mint>>) {
 }
 
 async fn run_redemption_recovery(
-    redeem_call: &RedeemCallManager<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    journal: &JournalManager<
-        PersistedEventStore<SqliteEventRepository, Redemption>,
-    >,
-    burn: &BurnManager<PersistedEventStore<SqliteEventRepository, Redemption>>,
+    redeem_call: &RedeemCallManager,
+    journal: &JournalManager,
+    burn: &BurnManager,
     vaults: &[Address],
 ) {
     info!(target: "redemption", "Running redemption recovery");

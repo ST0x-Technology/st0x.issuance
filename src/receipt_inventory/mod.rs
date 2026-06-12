@@ -24,7 +24,7 @@ use backfill::BackfillError;
 pub(crate) use backfill::ItnReceiptHandler;
 use burn_tracking::plan_burn;
 pub(crate) use burn_tracking::{
-    BurnPlan, BurnTrackingError, ReceiptBurnsView, ReceiptWithBalance,
+    BurnPlan, BurnTrackingError, ReceiptWithBalance,
 };
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};

@@ -19,6 +19,86 @@ pub(crate) struct BurnRecord {
     pub(crate) shares_burned: U256,
 }
 
+/// Payload of [`RedemptionEvent::TokensBurned`].
+///
+/// Wrapped in a newtype variant so its `Deserialize` can transparently accept
+/// the legacy v1.0 on-disk shape — a single top-level `receipt_id` +
+/// `shares_burned` — and normalize it into the v2.0 `burns` array. event-sorcery
+/// has no upcaster layer (unlike the cqrs-es `SemanticVersionEventUpcaster` this
+/// replaces), so the transformation that ran at load time is now performed during
+/// deserialization, leaving the stored events byte-for-byte unchanged. See
+/// [`TokensBurnedDataWire`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(try_from = "TokensBurnedDataWire")]
+pub(crate) struct TokensBurnedData {
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    pub(crate) tx_hash: B256,
+    /// All receipt burns performed in this transaction (v2.0 multi-burn shape).
+    pub(crate) burns: Vec<BurnRecord>,
+    /// Amount of dust returned to user (with 18 decimals). Dust recipient is
+    /// always `metadata.wallet` from the `Detected` event. Defaults to zero for
+    /// events prior to the dust handling feature.
+    pub(crate) dust_returned: U256,
+    pub(crate) gas_used: u64,
+    pub(crate) block_number: u64,
+    pub(crate) burned_at: DateTime<Utc>,
+}
+
+/// Wire shape for [`TokensBurnedData`] accepting both the v2.0 `burns` array and
+/// the legacy v1.0 flat `receipt_id`/`shares_burned` pair. `TryFrom` reconstructs
+/// the single-element `burns` array from the legacy fields when `burns` is absent.
+#[derive(Deserialize)]
+struct TokensBurnedDataWire {
+    issuer_request_id: IssuerRedemptionRequestId,
+    tx_hash: B256,
+    #[serde(default)]
+    burns: Vec<BurnRecord>,
+    #[serde(default)]
+    receipt_id: Option<U256>,
+    #[serde(default)]
+    shares_burned: Option<U256>,
+    #[serde(default)]
+    dust_returned: U256,
+    gas_used: u64,
+    block_number: u64,
+    burned_at: DateTime<Utc>,
+}
+
+impl TryFrom<TokensBurnedDataWire> for TokensBurnedData {
+    type Error = LegacyTokensBurnedError;
+
+    fn try_from(wire: TokensBurnedDataWire) -> Result<Self, Self::Error> {
+        let burns = match (
+            wire.burns.is_empty(),
+            wire.receipt_id,
+            wire.shares_burned,
+        ) {
+            (false, _, _) => wire.burns,
+            (true, Some(receipt_id), Some(shares_burned)) => {
+                vec![BurnRecord { receipt_id, shares_burned }]
+            }
+            (true, _, _) => return Err(LegacyTokensBurnedError),
+        };
+
+        Ok(Self {
+            issuer_request_id: wire.issuer_request_id,
+            tx_hash: wire.tx_hash,
+            burns,
+            dust_returned: wire.dust_returned,
+            gas_used: wire.gas_used,
+            block_number: wire.block_number,
+            burned_at: wire.burned_at,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "TokensBurned event carries neither a `burns` array nor legacy \
+     `receipt_id`/`shares_burned` fields"
+)]
+pub(crate) struct LegacyTokensBurnedError;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum RedemptionEvent {
     Detected {
@@ -58,22 +138,7 @@ pub(crate) enum RedemptionEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
-    TokensBurned {
-        issuer_request_id: IssuerRedemptionRequestId,
-        tx_hash: B256,
-        /// All receipt burns performed in this transaction.
-        /// v2.0 format: multiple burns in a single atomic transaction.
-        /// v1.0 events are upcasted to this format via SemanticVersionEventUpcaster.
-        burns: Vec<BurnRecord>,
-        /// Amount of dust returned to user (with 18 decimals).
-        /// Dust recipient is always `metadata.wallet` from the `Detected` event.
-        /// For events prior to dust handling feature: defaults to zero.
-        #[serde(default)]
-        dust_returned: U256,
-        gas_used: u64,
-        block_number: u64,
-        burned_at: DateTime<Utc>,
-    },
+    TokensBurned(TokensBurnedData),
     BurningFailed {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
@@ -187,7 +252,7 @@ impl DomainEvent for RedemptionEvent {
             Self::RedemptionFailed { .. } => {
                 "RedemptionEvent::RedemptionFailed".to_string()
             }
-            Self::TokensBurned { .. } => {
+            Self::TokensBurned(_) => {
                 "RedemptionEvent::TokensBurned".to_string()
             }
             Self::BurningFailed { .. } => {
@@ -216,7 +281,7 @@ impl DomainEvent for RedemptionEvent {
 
     fn event_version(&self) -> String {
         match self {
-            Self::TokensBurned { .. } => "2.0".to_string(),
+            Self::TokensBurned(_) => "2.0".to_string(),
             _ => "1.0".to_string(),
         }
     }
@@ -250,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_tokens_burned_event_type() {
-        let event = RedemptionEvent::TokensBurned {
+        let event = RedemptionEvent::TokensBurned(TokensBurnedData {
             issuer_request_id: test_redemption_id(),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -263,7 +328,7 @@ mod tests {
             gas_used: 50000,
             block_number: 1000,
             burned_at: Utc::now(),
-        };
+        });
 
         assert_eq!(event.event_type(), "RedemptionEvent::TokensBurned");
         assert_eq!(event.event_version(), "2.0");
@@ -287,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_tokens_burned_serialization() {
-        let event = RedemptionEvent::TokensBurned {
+        let event = RedemptionEvent::TokensBurned(TokensBurnedData {
             issuer_request_id: test_redemption_id(),
             tx_hash: b256!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -300,7 +365,7 @@ mod tests {
             gas_used: 75000,
             block_number: 2000,
             burned_at: Utc::now(),
-        };
+        });
 
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: RedemptionEvent =
@@ -410,7 +475,11 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::TokensBurned { dust_returned, burns, .. } = event
+        let RedemptionEvent::TokensBurned(TokensBurnedData {
+            dust_returned,
+            burns,
+            ..
+        }) = event
         else {
             panic!("Expected TokensBurned variant");
         };
@@ -418,6 +487,46 @@ mod tests {
         assert_eq!(dust_returned, U256::ZERO);
         assert_eq!(burns.len(), 1);
         assert_eq!(burns[0].receipt_id, uint!(0x42_U256));
+    }
+
+    /// Tests that a legacy v1.0 `TokensBurned` event — a flat top-level
+    /// `receipt_id` + `shares_burned` with no `burns` array — deserializes into
+    /// a single-element `burns` array. This verifies the tolerant
+    /// `TryFrom<TokensBurnedDataWire>` that replaces the cqrs-es upcaster.
+    #[test]
+    fn test_backwards_compat_tokens_burned_v1_flat_receipt() {
+        let json = r#"{
+            "TokensBurned": {
+                "issuer_request_id": "red-abcdef12",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "receipt_id": "0x42",
+                "shares_burned": "0x56bc75e2d63100000",
+                "gas_used": 50000,
+                "block_number": 1000,
+                "burned_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::TokensBurned(TokensBurnedData {
+            burns,
+            dust_returned,
+            ..
+        }) = event
+        else {
+            panic!("Expected TokensBurned variant");
+        };
+
+        assert_eq!(burns.len(), 1);
+        assert_eq!(
+            burns[0],
+            BurnRecord {
+                receipt_id: uint!(0x42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }
+        );
+        assert_eq!(dust_returned, U256::ZERO);
     }
 
     /// Tests that old BurnResumed events without external_tx_id default to None.
