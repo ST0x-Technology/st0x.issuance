@@ -10,7 +10,8 @@ use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use api::{
-    add_tokenized_asset, get_tokenized_asset, list_tokenized_assets,
+    add_tokenized_asset, get_tokenized_asset, get_tokenized_asset_status,
+    list_tokenized_assets,
 };
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;

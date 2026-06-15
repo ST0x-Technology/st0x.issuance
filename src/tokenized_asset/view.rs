@@ -11,6 +11,10 @@ pub(crate) enum TokenizedAssetViewError {
     Database(#[from] sqlx::Error),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
+    #[error(
+        "tokenized asset {underlying} has a non-live (null `$.Live`) projection row"
+    )]
+    NonLiveRow { underlying: UnderlyingSymbol },
 }
 
 /// Read model for a tokenized asset, projected from the
@@ -19,8 +23,9 @@ pub(crate) enum TokenizedAssetViewError {
 /// `tokenized_asset_view` stores the event-sorcery
 /// `Lifecycle<TokenizedAsset>` payload (`{"Live": {...}}`). The query helpers
 /// extract the `$.Live` sub-object, which mirrors this struct field-for-field,
-/// so it deserializes straight into `TokenizedAssetView`. Non-live rows have a
-/// NULL `$.Live` and are treated as "not found".
+/// so it deserializes straight into `TokenizedAssetView`. A non-live row has a
+/// NULL `$.Live` and is surfaced as a `NonLiveRow` error (known but
+/// indeterminate), distinct from an absent row ("not found").
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TokenizedAssetView {
     pub(crate) underlying: UnderlyingSymbol,
@@ -59,8 +64,11 @@ pub(crate) async fn list_enabled_assets(
 
 /// Loads the full tokenized asset view for a given underlying symbol.
 ///
-/// Returns `Ok(Some(view))` if the asset exists, `Ok(None)` if not found,
-/// or an error on database failure.
+/// Returns `Ok(Some(view))` for a live asset, `Ok(None)` if no row exists
+/// (unknown asset), or an error — including
+/// [`TokenizedAssetViewError::NonLiveRow`] when a row exists but its `$.Live`
+/// is null (a non-live or corrupt projection: known but indeterminate, not
+/// "unknown").
 pub(crate) async fn load_asset_by_underlying(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
@@ -76,8 +84,19 @@ pub(crate) async fn load_asset_by_underlying(
     .fetch_optional(pool)
     .await?;
 
-    let Some(live) = row.and_then(|row| row.live) else {
+    let Some(row) = row else {
         return Ok(None);
+    };
+
+    // A row whose `$.Live` is NULL is a non-live lifecycle state (e.g. a
+    // `Failed` lifecycle) or a corrupt projection: the asset is *known* but its
+    // state is indeterminate, which is distinct from an unknown asset. Surface
+    // it as an error so the status endpoint returns 500 ("indeterminate,
+    // retry") rather than 404 ("unknown"). See SPEC.md's status-code semantics.
+    let Some(live) = row.live else {
+        return Err(TokenizedAssetViewError::NonLiveRow {
+            underlying: underlying.clone(),
+        });
     };
 
     let view: TokenizedAssetView = serde_json::from_str(&live)?;
@@ -87,10 +106,15 @@ pub(crate) async fn load_asset_by_underlying(
 
 /// Finds the vault address for a given underlying symbol.
 ///
-/// Returns `Ok(Some(vault))` if a supported asset with that underlying exists
+/// Delegates to [`load_asset_by_underlying`] and so inherits its contract:
+/// `Ok(Some(vault))` if a supported asset with that underlying exists
 /// (including a frozen one — in-flight redemptions and mints of a frozen asset
-/// must still resolve their vault), `Ok(None)` if not found, or an error on
-/// database failure.
+/// must still resolve their vault), `Ok(None)` only when no row exists (unknown
+/// asset), or an error on database/deserialization failure — including
+/// [`TokenizedAssetViewError::NonLiveRow`] when a row exists but its `$.Live`
+/// is null (known but indeterminate, not "not found"). Callers in the mint and
+/// redemption flows therefore see a propagated error, not `Ok(None)`, for a
+/// non-live row.
 pub(crate) async fn find_vault_by_underlying(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
@@ -430,6 +454,68 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             TokenizedAssetViewError::Deserialization(_)
+        ));
+    }
+
+    // A row whose `$.Live` is null is a non-live lifecycle state (known but
+    // indeterminate), distinct from an absent row. The helper must surface it
+    // as `NonLiveRow` rather than collapsing it into `Ok(None)`, so the status
+    // endpoint can return 500 ("indeterminate, retry") instead of 404. Only
+    // reachable via external DB manipulation — the projection always writes a
+    // live `$.Live` payload.
+    #[tokio::test]
+    async fn test_load_asset_by_underlying_errors_on_non_live_row() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{\"Live\": null}')
+            ",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let result =
+            load_asset_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            TokenizedAssetViewError::NonLiveRow { underlying }
+                if underlying.0 == "AAPL"
+        ));
+    }
+
+    // `find_vault_by_underlying` delegates to `load_asset_by_underlying`, so a
+    // non-live row must propagate as `NonLiveRow` rather than collapsing to
+    // `Ok(None)` — the mint/redemption vault-lookup callers see an error, not
+    // "asset not found", for a known-but-indeterminate row.
+    #[tokio::test]
+    async fn test_find_vault_by_underlying_errors_on_non_live_row() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{\"Live\": null}')
+            ",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let result =
+            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+                .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            TokenizedAssetViewError::NonLiveRow { underlying }
+                if underlying.0 == "AAPL"
         ));
     }
 
