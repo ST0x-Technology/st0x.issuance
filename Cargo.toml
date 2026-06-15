@@ -4,17 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git" }
-sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git" }
-cqrs-es = "0.4.12"
+event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.1" }
+sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.1" }
+cqrs-es = "0.5.0"
 async-trait = "0.1.89"
 rocket = { version = "0.5.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-sqlx = { version = "0.8.6", features = [
+serde_json = "1.0.150"
+sqlx = { version = "0.9.0", features = [
   "sqlite",
   "chrono",
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls",
   "macros",
   "migrate",
 ] }
@@ -55,7 +56,7 @@ flate2 = "1.1.9"
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"
 alloy-sol-types = "1.4.1"
-event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", features = [
+event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.1", features = [
   "test-support",
 ] }
 httpmock = "0.8.2"

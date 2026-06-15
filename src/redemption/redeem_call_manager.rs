@@ -110,7 +110,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), RedeemCallManagerError> {
-        let aggregate_ctx = self
+        let mut aggregate_ctx = self
             .event_store
             .load_aggregate(&issuer_request_id.to_string())
             .await?;
@@ -576,7 +576,7 @@ mod tests {
         store: &TestStore,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
-        let context =
+        let mut context =
             store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
         context.aggregate().clone()
     }
@@ -853,7 +853,7 @@ mod tests {
             "Should call Alpaca once for the detected redemption"
         );
 
-        let context = harness
+        let mut context = harness
             .redemption_store
             .load_aggregate(&issuer_request_id.to_string())
             .await
@@ -917,7 +917,7 @@ mod tests {
         // No account registered for this wallet — recovery should auto-fail
         manager.recover_detected_redemptions().await;
 
-        let context = harness
+        let mut context = harness
             .redemption_store
             .load_aggregate(&issuer_request_id.to_string())
             .await

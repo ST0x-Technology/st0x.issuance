@@ -70,7 +70,7 @@ where
         &self,
         event_store: &ReceiptInventoryStore,
     ) -> Result<ReconcileResult, ReconcileError> {
-        let aggregate_context =
+        let mut aggregate_context =
             event_store.load_aggregate(&self.vault.to_string()).await?;
 
         let receipts: Vec<_> = aggregate_context
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(result.mismatches, 1, "Should have detected 1 mismatch");
 
         // Verify the aggregate was updated — receipt should be depleted
-        let context =
+        let mut context =
             store.load_aggregate(&evm.vault_address.to_string()).await.unwrap();
         let receipts = context.aggregate().receipts_with_balance();
         assert!(
