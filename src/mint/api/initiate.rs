@@ -104,6 +104,7 @@ mod tests {
     use rocket::routes;
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use tracing_test::traced_test;
 
     use super::initiate_mint;
     use crate::account::{AccountCommand, AlpacaAccountNumber, Email};
@@ -117,6 +118,7 @@ mod tests {
         Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
         view::find_by_issuer_request_id,
     };
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::TokenizedAssetCommand;
 
     #[tokio::test]
@@ -216,6 +218,200 @@ mod tests {
         )
         .expect("valid JSON response");
 
+        assert!(!mint_response.issuer_request_id.to_string().is_empty());
+        assert_eq!(mint_response.status, "created");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_initiate_mint_rejects_frozen_asset() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+        } = harness;
+
+        tokenized_asset_store
+            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool.clone())
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.0,
+            "token_symbol": token.0,
+            "network": network.0,
+            "client_id": client_id,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+
+        let error_response: ErrorResponse = serde_json::from_str(
+            &response.into_string().await.expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        assert_eq!(
+            error_response.error,
+            "Asset Frozen: Minting is suspended for this asset"
+        );
+
+        // The rejection must happen before any mint command is dispatched, so no
+        // Mint events are persisted for a frozen-asset request.
+        let mint_event_count = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) as "count!: i64"
+            FROM events
+            WHERE aggregate_type = 'Mint'
+            "#
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to count mint events");
+
+        assert_eq!(
+            mint_event_count, 0,
+            "frozen-asset request must not create mint events"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Rejecting mint for frozen asset"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_initiate_mint_accepts_unfrozen_asset() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset {
+            client_id, underlying, token, network, ..
+        } = harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+        } = harness;
+
+        // Keep an Arc handle so we can dispatch Unfreeze after Rocket takes
+        // ownership of the managed store.
+        let asset_store = tokenized_asset_store.clone();
+
+        asset_store
+            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.0,
+            "token_symbol": token.0,
+            "network": network.0,
+            "client_id": client_id,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let frozen_response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(frozen_response.status(), Status::BadRequest);
+
+        // Asserted here, before the Unfreeze, so the WARN can only come from the
+        // frozen request — confirming the rejection fired for the freeze reason
+        // rather than some unrelated validation failure.
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Rejecting mint for frozen asset"]
+        ));
+
+        // Unfreezing must let new mints through again — the whole point of the
+        // toggle is that issuance resumes after Unfreeze.
+        asset_store
+            .send(&underlying, TokenizedAssetCommand::Unfreeze)
+            .await
+            .expect("Failed to unfreeze asset");
+
+        let unfrozen_response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(unfrozen_response.status(), Status::Ok);
+
+        let mint_response: MintResponse = serde_json::from_str(
+            &unfrozen_response
+                .into_string()
+                .await
+                .expect("valid response body"),
+        )
+        .expect("valid JSON response");
+
+        // The 200 + "created" + non-empty issuer_request_id below is the
+        // unfrozen-path assertion: a frozen or rejected request never reaches a
+        // "created" mint response, so issuance demonstrably resumed.
         assert!(!mint_response.issuer_request_id.to_string().is_empty());
         assert_eq!(mint_response.status, "created");
     }

@@ -48,14 +48,14 @@ pub(crate) async fn get_tokenized_asset(
             token,
             network,
             vault,
-            enabled,
+            status,
             ..
         }) => Ok(Json(TokenizedAssetDetailResponse {
             underlying,
             token,
             network,
             vault,
-            enabled,
+            enabled: status.is_listed(),
         })),
         None => Err(Status::NotFound),
     }

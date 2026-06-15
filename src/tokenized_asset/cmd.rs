@@ -11,4 +11,6 @@ pub(crate) enum TokenizedAssetCommand {
         network: Network,
         vault: Address,
     },
+    Freeze,
+    Unfreeze,
 }

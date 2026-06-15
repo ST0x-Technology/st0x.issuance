@@ -318,7 +318,7 @@ async fn find_matching_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address, b256};
-    use event_sorcery::{Store, test_store};
+    use event_sorcery::{Store, StoreBuilder, test_store};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
@@ -329,6 +329,9 @@ mod tests {
         create_transfer_log, setup_test_db_with_asset,
     };
     use crate::test_utils::logs_contain_at;
+    use crate::tokenized_asset::{
+        TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+    };
     use crate::vault::mock::MockVaultService;
 
     fn setup_test_store(pool: &SqlitePool) -> Arc<Store<Redemption>> {
@@ -371,6 +374,61 @@ mod tests {
             assert!(
                 matches!(redemption, Redemption::Detected { .. }),
                 "Expected Detected state, got {redemption:?}"
+            );
+        }
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Redemption transfer detected"]
+        ));
+    }
+
+    // Freezing an asset gates new mints but must NOT stop redemption detection:
+    // in-flight redemptions of a frozen asset still need to detect and complete.
+    #[traced_test]
+    #[tokio::test]
+    async fn detect_transfer_succeeds_for_frozen_asset() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+
+        let (asset_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        asset_store
+            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let store = setup_test_store(&pool);
+
+        let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        let log = create_transfer_log(
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
+        );
+
+        let result = detect_transfer(&log, vault, &store, &pool).await;
+
+        let outcome = result.expect("Expected success");
+        assert!(
+            matches!(outcome, TransferOutcome::Detected { .. }),
+            "frozen asset must still detect redemptions, got {outcome:?}"
+        );
+
+        if let TransferOutcome::Detected { issuer_request_id, .. } = outcome {
+            let redemption =
+                store.load(&issuer_request_id).await.unwrap().unwrap();
+            assert!(
+                matches!(redemption, Redemption::Detected { .. }),
+                "frozen asset redemption must persist Detected state, got {redemption:?}"
             );
         }
 

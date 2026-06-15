@@ -12,6 +12,7 @@ use super::{
     UnderlyingSymbol,
 };
 use crate::account::{AccountView, view::find_by_client_id};
+use crate::tokenized_asset::view::load_asset_by_underlying;
 
 mod confirm;
 mod initiate;
@@ -40,6 +41,9 @@ pub(crate) enum MintApiError {
 
     #[error("Asset not available on network")]
     AssetNotAvailable,
+
+    #[error("Asset is frozen; new mints are suspended")]
+    AssetFrozen,
 
     #[error("Client not eligible")]
     ClientNotEligible,
@@ -79,6 +83,9 @@ impl<'r> Responder<'r, 'static> for MintApiError {
             ),
             Self::AssetNotAvailable => MintErrorResponse::bad_request(
                 "Invalid Token: Token not available on the network",
+            ),
+            Self::AssetFrozen => MintErrorResponse::bad_request(
+                "Asset Frozen: Minting is suspended for this asset",
             ),
             Self::ClientNotEligible => MintErrorResponse::bad_request(
                 "Insufficient Eligibility: Client not eligible",
@@ -188,32 +195,32 @@ pub(crate) async fn validate_asset_exists(
     token: &TokenSymbol,
     network: &Network,
 ) -> Result<(), MintApiError> {
-    let underlying_str = &underlying.0;
-    let token_str = &token.0;
-    let network_str = &network.0;
+    let asset = load_asset_by_underlying(pool, underlying)
+        .await
+        .map_err(|query_error| {
+            error!(target: "mint", error = %query_error, "Failed to query asset");
+            MintApiError::AssetQueryFailed(query_error)
+        })?;
 
-    let count = sqlx::query_scalar!(
-        r#"
-        SELECT COUNT(*) as "count: i64"
-        FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Live.underlying') = ?
-            AND json_extract(payload, '$.Live.token') = ?
-            AND json_extract(payload, '$.Live.network') = ?
-            AND json_extract(payload, '$.Live.enabled') = 1
-        "#,
-        underlying_str,
-        token_str,
-        network_str
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(target: "mint", "Failed to query asset: {e}");
-        MintApiError::AssetQueryFailed(e.into())
-    })?;
-
-    if count == 0 {
+    // An asset must exist for this exact (underlying, token, network) tuple. A
+    // frozen asset still exists and stays supported — it is rejected with a
+    // distinct `AssetFrozen` error so the suspension is observable and not
+    // conflated with de-listing.
+    let Some(asset) = asset
+        .filter(|asset| asset.token == *token && asset.network == *network)
+    else {
         return Err(MintApiError::AssetNotAvailable);
+    };
+
+    if asset.status.is_frozen() {
+        warn!(
+            target: "mint",
+            underlying = %underlying.0,
+            token = %token.0,
+            network = %network.0,
+            "Rejecting mint for frozen asset"
+        );
+        return Err(MintApiError::AssetFrozen);
     }
 
     Ok(())

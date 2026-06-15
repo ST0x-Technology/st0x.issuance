@@ -130,11 +130,11 @@ audit trail, enable time-travel debugging, and provide a single source of truth.
 - `sqlx migrate revert` - Revert last migration
 - `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
-- **Fixing "unable to open database file" errors** - If `cargo build` fails with
-  sqlx macro errors like
-  `error returned from database: (code: 14) unable to
-  open database file`, run
-  `sqlx db reset -y` to recreate the database
+- **CRITICAL: For ANY sqlx macro / compile-time DB error, the fix is
+  `sqlx db reset -y` inside `nix develop` — apply it directly, never
+  improvise.** Do NOT probe `DATABASE_URL`, look for a `.sqlx` cache, check for
+  `data.db`, or use an in-memory URL. After editing a migration:
+  `sqlx db reset -y`, then `cargo test`. Run all sqlx/cargo in `nix develop`.
 
 ### Development Tools
 
@@ -519,17 +519,16 @@ Environment variables are defined across the deployment pipeline:
   - **Group 2 - Internal**: our code via `crate::` / `super::`, no blank lines
     between them.
   - **FORBIDDEN**: Three+ groups; blank lines within a group; function-level
-    imports. **Sole exception**: enum variant imports (`use MyEnum::{A, B}`)
-    inside function bodies — never at module level.
+    imports. **Exceptions** (function-body `use` only): (1) enum variant imports
+    (`use MyEnum::{A, B}`) — never at module level; (2) imports used solely
+    inside `#[cfg(...)]`-gated code, where a module-scope import would warn as
+    unused under the inverse config.
   - Module declarations (`mod foo;`) may appear between imports.
     ```rust
     use std::sync::Arc;
-    use alloy::primitives::{Address, B256};
-    use cqrs_es::{CqrsFramework, EventStore};
-    use serde::{Deserialize, Serialize};
+    use alloy::primitives::Address;
 
     use crate::account::ClientId;
-    use crate::mint::TokenizationRequestId;
     use super::{Mint, MintCommand};
     ```
 - **Import Conventions**: Always import types and use them unqualified unless

@@ -19,6 +19,12 @@ pub(crate) enum TokenizedAssetEvent {
         previous_vault: Address,
         updated_at: DateTime<Utc>,
     },
+    Frozen {
+        frozen_at: DateTime<Utc>,
+    },
+    Unfrozen {
+        unfrozen_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for TokenizedAssetEvent {
@@ -27,6 +33,10 @@ impl DomainEvent for TokenizedAssetEvent {
             Self::Added { .. } => "TokenizedAssetEvent::Added".to_string(),
             Self::VaultAddressUpdated { .. } => {
                 "TokenizedAssetEvent::VaultAddressUpdated".to_string()
+            }
+            Self::Frozen { .. } => "TokenizedAssetEvent::Frozen".to_string(),
+            Self::Unfrozen { .. } => {
+                "TokenizedAssetEvent::Unfrozen".to_string()
             }
         }
     }
