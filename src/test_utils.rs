@@ -11,10 +11,8 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use cqrs_es::persist::{GenericQuery, PersistedEventStore};
 use event_sorcery::{Store, StoreBuilder};
 use rocket::routes;
-use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use url::Url;
@@ -29,8 +27,10 @@ use crate::bindings::{
 };
 use crate::config::{Config, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::{Mint, MintServices, MintView};
-use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+use crate::mint::{Mint, MintServices};
+use crate::receipt_inventory::{
+    CqrsReceiptService, ReceiptInventory, view::ReceiptInventoryViewReactor,
+};
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
@@ -116,24 +116,13 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
     };
 
-    // Setup Mint CQRS
-    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-        pool.clone(),
-        "mint_view".to_string(),
-    ));
-
-    let mint_query = GenericQuery::new(mint_view_repo);
-    let mint_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(mint_query)],
-        mint_services,
-    ));
-
-    let mint_event_repo = SqliteEventRepository::new(pool.clone());
-    let mint_event_store = Arc::new(PersistedEventStore::<
-        SqliteEventRepository,
-        Mint,
-    >::new_event_store(mint_event_repo));
+    // Setup Mint store (event-sorcery), mirroring the production wiring: the
+    // reactor keeps receipt_inventory_view in sync with Mint events.
+    let (mint_store, _mint_projection) =
+        StoreBuilder::<Mint>::new(pool.clone())
+            .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
+            .build(mint_services)
+            .await?;
 
     // Seed initial assets
     seed_test_assets(&tokenized_asset_store).await?;
@@ -145,8 +134,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
         .manage(test_config()?)
         .manage(account_store)
         .manage(tokenized_asset_store)
-        .manage(mint_cqrs)
-        .manage(mint_event_store)
+        .manage(mint_store)
         .manage(rate_limiter)
         .manage(pool)
         .mount(

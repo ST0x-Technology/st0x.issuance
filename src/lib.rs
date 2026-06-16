@@ -18,19 +18,18 @@ use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
-    Mint, MintServices, MintView, find_all_recoverable_mints,
+    Mint, MintServices, find_all_recoverable_mints,
     recovery::{
         DriveOutcome, MintRecoveryHandler, recover_mint,
         spawn_scheduled_mint_recovery,
     },
-    replay_mint_view,
 };
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
 use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptBurnsView, ReceiptInventory,
-    ReceiptInventoryView, burn_tracking::replay_receipt_burns_view,
-    replay_receipt_inventory_view,
+    burn_tracking::replay_receipt_burns_view,
+    view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
 use crate::redemption::{
     Redemption, RedemptionView,
@@ -72,10 +71,6 @@ pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
 
-pub(crate) type MintCqrs = Arc<SqliteCqrs<Mint>>;
-pub(crate) type MintEventStore =
-    Arc<PersistedEventStore<SqliteEventRepository, Mint>>;
-
 pub(crate) type RedemptionCqrs = Arc<SqliteCqrs<Redemption>>;
 pub(crate) type RedemptionEventStore =
     Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
@@ -84,14 +79,9 @@ pub(crate) type SqliteEventStore<A> =
     PersistedEventStore<SqliteEventRepository, A>;
 
 struct AggregateCqrsSetup {
-    mint: MintDeps,
+    mint_store: Arc<Store<Mint>>,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
-}
-
-struct MintDeps {
-    cqrs: MintCqrs,
-    event_store: MintEventStore,
 }
 
 struct RedemptionManagers {
@@ -262,14 +252,18 @@ pub async fn initialize_rocket(
 
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
 
-    let AggregateCqrsSetup { mint, redemption_cqrs, redemption_event_store } =
-        setup_aggregate_cqrs(
-            &pool,
-            &receipt_inventory_store,
-            blockchain_setup.vault_service.clone(),
-            alpaca_service.clone(),
-            bot_wallet,
-        );
+    let AggregateCqrsSetup {
+        mint_store,
+        redemption_cqrs,
+        redemption_event_store,
+    } = setup_aggregate_cqrs(
+        &pool,
+        &receipt_inventory_store,
+        blockchain_setup.vault_service.clone(),
+        alpaca_service.clone(),
+        bot_wallet,
+    )
+    .await?;
 
     let managers = setup_redemption_managers(
         &config,
@@ -285,8 +279,7 @@ pub async fn initialize_rocket(
     // up-to-date views. Each replay clears its view table first to remove
     // stale/corrupt data, then rebuilds from the event store.
     debug!(target: "startup", "Rebuilding all views from events");
-    replay_mint_view(pool.clone()).await?;
-    replay_receipt_inventory_view(pool.clone()).await?;
+    rebuild_receipt_inventory_view(&pool).await?;
     replay_redemption_view(pool.clone()).await?;
     replay_receipt_burns_view(pool.clone()).await?;
 
@@ -335,14 +328,7 @@ pub async fn initialize_rocket(
     let vaults: Vec<Address> =
         vault_configs.iter().map(|config| config.vault).collect();
 
-    run_recovery_with_timeout(
-        &pool,
-        &mint.cqrs,
-        &mint.event_store,
-        &managers,
-        &vaults,
-    )
-    .await;
+    run_recovery_with_timeout(&pool, &mint_store, &managers, &vaults).await;
 
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
@@ -352,7 +338,7 @@ pub async fn initialize_rocket(
         bot_wallet,
         backfill_start_block: config.backfill_start_block,
         receipt_poll_interval: config.receipt_poll_interval,
-        handler: MintRecoveryHandler::new(mint.cqrs.clone()),
+        handler: MintRecoveryHandler::new(mint_store.clone()),
     });
 
     {
@@ -386,7 +372,7 @@ pub async fn initialize_rocket(
         pool,
         account_store,
         tokenized_asset_store,
-        mint,
+        mint_store,
         redemption_cqrs,
         redemption_event_store,
         alpaca_service,
@@ -402,7 +388,7 @@ struct RocketState {
     pool: Pool<Sqlite>,
     account_store: Arc<Store<Account>>,
     tokenized_asset_store: Arc<Store<TokenizedAsset>>,
-    mint: MintDeps,
+    mint_store: Arc<Store<Mint>>,
     redemption_cqrs: RedemptionCqrs,
     redemption_event_store: RedemptionEventStore,
     alpaca_service: Arc<dyn AlpacaService>,
@@ -425,8 +411,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.rate_limiter)
         .manage(state.account_store)
         .manage(state.tokenized_asset_store)
-        .manage(state.mint.cqrs)
-        .manage(state.mint.event_store)
+        .manage(state.mint_store)
         .manage(state.redemption_cqrs)
         .manage(state.redemption_event_store)
         .manage(state.alpaca_service)
@@ -457,13 +442,13 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .register("/", catchers::json_catchers())
 }
 
-fn setup_aggregate_cqrs(
+async fn setup_aggregate_cqrs(
     pool: &Pool<Sqlite>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     vault_service: Arc<dyn vault::VaultService>,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
-) -> AggregateCqrsSetup {
+) -> Result<AggregateCqrsSetup, anyhow::Error> {
     // Create MintServices with all dependencies
     let receipt_service =
         Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
@@ -475,28 +460,20 @@ fn setup_aggregate_cqrs(
         receipts: receipt_service,
     };
 
-    let mint_view_repo = Arc::new(SqliteViewRepository::<MintView, Mint>::new(
-        pool.clone(),
-        "mint_view".to_string(),
-    ));
-    let mint_query = GenericQuery::new(mint_view_repo);
+    // Mint's canonical `mint_view` projection is auto-wired by StoreBuilder; the
+    // secondary `receipt_inventory_view` (formerly a View<Mint> GenericQuery) is
+    // maintained by the registered reactor.
+    let (mint_store, mint_projection) = StoreBuilder::<Mint>::new(pool.clone())
+        .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
+        .build(mint_services)
+        .await?;
 
-    let receipt_inventory_mint_repo =
-        Arc::new(SqliteViewRepository::<ReceiptInventoryView, Mint>::new(
-            pool.clone(),
-            "receipt_inventory_view".to_string(),
-        ));
-    let receipt_inventory_mint_query =
-        GenericQuery::new(receipt_inventory_mint_repo);
-
-    let mint_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(mint_query), Box::new(receipt_inventory_mint_query)],
-        mint_services,
-    ));
-    let mint_event_store = Arc::new(PersistedEventStore::new_event_store(
-        SqliteEventRepository::new(pool.clone()),
-    ));
+    // Rebuild `mint_view` from scratch so it reflects the current event log even
+    // when events were rolled back below the existing view version. StoreBuilder's
+    // `catch_up` is incremental — it cannot detect a truncated log (max event
+    // sequence < view version), so it would leave a stale view that recovery
+    // reads. Preserves the prior `replay_mint_view` startup behavior.
+    mint_projection.rebuild_all().await?;
 
     let redemption_view_repo =
         Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
@@ -527,11 +504,11 @@ fn setup_aggregate_cqrs(
         .with_upcasters(vec![create_tokens_burned_upcaster()]),
     );
 
-    AggregateCqrsSetup {
-        mint: MintDeps { cqrs: mint_cqrs, event_store: mint_event_store },
+    Ok(AggregateCqrsSetup {
+        mint_store,
         redemption_cqrs,
         redemption_event_store,
-    }
+    })
 }
 
 fn setup_redemption_managers(
@@ -572,11 +549,7 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
-async fn run_mint_recovery(
-    pool: &Pool<Sqlite>,
-    mint_cqrs: &MintCqrs,
-    mint_event_store: &MintEventStore,
-) {
+async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_store: &Arc<Store<Mint>>) {
     info!(target: "mint", "Running mint recovery");
 
     let recoverable_mints = match find_all_recoverable_mints(pool).await {
@@ -603,13 +576,12 @@ async fn run_mint_recovery(
         // failure — hand the mint to a background scheduled-recovery task so it
         // keeps progressing while the service runs instead of waiting for the
         // next restart.
-        match recover_mint(mint_cqrs, issuer_request_id.clone()).await {
+        match recover_mint(mint_store, issuer_request_id.clone()).await {
             DriveOutcome::RetryNotDue
             | DriveOutcome::Pending
             | DriveOutcome::Failed => {
                 spawn_scheduled_mint_recovery(
-                    mint_cqrs.clone(),
-                    mint_event_store.clone(),
+                    mint_store.clone(),
                     issuer_request_id,
                 );
             }
@@ -660,13 +632,12 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// cancelled to prevent concurrent side effects.
 async fn run_recovery_with_timeout(
     pool: &Pool<Sqlite>,
-    mint_cqrs: &MintCqrs,
-    mint_event_store: &MintEventStore,
+    mint_store: &Arc<Store<Mint>>,
     managers: &RedemptionManagers,
     vaults: &[Address],
 ) {
     let recovery = async {
-        run_mint_recovery(pool, mint_cqrs, mint_event_store).await;
+        run_mint_recovery(pool, mint_store).await;
         run_redemption_recovery(
             &managers.redeem_call,
             &managers.journal,
