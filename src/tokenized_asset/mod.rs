@@ -1,4 +1,5 @@
 mod api;
+pub(crate) mod cli;
 mod cmd;
 mod event;
 pub(crate) mod view;

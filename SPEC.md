@@ -545,6 +545,21 @@ The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
 in M1 and automatically by the dividend scheduler in M3 — the same command path
 either way.
 
+**Issuer CLI.** A dedicated `issuer` binary (separate from the HTTP server
+binary) is the M1 manual freeze trigger. It runs on the issuer host (over SSH)
+against the local SQLite store, and is where future issuer actions (e.g. `mint`,
+`donate`) will live as additional subcommands:
+
+- `issuer freeze <UNDERLYING>` — dispatch the `Freeze` command.
+- `issuer unfreeze <UNDERLYING>` — dispatch the `Unfreeze` command.
+- `issuer status <UNDERLYING>` — print the asset's current freeze status.
+
+Each subcommand opens the same event store, prints the resolved asset and its
+current status, requires confirmation before a mutating action, and dispatches
+the CQRS command through the `Store` (never writing the `events` table
+directly); freeze/unfreeze are idempotent. Per RAI-586 the trigger is a local
+action on the issuer host, not a remotely pushable endpoint.
+
 ## Services
 
 Aggregates use services to interact with external systems while keeping business

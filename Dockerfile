@@ -18,8 +18,9 @@ RUN nix develop --command echo "Nix dev env ready"
 
 COPY Cargo.toml Cargo.lock ./
 
-RUN mkdir -p src && \
+RUN mkdir -p src/bin && \
     echo 'fn main() {}' > src/main.rs && \
+    echo 'fn main() {}' > src/bin/issuer.rs && \
     touch src/lib.rs
 
 RUN nix develop --command cargo chef prepare --recipe-path recipe.json
@@ -58,6 +59,7 @@ RUN nix develop --command bash -c ' \
 
 RUN apt-get update && apt-get install -y --no-install-recommends patchelf && \
     patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 /app/target/${BUILD_PROFILE}/st0x-issuance && \
+    patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 /app/target/${BUILD_PROFILE}/issuer && \
     apt-get remove -y patchelf && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 FROM debian:trixie-slim
@@ -72,4 +74,5 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY --from=builder /app/target/${BUILD_PROFILE}/st0x-issuance ./server
+COPY --from=builder /app/target/${BUILD_PROFILE}/issuer ./issuer
 COPY --from=builder /app/migrations ./migrations

@@ -2,6 +2,7 @@
 name = "st0x-issuance"
 version = "0.1.0"
 edition = "2024"
+default-run = "st0x-issuance"
 
 [dependencies]
 event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
