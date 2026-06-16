@@ -5518,6 +5518,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-issuance-client"
+version = "0.1.0"
+dependencies = [
+ "httpmock",
+ "reqwest",
+ "serde_json",
+ "st0x-issuance-dto",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "st0x-issuance-dto"
 version = "0.1.0"
 dependencies = [

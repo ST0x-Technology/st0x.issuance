@@ -17,16 +17,17 @@ COPY flake.nix flake.lock ./
 RUN nix develop --command echo "Nix dev env ready"
 
 COPY Cargo.toml Cargo.lock ./
-# Workspace members must exist at metadata-resolution time, so the dto member's
+# Workspace members must exist at metadata-resolution time, so each member's
 # manifest and a stub source tree have to be present before `cargo chef prepare`
 # (cook reconstructs the skeleton from recipe.json afterwards).
 COPY crates/dto/Cargo.toml crates/dto/Cargo.toml
+COPY crates/client/Cargo.toml crates/client/Cargo.toml
 
-RUN mkdir -p src/bin crates/dto/src && \
+RUN mkdir -p src/bin crates/dto/src crates/client/src && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'fn main() {}' > src/bin/issuer.rs && \
     echo 'fn main() {}' > crates/dto/src/main.rs && \
-    touch src/lib.rs crates/dto/src/lib.rs
+    touch src/lib.rs crates/dto/src/lib.rs crates/client/src/lib.rs
 
 RUN nix develop --command cargo chef prepare --recipe-path recipe.json
 

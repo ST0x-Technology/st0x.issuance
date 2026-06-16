@@ -24,7 +24,7 @@ sqlx = { version = "0.9.0", features = [
   "macros",
   "migrate",
 ] }
-thiserror = "2.0.17"
+thiserror = { workspace = true }
 tracing = "0.1.41"
 chrono = { version = "0.4.42", features = ["serde"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
@@ -37,8 +37,8 @@ alloy = { version = "1.0.41", features = [
   "rand",
 ] }
 rust_decimal = { version = "1.39.0", features = ["serde"] }
-tokio = { version = "1.48.0", features = ["time"] }
-reqwest = { version = "0.12.24", features = ["json", "blocking", "gzip"] }
+tokio = { workspace = true, features = ["time"] }
+reqwest = { workspace = true, features = ["blocking", "gzip"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-opentelemetry = "0.31.0"
 opentelemetry = "0.30.0"
@@ -46,7 +46,7 @@ opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.30.0"
 backon = "1.6.0"
 futures = "0.3.31"
-url = "2.5.7"
+url = { workspace = true }
 anyhow = "1.0.100"
 dotenvy = "0.15.7"
 itertools = "0.14.0"
@@ -64,24 +64,29 @@ alloy-sol-types = "1.4.1"
 event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2", features = [
   "test-support",
 ] }
-httpmock = "0.8.2"
+httpmock = { workspace = true }
 proptest = "1.10.0"
 rand = "0.8"
 rsa = "0.9.10"
 rust_decimal_macros = "1.40.0"
 tempfile = "3.23.0"
-tokio = { version = "1.48.0", features = ["macros"] }
+tokio = { workspace = true, features = ["macros"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 
 [workspace]
-members = ["crates/dto"]
+members = ["crates/dto", "crates/client"]
 
 [workspace.dependencies]
 alloy-primitives = { version = "1.6.0", features = ["serde"] }
 clap = { version = "4.5.49", features = ["derive"] }
+httpmock = "0.8.2"
+reqwest = { version = "0.12.24", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0" }
 ts-rs = "11.0.1"
+url = "2.5.7"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
