@@ -16,10 +16,12 @@ use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use url::Url;
 
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
+use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
@@ -111,6 +113,93 @@ pub async fn wait_for_mock_hits(
                  (got {} after {}s)",
                 mock.calls_async().await,
                 timeout.as_secs()
+            )
+            .into());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Launches the full HTTP service on an OS-assigned ephemeral port in the
+/// background and returns its base URL once it accepts connections, so e2e
+/// tests can drive it through a real network client (e.g.
+/// `st0x_issuance_client::IssuanceClient`) over TCP rather than the in-process
+/// `rocket::local` client. Each call binds a distinct port, so test binaries
+/// that `cargo test` runs in parallel never collide.
+pub async fn spawn_http_server(
+    config: Config,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    // Bind port 0 to let the OS pick a free port, read the assigned number,
+    // then drop the listener so Rocket can claim it. This replaces a fixed
+    // port that would collide across parallel test binaries. The release/rebind
+    // gap is a brief TOCTOU, but if anything grabs the port first the bind
+    // failure surfaces through `launch_err_rx` below as a clear error rather
+    // than a silent run against the wrong process.
+    let address: SocketAddr =
+        std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+
+    let rocket = initialize_rocket(config).await?;
+
+    // `build_rocket` hard-codes port 8000 for production; override it with the
+    // ephemeral port for this test without touching the production path.
+    let figment =
+        rocket.figment().clone().merge((rocket::Config::PORT, address.port()));
+    let rocket = rocket.configure(figment);
+
+    // Forward a `launch()` failure on a oneshot rather than letting it vanish
+    // into a detached task: without this, a launch error (bind failure, ignite
+    // error) would degrade into the generic readiness timeout below with the
+    // real cause lost to stderr.
+    let (launch_err_tx, launch_err_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(error) = rocket.launch().await {
+            // If readiness already won the select the receiver is gone and
+            // `send` hands the error back. `rocket::Error` panics on Drop unless
+            // it has been inspected, so Display it here (which also keeps the
+            // post-startup-failure diagnostic) instead of dropping it silently.
+            if let Err(unsent) = launch_err_tx.send(error) {
+                eprintln!("e2e HTTP server exited after startup: {unsent}");
+            }
+        }
+    });
+
+    // Race readiness against a launch failure so the actual error surfaces as
+    // the test failure instead of a 10s "never started listening" timeout.
+    tokio::select! {
+        biased;
+        launch_err = launch_err_rx => {
+            // `Ok` carries the launch error (Display-ing it also marks the
+            // rocket::Error handled, dodging its Drop panic); `Err` is a dropped
+            // sender, i.e. the server task ended without a launch error.
+            let message = launch_err.map_or_else(
+                |_| "e2e HTTP server exited before it became ready".to_string(),
+                |error| format!("e2e HTTP server failed to launch: {error}"),
+            );
+            Err(message.into())
+        }
+        ready = wait_until_listening(address) => {
+            ready?;
+            Ok(Url::parse(&format!("http://{address}/"))?)
+        }
+    }
+}
+
+async fn wait_until_listening(
+    address: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(10);
+    let poll_interval = tokio::time::Duration::from_millis(50);
+
+    loop {
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "HTTP server never started listening on {address}"
             )
             .into());
         }
@@ -235,6 +324,57 @@ pub async fn preseed_tokenized_asset_into_pool(
     .bind(&event_payload_str)
     .execute(pool)
     .await?;
+
+    Ok(())
+}
+
+/// Seeds an asset that is currently frozen by appending a `Frozen` event
+/// (sequence 2) after the `Added` event. Per the AGENTS.md setup-phase
+/// exception, only the event store is seeded; the view is rebuilt from these
+/// events by `initialize_rocket` at startup.
+pub async fn preseed_frozen_tokenized_asset(
+    db_url: &str,
+    vault: Address,
+    underlying: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool =
+        SqlitePoolOptions::new().max_connections(1).connect(db_url).await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    preseed_tokenized_asset_into_pool(&pool, vault, underlying, token).await?;
+
+    let frozen_payload = json!({
+        "Frozen": { "frozen_at": Utc::now() }
+    })
+    .to_string();
+
+    sqlx::query(
+        "
+        INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES (
+            'TokenizedAsset',
+            ?,
+            2,
+            'TokenizedAssetEvent::Frozen', '1.0', ?, '{}'
+        )
+        ",
+    )
+    .bind(underlying)
+    .bind(&frozen_payload)
+    .execute(&pool)
+    .await?;
+
+    pool.close().await;
 
     Ok(())
 }

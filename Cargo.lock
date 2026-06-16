@@ -5504,6 +5504,7 @@ dependencies = [
  "serde_json",
  "sqlite-es",
  "sqlx",
+ "st0x-issuance-client",
  "st0x-issuance-dto",
  "subtle",
  "tempfile",

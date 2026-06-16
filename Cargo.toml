@@ -69,6 +69,7 @@ proptest = "1.10.0"
 rand = "0.8"
 rsa = "0.9.10"
 rust_decimal_macros = "1.40.0"
+st0x-issuance-client = { path = "crates/client" }
 tempfile = "3.23.0"
 tokio = { workspace = true, features = ["macros"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

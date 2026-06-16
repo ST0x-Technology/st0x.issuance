@@ -21,10 +21,8 @@ pub(crate) use view::TokenizedAssetView;
 // The asset wire newtypes are defined once in the shared `st0x-issuance-dto`
 // crate so the API DTOs, Rust clients, and the TypeScript dashboard all share a
 // single definition.
-pub use st0x_issuance_dto::UnderlyingSymbol;
-pub(crate) use st0x_issuance_dto::{
-    Network, TokenSymbol, TokenizedAssetStatus,
-};
+pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
+pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
 /// Whether an asset accepts new mints.
 ///
