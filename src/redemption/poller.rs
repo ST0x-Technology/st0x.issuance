@@ -317,6 +317,7 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use cqrs_es::{CqrsFramework, mem_store::MemStore};
+    use event_sorcery::test_store;
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use tracing_test::traced_test;
@@ -337,12 +338,15 @@ mod tests {
     type TestRedemptionCqrs =
         Arc<CqrsFramework<Redemption, TestRedemptionStore>>;
 
-    fn setup_test_cqrs()
-    -> (TestRedemptionCqrs, Arc<TestRedemptionStore>, Arc<dyn ReceiptService>)
+    /// `pool` must already have migrations applied — the receipt store writes
+    /// to the `events` table on first command dispatch.
+    fn setup_test_cqrs(
+        pool: &SqlitePool,
+    ) -> (TestRedemptionCqrs, Arc<TestRedemptionStore>, Arc<dyn ReceiptService>)
     {
         let store = Arc::new(MemStore::default());
-        let receipt_inventory_store: Arc<MemStore<ReceiptInventory>> =
-            Arc::new(MemStore::default());
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let vault_service: Arc<dyn crate::vault::VaultService> =
             Arc::new(MockVaultService::new_success());
         let cqrs = Arc::new(CqrsFramework::new(
@@ -350,16 +354,8 @@ mod tests {
             vec![],
             vault_service,
         ));
-        let receipt_inventory_cqrs = Arc::new(CqrsFramework::new(
-            (*receipt_inventory_store).clone(),
-            vec![],
-            (),
-        ));
         let receipt_service: Arc<dyn ReceiptService> =
-            Arc::new(CqrsReceiptService::new(
-                receipt_inventory_store,
-                receipt_inventory_cqrs,
-            ));
+            Arc::new(CqrsReceiptService::new(receipt_store));
 
         (cqrs, store, receipt_service)
     }
@@ -387,7 +383,7 @@ mod tests {
         backfill_start_block: u64,
         pool: SqlitePool,
     ) -> TestPollerSetup<impl alloy::providers::Provider + Clone> {
-        let (cqrs, store, receipt_service) = setup_test_cqrs();
+        let (cqrs, store, receipt_service) = setup_test_cqrs(&pool);
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
@@ -630,7 +626,7 @@ mod tests {
 
         let pool = setup_test_db_with_asset(vault, None).await;
 
-        let (cqrs, store, receipt_service) = setup_test_cqrs();
+        let (cqrs, store, receipt_service) = setup_test_cqrs(&pool);
 
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;

@@ -3,7 +3,8 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use cqrs_es::AggregateError;
+use event_sorcery::Store;
 use futures::{StreamExt, stream};
 use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
@@ -44,19 +45,15 @@ fn block_ranges(
 ///
 /// This handles receipts minted outside our system (e.g., manual operations)
 /// and receipts transferred to the bot wallet from other addresses.
-pub(crate) struct ReceiptBackfiller<
-    ProviderType,
-    ReceiptInventoryStore,
-    Handler,
-> where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
+pub(crate) struct ReceiptBackfiller<ProviderType, Handler>
+where
     Handler: ItnReceiptHandler,
 {
     provider: ProviderType,
     receipt_contract: Address,
     bot_wallet: Address,
     vault: Address,
-    cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+    store: Arc<Store<ReceiptInventory>>,
     pool: Pool<Sqlite>,
     handler: Handler,
 }
@@ -88,10 +85,8 @@ pub(crate) enum BackfillError {
     Checkpoint(#[from] CheckpointError),
 }
 
-impl<ProviderType, ReceiptInventoryStore, Handler>
-    ReceiptBackfiller<ProviderType, ReceiptInventoryStore, Handler>
+impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
 where
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
     Handler: ItnReceiptHandler,
 {
     pub(crate) const fn new(
@@ -99,7 +94,7 @@ where
         receipt_contract: Address,
         bot_wallet: Address,
         vault: Address,
-        cqrs: Arc<CqrsFramework<ReceiptInventory, ReceiptInventoryStore>>,
+        store: Arc<Store<ReceiptInventory>>,
         pool: Pool<Sqlite>,
         handler: Handler,
     ) -> Self {
@@ -108,18 +103,16 @@ where
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store,
             pool,
             handler,
         }
     }
 }
 
-impl<ProviderType, ReceiptInventoryStore, Handler>
-    ReceiptBackfiller<ProviderType, ReceiptInventoryStore, Handler>
+impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
 where
     ProviderType: alloy::providers::Provider + Clone + Send + Sync,
-    ReceiptInventoryStore: EventStore<ReceiptInventory>,
     Handler: ItnReceiptHandler,
 {
     /// Scans historic Deposit and ERC-1155 transfer events to discover
@@ -463,9 +456,9 @@ where
             Some(discovery.receipt_information.clone())
         };
 
-        self.cqrs
-            .execute(
-                &self.vault.to_string(),
+        self.store
+            .send(
+                &self.vault,
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: discovery.receipt_id,
                     balance: Shares::from(current_balance),
@@ -481,9 +474,9 @@ where
         // For already-known receipts, DiscoverReceipt is a no-op. Reconcile
         // ensures the aggregate reflects the current on-chain balance (e.g.,
         // after an inbound transfer increases the balance).
-        self.cqrs
-            .execute(
-                &self.vault.to_string(),
+        self.store
+            .send(
+                &self.vault,
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id: discovery.receipt_id,
                     on_chain_balance: Shares::from(current_balance),
@@ -518,9 +511,9 @@ where
             .call()
             .await?;
 
-        self.cqrs
-            .execute(
-                &self.vault.to_string(),
+        self.store
+            .send(
+                &self.vault,
                 ReceiptInventoryCommand::ReconcileBalance {
                     receipt_id,
                     on_chain_balance: Shares::from(on_chain_balance),
@@ -651,9 +644,7 @@ mod tests {
     use alloy::rpc::types::Log;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolEvent;
-    use cqrs_es::{
-        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
-    };
+    use event_sorcery::{Store, test_store};
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::{Pool, Sqlite};
     use std::sync::Arc;
@@ -664,11 +655,9 @@ mod tests {
     use crate::poll_checkpoint;
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
-        Shares,
+        Shares, load_inventory,
     };
     use crate::test_utils::logs_contain_at;
-
-    type TestStore = MemStore<ReceiptInventory>;
 
     async fn setup_test_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -727,12 +716,10 @@ mod tests {
         }
     }
 
-    async fn setup_cqrs()
-    -> (Arc<CqrsFramework<ReceiptInventory, TestStore>>, Pool<Sqlite>) {
-        let cqrs =
-            Arc::new(CqrsFramework::new(MemStore::default(), vec![], ()));
+    async fn setup_store() -> (Arc<Store<ReceiptInventory>>, Pool<Sqlite>) {
         let pool = setup_test_pool().await;
-        (cqrs, pool)
+        let store = Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        (store, pool)
     }
 
     /// Pushes empty responses for the inbound transfer, withdraw, and
@@ -754,22 +741,11 @@ mod tests {
         }
     }
 
-    async fn setup_cqrs_with_store() -> (
-        Arc<CqrsFramework<ReceiptInventory, TestStore>>,
-        Arc<TestStore>,
-        Pool<Sqlite>,
-    ) {
-        let store = Arc::new(MemStore::default());
-        let cqrs = Arc::new(CqrsFramework::new((*store).clone(), vec![], ()));
-        let pool = setup_test_pool().await;
-        (cqrs, store, pool)
-    }
-
     #[tokio::test]
     #[traced_test]
     async fn backfill_discovers_receipt_from_historic_deposit() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, pool) = setup_cqrs().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(42);
         let balance = U256::from(1000);
@@ -807,7 +783,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store,
             pool.clone(),
             NoOpItnHandler,
         );
@@ -838,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_is_idempotent() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(42);
         let balance = U256::from(1000);
@@ -875,7 +851,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs.clone(),
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -886,10 +862,10 @@ mod tests {
 
         // After the first run the aggregate has exactly one Discovered event
         // and the SQL checkpoint matches the chain head.
-        let mut ctx_after_first =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
+        let inventory_after_first =
+            load_inventory(&store, &vault).await.unwrap();
         assert_eq!(
-            ctx_after_first.aggregate().receipts_with_balance().len(),
+            inventory_after_first.receipts_with_balance().len(),
             1,
             "first run should produce exactly one receipt"
         );
@@ -919,7 +895,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -931,10 +907,10 @@ mod tests {
         // After the second run the aggregate still has exactly one receipt
         // (no duplicate Discovered event applied) and the checkpoint is
         // unchanged.
-        let mut ctx_after_second =
-            store.load_aggregate(&vault.to_string()).await.unwrap();
+        let inventory_after_second =
+            load_inventory(&store, &vault).await.unwrap();
         assert_eq!(
-            ctx_after_second.aggregate().receipts_with_balance().len(),
+            inventory_after_second.receipts_with_balance().len(),
             1,
             "second run must not produce a duplicate receipt"
         );
@@ -954,7 +930,7 @@ mod tests {
     #[traced_test]
     async fn backfill_skips_zero_balance_receipts() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, pool) = setup_cqrs().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(99);
         let deposit_amount = U256::from(500);
@@ -992,7 +968,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store,
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1023,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_uses_current_onchain_balance_not_deposit_amount() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(77);
         let original_deposit = U256::from(1000);
@@ -1062,7 +1038,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1072,8 +1048,8 @@ mod tests {
 
         assert_eq!(result.processed_count, 1);
 
-        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = ctx.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
 
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].available_balance.inner(), current_balance);
@@ -1082,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_filters_deposits_by_owner() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, pool) = setup_cqrs().await;
+        let (store, pool) = setup_store().await;
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
 
@@ -1136,7 +1112,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store,
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1151,7 +1127,7 @@ mod tests {
     #[traced_test]
     async fn backfill_emits_checkpoint_after_processing() {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
-        let (cqrs, _store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(42);
         let balance = U256::from(1000);
@@ -1189,7 +1165,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store,
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1392,7 +1368,7 @@ mod tests {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(55);
         let balance = U256::from(750);
@@ -1434,7 +1410,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1446,8 +1422,8 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify the receipt was actually discovered with correct ID and balance
-        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = ctx.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1, "Should discover exactly one receipt");
         assert_eq!(
             receipts[0].receipt_id,
@@ -1466,7 +1442,7 @@ mod tests {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let tx_hash = b256!(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1518,7 +1494,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1533,9 +1509,9 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify: aggregate has no receipts at all
-        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
         assert!(
-            ctx.aggregate().receipts_with_balance().is_empty(),
+            inventory.receipts_with_balance().is_empty(),
             "No receipts should be discovered from outbound/mint transfers"
         );
     }
@@ -1545,7 +1521,7 @@ mod tests {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id = U256::from(88);
         let balance = U256::from(500);
@@ -1602,7 +1578,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1613,8 +1589,8 @@ mod tests {
         // Should only process once despite appearing in both Deposit and Transfer
         assert_eq!(result.processed_count, 1);
 
-        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = ctx.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert_eq!(
             receipts.len(),
             1,
@@ -1639,29 +1615,30 @@ mod tests {
         let (receipt_contract, bot_wallet, vault) = test_addresses();
         let other_wallet =
             address!("0x4444444444444444444444444444444444444444");
-        let (cqrs, store, pool) = setup_cqrs_with_store().await;
+        let (store, pool) = setup_store().await;
 
         let receipt_id_raw = U256::from(55);
         let stale_balance = U256::from(500);
         let new_on_chain_balance = U256::from(750);
 
         // Seed aggregate with a receipt at a stale lower balance
-        cqrs.execute(
-            &vault.to_string(),
-            ReceiptInventoryCommand::DiscoverReceipt {
-                receipt_id: ReceiptId::from(receipt_id_raw),
-                balance: Shares::from(stale_balance),
-                block_number: 50,
-                tx_hash: b256!(
-                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-                ),
-                source: ReceiptSource::External,
-                receipt_info: None,
-                receipt_info_bytes: None,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(receipt_id_raw),
+                    balance: Shares::from(stale_balance),
+                    block_number: 50,
+                    tx_hash: b256!(
+                        "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    ),
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
 
         // Inbound transfer log (someone sent tokens to bot_wallet)
         let transfer_log = create_transfer_single_log(
@@ -1701,7 +1678,7 @@ mod tests {
             receipt_contract,
             bot_wallet,
             vault,
-            cqrs,
+            store.clone(),
             pool.clone(),
             NoOpItnHandler,
         );
@@ -1711,8 +1688,8 @@ mod tests {
         assert_eq!(result.processed_count, 1);
 
         // Verify balance was reconciled upward from 500 to 750
-        let mut ctx = store.load_aggregate(&vault.to_string()).await.unwrap();
-        let receipts = ctx.aggregate().receipts_with_balance();
+        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].available_balance,

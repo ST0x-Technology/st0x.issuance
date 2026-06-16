@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, B256, address};
 use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-use event_sorcery::{Store, StoreBuilder};
+use event_sorcery::{Store, StoreBuilder, test_store};
 use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::fireblocks::SignerConfig;
 use crate::mint::{
     Mint, MintServices, MintView, Network, TokenSymbol, UnderlyingSymbol,
 };
-use crate::receipt_inventory::CqrsReceiptService;
+use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
 
@@ -79,12 +79,8 @@ impl TestHarness {
                 .await
                 .expect("Failed to build tokenized asset store");
 
-        let receipt_inventory_event_store = {
-            let event_repo = SqliteEventRepository::new(pool.clone());
-            Arc::new(PersistedEventStore::new_event_store(event_repo))
-        };
-        let receipt_inventory_cqrs =
-            Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let receipt_inventory_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mint_services = MintServices {
@@ -93,8 +89,7 @@ impl TestHarness {
             pool: pool.clone(),
             bot,
             receipts: Arc::new(CqrsReceiptService::new(
-                receipt_inventory_event_store,
-                receipt_inventory_cqrs,
+                receipt_inventory_store,
             )),
         };
 

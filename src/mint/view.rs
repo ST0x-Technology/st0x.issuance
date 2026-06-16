@@ -643,14 +643,12 @@ mod tests {
     use alloy::primitives::{address, b256, uint};
     use cqrs_es::EventEnvelope;
     use cqrs_es::persist::GenericQuery;
+    use event_sorcery::test_store;
     use rust_decimal::Decimal;
     use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
     use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    use cqrs_es::CqrsFramework;
-    use cqrs_es::mem_store::MemStore;
 
     use super::*;
     use crate::alpaca::mock::MockAlpacaService;
@@ -677,22 +675,14 @@ mod tests {
                 .expect("Failed to run migrations");
 
             let receipt_store =
-                Arc::new(MemStore::<ReceiptInventory>::default());
-            let receipt_cqrs = Arc::new(CqrsFramework::new(
-                (*receipt_store).clone(),
-                vec![],
-                (),
-            ));
+                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
             let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
             let mint_services = MintServices {
                 vault: Arc::new(MockVaultService::new_success()),
                 alpaca: Arc::new(MockAlpacaService::new_success()),
                 pool: pool.clone(),
                 bot,
-                receipts: Arc::new(CqrsReceiptService::new(
-                    receipt_store,
-                    receipt_cqrs,
-                )),
+                receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
             };
 
             let view_repo =

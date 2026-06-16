@@ -2163,7 +2163,7 @@ pub(crate) mod tests {
         Aggregate, AggregateContext, CqrsFramework, EventStore,
         event_sink::EventSink, mem_store::MemStore, test::TestFramework,
     };
-    use event_sorcery::StoreBuilder;
+    use event_sorcery::{Store, StoreBuilder, test_store};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -2357,8 +2357,7 @@ pub(crate) mod tests {
     pub(super) struct MintTestFixture {
         pub(super) mint_cqrs: Arc<CqrsFramework<Mint, MemStore<Mint>>>,
         pub(super) mint_store: Arc<MemStore<Mint>>,
-        pub(super) receipt_cqrs:
-            Arc<CqrsFramework<ReceiptInventory, MemStore<ReceiptInventory>>>,
+        pub(super) receipt_store: Arc<Store<ReceiptInventory>>,
     }
 
     impl MintTestFixture {
@@ -2399,19 +2398,13 @@ pub(crate) mod tests {
                 .unwrap();
 
             let receipt_store =
-                Arc::new(MemStore::<ReceiptInventory>::default());
-            let receipt_cqrs = Arc::new(CqrsFramework::new(
-                (*receipt_store).clone(),
-                vec![],
-                (),
-            ));
+                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
             let services = MintServices {
                 vault,
                 alpaca: Arc::new(MockAlpacaService::new_success()),
                 receipts: Arc::new(CqrsReceiptService::new(
-                    receipt_store,
-                    receipt_cqrs.clone(),
+                    receipt_store.clone(),
                 )),
                 pool: pool.clone(),
                 bot: BOT,
@@ -2424,7 +2417,7 @@ pub(crate) mod tests {
                 services,
             ));
 
-            Self { mint_cqrs, mint_store, receipt_cqrs }
+            Self { mint_cqrs, mint_store, receipt_store }
         }
 
         pub(super) async fn seed_mint_events(
@@ -2496,25 +2489,28 @@ pub(crate) mod tests {
             .expect("Failed to create runtime");
 
         let pool = rt.block_on(async {
-            SqlitePoolOptions::new()
+            let pool = SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect(":memory:")
                 .await
-                .expect("Failed to create in-memory database")
+                .expect("Failed to create in-memory database");
+
+            sqlx::migrate!()
+                .run(&pool)
+                .await
+                .expect("Failed to run migrations");
+
+            pool
         });
 
-        let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let receipt_cqrs =
-            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
         MintServices {
             vault: Arc::new(MockVaultService::new_success()),
             alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_store,
-                receipt_cqrs,
-            )),
+            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
             bot,
         }
@@ -4084,17 +4080,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let receipt_store = Arc::new(MemStore::<ReceiptInventory>::default());
-        let receipt_cqrs =
-            Arc::new(CqrsFramework::new((*receipt_store).clone(), vec![], ()));
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         let services = MintServices {
             vault: Arc::new(MockVaultService::new_success()),
             alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_store,
-                receipt_cqrs,
-            )),
+            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
             bot: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         };

@@ -549,9 +549,9 @@ mod tests {
         );
 
         fixture
-            .receipt_cqrs
-            .execute(
-                &VAULT.to_string(),
+            .receipt_store
+            .send(
+                &VAULT,
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(42_U256)),
                     balance: Shares::from(
