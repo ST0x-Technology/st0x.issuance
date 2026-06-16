@@ -1,11 +1,12 @@
 use alloy::primitives::Address;
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use cqrs_es::AggregateError;
+use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    IssuerRedemptionRequestId, Redemption, RedemptionCommand, RedemptionError,
+    IssuerRedemptionRequestId, Redemption, RedemptionCommand,
     RedemptionViewError, find_detected,
 };
 use crate::QuantityConversionError;
@@ -17,21 +18,19 @@ use crate::tokenized_asset::view::{
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 
-pub(crate) struct RedeemCallManager<ES: EventStore<Redemption>> {
+pub(crate) struct RedeemCallManager {
     alpaca_service: Arc<dyn AlpacaService>,
-    cqrs: Arc<CqrsFramework<Redemption, ES>>,
-    event_store: Arc<ES>,
+    store: Arc<Store<Redemption>>,
     pool: Pool<Sqlite>,
 }
 
-impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
+impl RedeemCallManager {
     pub(crate) fn new(
         alpaca_service: Arc<dyn AlpacaService>,
-        cqrs: Arc<CqrsFramework<Redemption, ES>>,
-        event_store: Arc<ES>,
+        store: Arc<Store<Redemption>>,
         pool: Pool<Sqlite>,
     ) -> Self {
-        Self { alpaca_service, cqrs, event_store, pool }
+        Self { alpaca_service, store, pool }
     }
 
     pub(crate) async fn recover_detected_redemptions(&self) {
@@ -71,10 +70,8 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                             .to_string(),
                     };
 
-                    if let Err(err) = self
-                        .cqrs
-                        .execute(&issuer_request_id.to_string(), command)
-                        .await
+                    if let Err(err) =
+                        self.store.send(issuer_request_id, command).await
                     {
                         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                             error = %err,
@@ -110,14 +107,14 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), RedeemCallManagerError> {
-        let mut aggregate_ctx = self
-            .event_store
-            .load_aggregate(&issuer_request_id.to_string())
-            .await?;
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Redemption not found, skipping"
+            );
+            return Ok(());
+        };
 
-        let aggregate = aggregate_ctx.aggregate();
-
-        let Redemption::Detected { metadata } = aggregate else {
+        let Redemption::Detected { metadata } = &aggregate else {
             debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                 "Redemption no longer in Detected state, skipping"
             );
@@ -137,7 +134,7 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
         self.handle_redemption_detected(
             &alpaca_account,
             issuer_request_id,
-            aggregate,
+            &aggregate,
             client_id,
             network,
         )
@@ -241,9 +238,9 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     "Alpaca redeem API call succeeded"
                 );
 
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::RecordAlpacaCall {
                             issuer_request_id: issuer_request_id.clone(),
                             tokenization_request_id: response
@@ -266,9 +263,9 @@ impl<ES: EventStore<Redemption>> RedeemCallManager<ES> {
                     "Alpaca redeem API call failed"
                 );
 
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::RecordAlpacaFailure {
                             issuer_request_id: issuer_request_id.clone(),
                             error: err.to_string(),
@@ -291,7 +288,7 @@ pub(crate) enum RedeemCallManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
     #[error("CQRS error: {0}")]
-    Cqrs(#[from] AggregateError<RedemptionError>),
+    Cqrs(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("View error: {0}")]
@@ -310,16 +307,22 @@ pub(crate) enum RedeemCallManagerError {
     QuantityConversion(#[from] QuantityConversionError),
 }
 
+// `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
+// Redemption aggregate), so it's boxed to keep `RedeemCallManagerError` small.
+impl From<AggregateError<LifecycleError<Redemption>>>
+    for RedeemCallManagerError
+{
+    fn from(error: AggregateError<LifecycleError<Redemption>>) -> Self {
+        Self::Cqrs(Box::new(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
-    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-    use cqrs_es::{
-        AggregateContext, CqrsFramework, EventStore, mem_store::MemStore,
-    };
+    use chrono::Utc;
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
-    use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use tracing_test::traced_test;
@@ -330,9 +333,10 @@ mod tests {
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::Quantity;
+    use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionView, UnderlyingSymbol,
+        UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
@@ -341,20 +345,18 @@ mod tests {
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
-    type TestCqrs = cqrs_es::CqrsFramework<Redemption, MemStore<Redemption>>;
-    type TestStore = MemStore<Redemption>;
-
     fn test_alpaca_account() -> AlpacaAccountNumber {
         AlpacaAccountNumber("test-account".to_string())
     }
 
-    type RedemptionStore =
-        PersistedEventStore<SqliteEventRepository, Redemption>;
-
+    /// Builds the full set of event-sorcery stores backed by one in-memory
+    /// SQLite pool: a [`Store<Redemption>`] wired with the
+    /// [`RedemptionViewReactor`] (so the recovery sweeps that read
+    /// `redemption_view` via `find_detected` see redemptions), plus account and
+    /// asset stores whose projections back the recovery lookups.
     struct TestHarness {
         pool: sqlx::Pool<sqlx::Sqlite>,
-        redemption_store: Arc<RedemptionStore>,
-        redemption_cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
+        redemption_store: Arc<Store<Redemption>>,
         account_store: Arc<Store<Account>>,
         asset_store: Arc<Store<TokenizedAsset>>,
     }
@@ -372,26 +374,14 @@ mod tests {
                 .await
                 .expect("Failed to run migrations");
 
+            let vault_service: Arc<dyn VaultService> =
+                Arc::new(MockVaultService::new_success());
             let redemption_store =
-                Arc::new(PersistedEventStore::new_event_store(
-                    SqliteEventRepository::new(pool.clone()),
-                ));
-            let redemption_view_repo = Arc::new(SqliteViewRepository::<
-                RedemptionView,
-                Redemption,
-            >::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
-            let redemption_query = GenericQuery::new(redemption_view_repo);
-            let vault_service = Arc::new(MockVaultService::new_success());
-            let redemption_cqrs = Arc::new(CqrsFramework::new(
-                PersistedEventStore::new_event_store(
-                    SqliteEventRepository::new(pool.clone()),
-                ),
-                vec![Box::new(redemption_query)],
-                vault_service,
-            ));
+                StoreBuilder::<Redemption>::new(pool.clone())
+                    .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
+                    .build(vault_service)
+                    .await
+                    .expect("Failed to build redemption store");
 
             let (account_store, _account_projection) =
                 StoreBuilder::<Account>::new(pool.clone())
@@ -405,13 +395,7 @@ mod tests {
                     .await
                     .expect("Failed to build tokenized asset store");
 
-            Self {
-                pool,
-                redemption_store,
-                redemption_cqrs,
-                account_store,
-                asset_store,
-            }
+            Self { pool, redemption_store, account_store, asset_store }
         }
 
         async fn register_and_link_account(
@@ -471,9 +455,9 @@ mod tests {
             underlying: &UnderlyingSymbol,
             wallet: Address,
         ) {
-            self.redemption_cqrs
-                .execute(
-                    &issuer_request_id.to_string(),
+            self.redemption_store
+                .send(
+                    issuer_request_id,
                     RedemptionCommand::Detect {
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
@@ -493,18 +477,17 @@ mod tests {
         fn create_manager(
             &self,
             alpaca_service: Arc<dyn crate::alpaca::AlpacaService>,
-        ) -> RedeemCallManager<RedemptionStore> {
+        ) -> RedeemCallManager {
             RedeemCallManager::new(
                 alpaca_service,
-                self.redemption_cqrs.clone(),
                 self.redemption_store.clone(),
                 self.pool.clone(),
             )
         }
     }
 
-    async fn setup_test_cqrs()
-    -> (Arc<TestCqrs>, Arc<TestStore>, sqlx::Pool<sqlx::Sqlite>) {
+    async fn setup_test_store()
+    -> (Arc<Store<Redemption>>, sqlx::Pool<sqlx::Sqlite>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -516,20 +499,19 @@ mod tests {
             .await
             .expect("Failed to run migrations");
 
-        let store = Arc::new(MemStore::default());
         let vault_service: Arc<dyn VaultService> =
             Arc::new(MockVaultService::new_success());
-        let cqrs = Arc::new(cqrs_es::CqrsFramework::new(
-            (*store).clone(),
-            vec![],
-            vault_service,
-        ));
-        (cqrs, store, pool)
+        let store = StoreBuilder::<Redemption>::new(pool.clone())
+            .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
+            .build(vault_service)
+            .await
+            .expect("Failed to build redemption store");
+
+        (store, pool)
     }
 
     async fn create_test_redemption_in_detected_state(
-        cqrs: &TestCqrs,
-        store: &TestStore,
+        store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -541,49 +523,36 @@ mod tests {
         );
         let block_number = 12345;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                },
+            )
+            .await
+            .unwrap();
 
-        load_aggregate(store, issuer_request_id).await
-    }
-
-    async fn load_aggregate(
-        store: &TestStore,
-        issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> Redemption {
-        let mut context =
-            store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
-        context.aggregate().clone()
+        store.load(issuer_request_id).await.unwrap().unwrap()
     }
 
     #[tokio::test]
     async fn test_handle_redemption_detected_with_success() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool,
-        );
+        let manager =
+            RedeemCallManager::new(alpaca_service, store.clone(), pool);
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let aggregate = create_test_redemption_in_detected_state(
-            &cqrs,
             &store,
             &issuer_request_id,
         )
@@ -607,7 +576,7 @@ mod tests {
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
         let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+            store.load(&issuer_request_id).await.unwrap().unwrap();
 
         assert!(
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
@@ -617,21 +586,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service_mock =
             Arc::new(MockAlpacaService::new_failure("API timeout"));
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool,
-        );
+        let manager =
+            RedeemCallManager::new(alpaca_service, store.clone(), pool);
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let aggregate = create_test_redemption_in_detected_state(
-            &cqrs,
             &store,
             &issuer_request_id,
         )
@@ -658,7 +622,7 @@ mod tests {
         assert_eq!(alpaca_service_mock.get_call_count(), 1);
 
         let updated_aggregate =
-            load_aggregate(&store, &issuer_request_id).await;
+            store.load(&issuer_request_id).await.unwrap().unwrap();
 
         let Redemption::Failed { reason, .. } = updated_aggregate else {
             panic!("Expected Failed state, got {updated_aggregate:?}");
@@ -672,14 +636,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_redemption_detected_with_wrong_state_fails() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager =
-            RedeemCallManager::new(alpaca_service, cqrs.clone(), store, pool);
+        let manager = RedeemCallManager::new(alpaca_service, store, pool);
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let aggregate = Redemption::Uninitialized;
+        // A non-Detected aggregate exercises the InvalidAggregateState guard.
+        let aggregate = Redemption::Completed {
+            issuer_request_id: issuer_request_id.clone(),
+            burn_tx_hash: b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            completed_at: Utc::now(),
+        };
 
         let client_id = ClientId::new();
         let network = Network::new("base");
@@ -733,10 +703,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_account_for_recovery_not_found() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, cqrs, store, pool);
+        let manager = RedeemCallManager::new(alpaca_service, store, pool);
 
         let wallet = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
@@ -771,10 +741,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_network_for_asset_not_found() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service = Arc::new(MockAlpacaService::new_success())
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, cqrs, store, pool);
+        let manager = RedeemCallManager::new(alpaca_service, store, pool);
 
         let underlying = UnderlyingSymbol::new("UNKNOWN");
 
@@ -788,11 +758,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_detected_redemptions_empty() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(alpaca_service, cqrs, store, pool);
+        let manager = RedeemCallManager::new(alpaca_service, store, pool);
 
         manager.recover_detected_redemptions().await;
 
@@ -840,12 +810,12 @@ mod tests {
             "Should call Alpaca once for the detected redemption"
         );
 
-        let mut context = harness
+        let updated_aggregate = harness
             .redemption_store
-            .load_aggregate(&issuer_request_id.to_string())
+            .load(&issuer_request_id)
             .await
+            .unwrap()
             .unwrap();
-        let updated_aggregate = context.aggregate();
         assert!(
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
             "Expected AlpacaCalled state, got {updated_aggregate:?}"
@@ -854,24 +824,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_single_detected_missing_account() {
-        let (cqrs, store, pool) = setup_test_cqrs().await;
+        let (store, pool) = setup_test_store().await;
         let alpaca_service_mock = Arc::new(MockAlpacaService::new_success());
         let alpaca_service = alpaca_service_mock.clone()
             as Arc<dyn crate::alpaca::AlpacaService>;
-        let manager = RedeemCallManager::new(
-            alpaca_service,
-            cqrs.clone(),
-            store.clone(),
-            pool.clone(),
-        );
+        let manager =
+            RedeemCallManager::new(alpaca_service, store.clone(), pool.clone());
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_detected_state(
-            &cqrs,
-            &store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_detected_state(&store, &issuer_request_id)
+            .await;
 
         let result = manager.recover_single_detected(&issuer_request_id).await;
 
@@ -904,12 +866,12 @@ mod tests {
         // No account registered for this wallet — recovery should auto-fail
         manager.recover_detected_redemptions().await;
 
-        let mut context = harness
+        let updated_aggregate = harness
             .redemption_store
-            .load_aggregate(&issuer_request_id.to_string())
+            .load(&issuer_request_id)
             .await
+            .unwrap()
             .unwrap();
-        let updated_aggregate = context.aggregate();
         assert!(
             matches!(updated_aggregate, Redemption::Failed { .. }),
             "Expected Detected redemption with missing account to be auto-failed, \

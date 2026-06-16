@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, B256, U256};
-use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+use cqrs_es::AggregateError;
+use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -9,7 +10,8 @@ use super::view::{
 };
 use super::{
     BurnExternalTxId, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-    RedemptionError, next_burn_retry_external_tx_id_from_history,
+    RedemptionError, RedemptionEvent,
+    next_burn_retry_external_tx_id_from_history,
 };
 use crate::fireblocks::{FireblocksVaultError, vault_service};
 use crate::mint::QuantityConversionError;
@@ -53,49 +55,34 @@ pub(crate) enum RecoveryOutcome {
 /// handler calls the vault service to perform the actual burn operation.
 ///
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
-pub(crate) struct BurnManager<RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
+pub(crate) struct BurnManager {
     /// Used only for balance queries during recovery (not for burns - those go through aggregate)
     vault_service: Arc<dyn VaultService>,
     view_pool: Pool<Sqlite>,
-    cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
-    store: Arc<RedemptionStore>,
+    store: Arc<Store<Redemption>>,
     receipt_service: Arc<dyn ReceiptService>,
     bot_wallet: Address,
 }
 
-impl<RedemptionStore> BurnManager<RedemptionStore>
-where
-    RedemptionStore: EventStore<Redemption>,
-{
+impl BurnManager {
     /// Creates a new burn manager.
     ///
     /// # Arguments
     ///
     /// * `vault_service` - Vault service for balance queries during recovery
     /// * `view_pool` - Database pool for querying views
-    /// * `cqrs` - CQRS framework for executing commands on the Redemption aggregate
-    /// * `store` - Event store for loading aggregate state during recovery
+    /// * `store` - Event-sorcery store for dispatching commands and loading
+    ///   aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
         vault_service: Arc<dyn VaultService>,
         view_pool: Pool<Sqlite>,
-        cqrs: Arc<CqrsFramework<Redemption, RedemptionStore>>,
-        store: Arc<RedemptionStore>,
+        store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
     ) -> Self {
-        Self {
-            vault_service,
-            view_pool,
-            cqrs,
-            store,
-            receipt_service,
-            bot_wallet,
-        }
+        Self { vault_service, view_pool, store, receipt_service, bot_wallet }
     }
 
     /// Recovers redemptions stuck in the `Burning` state at startup.
@@ -195,10 +182,14 @@ where
         burn_tx_hash: B256,
         reason: String,
     ) -> Result<BurnVerification, BurnManagerError> {
-        let mut context =
-            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+        let redemption =
+            self.store.load(issuer_request_id).await?.ok_or_else(|| {
+                BurnManagerError::InvalidAggregateState {
+                    current_state: "Uninitialized".to_string(),
+                }
+            })?;
 
-        let underlying = match context.aggregate() {
+        let underlying = match &redemption {
             Redemption::Burning { metadata, .. }
             | Redemption::BurnSubmitted { metadata, .. } => {
                 metadata.underlying.clone()
@@ -228,9 +219,9 @@ where
             "Force-completing stuck Burning redemption: burn verified on-chain"
         );
 
-        self.cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+        self.store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::ForceCompleteBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     burn_tx_hash,
@@ -303,12 +294,19 @@ where
         vault: Address,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<(), BurnManagerError> {
-        use Redemption::{Completed, Uninitialized};
+        use Redemption::Completed;
 
-        let mut context =
-            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+        // A reservation for a redemption with no events is anomalous (e.g.
+        // pruned history). Leave it for manual review rather than releasing
+        // blindly against an unknown on-chain outcome.
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Reservation held for an unknown redemption; left for manual review"
+            );
+            return Ok(());
+        };
 
-        match context.aggregate() {
+        match aggregate {
             // The burn confirmed on-chain but settlement was missed (e.g. a
             // crash in the confirm->settle window). Settle to reduce the mirror.
             Completed { .. } => {
@@ -316,14 +314,6 @@ where
                     "Settling reservation for completed redemption"
                 );
                 self.settle_reserved_burn(vault, issuer_request_id).await;
-            }
-            // A reservation for a redemption with no events is anomalous (e.g.
-            // pruned history). Leave it for manual review rather than releasing
-            // blindly against an unknown on-chain outcome.
-            Uninitialized => {
-                warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                    "Reservation held for an unknown redemption; left for manual review"
-                );
             }
             // All other states are LEFT in place. A definitive failure already
             // released its reservation in the live/recovery paths (gated on
@@ -463,7 +453,7 @@ where
                 reason,
             };
 
-            self.cqrs.execute(&issuer_request_id.to_string(), command).await?;
+            self.store.send(issuer_request_id, command).await?;
 
             // The burn likely already landed (on-chain balance is too low to
             // burn again), so any reservation from a prior attempt is LEFT in
@@ -492,9 +482,9 @@ where
             detected_at: *detected_at,
         };
 
-        self.cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+        self.store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::ResumeBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     metadata,
@@ -510,11 +500,13 @@ where
 
         // Step 2: Load the updated aggregate (now in Burning) and use
         // the standard submit → persist tx ID → confirm flow.
-        let mut context =
-            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: "Uninitialized".to_string(),
+            });
+        };
 
-        self.handle_burning_started(issuer_request_id, context.aggregate())
-            .await?;
+        self.handle_burning_started(issuer_request_id, &aggregate).await?;
 
         debug!(target: "redemption", issuer_request_id = %issuer_request_id,
             "Successfully retried burn"
@@ -564,9 +556,9 @@ where
 
                 // Safe: BurningFailed always transitions the aggregate to
                 // Failed, so RecordExistingBurn (which requires Failed) is valid.
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::RecordExistingBurn {
                             issuer_request_id: issuer_request_id.clone(),
                             fireblocks_tx_id: fireblocks_tx_id.to_string(),
@@ -600,9 +592,9 @@ where
                     "Fireblocks burn confirmation failed for tx {fireblocks_tx_id}: {err}"
                 );
 
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::MarkFailed {
                             issuer_request_id: issuer_request_id.clone(),
                             reason,
@@ -619,12 +611,14 @@ where
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        let mut context =
-            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                "Redemption not found, skipping"
+            );
+            return Ok(RecoveryOutcome::AlreadyAdvanced);
+        };
 
-        let aggregate = context.aggregate();
-
-        match aggregate {
+        match &aggregate {
             // Already submitted to Fireblocks but never confirmed — resume polling
             Redemption::BurnSubmitted {
                 metadata,
@@ -652,9 +646,9 @@ where
                 );
 
                 let confirm_result = self
-                    .cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                    .store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::ConfirmBurn {
                             issuer_request_id: issuer_request_id.clone(),
                             fireblocks_tx_id: fireblocks_tx_id.clone(),
@@ -674,15 +668,19 @@ where
 
                         Ok(RecoveryOutcome::ExistingBurnRecorded)
                     }
-                    Err(AggregateError::UserError(RedemptionError::Vault(
-                        err,
+                    Err(AggregateError::UserError(LifecycleError::Apply(
+                        RedemptionError::Vault {
+                            message: err,
+                            release_reservation,
+                            ..
+                        },
                     ))) => {
                         warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                             error = %err,
                             "Burn confirmation failed during recovery"
                         );
 
-                        if should_release_reserved_burn(&err) {
+                        if release_reservation {
                             self.release_reserved_burn(
                                 vault,
                                 issuer_request_id,
@@ -690,13 +688,13 @@ where
                             .await;
                         }
 
-                        self.cqrs
-                            .execute(
-                                &issuer_request_id.to_string(),
+                        self.store
+                            .send(
+                                issuer_request_id,
                                 RedemptionCommand::RecordBurnFailure {
                                     issuer_request_id: issuer_request_id
                                         .clone(),
-                                    error: err.to_string(),
+                                    error: err.clone(),
                                     fireblocks_tx_id: Some(
                                         fireblocks_tx_id.clone(),
                                     ),
@@ -705,7 +703,13 @@ where
                             )
                             .await?;
 
-                        Err(BurnManagerError::Vault(err))
+                        Err(BurnManagerError::Redemption(
+                            RedemptionError::Vault {
+                                message: err,
+                                release_reservation,
+                                fireblocks_tx_id: None,
+                            },
+                        ))
                     }
                     Err(err) => Err(err.into()),
                 }
@@ -773,7 +777,7 @@ where
                     "Recovering Burning redemption - resuming burn"
                 );
 
-                self.handle_burning_started(issuer_request_id, aggregate)
+                self.handle_burning_started(issuer_request_id, &aggregate)
                     .await?;
 
                 Ok(RecoveryOutcome::Executed)
@@ -848,9 +852,9 @@ where
                 "{error_msg}"
             );
 
-            self.cqrs
-                .execute(
-                    &issuer_request_id.to_string(),
+            self.store
+                .send(
+                    issuer_request_id,
                     RedemptionCommand::RecordBurnFailure {
                         issuer_request_id: issuer_request_id.clone(),
                         error: error_msg,
@@ -909,12 +913,27 @@ where
         issuer_request_id: &IssuerRedemptionRequestId,
         detected_tx_hash: &B256,
     ) -> Result<Option<BurnExternalTxId>, BurnManagerError> {
-        let events =
-            self.store.load_events(&issuer_request_id.to_string()).await?;
+        let id_str = issuer_request_id.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT payload as "payload!: String"
+            FROM events
+            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+            ORDER BY sequence
+            "#,
+            id_str
+        )
+        .fetch_all(&self.view_pool)
+        .await?;
+
+        let events: Vec<RedemptionEvent> = rows
+            .iter()
+            .map(|row| serde_json::from_str(&row.payload))
+            .collect::<Result<_, _>>()?;
 
         Ok(next_burn_retry_external_tx_id_from_history(
             detected_tx_hash,
-            events.iter().map(|event| &event.payload),
+            events.iter(),
         )?)
     }
 
@@ -980,9 +999,9 @@ where
             "{error_msg}"
         );
 
-        self.cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+        self.store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error_msg.clone(),
@@ -1047,9 +1066,9 @@ where
                 "Failed to reserve receipts before burn submission; aborting to avoid double-spend"
             );
 
-            self.cqrs
-                .execute(
-                    &issuer_request_id.to_string(),
+            self.store
+                .send(
+                    issuer_request_id,
                     RedemptionCommand::RecordBurnFailure {
                         issuer_request_id: issuer_request_id.clone(),
                         error: err.to_string(),
@@ -1064,9 +1083,9 @@ where
 
         // Step 1: Submit the burn transaction (emits BurnFireblocksSubmitted)
         let submit_result = self
-            .cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+            .store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: issuer_request_id.clone(),
                     vault,
@@ -1084,9 +1103,13 @@ where
                     "BurnTokens submitted, confirming..."
                 );
             }
-            Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
-                let fireblocks_tx_id = extract_fireblocks_tx_id(&err);
-
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                RedemptionError::Vault {
+                    message: err,
+                    release_reservation,
+                    fireblocks_tx_id,
+                },
+            ))) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     fireblocks_tx_id = ?fireblocks_tx_id,
@@ -1104,23 +1127,29 @@ where
                 // the balance and double-submit. Recovery (via the preserved
                 // `fireblocks_tx_id`) or manual intervention resolves retained
                 // reservations.
-                if should_release_reserved_burn(&err) {
+                if release_reservation {
                     self.release_reserved_burn(vault, issuer_request_id).await;
                 }
 
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
-                            error: err.to_string(),
-                            fireblocks_tx_id,
+                            error: err.clone(),
+                            fireblocks_tx_id: fireblocks_tx_id.clone(),
                             planned_burns,
                         },
                     )
                     .await?;
 
-                return Err(BurnManagerError::Vault(err));
+                return Err(BurnManagerError::Redemption(
+                    RedemptionError::Vault {
+                        message: err,
+                        release_reservation,
+                        fireblocks_tx_id,
+                    },
+                ));
             }
             // Submission outcome is unknown (non-vault error): keep the
             // reservation so a concurrent redemption cannot reuse the balance.
@@ -1130,15 +1159,16 @@ where
         }
 
         // Step 2: Load aggregate to get the fireblocks_tx_id from BurnSubmitted state
-        let mut context =
-            self.store.load_aggregate(&issuer_request_id.to_string()).await?;
+        let Some(aggregate) = self.store.load(issuer_request_id).await? else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: "Uninitialized".to_string(),
+            });
+        };
 
-        let Redemption::BurnSubmitted { fireblocks_tx_id, .. } =
-            context.aggregate()
+        let Redemption::BurnSubmitted { fireblocks_tx_id, .. } = &aggregate
         else {
             return Err(BurnManagerError::InvalidAggregateState {
-                current_state: aggregate_state_name(context.aggregate())
-                    .to_string(),
+                current_state: aggregate_state_name(&aggregate).to_string(),
             });
         };
 
@@ -1146,9 +1176,9 @@ where
 
         // Step 3: Confirm the burn (emits TokensBurned or error)
         let confirm_result = self
-            .cqrs
-            .execute(
-                &issuer_request_id.to_string(),
+            .store
+            .send(
+                issuer_request_id,
                 RedemptionCommand::ConfirmBurn {
                     issuer_request_id: issuer_request_id.clone(),
                     fireblocks_tx_id: fireblocks_tx_id.clone(),
@@ -1169,29 +1199,39 @@ where
 
                 Ok(())
             }
-            Err(AggregateError::UserError(RedemptionError::Vault(err))) => {
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                RedemptionError::Vault {
+                    message: err,
+                    release_reservation,
+                    ..
+                },
+            ))) => {
                 warn!(target: "redemption", issuer_request_id = %issuer_request_id,
                     error = %err,
                     "Burn confirmation failed"
                 );
 
-                if should_release_reserved_burn(&err) {
+                if release_reservation {
                     self.release_reserved_burn(vault, issuer_request_id).await;
                 }
 
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.to_string(),
+                self.store
+                    .send(
+                        issuer_request_id,
                         RedemptionCommand::RecordBurnFailure {
                             issuer_request_id: issuer_request_id.clone(),
-                            error: err.to_string(),
+                            error: err.clone(),
                             fireblocks_tx_id: Some(fireblocks_tx_id),
                             planned_burns,
                         },
                     )
                     .await?;
 
-                Err(BurnManagerError::Vault(err))
+                Err(BurnManagerError::Redemption(RedemptionError::Vault {
+                    message: err,
+                    release_reservation,
+                    fireblocks_tx_id: None,
+                }))
             }
             Err(err) => Err(err.into()),
         }
@@ -1287,7 +1327,6 @@ where
 
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
     match aggregate {
-        Redemption::Uninitialized => "Uninitialized",
         Redemption::Detected { .. } => "Detected",
         Redemption::AlpacaCalled { .. } => "AlpacaCalled",
         Redemption::Burning { .. } => "Burning",
@@ -1300,7 +1339,7 @@ const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
 
 /// Extracts the Fireblocks transaction ID from a `VaultError`, if the error
 /// originated from a Fireblocks error that carries a transaction ID.
-fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
+pub(crate) fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
     match error {
         VaultError::Fireblocks(
             crate::fireblocks::FireblocksVaultError::TransactionFailed {
@@ -1316,7 +1355,7 @@ fn extract_fireblocks_tx_id(error: &VaultError) -> Option<String> {
 /// Whether a failed burn confirmation definitively consumed no receipts, so its
 /// inventory reservation must be released. Ambiguous pending Fireblocks statuses
 /// keep the reservation (the transaction may still land on-chain).
-const fn should_release_reserved_burn(error: &VaultError) -> bool {
+pub(crate) const fn should_release_reserved_burn(error: &VaultError) -> bool {
     match error {
         VaultError::Fireblocks(FireblocksVaultError::TransactionFailed {
             status,
@@ -1333,8 +1372,10 @@ pub(crate) enum BurnManagerError {
     Vault(#[from] VaultError),
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("CQRS error: {0}")]
-    Cqrs(#[from] AggregateError<RedemptionError>),
+    Cqrs(#[from] AggregateError<LifecycleError<Redemption>>),
     #[error("Redemption error: {0}")]
     Redemption(#[from] RedemptionError),
     #[error("Invalid aggregate state: {current_state}")]
@@ -1361,21 +1402,12 @@ pub(crate) enum BurnManagerError {
 mod tests {
     use alloy::primitives::{Address, Bytes, U256, address, b256, uint};
     use chrono::Utc;
-    use cqrs_es::{
-        AggregateContext, EventStore,
-        persist::{GenericQuery, PersistedEventStore},
-    };
     use event_sorcery::{Store, StoreBuilder, test_store};
     use fireblocks_sdk::models::TransactionStatus;
     use rust_decimal::Decimal;
-    use sqlite_es::{
-        SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
-    };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use tracing_test::traced_test;
-
-    use crate::redemption::BurnExternalTxId;
 
     use super::{
         BurnManager, BurnManagerError, Redemption, RedemptionCommand,
@@ -1388,8 +1420,11 @@ mod tests {
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
-    use crate::redemption::view::RedemptionView;
-    use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
+    use crate::redemption::BurnExternalTxId;
+    use crate::redemption::view::RedemptionViewReactor;
+    use crate::redemption::{
+        BurnRecord, IssuerRedemptionRequestId, RedemptionError,
+    };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
@@ -1469,12 +1504,8 @@ mod tests {
         assert!(!should_release_reserved_burn(&VaultError::InvalidReceipt));
     }
 
-    type TestCqrs = SqliteCqrs<Redemption>;
-    type TestStore = PersistedEventStore<SqliteEventRepository, Redemption>;
-
     struct TestHarness {
-        cqrs: Arc<TestCqrs>,
-        store: Arc<TestStore>,
+        store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         receipt_inventory_store: Arc<Store<ReceiptInventory>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
@@ -1499,26 +1530,18 @@ mod tests {
                 .await
                 .expect("Failed to run migrations");
 
-            let redemption_view_repo = Arc::new(SqliteViewRepository::<
-                RedemptionView,
-                Redemption,
-            >::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
-
-            let redemption_query = GenericQuery::new(redemption_view_repo);
-
             let vault_service: Arc<dyn crate::vault::VaultService> =
                 vault_mock.clone();
-            let cqrs = Arc::new(sqlite_cqrs(
-                pool.clone(),
-                vec![Box::new(redemption_query)],
-                vault_service,
-            ));
 
-            let repo = SqliteEventRepository::new(pool.clone());
-            let store = Arc::new(PersistedEventStore::new_event_store(repo));
+            // Redemption has no canonical Table projection; its query-facing
+            // `redemption_view` is maintained by an explicit reactor, so the
+            // test store wires the same reactor production uses to keep
+            // `find_burning`/`find_burn_failed` populated during recovery.
+            let store = StoreBuilder::<Redemption>::new(pool.clone())
+                .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
+                .build(vault_service)
+                .await
+                .expect("Failed to build redemption store");
 
             let receipt_inventory_store =
                 Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
@@ -1534,7 +1557,6 @@ mod tests {
             ));
 
             Self {
-                cqrs,
                 store,
                 receipt_service,
                 receipt_inventory_store,
@@ -1593,8 +1615,7 @@ mod tests {
     }
 
     async fn create_test_redemption_in_burning_state(
-        cqrs: &TestCqrs,
-        store: &TestStore,
+        store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
         let tokenization_request_id =
@@ -1608,59 +1629,60 @@ mod tests {
         );
         let block_number = 12345;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity: quantity.clone(),
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    wallet,
+                    quantity: quantity.clone(),
+                    tx_hash,
+                    block_number,
+                },
+            )
+            .await
+            .unwrap();
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: issuer_request_id.clone(),
-                tokenization_request_id,
-                alpaca_quantity: quantity,
-                dust_quantity: Quantity::new(Decimal::ZERO),
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    alpaca_quantity: quantity,
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                },
+            )
+            .await
+            .unwrap();
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
 
         load_aggregate(store, issuer_request_id).await
     }
 
     async fn load_aggregate(
-        store: &TestStore,
+        store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
-        let mut context =
-            store.load_aggregate(&issuer_request_id.to_string()).await.unwrap();
-        context.aggregate().clone()
+        store.load(issuer_request_id).await.unwrap().unwrap()
     }
 
     #[tokio::test]
     async fn test_handle_burning_started_with_success() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1671,7 +1693,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -1687,12 +1708,9 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -1729,7 +1747,7 @@ mod tests {
                 .with_verified_burn(45_989_009, uint!(17_U256)),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1740,19 +1758,14 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         // Seed a held reservation so the test fails if force-complete stops
         // settling inventory after terminalizing the aggregate.
@@ -1827,7 +1840,7 @@ mod tests {
         let vault_mock =
             Arc::new(MockVaultService::new_success().with_unverifiable_burn());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1838,19 +1851,14 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         let result = manager
             .force_complete_burn(
@@ -1881,7 +1889,7 @@ mod tests {
         let vault_mock =
             Arc::new(MockVaultService::new_success().with_reverted_burn());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1892,19 +1900,14 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         let result = manager
             .force_complete_burn(
@@ -1932,14 +1935,13 @@ mod tests {
     async fn test_force_complete_burn_rejects_non_burning_state() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -1971,7 +1973,7 @@ mod tests {
     async fn test_handle_burning_started_passes_retry_external_tx_id() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -1982,7 +1984,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2003,12 +2004,9 @@ mod tests {
         // Thread the retry externalTxId through a real persisted BurnResumed
         // event (Failed → Burning) so we verify the full apply path, not an
         // in-memory mutation.
-        let burning = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let burning =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let Redemption::Burning {
             metadata,
@@ -2023,33 +2021,35 @@ mod tests {
             panic!("Expected Burning state, got {burning:?}");
         };
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "burn failed".to_string(),
-                fireblocks_tx_id: None,
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("RecordBurnFailure failed");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "burn failed".to_string(),
+                    fireblocks_tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::ResumeBurn {
-                issuer_request_id: issuer_request_id.clone(),
-                metadata,
-                tokenization_request_id,
-                alpaca_quantity,
-                dust_quantity,
-                called_at,
-                alpaca_journal_completed_at,
-                external_tx_id: Some(retry_external_tx_id.clone()),
-            },
-        )
-        .await
-        .expect("ResumeBurn failed");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ResumeBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    metadata,
+                    tokenization_request_id,
+                    alpaca_quantity,
+                    dust_quantity,
+                    called_at,
+                    alpaca_journal_completed_at,
+                    external_tx_id: Some(retry_external_tx_id.clone()),
+                },
+            )
+            .await
+            .expect("ResumeBurn failed");
 
         let aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -2076,7 +2076,6 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness {
-            cqrs,
             store,
             receipt_service,
             receipt_inventory_store,
@@ -2093,7 +2092,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2132,12 +2130,9 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2166,7 +2161,6 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness {
-            cqrs,
             store,
             receipt_service,
             receipt_inventory_store,
@@ -2183,7 +2177,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2224,12 +2217,9 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2253,7 +2243,7 @@ mod tests {
     async fn test_handle_burning_started_with_blockchain_failure() {
         let vault_mock = Arc::new(MockVaultService::new_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2264,7 +2254,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2280,19 +2269,21 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(BurnManagerError::Vault(_))),
+            matches!(
+                result,
+                Err(BurnManagerError::Redemption(
+                    RedemptionError::Vault { .. }
+                ))
+            ),
             "Expected blockchain error, got {result:?}"
         );
 
@@ -2331,7 +2322,7 @@ mod tests {
     async fn test_burn_submission_failure_retains_reservation() {
         let vault_mock = Arc::new(MockVaultService::new_submit_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
@@ -2341,7 +2332,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2356,20 +2346,23 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(BurnManagerError::Vault(_))),
-            "Expected submission failure, got {result:?}"
+            matches!(
+                result,
+                Err(BurnManagerError::Redemption(RedemptionError::Vault {
+                    release_reservation: false,
+                    ..
+                }))
+            ),
+            "Expected submission failure that retains the reservation, got {result:?}"
         );
 
         assert!(
@@ -2390,7 +2383,7 @@ mod tests {
     async fn test_submit_revert_releases_reservation() {
         let vault_mock = Arc::new(MockVaultService::new_submit_revert());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
@@ -2400,7 +2393,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2415,20 +2407,23 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(BurnManagerError::Vault(_))),
-            "Expected a revert submission failure, got {result:?}"
+            matches!(
+                result,
+                Err(BurnManagerError::Redemption(RedemptionError::Vault {
+                    release_reservation: true,
+                    ..
+                }))
+            ),
+            "Expected a revert submission failure that releases the reservation, got {result:?}"
         );
 
         assert!(
@@ -2449,7 +2444,7 @@ mod tests {
     async fn test_confirm_revert_releases_reservation() {
         let vault_mock = Arc::new(MockVaultService::new_confirm_revert());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
@@ -2459,7 +2454,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2474,20 +2468,23 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
             .await;
 
         assert!(
-            matches!(result, Err(BurnManagerError::Vault(_))),
-            "Expected a revert confirmation failure, got {result:?}"
+            matches!(
+                result,
+                Err(BurnManagerError::Redemption(RedemptionError::Vault {
+                    release_reservation: true,
+                    ..
+                }))
+            ),
+            "Expected a revert confirmation failure that releases the reservation, got {result:?}"
         );
 
         assert!(
@@ -2503,7 +2500,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_burning_started_with_insufficient_balance() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2514,7 +2511,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2522,12 +2518,9 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2553,13 +2546,12 @@ mod tests {
     #[tokio::test]
     async fn test_handle_burning_started_with_wrong_state_fails() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2575,20 +2567,21 @@ mod tests {
         );
         let block_number = 54321;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                },
+            )
+            .await
+            .unwrap();
 
         let aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -2609,7 +2602,7 @@ mod tests {
     async fn test_complete_redemption_with_burn() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2620,7 +2613,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2636,12 +2628,9 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2662,7 +2651,7 @@ mod tests {
     #[tokio::test]
     async fn test_partial_burn_receipt_remains_active() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying_symbol = UnderlyingSymbol::new("AAPL");
@@ -2673,7 +2662,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2700,41 +2688,44 @@ mod tests {
         );
         let block_number = 22222;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying: underlying.clone(),
-                token,
-                wallet,
-                quantity: quantity.clone(),
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying: underlying.clone(),
+                    token,
+                    wallet,
+                    quantity: quantity.clone(),
+                    tx_hash,
+                    block_number,
+                },
+            )
+            .await
+            .unwrap();
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: issuer_request_id.clone(),
-                tokenization_request_id,
-                alpaca_quantity: quantity,
-                dust_quantity: Quantity::new(Decimal::ZERO),
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id,
+                    alpaca_quantity: quantity,
+                    dust_quantity: Quantity::new(Decimal::ZERO),
+                },
+            )
+            .await
+            .unwrap();
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
 
         let aggregate = load_aggregate(store, &issuer_request_id).await;
 
@@ -2755,7 +2746,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_depletes_receipt() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2766,7 +2757,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2782,12 +2772,9 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2806,7 +2793,7 @@ mod tests {
     #[tokio::test]
     async fn test_burn_with_multiple_receipts() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2817,7 +2804,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2841,12 +2827,9 @@ mod tests {
             )
             .await;
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2865,7 +2848,7 @@ mod tests {
     #[tokio::test]
     async fn test_insufficient_balance_scenario() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2876,7 +2859,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2884,12 +2866,9 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        let aggregate = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let aggregate =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let result = manager
             .handle_burning_started(&issuer_request_id, &aggregate)
@@ -2915,13 +2894,12 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_redemptions_empty() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2934,7 +2912,7 @@ mod tests {
     async fn test_recover_burning_redemptions_with_valid_redemption() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2945,7 +2923,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -2961,12 +2938,8 @@ mod tests {
             )
             .await;
 
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         manager.recover_burning_redemptions().await;
 
@@ -2983,7 +2956,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_skips_when_balance_insufficient() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -2999,7 +2972,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3008,12 +2980,8 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
         // Create a redemption in Burning state (needs 100 shares)
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         // Recovery should skip this redemption without attempting burn
         manager.recover_burning_redemptions().await;
@@ -3037,14 +3005,13 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burning_skips_non_burning_state() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3061,20 +3028,21 @@ mod tests {
         );
         let block_number = 12345;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::Detect {
-                issuer_request_id: issuer_request_id.clone(),
-                underlying,
-                token,
-                wallet,
-                quantity,
-                tx_hash,
-                block_number,
-            },
-        )
-        .await
-        .unwrap();
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: issuer_request_id.clone(),
+                    underlying,
+                    token,
+                    wallet,
+                    quantity,
+                    tx_hash,
+                    block_number,
+                },
+            )
+            .await
+            .unwrap();
 
         manager.recover_burning_redemptions().await;
 
@@ -3096,7 +3064,7 @@ mod tests {
     async fn test_recover_burn_failed_redemptions() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3106,7 +3074,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3123,25 +3090,22 @@ mod tests {
             .await;
 
         // Create redemption and progress to Burning state
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         // Record burn failure to transition to Failed/BurnFailed
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "Initial burn failed".to_string(),
-                fireblocks_tx_id: None,
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Initial burn failed".to_string(),
+                    fireblocks_tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         // Verify aggregate is in Failed state
         let aggregate = load_aggregate(store, &issuer_request_id).await;
@@ -3182,7 +3146,7 @@ mod tests {
             ),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3192,7 +3156,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3208,12 +3171,9 @@ mod tests {
             )
             .await;
 
-        let burning = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let burning =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let Redemption::Burning { metadata, .. } = &burning else {
             panic!("Expected Burning state, got {burning:?}");
@@ -3221,17 +3181,18 @@ mod tests {
         let detected_tx_hash = metadata.detected_tx_hash;
 
         // Fail with a recorded Fireblocks tx ID so recovery inspects it.
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "Terminal Fireblocks failure".to_string(),
-                fireblocks_tx_id: Some("fb-failed-123".to_string()),
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Terminal Fireblocks failure".to_string(),
+                    fireblocks_tx_id: Some("fb-failed-123".to_string()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         manager.recover_burn_failed_redemptions().await;
 
@@ -3282,7 +3243,7 @@ mod tests {
             ),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3292,7 +3253,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3308,12 +3268,9 @@ mod tests {
             )
             .await;
 
-        let burning = create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        let burning =
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
 
         let Redemption::Burning { metadata, .. } = &burning else {
             panic!("Expected Burning state, got {burning:?}");
@@ -3325,36 +3282,38 @@ mod tests {
         // Seed a prior replacement burn submission (retry-1) into history so
         // recovery must derive the next id by scanning history, not via the
         // no-prior-submission fallback (which would yield retry-1).
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::BurnTokens {
-                issuer_request_id: issuer_request_id.clone(),
-                vault,
-                burns: vec![MultiBurnEntry {
-                    receipt_id: uint!(99_U256),
-                    burn_shares: uint!(100_000000000000000000_U256),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: uint!(0_U256),
-                owner: TEST_WALLET,
-                external_tx_id: Some(prior_retry_id),
-            },
-        )
-        .await
-        .expect("Failed to seed prior burn submission");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(99_U256),
+                        burn_shares: uint!(100_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: uint!(0_U256),
+                    owner: TEST_WALLET,
+                    external_tx_id: Some(prior_retry_id),
+                },
+            )
+            .await
+            .expect("Failed to seed prior burn submission");
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "Replacement burn terminally failed".to_string(),
-                fireblocks_tx_id: Some("mock-fb-burn".to_string()),
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Replacement burn terminally failed".to_string(),
+                    fireblocks_tx_id: Some("mock-fb-burn".to_string()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         manager.recover_burn_failed_redemptions().await;
 
@@ -3388,7 +3347,7 @@ mod tests {
                 .with_fireblocks_tx_status(FireblocksTxStatus::Pending),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3398,7 +3357,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3414,24 +3372,22 @@ mod tests {
             )
             .await;
 
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "Recorded failure while tx still pending".to_string(),
-                fireblocks_tx_id: Some("fb-pending-123".to_string()),
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Recorded failure while tx still pending"
+                        .to_string(),
+                    fireblocks_tx_id: Some("fb-pending-123".to_string()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         manager.recover_burn_failed_redemptions().await;
 
@@ -3469,7 +3425,7 @@ mod tests {
             ),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3479,7 +3435,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3495,25 +3450,22 @@ mod tests {
             )
             .await;
 
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "Recorded failure though tx actually completed"
-                    .to_string(),
-                fireblocks_tx_id: Some("fb-completed-123".to_string()),
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "Recorded failure though tx actually completed"
+                        .to_string(),
+                    fireblocks_tx_id: Some("fb-completed-123".to_string()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         manager.recover_burn_failed_redemptions().await;
 
@@ -3539,7 +3491,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burn_failed_skips_when_balance_insufficient() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3555,7 +3507,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3571,24 +3522,21 @@ mod tests {
             )
             .await;
 
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "RPC timeout".to_string(),
-                fireblocks_tx_id: None,
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "RPC timeout".to_string(),
+                    fireblocks_tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         let aggregate = load_aggregate(store, &issuer_request_id).await;
         assert!(
@@ -3618,7 +3566,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_burn_failed_marks_failed_when_balance_insufficient() {
         let harness = setup_test_environment().await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3633,7 +3581,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3641,24 +3588,21 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "ERC1155: burn amount exceeds balance".to_string(),
-                fireblocks_tx_id: None,
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("Failed to record burn failure");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: issuer_request_id.clone(),
+                    error: "ERC1155: burn amount exceeds balance".to_string(),
+                    fireblocks_tx_id: None,
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("Failed to record burn failure");
 
         // Recovery should auto-fail (MarkFailed) instead of just skipping
         manager.recover_burn_failed_redemptions().await;
@@ -3693,7 +3637,7 @@ mod tests {
     async fn test_recover_burn_submitted_confirms_existing_transaction() {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
-        let TestHarness { cqrs, store, receipt_service, pool, .. } = &harness;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let underlying = UnderlyingSymbol::new("AAPL");
@@ -3704,7 +3648,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             pool.clone(),
-            cqrs.clone(),
             store.clone(),
             receipt_service.clone(),
             TEST_WALLET,
@@ -3721,34 +3664,31 @@ mod tests {
             .await;
 
         // Drive redemption to Burning state
-        create_test_redemption_in_burning_state(
-            cqrs,
-            store,
-            &issuer_request_id,
-        )
-        .await;
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
 
         // Issue BurnTokens directly to stop at BurnSubmitted (simulating
         // a crash between submit and confirm). This calls submit_burn on
         // the mock and emits BurnFireblocksSubmitted without confirming.
-        cqrs.execute(
-            &issuer_request_id.to_string(),
-            RedemptionCommand::BurnTokens {
-                issuer_request_id: issuer_request_id.clone(),
-                vault,
-                burns: vec![crate::vault::MultiBurnEntry {
-                    receipt_id: uint!(99_U256),
-                    burn_shares: uint!(100_000000000000000000_U256),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner: TEST_WALLET,
-                external_tx_id: None,
-            },
-        )
-        .await
-        .expect("BurnTokens should succeed");
+        store
+            .send(
+                &issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault,
+                    burns: vec![crate::vault::MultiBurnEntry {
+                        receipt_id: uint!(99_U256),
+                        burn_shares: uint!(100_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: TEST_WALLET,
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("BurnTokens should succeed");
 
         // Verify aggregate is in BurnSubmitted state
         let aggregate = load_aggregate(store, &issuer_request_id).await;
@@ -3817,7 +3757,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             harness.pool.clone(),
-            harness.cqrs.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
@@ -3842,7 +3781,6 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let aggregate = create_test_redemption_in_burning_state(
-            &harness.cqrs,
             &harness.store,
             &issuer_request_id,
         )
@@ -3898,7 +3836,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             harness.pool.clone(),
-            harness.cqrs.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,
@@ -3915,7 +3852,6 @@ mod tests {
         // Drive the redemption to Failed (the failing mock fails the burn).
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let aggregate = create_test_redemption_in_burning_state(
-            &harness.cqrs,
             &harness.store,
             &issuer_request_id,
         )
@@ -3962,7 +3898,6 @@ mod tests {
         let manager = BurnManager::new(
             blockchain_service,
             harness.pool.clone(),
-            harness.cqrs.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
             TEST_WALLET,

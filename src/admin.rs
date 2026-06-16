@@ -1,8 +1,8 @@
 use alloy::primitives::B256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, AggregateError, EventStore};
-use event_sorcery::Store;
+use cqrs_es::AggregateError;
+use event_sorcery::{EventSourced, LifecycleError, Store};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
@@ -33,7 +33,6 @@ use crate::tokenized_asset::UnderlyingSymbol;
 use crate::vault::{
     BurnVerification, FireblocksTxStatus, VaultError, VaultService,
 };
-use crate::{RedemptionCqrs, RedemptionEventStore, SqliteEventStore};
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -54,7 +53,7 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
 }
 
 #[async_trait]
-impl RedemptionBurnRecovery for BurnManager<SqliteEventStore<Redemption>> {
+impl RedemptionBurnRecovery for BurnManager {
     async fn execute_recovered_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -159,28 +158,51 @@ struct ReprocessContext {
 /// because the view's `Failed` state collapses pre-Alpaca and post-Alpaca
 /// failures into the same variant.
 async fn load_reprocess_context(
-    event_store: &RedemptionEventStore,
-    aggregate_id: &str,
+    pool: &Pool<Sqlite>,
+    aggregate_id: &IssuerRedemptionRequestId,
 ) -> Result<ReprocessContext, Status> {
-    let events =
-        event_store.load_events(aggregate_id).await.map_err(|err| {
-            error!(target: "admin", aggregate_id = aggregate_id,
+    let aggregate_id_str = aggregate_id.to_string();
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+        ORDER BY sequence
+        "#,
+        aggregate_id_str
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|err| {
+        error!(target: "admin", aggregate_id = %aggregate_id_str,
+            error = %err,
+            "Failed to load redemption events"
+        );
+        Status::InternalServerError
+    })?;
+
+    if rows.is_empty() {
+        return Err(Status::NotFound);
+    }
+
+    let events: Vec<RedemptionEvent> = rows
+        .iter()
+        .map(|row| serde_json::from_str(&row.payload))
+        .collect::<Result<_, _>>()
+        .map_err(|err: serde_json::Error| {
+            error!(target: "admin", aggregate_id = %aggregate_id_str,
                 error = %err,
-                "Failed to load redemption events"
+                "Failed to deserialize redemption events"
             );
             Status::InternalServerError
         })?;
-
-    if events.is_empty() {
-        return Err(Status::NotFound);
-    }
 
     let mut metadata = None;
     let mut alpaca_called = None;
     let mut burning_failed = None;
 
     for event in &events {
-        match &event.payload {
+        match event {
             RedemptionEvent::Detected {
                 issuer_request_id,
                 underlying,
@@ -233,7 +255,7 @@ async fn load_reprocess_context(
     }
 
     let Some(metadata) = metadata else {
-        error!(target: "admin", aggregate_id = aggregate_id,
+        error!(target: "admin", aggregate_id = %aggregate_id_str,
             "No Detected event found in redemption event history"
         );
         return Err(Status::InternalServerError);
@@ -242,10 +264,10 @@ async fn load_reprocess_context(
     let burn_retry_external_tx_id =
         next_burn_retry_external_tx_id_from_history(
             &metadata.detected_tx_hash,
-            events.iter().map(|event| &event.payload),
+            events.iter(),
         )
         .map_err(|error| {
-            error!(target: "admin", aggregate_id = aggregate_id,
+            error!(target: "admin", aggregate_id = %aggregate_id_str,
                 %error,
                 "Failed to compute next burn retry external tx id"
             );
@@ -269,8 +291,8 @@ async fn load_reprocess_context(
 ///   Refuses if Alpaca's journal hasn't completed (to avoid burning without backing).
 #[tracing::instrument(skip(
     _auth,
-    cqrs,
-    event_store,
+    store,
+    pool,
     alpaca_service,
     vault_service,
     burn_recovery
@@ -278,8 +300,8 @@ async fn load_reprocess_context(
 #[post("/admin/recover/redemption/<issuer_request_id>")]
 pub(crate) async fn recover_redemption(
     _auth: InternalAuth,
-    cqrs: &rocket::State<RedemptionCqrs>,
-    event_store: &rocket::State<RedemptionEventStore>,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
@@ -288,12 +310,12 @@ pub(crate) async fn recover_redemption(
     let aggregate_id = issuer_request_id.to_string();
 
     let context =
-        load_reprocess_context(event_store.inner(), &aggregate_id).await?;
+        load_reprocess_context(pool.inner(), &issuer_request_id).await?;
 
     let Some(alpaca_data) = context.alpaca_called else {
         // Pre-Alpaca failure: safe to reset to Detected and re-call Alpaca.
         return recover_pre_alpaca(
-            cqrs,
+            store,
             &aggregate_id,
             issuer_request_id,
             context.metadata,
@@ -303,7 +325,7 @@ pub(crate) async fn recover_redemption(
 
     // Post-Alpaca failure: verify with Alpaca before burning.
     recover_post_alpaca(
-        cqrs,
+        store,
         alpaca_service,
         vault_service.inner(),
         burn_recovery.inner(),
@@ -320,26 +342,27 @@ pub(crate) async fn recover_redemption(
 }
 
 async fn recover_pre_alpaca(
-    cqrs: &RedemptionCqrs,
+    store: &Store<Redemption>,
     aggregate_id: &str,
     issuer_request_id: IssuerRedemptionRequestId,
     metadata: RedemptionMetadata,
 ) -> Result<Json<ReprocessResponse>, Status> {
-    cqrs.execute(
-        aggregate_id,
-        RedemptionCommand::Reprocess {
-            issuer_request_id: issuer_request_id.clone(),
-            metadata,
-        },
-    )
-    .await
-    .map_err(|err| {
-        error!(target: "admin", aggregate_id = %aggregate_id,
-            error = %err,
-            "Failed to recover redemption (pre-Alpaca)"
-        );
-        map_redemption_error(&err)
-    })?;
+    store
+        .send(
+            &issuer_request_id,
+            RedemptionCommand::Reprocess {
+                issuer_request_id: issuer_request_id.clone(),
+                metadata,
+            },
+        )
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to recover redemption (pre-Alpaca)"
+            );
+            map_redemption_error(&err)
+        })?;
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         "Redemption recovered from Failed to Detected"
@@ -366,7 +389,7 @@ struct PostAlpacaRecoveryInput {
 }
 
 async fn recover_post_alpaca(
-    cqrs: &RedemptionCqrs,
+    store: &Store<Redemption>,
     alpaca_service: &Arc<dyn AlpacaService>,
     vault_service: &Arc<dyn VaultService>,
     burn_recovery: &Arc<dyn RedemptionBurnRecovery>,
@@ -450,7 +473,7 @@ async fn recover_post_alpaca(
     // If a Fireblocks tx ID was recorded on a previous BurningFailed event,
     // inspect it before deciding whether to record the existing burn or resume.
     let burn_retry_external_tx_id = match inspect_prior_fireblocks_burn(
-        cqrs,
+        store,
         vault_service,
         &aggregate_id,
         &issuer_request_id,
@@ -474,27 +497,28 @@ async fn recover_post_alpaca(
     };
     let alpaca_journal_completed_at = *alpaca_journal_completed_at;
 
-    cqrs.execute(
-        &aggregate_id,
-        RedemptionCommand::ResumeBurn {
-            issuer_request_id: issuer_request_id.clone(),
-            metadata,
-            tokenization_request_id: alpaca_data.tokenization_request_id,
-            alpaca_quantity: alpaca_data.alpaca_quantity,
-            dust_quantity: alpaca_data.dust_quantity,
-            called_at: alpaca_data.called_at,
-            alpaca_journal_completed_at,
-            external_tx_id: burn_retry_external_tx_id,
-        },
-    )
-    .await
-    .map_err(|err| {
-        error!(target: "admin", aggregate_id = %aggregate_id,
-            error = %err,
-            "Failed to recover redemption (post-Alpaca)"
-        );
-        map_redemption_error(&err)
-    })?;
+    store
+        .send(
+            &issuer_request_id,
+            RedemptionCommand::ResumeBurn {
+                issuer_request_id: issuer_request_id.clone(),
+                metadata,
+                tokenization_request_id: alpaca_data.tokenization_request_id,
+                alpaca_quantity: alpaca_data.alpaca_quantity,
+                dust_quantity: alpaca_data.dust_quantity,
+                called_at: alpaca_data.called_at,
+                alpaca_journal_completed_at,
+                external_tx_id: burn_retry_external_tx_id,
+            },
+        )
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to recover redemption (post-Alpaca)"
+            );
+            map_redemption_error(&err)
+        })?;
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         "Redemption recovered from Failed to Burning"
@@ -536,7 +560,7 @@ enum PriorBurnDisposition {
 /// pending (cannot recover yet), or terminally failed (resume with a fresh
 /// replacement `externalTxId`).
 async fn inspect_prior_fireblocks_burn(
-    cqrs: &RedemptionCqrs,
+    store: &Store<Redemption>,
     vault_service: &Arc<dyn VaultService>,
     aggregate_id: &str,
     issuer_request_id: &IssuerRedemptionRequestId,
@@ -569,24 +593,25 @@ async fn inspect_prior_fireblocks_burn(
                 "Fireblocks tx already completed on-chain, recording existing burn"
             );
 
-            cqrs.execute(
-                aggregate_id,
-                RedemptionCommand::RecordExistingBurn {
-                    issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: fb_tx_id.clone(),
-                    tx_hash,
-                    planned_burns: bf_data.planned_burns.clone(),
-                    block_number,
-                },
-            )
-            .await
-            .map_err(|err| {
-                error!(target: "admin", aggregate_id = %aggregate_id,
-                    error = %err,
-                    "Failed to record existing burn"
-                );
-                map_redemption_error(&err)
-            })?;
+            store
+                .send(
+                    issuer_request_id,
+                    RedemptionCommand::RecordExistingBurn {
+                        issuer_request_id: issuer_request_id.clone(),
+                        fireblocks_tx_id: fb_tx_id.clone(),
+                        tx_hash,
+                        planned_burns: bf_data.planned_burns.clone(),
+                        block_number,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    error!(target: "admin", aggregate_id = %aggregate_id,
+                        error = %err,
+                        "Failed to record existing burn"
+                    );
+                    map_redemption_error(&err)
+                })?;
 
             Ok(PriorBurnDisposition::AlreadyRecorded(ReprocessResponse {
                 aggregate_type: AggregateKind::Redemption,
@@ -684,11 +709,13 @@ fn report_recovery_outcome(
     }
 }
 
-const fn map_redemption_error(err: &AggregateError<RedemptionError>) -> Status {
+const fn map_redemption_error(
+    err: &AggregateError<LifecycleError<Redemption>>,
+) -> Status {
     match err {
-        AggregateError::UserError(RedemptionError::AlreadyCompleted {
-            ..
-        }) => Status::Conflict,
+        AggregateError::UserError(LifecycleError::Apply(
+            RedemptionError::AlreadyCompleted { .. },
+        )) => Status::Conflict,
         AggregateError::UserError(_) => Status::UnprocessableEntity,
         _ => Status::InternalServerError,
     }
@@ -707,7 +734,7 @@ pub(crate) struct CloseRedemptionRequest {
 /// off-chain reconciliation). For a redemption whose burn *did* land on-chain,
 /// use `/admin/force-complete/redemption` instead. Closed redemptions do not
 /// appear in stuck queries.
-#[tracing::instrument(skip(_auth, cqrs, event_store))]
+#[tracing::instrument(skip(_auth, store, pool))]
 #[post(
     "/admin/close/redemption/<issuer_request_id>",
     format = "json",
@@ -715,32 +742,32 @@ pub(crate) struct CloseRedemptionRequest {
 )]
 pub(crate) async fn close_redemption(
     _auth: InternalAuth,
-    cqrs: &rocket::State<RedemptionCqrs>,
-    event_store: &rocket::State<RedemptionEventStore>,
+    store: &rocket::State<Arc<Store<Redemption>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
     issuer_request_id: IssuerRedemptionRequestId,
     body: Json<CloseRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let aggregate_id = issuer_request_id.to_string();
 
-    cqrs.execute(
-        &aggregate_id,
-        RedemptionCommand::CloseRedemption {
-            issuer_request_id: issuer_request_id.clone(),
-            reason: body.into_inner().reason,
-        },
-    )
-    .await
-    .map_err(|err| {
-        error!(target: "admin", aggregate_id = %aggregate_id,
-            error = %err,
-            "Failed to close redemption"
-        );
-        map_redemption_error(&err)
-    })?;
+    store
+        .send(
+            &issuer_request_id,
+            RedemptionCommand::CloseRedemption {
+                issuer_request_id: issuer_request_id.clone(),
+                reason: body.into_inner().reason,
+            },
+        )
+        .await
+        .map_err(|err| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %err,
+                "Failed to close redemption"
+            );
+            map_redemption_error(&err)
+        })?;
 
     let previous_state =
-        redemption_state_before_last_event(event_store.inner(), &aggregate_id)
-            .await?;
+        redemption_state_before_last_event(pool.inner(), &aggregate_id).await?;
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         previous_state = %previous_state,
@@ -772,7 +799,7 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 /// shares) before the redemption is moved to `Completed`, recording the proving
 /// tx hash for audit. Ambiguous cases with no verifiable on-chain burn are
 /// rejected (`422`) — use `/admin/close/redemption` for those.
-#[tracing::instrument(skip(_auth, event_store, burn_recovery))]
+#[tracing::instrument(skip(_auth, pool, burn_recovery))]
 #[post(
     "/admin/force-complete/redemption/<issuer_request_id>",
     format = "json",
@@ -780,7 +807,7 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 )]
 pub(crate) async fn force_complete_redemption(
     _auth: InternalAuth,
-    event_store: &rocket::State<RedemptionEventStore>,
+    pool: &rocket::State<Pool<Sqlite>>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
     body: Json<ForceCompleteRedemptionRequest>,
@@ -801,8 +828,7 @@ pub(crate) async fn force_complete_redemption(
         })?;
 
     let previous_state =
-        redemption_state_before_last_event(event_store.inner(), &aggregate_id)
-            .await?;
+        redemption_state_before_last_event(pool.inner(), &aggregate_id).await?;
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         burn_tx_hash = ?burn_tx_hash,
@@ -834,25 +860,57 @@ pub(crate) async fn force_complete_redemption(
 /// pre-transition state. An aggregate with no prior events resolves to
 /// `Uninitialized`.
 async fn redemption_state_before_last_event(
-    event_store: &RedemptionEventStore,
+    pool: &Pool<Sqlite>,
     aggregate_id: &str,
 ) -> Result<String, Status> {
-    let events =
-        event_store.load_events(aggregate_id).await.map_err(|err| {
-            error!(target: "admin", aggregate_id = %aggregate_id,
-                error = %err,
-                "Failed to load redemption events"
-            );
-            Status::InternalServerError
-        })?;
+    let rows = sqlx::query!(
+        r#"
+        SELECT payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+        ORDER BY sequence
+        "#,
+        aggregate_id
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|err| {
+        error!(target: "admin", aggregate_id = %aggregate_id,
+            error = %err,
+            "Failed to load redemption events"
+        );
+        Status::InternalServerError
+    })?;
 
-    let mut prior = Redemption::default();
-    let pre_terminal = events.len().saturating_sub(1);
-    for envelope in events.into_iter().take(pre_terminal) {
-        prior.apply(envelope.payload);
+    let pre_terminal = rows.len().saturating_sub(1);
+    let mut prior: Option<Redemption> = None;
+    for row in rows.into_iter().take(pre_terminal) {
+        let event: RedemptionEvent = serde_json::from_str(&row.payload)
+            .map_err(|err| {
+                error!(target: "admin", aggregate_id = %aggregate_id,
+                    error = %err,
+                    "Failed to deserialize redemption event"
+                );
+                Status::InternalServerError
+            })?;
+        prior = match prior {
+            None => Redemption::originate(&event),
+            Some(state) => {
+                Redemption::evolve(&state, &event).map_err(|err| {
+                    error!(target: "admin", aggregate_id = %aggregate_id,
+                        error = %err,
+                        "Failed to evolve redemption state"
+                    );
+                    Status::InternalServerError
+                })?
+            }
+        };
     }
 
-    Ok(prior.state_name().to_string())
+    Ok(prior.map_or_else(
+        || "Uninitialized".to_string(),
+        |state| state.state_name().to_string(),
+    ))
 }
 
 /// Maps a burn-manager failure to an HTTP status for the force-complete
@@ -1014,17 +1072,11 @@ pub(crate) async fn close_mint(
 /// leaves a redemption in `Burning` indefinitely with no terminal event).
 const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 
-#[tracing::instrument(skip(
-    _auth,
-    pool,
-    redemption_event_store,
-    vault_service
-))]
+#[tracing::instrument(skip(_auth, pool, vault_service))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-    redemption_event_store: &rocket::State<RedemptionEventStore>,
     vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
@@ -1045,8 +1097,8 @@ pub(crate) async fn list_stuck(
         }
 
         let history = redemption_history_summary(
-            redemption_event_store.inner(),
-            &issuer_redemption_request_id.to_string(),
+            pool.inner(),
+            &issuer_redemption_request_id,
         )
         .await;
 
@@ -1320,16 +1372,33 @@ struct RedemptionHistorySummary {
     fireblocks_tx_id: Option<String>,
 }
 
+/// Summarizes a redemption's history for the `/admin/stuck` metadata lookup.
+///
+/// Reads the raw `RedemptionEvent` payloads straight from the `events` table.
+/// `event_sorcery::Store` exposes no event-log read, so the history is loaded
+/// with a direct query rather than through the aggregate store.
 async fn redemption_history_summary(
-    event_store: &crate::SqliteEventStore<crate::redemption::Redemption>,
-    aggregate_id: &str,
+    pool: &Pool<Sqlite>,
+    aggregate_id: &IssuerRedemptionRequestId,
 ) -> RedemptionHistorySummary {
-    let events = match event_store.load_events(aggregate_id).await {
-        Ok(events) => events,
+    let aggregate_id_str = aggregate_id.to_string();
+    let rows = match sqlx::query!(
+        r#"
+        SELECT payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+        ORDER BY sequence
+        "#,
+        aggregate_id_str
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
         Err(err) => {
             warn!(
                 target: "admin",
-                aggregate_id = aggregate_id,
+                aggregate_id = %aggregate_id_str,
                 error = %err,
                 "Failed to load redemption events for stuck metadata lookup"
             );
@@ -1337,9 +1406,24 @@ async fn redemption_history_summary(
         }
     };
 
-    redemption_history_summary_from_events(
-        events.into_iter().map(|event| event.payload),
-    )
+    let events = match rows
+        .into_iter()
+        .map(|row| serde_json::from_str::<RedemptionEvent>(&row.payload))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                target: "admin",
+                aggregate_id = %aggregate_id_str,
+                error = %err,
+                "Failed to deserialize redemption events for stuck metadata lookup"
+            );
+            return RedemptionHistorySummary::default();
+        }
+    };
+
+    redemption_history_summary_from_events(events)
 }
 
 /// Pure reduce: builds a `RedemptionHistorySummary` from an ordered sequence
@@ -1676,13 +1760,9 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256};
     use async_trait::async_trait;
     use chrono::Utc;
-    use cqrs_es::persist::{GenericQuery, PersistedEventStore};
-    use cqrs_es::{AggregateContext, EventStore};
+    use event_sorcery::{Store, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
-    use sqlite_es::{
-        SqliteCqrs, SqliteEventRepository, SqliteViewRepository, sqlite_cqrs,
-    };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1979,9 +2059,6 @@ mod tests {
         assert_eq!(entry.quantity, Some(metadata.quantity));
     }
 
-    type TestEventStore =
-        Arc<PersistedEventStore<SqliteEventRepository, Redemption>>;
-
     async fn setup_pool() -> sqlx::Pool<sqlx::Sqlite> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1997,171 +2074,169 @@ mod tests {
         pool
     }
 
-    fn setup_cqrs(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-    ) -> (Arc<SqliteCqrs<Redemption>>, TestEventStore) {
-        let view_repo =
-            Arc::new(SqliteViewRepository::<RedemptionView, Redemption>::new(
-                pool.clone(),
-                "redemption_view".to_string(),
-            ));
-        let query = GenericQuery::new(view_repo);
-        let vault_service = Arc::new(MockVaultService::new_success());
-        let cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(query)],
-            vault_service,
-        ));
-        let event_store = Arc::new(PersistedEventStore::new_event_store(
-            SqliteEventRepository::new(pool.clone()),
-        ));
-        (cqrs, event_store)
+    /// Builds an event-sorcery [`Store<Redemption>`] backed by the given pool,
+    /// wired with a success vault mock. No reactors are registered, so the
+    /// `redemption_view` projection stays empty — the admin paths under test
+    /// read the `events` table directly, not the view.
+    fn setup_store(pool: &sqlx::Pool<sqlx::Sqlite>) -> Arc<Store<Redemption>> {
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success());
+        Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
     }
 
-    /// Sets up an in-memory SQLite CQRS framework with a redemption in Failed
+    /// Sets up an in-memory redemption store with a redemption in Failed
     /// state (post-Alpaca, i.e. with AlpacaCalled event in history).
     async fn setup_failed_redemption() -> (
-        Arc<SqliteCqrs<Redemption>>,
-        TestEventStore,
+        Arc<Store<Redemption>>,
+        sqlx::Pool<sqlx::Sqlite>,
         RedemptionMetadata,
         AlpacaCalledData,
     ) {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
+        let store = setup_store(&pool);
 
         let metadata = test_metadata();
         let alpaca_data = test_alpaca_data();
-        let aggregate_id = metadata.issuer_request_id.to_string();
 
         // Drive aggregate to Failed state (post-Alpaca)
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::Detect {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                underlying: metadata.underlying.clone(),
-                token: metadata.token.clone(),
-                wallet: metadata.wallet,
-                quantity: metadata.quantity.clone(),
-                tx_hash: metadata.detected_tx_hash,
-                block_number: metadata.block_number,
-            },
-        )
-        .await
-        .expect("Detect failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                tokenization_request_id: alpaca_data
-                    .tokenization_request_id
-                    .clone(),
-                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
-                dust_quantity: alpaca_data.dust_quantity.clone(),
-            },
-        )
-        .await
-        .expect("RecordAlpacaCall failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::MarkFailed {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                reason: "Journal timed out".to_string(),
-            },
-        )
-        .await
-        .expect("MarkFailed failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "Journal timed out".to_string(),
+                },
+            )
+            .await
+            .expect("MarkFailed failed");
 
-        (cqrs, event_store, metadata, alpaca_data)
+        (store, pool, metadata, alpaca_data)
     }
 
     #[tokio::test]
     async fn test_load_reprocess_context_derives_retry_id_from_history() {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
+        let store = setup_store(&pool);
 
         let metadata = test_metadata();
         let alpaca_data = test_alpaca_data();
-        let aggregate_id = metadata.issuer_request_id.to_string();
 
         // Drive the redemption through a real burn submission that then fails,
         // so event history carries a BurnFireblocksSubmitted event the
         // derivation must scan — rather than injecting the retry id directly.
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::Detect {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                underlying: metadata.underlying.clone(),
-                token: metadata.token.clone(),
-                wallet: metadata.wallet,
-                quantity: metadata.quantity.clone(),
-                tx_hash: metadata.detected_tx_hash,
-                block_number: metadata.block_number,
-            },
-        )
-        .await
-        .expect("Detect failed");
-
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                tokenization_request_id: alpaca_data
-                    .tokenization_request_id
-                    .clone(),
-                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
-                dust_quantity: alpaca_data.dust_quantity.clone(),
-            },
-        )
-        .await
-        .expect("RecordAlpacaCall failed");
-
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-            },
-        )
-        .await
-        .expect("ConfirmAlpacaComplete failed");
-
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::BurnTokens {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                vault: address!("0xcccccccccccccccccccccccccccccccccccccccc"),
-                burns: vec![MultiBurnEntry {
-                    receipt_id: U256::from(99),
-                    burn_shares: U256::from(100),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner: Address::ZERO,
-                external_tx_id: Some(BurnExternalTxId::base(
-                    &metadata.detected_tx_hash,
-                )),
-            },
-        )
-        .await
-        .expect("BurnTokens failed");
-
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::RecordBurnFailure {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                error: "burn terminally failed".to_string(),
-                fireblocks_tx_id: Some("mock-fb-burn".to_string()),
-                planned_burns: vec![],
-            },
-        )
-        .await
-        .expect("RecordBurnFailure failed");
-
-        let context = load_reprocess_context(&event_store, &aggregate_id)
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
             .await
-            .expect("load_reprocess_context failed");
+            .expect("Detect failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(99),
+                        burn_shares: U256::from(100),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id: Some(BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    )),
+                },
+            )
+            .await
+            .expect("BurnTokens failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    error: "burn terminally failed".to_string(),
+                    fireblocks_tx_id: Some("mock-fb-burn".to_string()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
+
+        let context =
+            load_reprocess_context(&pool, &metadata.issuer_request_id)
+                .await
+                .expect("load_reprocess_context failed");
 
         // The base BurnFireblocksSubmitted in history must advance the derived
         // id to retry-1, proving the derivation is wired into
@@ -2186,7 +2261,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_completed_succeeds() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2200,7 +2275,7 @@ mod tests {
             burn_recovery.clone();
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &burn_recovery_state,
@@ -2227,7 +2302,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_persists_retry_external_tx_id() {
-        let (cqrs, event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2240,7 +2315,7 @@ mod tests {
             BurnExternalTxId::from_string("burn-0xabc-retry-1".to_string());
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2257,14 +2332,14 @@ mod tests {
 
         result.expect("Expected Ok response");
 
-        let mut context = event_store
-            .load_aggregate(&metadata.issuer_request_id.to_string())
+        let redemption = store
+            .load(&metadata.issuer_request_id)
             .await
-            .expect("Expected aggregate to load");
+            .expect("Expected aggregate to load")
+            .expect("Expected redemption to be initialized");
 
-        let Redemption::Burning { external_tx_id, .. } = context.aggregate()
-        else {
-            panic!("Expected Burning state, got {:?}", context.aggregate());
+        let Redemption::Burning { external_tx_id, .. } = &redemption else {
+            panic!("Expected Burning state, got {redemption:?}");
         };
 
         assert_eq!(external_tx_id, &Some(retry_external_tx_id));
@@ -2277,7 +2352,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_post_alpaca_uses_retry_id_fallback_on_terminal_failure()
      {
-        let (cqrs, event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2297,7 +2372,7 @@ mod tests {
         );
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &vault,
             &mock_burn_recovery(),
@@ -2319,14 +2394,14 @@ mod tests {
 
         result.expect("Expected Ok response");
 
-        let mut context = event_store
-            .load_aggregate(&metadata.issuer_request_id.to_string())
+        let redemption = store
+            .load(&metadata.issuer_request_id)
             .await
-            .expect("Expected aggregate to load");
+            .expect("Expected aggregate to load")
+            .expect("Expected redemption to be initialized");
 
-        let Redemption::Burning { external_tx_id, .. } = context.aggregate()
-        else {
-            panic!("Expected Burning state, got {:?}", context.aggregate());
+        let Redemption::Burning { external_tx_id, .. } = &redemption else {
+            panic!("Expected Burning state, got {redemption:?}");
         };
 
         // The terminally failed Fireblocks tx permanently blocks the base
@@ -2349,7 +2424,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_pending_returns_422() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2360,7 +2435,7 @@ mod tests {
         });
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2382,7 +2457,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_rejected_returns_422() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2393,7 +2468,7 @@ mod tests {
         });
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2415,7 +2490,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_api_error_returns_502() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Error(AlpacaError::Api {
@@ -2425,7 +2500,7 @@ mod tests {
         });
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2447,14 +2522,14 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_mint_type_returns_500() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(TokenizationRequest::Mint {}),
         });
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2479,7 +2554,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_recover_post_alpaca_field_mismatch_returns_500() {
-        let (cqrs, _event_store, metadata, alpaca_data) =
+        let (store, _pool, metadata, alpaca_data) =
             setup_failed_redemption().await;
 
         // Return a response with a different underlying symbol
@@ -2498,7 +2573,7 @@ mod tests {
             Arc::new(PollMockAlpaca { response: PollResponse::Ok(mismatched) });
 
         let result = recover_post_alpaca(
-            &cqrs,
+            &store,
             &alpaca,
             &mock_vault_service(),
             &mock_burn_recovery(),
@@ -2524,10 +2599,10 @@ mod tests {
     #[tokio::test]
     async fn test_load_reprocess_context_not_found_for_unknown_aggregate() {
         let pool = setup_pool().await;
-        let (_cqrs, event_store) = setup_cqrs(&pool);
 
         let result =
-            load_reprocess_context(&event_store, "nonexistent-id").await;
+            load_reprocess_context(&pool, &IssuerRedemptionRequestId::random())
+                .await;
 
         assert_eq!(result.err(), Some(Status::NotFound));
     }
@@ -2538,8 +2613,8 @@ mod tests {
         alpaca: Arc<dyn AlpacaService>,
     ) -> (
         rocket::Rocket<rocket::Build>,
-        Arc<SqliteCqrs<Redemption>>,
-        TestEventStore,
+        Arc<Store<Redemption>>,
+        sqlx::Pool<sqlx::Sqlite>,
     ) {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
@@ -2564,103 +2639,106 @@ mod tests {
         };
 
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
+        let store = setup_store(&pool);
 
         let rocket = rocket::build()
             .manage(config)
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs.clone())
-            .manage(event_store.clone())
+            .manage(store.clone())
+            .manage(pool.clone())
             .manage(alpaca)
             .manage(mock_vault_service())
             .manage(mock_burn_recovery())
             .mount("/", rocket::routes![super::recover_redemption]);
 
-        (rocket, cqrs, event_store)
+        (rocket, store, pool)
     }
 
     /// Drives a redemption to Failed state with only a Detected event
     /// (pre-Alpaca failure path).
     async fn setup_pre_alpaca_failure(
-        cqrs: &Arc<SqliteCqrs<Redemption>>,
+        store: &Store<Redemption>,
     ) -> RedemptionMetadata {
         let metadata = test_metadata();
-        let aggregate_id = metadata.issuer_request_id.to_string();
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::Detect {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                underlying: metadata.underlying.clone(),
-                token: metadata.token.clone(),
-                wallet: metadata.wallet,
-                quantity: metadata.quantity.clone(),
-                tx_hash: metadata.detected_tx_hash,
-                block_number: metadata.block_number,
-            },
-        )
-        .await
-        .expect("Detect failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::MarkFailed {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                reason: "Pre-Alpaca failure".to_string(),
-            },
-        )
-        .await
-        .expect("MarkFailed failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "Pre-Alpaca failure".to_string(),
+                },
+            )
+            .await
+            .expect("MarkFailed failed");
 
         metadata
     }
 
     /// Drives a redemption to Failed state after AlpacaCalled (post-Alpaca).
     async fn setup_post_alpaca_failure(
-        cqrs: &Arc<SqliteCqrs<Redemption>>,
+        store: &Store<Redemption>,
     ) -> (RedemptionMetadata, AlpacaCalledData) {
         let metadata = test_metadata();
         let alpaca_data = test_alpaca_data();
-        let aggregate_id = metadata.issuer_request_id.to_string();
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::Detect {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                underlying: metadata.underlying.clone(),
-                token: metadata.token.clone(),
-                wallet: metadata.wallet,
-                quantity: metadata.quantity.clone(),
-                tx_hash: metadata.detected_tx_hash,
-                block_number: metadata.block_number,
-            },
-        )
-        .await
-        .expect("Detect failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                tokenization_request_id: alpaca_data
-                    .tokenization_request_id
-                    .clone(),
-                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
-                dust_quantity: alpaca_data.dust_quantity.clone(),
-            },
-        )
-        .await
-        .expect("RecordAlpacaCall failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::MarkFailed {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                reason: "Journal timed out".to_string(),
-            },
-        )
-        .await
-        .expect("MarkFailed failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "Journal timed out".to_string(),
+                },
+            )
+            .await
+            .expect("MarkFailed failed");
 
         (metadata, alpaca_data)
     }
@@ -2676,8 +2754,8 @@ mod tests {
             )),
         });
 
-        let (rocket, cqrs, _event_store) = test_rocket(alpaca).await;
-        let metadata = setup_pre_alpaca_failure(&cqrs).await;
+        let (rocket, store, _pool) = test_rocket(alpaca).await;
+        let metadata = setup_pre_alpaca_failure(&store).await;
 
         let client =
             rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
@@ -2703,8 +2781,8 @@ mod tests {
     }
 
     fn post_alpaca_rocket(
-        cqrs: Arc<SqliteCqrs<Redemption>>,
-        event_store: TestEventStore,
+        store: Arc<Store<Redemption>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
         alpaca: Arc<dyn AlpacaService>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
@@ -2733,8 +2811,8 @@ mod tests {
         rocket::build()
             .manage(config)
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(cqrs)
-            .manage(event_store)
+            .manage(store)
+            .manage(pool)
             .manage(alpaca)
             .manage(mock_vault_service())
             .manage(burn_recovery)
@@ -2766,12 +2844,11 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_resumes_to_burning() {
-        // Must create a no-op mock initially; we replace the state after
-        // setup. Instead, use a single pool/cqrs and build the mock from
-        // the actual metadata produced by setup.
+        // Build the Alpaca mock from the actual metadata produced by setup so
+        // the endpoint's field validation passes.
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
-        let (metadata, alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+        let store = setup_store(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&store).await;
 
         // Now build the mock with the real metadata so field validation passes.
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
@@ -2786,7 +2863,7 @@ mod tests {
             burn_recovery.clone();
 
         let rocket =
-            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
 
         let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -2804,8 +2881,8 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_reports_skipped_burn() {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
-        let (metadata, alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+        let store = setup_store(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&store).await;
 
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2826,7 +2903,7 @@ mod tests {
             burn_recovery.clone();
 
         let rocket =
-            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
 
         let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -2846,8 +2923,8 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_burn_failure_returns_502() {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
-        let (metadata, alpaca_data) = setup_post_alpaca_failure(&cqrs).await;
+        let store = setup_store(&pool);
+        let (metadata, alpaca_data) = setup_post_alpaca_failure(&store).await;
 
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2866,7 +2943,7 @@ mod tests {
             burn_recovery.clone();
 
         let rocket =
-            post_alpaca_rocket(cqrs, event_store, alpaca, burn_recovery_state);
+            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
 
         let (status, _body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -2882,56 +2959,56 @@ mod tests {
 
     /// Drives a redemption to `Burning` state (post-journal, pre-burn) — the
     /// state stuck redemptions wedge in.
-    async fn setup_burning(
-        cqrs: &Arc<SqliteCqrs<Redemption>>,
-    ) -> RedemptionMetadata {
+    async fn setup_burning(store: &Store<Redemption>) -> RedemptionMetadata {
         let metadata = test_metadata();
         let alpaca_data = test_alpaca_data();
-        let aggregate_id = metadata.issuer_request_id.to_string();
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::Detect {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                underlying: metadata.underlying.clone(),
-                token: metadata.token.clone(),
-                wallet: metadata.wallet,
-                quantity: metadata.quantity.clone(),
-                tx_hash: metadata.detected_tx_hash,
-                block_number: metadata.block_number,
-            },
-        )
-        .await
-        .expect("Detect failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::RecordAlpacaCall {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                tokenization_request_id: alpaca_data
-                    .tokenization_request_id
-                    .clone(),
-                alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
-                dust_quantity: alpaca_data.dust_quantity.clone(),
-            },
-        )
-        .await
-        .expect("RecordAlpacaCall failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
 
-        cqrs.execute(
-            &aggregate_id,
-            RedemptionCommand::ConfirmAlpacaComplete {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-            },
-        )
-        .await
-        .expect("ConfirmAlpacaComplete failed");
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete failed");
 
         metadata
     }
 
     fn force_complete_rocket(
-        event_store: TestEventStore,
+        pool: sqlx::Pool<sqlx::Sqlite>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
         use crate::alpaca::service::AlpacaConfig;
@@ -2959,7 +3036,7 @@ mod tests {
         rocket::build()
             .manage(config)
             .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(event_store)
+            .manage(pool)
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::force_complete_redemption])
     }
@@ -2995,31 +3072,31 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_force_complete_records_verified_burn() {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
-        let metadata = setup_burning(&cqrs).await;
+        let store = setup_store(&pool);
+        let metadata = setup_burning(&store).await;
 
-        // Production's `force_complete_burn` appends `BurnForceCompleted` before
+        // In production `force_complete_burn` appends `BurnForceCompleted` before
         // the endpoint reads the prior state; the mock can't, so append it here
-        // to reproduce the real on-disk shape (terminal event =
-        // `BurnForceCompleted`, so `redemption_state_before_last_event` resolves
-        // to `Burning`).
-        cqrs.execute(
-            &metadata.issuer_request_id.to_string(),
-            RedemptionCommand::ForceCompleteBurn {
-                issuer_request_id: metadata.issuer_request_id.clone(),
-                burn_tx_hash: alloy::primitives::B256::ZERO,
-                block_number: 45_989_009,
-                reason: "burn confirmed on-chain".to_string(),
-            },
-        )
-        .await
-        .expect("ForceCompleteBurn failed");
+        // to reproduce the real on-disk shape (terminal event = `BurnForceCompleted`,
+        // so `redemption_state_before_last_event` resolves to `Burning`).
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ForceCompleteBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    burn_tx_hash: alloy::primitives::B256::ZERO,
+                    block_number: 45_989_009,
+                    reason: "burn confirmed on-chain".to_string(),
+                },
+            )
+            .await
+            .expect("ForceCompleteBurn failed");
 
         let burn_recovery = Arc::new(MockBurnRecovery::default());
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket = force_complete_rocket(event_store, burn_recovery_state);
+        let rocket = force_complete_rocket(pool, burn_recovery_state);
         let body = r#"{"burn_tx_hash":"0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf","reason":"burn confirmed on-chain"}"#;
 
         let (status, body) =
@@ -3039,8 +3116,8 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_force_complete_unverifiable_returns_422() {
         let pool = setup_pool().await;
-        let (cqrs, event_store) = setup_cqrs(&pool);
-        let metadata = setup_burning(&cqrs).await;
+        let store = setup_store(&pool);
+        let metadata = setup_burning(&store).await;
 
         // Verification fails: the operator-supplied hash is not a burn.
         let burn_recovery = Arc::new(MockBurnRecovery {
@@ -3050,7 +3127,7 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket = force_complete_rocket(event_store, burn_recovery_state);
+        let rocket = force_complete_rocket(pool, burn_recovery_state);
         let body = r#"{"burn_tx_hash":"0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf","reason":"not actually a burn"}"#;
 
         let (status, _body) =
