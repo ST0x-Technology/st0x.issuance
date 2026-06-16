@@ -1365,6 +1365,7 @@ mod tests {
         AggregateContext, EventStore,
         persist::{GenericQuery, PersistedEventStore},
     };
+    use event_sorcery::{Store, StoreBuilder};
     use fireblocks_sdk::models::TransactionStatus;
     use rust_decimal::Decimal;
     use sqlite_es::{
@@ -1390,7 +1391,6 @@ mod tests {
     use crate::redemption::view::RedemptionView;
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::view::TokenizedAssetView;
     use crate::tokenized_asset::{
         TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
     };
@@ -1478,7 +1478,7 @@ mod tests {
         receipt_service: Arc<dyn ReceiptService>,
         receipt_inventory_cqrs: Arc<SqliteCqrs<ReceiptInventory>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
-        asset_cqrs: SqliteCqrs<TokenizedAsset>,
+        asset_store: Arc<Store<TokenizedAsset>>,
     }
 
     impl TestHarness {
@@ -1526,16 +1526,11 @@ mod tests {
                 PersistedEventStore::new_event_store(receipt_inventory_repo),
             );
 
-            let asset_view_repo = Arc::new(SqliteViewRepository::<
-                TokenizedAssetView,
-                TokenizedAsset,
-            >::new(
-                pool.clone(),
-                "tokenized_asset_view".to_string(),
-            ));
-            let asset_query = GenericQuery::new(asset_view_repo);
-            let asset_cqrs =
-                sqlite_cqrs(pool.clone(), vec![Box::new(asset_query)], ());
+            let (asset_store, _asset_projection) =
+                StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                    .build(())
+                    .await
+                    .expect("Failed to build tokenized asset store");
 
             let receipt_inventory_cqrs =
                 Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
@@ -1551,7 +1546,7 @@ mod tests {
                 receipt_service,
                 receipt_inventory_cqrs,
                 pool,
-                asset_cqrs,
+                asset_store,
             }
         }
 
@@ -1560,9 +1555,9 @@ mod tests {
             underlying: &UnderlyingSymbol,
             vault: Address,
         ) {
-            self.asset_cqrs
-                .execute(
-                    &underlying.0,
+            self.asset_store
+                .send(
+                    underlying,
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),

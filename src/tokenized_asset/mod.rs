@@ -4,9 +4,9 @@ mod event;
 pub(crate) mod view;
 
 use alloy::primitives::Address;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::Aggregate;
-use cqrs_es::event_sink::EventSink;
+use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use api::{
@@ -14,7 +14,7 @@ pub(crate) use api::{
 };
 pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
-pub(crate) use view::{TokenizedAssetView, TokenizedAssetViewRepo};
+pub(crate) use view::TokenizedAssetView;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnderlyingSymbol(pub(crate) String);
@@ -22,6 +22,14 @@ pub struct UnderlyingSymbol(pub(crate) String);
 impl std::fmt::Display for UnderlyingSymbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for UnderlyingSymbol {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s))
     }
 }
 
@@ -61,91 +69,37 @@ impl Network {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) enum TokenizedAsset {
-    #[default]
-    NotAdded,
-    Added {
-        underlying: UnderlyingSymbol,
-        token: TokenSymbol,
-        network: Network,
-        vault: Address,
-        enabled: bool,
-        added_at: DateTime<Utc>,
-    },
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TokenizedAsset {
+    underlying: UnderlyingSymbol,
+    token: TokenSymbol,
+    network: Network,
+    vault: Address,
+    enabled: bool,
+    added_at: DateTime<Utc>,
 }
 
-impl Aggregate for TokenizedAsset {
-    type Command = TokenizedAssetCommand;
+#[async_trait]
+impl EventSourced for TokenizedAsset {
+    type Id = UnderlyingSymbol;
     type Event = TokenizedAssetEvent;
-    type Error = TokenizedAssetError;
+    type Command = TokenizedAssetCommand;
+    type Error = Never;
     type Services = ();
+    type Materialized = Table;
 
-    const TYPE: &'static str = "TokenizedAsset";
+    const AGGREGATE_TYPE: &'static str = "TokenizedAsset";
+    const PROJECTION: Table = Table("tokenized_asset_view");
+    const SCHEMA_VERSION: u64 = 1;
 
-    async fn handle(
-        &mut self,
-        command: Self::Command,
-        _services: &Self::Services,
-        sink: &EventSink<Self>,
-    ) -> Result<(), Self::Error> {
-        match command {
-            TokenizedAssetCommand::Add {
-                underlying,
-                token,
-                network,
-                vault,
-            } => match self {
-                Self::Added { vault: current_vault, .. }
-                    if *current_vault == vault =>
-                {
-                    tracing::debug!(target: "asset", underlying = %underlying.0,
-                        "Asset already added with same vault, skipping"
-                    );
-                    Ok(())
-                }
+    // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
+    // and event-sorcery hardwires snapshot-every-N with no off switch, so
+    // usize::MAX makes the next-snapshot threshold unreachable. The proper
+    // fix is for event-sorcery to take the snapshot policy explicitly from
+    // the consumer, including the option to disable snapshotting entirely.
+    const SNAPSHOT_SIZE: usize = usize::MAX;
 
-                Self::Added { vault: current_vault, .. } => {
-                    tracing::info!(target: "asset", underlying = %underlying.0,
-                        previous_vault = %current_vault,
-                        new_vault = %vault,
-                        "Updating vault address for asset"
-                    );
-                    sink.write(
-                        TokenizedAssetEvent::VaultAddressUpdated {
-                            vault,
-                            previous_vault: *current_vault,
-                            updated_at: Utc::now(),
-                        },
-                        self,
-                    )
-                    .await;
-                    Ok(())
-                }
-
-                Self::NotAdded => {
-                    tracing::info!(target: "asset", underlying = %underlying.0,
-                        vault = %vault,
-                        "Adding new tokenized asset"
-                    );
-                    sink.write(
-                        TokenizedAssetEvent::Added {
-                            underlying,
-                            token,
-                            network,
-                            vault,
-                            added_at: Utc::now(),
-                        },
-                        self,
-                    )
-                    .await;
-                    Ok(())
-                }
-            },
-        }
-    }
-
-    fn apply(&mut self, event: Self::Event) {
+    fn originate(event: &Self::Event) -> Option<Self> {
         match event {
             TokenizedAssetEvent::Added {
                 underlying,
@@ -153,36 +107,89 @@ impl Aggregate for TokenizedAsset {
                 network,
                 vault,
                 added_at,
-            } => {
-                *self = Self::Added {
-                    underlying,
-                    token,
-                    network,
-                    vault,
-                    enabled: true,
-                    added_at,
-                };
-            }
-            TokenizedAssetEvent::VaultAddressUpdated {
-                vault: new_vault,
-                ..
-            } => {
-                if let Self::Added { vault, .. } = self {
-                    *vault = new_vault;
-                }
-            }
+            } => Some(Self {
+                underlying: underlying.clone(),
+                token: token.clone(),
+                network: network.clone(),
+                vault: *vault,
+                enabled: true,
+                added_at: *added_at,
+            }),
+            TokenizedAssetEvent::VaultAddressUpdated { .. } => None,
         }
     }
-}
 
-#[derive(Debug, PartialEq, thiserror::Error)]
-pub(crate) enum TokenizedAssetError {}
+    fn evolve(
+        entity: &Self,
+        event: &Self::Event,
+    ) -> Result<Option<Self>, Self::Error> {
+        match event {
+            TokenizedAssetEvent::VaultAddressUpdated { vault, .. } => {
+                Ok(Some(Self { vault: *vault, ..entity.clone() }))
+            }
+
+            // A second `Added` re-adds the asset, overwriting in place — the
+            // pre-migration `apply` did this silently. event-sorcery turns an
+            // unhandled event (`Ok(None)`) into a permanent `Failed` lifecycle,
+            // which startup `catch_up` would hit for any stream carrying a
+            // duplicate `Added` (only reachable via direct event-store seeding),
+            // so handle it explicitly rather than bricking the aggregate.
+            TokenizedAssetEvent::Added { .. } => Ok(Self::originate(event)),
+        }
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        let TokenizedAssetCommand::Add { underlying, token, network, vault } =
+            command;
+
+        tracing::info!(target: "asset", underlying = %underlying.0,
+            vault = %vault,
+            "Adding new tokenized asset"
+        );
+
+        Ok(vec![TokenizedAssetEvent::Added {
+            underlying,
+            token,
+            network,
+            vault,
+            added_at: Utc::now(),
+        }])
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        let TokenizedAssetCommand::Add { underlying, vault, .. } = command;
+
+        if self.vault == vault {
+            tracing::debug!(target: "asset", underlying = %underlying.0,
+                "Asset already added with same vault, skipping"
+            );
+            return Ok(vec![]);
+        }
+
+        tracing::info!(target: "asset", underlying = %underlying.0,
+            previous_vault = %self.vault,
+            new_vault = %vault,
+            "Updating vault address for asset"
+        );
+        Ok(vec![TokenizedAssetEvent::VaultAddressUpdated {
+            vault,
+            previous_vault: self.vault,
+            updated_at: Utc::now(),
+        }])
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use cqrs_es::{Aggregate, test::TestFramework};
-    use tracing::Level;
+    use event_sorcery::{TestHarness, replay};
     use tracing_test::traced_test;
 
     use super::{
@@ -191,17 +198,15 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
 
-    type TokenizedAssetTestFramework = TestFramework<TokenizedAsset>;
-
     #[traced_test]
-    #[test]
-    fn test_add_asset_creates_new_asset() {
+    #[tokio::test]
+    async fn test_add_asset_creates_new_asset() {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
         let network = Network::new("base");
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let events = TokenizedAssetTestFramework::with(())
+        let events = TestHarness::<TokenizedAsset>::with(())
             .given_no_previous_events()
             .when(TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
@@ -209,8 +214,8 @@ mod tests {
                 network: network.clone(),
                 vault,
             })
-            .inspect_result()
-            .unwrap();
+            .await
+            .events();
 
         assert_eq!(events.len(), 1);
 
@@ -232,17 +237,17 @@ mod tests {
         assert!(added_at.timestamp() > 0);
 
         assert!(logs_contain_at!(
-            Level::INFO,
+            tracing::Level::INFO,
             &["Adding new tokenized asset", "AAPL"]
         ));
     }
 
     #[traced_test]
-    #[test]
-    fn test_add_asset_when_already_added_with_same_vault_is_idempotent() {
+    #[tokio::test]
+    async fn test_add_asset_when_already_added_with_same_vault_is_idempotent() {
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        TokenizedAssetTestFramework::with(())
+        TestHarness::<TokenizedAsset>::with(())
             .given(vec![TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
@@ -256,21 +261,22 @@ mod tests {
                 network: Network::new("base"),
                 vault,
             })
-            .then_expect_events(vec![]);
+            .await
+            .then_expect_events(&[]);
 
         assert!(logs_contain_at!(
-            Level::DEBUG,
+            tracing::Level::DEBUG,
             &["Asset already added with same vault, skipping"]
         ));
     }
 
     #[traced_test]
-    #[test]
-    fn test_add_asset_with_different_vault_emits_vault_updated() {
+    #[tokio::test]
+    async fn test_add_asset_with_different_vault_emits_vault_updated() {
         let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
         let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let events = TokenizedAssetTestFramework::with(())
+        let events = TestHarness::<TokenizedAsset>::with(())
             .given(vec![TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
@@ -284,8 +290,8 @@ mod tests {
                 network: Network::new("base"),
                 vault: vault_b,
             })
-            .inspect_result()
-            .unwrap();
+            .await
+            .events();
 
         assert_eq!(events.len(), 1, "Expected exactly one event");
 
@@ -304,7 +310,7 @@ mod tests {
         }
 
         assert!(logs_contain_at!(
-            Level::INFO,
+            tracing::Level::INFO,
             &["Updating vault address for asset", "AAPL"]
         ));
     }
@@ -317,26 +323,25 @@ mod tests {
         let vault = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
         let added_at = chrono::Utc::now();
 
-        let mut asset = TokenizedAsset::default();
-        asset.apply(TokenizedAssetEvent::Added {
-            underlying: underlying.clone(),
-            token: token.clone(),
-            network: network.clone(),
-            vault,
-            added_at,
-        });
+        let asset =
+            replay::<TokenizedAsset>(vec![TokenizedAssetEvent::Added {
+                underlying: underlying.clone(),
+                token: token.clone(),
+                network: network.clone(),
+                vault,
+                added_at,
+            }])
+            .unwrap()
+            .unwrap();
 
-        let TokenizedAsset::Added {
+        let TokenizedAsset {
             underlying: added_underlying,
             token: added_token,
             network: added_network,
             vault: added_vault,
             enabled,
             added_at: added_at_timestamp,
-        } = asset
-        else {
-            panic!("Expected Added state after apply");
-        };
+        } = asset;
 
         assert_eq!(added_underlying, underlying);
         assert_eq!(added_token, token);
@@ -351,54 +356,57 @@ mod tests {
         let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
         let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let mut asset = TokenizedAsset::default();
-        asset.apply(TokenizedAssetEvent::Added {
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            vault: vault_a,
-            added_at: chrono::Utc::now(),
-        });
-        asset.apply(TokenizedAssetEvent::VaultAddressUpdated {
-            vault: vault_b,
-            previous_vault: vault_a,
-            updated_at: chrono::Utc::now(),
-        });
+        let asset = replay::<TokenizedAsset>(vec![
+            TokenizedAssetEvent::Added {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault: vault_a,
+                added_at: chrono::Utc::now(),
+            },
+            TokenizedAssetEvent::VaultAddressUpdated {
+                vault: vault_b,
+                previous_vault: vault_a,
+                updated_at: chrono::Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
 
-        let TokenizedAsset::Added { vault, .. } = asset else {
-            panic!("Expected Added state after vault update");
-        };
-
+        let TokenizedAsset { vault, .. } = asset;
         assert_eq!(vault, vault_b);
     }
 
+    // A duplicate `Added` mid-stream (only reachable via direct event-store
+    // seeding) must overwrite state like the pre-migration `apply` did — not
+    // fall through to `Ok(None)`, which event-sorcery escalates to a permanent
+    // `Failed` lifecycle that startup `catch_up` would then hit.
     #[test]
     fn test_apply_duplicate_added_overwrites_state() {
         let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
         let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-        let mut asset = TokenizedAsset::default();
-        asset.apply(TokenizedAssetEvent::Added {
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
-            vault: vault_a,
-            added_at: chrono::Utc::now(),
-        });
-        asset.apply(TokenizedAssetEvent::Added {
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL2"),
-            network: Network::new("base"),
-            vault: vault_b,
-            added_at: chrono::Utc::now(),
-        });
+        let asset = replay::<TokenizedAsset>(vec![
+            TokenizedAssetEvent::Added {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::new("base"),
+                vault: vault_a,
+                added_at: chrono::Utc::now(),
+            },
+            TokenizedAssetEvent::Added {
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL2"),
+                network: Network::new("base"),
+                vault: vault_b,
+                added_at: chrono::Utc::now(),
+            },
+        ])
+        .expect("duplicate Added must not fail the lifecycle")
+        .expect("aggregate must stay live after a duplicate Added");
 
-        let TokenizedAsset::Added { vault, token, .. } = asset else {
-            panic!("Expected Added state after duplicate Added");
-        };
-
-        assert_eq!(vault, vault_b);
-        assert_eq!(token, TokenSymbol::new("tAAPL2"));
+        assert_eq!(asset.vault, vault_b);
+        assert_eq!(asset.token, TokenSymbol::new("tAAPL2"));
     }
 
     #[test]

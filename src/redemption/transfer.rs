@@ -297,16 +297,17 @@ async fn find_matching_asset(
 
     assets
         .into_iter()
-        .find_map(|view| match view {
-            TokenizedAssetView::Asset {
-                underlying,
-                token,
-                network,
-                vault: addr,
-                ..
-            } if addr == vault => Some((underlying, token, network)),
-            _ => None,
-        })
+        .find_map(
+            |TokenizedAssetView {
+                 underlying,
+                 token,
+                 network,
+                 vault: addr,
+                 ..
+             }| {
+                (addr == vault).then_some((underlying, token, network))
+            },
+        )
         .ok_or(TransferProcessingError::NoMatchingAsset { vault })
 }
 
