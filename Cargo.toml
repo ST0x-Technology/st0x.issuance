@@ -4,14 +4,18 @@ version = "0.1.0"
 edition = "2024"
 default-run = "st0x-issuance"
 
+[lints]
+workspace = true
+
 [dependencies]
+st0x-issuance-dto = { path = "crates/dto" }
 event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 cqrs-es = "0.5.0"
 async-trait = "0.1.89"
 rocket = { version = "0.5.1", features = ["json"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { version = "0.9.0", features = [
   "sqlite",
   "chrono",
@@ -24,7 +28,7 @@ thiserror = "2.0.17"
 tracing = "0.1.41"
 chrono = { version = "0.4.42", features = ["serde"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
-clap = { version = "4.5.49", features = ["derive", "env"] }
+clap = { workspace = true, features = ["env"] }
 alloy = { version = "1.0.41", features = [
   "provider-ws",
   "provider-http",
@@ -69,10 +73,20 @@ tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["macros"] }
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 
-[lints.rust]
+[workspace]
+members = ["crates/dto"]
+
+[workspace.dependencies]
+alloy-primitives = { version = "1.6.0", features = ["serde"] }
+clap = { version = "4.5.49", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ts-rs = "11.0.1"
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 unwrap_used = "deny"
 enum_glob_use = "allow"
 

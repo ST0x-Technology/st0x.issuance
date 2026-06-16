@@ -433,14 +433,15 @@ Environment variables are defined across the deployment pipeline:
     `Json(#[from] serde_json::Error)`
     - generic, truthful. Use context from where the error is handled.
 - **CRITICAL: Make Invalid States Unrepresentable**: Use ADTs/enums to encode
-  business rules and state transitions directly in types rather than runtime
-  validation.
-  - **FORBIDDEN**: Types with all/most fields `Option`; multiple nullable fields
-    that can contradict; string status fields paired with Options meant to be
-    present only for certain statuses
+  business rules and state transitions in types, not runtime validation.
+  - **FORBIDDEN**: Types with all/most fields `Option`; nullable fields that can
+    contradict; multiple `bool`s encoding one status (e.g.
+    `{ enabled: bool, frozen: bool }` — four combos, only some valid); string
+    status fields paired with Options present only for certain statuses
   - **CORRECT**: Enum variants for mutually exclusive states, with
     state-specific data inside each variant; newtypes to prevent mixing
-    incompatible values
+    incompatible values. A status with N states is ONE enum of N variants, never
+    N booleans (`enum AssetStatus { Enabled, Frozen }`)
   - Example: `enum Account { NotLinked, Linked { client_id, email, ... } }`, NOT
     `struct Account { client_id: Option<ClientId>, email: Option<Email>, ... }`
 - **CRITICAL: Parse, Don't Validate**: If a value exists, it must be valid.
@@ -454,17 +455,11 @@ Environment variables are defined across the deployment pipeline:
   - Applies to ALL constrained domain types: API keys, emails, quantities,
     addresses, IDs, etc.
     ```rust
-    // WRONG: validate() can be forgotten → an invalid value can exist
-    pub struct ApiKey(pub String);
-    impl ApiKey { pub fn validate(&self) -> Result<(), Error> { /* ... */ } }
-
-    // CORRECT: if ApiKey exists, it's guaranteed valid
-    pub struct ApiKey(String); // private inner value
+    // existence ⇒ validity: private inner, fallible new() the only constructor
+    pub struct ApiKey(String);
     impl ApiKey {
         pub fn new(value: String) -> Result<Self, ApiKeyError> {
-            if value.len() < 32 {
-                return Err(ApiKeyError::TooShort { len: value.len() });
-            }
+            if value.len() < 32 { return Err(ApiKeyError::TooShort); }
             Ok(Self(value))
         }
     }

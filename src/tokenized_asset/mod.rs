@@ -18,58 +18,13 @@ pub(crate) use cmd::TokenizedAssetCommand;
 pub(crate) use event::TokenizedAssetEvent;
 pub(crate) use view::TokenizedAssetView;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnderlyingSymbol(pub(crate) String);
-
-impl std::fmt::Display for UnderlyingSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for UnderlyingSymbol {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
-    }
-}
-
-impl UnderlyingSymbol {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TokenSymbol(pub(crate) String);
-
-impl std::fmt::Display for TokenSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl TokenSymbol {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Network(pub(crate) String);
-
-impl std::fmt::Display for Network {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Network {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
+// The asset wire newtypes are defined once in the shared `st0x-issuance-dto`
+// crate so the API DTOs, Rust clients, and the TypeScript dashboard all share a
+// single definition.
+pub use st0x_issuance_dto::UnderlyingSymbol;
+pub(crate) use st0x_issuance_dto::{
+    Network, TokenSymbol, TokenizedAssetStatus,
+};
 
 /// Whether an asset accepts new mints.
 ///
@@ -78,23 +33,27 @@ impl Network {
 /// complete. This is orthogonal to listing; see the freeze invariant in
 /// SPEC.md. Serializes to the bare strings `"Enabled"` / `"Frozen"`, which the
 /// view queries match against `$.Live.status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AssetStatus {
     Enabled,
     Frozen,
 }
 
 impl AssetStatus {
-    /// Whether the asset is supported (appears in `list_enabled_assets`). Both
-    /// `Enabled` and `Frozen` assets are supported — freezing gates minting, not
-    /// listing, so this must never conflate freeze with de-listing.
-    pub(crate) const fn is_listed(&self) -> bool {
-        matches!(self, Self::Enabled | Self::Frozen)
-    }
-
     /// Whether new mints are currently rejected for this asset.
-    pub(crate) const fn is_frozen(&self) -> bool {
+    pub(crate) const fn is_frozen(self) -> bool {
         matches!(self, Self::Frozen)
+    }
+}
+
+/// Maps the domain freeze state onto its wire representation. The two enums are
+/// kept distinct (domain vs API contract) but always move in lock-step.
+impl From<AssetStatus> for TokenizedAssetStatus {
+    fn from(status: AssetStatus) -> Self {
+        match status {
+            AssetStatus::Enabled => Self::Enabled,
+            AssetStatus::Frozen => Self::Frozen,
+        }
     }
 }
 
@@ -194,7 +153,7 @@ impl EventSourced for TokenizedAsset {
                 // the authoritative `Added` event. Naming the single carried-over
                 // field keeps the no-silent-unfreeze invariant local, and stops a
                 // future field from being silently carried from stale state.
-                status: entity.status.clone(),
+                status: entity.status,
             })),
         }
     }
@@ -210,7 +169,7 @@ impl EventSourced for TokenizedAsset {
                 network,
                 vault,
             } => {
-                tracing::info!(target: "asset", underlying = %underlying.0,
+                tracing::info!(target: "asset", underlying = %underlying,
                     vault = %vault,
                     "Adding new tokenized asset"
                 );
@@ -244,13 +203,13 @@ impl EventSourced for TokenizedAsset {
         match command {
             TokenizedAssetCommand::Add { underlying, vault, .. } => {
                 if self.vault == vault {
-                    tracing::debug!(target: "asset", underlying = %underlying.0,
+                    tracing::debug!(target: "asset", underlying = %underlying,
                         "Asset already added with same vault, skipping"
                     );
                     return Ok(vec![]);
                 }
 
-                tracing::info!(target: "asset", underlying = %underlying.0,
+                tracing::info!(target: "asset", underlying = %underlying,
                     previous_vault = %self.vault,
                     new_vault = %vault,
                     "Updating vault address for asset"
@@ -265,14 +224,14 @@ impl EventSourced for TokenizedAsset {
             TokenizedAssetCommand::Freeze => {
                 if self.status == AssetStatus::Frozen {
                     tracing::debug!(target: "asset",
-                        underlying = %self.underlying.0,
+                        underlying = %self.underlying,
                         "Asset already frozen, skipping"
                     );
                     return Ok(vec![]);
                 }
 
                 tracing::info!(target: "asset",
-                    underlying = %self.underlying.0,
+                    underlying = %self.underlying,
                     "Freezing tokenized asset"
                 );
                 Ok(vec![TokenizedAssetEvent::Frozen { frozen_at: Utc::now() }])
@@ -281,14 +240,14 @@ impl EventSourced for TokenizedAsset {
             TokenizedAssetCommand::Unfreeze => {
                 if self.status == AssetStatus::Enabled {
                     tracing::debug!(target: "asset",
-                        underlying = %self.underlying.0,
+                        underlying = %self.underlying,
                         "Asset already enabled, skipping"
                     );
                     return Ok(vec![]);
                 }
 
                 tracing::info!(target: "asset",
-                    underlying = %self.underlying.0,
+                    underlying = %self.underlying,
                     "Unfreezing tokenized asset"
                 );
                 Ok(vec![TokenizedAssetEvent::Unfrozen {
