@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use super::{Network, TokenSymbol, UnderlyingSymbol};
+use super::{AssetStatus, Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenizedAssetViewError {
@@ -27,10 +27,17 @@ pub(crate) struct TokenizedAssetView {
     pub(crate) token: TokenSymbol,
     pub(crate) network: Network,
     pub(crate) vault: Address,
-    pub(crate) enabled: bool,
+    pub(crate) status: AssetStatus,
     pub(crate) added_at: DateTime<Utc>,
 }
 
+/// Lists all supported assets, including frozen ones.
+///
+/// Freezing gates new minting only — a frozen asset stays in this set so
+/// in-flight redemption detection (`src/redemption/`) and receipt backfilling
+/// keep working. The filter matches `$.Live.status` against the supported
+/// states rather than excluding `Frozen`, preserving the freeze invariant (see
+/// SPEC.md).
 pub(crate) async fn list_enabled_assets(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<TokenizedAssetView>, TokenizedAssetViewError> {
@@ -38,7 +45,7 @@ pub(crate) async fn list_enabled_assets(
         r#"
         SELECT json_extract(payload, '$.Live') as "live: String"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Live.enabled') = 1
+        WHERE json_extract(payload, '$.Live.status') IN ('Enabled', 'Frozen')
         "#
     )
     .fetch_all(pool)
@@ -80,15 +87,17 @@ pub(crate) async fn load_asset_by_underlying(
 
 /// Finds the vault address for a given underlying symbol.
 ///
-/// Returns `Ok(Some(vault))` if an enabled asset with that underlying exists,
-/// `Ok(None)` if not found or disabled, or an error on database failure.
+/// Returns `Ok(Some(vault))` if a supported asset with that underlying exists
+/// (including a frozen one — in-flight redemptions and mints of a frozen asset
+/// must still resolve their vault), `Ok(None)` if not found, or an error on
+/// database failure.
 pub(crate) async fn find_vault_by_underlying(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
 ) -> Result<Option<Address>, TokenizedAssetViewError> {
     Ok(load_asset_by_underlying(pool, underlying)
         .await?
-        .and_then(|asset| asset.enabled.then_some(asset.vault)))
+        .map(|asset| asset.vault))
 }
 
 #[cfg(test)]
@@ -102,7 +111,7 @@ mod tests {
     use super::*;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
+        AssetStatus, TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
     };
 
     struct TestHarness {
@@ -352,5 +361,47 @@ mod tests {
             Some(vault_b),
             "view must reflect the updated vault after VaultAddressUpdated"
         );
+    }
+
+    // Freezing must project `status: Frozen` into the view AND keep the asset in
+    // `list_enabled_assets` — the freeze invariant that lets in-flight
+    // redemptions of a frozen asset keep detecting (see SPEC.md).
+    #[tokio::test]
+    async fn test_freeze_projects_status_and_keeps_asset_listed() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, store } = &harness;
+
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        harness.add_asset("AAPL", vault).await;
+
+        let before = load_asset_by_underlying(pool, &underlying)
+            .await
+            .unwrap()
+            .expect("asset exists before freeze");
+        assert_eq!(before.status, AssetStatus::Enabled);
+
+        store
+            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        let after = load_asset_by_underlying(pool, &underlying)
+            .await
+            .unwrap()
+            .expect("asset exists after freeze");
+        assert_eq!(after.status, AssetStatus::Frozen);
+
+        let listed =
+            list_enabled_assets(pool).await.expect("Query should succeed");
+        assert_eq!(listed.len(), 1, "frozen asset must stay listed");
+        assert_eq!(listed[0].status, AssetStatus::Frozen);
+
+        // A frozen asset must still resolve its vault so in-flight redemptions
+        // and mints can complete.
+        let resolved = find_vault_by_underlying(pool, &underlying)
+            .await
+            .expect("Query should succeed");
+        assert_eq!(resolved, Some(vault));
     }
 }

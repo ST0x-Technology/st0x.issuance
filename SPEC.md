@@ -483,41 +483,67 @@ stateDiagram-v2
 ### TokenizedAsset Aggregate
 
 The `TokenizedAsset` aggregate manages which assets are supported for
-tokenization.
+tokenization. The aggregate id is the `UnderlyingSymbol`.
 
 **Aggregate State:**
 
 - `underlying`, `token`: Symbol identifiers
 - `network`: Blockchain network
-- `vault_address`: On-chain vault contract address
-- `enabled`: Whether asset is currently available for minting/redeeming
-- Timestamps
+- `vault`: On-chain vault contract address
+- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
+  rejected, but the asset stays supported and in-flight redemptions still
+  complete)
+- `added_at`: Timestamp
 
 **Commands:**
 
-- `AddAsset { underlying, token, network, vault_address }` - Add new supported
-  asset
-- `EnableAsset { underlying }` - Enable asset for minting/redeeming
-- `DisableAsset { underlying, reason }` - Disable asset temporarily
-- `UpdateVaultAddress { underlying, vault_address }` - Update vault contract
-  address
+- `Add { underlying, token, network, vault }` - Add a new supported asset.
+  Re-adding with a different vault updates the vault address; re-adding with the
+  same vault is a no-op.
+- `Freeze` - Stop accepting new mints for this asset (idempotent — freezing a
+  frozen asset is a no-op).
+- `Unfreeze` - Resume accepting mints (idempotent).
 
 **Events:**
 
-- `AssetAdded { underlying, token, network, vault_address }` - New asset added
-- `AssetEnabled { underlying }` - Asset enabled
-- `AssetDisabled { underlying, reason }` - Asset disabled
-- `VaultAddressUpdated { underlying, vault_address, previous_address }` - Vault
-  address changed
+- `Added { underlying, token, network, vault, added_at }` - New asset added
+- `VaultAddressUpdated { vault, previous_vault, updated_at }` - Vault address
+  changed
+- `Frozen { frozen_at }` - Asset frozen (new mints rejected)
+- `Unfrozen { unfrozen_at }` - Asset unfrozen (mints resume)
 
 **Command -> Event Mappings:**
 
-| Command              | Events Produced       | Notes                                       |
-| -------------------- | --------------------- | ------------------------------------------- |
-| `AddAsset`           | `AssetAdded`          | New tokenized asset added to supported list |
-| `EnableAsset`        | `AssetEnabled`        | Asset enabled for minting/redeeming         |
-| `DisableAsset`       | `AssetDisabled`       | Asset temporarily disabled                  |
-| `UpdateVaultAddress` | `VaultAddressUpdated` | Vault contract address changed              |
+| Command    | Events Produced                 | Notes                                                         |
+| ---------- | ------------------------------- | ------------------------------------------------------------- |
+| `Add`      | `Added` / `VaultAddressUpdated` | New asset, or vault update if re-added with a different vault |
+| `Freeze`   | `Frozen`                        | No event if already frozen (idempotent)                       |
+| `Unfreeze` | `Unfrozen`                      | No event if already enabled (idempotent)                      |
+
+**Freeze State Machine:**
+
+```
+Enabled ⇄ Frozen
+   Freeze:   Enabled -> Frozen
+   Unfreeze: Frozen  -> Enabled
+```
+
+**Freeze invariant — frozen is not de-listed.** Freezing only gates _new_ mints:
+`POST /inkind/issuance` rejects a frozen asset with a distinct `AssetFrozen`
+error (separate from `AssetNotAvailable`), so the rejection is observable and
+not conflated with de-listing. A frozen asset stays in `list_enabled_assets()`,
+so in-flight redemption detection (`src/redemption/`) keeps working — issuance
+reacts to on-chain transfers and has no "reject redemption" point. Preventing
+_new_ redemptions of a frozen asset is the liquidity rebalance guard's job
+(RAI-1038), which reads the per-asset status endpoint (see "Tokenized Assets
+Data Endpoint"). This issuance-side freeze plus the liquidity guard form the
+single dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze
+is involved here (that is separate, heavier supply-control work and out of
+scope).
+
+The `Freeze` / `Unfreeze` commands are emitted manually via the issuer-host CLI
+in M1 and automatically by the dividend scheduler in M3 — the same command path
+either way.
 
 ## Services
 
@@ -1886,10 +1912,10 @@ events.
 
 **TokenizedAssetView** - Supported assets:
 
-- Listens to: `AssetAdded`, `AssetEnabled`, `AssetDisabled`,
-  `VaultAddressUpdated`
-- Updates: Asset configuration, enabled status
+- Listens to: `Added`, `VaultAddressUpdated`, `Frozen`, `Unfrozen`
+- Updates: Asset configuration and freeze `status` (`Enabled` / `Frozen`)
 - Used for: Validating mint/redemption requests, listing available assets
+  (including frozen ones), and serving the per-asset freeze status endpoint
 
 ## Framework Wiring
 
