@@ -308,6 +308,101 @@ mod tests {
         ));
     }
 
+    // Production regression (RAI-1083): the issuance bot crash-looped at startup
+    // because projection catch-up asserted each aggregate's events form a
+    // contiguous `1..N` run, aborting with a fatal `EventSequenceGap` otherwise.
+    // Real production data violates that: `ReceiptInventory` aggregates were
+    // written with a sequence counter shared across aggregates (sparse
+    // per-aggregate sequences such as `24, 4559, ...`), and a heavily-retried
+    // `Mint` carried a sequence hole. With the event-sorcery catch-up fix pinned,
+    // startup must replay whatever events exist in `sequence` order and rebuild
+    // the view rather than abort. `TokenizedAsset` exercises the same generic
+    // Table-projection catch-up path that crashed the `Mint` aggregate in prod.
+    #[traced_test]
+    #[tokio::test]
+    async fn build_rebuilds_view_despite_non_contiguous_event_sequences() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        // A genesis `Added` at a non-1 sequence followed by a `Frozen` after a
+        // large gap reproduces the sparse, shared-counter sequencing that aborted
+        // catch-up in production.
+        let added = serde_json::to_string(&TokenizedAssetEvent::Added {
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            network: Network::new("base"),
+            vault,
+            added_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let frozen = serde_json::to_string(&TokenizedAssetEvent::Frozen {
+            frozen_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        for (sequence, event_type, payload) in [
+            (24_i64, "TokenizedAssetEvent::Added", added.as_str()),
+            (4559_i64, "TokenizedAssetEvent::Frozen", frozen.as_str()),
+        ] {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('TokenizedAsset', 'AAPL', ?, ?, '1.0', ?, '{}')
+                ",
+            )
+            .bind(sequence)
+            .bind(event_type)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Catch-up must not abort on the gap: it replays both events in sequence
+        // order and rebuilds the view from scratch.
+        StoreBuilder::<TokenizedAsset>::new(pool.clone())
+            .build(())
+            .await
+            .expect("startup must tolerate non-contiguous event sequences");
+
+        // `Frozen` applied on top of `Added` proves in-order replay across the
+        // gap -- an out-of-order or dropped event could not yield `Frozen`.
+        let asset =
+            load_asset_by_underlying(&pool, &UnderlyingSymbol::new("AAPL"))
+                .await
+                .unwrap()
+                .expect("asset rebuilt despite the sequence gap");
+        assert_eq!(asset.status, AssetStatus::Frozen);
+        assert_eq!(asset.vault, vault);
+
+        // The view advances to the max event sequence, not the event count.
+        let (version,): (i64,) = sqlx::query_as(
+            "SELECT version FROM tokenized_asset_view WHERE view_id = 'AAPL'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 4559, "view advances to the max event sequence");
+    }
+
     #[tokio::test]
     async fn test_load_asset_by_underlying_errors_on_malformed_payload() {
         let harness = TestHarness::new().await;
