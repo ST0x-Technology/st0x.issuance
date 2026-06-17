@@ -117,7 +117,7 @@ impl EventSourced for TokenizedAsset {
 
     const AGGREGATE_TYPE: &'static str = "TokenizedAsset";
     const PROJECTION: Table = Table("tokenized_asset_view");
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -300,13 +300,16 @@ impl EventSourced for TokenizedAsset {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use event_sorcery::{TestHarness, replay};
+    use chrono::Utc;
+    use event_sorcery::{StoreBuilder, TestHarness, replay};
+    use sqlx::sqlite::SqlitePoolOptions;
     use tracing_test::traced_test;
 
     use super::{
         AssetStatus, Network, TokenSymbol, TokenizedAsset,
         TokenizedAssetCommand, TokenizedAssetEvent, UnderlyingSymbol,
     };
+    use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
 
     #[traced_test]
@@ -726,5 +729,182 @@ mod tests {
     fn test_network_display() {
         let network = Network::new("base");
         assert_eq!(format!("{network}"), "base");
+    }
+
+    /// Regression: pre-event-sorcery snapshot and `tokenized_asset_view` payloads
+    /// must be cleared before `StoreBuilder::build` projection catch-up.
+    #[tokio::test]
+    async fn pre_lifecycle_snapshot_and_view_cleared_before_store_build() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let underlying = "AAPL";
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let now = Utc::now();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "TokenizedAsset", "version": 1 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'TokenizedAsset',
+                ?,
+                1,
+                'TokenizedAssetEvent::Added',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(underlying)
+        .bind(
+            serde_json::json!({
+                "Added": {
+                    "underlying": underlying,
+                    "token": "tAAPL",
+                    "network": "base",
+                    "vault": vault,
+                    "added_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stale = serde_json::json!({
+            "underlying": underlying,
+            "token": "tAAPL",
+            "network": "base",
+            "vault": vault,
+            "status": "Enabled",
+            "added_at": now,
+        });
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'TokenizedAsset',
+                ?,
+                1,
+                0,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(underlying)
+        .bind(stale.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+        )
+        .bind(underlying)
+        .bind(stale.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        prepare_event_sourced_startup::<TokenizedAsset>(&pool).await.unwrap();
+        StoreBuilder::<TokenizedAsset>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let stale_snapshot_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM snapshots
+            WHERE aggregate_type = 'TokenizedAsset'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(underlying)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stale_snapshot_count, 0,
+            "Startup must clear incompatible TokenizedAsset snapshots"
+        );
+
+        let view_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM tokenized_asset_view WHERE view_id = ?",
+        )
+        .bind(underlying)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&view_payload).unwrap();
+        assert!(
+            payload
+                .get("Live")
+                .and_then(|live| live.get("underlying"))
+                .is_some(),
+            "Projection catch-up must rebuild tokenized_asset_view with Lifecycle payload, got {payload}"
+        );
     }
 }

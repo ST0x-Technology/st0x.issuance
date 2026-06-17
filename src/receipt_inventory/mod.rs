@@ -1038,7 +1038,7 @@ impl EventSourced for ReceiptInventory {
 
     const AGGREGATE_TYPE: &'static str = "ReceiptInventory";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -1131,12 +1131,14 @@ fn required_burns_by_receipt(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Bytes, TxHash, address, b256};
-    use event_sorcery::test_store;
+    use event_sorcery::{StoreBuilder, test_store};
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
 
     const TEST_OA_SCHEMA: &str =
@@ -2926,6 +2928,110 @@ mod tests {
             receipts[0].receipt_info,
             Some(receipt_info),
             "receipt_info should be stored by register_minted_receipt"
+        );
+    }
+
+    /// Regression: pre-event-sorcery snapshot payloads must be cleared before
+    /// `StoreBuilder::build` projection catch-up.
+    #[tokio::test]
+    async fn pre_lifecycle_snapshot_cleared_before_store_build() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let aggregate_id = format!("{vault:#x}");
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "ReceiptInventory", "version": 1 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'ReceiptInventory',
+                ?,
+                1,
+                0,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(aggregate_id.as_str())
+        .bind(
+            serde_json::json!({
+                "receipts": {},
+                "itn_receipts": {},
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        prepare_event_sourced_startup::<ReceiptInventory>(&pool).await.unwrap();
+        StoreBuilder::<ReceiptInventory>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let stale_snapshot_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM snapshots
+            WHERE aggregate_type = 'ReceiptInventory'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(aggregate_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stale_snapshot_count, 0,
+            "Startup must clear incompatible ReceiptInventory snapshots"
         );
     }
 }
