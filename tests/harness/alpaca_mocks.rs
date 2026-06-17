@@ -20,6 +20,7 @@ pub fn setup_mint_mocks(mock_alpaca: &MockServer) -> Mock<'_> {
     })
 }
 
+#[derive(Clone)]
 pub struct RedemptionState {
     pub issuer_request_id: String,
     pub tx_hash: String,
@@ -105,41 +106,65 @@ pub fn setup_redemption_mocks(
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
             .path_matches(
-                r"^/v1/accounts/test-account/tokenization/requests.*",
+                r"^/v1/accounts/test-account/tokenization/requests/.+",
             )
             .header("authorization", &basic_auth)
             .header("APCA-API-KEY-ID", &api_key)
             .header("APCA-API-SECRET-KEY", &api_secret);
 
         then.status(200).respond_with(
-            move |_req: &httpmock::HttpMockRequest| {
-                let responses: Vec<_> = {
-                    let states = shared_state.lock().unwrap();
-                    states
-                        .iter()
-                        .map(|state| {
-                            json!({
-                                "tokenization_request_id": format!("tok-redeem-{}", state.issuer_request_id),
-                                "issuer_request_id": state.issuer_request_id,
-                                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                                "updated_at": "2025-09-12T17:30:00.000000-04:00",
-                                "type": "redeem",
-                                "status": "completed",
-                                "underlying_symbol": state.underlying_symbol,
-                                "token_symbol": state.token_symbol,
-                                "qty": state.qty,
-                                "issuer": "test-issuer",
-                                "network": "base",
-                                "wallet_address": state.wallet_address,
-                                "tx_hash": state.tx_hash,
-                                "fees": "0.5"
-                            })
-                        })
-                        .collect()
+            move |req: &httpmock::HttpMockRequest| {
+                // Extract the tokenization_request_id from the URL path,
+                // stripping any query string before splitting.
+                // Path: /v1/accounts/test-account/tokenization/requests/{id}
+                let uri = req.uri_str();
+                let path = uri.split('?').next().unwrap_or(uri);
+                let tok_id = path.split('/').next_back().unwrap_or("");
+                if tok_id.is_empty() {
+                    return httpmock::HttpMockResponse {
+                        status: Some(404),
+                        headers: None,
+                        body: Some("not found".into()),
+                    };
+                }
+
+                let matched = shared_state
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|s| {
+                        format!("tok-redeem-{}", s.issuer_request_id) == tok_id
+                    })
+                    .cloned();
+
+                let Some(state) = matched else {
+                    return httpmock::HttpMockResponse {
+                        status: Some(404),
+                        headers: None,
+                        body: Some("not found".into()),
+                    };
                 };
 
-                let response_body =
-                    serde_json::to_string(&responses).unwrap();
+                let tok_req_id =
+                    format!("tok-redeem-{}", state.issuer_request_id);
+
+                let response_body = serde_json::to_string(&json!({
+                    "tokenization_request_id": tok_req_id,
+                    "issuer_request_id": state.issuer_request_id,
+                    "created_at": "2025-09-12T17:28:48.642437-04:00",
+                    "updated_at": "2025-09-12T17:30:00.000000-04:00",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": state.underlying_symbol,
+                    "token_symbol": state.token_symbol,
+                    "qty": state.qty,
+                    "issuer": "test-issuer",
+                    "network": "base",
+                    "wallet_address": state.wallet_address,
+                    "tx_hash": state.tx_hash,
+                    "fees": "0.5"
+                }))
+                .unwrap();
 
                 httpmock::HttpMockResponse {
                     status: Some(200),

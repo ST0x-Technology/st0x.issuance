@@ -1346,7 +1346,7 @@ sequenceDiagram
     Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account -> To: AP
 
     loop Poll for completion
-        Us->>Alpaca: GET /tokenization/requests
+        Us->>Alpaca: GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}
         Alpaca->>Us: {status: "pending" | "completed"}
     end
 
@@ -1547,9 +1547,14 @@ struct AlpacaRedeemResponse {
 **Alpaca's Action:** Automatically journals the underlying shares from our
 tokenization account to the AP's account.
 
-**Our Action:** Poll Alpaca's list endpoint to check status.
+**Our Action:** Poll Alpaca's per-request endpoint to check status.
 
-**Endpoint:** `GET /v1/accounts/{account_id}/tokenization/requests`
+**Endpoint:**
+`GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}`
+— returns a single request object. A real HTTP `404` maps to `RequestNotFound`
+(the journal loop keeps polling it until timeout rather than aborting, since a
+freshly-created request may briefly be invisible — empirical/precautionary
+assumption, not a documented Alpaca guarantee).
 
 **Polling Strategy:**
 
@@ -1711,8 +1716,8 @@ We call these Alpaca endpoints:
    mint completed
 2. **`POST /v1/accounts/{account_id}/tokenization/callback/redeem`** - Initiate
    redemption
-3. **`GET /v1/accounts/{account_id}/tokenization/requests`** - List/poll
-   requests
+3. **`GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}`**
+   - Poll a single request's status
 
 ### Authentication
 

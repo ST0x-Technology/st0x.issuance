@@ -175,9 +175,14 @@ impl AlpacaService for MockAlpacaService {
                     updated_at: Some(Utc::now()),
                 })
             } else {
-                Err(AlpacaError::RequestNotFound(
-                    tokenization_request_id.clone(),
-                ))
+                let body = self
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Mock error".to_string());
+                Err(AlpacaError::RequestNotFound {
+                    id: tokenization_request_id.clone(),
+                    body,
+                })
             }
         }
 

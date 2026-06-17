@@ -327,6 +327,10 @@ Bug fixes and improvements that don't fit into the original phases.
 
 #### API & Integration
 
+- [x] [RAI-912](https://linear.app/makeitrain/issue/RAI-912) - Switch Alpaca
+      journal polling to per-request GET endpoints (fixes aged-request recovery
+      502s; admin recovery now returns 404 for a definitive Alpaca not-found)
+  - **PR:** [#178](https://github.com/ST0x-Technology/st0x.issuance/pull/178)
 - [x] [#76](https://github.com/ST0x-Technology/st0x.issuance/issues/76) - Split
       account creation into Registration and Alpaca Linking
   - **PR:** [#75](https://github.com/ST0x-Technology/st0x.issuance/pull/75)
