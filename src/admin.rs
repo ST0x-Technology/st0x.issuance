@@ -73,14 +73,14 @@ impl RedemptionBurnRecovery for BurnManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregateKind {
     Mint,
     Redemption,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct ReprocessResponse {
     aggregate_type: AggregateKind,
     aggregate_id: String,
@@ -88,24 +88,28 @@ pub(crate) struct ReprocessResponse {
     message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct StuckAggregate {
     aggregate_type: AggregateKind,
     aggregate_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
     tokenization_request_id: Option<TokenizationRequestId>,
     state: String,
     detail: String,
+    #[schema(value_type = String)]
     timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     underlying: Option<UnderlyingSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
     quantity: Option<Quantity>,
     /// Primary on-chain transaction hash for this aggregate, when known.
     /// For redemptions this is the detected transfer tx hash. For mints this
     /// is the successful mint tx hash, or a Fireblocks network hash when the
     /// signing backend exposes one.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
     tx_hash: Option<B256>,
     /// Fireblocks transaction ID associated with this aggregate's current
     /// stuck step. For mints, sourced from the most recent
@@ -120,7 +124,7 @@ pub(crate) struct StuckAggregate {
     fireblocks_status: Option<FireblocksTxStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct StuckResponse {
     stuck: Vec<StuckAggregate>,
 }
@@ -291,6 +295,28 @@ async fn load_reprocess_context(
 /// - **Post-Alpaca failures**: Polls Alpaca to verify the journal completed, then
 ///   resumes to `Burning` and invokes burn recovery immediately.
 ///   Refuses if Alpaca's journal hasn't completed (to avoid burning without backing).
+#[utoipa::path(
+    post,
+    path = "/admin/recover/redemption/{issuer_request_id}",
+    tag = "admin",
+    params(
+        ("issuer_request_id" = String, Path,
+            description = "Issuer redemption request id of the stuck redemption")
+    ),
+    responses(
+        (status = 200, description = "Recovery initiated; describes the path taken",
+            body = ReprocessResponse),
+        (status = 404, description = "No redemption found for this id"),
+        (status = 409, description = "Redemption already completed"),
+        (status = 422,
+            description = "Cannot recover: Alpaca journal pending/rejected, \
+                Fireblocks burn still pending, or invalid aggregate state"),
+        (status = 502,
+            description = "Alpaca poll, Fireblocks lookup, or burn execution failed"),
+        (status = 500, description = "Event load/deserialize or internal failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(
     _auth,
     store,
@@ -741,7 +767,7 @@ const fn map_redemption_error(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CloseRedemptionRequest {
     reason: String,
 }
@@ -754,6 +780,24 @@ pub(crate) struct CloseRedemptionRequest {
 /// off-chain reconciliation). For a redemption whose burn *did* land on-chain,
 /// use `/admin/force-complete/redemption` instead. Closed redemptions do not
 /// appear in stuck queries.
+#[utoipa::path(
+    post,
+    path = "/admin/close/redemption/{issuer_request_id}",
+    tag = "admin",
+    params(
+        ("issuer_request_id" = String, Path,
+            description = "Issuer redemption request id to close")
+    ),
+    request_body = CloseRedemptionRequest,
+    responses(
+        (status = 200, description = "Redemption closed by admin",
+            body = ReprocessResponse),
+        (status = 409, description = "Redemption already completed"),
+        (status = 422, description = "Invalid state transition for close"),
+        (status = 500, description = "Event load/deserialize or internal failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store, pool))]
 #[post(
     "/admin/close/redemption/<issuer_request_id>",
@@ -802,10 +846,11 @@ pub(crate) async fn close_redemption(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct ForceCompleteRedemptionRequest {
     /// On-chain transaction hash that burned the redemption's shares. Verified
     /// against the chain before the redemption is terminalized.
+    #[schema(value_type = String)]
     burn_tx_hash: B256,
     /// Operator-supplied audit reason recorded with the terminal event.
     reason: String,
@@ -819,6 +864,26 @@ pub(crate) struct ForceCompleteRedemptionRequest {
 /// shares) before the redemption is moved to `Completed`, recording the proving
 /// tx hash for audit. Ambiguous cases with no verifiable on-chain burn are
 /// rejected (`422`) — use `/admin/close/redemption` for those.
+#[utoipa::path(
+    post,
+    path = "/admin/force-complete/redemption/{issuer_request_id}",
+    tag = "admin",
+    params(
+        ("issuer_request_id" = String, Path,
+            description = "Issuer redemption request id to force-complete")
+    ),
+    request_body = ForceCompleteRedemptionRequest,
+    responses(
+        (status = 200, description = "Burn verified on-chain; redemption completed",
+            body = ReprocessResponse),
+        (status = 422,
+            description = "Supplied hash is not a verifiable burn, or invalid \
+                aggregate state"),
+        (status = 502, description = "On-chain/RPC verification failure"),
+        (status = 500, description = "Event load/deserialize or internal failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, pool, burn_recovery))]
 #[post(
     "/admin/force-complete/redemption/<issuer_request_id>",
@@ -952,6 +1017,24 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/reprocess/mint/{aggregate_id}",
+    tag = "admin",
+    params(
+        ("aggregate_id" = String, Path,
+            description = "Issuer mint request id (UUID) to reprocess")
+    ),
+    responses(
+        (status = 200, description = "Recovery initiated", body = ReprocessResponse),
+        (status = 400, description = "Aggregate id is not a valid UUID"),
+        (status = 404, description = "No mint found for this id"),
+        (status = 409, description = "Mint already completed or closed"),
+        (status = 422, description = "Invalid state transition for recovery"),
+        (status = 500, description = "View query or internal failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store, pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
@@ -1034,7 +1117,7 @@ pub(crate) async fn reprocess_mint(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CloseMintRequest {
     reason: String,
 }
@@ -1042,6 +1125,23 @@ pub(crate) struct CloseMintRequest {
 /// Admin endpoint to close a mint that cannot be automatically recovered.
 ///
 /// Valid from any non-terminal state. Closed mints do not appear in stuck queries.
+#[utoipa::path(
+    post,
+    path = "/admin/close/mint/{aggregate_id}",
+    tag = "admin",
+    params(
+        ("aggregate_id" = String, Path,
+            description = "Issuer mint request id (UUID) to close")
+    ),
+    request_body = CloseMintRequest,
+    responses(
+        (status = 200, description = "Mint closed by admin", body = ReprocessResponse),
+        (status = 400, description = "Aggregate id is not a valid UUID"),
+        (status = 422, description = "Invalid state transition for close"),
+        (status = 500, description = "Internal failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store))]
 #[post("/admin/close/mint/<aggregate_id>", format = "json", data = "<body>")]
 pub(crate) async fn close_mint(
@@ -1092,6 +1192,17 @@ pub(crate) async fn close_mint(
 /// leaves a redemption in `Burning` indefinitely with no terminal event).
 const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 
+#[utoipa::path(
+    get,
+    path = "/admin/stuck",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Stuck mints and redemptions, enriched with \
+            best-effort Fireblocks status", body = StuckResponse),
+        (status = 500, description = "Failed to query stuck aggregates")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, pool, vault_service))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
@@ -1732,7 +1843,7 @@ fn tx_hash_from_fireblocks_status(status: &FireblocksTxStatus) -> Option<B256> {
 }
 
 /// Response for the Fireblocks transaction status lookup endpoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct FireblocksTxResponse {
     fireblocks_tx_id: String,
     #[serde(flatten)]
@@ -1743,6 +1854,23 @@ pub(crate) struct FireblocksTxResponse {
 ///
 /// Useful for checking orphaned transactions that were submitted but never
 /// recorded in the event store (e.g. due to recovery timeout).
+#[utoipa::path(
+    get,
+    path = "/admin/fireblocks/tx/{fireblocks_tx_id}",
+    tag = "admin",
+    params(
+        ("fireblocks_tx_id" = String, Path,
+            description = "Fireblocks transaction id to look up")
+    ),
+    responses(
+        (status = 200, description = "Live Fireblocks transaction status",
+            body = FireblocksTxResponse),
+        (status = 404,
+            description = "Unknown tx, or backend is non-Fireblocks (Local signer)"),
+        (status = 502, description = "Fireblocks lookup failed")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, vault_service))]
 #[get("/admin/fireblocks/tx/<fireblocks_tx_id>")]
 pub(crate) async fn check_fireblocks_tx(
@@ -2647,7 +2775,7 @@ mod tests {
     ) {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, LogLevel};
+        use crate::config::{Config, Environment, LogLevel};
         use crate::fireblocks::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
@@ -2662,6 +2790,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
@@ -2817,7 +2946,7 @@ mod tests {
     ) -> rocket::Rocket<rocket::Build> {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, LogLevel};
+        use crate::config::{Config, Environment, LogLevel};
         use crate::fireblocks::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
@@ -2832,6 +2961,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
@@ -3129,7 +3259,7 @@ mod tests {
     ) -> rocket::Rocket<rocket::Build> {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, LogLevel};
+        use crate::config::{Config, Environment, LogLevel};
         use crate::fireblocks::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
@@ -3143,6 +3273,7 @@ mod tests {
             backfill_start_block: 0,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),

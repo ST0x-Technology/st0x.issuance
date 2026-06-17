@@ -17,6 +17,22 @@ use super::{
 };
 use crate::auth::{InternalAuth, IssuerAuth};
 
+#[utoipa::path(
+    get,
+    path = "/tokenized-assets/{underlying}",
+    tag = "tokenized-assets",
+    params(
+        ("underlying" = String, Path,
+            description = "Underlying equity symbol, e.g. SGOV")
+    ),
+    responses(
+        (status = 200, description = "Asset detail including freeze status",
+            body = TokenizedAssetDetailResponse),
+        (status = 404, description = "Unknown asset"),
+        (status = 500, description = "View load or deserialization failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets/<underlying>")]
 pub(crate) async fn get_tokenized_asset(
@@ -55,6 +71,23 @@ pub(crate) async fn get_tokenized_asset(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/tokenized-assets/{underlying}/status",
+    tag = "tokenized-assets",
+    params(
+        ("underlying" = String, Path,
+            description = "Underlying equity symbol, e.g. SGOV")
+    ),
+    responses(
+        (status = 200, description = "Per-asset freeze status",
+            body = TokenizedAssetStatusResponse),
+        (status = 404, description = "Unknown asset"),
+        (status = 500,
+            description = "Indeterminate (view load failure); retry, do not treat as enabled")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets/<underlying>/status")]
 pub(crate) async fn get_tokenized_asset_status(
@@ -111,6 +144,18 @@ pub(crate) async fn list_tokenized_assets(
     Ok(Json(TokenizedAssetsListResponse { tokens }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/tokenized-assets",
+    tag = "tokenized-assets",
+    request_body = AddTokenizedAssetRequest,
+    responses(
+        (status = 201, description = "Asset added (idempotent: also 201 if it already existed)",
+            body = AddTokenizedAssetResponse),
+        (status = 500, description = "Failed to add asset")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store), fields(
     underlying = %request.underlying,
     token = %request.token,
@@ -164,7 +209,7 @@ mod tests {
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, LogLevel};
+    use crate::config::{Config, Environment, LogLevel};
     use crate::fireblocks::SignerConfig;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
@@ -182,6 +227,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph")

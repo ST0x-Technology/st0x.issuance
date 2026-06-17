@@ -53,6 +53,7 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
 pub(crate) mod fireblocks;
+mod openapi;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
@@ -62,7 +63,7 @@ pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
-pub use config::{Config, LogLevel, setup_tracing};
+pub use config::{Config, Environment, LogLevel, setup_tracing};
 pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
@@ -391,7 +392,10 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         // client IP at the network layer (e.g., PROXY protocol) rather than headers.
         .merge(("ip_header", false));
 
-    rocket::custom(figment)
+    // Read before `state.config` is moved into management below.
+    let environment = state.config.environment;
+
+    let rocket = rocket::custom(figment)
         .manage(state.config)
         .manage(state.rate_limiter)
         .manage(state.account_store)
@@ -424,7 +428,31 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::check_fireblocks_tx,
             ],
         )
-        .register("/", catchers::json_catchers())
+        .register("/", catchers::json_catchers());
+
+    mount_api_docs(rocket, environment)
+}
+
+/// Mounts the SwaggerUI and `/api-docs/openapi.json` endpoints, but only outside
+/// production. The docs expose the full internal/admin API surface (paths,
+/// parameters, schemas), so unlike the handlers themselves they carry no
+/// `InternalAuth`/`IssuerAuth` guard; gating them on `ENVIRONMENT` keeps that
+/// schema off a production host entirely. See [`Environment::exposes_api_docs`].
+fn mount_api_docs(
+    rocket: rocket::Rocket<rocket::Build>,
+    environment: Environment,
+) -> rocket::Rocket<rocket::Build> {
+    if !environment.exposes_api_docs() {
+        return rocket;
+    }
+
+    rocket.mount(
+        "/",
+        utoipa_swagger_ui::SwaggerUi::new("/swagger-ui/<_..>").url(
+            "/api-docs/openapi.json",
+            <openapi::ApiDoc as utoipa::OpenApi>::openapi(),
+        ),
+    )
 }
 
 async fn setup_aggregate_cqrs(
@@ -1003,8 +1031,30 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        Quantity, QuantityConversionError, next_receipt_backfill_block,
+        Environment, Quantity, QuantityConversionError, mount_api_docs,
+        next_receipt_backfill_block,
     };
+
+    #[test]
+    fn api_docs_mounted_only_outside_production() {
+        // Production must serve no docs routes at all; a bare rocket has none,
+        // so the gated mount adding nothing leaves the count at zero.
+        assert_eq!(
+            mount_api_docs(rocket::build(), Environment::Production)
+                .routes()
+                .count(),
+            0,
+            "production must not expose the OpenAPI docs"
+        );
+
+        for environment in [Environment::Development, Environment::Staging] {
+            assert!(
+                mount_api_docs(rocket::build(), environment).routes().count()
+                    > 0,
+                "{environment:?} must serve the OpenAPI docs"
+            );
+        }
+    }
 
     #[test]
     fn test_quantity_display() {

@@ -324,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
-    use crate::config::LogLevel;
+    use crate::config::{Environment, LogLevel};
     use crate::fireblocks::SignerConfig;
 
     #[rocket::get("/issuer-test")]
@@ -348,6 +348,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph")

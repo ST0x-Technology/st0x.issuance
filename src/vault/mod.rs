@@ -190,11 +190,15 @@ pub(crate) fn verify_burn_in_receipt(
 }
 
 /// Status of a Fireblocks transaction, as returned by `check_fireblocks_tx`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum FireblocksTxStatus {
     /// Transaction completed on-chain.
-    Completed { tx_hash: B256, block_number: u64 },
+    Completed {
+        #[schema(value_type = String)]
+        tx_hash: B256,
+        block_number: u64,
+    },
     /// Transaction is still pending (submitted, confirming, etc.).
     Pending,
     /// Transaction reached a terminal failure status.

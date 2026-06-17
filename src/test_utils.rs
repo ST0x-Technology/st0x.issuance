@@ -25,7 +25,7 @@ use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
-use crate::config::{Config, LogLevel};
+use crate::config::{Config, Environment, LogLevel};
 use crate::fireblocks::SignerConfig;
 use crate::mint::{Mint, MintServices};
 use crate::receipt_inventory::{
@@ -65,6 +65,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
         auth: test_auth_config()?,
         log_level: LogLevel::Debug,
+        environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig::test_default(),
         subgraph_url: Url::parse("http://localhost:0/subgraph")?,

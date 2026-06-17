@@ -27,8 +27,8 @@ use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
 };
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
-    SignerConfig,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
+    LogLevel, SignerConfig,
 };
 
 pub async fn wait_for_shares<T>(
@@ -515,6 +515,7 @@ pub fn create_config_with_db(
                     .expect("Valid IP ranges"),
             },
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig {
                 api_base_url: mock_alpaca.base_url(),

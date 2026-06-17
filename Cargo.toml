@@ -8,7 +8,7 @@ default-run = "st0x-issuance"
 workspace = true
 
 [dependencies]
-st0x-issuance-dto = { path = "crates/dto" }
+st0x-issuance-dto = { path = "crates/dto", features = ["utoipa"] }
 event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 cqrs-es = "0.5.0"
@@ -57,6 +57,8 @@ governor = "0.10.2"
 fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", branch = "fix/confirming-not-terminal" }
 ciborium = "0.2.2"
 flate2 = "1.1.9"
+utoipa = { version = "5.5.0", features = ["rocket_extras"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["rocket"] }
 
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"

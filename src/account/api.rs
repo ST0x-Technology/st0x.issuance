@@ -67,16 +67,33 @@ impl<'r> Responder<'r, 'static> for ApiError {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct RegisterAccountRequest {
+    #[schema(value_type = String)]
     pub(crate) email: Email,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RegisterAccountResponse {
+    #[schema(value_type = String)]
     pub client_id: ClientId,
 }
 
+#[utoipa::path(
+    post,
+    path = "/accounts",
+    tag = "accounts",
+    request_body = RegisterAccountRequest,
+    responses(
+        (status = 200, description = "Account registered",
+            body = RegisterAccountResponse),
+        (status = 400, description = "Invalid registration command"),
+        (status = 409, description = "Email already registered"),
+        (status = 422, description = "Malformed or invalid email payload"),
+        (status = 500, description = "Email claim or event-store failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store, pool), fields(email = %request.email.0))]
 #[post("/accounts", format = "json", data = "<request>")]
 pub(crate) async fn register_account(
@@ -192,16 +209,35 @@ pub(crate) async fn connect_account(
     Ok(Json(AccountLinkResponse { client_id }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct WhitelistWalletRequest {
+    #[schema(value_type = String)]
     pub(crate) wallet: Address,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WhitelistWalletResponse {
     pub success: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/accounts/{client_id}/wallets",
+    tag = "accounts",
+    params(
+        ("client_id" = String, Path,
+            description = "Client UUID of the Alpaca-linked account")
+    ),
+    request_body = WhitelistWalletRequest,
+    responses(
+        (status = 200, description = "Wallet whitelisted",
+            body = WhitelistWalletResponse),
+        (status = 404, description = "Account not found or not linked to Alpaca"),
+        (status = 422, description = "Malformed wallet payload"),
+        (status = 500, description = "View load or event-store failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store, pool), fields(
     client_id = %client_id,
     wallet = ?request.wallet
@@ -229,6 +265,24 @@ pub(crate) async fn whitelist_wallet(
     Ok(Json(WhitelistWalletResponse { success: true }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/accounts/{client_id}/wallets/{wallet}",
+    tag = "accounts",
+    params(
+        ("client_id" = String, Path,
+            description = "Client UUID of the Alpaca-linked account"),
+        ("wallet" = String, Path,
+            description = "Wallet address to remove from the whitelist")
+    ),
+    responses(
+        (status = 200, description = "Wallet removed from the whitelist",
+            body = WhitelistWalletResponse),
+        (status = 404, description = "Account not found or not linked to Alpaca"),
+        (status = 500, description = "View load or event-store failure")
+    ),
+    security(("internal_api_key" = []))
+)]
 #[tracing::instrument(skip(_auth, store, pool), fields(
     client_id = %client_id,
     wallet = %wallet.0
@@ -271,7 +325,7 @@ mod tests {
     use crate::account::Account;
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, LogLevel};
+    use crate::config::{Config, Environment, LogLevel};
     use crate::fireblocks::SignerConfig;
     use crate::test_utils::logs_contain_at;
 
@@ -286,6 +340,7 @@ mod tests {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: test_auth_config().unwrap(),
             log_level: LogLevel::Debug,
+            environment: Environment::Development,
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph")

@@ -1,4 +1,4 @@
-mod api;
+pub(crate) mod api;
 pub(crate) mod cli;
 mod cmd;
 mod event;
