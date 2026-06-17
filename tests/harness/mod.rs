@@ -501,3 +501,139 @@ pub async fn perform_mint_and_confirm_with(
 
     Ok(issuer_request_id)
 }
+
+/// Seeds a `SchemaRegistry` event recording the last-known schema version for
+/// an aggregate. Used in setup phases to simulate production DB state before a
+/// `SCHEMA_VERSION` bump.
+pub async fn seed_schema_registry_version(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    aggregate_name: &str,
+    version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sequence: i64 = sqlx::query_scalar(
+        "
+        SELECT COALESCE(MAX(sequence), 0) + 1
+        FROM events
+        WHERE aggregate_type = 'SchemaRegistry'
+          AND aggregate_id = 'schema'
+        ",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let payload = json!({
+        "VersionUpdated": {
+            "name": aggregate_name,
+            "version": version,
+        }
+    })
+    .to_string();
+
+    sqlx::query(
+        "
+        INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES (
+            'SchemaRegistry',
+            'schema',
+            ?,
+            'SchemaRegistryEvent::VersionUpdated',
+            '1.0',
+            ?,
+            '{}'
+        )
+        ",
+    )
+    .bind(sequence)
+    .bind(payload)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Inserts a pre-event-sorcery snapshot row: bare aggregate enum JSON (e.g.
+/// `{"Completed": {...}}`) rather than the `Lifecycle` wrapper
+/// (`{"Live": {...}}`). Reproduces production DB state that bricks startup if
+/// stale snapshots are not cleared before projection catch-up.
+pub async fn seed_pre_lifecycle_snapshot(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    last_sequence: i64,
+    payload: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(
+        "
+        INSERT INTO snapshots (
+            aggregate_type,
+            aggregate_id,
+            last_sequence,
+            snapshot_version,
+            payload,
+            timestamp
+        )
+        VALUES (?, ?, ?, 0, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .bind(last_sequence)
+    .bind(payload.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Inserts a pre-event-sorcery canonical projection row (bare aggregate JSON).
+pub async fn seed_pre_lifecycle_view_row(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    table: &str,
+    view_id: &str,
+    version: i64,
+    payload: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let query = match table {
+        "account_view" => {
+            "
+            INSERT INTO account_view (view_id, version, payload)
+            VALUES (?, ?, ?)
+        "
+        }
+        "mint_view" => {
+            "
+            INSERT INTO mint_view (view_id, version, payload)
+            VALUES (?, ?, ?)
+        "
+        }
+        "tokenized_asset_view" => {
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES (?, ?, ?)
+        "
+        }
+        other => {
+            return Err(format!(
+                "unsupported view table for pre-Lifecycle fixture: {other}"
+            )
+            .into());
+        }
+    };
+
+    sqlx::query(query)
+        .bind(view_id)
+        .bind(version)
+        .bind(payload.to_string())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}

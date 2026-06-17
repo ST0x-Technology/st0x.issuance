@@ -1781,7 +1781,7 @@ impl EventSourced for Mint {
 
     const AGGREGATE_TYPE: &'static str = "Mint";
     const PROJECTION: Table = Table("mint_view");
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -2142,7 +2142,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
-    use uuid::Uuid;
+    use uuid::{Uuid, uuid};
 
     use super::{
         AutomaticRetryDecision, ClientId, IssuerMintRequestId, Mint,
@@ -2151,8 +2151,9 @@ pub(crate) mod tests {
         UnderlyingSymbol, find_by_issuer_request_id,
     };
     use crate::alpaca::mock::MockAlpacaService;
+    use crate::prepare_event_sourced_startup;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::log_count_at;
+    use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -3432,6 +3433,405 @@ pub(crate) mod tests {
                 .unwrap();
 
         (mint_store, pool)
+    }
+
+    /// Regression: pre-event-sorcery snapshot payloads (`{"Completed": ...}`)
+    /// must be cleared by schema reconciliation before projection catch-up
+    /// calls `load_with_context`, which deserializes into `Lifecycle<Mint>`.
+    #[traced_test]
+    #[tokio::test]
+    async fn pre_lifecycle_snapshot_cleared_before_projection_catch_up() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let mint_id = IssuerMintRequestId::new(uuid!(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        let mint_id_str = mint_id.to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "Mint", "version": 1 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Mint',
+                ?,
+                1,
+                'MintEvent::Initiated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(mint_id_str.as_str())
+        .bind(
+            serde_json::json!({
+                "Initiated": {
+                    "issuer_request_id": mint_id_str,
+                    "tokenization_request_id": "tok-stale",
+                    "quantity": "1.0",
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "network": "base",
+                    "client_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                    "wallet": "0x1234567890123456789012345678901234567890",
+                    "initiated_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'Mint',
+                ?,
+                1,
+                0,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(mint_id_str.as_str())
+        .bind(
+            serde_json::json!({
+                "Completed": {
+                    "issuer_request_id": mint_id_str,
+                    "tokenization_request_id": "tok-stale",
+                    "quantity": "1.0",
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "network": "base",
+                    "client_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                    "wallet": "0x1234567890123456789012345678901234567890",
+                    "initiated_at": now,
+                    "journal_confirmed_at": now,
+                    "tx_hash": "0xbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00d",
+                    "receipt_id": "1",
+                    "shares_minted": "1000000000000000000",
+                    "gas_used": 21000,
+                    "block_number": 1,
+                    "minted_at": now,
+                    "completed_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (asset_store, _asset_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        asset_store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault: VAULT,
+                },
+            )
+            .await
+            .unwrap();
+
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+
+        let services = MintServices {
+            vault: Arc::new(MockVaultService::new_success()),
+            alpaca: Arc::new(MockAlpacaService::new_success()),
+            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool: pool.clone(),
+            bot: BOT,
+        };
+
+        prepare_event_sourced_startup::<Mint>(&pool).await.unwrap();
+        StoreBuilder::<Mint>::new(pool.clone()).build(services).await.unwrap();
+
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &["Cleared stale snapshots", "Mint"]
+        ));
+
+        let stale_snapshot_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM snapshots
+            WHERE aggregate_type = 'Mint'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(mint_id_str.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stale_snapshot_count, 0,
+            "Schema reconciliation must delete incompatible Mint snapshots"
+        );
+    }
+
+    async fn seed_pre_lifecycle_mint_view_row(
+        pool: &Pool<Sqlite>,
+        mint_id: &str,
+        version: i64,
+        payload: &serde_json::Value,
+    ) {
+        sqlx::query(
+            "
+            INSERT INTO mint_view (view_id, version, payload)
+            VALUES (?, ?, ?)
+            ",
+        )
+        .bind(mint_id)
+        .bind(version)
+        .bind(payload.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Regression: pre-event-sorcery `mint_view` payloads (`{"Completed": ...}`)
+    /// must be cleared on schema version change before projection catch-up calls
+    /// `load_with_context`, which deserializes into `Lifecycle<Mint>`.
+    #[tokio::test]
+    async fn pre_lifecycle_mint_view_cleared_before_projection_catch_up() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let mint_id = IssuerMintRequestId::new(uuid!(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        let mint_id_str = mint_id.to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "Mint", "version": 1 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Mint',
+                ?,
+                1,
+                'MintEvent::Initiated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(mint_id_str.as_str())
+        .bind(
+            serde_json::json!({
+                "Initiated": {
+                    "issuer_request_id": mint_id_str,
+                    "tokenization_request_id": "tok-stale-view",
+                    "quantity": "1.0",
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "network": "base",
+                    "client_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                    "wallet": "0x1234567890123456789012345678901234567890",
+                    "initiated_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        seed_pre_lifecycle_mint_view_row(
+            &pool,
+            &mint_id_str,
+            1,
+            &serde_json::json!({
+                "Completed": {
+                    "issuer_request_id": mint_id_str,
+                    "tokenization_request_id": "tok-stale-view",
+                    "quantity": "1.0",
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "network": "base",
+                    "client_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                    "wallet": "0x1234567890123456789012345678901234567890",
+                    "initiated_at": now,
+                    "journal_confirmed_at": now,
+                    "tx_hash": "0xbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00d",
+                    "receipt_id": "1",
+                    "shares_minted": "1000000000000000000",
+                    "gas_used": 21000,
+                    "block_number": 1,
+                    "minted_at": now,
+                    "completed_at": now,
+                }
+            }),
+        )
+        .await;
+
+        let (asset_store, _asset_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        asset_store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault: VAULT,
+                },
+            )
+            .await
+            .unwrap();
+
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+
+        let services = MintServices {
+            vault: Arc::new(MockVaultService::new_success()),
+            alpaca: Arc::new(MockAlpacaService::new_success()),
+            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool: pool.clone(),
+            bot: BOT,
+        };
+
+        prepare_event_sourced_startup::<Mint>(&pool).await.unwrap();
+        StoreBuilder::<Mint>::new(pool.clone()).build(services).await.unwrap();
+
+        let view_payload: String = sqlx::query_scalar(
+            "
+            SELECT payload
+            FROM mint_view
+            WHERE view_id = ?
+            ",
+        )
+        .bind(mint_id_str.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&view_payload).unwrap();
+        assert!(
+            payload
+                .get("Live")
+                .and_then(|live| live.get("Initiated"))
+                .is_some(),
+            "Projection catch-up must rebuild mint_view with Lifecycle payload, got {payload}"
+        );
     }
 
     #[tokio::test]

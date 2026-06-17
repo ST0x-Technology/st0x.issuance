@@ -1841,6 +1841,24 @@ that snapshot, rather than replaying all events from the beginning. Snapshots
 can be deleted at any time - aggregates can always be rebuilt from the event
 store alone.
 
+**Snapshot schema versioning**: event-sorcery wraps each aggregate in
+`Lifecycle<Entity>` (`Uninitialized` / `Live` / `Failed`). Snapshot payloads
+therefore serialize as `{"Live": {<entity>}}`, not as the bare entity enum (e.g.
+`{"Completed": {...}}`). A snapshot written before a wire-format change is
+incompatible and bricks startup on deserialize.
+
+Each `EventSourced` aggregate declares `SCHEMA_VERSION`. On every
+`StoreBuilder::build`, the schema reconciler compares the stored version
+(registered in the `SchemaRegistry` event stream) against the code version. When
+they differ, all snapshots for that aggregate type are deleted before any load
+or projection catch-up runs. **Any change to aggregate snapshot serialization —
+including wrapping in `Lifecycle` — MUST bump `SCHEMA_VERSION`.** Startup also
+purges any snapshot rows whose payload is not `Lifecycle`-shaped (covers the
+case where the registry already records the new version but stale rows remain).
+Canonical `Table` projections for the same aggregate are cleared when schema
+reconciliation detects a version change, before `StoreBuilder::build` projection
+catch-up.
+
 ### View Tables
 
 All view tables follow the same pattern: `view_id` (primary key), `version`

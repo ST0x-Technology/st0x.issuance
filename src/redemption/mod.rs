@@ -828,7 +828,7 @@ impl EventSourced for Redemption {
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -1271,9 +1271,10 @@ impl Redemption {
 mod tests {
     use alloy::primitives::{TxHash, U256, address, b256, uint};
     use chrono::Utc;
-    use event_sorcery::{LifecycleError, TestHarness, replay};
+    use event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     use super::{
@@ -1283,6 +1284,7 @@ mod tests {
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::prepare_event_sourced_startup;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{MultiBurnEntry, VaultService};
@@ -3191,5 +3193,158 @@ mod tests {
             prop_assert!(display.starts_with("0x"));
             prop_assert_eq!(display.len(), 66);
         }
+    }
+
+    /// Regression: pre-event-sorcery snapshot payloads must be cleared before
+    /// `StoreBuilder::build` projection catch-up.
+    #[tokio::test]
+    async fn pre_lifecycle_snapshot_cleared_before_store_build() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let tx_hash = b256!(
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+        let redemption_id = IssuerRedemptionRequestId::new(tx_hash);
+        let redemption_id_str = redemption_id.to_string();
+        let now = Utc::now();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "Redemption", "version": 1 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Redemption',
+                ?,
+                1,
+                'RedemptionEvent::Detected',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(redemption_id_str.as_str())
+        .bind(
+            serde_json::json!({
+                "Detected": {
+                    "issuer_request_id": redemption_id_str,
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "wallet": "0x1234567890123456789012345678901234567890",
+                    "quantity": "1.0",
+                    "tx_hash": redemption_id_str,
+                    "block_number": 1,
+                    "detected_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'Redemption',
+                ?,
+                1,
+                0,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(redemption_id_str.as_str())
+        .bind(
+            serde_json::json!({
+                "Completed": {
+                    "issuer_request_id": redemption_id_str,
+                    "burn_tx_hash": redemption_id_str,
+                    "completed_at": now,
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        prepare_event_sourced_startup::<Redemption>(&pool).await.unwrap();
+        StoreBuilder::<Redemption>::new(pool.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+
+        let stale_snapshot_count: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM snapshots
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+            ",
+        )
+        .bind(redemption_id_str.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stale_snapshot_count, 0,
+            "Startup must clear incompatible Redemption snapshots"
+        );
     }
 }

@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use event_sorcery::{Store, StoreBuilder};
+use event_sorcery::{
+    EventSourced, ReconcileError, Reconciler, Store, StoreBuilder,
+};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -222,12 +224,15 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    prepare_event_sourced_startup::<TokenizedAsset>(&pool).await?;
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
+    prepare_event_sourced_startup::<Account>(&pool).await?;
     let (account_store, _account_projection) =
         StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
+    prepare_event_sourced_startup::<ReceiptInventory>(&pool).await?;
     let receipt_inventory_store =
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
@@ -441,6 +446,7 @@ async fn setup_aggregate_cqrs(
     // Mint's canonical `mint_view` projection is auto-wired by StoreBuilder; the
     // secondary `receipt_inventory_view` (formerly a View<Mint> GenericQuery) is
     // maintained by the registered reactor.
+    prepare_event_sourced_startup::<Mint>(pool).await?;
     let (mint_store, mint_projection) = StoreBuilder::<Mint>::new(pool.clone())
         .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
         .build(mint_services)
@@ -459,6 +465,7 @@ async fn setup_aggregate_cqrs(
     // Failed and tracking re-entry timestamps the aggregate state discards) and
     // `receipt_burns_view` (burns keyed by redemption aggregate_id, joined with
     // receipt_inventory_view at query time to compute available balance).
+    prepare_event_sourced_startup::<Redemption>(pool).await?;
     let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
         .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
         .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
@@ -466,6 +473,98 @@ async fn setup_aggregate_cqrs(
         .await?;
 
     Ok(AggregateCqrsSetup { mint_store, redemption_store })
+}
+
+/// Startup hygiene for event-sourced aggregates before `StoreBuilder::build`.
+///
+/// 1. Schema reconciliation — clears all snapshots when `SCHEMA_VERSION` changed
+/// 2. Purges any remaining snapshots whose payload is not `Lifecycle`-shaped
+/// 3. Clears canonical `Table` projections when schema version changed
+///    (`catch_up` runs before `rebuild_all` and would brick on stale rows)
+pub(crate) async fn prepare_event_sourced_startup<Entity>(
+    pool: &Pool<Sqlite>,
+) -> Result<(), ReconcileError>
+where
+    Entity: EventSourced,
+{
+    let schema_changed =
+        Reconciler::new(pool.clone()).reconcile::<Entity>().await?;
+
+    let purged =
+        purge_incompatible_lifecycle_snapshots(pool, Entity::AGGREGATE_TYPE)
+            .await?;
+
+    if purged > 0 {
+        info!(
+            target: "startup",
+            aggregate = Entity::AGGREGATE_TYPE,
+            purged,
+            "Purged incompatible snapshot rows"
+        );
+    }
+
+    if schema_changed {
+        clear_canonical_projection_for_aggregate(pool, Entity::AGGREGATE_TYPE)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn purge_incompatible_lifecycle_snapshots(
+    pool: &Pool<Sqlite>,
+    aggregate_type: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query!(
+        "
+        DELETE FROM snapshots
+        WHERE aggregate_type = ?
+          AND json_extract(payload, '$.Live') IS NULL
+          AND json_extract(payload, '$.Uninitialized') IS NULL
+          AND json_extract(payload, '$.Failed') IS NULL
+        ",
+        aggregate_type
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+async fn clear_canonical_projection_for_aggregate(
+    pool: &Pool<Sqlite>,
+    aggregate_type: &str,
+) -> Result<(), ReconcileError> {
+    let table = match aggregate_type {
+        "Account" => "account_view",
+        "Mint" => "mint_view",
+        "TokenizedAsset" => "tokenized_asset_view",
+        _ => return Ok(()),
+    };
+
+    info!(
+        target: "startup",
+        aggregate = aggregate_type,
+        table,
+        "Clearing canonical projection after schema version change",
+    );
+
+    match table {
+        "account_view" => {
+            sqlx::query!("DELETE FROM account_view").execute(pool).await?
+        }
+        "mint_view" => {
+            sqlx::query!("DELETE FROM mint_view").execute(pool).await?
+        }
+        "tokenized_asset_view" => {
+            sqlx::query!("DELETE FROM tokenized_asset_view")
+                .execute(pool)
+                .await?
+        }
+        _ => unreachable!("table derived from supported aggregate types"),
+    };
+
+    Ok(())
 }
 
 fn setup_redemption_managers(
