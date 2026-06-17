@@ -173,7 +173,7 @@ mod tests {
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),
-                        network: Network::new("base"),
+                        network: Network::Base,
                         vault,
                     },
                 )
@@ -279,7 +279,7 @@ mod tests {
             serde_json::to_string(&TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault,
                 added_at: chrono::Utc::now(),
             })
@@ -364,7 +364,7 @@ mod tests {
         let added = serde_json::to_string(&TokenizedAssetEvent::Added {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
+            network: Network::Base,
             vault,
             added_at: chrono::Utc::now(),
         })

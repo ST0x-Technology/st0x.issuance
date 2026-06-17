@@ -155,23 +155,21 @@ async fn seed_test_assets(
         (
             "AAPL",
             "tAAPL",
-            "base",
             address!("0x1234567890abcdef1234567890abcdef12345678"),
         ),
         (
             "TSLA",
             "tTSLA",
-            "base",
             address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
         ),
     ];
 
-    for (underlying, token, network, vault) in assets {
+    for (underlying, token, vault) in assets {
         let underlying = UnderlyingSymbol::new(underlying);
         let command = TokenizedAssetCommand::Add {
             underlying: underlying.clone(),
             token: TokenSymbol::new(token),
-            network: Network::new(network),
+            network: Network::Base,
             vault,
         };
 

@@ -162,7 +162,7 @@ mod tests {
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let asset_cmd = TokenizedAssetCommand::Add {
@@ -259,7 +259,7 @@ mod tests {
             "qty": "100.5",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
@@ -353,7 +353,7 @@ mod tests {
             "qty": "100.5",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
@@ -566,7 +566,7 @@ mod tests {
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let asset_cmd = TokenizedAssetCommand::Add {
@@ -662,7 +662,7 @@ mod tests {
             "qty": "50.0",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
@@ -741,7 +741,7 @@ mod tests {
             "qty": "75.5",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
         });
@@ -831,7 +831,7 @@ mod tests {
             "qty": "100.5",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": "invalid-address"
         });
@@ -899,17 +899,12 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(response.status(), Status::BadRequest);
-
-        let error_response: ErrorResponse = serde_json::from_str(
-            &response.into_string().await.expect("valid response body"),
-        )
-        .expect("valid JSON response");
-
-        assert_eq!(
-            error_response.error,
-            "Invalid Token: Token not available on the network"
-        );
+        // `Network` is a closed enum, so an unsupported network is
+        // unrepresentable: the request is rejected at JSON deserialization
+        // (Rocket's data guard -> 422) before the handler's asset-availability
+        // check runs. A mismatched-but-parseable network can no longer be
+        // expressed, so the old handler-level 400 path is unreachable here.
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 
     #[tokio::test]
@@ -1022,7 +1017,7 @@ mod tests {
             "qty": "100.5",
             "underlying_symbol": underlying.0,
             "token_symbol": token.0,
-            "network": network.0,
+            "network": network.as_str(),
             "client_id": client_id,
             "wallet_address": non_whitelisted_wallet.to_string()
         });

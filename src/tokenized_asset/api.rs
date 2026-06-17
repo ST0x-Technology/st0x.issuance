@@ -210,7 +210,7 @@ mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: address!(
                         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),
@@ -593,7 +593,7 @@ mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: address!(
                         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),
@@ -704,7 +704,7 @@ mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: address!(
                         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),

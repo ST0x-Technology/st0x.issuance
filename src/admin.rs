@@ -3815,7 +3815,7 @@ mod tests {
         let tokenization_request_id = TokenizationRequestId::new("alp-stuck-1");
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let quantity = crate::mint::Quantity::new(Decimal::from(100));
@@ -3961,7 +3961,7 @@ mod tests {
                 quantity: crate::mint::Quantity::new(Decimal::from(100)),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 client_id: ClientId::new(),
                 wallet: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
                 initiated_at: failed_at,
