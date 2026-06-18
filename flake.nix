@@ -25,7 +25,7 @@
 
         # Vendoring reads the whole workspace lock, so the main crate's two git
         # deps (event-sorcery/sqlite-es + fireblocks-sdk) need pinned hashes
-        # even though the dto/client crates never pull them in.
+        # even though the dto crate never pulls them in.
         cargoVendorDir = craneLib.vendorCargoDeps {
           src = crateSrc;
           outputHashes = {
@@ -36,26 +36,24 @@
           };
         };
 
-        # The dto + client crates are pure-Rust wire/HTTP helpers: no sqlx, no
-        # Rain `sol!` ABIs, no workspace git deps in their tree. Scoping every
-        # cargo invocation to them with `-p` keeps the main crate's database,
-        # ABI, and Fireblocks machinery out of the nix closure entirely, so we
-        # never need the live DB, ST0X_*_ABI env, or sqlite-es migrations the
-        # main crate's nix build would require.
+        # The dto crate is a pure-Rust wire-types helper: no sqlx, no Rain
+        # `sol!` ABIs, no workspace git deps in its tree. Scoping every cargo
+        # invocation to it with `-p` keeps the main crate's database, ABI, and
+        # Fireblocks dependencies from being compiled and keeps their build-time
+        # requirements out of the build, so we never need the live DB,
+        # ST0X_*_ABI env, or sqlite-es migrations the main crate's nix build
+        # would require. (The vendored sources for those git deps are still
+        # fetched — see the outputHashes above — but cargo only compiles the dto
+        # crate.)
         crateArgs = {
           src = crateSrc;
           inherit cargoVendorDir;
           strictDeps = true;
-          # The dto/client crates are pure Rust with sandbox-safe tests (temp-dir
-          # binding export + loopback httpmock), so run them under `nix flake
-          # check` for extra CI coverage rather than only type-checking.
+          # The dto crate is pure Rust with sandbox-safe tests (temp-dir binding
+          # export), so run it under `nix flake check` for extra CI coverage
+          # rather than only type-checking.
           doCheck = true;
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [
-            pkgs.openssl
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.apple-sdk_15 ];
-          cargoExtraArgs = "-p st0x-issuance-dto -p st0x-issuance-client";
+          cargoExtraArgs = "-p st0x-issuance-dto";
         };
 
         cargoArtifacts = craneLib.buildDepsOnly crateArgs;
@@ -67,16 +65,6 @@
             inherit cargoArtifacts;
             cargoExtraArgs = "-p st0x-issuance-dto";
             meta.description = "st0x issuance API DTO types + TypeScript binding exporter";
-          }
-        );
-
-        st0x-issuance-client = craneLib.buildPackage (
-          crateArgs
-          // {
-            pname = "st0x-issuance-client";
-            inherit cargoArtifacts;
-            cargoExtraArgs = "-p st0x-issuance-client";
-            meta.description = "Typed Rust client for the st0x issuance HTTP API";
           }
         );
 
@@ -100,7 +88,6 @@
         issuanceBuilds = {
           inherit
             st0x-issuance-dto
-            st0x-issuance-client
             st0x-issuance-dto-typescript
             ;
         };
