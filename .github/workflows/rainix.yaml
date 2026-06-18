@@ -13,7 +13,7 @@ jobs:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           android: true
           dotnet: true
@@ -22,19 +22,19 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - uses: nixbuild/nix-quick-install-action@v30
+      - uses: nixbuild/nix-quick-install-action@5bb6a3b3abe66fd09bbf250dce8ada94f856a703  # v30
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
 
       - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
@@ -55,7 +55,7 @@ jobs:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           android: true
           dotnet: true
@@ -64,19 +64,19 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - uses: nixbuild/nix-quick-install-action@v30
+      - uses: nixbuild/nix-quick-install-action@5bb6a3b3abe66fd09bbf250dce8ada94f856a703  # v30
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
 
       - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-

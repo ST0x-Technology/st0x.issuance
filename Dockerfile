@@ -1,4 +1,4 @@
-FROM ubuntu:latest AS builder
+FROM ubuntu:24.04 AS builder
 
 ARG BUILD_PROFILE=release
 
