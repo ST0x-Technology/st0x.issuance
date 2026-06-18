@@ -34,6 +34,7 @@
               runtimeInputs = [
                 pkgs.nushell
                 pkgs.coreutils
+                pkgs.docker-client
               ];
               text = ''
                 exec nu ${./scripts/smoke-test-image.nu} "$@"
