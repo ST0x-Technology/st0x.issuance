@@ -14,6 +14,11 @@ def main [image: string] {
 
   print $output
 
+  if $result.exit_code == 124 {
+    print "::error::server binary timed out after 30s"
+    exit 1
+  }
+
   if not ($output | str contains "Failed to parse configuration") {
     print "::error::server binary did not start"
     exit 1
