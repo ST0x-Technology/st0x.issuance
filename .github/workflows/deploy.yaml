@@ -9,12 +9,15 @@ env:
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
   REGISTRY_NAME: stox
 
+permissions:
+  contents: read
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
           android: true
           dotnet: true
@@ -23,39 +26,39 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: recursive
+          persist-credentials: false
+
+      - uses: nixbuild/nix-quick-install-action@5bb6a3b3abe66fd09bbf250dce8ada94f856a703  # v30
 
       - name: Install doctl
-        uses: digitalocean/action-doctl@v2
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f  # v2
         with:
           token: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Build Docker image
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE=registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot
           echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
           docker build \
-            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:$SHORT_SHA \
-            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest .
+            -t "$IMAGE:$SHORT_SHA" \
+            -t "$IMAGE:latest" .
 
       - name: Test image runs
-        run: |
-          docker run -d --name test-container registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
-          sleep 5
-          docker ps -a
-          docker logs test-container
-          docker rm -f test-container
+        run: nix run .#smoke-test-image -- "$IMAGE:$SHORT_SHA"
 
       - name: Log in to DO Container Registry
         run: doctl registry login --expiry-seconds 1200
 
       - name: Push image to DO Registry
         run: |
-          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
-          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest
+          docker push "$IMAGE:$SHORT_SHA"
+          docker push "$IMAGE:latest"
 
       - name: Encode file contents
         run: |
@@ -64,7 +67,7 @@ jobs:
           echo "PREP_SCRIPT=$(base64 -w 0 prep-docker-compose.sh)" >> $GITHUB_ENV
 
       - name: Deploy to Droplet
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262  # v1.0.3
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: root

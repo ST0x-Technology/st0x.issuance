@@ -1,4 +1,4 @@
-FROM ubuntu:latest AS builder
+FROM ubuntu:24.04 AS builder
 
 ARG BUILD_PROFILE=release
 
@@ -60,7 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends patchelf && \
     patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 /app/target/${BUILD_PROFILE}/st0x-issuance && \
     apt-get remove -y patchelf && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
-FROM debian:12-slim
+FROM debian:trixie-slim
 
 ARG BUILD_PROFILE=release
 
