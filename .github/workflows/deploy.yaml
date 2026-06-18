@@ -27,6 +27,8 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: nixbuild/nix-quick-install-action@v30
+
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
@@ -35,27 +37,24 @@ jobs:
       - name: Build Docker image
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE=registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot
           echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
           docker build \
-            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:$SHORT_SHA \
-            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest .
+            -t "$IMAGE:$SHORT_SHA" \
+            -t "$IMAGE:latest" .
 
       - name: Test image runs
-        run: |
-          docker run -d --name test-container registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
-          sleep 5
-          docker ps -a
-          docker logs test-container
-          docker rm -f test-container
+        run: nix run .#smoke-test-image -- "$IMAGE:$SHORT_SHA"
 
       - name: Log in to DO Container Registry
         run: doctl registry login --expiry-seconds 1200
 
       - name: Push image to DO Registry
         run: |
-          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:${{ env.SHORT_SHA }}
-          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/issuance-bot:latest
+          docker push "$IMAGE:$SHORT_SHA"
+          docker push "$IMAGE:latest"
 
       - name: Encode file contents
         run: |

@@ -28,6 +28,17 @@
                 (cd lib/ethgild && forge build)
               '';
             };
+
+            smoke-test-image = pkgs.writeShellApplication {
+              name = "smoke-test-image";
+              runtimeInputs = [
+                pkgs.nushell
+                pkgs.coreutils
+              ];
+              text = ''
+                exec nu ${./scripts/smoke-test-image.nu} "$@"
+              '';
+            };
           };
 
         devShell = pkgs.mkShell {
