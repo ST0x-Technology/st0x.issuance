@@ -66,6 +66,7 @@ pub use config::{Config, LogLevel, setup_tracing};
 pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
+pub use tokenized_asset::cli::run_issuer_cli;
 
 struct AggregateCqrsSetup {
     mint_store: Arc<Store<Mint>>,

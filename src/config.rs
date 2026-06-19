@@ -27,6 +27,15 @@ pub(crate) struct BlockchainSetup<HttpP> {
 /// Default chain ID (Base mainnet)
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
 
+/// Default SQLite database URL when `DATABASE_URL` is unset. Production overrides
+/// it via the environment (see `docker-compose.template.yaml`). Single source of
+/// truth shared by the server config and the issuer CLI.
+pub(crate) const DEFAULT_DATABASE_URL: &str = "sqlite:data.db";
+
+/// Default SQLite connection-pool size, shared by the server config and the
+/// issuer CLI.
+pub(crate) const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 5;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -120,7 +129,7 @@ struct Env {
     #[arg(
         long,
         env = "DATABASE_URL",
-        default_value = "sqlite:data.db",
+        default_value = DEFAULT_DATABASE_URL,
         help = "SQLite database URL"
     )]
     database_url: String,
@@ -128,7 +137,7 @@ struct Env {
     #[arg(
         long,
         env = "DATABASE_MAX_CONNECTIONS",
-        default_value = "5",
+        default_value_t = DEFAULT_DATABASE_MAX_CONNECTIONS,
         help = "Maximum number of database connections in the pool"
     )]
     database_max_connections: u32,
