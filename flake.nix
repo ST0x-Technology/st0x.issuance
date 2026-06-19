@@ -29,8 +29,8 @@
         cargoVendorDir = craneLib.vendorCargoDeps {
           src = crateSrc;
           outputHashes = {
-            "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.1#d0ad3f66bb5a1da23161d898027bff1abb9dabd6" =
-              "sha256-fmBLdcyNoPh+Hktl1vVgeXdKtaxA+a1+xYi5Acxsr6o=";
+            "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.2#8f5c81f3472ac4ca84bbcebbddaa0b3b01f2cfea" =
+              "sha256-d0bl1jVmPeu9UPl4cNjY+cAaaLEDmLxw1BQhGrH5eV8=";
             "git+https://github.com/0xgleb/fireblocks-sdk-rs.git?branch=fix/confirming-not-terminal#18227211082342818efaf6a1b58c89c65a6f17cd" =
               "sha256-KThUI0Cvh1JELem7SUQ1K3WqMccFeYfS3BqfLXwk2AE=";
           };
