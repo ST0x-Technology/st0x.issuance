@@ -50,6 +50,7 @@ pub struct Config {
     pub receipt_poll_interval: Duration,
     pub auth: AuthConfig,
     pub log_level: LogLevel,
+    pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
     pub subgraph_url: Url,
@@ -174,6 +175,15 @@ struct Env {
     #[clap(long, env, default_value = "debug")]
     log_level: LogLevel,
 
+    #[arg(
+        long,
+        env = "ENVIRONMENT",
+        default_value = "production",
+        help = "Deployment environment; gates dev-only surfaces such as the \
+                OpenAPI docs (one of: development, staging, production)"
+    )]
+    environment: Environment,
+
     #[clap(flatten)]
     hyperdx: HyperDxEnv,
 
@@ -213,6 +223,7 @@ impl Env {
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             auth: self.auth,
             log_level: self.log_level,
+            environment: self.environment,
             hyperdx,
             alpaca: self.alpaca,
             subgraph_url: self.subgraph_url,
@@ -249,6 +260,28 @@ impl From<&LogLevel> for Level {
             LogLevel::Info => Self::INFO,
             LogLevel::Warn => Self::WARN,
             LogLevel::Error => Self::ERROR,
+        }
+    }
+}
+
+/// Deployment environment. Gates developer-facing surfaces that must not be
+/// exposed in production. Defaults to `Production` so an unset `ENVIRONMENT`
+/// fails closed (docs hidden) rather than open.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    Development,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    /// Whether the interactive OpenAPI docs (SwaggerUI + `/api-docs/openapi.json`)
+    /// should be served. They expose the full internal/admin API surface, so they
+    /// are served only outside production.
+    pub(crate) const fn exposes_api_docs(self) -> bool {
+        match self {
+            Self::Development | Self::Staging => true,
+            Self::Production => false,
         }
     }
 }
@@ -390,6 +423,25 @@ mod tests {
         let env = Env::try_parse_from(args).unwrap();
 
         assert_eq!(env.auth.alpaca_ip_ranges, IpWhitelist::AllowAll);
+    }
+
+    #[test]
+    fn api_docs_exposed_only_outside_production() {
+        assert!(Environment::Development.exposes_api_docs());
+        assert!(Environment::Staging.exposes_api_docs());
+        assert!(!Environment::Production.exposes_api_docs());
+    }
+
+    #[test]
+    fn environment_defaults_to_production_and_parses_explicit_value() {
+        // An unset ENVIRONMENT must fail closed to production (docs hidden).
+        let default_env = Env::try_parse_from(minimal_args()).unwrap();
+        assert_eq!(default_env.environment, Environment::Production);
+
+        let mut args = minimal_args();
+        args.extend_from_slice(&["--environment", "staging"]);
+        let staging_env = Env::try_parse_from(args).unwrap();
+        assert_eq!(staging_env.environment, Environment::Staging);
     }
 
     #[test]

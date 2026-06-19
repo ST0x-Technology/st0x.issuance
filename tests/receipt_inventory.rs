@@ -18,8 +18,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
-    SignerConfig, initialize_rocket,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
+    LogLevel, SignerConfig, initialize_rocket,
 };
 
 async fn wait_for_receipt_depleted(
@@ -303,6 +303,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
                 .expect("Valid IP ranges"),
         },
         log_level: LogLevel::Debug,
+        environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),

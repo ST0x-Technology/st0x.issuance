@@ -14,8 +14,8 @@ use url::Url;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, IpWhitelist, LogLevel,
-    SignerConfig, initialize_rocket,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
+    LogLevel, SignerConfig, initialize_rocket,
 };
 
 #[tokio::test]
@@ -60,6 +60,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
                 .expect("Valid IP ranges"),
         },
         log_level: LogLevel::Debug,
+        environment: Environment::Development,
         hyperdx: None,
         alpaca: AlpacaConfig {
             api_base_url: mock_alpaca.base_url(),

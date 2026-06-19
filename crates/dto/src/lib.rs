@@ -15,6 +15,7 @@ use ts_rs::TS;
 
 /// Underlying equity symbol, e.g. `SGOV`. Also the `TokenizedAsset` aggregate id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct UnderlyingSymbol(pub String);
 
 impl UnderlyingSymbol {
@@ -39,6 +40,7 @@ impl FromStr for UnderlyingSymbol {
 
 /// Tokenized share symbol, e.g. `tSGOV`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenSymbol(pub String);
 
 impl TokenSymbol {
@@ -61,6 +63,7 @@ impl std::fmt::Display for TokenSymbol {
 /// enum (rather than an opaque `String`) means an unsupported network is now a
 /// deserialization error instead of a value that silently flows through.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Network {
     Base,
@@ -89,11 +92,13 @@ impl std::fmt::Display for Network {
 /// frozen asset as enabled. The enum keeps the freeze state visible to
 /// consumers and the contradictory states unrepresentable.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenizedAssetDetailResponse {
     pub underlying: UnderlyingSymbol,
     pub token: TokenSymbol,
     pub network: Network,
     #[ts(type = "string")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub vault: Address,
     pub status: TokenizedAssetStatus,
 }
@@ -107,6 +112,7 @@ pub struct TokenizedAssetDetailResponse {
 /// `{ enabled, frozen }` boolean combinations (e.g. de-listed yet frozen) that
 /// the old two-bool shape allowed are now unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TokenizedAssetStatus {
     /// Accepting new mints (not frozen).
@@ -119,6 +125,7 @@ pub enum TokenizedAssetStatus {
 /// `GET /tokenized-assets/<underlying>/status` and consumed by the liquidity
 /// rebalance guard.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenizedAssetStatusResponse {
     pub underlying: UnderlyingSymbol,
     pub status: TokenizedAssetStatus,
@@ -140,16 +147,19 @@ pub struct TokenizedAssetsListResponse {
 
 /// Request body of `POST /tokenized-assets`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct AddTokenizedAssetRequest {
     pub underlying: UnderlyingSymbol,
     pub token: TokenSymbol,
     pub network: Network,
     #[ts(type = "string")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub vault: Address,
 }
 
 /// Response body of `POST /tokenized-assets`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct AddTokenizedAssetResponse {
     pub underlying: UnderlyingSymbol,
 }
