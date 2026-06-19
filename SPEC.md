@@ -967,40 +967,39 @@ struct TokenizedAsset {
 
 Internal service-to-service endpoint (internal auth) consumed by the liquidity
 rebalance guard (RAI-1038) to skip frozen assets before starting a rebalancing
-flow. Returns the asset's listing + freeze status, or `404` if the asset is
-unknown.
+flow. Returns the asset's `status` (`enabled` or `frozen`), or `404` if the
+asset is unknown.
 
 **Response:**
 
 ```json
 {
   "underlying": "SGOV",
-  "enabled": true,
-  "frozen": true
+  "status": "frozen"
 }
 ```
 
-- `enabled` — the asset is supported/listed. A frozen asset stays listed (see
-  the freeze invariant under "TokenizedAsset Aggregate"), so this stays `true`
-  when frozen.
-- `frozen` — new mints are currently rejected for this asset.
+- `status` — `"enabled"` when the asset accepts new mints, or `"frozen"` when
+  new mints are gated (the rebalance guard skips frozen assets). A frozen asset
+  stays supported/listed (see the freeze invariant under "TokenizedAsset
+  Aggregate") — freezing gates only new minting, it never de-lists.
 
 **Status Codes:**
 
-- `200`: asset found — returns its listing + freeze status
+- `200`: asset found — returns its `status` (`"enabled"` or `"frozen"`)
 - `401`: missing or invalid internal API key
 - `404`: asset unknown
-- `500`: database or view-deserialization failure — the freeze status is
-  **indeterminate**. A consumer must NOT treat any non-`404` failure as "not
-  frozen"; treat `500` as "unknown, retry" rather than proceeding.
+- `500`: database or view-deserialization failure — the status is
+  **indeterminate**. A consumer must NOT treat any non-`404` failure as
+  `"enabled"`; treat `500` as "unknown, retry" rather than proceeding.
 
-`frozen: false` reflects the **projected** view state and is only as fresh as
-the projection. The view is updated asynchronously after a `Freeze`/`Unfreeze`
-event commits, so there is a brief window in which a just-committed freeze still
-reports `frozen: false`. A consumer gating an irreversible action on this signal
-(e.g. the rebalance guard) should confirm propagation — poll until
-`frozen: true`, or apply a safety delay after issuing a freeze — rather than
-trusting a single read.
+`status: "enabled"` reflects the **projected** view state and is only as fresh
+as the projection. The view is updated asynchronously after a
+`Freeze`/`Unfreeze` event commits, so there is a brief window in which a
+just-committed freeze still reports `status: "enabled"`. A consumer gating an
+irreversible action on this signal (e.g. the rebalance guard) should confirm
+propagation — poll until `status: "frozen"`, or apply a safety delay after
+issuing a freeze — rather than trusting a single read.
 
 ### 3. Token Minting (Alpaca ITN Flow)
 

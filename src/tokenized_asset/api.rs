@@ -1,27 +1,21 @@
-use alloy::primitives::Address;
 use event_sorcery::{AggregateError, Store};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post};
-use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use st0x_issuance_dto::{
+    AddTokenizedAssetRequest, AddTokenizedAssetResponse,
+    TokenizedAssetDetailResponse, TokenizedAssetResponse,
+    TokenizedAssetStatusResponse, TokenizedAssetsListResponse,
+};
 use std::sync::Arc;
 use tracing::error;
 
 use super::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-    UnderlyingSymbol, view::TokenizedAssetView,
+    TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+    view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
-
-#[derive(Debug, Serialize)]
-pub(crate) struct TokenizedAssetDetailResponse {
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) token: TokenSymbol,
-    pub(crate) network: Network,
-    pub(crate) vault: Address,
-    pub(crate) enabled: bool,
-}
 
 #[tracing::instrument(skip(_auth, pool))]
 #[get("/tokenized-assets/<underlying>")]
@@ -55,19 +49,10 @@ pub(crate) async fn get_tokenized_asset(
             token,
             network,
             vault,
-            enabled: status.is_listed(),
+            status: status.into(),
         })),
         None => Err(Status::NotFound),
     }
-}
-
-/// Per-asset freeze status, consumed by the liquidity rebalance guard
-/// (RAI-1038) to skip frozen assets before starting a rebalancing flow.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TokenizedAssetStatusResponse {
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) enabled: bool,
-    pub(crate) frozen: bool,
 }
 
 #[tracing::instrument(skip(_auth, pool))]
@@ -93,24 +78,11 @@ pub(crate) async fn get_tokenized_asset_status(
         Some(TokenizedAssetView { underlying, status, .. }) => {
             Ok(Json(TokenizedAssetStatusResponse {
                 underlying,
-                enabled: status.is_listed(),
-                frozen: status.is_frozen(),
+                status: status.into(),
             }))
         }
         None => Err(Status::NotFound),
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TokenizedAssetResponse {
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) token: TokenSymbol,
-    pub(crate) networks: Vec<Network>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TokenizedAssetsListResponse {
-    pub(crate) tokens: Vec<TokenizedAssetResponse>,
 }
 
 #[tracing::instrument(skip(_auth, pool))]
@@ -137,19 +109,6 @@ pub(crate) async fn list_tokenized_assets(
         .collect();
 
     Ok(Json(TokenizedAssetsListResponse { tokens }))
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AddTokenizedAssetRequest {
-    pub(crate) underlying: UnderlyingSymbol,
-    pub(crate) token: TokenSymbol,
-    pub(crate) network: Network,
-    pub(crate) vault: Address,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct AddTokenizedAssetResponse {
-    pub(crate) underlying: UnderlyingSymbol,
 }
 
 #[tracing::instrument(skip(_auth, store), fields(
@@ -208,7 +167,9 @@ mod tests {
     use crate::config::{Config, LogLevel};
     use crate::fireblocks::SignerConfig;
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    };
 
     fn test_config() -> Config {
         Config {
@@ -280,18 +241,20 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: TokenizedAssetsListResponse =
+        // Assert the raw JSON the Alpaca/dashboard consumers see — not a
+        // round-trip through the producer struct, which would mask a serde
+        // rename or a change to the moved DTO/newtype wire encoding.
+        let body: Value =
             response.into_json().await.expect("valid JSON response");
-
-        assert_eq!(response_body.tokens.len(), 1);
         assert_eq!(
-            response_body.tokens[0].underlying,
-            UnderlyingSymbol::new("AAPL")
-        );
-        assert_eq!(response_body.tokens[0].token, TokenSymbol::new("tAAPL"));
-        assert_eq!(
-            response_body.tokens[0].networks,
-            vec![Network::new("base")]
+            body,
+            json!({
+                "tokens": [{
+                    "underlying": "AAPL",
+                    "token": "tAAPL",
+                    "networks": ["base"]
+                }]
+            })
         );
     }
 
@@ -330,10 +293,14 @@ mod tests {
 
         assert_eq!(response.status(), Status::Ok);
 
-        let response_body: TokenizedAssetsListResponse =
+        // Assert the raw wire shape rather than round-tripping through the DTO
+        // struct: a wire-breaking rename (e.g. `tokens` -> `assets`) must fail
+        // as a contract mismatch here, not get masked by a struct deserialize
+        // error that never reaches the field assertion.
+        let body: Value =
             response.into_json().await.expect("valid JSON response");
 
-        assert!(response_body.tokens.is_empty());
+        assert_eq!(body, json!({ "tokens": [] }));
     }
 
     #[tokio::test]
@@ -421,12 +388,13 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(
-            response.status(),
-            Status::Created,
-            "Response body: {:?}",
-            response.into_string().await
-        );
+        assert_eq!(response.status(), Status::Created);
+
+        // Pin the POST response body on the wire — the moved
+        // AddTokenizedAssetResponse DTO encoded through Rocket's JSON responder.
+        let body: Value =
+            response.into_json().await.expect("valid JSON response");
+        assert_eq!(body, json!({ "underlying": "AAPL" }));
     }
 
     #[tokio::test]
@@ -660,7 +628,7 @@ mod tests {
             before.into_json().await.expect("valid JSON response");
         assert_eq!(
             before_body,
-            json!({ "underlying": "AAPL", "enabled": true, "frozen": false })
+            json!({ "underlying": "AAPL", "status": "enabled" })
         );
 
         store
@@ -682,17 +650,18 @@ mod tests {
 
         assert_eq!(after.status(), Status::Ok);
 
-        // A frozen asset stays enabled (listed) for redemptions; only `frozen`
-        // flips to true.
+        // A frozen asset stays listed for redemptions; the status flips to
+        // `frozen`.
         let after_body: Value =
             after.into_json().await.expect("valid JSON response");
         assert_eq!(
             after_body,
-            json!({ "underlying": "AAPL", "enabled": true, "frozen": true })
+            json!({ "underlying": "AAPL", "status": "frozen" })
         );
 
-        // Unfreezing must flip `frozen` back to false — the other half of the
-        // guard's lifecycle, exercised through the same HTTP + projection path.
+        // Unfreezing must flip the status back to `enabled` — the other half of
+        // the guard's lifecycle, exercised through the same HTTP + projection
+        // path.
         store
             .send(
                 &UnderlyingSymbol::new("AAPL"),
@@ -719,7 +688,98 @@ mod tests {
             unfrozen.into_json().await.expect("valid JSON response");
         assert_eq!(
             unfrozen_body,
-            json!({ "underlying": "AAPL", "enabled": true, "frozen": false })
+            json!({ "underlying": "AAPL", "status": "enabled" })
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_detail_reflects_freeze() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+
+        store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to add asset");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let enabled = client
+            .get("/tokenized-assets/AAPL")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(enabled.status(), Status::Ok);
+
+        // Assert the raw JSON body rather than round-tripping the producer
+        // struct, so a serde rename or a regression back to a lossy `enabled`
+        // bool fails here.
+        let enabled_body: Value =
+            enabled.into_json().await.expect("valid JSON response");
+        assert_eq!(
+            enabled_body,
+            json!({
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "network": "base",
+                "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "enabled"
+            })
+        );
+
+        store
+            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Freezing tokenized asset", "AAPL"]
+        ));
+
+        let frozen = client
+            .get("/tokenized-assets/AAPL")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(frozen.status(), Status::Ok);
+
+        // A frozen asset must report `status: "frozen"`, not the old
+        // `enabled: true` that conflated frozen with mint-accepting.
+        let frozen_body: Value =
+            frozen.into_json().await.expect("valid JSON response");
+        assert_eq!(
+            frozen_body,
+            json!({
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "network": "base",
+                "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "frozen"
+            })
         );
     }
 
@@ -790,13 +850,16 @@ mod tests {
 
         assert_eq!(response.status(), Status::NotFound);
 
-        // The 404 must not carry a parseable freeze status — the guard has to
-        // tell "unknown" apart from "known and not frozen", so a regression that
-        // returned a {enabled, frozen} body with 404 must fail here.
-        let body = response.into_string().await.unwrap_or_default();
+        // The 404 must not carry a parseable status — the guard has to tell
+        // "unknown" apart from "known and enabled", so a regression that returned
+        // a status body with 404 must fail here.
+        let body = response
+            .into_string()
+            .await
+            .expect("404 response body should be readable");
         assert!(
-            !body.contains("\"frozen\""),
-            "404 body must not expose a freeze status, got: {body}"
+            !body.contains("\"status\""),
+            "404 body must not expose a status, got: {body}"
         );
     }
 
