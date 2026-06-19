@@ -12,3 +12,5 @@ target/
 claude-local-ctx/
 .claude/
 .tmp/
+/result
+/result-*
