@@ -217,7 +217,7 @@ pub(crate) async fn validate_asset_exists(
             target: "mint",
             underlying = %underlying.0,
             token = %token.0,
-            network = %network.0,
+            network = %network,
             "Rejecting mint for frozen asset"
         );
         return Err(MintApiError::AssetFrozen);

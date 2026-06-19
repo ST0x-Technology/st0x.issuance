@@ -53,19 +53,32 @@ impl std::fmt::Display for TokenSymbol {
     }
 }
 
-/// Blockchain network the tokenized asset lives on, e.g. `base`.
+/// Blockchain network a tokenized asset lives on.
+///
+/// A closed set -- only `base` is supported today. Serialized as the lowercase
+/// wire string (`"base"`) it has always used, so the JSON contract and the
+/// values already persisted in the event store are unchanged. Modeling it as an
+/// enum (rather than an opaque `String`) means an unsupported network is now a
+/// deserialization error instead of a value that silently flows through.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
-pub struct Network(pub String);
+#[serde(rename_all = "snake_case")]
+pub enum Network {
+    Base,
+}
 
 impl Network {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// The lowercase wire string for this network, matching the serde encoding.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Base => "base",
+        }
     }
 }
 
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -181,10 +194,7 @@ mod tests {
             serde_json::to_value(TokenSymbol::new("tSGOV")).unwrap(),
             json!("tSGOV")
         );
-        assert_eq!(
-            serde_json::to_value(Network::new("base")).unwrap(),
-            json!("base")
-        );
+        assert_eq!(serde_json::to_value(Network::Base).unwrap(), json!("base"));
     }
 
     #[test]
@@ -199,15 +209,30 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<Network>(json!("base")).unwrap(),
-            Network::new("base")
+            Network::Base
         );
+    }
+
+    // `Network` is a closed enum, so an unsupported or wrong-cased network must
+    // fail to deserialize rather than flow through as an opaque string — the
+    // invariant that replaced the old unvalidated `Network(String)` newtype.
+    #[test]
+    fn network_rejects_unknown_and_non_snake_case_variants() {
+        for invalid in
+            [json!("ethereum"), json!("Base"), json!("BASE"), json!("")]
+        {
+            assert!(
+                serde_json::from_value::<Network>(invalid.clone()).is_err(),
+                "{invalid} must not deserialize as Network"
+            );
+        }
     }
 
     #[test]
     fn newtypes_display_their_inner_value() {
         assert_eq!(UnderlyingSymbol::new("SGOV").to_string(), "SGOV");
         assert_eq!(TokenSymbol::new("tSGOV").to_string(), "tSGOV");
-        assert_eq!(Network::new("base").to_string(), "base");
+        assert_eq!(Network::Base.to_string(), "base");
     }
 
     #[test]
@@ -273,7 +298,7 @@ mod tests {
             tokens: vec![TokenizedAssetResponse {
                 underlying: UnderlyingSymbol::new("SGOV"),
                 token: TokenSymbol::new("tSGOV"),
-                networks: vec![Network::new("base")],
+                networks: vec![Network::Base],
             }],
         };
 
@@ -294,7 +319,7 @@ mod tests {
         let response = TokenizedAssetDetailResponse {
             underlying: UnderlyingSymbol::new("SGOV"),
             token: TokenSymbol::new("tSGOV"),
-            network: Network::new("base"),
+            network: Network::Base,
             vault: vault(),
             status: TokenizedAssetStatus::Frozen,
         };
@@ -329,7 +354,7 @@ mod tests {
 
         assert_eq!(request.underlying, UnderlyingSymbol::new("SGOV"));
         assert_eq!(request.token, TokenSymbol::new("tSGOV"));
-        assert_eq!(request.network, Network::new("base"));
+        assert_eq!(request.network, Network::Base);
         assert_eq!(request.vault, vault());
     }
 
@@ -376,6 +401,17 @@ mod tests {
             status_enum_ts.contains("\"enabled\"")
                 && status_enum_ts.contains("\"frozen\""),
             "TokenizedAssetStatus must be an \"enabled\" | \"frozen\" union in TS:\n{status_enum_ts}"
+        );
+
+        // `Network` is a closed enum, so ts_rs must emit a string-literal union
+        // (`"base"`), not the bare `string` alias the old transparent newtype
+        // produced — the dashboard switches on this exact wire string, so a
+        // regression to `string` must fail here.
+        let network_ts =
+            std::fs::read_to_string(out_dir.join("Network.ts")).unwrap();
+        assert!(
+            network_ts.contains("\"base\""),
+            "Network must be a \"base\" string-literal union in TS:\n{network_ts}"
         );
 
         // The newtypes must resolve to a bare `string`, matching their

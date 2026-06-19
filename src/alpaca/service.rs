@@ -374,7 +374,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         }
     }
 
@@ -602,7 +602,7 @@ mod tests {
             token: TokenSymbol::new("tAAPL"),
             client_id,
             quantity: Quantity::new(rust_decimal::Decimal::from(100)),
-            network: Network::new("base"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"

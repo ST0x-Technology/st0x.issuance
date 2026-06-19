@@ -276,7 +276,7 @@ mod tests {
     async fn test_add_asset_creates_new_asset() {
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let events = TestHarness::<TokenizedAsset>::with(())
@@ -324,14 +324,14 @@ mod tests {
             .given(vec![TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault,
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::Add {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault,
             })
             .await
@@ -353,14 +353,14 @@ mod tests {
             .given(vec![TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::Add {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_b,
             })
             .await
@@ -392,7 +392,7 @@ mod tests {
         TokenizedAssetEvent::Added {
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
+            network: Network::Base,
             vault,
             added_at: chrono::Utc::now(),
         }
@@ -549,7 +549,7 @@ mod tests {
     fn test_apply_asset_added_updates_state() {
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
-        let network = Network::new("base");
+        let network = Network::Base;
         let vault = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
         let added_at = chrono::Utc::now();
 
@@ -590,7 +590,7 @@ mod tests {
             TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             },
@@ -620,14 +620,14 @@ mod tests {
             TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             },
             TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL2"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_b,
                 added_at: chrono::Utc::now(),
             },
@@ -652,7 +652,7 @@ mod tests {
             TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             },
@@ -660,7 +660,7 @@ mod tests {
             TokenizedAssetEvent::Added {
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL2"),
-                network: Network::new("base"),
+                network: Network::Base,
                 vault: vault_b,
                 added_at: chrono::Utc::now(),
             },
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_network_display() {
-        let network = Network::new("base");
+        let network = Network::Base;
         assert_eq!(format!("{network}"), "base");
     }
 

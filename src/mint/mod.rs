@@ -2354,7 +2354,7 @@ pub(crate) mod tests {
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new("tAAPL"),
-                        network: Network::new("base"),
+                        network: Network::Base,
                         vault: VAULT,
                     },
                 )
@@ -2432,7 +2432,7 @@ pub(crate) mod tests {
                 quantity: Quantity::new(Decimal::from(100)),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 client_id: ClientId::new(),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 initiated_at: failed_at,
@@ -2517,7 +2517,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -2582,7 +2582,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -2627,7 +2627,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(50));
         let underlying = UnderlyingSymbol::new("TSLA");
         let token = TokenSymbol::new("tTSLA");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
         let initiated_at = chrono::Utc::now();
@@ -2679,7 +2679,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -2723,7 +2723,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -2771,7 +2771,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -2818,7 +2818,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -2857,7 +2857,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let reason = "Insufficient funds";
@@ -2919,7 +2919,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -2960,7 +2960,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -3000,7 +3000,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -3062,7 +3062,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -3132,7 +3132,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -3194,7 +3194,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -3267,7 +3267,7 @@ pub(crate) mod tests {
         let quantity = Quantity::new(Decimal::from(100));
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let client_id = ClientId::new();
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let initiated_at = Utc::now();
@@ -3376,7 +3376,7 @@ pub(crate) mod tests {
                 quantity: Quantity::new(Decimal::from(100)),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 client_id: ClientId::new(),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             }
@@ -3408,7 +3408,7 @@ pub(crate) mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: VAULT,
                 },
             )
@@ -3591,7 +3591,7 @@ pub(crate) mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: VAULT,
                 },
             )
@@ -3790,7 +3790,7 @@ pub(crate) mod tests {
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     vault: VAULT,
                 },
             )
@@ -4302,7 +4302,7 @@ pub(crate) mod tests {
                 quantity: Quantity::new(Decimal::from(100)),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 client_id: ClientId::new(),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 initiated_at: now,
@@ -4378,7 +4378,7 @@ pub(crate) mod tests {
                     quantity: Quantity::new(Decimal::from(100)),
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     client_id: ClientId::new(),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -4421,7 +4421,7 @@ pub(crate) mod tests {
                     quantity: Quantity::new(Decimal::from(100)),
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     client_id: ClientId::new(),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -4465,7 +4465,7 @@ pub(crate) mod tests {
             quantity: Quantity::new(Decimal::from(100)),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
+            network: Network::Base,
             client_id: ClientId::new(),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             initiated_at: now,
@@ -4478,7 +4478,7 @@ pub(crate) mod tests {
             quantity: Quantity::new(Decimal::from(100)),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
+            network: Network::Base,
             client_id: ClientId::new(),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             initiated_at: now,

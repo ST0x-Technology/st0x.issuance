@@ -254,7 +254,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let serialized = serde_json::to_value(&request).unwrap();
@@ -293,7 +293,7 @@ mod tests {
             token: TokenSymbol::new("tAAPL"),
             client_id,
             quantity: Quantity::new(Decimal::new(10050, 2)),
-            network: Network::new("base"),
+            network: Network::Base,
             wallet: address!("0x9999999999999999999999999999999999999999"),
             tx_hash,
         };
@@ -337,7 +337,7 @@ mod tests {
             tx_hash: b256!(
                 "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let json = serde_json::to_string(&request).unwrap();

@@ -37,7 +37,7 @@ pub(crate) async fn setup_test_db_with_asset(
 
     let underlying = UnderlyingSymbol::new("AAPL");
     let token = TokenSymbol::new("tAAPL");
-    let network = Network::new("base");
+    let network = Network::Base;
 
     asset_store
         .send(

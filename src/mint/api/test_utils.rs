@@ -132,7 +132,7 @@ impl TestHarness {
 
         let underlying = UnderlyingSymbol::new("AAPL");
         let token = TokenSymbol::new("tAAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let asset_cmd = TokenizedAssetCommand::Add {

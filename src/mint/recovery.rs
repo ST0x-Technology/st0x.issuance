@@ -391,7 +391,7 @@ mod tests {
                     TokenizedAssetCommand::Add {
                         underlying: UnderlyingSymbol::new("AAPL"),
                         token: TokenSymbol::new("tAAPL"),
-                        network: Network::new("base"),
+                        network: Network::Base,
                         vault: VAULT,
                     },
                 )
@@ -562,7 +562,7 @@ mod tests {
                 quantity: Quantity::new(Decimal::from(100)),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
-                network: Network::new("base"),
+                network: Network::Base,
                 client_id: ClientId::new(),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 initiated_at: now,

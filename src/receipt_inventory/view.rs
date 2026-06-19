@@ -334,7 +334,7 @@ mod tests {
             quantity: Quantity::new(Decimal::from(100)),
             underlying,
             token,
-            network: Network::new("base"),
+            network: Network::Base,
             client_id: ClientId::new(),
             wallet,
             initiated_at: Utc::now(),

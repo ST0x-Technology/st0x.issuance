@@ -231,7 +231,7 @@ impl RedeemCallManager {
                     underlying = %response.underlying.0,
                     token = %response.token.0,
                     quantity = %response.quantity.0,
-                    network = %response.network.0,
+                    network = %response.network,
                     wallet = %response.wallet,
                     tx_hash = %response.tx_hash,
                     fees = ?response.fees.as_ref().map(|f| f.0),
@@ -559,7 +559,7 @@ mod tests {
         .await;
 
         let client_id = ClientId::new();
-        let network = Network::new("base");
+        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -602,7 +602,7 @@ mod tests {
         .await;
 
         let client_id = ClientId::new();
-        let network = Network::new("base");
+        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -652,7 +652,7 @@ mod tests {
         };
 
         let client_id = ClientId::new();
-        let network = Network::new("base");
+        let network = Network::Base;
 
         let result = manager
             .handle_redemption_detected(
@@ -729,7 +729,7 @@ mod tests {
         let manager = harness.create_manager(alpaca_service);
 
         let underlying = UnderlyingSymbol::new("AAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
 
         harness.add_asset(&underlying, &network).await;
 
@@ -785,7 +785,7 @@ mod tests {
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-recovery".to_string());
         let underlying = UnderlyingSymbol::new("AAPL");
-        let network = Network::new("base");
+        let network = Network::Base;
 
         harness
             .register_and_link_account(

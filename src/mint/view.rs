@@ -368,7 +368,7 @@ mod tests {
                     quantity: Quantity::new(Decimal::from(50)),
                     underlying: UnderlyingSymbol::new("TSLA"),
                     token: TokenSymbol::new("tTSLA"),
-                    network: Network::new("base"),
+                    network: Network::Base,
                     client_id: ClientId::new(),
                     wallet: address!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(found_quantity, Quantity::new(Decimal::from(50)));
         assert_eq!(found_underlying, UnderlyingSymbol::new("TSLA"));
         assert_eq!(found_token, TokenSymbol::new("tTSLA"));
-        assert_eq!(found_network, Network::new("base"));
+        assert_eq!(found_network, Network::Base);
     }
 
     #[tokio::test]
@@ -428,7 +428,7 @@ mod tests {
             quantity: Quantity::new(Decimal::from(100)),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
-            network: Network::new("base"),
+            network: Network::Base,
             client_id: ClientId::new(),
             wallet: address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
             initiated_at: Utc::now(),

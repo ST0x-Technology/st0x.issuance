@@ -233,7 +233,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let result = mock.send_mint_callback(request).await;
@@ -255,7 +255,7 @@ mod tests {
             tx_hash: b256!(
                 "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let result = mock.send_mint_callback(request).await;
@@ -283,7 +283,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         mock.send_mint_callback(request.clone()).await.unwrap();
@@ -303,7 +303,7 @@ mod tests {
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId::new(),
             quantity: Quantity::new(Decimal::from(100)),
-            network: Network::new("base"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -367,7 +367,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let redeem_request = create_redeem_request();
@@ -441,7 +441,7 @@ mod tests {
             tx_hash: b256!(
                 "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
             ),
-            network: Network::new("base"),
+            network: Network::Base,
         };
 
         let redeem_request = create_redeem_request();
