@@ -61,6 +61,46 @@ pub(crate) async fn get_tokenized_asset(
     }
 }
 
+/// Per-asset freeze status, consumed by the liquidity rebalance guard
+/// (RAI-1038) to skip frozen assets before starting a rebalancing flow.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TokenizedAssetStatusResponse {
+    pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) enabled: bool,
+    pub(crate) frozen: bool,
+}
+
+#[tracing::instrument(skip(_auth, pool))]
+#[get("/tokenized-assets/<underlying>/status")]
+pub(crate) async fn get_tokenized_asset_status(
+    underlying: &str,
+    _auth: InternalAuth,
+    pool: &rocket::State<Pool<Sqlite>>,
+) -> Result<Json<TokenizedAssetStatusResponse>, Status> {
+    let underlying_symbol = UnderlyingSymbol::new(underlying);
+
+    let view =
+        super::view::load_asset_by_underlying(pool.inner(), &underlying_symbol)
+            .await
+            .map_err(|err| {
+                error!(target: "asset", error = %err,
+                    "Failed to load tokenized asset status"
+                );
+                Status::InternalServerError
+            })?;
+
+    match view {
+        Some(TokenizedAssetView { underlying, status, .. }) => {
+            Ok(Json(TokenizedAssetStatusResponse {
+                underlying,
+                enabled: status.is_listed(),
+                frozen: status.is_frozen(),
+            }))
+        }
+        None => Err(Status::NotFound),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TokenizedAssetResponse {
     pub(crate) underlying: UnderlyingSymbol,
@@ -157,7 +197,9 @@ mod tests {
     use event_sorcery::StoreBuilder;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
+    use serde_json::{Value, json};
     use sqlx::sqlite::SqlitePoolOptions;
+    use tracing_test::traced_test;
     use url::Url;
 
     use super::*;
@@ -165,6 +207,7 @@ mod tests {
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, LogLevel};
     use crate::fireblocks::SignerConfig;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 
     fn test_config() -> Config {
@@ -549,5 +592,351 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    async fn migrated_in_memory_pool() -> sqlx::Pool<sqlx::Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        pool
+    }
+
+    fn internal_api_key() -> Header<'static> {
+        Header::new("X-API-KEY", "test-key-12345678901234567890123456")
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_status_reflects_freeze() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+
+        store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL"),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::new("base"),
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                },
+            )
+            .await
+            .expect("Failed to add asset");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let before = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(before.status(), Status::Ok);
+
+        // Assert the raw JSON body the external RAI-1038 guard parses — not a
+        // round-trip through the producer struct, which would mask a serde
+        // rename or a change to UnderlyingSymbol's wire encoding.
+        let before_body: Value =
+            before.into_json().await.expect("valid JSON response");
+        assert_eq!(
+            before_body,
+            json!({ "underlying": "AAPL", "enabled": true, "frozen": false })
+        );
+
+        store
+            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .await
+            .expect("Failed to freeze asset");
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Freezing tokenized asset", "AAPL"]
+        ));
+
+        let after = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(after.status(), Status::Ok);
+
+        // A frozen asset stays enabled (listed) for redemptions; only `frozen`
+        // flips to true.
+        let after_body: Value =
+            after.into_json().await.expect("valid JSON response");
+        assert_eq!(
+            after_body,
+            json!({ "underlying": "AAPL", "enabled": true, "frozen": true })
+        );
+
+        // Unfreezing must flip `frozen` back to false — the other half of the
+        // guard's lifecycle, exercised through the same HTTP + projection path.
+        store
+            .send(
+                &UnderlyingSymbol::new("AAPL"),
+                TokenizedAssetCommand::Unfreeze,
+            )
+            .await
+            .expect("Failed to unfreeze asset");
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Unfreezing tokenized asset", "AAPL"]
+        ));
+
+        let unfrozen = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(unfrozen.status(), Status::Ok);
+
+        let unfrozen_body: Value =
+            unfrozen.into_json().await.expect("valid JSON response");
+        assert_eq!(
+            unfrozen_body,
+            json!({ "underlying": "AAPL", "enabled": true, "frozen": false })
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_status_db_error_returns_500() {
+        let pool = migrated_in_memory_pool().await;
+
+        // A row whose `$.Live` payload does not deserialize into
+        // `TokenizedAssetView` forces the typed view load to error, exercising
+        // the handler's error -> 500 mapping and the operator-facing log that
+        // is the only signal for this failure mode.
+        sqlx::query(
+            r#"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{"Live": {"bad_field": 1}}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert malformed view row");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Failed to load tokenized asset status"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_status_unknown_asset_returns_404() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/UNKNOWN/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::NotFound);
+
+        // The 404 must not carry a parseable freeze status — the guard has to
+        // tell "unknown" apart from "known and not frozen", so a regression that
+        // returned a {enabled, frozen} body with 404 must fail here.
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            !body.contains("\"frozen\""),
+            "404 body must not expose a freeze status, got: {body}"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_status_non_live_row_returns_500() {
+        let pool = migrated_in_memory_pool().await;
+
+        // A view row whose `$.Live` is null (a non-live lifecycle state) is a
+        // known-but-indeterminate asset, not an unknown one. It must map to 500
+        // ("indeterminate, retry"), NOT 404 — so the rebalance guard retries
+        // rather than treating the asset as permanently absent.
+        sqlx::query(
+            r#"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{"Live": null}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert non-live view row");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Failed to load tokenized asset status"]
+        ));
+    }
+
+    // The detail endpoint shares `load_asset_by_underlying`, so a non-live
+    // (`$.Live` null) row now flips it from 404 to 500 too — pin that changed
+    // contract so the shared-helper behavior is not silently regressed.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_tokenized_asset_non_live_row_returns_500() {
+        let pool = migrated_in_memory_pool().await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{"Live": null}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert non-live view row");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Failed to load tokenized asset"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_status_without_auth_returns_401() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response =
+            client.get("/tokenized-assets/AAPL/status").dispatch().await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_get_status_wrong_api_key_returns_401() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        // A present-but-wrong key must be rejected, not just a missing header:
+        // `InternalAuth` validates the key value, so knowing the header name is
+        // not enough to reach the endpoint.
+        let response = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(Header::new(
+                "X-API-KEY",
+                "wrong-key-00000000000000000000000000",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+
+        assert!(logs_contain_at!(tracing::Level::WARN, &["Invalid API key"]));
     }
 }

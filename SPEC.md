@@ -946,6 +946,47 @@ struct TokenizedAsset {
 }
 ```
 
+#### Per-Asset Freeze Status
+
+**Endpoint:** `GET /tokenized-assets/<underlying>/status`
+
+Internal service-to-service endpoint (internal auth) consumed by the liquidity
+rebalance guard (RAI-1038) to skip frozen assets before starting a rebalancing
+flow. Returns the asset's listing + freeze status, or `404` if the asset is
+unknown.
+
+**Response:**
+
+```json
+{
+  "underlying": "SGOV",
+  "enabled": true,
+  "frozen": true
+}
+```
+
+- `enabled` — the asset is supported/listed. A frozen asset stays listed (see
+  the freeze invariant under "TokenizedAsset Aggregate"), so this stays `true`
+  when frozen.
+- `frozen` — new mints are currently rejected for this asset.
+
+**Status Codes:**
+
+- `200`: asset found — returns its listing + freeze status
+- `401`: missing or invalid internal API key
+- `404`: asset unknown
+- `500`: database or view-deserialization failure — the freeze status is
+  **indeterminate**. A consumer must NOT treat any non-`404` failure as "not
+  frozen"; treat `500` as "unknown, retry" rather than proceeding.
+
+`frozen: false` reflects the **projected** view state and is only as fresh as
+the projection. The view is updated asynchronously after a `Freeze`/`Unfreeze`
+event commits, so there is a brief window in which a just-committed freeze still
+reports `frozen: false`. A consumer gating an irreversible action on this signal
+(e.g. the rebalance guard) should confirm propagation — poll until
+`frozen: true`, or apply a safety delay after issuing a freeze — rather than
+trusting a single read.
+
 ### 3. Token Minting (Alpaca ITN Flow)
 
 #### Receipts and Backing
@@ -1707,6 +1748,8 @@ We run an HTTP server that implements these endpoints.
 3. **`DELETE /accounts/{client_id}/wallets/{wallet}`** - Un-whitelist wallet
    address for AP
 4. **`POST /tokenized-assets`** - Add a new tokenized asset
+5. **`GET /tokenized-assets/<underlying>/status`** - Per-asset listing + freeze
+   status, consumed by the liquidity rebalance guard (RAI-1038)
 
 ### Endpoints We Call
 
