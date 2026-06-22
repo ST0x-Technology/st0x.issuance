@@ -13,6 +13,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
 };
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
@@ -363,7 +364,6 @@ pub async fn initialize_rocket(
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
         provider: blockchain_setup.http_provider.clone(),
-        vault_configs: vault_configs.clone(),
         receipt_inventory_store: receipt_inventory_store.clone(),
         bot_wallet,
         backfill_start_block: config.backfill_start_block,
@@ -374,14 +374,13 @@ pub async fn initialize_rocket(
     {
         info!(
             target: "redemption",
-            vault_count = vaults.len(),
-            "Spawning transfer poller (eth_getLogs across all vaults)"
+            "Spawning transfer poller (re-reads enabled vaults each pass, so \
+             runtime-added assets are covered without a restart)"
         );
 
         let poller = TransferPoller::new(TransferPollerConfig {
             provider: blockchain_setup.http_provider,
             bot_wallet,
-            vaults,
             backfill_start_block: config.backfill_start_block,
             store: redemption_store.clone(),
             pool: pool.clone(),
@@ -1032,7 +1031,6 @@ where
 struct PeriodicBackfillSpawn<P, H> {
     pool: Pool<Sqlite>,
     provider: P,
-    vault_configs: Vec<VaultBackfillConfig>,
     receipt_inventory_store: Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
     backfill_start_block: u64,
@@ -1040,6 +1038,11 @@ struct PeriodicBackfillSpawn<P, H> {
     handler: H,
 }
 
+/// Spawns the periodic receipt-backfill reconciliation loop. Each pass re-reads
+/// the enabled vault set from the tokenized-asset view, so an asset added or
+/// re-pointed at runtime is reconciled without a restart. Receipt-contract
+/// addresses are resolved once per vault and cached, since a vault's receipt
+/// contract is immutable on-chain.
 fn spawn_periodic_receipt_backfills<P, H>(spawn: PeriodicBackfillSpawn<P, H>)
 where
     P: Provider + Clone + Send + Sync + 'static,
@@ -1048,23 +1051,12 @@ where
     let PeriodicBackfillSpawn {
         pool,
         provider,
-        vault_configs,
         receipt_inventory_store,
         bot_wallet,
         backfill_start_block,
         receipt_poll_interval,
         handler,
     } = spawn;
-
-    // With no vaults there is nothing to reconcile, so avoid spawning a task
-    // that would fetch the chain head every interval for no work.
-    if vault_configs.is_empty() {
-        debug!(
-            target: "receipt",
-            "No vaults configured; skipping periodic receipt backfill"
-        );
-        return;
-    }
 
     tokio::spawn(async move {
         let ctx = PeriodicBackfillCtx {
@@ -1076,6 +1068,11 @@ where
             handler: &handler,
         };
 
+        let mut receipt_contracts: HashMap<
+            VaultAddress,
+            ReceiptContractAddress,
+        > = HashMap::new();
+
         let mut interval = tokio::time::interval(receipt_poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Skip the first tick (fires immediately) — the startup backfill
@@ -1085,6 +1082,27 @@ where
 
         loop {
             interval.tick().await;
+
+            // Re-read the enabled vault set each pass so runtime-added assets
+            // are reconciled without a restart.
+            let assets = match list_enabled_assets(&pool).await {
+                Ok(assets) => assets,
+                Err(error) => {
+                    warn!(
+                        target: "receipt",
+                        error = %error,
+                        "Failed to list enabled assets; skipping receipt \
+                         backfill pass"
+                    );
+                    continue;
+                }
+            };
+
+            // With no enabled assets there is nothing to reconcile, so skip the
+            // chain-head fetch entirely.
+            if assets.is_empty() {
+                continue;
+            }
 
             // Fetch the chain head once per pass and reuse it for every vault.
             // The receipt backfill scans the same block range across all
@@ -1103,23 +1121,106 @@ where
                 }
             };
 
-            for config in &vault_configs {
-                if let Err(error) = run_periodic_receipt_backfill_for_config(
-                    &ctx, *config, head_block,
+            // Per-vault failures log at DEBUG (loop-body rule); the pass emits a
+            // single WARN summary below if any vault failed.
+            let mut failed_vaults: Vec<Address> = Vec::new();
+
+            for asset in &assets {
+                let receipt_contract = match cached_receipt_contract(
+                    &provider,
+                    VaultAddress(asset.vault),
+                    &mut receipt_contracts,
                 )
                 .await
                 {
-                    warn!(
+                    Ok(receipt_contract) => receipt_contract,
+                    Err(error) => {
+                        debug!(
+                            target: "receipt",
+                            error = %error,
+                            vault = %asset.vault,
+                            "Failed to resolve receipt contract; skipping vault \
+                             this pass"
+                        );
+                        failed_vaults.push(asset.vault);
+                        continue;
+                    }
+                };
+
+                let config = VaultBackfillConfig {
+                    vault: asset.vault,
+                    receipt_contract: receipt_contract.0,
+                };
+
+                if let Err(error) = run_periodic_receipt_backfill_for_config(
+                    &ctx, config, head_block,
+                )
+                .await
+                {
+                    debug!(
                         target: "receipt",
                         error = %error,
-                        vault = %config.vault,
+                        vault = %asset.vault,
                         "Periodic receipt backfill failed; next run will resume \
                          from the last checkpoint"
                     );
+                    failed_vaults.push(asset.vault);
                 }
+            }
+
+            if !failed_vaults.is_empty() {
+                warn!(
+                    target: "receipt",
+                    failed_vault_count = failed_vaults.len(),
+                    failed_vaults = ?failed_vaults,
+                    total_vaults = assets.len(),
+                    "Receipt backfill pass completed with vault failures; each \
+                     resumes from its checkpoint next pass"
+                );
             }
         }
     });
+}
+
+/// A vault's own address, as opposed to the address of the ERC-1155 receipt
+/// contract it deploys. Distinct newtypes keep the receipt-contract cache
+/// from silently mixing the two address spaces up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VaultAddress(Address);
+
+/// The address of the ERC-1155 receipt contract a vault deploys. See
+/// [`VaultAddress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiptContractAddress(Address);
+
+/// Resolves a vault's ERC-1155 receipt contract, caching the result by vault
+/// address.
+///
+/// The cache is never evicted, and does not need to be: a vault's receipt
+/// contract is immutable on-chain, so a cached entry stays correct even after an
+/// asset is re-pointed away from a vault and later re-pointed back to it. Keying
+/// by vault ADDRESS (not by asset/underlying) is what makes a re-point safe — a
+/// re-pointed asset resolves a brand-new vault address, which is a cache miss
+/// that resolves fresh, so the old vault's contract is never served. The map
+/// grows by at most one entry per distinct vault ever seen, bounded by the
+/// operator-controlled asset set.
+async fn cached_receipt_contract<P: Provider>(
+    provider: &P,
+    vault: VaultAddress,
+    cache: &mut HashMap<VaultAddress, ReceiptContractAddress>,
+) -> Result<ReceiptContractAddress, anyhow::Error> {
+    if let Some(receipt_contract) = cache.get(&vault) {
+        return Ok(*receipt_contract);
+    }
+
+    let vault_contract =
+        bindings::OffchainAssetReceiptVault::new(vault.0, provider);
+    let receipt_contract = ReceiptContractAddress(Address::from(
+        vault_contract.receipt().call().await?.0,
+    ));
+    cache.insert(vault, receipt_contract);
+
+    Ok(receipt_contract)
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
@@ -1225,14 +1326,57 @@ fn spawn_mint_recovery_worker(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, uint};
+    use alloy::primitives::{U256, address, uint};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     use super::{
-        Environment, Quantity, QuantityConversionError, mount_api_docs,
+        Environment, Quantity, QuantityConversionError, ReceiptContractAddress,
+        VaultAddress, cached_receipt_contract, mount_api_docs,
         next_receipt_backfill_block,
     };
+
+    /// The receipt-contract cache must resolve once on-chain and serve every
+    /// subsequent call from memory — a receipt contract is immutable per vault,
+    /// so a second RPC is wasted. Here the mock provider is given exactly one
+    /// `eth_call` response; the second call must hit the cache (an RPC would
+    /// fail against the now-empty mock).
+    #[tokio::test]
+    async fn cached_receipt_contract_resolves_once_then_serves_from_cache() {
+        let vault = VaultAddress(address!(
+            "0x1234567890abcdef1234567890abcdef12345678"
+        ));
+        let receipt_contract = ReceiptContractAddress(address!(
+            "0x00000000000000000000000000000000beefbeef"
+        ));
+
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt_contract.0.into_word());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let mut cache = HashMap::new();
+
+        let first = cached_receipt_contract(&provider, vault, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(first, receipt_contract, "miss must resolve on-chain");
+        assert_eq!(
+            cache.get(&vault),
+            Some(&receipt_contract),
+            "resolved contract must be cached"
+        );
+
+        let second = cached_receipt_contract(&provider, vault, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            second, receipt_contract,
+            "second call must serve from cache without an RPC"
+        );
+    }
 
     #[test]
     fn api_docs_mounted_only_outside_production() {
