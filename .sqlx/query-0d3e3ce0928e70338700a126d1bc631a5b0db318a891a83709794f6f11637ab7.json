@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO mint_view (view_id, version, payload) VALUES (?, 1, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "0d3e3ce0928e70338700a126d1bc631a5b0db318a891a83709794f6f11637ab7"
+}

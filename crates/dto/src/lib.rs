@@ -3,7 +3,7 @@
 //!
 //! These derive [`ts_rs::TS`] so the dashboard can build against generated
 //! bindings without depending on the backend crate. The serde representation is
-//! the API contract (snake_case) -- do not add `rename_all` without versioning
+//! the API contract (`snake_case`) -- do not add `rename_all` without versioning
 //! the endpoints.
 
 use std::path::Path;

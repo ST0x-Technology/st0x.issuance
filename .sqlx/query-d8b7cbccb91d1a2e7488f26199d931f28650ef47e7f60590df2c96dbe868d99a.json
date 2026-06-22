@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO events (\n                aggregate_type, aggregate_id, sequence,\n                event_type, event_version, payload, metadata\n            )\n            VALUES ('Redemption', ?, ?, ?, '1.0', ?, '{}')\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "d8b7cbccb91d1a2e7488f26199d931f28650ef47e7f60590df2c96dbe868d99a"
+}
