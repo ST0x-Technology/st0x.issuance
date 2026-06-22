@@ -12,7 +12,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-pub use ip_whitelist::IpWhitelist;
+pub use ip_whitelist::{InternalIpWhitelist, IpWhitelist};
 pub(crate) use rate_limit::FailedAuthRateLimiter;
 
 #[derive(Clone)]
@@ -79,7 +79,7 @@ pub struct AuthConfig {
         help = "Comma-separated CIDR ranges for internal endpoints. \
                 Default includes localhost and Docker networks."
     )]
-    pub internal_ip_ranges: IpWhitelist,
+    pub internal_ip_ranges: InternalIpWhitelist,
 }
 
 /// Guard for Alpaca issuer endpoints.
@@ -119,7 +119,9 @@ impl<'r> FromRequest<'r> for InternalAuth {
     async fn from_request(
         request: &'r Request<'_>,
     ) -> Outcome<Self, Self::Error> {
-        match authenticate_request(request, |auth| &auth.internal_ip_ranges) {
+        match authenticate_request(request, |auth| {
+            auth.internal_ip_ranges.whitelist()
+        }) {
             Ok(client_ip) => {
                 debug!(target: "auth", ip = %client_ip,
                     endpoint = %request.uri(),
