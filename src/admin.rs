@@ -1,4 +1,5 @@
 use alloy::primitives::B256;
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
@@ -19,7 +20,7 @@ use crate::auth::InternalAuth;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, MintEvent, MintView,
     TokenizationRequestId, find_by_issuer_request_id,
-    find_stuck as find_stuck_mints, recovery::spawn_scheduled_mint_recovery,
+    find_stuck as find_stuck_mints, recovery::enqueue_scheduled_mint_recovery,
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1035,12 +1036,13 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool))]
+#[tracing::instrument(skip(_auth, store, pool, apalis_pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
+    apalis_pool: &rocket::State<ApalisSqlitePool>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let issuer_request_id: IssuerMintRequestId = aggregate_id
@@ -1104,10 +1106,22 @@ pub(crate) async fn reprocess_mint(
     );
 
     // A single manual Recover advances the mint by one step (e.g. submits the
-    // next retry, leaving it in FireblocksSubmitted). Hand it to a background
-    // scheduled-recovery task so it is driven to completion instead of
-    // stalling until the next restart or another manual reprocess.
-    spawn_scheduled_mint_recovery(store.inner().clone(), issuer_request_id);
+    // next retry, leaving it in FireblocksSubmitted). Enqueue a durable recovery
+    // job so it is driven to completion instead of stalling until the next
+    // restart or another manual reprocess.
+    enqueue_scheduled_mint_recovery(
+        pool.inner(),
+        apalis_pool.inner(),
+        issuer_request_id,
+    )
+    .await
+    .map_err(|error| {
+        error!(target: "admin", aggregate_id = aggregate_id,
+            error = %error,
+            "Failed to enqueue scheduled mint recovery after reprocess"
+        );
+        Status::InternalServerError
+    })?;
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO receipt_inventory_view (view_id, version, payload)\n            VALUES (?, 1, ?)\n            ON CONFLICT(view_id) DO UPDATE SET\n                version = version + 1,\n                payload = ?\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "0c11a1a1bbb0e266499ef1354ded6a015b94aa550a57926db06101dbef9a5bd9"
+}

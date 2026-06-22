@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        DELETE FROM snapshots\n        WHERE aggregate_type = ?\n          AND json_extract(payload, '$.Live') IS NULL\n          AND json_extract(payload, '$.Uninitialized') IS NULL\n          AND json_extract(payload, '$.Failed') IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d1f2834f68defb47110f6c0ff2f55ab2a5a5c1e0a42f95519bdaeddf85f07cda"
+}

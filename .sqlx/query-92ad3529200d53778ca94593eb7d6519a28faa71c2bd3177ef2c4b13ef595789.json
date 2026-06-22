@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM mint_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "92ad3529200d53778ca94593eb7d6519a28faa71c2bd3177ef2c4b13ef595789"
+}

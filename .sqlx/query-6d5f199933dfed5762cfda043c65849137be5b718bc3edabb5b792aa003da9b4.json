@@ -1,0 +1,30 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            view_id as \"view_id!: String\",\n            json_extract(payload, '$.Live') as \"live: String\"\n        FROM mint_view\n        WHERE json_extract(payload, '$.Live.Initiated')           IS NOT NULL\n           OR json_extract(payload, '$.Live.JournalConfirmed')    IS NOT NULL\n           OR json_extract(payload, '$.Live.JournalRejected')     IS NOT NULL\n           OR json_extract(payload, '$.Live.Minting')             IS NOT NULL\n           OR json_extract(payload, '$.Live.FireblocksSubmitted') IS NOT NULL\n           OR json_extract(payload, '$.Live.CallbackPending')     IS NOT NULL\n           OR json_extract(payload, '$.Live.MintingFailed')       IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "view_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mint_view",
+            "name": "view_id"
+          }
+        }
+      },
+      {
+        "name": "live: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [true, null]
+  },
+  "hash": "6d5f199933dfed5762cfda043c65849137be5b718bc3edabb5b792aa003da9b4"
+}

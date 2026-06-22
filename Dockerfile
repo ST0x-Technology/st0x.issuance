@@ -33,7 +33,13 @@ RUN nix develop --command cargo chef prepare --recipe-path recipe.json
 
 RUN rm -rf src crates
 
+# apalis-sqlite (a dependency, compiled here during the cook step) has
+# compile-time sqlx `query!` macros. `.cargo/config.toml` — which sets
+# SQLX_OFFLINE — is not copied until the `COPY . .` below, so set it explicitly
+# here; apalis-sqlite ships its own `.sqlx` cache, so the macros resolve without
+# a database. Without this the cook fails to compile apalis-sqlite (E0282).
 RUN nix develop --command bash -c ' \
+    export SQLX_OFFLINE=true && \
     if [ "$BUILD_PROFILE" = "release" ]; then \
         cargo chef cook --release --recipe-path recipe.json; \
     else \

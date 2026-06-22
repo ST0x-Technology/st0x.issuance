@@ -1,0 +1,19 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM tokenized_asset_view\n        WHERE view_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "live: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [null]
+  },
+  "hash": "b505a8d99b2075d222deb3254e562663dba16f4bb8074f0a304b5546f80c62d5"
+}

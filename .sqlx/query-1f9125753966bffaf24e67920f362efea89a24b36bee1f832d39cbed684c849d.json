@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM tokenized_asset_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "1f9125753966bffaf24e67920f362efea89a24b36bee1f832d39cbed684c849d"
+}

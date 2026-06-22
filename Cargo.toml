@@ -59,6 +59,19 @@ ciborium = "0.2.2"
 flate2 = "1.1.9"
 utoipa = { version = "5.5.0", features = ["rocket_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["rocket"] }
+# Exact pins: migrations/*_apalis_job_tables.sql hand-replays apalis-sqlite's
+# final Jobs/Workers schema (we own the migration instead of running apalis's
+# migrator, which would race our _sqlx_migrations). apalis-sqlite's compiled
+# queries depend on the exact column order/names of that schema, so on ANY bump
+# of these pins the migration must be re-replayed from the new apalis-sqlite
+# migrations/ — otherwise the positional INSERT silently desyncs at runtime.
+#
+# These are pre-release RCs: the public API is not stable, bug fixes in later
+# RCs are NOT picked up under the `=` pin, and 1.0.0 final may ship schema/API
+# changes. Track the 1.0.0 final release and upgrade to it (re-replaying the
+# migration as above) before this service goes to production.
+apalis = "=1.0.0-rc.9"
+apalis-sqlite = "=1.0.0-rc.8"
 
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"

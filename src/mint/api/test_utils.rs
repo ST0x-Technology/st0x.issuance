@@ -1,7 +1,10 @@
 use alloy::primitives::{Address, B256, address};
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use event_sorcery::{Store, StoreBuilder, test_store};
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 use crate::account::{
@@ -15,6 +18,7 @@ use crate::fireblocks::SignerConfig;
 use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 
 pub(crate) fn test_config() -> Config {
@@ -38,6 +42,11 @@ pub(crate) fn test_config() -> Config {
 
 pub(crate) struct TestHarness {
     pub(crate) pool: sqlx::Pool<sqlx::Sqlite>,
+    /// The apalis-sqlite (sqlx 0.8) pool the confirm/admin routes require to
+    /// enqueue recovery jobs. Shares the event-store pool's SQLite file so the
+    /// `Jobs`/`Workers` tables our migrations create are visible to it (two
+    /// private `:memory:` DBs would not share them).
+    pub(crate) apalis_pool: ApalisSqlitePool,
     pub(crate) account_store: Arc<Store<Account>>,
     pub(crate) asset_store: Arc<Store<TokenizedAsset>>,
     pub(crate) mint_store: Arc<Store<Mint>>,
@@ -45,11 +54,43 @@ pub(crate) struct TestHarness {
 
 impl TestHarness {
     pub(crate) async fn new() -> Self {
+        Self::new_with_mint_vault(Arc::new(MockVaultService::new_success()))
+            .await
+    }
+
+    /// Like [`new`](Self::new), but with a caller-chosen vault so failure-path
+    /// tests can drive a mint into `MintingFailed`.
+    pub(crate) async fn new_with_mint_vault(
+        vault: Arc<dyn VaultService>,
+    ) -> Self {
+        // Both pools must address the SAME SQLite file: the apalis-sqlite (0.8)
+        // pool needs the `Jobs`/`Workers` tables our migrations create on the
+        // event-store (0.9) pool, and the two sqlx majors do not share a private
+        // `:memory:` database. WAL + busy_timeout mirror the production pools so
+        // the two writers coexist on one file without lock flakes.
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_url =
+            format!("sqlite:{}", temp_dir.path().join("issuance.db").display());
+
+        // Persist the dir for the process rather than holding it as a drop
+        // guard on the harness: callers routinely move fields out with
+        // `let TestHarness { pool, apalis_pool, mint_store, .. } = harness`,
+        // which would drop a guard field immediately and delete the database
+        // while the extracted pools are still using it. The small dir is
+        // reclaimed by the OS temp cleanup.
+        let _persisted_db_dir = temp_dir.keep();
+
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&db_url)
+            .expect("valid sqlite url")
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect(":memory:")
+            .connect_with(options)
             .await
-            .expect("Failed to create in-memory database");
+            .expect("Failed to create database");
 
         sqlx::migrate!("./migrations")
             .run(&pool)
@@ -73,7 +114,7 @@ impl TestHarness {
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mint_services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
+            vault,
             alpaca: Arc::new(MockAlpacaService::new_success()),
             pool: pool.clone(),
             bot,
@@ -88,7 +129,17 @@ impl TestHarness {
                 .await
                 .expect("Failed to build mint store");
 
-        Self { pool, account_store, asset_store, mint_store }
+        let apalis_options =
+            apalis_sqlite::SqliteConnectOptions::from_str(&db_url)
+                .expect("valid sqlite url")
+                .pragma("journal_mode", "WAL")
+                .busy_timeout(Duration::from_secs(5));
+
+        let apalis_pool = ApalisSqlitePool::connect_with(apalis_options)
+            .await
+            .expect("Failed to create apalis pool");
+
+        Self { pool, apalis_pool, account_store, asset_store, mint_store }
     }
 }
 

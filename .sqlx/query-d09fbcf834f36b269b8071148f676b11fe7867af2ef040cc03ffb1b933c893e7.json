@@ -1,0 +1,35 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            aggregate_id as \"aggregate_id!: String\",\n            payload as \"payload!: String\"\n        FROM events\n        WHERE aggregate_type = 'Mint'\n        ORDER BY aggregate_id, sequence\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "aggregate_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "aggregate_id"
+          }
+        }
+      },
+      {
+        "name": "payload!: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [false, false]
+  },
+  "hash": "d09fbcf834f36b269b8071148f676b11fe7867af2ef040cc03ffb1b933c893e7"
+}
