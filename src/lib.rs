@@ -62,7 +62,7 @@ pub(crate) mod vault;
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
-pub use auth::{AuthConfig, IpWhitelist, IssuerApiKey};
+pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use config::{Config, Environment, LogLevel, setup_tracing};
 pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
