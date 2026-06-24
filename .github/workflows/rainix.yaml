@@ -41,7 +41,6 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
-      - run: nix run .#prepSolArtifacts
       - run: nix flake check
 
       - run: nix develop -c sqlx db create

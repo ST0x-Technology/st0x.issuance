@@ -1,0 +1,69 @@
+name: Rekey Secrets
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || ''}}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rekey:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        continue-on-error: true
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Rekey agenix secrets
+        run: |
+          nix run github:yaxitech/ragenix -- \
+            --rules ./secret/secrets.nix \
+            -i ~/.ssh/id_ed25519 \
+            -r
+
+      - name: Create PR with rekeyed secrets
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add secret/*.age
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            branch="chore/rekey-secrets-$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$branch"
+            git commit -m "chore: rekey agenix secrets"
+            git push origin "$branch"
+            gh pr create \
+              --title "chore: rekey agenix secrets" \
+              --body "Automated rekey triggered by workflow_dispatch." \
+              --base main \
+              --head "$branch"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -rf ~/.ssh/id_ed25519
