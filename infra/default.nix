@@ -283,6 +283,7 @@ let
               echo "Ensuring st0x-issuance is restarted on ${env}..." >&2
               ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance" || true
             fi
+            _cleanup_identity
           }
           trap '_restart_service' EXIT
 
