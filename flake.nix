@@ -2,24 +2,177 @@
   description = "Flake for development workflows.";
 
   inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    rainix.url = "github:rainprotocol/rainix";
+    rainix = {
+      url = "github:rainprotocol/rainix?rev=36342d3f1a104adf987793df7f101cf804e62a34";
+      inputs = {
+        foundry.inputs.nixpkgs.follows = "nixpkgs";
+        git-hooks-nix.inputs.nixpkgs.follows = "nixpkgs";
+        nixpkgs.follows = "nixpkgs";
+        rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+        solc.inputs.nixpkgs.follows = "nixpkgs";
+      };
+    };
     crane.url = "github:ipetkov/crane";
+    ragenix = {
+      url = "github:yaxitech/ragenix";
+      inputs.crane.follows = "crane";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    deploy-rs = {
+      url = "github:serokell/deploy-rs";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    bun2nix = {
+      url = "github:nix-community/bun2nix/2.0.8";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    nixos-anywhere = {
+      url = "github:nix-community/nixos-anywhere";
+      inputs.nixos-stable.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    ethgild = {
+      type = "git";
+      url = "https://github.com/gildlab/ethgild";
+      rev = "59ae2ff9bb86fd61e0e8494622cb4da492678b1a";
+      flake = false;
+      submodules = true;
+    };
   };
 
   outputs =
     {
+      self,
       flake-utils,
       rainix,
       crane,
+      ragenix,
+      deploy-rs,
+      ethgild,
+      disko,
+      nixos-anywhere,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      inherit (import ./keys.nix) keys tailscaleHost tailnetSuffix;
+      inherit (rainix.inputs.nixpkgs) lib;
+      environments = {
+        prod = {
+          nodeName = "st0x-issuance";
+          volumeName = "st0x-issuance-data";
+          hostKey = keys.host-prod;
+          tailscaleMagicDnsName = "${tailscaleHost.prod}.${tailnetSuffix}";
+        };
+        staging = {
+          nodeName = "st0x-issuance-staging";
+          volumeName = "st0x-issuance-staging-data";
+          hostKey = keys.host-staging;
+          tailscaleMagicDnsName = "${tailscaleHost.staging}.${tailnetSuffix}";
+        };
+      };
+      envNames = builtins.attrNames environments;
+    in
+    {
+      nixosConfigurations =
+        let
+          mkNixos =
+            { environment, modules }:
+            lib.nixosSystem {
+              system = "x86_64-linux";
+              specialArgs = {
+                inherit environment;
+                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
+                inherit (self.packages.x86_64-linux) st0x-issuance issuer;
+              };
+              modules = [ disko.nixosModules.disko ] ++ modules;
+            };
+
+          full =
+            env:
+            mkNixos {
+              environment = env;
+              modules = [
+                ragenix.nixosModules.default
+                ./os.nix
+              ];
+            };
+
+          bootstrap =
+            env:
+            mkNixos {
+              environment = env;
+              modules = [ ./bootstrap.nix ];
+            };
+        in
+        builtins.listToAttrs (
+          builtins.concatMap (env: [
+            {
+              name = environments.${env}.nodeName;
+              value = full env;
+            }
+            {
+              name = "${environments.${env}.nodeName}-bootstrap";
+              value = bootstrap env;
+            }
+          ]) envNames
+        );
+
+      deploy =
+        (import ./deploy.nix {
+          inherit
+            lib
+            deploy-rs
+            self
+            environments
+            ;
+        }).config;
+    }
+    // flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = rainix.pkgs.${system};
+        pkgs = import rainix.inputs.nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
+        };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
+        rustToolchain = rainix.rust-toolchain.${system};
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        foundryBin = rainix.pkgs.${system}.foundry-bin;
+
+        rustShell = rainix.devShells.${system}.rust-shell;
+
+        ragenixPkg = ragenix.packages.${system}.default;
+        nixosAnywherePkg = nixos-anywhere.packages.${system}.default;
+
+        infraPkgs = import ./infra {
+          inherit
+            pkgs
+            ragenix
+            system
+            ;
+          environments = envNames;
+        };
+        rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
+
+        deployScripts =
+          (import ./deploy.nix {
+            inherit
+              lib
+              deploy-rs
+              self
+              environments
+              ;
+          }).mkDeployScripts
+            {
+              inherit pkgs infraPkgs;
+              localSystem = system;
+            };
 
         crateSrc = craneLib.cleanCargoSource ./.;
 
@@ -95,6 +248,33 @@
           fi
         '';
 
+        inherit
+          (import ./nix/mk-abi.nix {
+            inherit pkgs;
+            foundry = foundryBin;
+            solc = rainix.pkgs.${system}.solc_0_8_25;
+          })
+          mkAbi
+          ;
+
+        inherit
+          (import ./nix/abis.nix {
+            inherit pkgs mkAbi;
+            sources = {
+              inherit ethgild;
+            };
+          })
+          abis
+          abiEnv
+          # abisEnvs
+          ;
+
+        # Server and operator CLI
+        rust = pkgs.callPackage ./rust.nix {
+          inherit craneLib abiEnv;
+          ethgildAbis = abis.ethgild;
+        };
+
         # Single source for the issuance derivations exported from both `packages`
         # and `checks`, so the two lists can't drift apart.
         issuanceBuilds = {
@@ -112,12 +292,10 @@
           in
           rainixPkgs
           // {
-            prepSolArtifacts = rainix.mkTask.${system} {
+            prepSolArtifacts = pkgs.writeShellApplication {
               name = "prep-sol-artifacts";
-              additionalBuildInputs = rainix.sol-build-inputs.${system};
-              body = ''
-                set -euxo pipefail
-                (cd lib/ethgild && forge build)
+              text = ''
+                ln -sfn ${abis.ethgild}/out abis
               '';
             };
 
@@ -132,8 +310,67 @@
                 exec nu ${./scripts/smoke-test-image.nu} "$@"
               '';
             };
+
+            inherit (rust)
+              st0x-issuance
+              issuer
+              ;
+
+            bootstrap = pkgs.writeShellApplication {
+              name = "bootstrap-nixos";
+              runtimeInputs = infraPkgs.buildInputs ++ [
+                nixosAnywherePkg
+                pkgs.gnused
+              ];
+              text = ''
+                env="''${1:?usage: bootstrap <prod|staging>}"
+                shift
+
+                case "$env" in
+                  ${builtins.concatStringsSep "\n" (
+                    map (env: ''
+                      ${env})
+                        flake_config="${environments.${env}.nodeName}-bootstrap"
+                        host_key_field="host-${env}" ;;'') envNames
+                  )}
+                  *)
+                    echo "ERROR: unknown environment '$env'" >&2
+                    exit 1 ;;
+                esac
+
+                ${infraPkgs.parseIdentity}
+
+                export env flake_config host_key_field identity
+
+                exec ${./scripts/bootstrap.sh} "$@"
+              '';
+            };
+
+            secret = pkgs.writeShellApplication {
+              name = "secret";
+              runtimeInputs = [
+                ragenixPkg
+                pkgs.nushell
+                pkgs.coreutils
+              ];
+              text = ''
+                exec nu ${./scripts/secret.nu} "$@"
+              '';
+            };
+
+            rekey = pkgs.writeShellApplication {
+              name = "rekey";
+              runtimeInputs = [ ragenixPkg ];
+              text = ''
+                ${infraPkgs.parseIdentity}
+                exec ${rekeySecrets}
+              '';
+            };
           }
-          // issuanceBuilds;
+          // issuanceBuilds
+          // rust
+          // infraPkgs.packages
+          // deployScripts;
 
         # `nix flake check` (run in both rainix.yaml CI jobs) evaluates the
         # `checks` output, not `packages`; aliasing the crate derivations here is
@@ -141,8 +378,12 @@
         checks = issuanceBuilds;
 
         devShell = pkgs.mkShell {
-          inherit (rainix.devShells.${system}.default) shellHook;
+          # inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+          shellHook = ''
+            ${rainix.devShells.${system}.default.shellHook or ""}
+            ln -sfn ${abis.ethgild}/out abis
+          '';
 
           buildInputs =
             with pkgs;
@@ -151,9 +392,18 @@
               sqlx-cli
               cargo-expand
               cargo-chef
+              ragenixPkg
+              packages.secret
+              packages.rekey
+              nixosAnywherePkg
               packages.prepSolArtifacts
+              foundryBin
             ]
-            ++ rainix.devShells.${system}.default.buildInputs;
+            ++ rainix.devShells.${system}.default.buildInputs
+            ++ infraPkgs.buildInputs
+            ++ builtins.attrValues infraPkgs.packages
+            ++ builtins.attrValues deployScripts
+            ++ rustShell.buildInputs;
 
           DATABASE_URL = "sqlite:./issuance.db";
         };
