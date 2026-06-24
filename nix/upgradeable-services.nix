@@ -35,7 +35,14 @@ let
         "ALPACA_API_BASE_URL=https://broker-api.alpaca.markets"
         # Gates dev-only surfaces (OpenAPI docs). "production" hides them;
         # "staging" exposes them for easier debugging on the staging host.
-        "ENVIRONMENT=${if environment == "prod" then "production" else "staging"}"
+        "ENVIRONMENT=${
+          if environment == "prod" then
+            "production"
+          else if environment == "staging" then
+            "staging"
+          else
+            throw "Unsupported environment '${environment}'"
+        }"
         "LOG_LEVEL=debug"
       ]
     else
