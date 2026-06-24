@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rainix = {
-      url = "github:rainprotocol/rainix?rev=36342d3f1a104adf987793df7f101cf804e62a34";
+      url = "github:rainprotocol/rainix";
       inputs = {
         foundry.inputs.nixpkgs.follows = "nixpkgs";
         git-hooks-nix.inputs.nixpkgs.follows = "nixpkgs";
@@ -368,7 +368,6 @@
             };
           }
           // issuanceBuilds
-          // rust
           // infraPkgs.packages
           // deployScripts;
 
