@@ -257,7 +257,7 @@
           # abisEnvs
           ;
 
-        # Server and operator CLI
+        # Server (st0x-issuance) and operator CLI (issuer)
         rust = pkgs.callPackage ./rust.nix {
           inherit craneLib abiEnv;
           ethgildAbis = abis.ethgild;
