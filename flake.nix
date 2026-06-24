@@ -358,36 +358,38 @@
         # what builds them and runs the TypeScript exporter in CI.
         checks = issuanceBuilds;
 
-        devShell = pkgs.mkShell {
-          # inherit (rainix.devShells.${system}.default) shellHook;
-          inherit (rainix.devShells.${system}.default) nativeBuildInputs;
-          shellHook = ''
-            ${rainix.devShells.${system}.default.shellHook or ""}
-            ln -sfn ${abis.ethgild}/out abis
-          '';
+        devShell =
+          pkgs.mkShell {
+            # inherit (rainix.devShells.${system}.default) shellHook;
+            inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+            shellHook = ''
+              ${rainix.devShells.${system}.default.shellHook or ""}
+              ln -sfn ${abis.ethgild}/out abis
+            '';
 
-          buildInputs =
-            with pkgs;
-            [
-              bacon
-              sqlx-cli
-              cargo-expand
-              cargo-chef
-              ragenixPkg
-              packages.secret
-              packages.rekey
-              nixosAnywherePkg
-              packages.prepSolArtifacts
-              foundryBin
-            ]
-            ++ rainix.devShells.${system}.default.buildInputs
-            ++ infraPkgs.buildInputs
-            ++ builtins.attrValues infraPkgs.packages
-            ++ builtins.attrValues deployScripts
-            ++ rustShell.buildInputs;
+            buildInputs =
+              with pkgs;
+              [
+                bacon
+                sqlx-cli
+                cargo-expand
+                cargo-chef
+                ragenixPkg
+                packages.secret
+                packages.rekey
+                nixosAnywherePkg
+                packages.prepSolArtifacts
+                foundryBin
+              ]
+              ++ rainix.devShells.${system}.default.buildInputs
+              ++ infraPkgs.buildInputs
+              ++ builtins.attrValues infraPkgs.packages
+              ++ builtins.attrValues deployScripts
+              ++ rustShell.buildInputs;
 
-          DATABASE_URL = "sqlite:./issuance.db";
-        };
+            DATABASE_URL = "sqlite:./issuance.db";
+          }
+          // abiEnv;
       }
     );
 }
