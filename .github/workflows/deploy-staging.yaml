@@ -1,0 +1,78 @@
+name: Deploy to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to deploy"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        continue-on-error: true
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Resolve deploy host via Tailscale
+        run: |
+          DEPLOY_HOST=$(nix eval --raw --file keys.nix tailscaleHost.staging)
+          echo "DEPLOY_HOST=$DEPLOY_HOST" >> "$GITHUB_ENV"
+          echo "::add-mask::$DEPLOY_HOST"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -R "$DEPLOY_HOST" >/dev/null 2>&1 || true
+          echo "$DEPLOY_HOST $(nix eval --raw --file keys.nix keys.host-staging)" >> ~/.ssh/known_hosts
+
+      - name: Warm up Tailscale tunnel
+        run: |
+          for attempt in {1..6}; do
+            if tailscale ping --c 1 "$DEPLOY_HOST"; then
+              exit 0
+            fi
+            echo "Tailscale ping failed on attempt $attempt; retrying..."
+            sleep 5
+          done
+          tailscale status
+          exit 1
+
+      - name: Deploy all profiles
+        run: nix run .#stagingDeployAll
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -rf ~/.ssh/id_ed25519
