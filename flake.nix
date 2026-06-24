@@ -268,7 +268,6 @@
         # Server (st0x-issuance) and operator CLI (issuer)
         rust = pkgs.callPackage ./rust.nix {
           inherit craneLib abiEnv;
-          ethgildAbis = abis.ethgild;
         };
 
         # Single source for the issuance derivations exported from both `packages`

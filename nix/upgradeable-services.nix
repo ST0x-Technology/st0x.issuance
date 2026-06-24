@@ -27,7 +27,7 @@ let
   # Secrets are supplied via EnvironmentFile (issuance kind) or
   # left entirely absent (plain kind).
   staticEnvironment =
-    name: cfg:
+    _name: cfg:
     if cfg.kind == "st0x" then
       [
         "DATABASE_URL=sqlite:///mnt/data/issuance.db"
@@ -35,7 +35,7 @@ let
         "ALPACA_API_BASE_URL=https://broker-api.alpaca.markets"
         # Gates dev-only surfaces (OpenAPI docs). "production" hides them;
         # "staging" exposes them for easier debugging on the staging host.
-        "ENVIRONMENT=${if environment == "prod" then "${name} production" else "${name} staging"}"
+        "ENVIRONMENT=${if environment == "prod" then "production" else "staging"}"
         "LOG_LEVEL=debug"
       ]
     else

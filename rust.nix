@@ -2,7 +2,6 @@
   pkgs,
   abiEnv,
   craneLib,
-  ethgildAbis,
 }:
 
 let
@@ -14,20 +13,12 @@ let
     filter =
       path: type:
       # Keep everything crane would normally keep PLUS the compiled ABI files.
-      (craneLib.filterCargoSources path type)
-      # || (pkgs.lib.hasInfix "/lib/ethgild/out/" path)
-      || (pkgs.lib.hasInfix "/migrations" path);
+      (craneLib.filterCargoSources path type) || (pkgs.lib.hasInfix "/migrations" path);
   };
 
   # Overlay the forge-built ABIs over the cleaned source so the `sol!()`
   # macros in src/bindings.rs can resolve them.
-  fullSrc = pkgs.runCommand "st0x-issuance-src" { } ''
-    cp -rL --no-preserve=mode ${baseSrc} $out
-    chmod -R u+w $out
-    rm -rf $out/lib/ethgild/out
-    mkdir -p $out/lib/ethgild
-    cp -r ${ethgildAbis}/out $out/lib/ethgild/out
-  '';
+  fullSrc = baseSrc;
 
   # Git dependency output hashes — update when Cargo.lock is re-pinned.
   baseVendorDir = craneLib.vendorCargoDeps {
@@ -93,7 +84,6 @@ let
       pkgs.apple-sdk_15
     ];
 
-    # use path that matches with Dockerfile
     DATABASE_URL = "sqlite:///tmp/build_db.sqlite";
   };
 

@@ -1,6 +1,6 @@
 { lib }:
 
-# kind = "issuance" -- env-file secrets pipeline: rage-decrypt env file +
+# kind = "st0x" -- env-file secrets pipeline: rage-decrypt env file +
 #                      fireblocks key, install both, chown data dirs,
 #                      write git-rev, marker file, restart unit.
 # kind = "plain"    -- has a systemd unit but no secrets/config. Marker file
