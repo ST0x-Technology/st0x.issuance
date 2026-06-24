@@ -58,7 +58,6 @@ fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", bran
 ciborium = "0.2.2"
 flate2 = "1.1.9"
 utoipa = { version = "5.5.0", features = ["rocket_extras"] }
-# utoipa-swagger-ui = { version = "9.0.2", features = ["rocket"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["rocket", "vendored"] }
 
 [dev-dependencies]
