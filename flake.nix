@@ -358,8 +358,8 @@
         # what builds them and runs the TypeScript exporter in CI.
         checks = issuanceBuilds;
 
-        devShell =
-          pkgs.mkShell {
+        devShell = pkgs.mkShell (
+          {
             # inherit (rainix.devShells.${system}.default) shellHook;
             inherit (rainix.devShells.${system}.default) nativeBuildInputs;
             shellHook = ''
@@ -389,7 +389,8 @@
 
             DATABASE_URL = "sqlite:./issuance.db";
           }
-          // abiEnv;
+          // abiEnv
+        );
       }
     );
 }
