@@ -20,7 +20,7 @@ set -euo pipefail
 trap "rm -f infra/terraform.tfstate" EXIT
 
 if [ -f "infra/terraform.tfstate.age" ]; then
-  rage -d -i "$identity" infra/terraform.tfstate.age > infra/terraform.tfstate
+  rage -d -i "$identity" infra/terraform.tfstate.age >infra/terraform.tfstate
 elif [ ! -f "infra/terraform.tfstate" ]; then
   echo "ERROR: neither infra/terraform.tfstate.age nor infra/terraform.tfstate found" >&2
   exit 1
@@ -58,8 +58,8 @@ done
 
 new_key=$(
   ssh "${ssh_opts[@]}" "root@$host_ip" \
-    cat /etc/ssh/ssh_host_ed25519_key.pub \
-    | awk '{print $1 " " $2}'
+    cat /etc/ssh/ssh_host_ed25519_key.pub |
+    awk '{print $1 " " $2}'
 )
 
 valid_key='^ssh-ed25519 [A-Za-z0-9+/=_]+$'
@@ -69,7 +69,7 @@ if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
 fi
 
 sed -i \
-  "/$host_key_field =/{n;s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|;}" \
+  "/$host_key_field =/ s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|" \
   keys.nix
 
 if ! grep -qF "$new_key" keys.nix; then
