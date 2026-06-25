@@ -11,8 +11,21 @@
 use alloy::primitives::Address;
 use sqlx::{Pool, Sqlite};
 
-/// Checkpoint name for the global transfer poller.
+/// Legacy global transfer-poll checkpoint. Superseded by the per-vault
+/// [`transfer_poll_name`] checkpoints; retained only as the seed source that
+/// [`crate::redemption::poller::TransferPoller`] migrates existing vaults from
+/// at startup, so a deploy does not re-scan every vault from
+/// `backfill_start_block`.
 pub(crate) const TRANSFER_POLL: &str = "transfer_poll";
+
+/// Checkpoint name for the transfer poller for a given vault. Per-vault (rather
+/// than one global cursor) so a vault added or re-pointed at runtime is scanned
+/// from `backfill_start_block` on first appearance instead of inheriting a
+/// global checkpoint that is already past its on-chain history — which would
+/// silently drop the redemptions on that vault below the global checkpoint.
+pub(crate) fn transfer_poll_name(vault: Address) -> String {
+    format!("transfer_poll:{vault:#x}")
+}
 
 /// Checkpoint name for the receipt backfiller for a given vault.
 pub(crate) fn receipt_backfill_name(vault: Address) -> String {

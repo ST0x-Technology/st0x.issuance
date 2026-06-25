@@ -53,6 +53,11 @@ pub(crate) enum TransferProcessingError {
     TokenizedAssetView(#[from] TokenizedAssetViewError),
     #[error("No asset found for vault {vault}")]
     NoMatchingAsset { vault: Address },
+    #[error(
+        "Multiple enabled assets are bound to vault {vault}; refusing to \
+         attribute its redemptions to an arbitrary underlying"
+    )]
+    AmbiguousVault { vault: Address },
 }
 
 // `AggregateError<LifecycleError<Redemption>>` is large (it can carry a full
@@ -299,20 +304,25 @@ async fn find_matching_asset(
 ) -> Result<(UnderlyingSymbol, TokenSymbol, Network), TransferProcessingError> {
     let assets = list_enabled_assets(pool).await?;
 
-    assets
-        .into_iter()
-        .find_map(
-            |TokenizedAssetView {
-                 underlying,
-                 token,
-                 network,
-                 vault: addr,
-                 ..
-             }| {
-                (addr == vault).then_some((underlying, token, network))
-            },
-        )
-        .ok_or(TransferProcessingError::NoMatchingAsset { vault })
+    let mut matching = assets.into_iter().filter(|asset| asset.vault == vault);
+
+    let first = matching
+        .next()
+        .ok_or(TransferProcessingError::NoMatchingAsset { vault })?;
+
+    // Two enabled assets bound to the same vault is a misconfiguration: neither
+    // this lookup nor the per-vault checkpoint can disambiguate them, so picking
+    // an arbitrary one would silently journal the redemption against the wrong
+    // underlying at Alpaca. Fail loudly instead — `AmbiguousVault` is transient
+    // (deliberately not in `is_non_transient`), so the vault's checkpoint
+    // freezes and the failure recurs until an operator removes the duplicate,
+    // rather than dropping or misrouting the redemption.
+    if matching.next().is_some() {
+        return Err(TransferProcessingError::AmbiguousVault { vault });
+    }
+
+    let TokenizedAssetView { underlying, token, network, .. } = first;
+    Ok((underlying, token, network))
 }
 
 #[cfg(test)]
@@ -330,7 +340,8 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
@@ -565,6 +576,64 @@ mod tests {
                 Err(TransferProcessingError::NoMatchingAsset { .. })
             ),
             "Expected NoMatchingAsset, got {result:?}"
+        );
+    }
+
+    /// Two enabled assets bound to the same vault is a misconfiguration that
+    /// `find_matching_asset` must reject with `AmbiguousVault` rather than
+    /// silently attributing the redemption to an arbitrary underlying at Alpaca.
+    #[traced_test]
+    #[tokio::test]
+    async fn detect_transfer_ambiguous_vault_when_two_assets_share_one() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        // `setup_test_db_with_asset` seeds AAPL on `vault`; add a SECOND asset
+        // (TSLA) bound to the SAME vault to create the ambiguity.
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
+
+        let (asset_store, _projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let tsla = UnderlyingSymbol::new("TSLA");
+        asset_store
+            .send(
+                &tsla,
+                TokenizedAssetCommand::Add {
+                    underlying: tsla.clone(),
+                    token: TokenSymbol::new("tTSLA"),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .unwrap();
+
+        let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
+        let log = create_transfer_log(
+            vault,
+            ap_wallet,
+            bot_wallet,
+            value,
+            b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            12345,
+        );
+
+        let result = detect_transfer(&log, vault, &store, &pool).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(TransferProcessingError::AmbiguousVault { .. })
+            ),
+            "two assets sharing a vault must fail loudly, not misroute: \
+             got {result:?}"
         );
     }
 
