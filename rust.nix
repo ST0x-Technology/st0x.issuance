@@ -7,17 +7,15 @@
 let
   # Full source tree including the ethgild `out/` directory produced above.
   # crane's cleanCargoSource strips non-Rust files, so we supply an explicit
-  # filter that also keeps `lib/ethgild/out/**` for the `sol!()` macros.
+  # filter that also keeps migrations
   baseSrc = pkgs.lib.cleanSourceWith {
     src = pkgs.lib.cleanSource ./.;
     filter =
       path: type:
-      # Keep everything crane would normally keep PLUS the compiled ABI files.
+      # Keep everything crane would normally keep PLUS the migrations.
       (craneLib.filterCargoSources path type) || (pkgs.lib.hasInfix "/migrations" path);
   };
 
-  # Overlay the forge-built ABIs over the cleaned source so the `sol!()`
-  # macros in src/bindings.rs can resolve them.
   fullSrc = baseSrc;
 
   # Git dependency output hashes — update when Cargo.lock is re-pinned.
