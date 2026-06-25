@@ -1,5 +1,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use apalis::prelude::{Monitor, WorkerBuilder};
+use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use event_sorcery::{
     EventSourced, ReconcileError, Reconciler, Store, StoreBuilder,
 };
@@ -7,7 +9,11 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
+};
+use sqlx::{Pool, Sqlite};
+use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
@@ -18,8 +24,9 @@ use crate::auth::FailedAuthRateLimiter;
 use crate::mint::{
     Mint, MintServices, find_all_recoverable_mints,
     recovery::{
-        DriveOutcome, MintRecoveryHandler, recover_mint,
-        spawn_scheduled_mint_recovery,
+        DriveOutcome, MintRecoveryHandler, MintRecoveryJob, MintRecoveryQueue,
+        MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
+        push_mint_recovery_job, recover_mint, vacuum_terminal_recovery_jobs,
     },
 };
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
@@ -226,6 +233,14 @@ pub async fn initialize_rocket(
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // apalis-sqlite (the recovery job store) is built on sqlx 0.8, so it needs
+    // its own pool distinct from the sqlx 0.9 `pool` the event store uses. Both
+    // address the same SQLite file; WAL + `busy_timeout` (set in `create_pool`
+    // and here) let the two writers coexist without "database is locked". The
+    // app owns the apalis `Jobs`/`Workers` tables via migrations, so the pool
+    // connects after the migrator has created them.
+    let apalis_pool = create_apalis_pool(&config).await?;
+
     prepare_event_sourced_startup::<TokenizedAsset>(&pool).await?;
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
@@ -317,7 +332,25 @@ pub async fn initialize_rocket(
     let vaults: Vec<Address> =
         vault_configs.iter().map(|config| config.vault).collect();
 
-    run_recovery_with_timeout(&pool, &mint_store, &managers, &vaults).await;
+    // Drain MintRecoveryJobs in the background: the worker runs the per-mint
+    // recovery budget loop for each enqueued job. Spawned before recovery so the
+    // deferred jobs the synchronous pass enqueues start draining immediately.
+    spawn_mint_recovery_worker(apalis_pool.clone(), mint_store.clone());
+
+    // Periodically re-enqueue recoverable mints that lost their recovery job
+    // (e.g. an enqueue that failed during a transient SQLite outage at confirm
+    // time), so a stranded mint is picked up within one interval instead of
+    // waiting for the next process restart.
+    spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
+
+    run_recovery_with_timeout(
+        &pool,
+        &apalis_pool,
+        &mint_store,
+        &managers,
+        &vaults,
+    )
+    .await;
 
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
@@ -358,6 +391,7 @@ pub async fn initialize_rocket(
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
         pool,
+        apalis_pool,
         account_store,
         tokenized_asset_store,
         mint_store,
@@ -373,6 +407,7 @@ struct RocketState {
     config: Config,
     rate_limiter: FailedAuthRateLimiter,
     pool: Pool<Sqlite>,
+    apalis_pool: ApalisSqlitePool,
     account_store: Arc<Store<Account>>,
     tokenized_asset_store: Arc<Store<TokenizedAsset>>,
     mint_store: Arc<Store<Mint>>,
@@ -406,6 +441,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.burn_recovery)
         .manage(state.vault_service)
         .manage(state.pool)
+        .manage(state.apalis_pool)
         .mount(
             "/",
             routes![
@@ -631,8 +667,22 @@ fn setup_redemption_managers(
     Ok(RedemptionManagers { redeem_call, journal, burn })
 }
 
-async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_store: &Arc<Store<Mint>>) {
+async fn run_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+    mint_store: &Arc<Store<Mint>>,
+) {
     info!(target: "mint", "Running mint recovery");
+
+    // Clear terminal recovery jobs left by prior runs before re-enqueuing below,
+    // so the Jobs table stays bounded across restarts and a still-recoverable
+    // mint's idempotency key is free to re-enqueue. Non-fatal: a vacuum failure
+    // only risks duplicate/retained rows, not lost recovery.
+    if let Err(error) = vacuum_terminal_recovery_jobs(pool).await {
+        warn!(target: "mint", error = %error,
+            "Failed to vacuum terminal mint-recovery jobs"
+        );
+    }
 
     let recoverable_mints = match find_all_recoverable_mints(pool).await {
         Ok(mints) => mints,
@@ -662,16 +712,95 @@ async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_store: &Arc<Store<Mint>>) {
             DriveOutcome::RetryNotDue
             | DriveOutcome::Pending
             | DriveOutcome::Failed => {
-                spawn_scheduled_mint_recovery(
-                    mint_store.clone(),
-                    issuer_request_id,
-                );
+                if let Err(error) = enqueue_scheduled_mint_recovery(
+                    pool,
+                    apalis_pool,
+                    issuer_request_id.clone(),
+                )
+                .await
+                {
+                    // Degraded but self-recovering: the periodic reconciler
+                    // re-scans recoverable mints and re-enqueues this one, so a
+                    // failed enqueue here delays recovery rather than losing it.
+                    // WARN, not ERROR — an ERROR would raise a false
+                    // unrecoverable alert for a transient, self-healing miss.
+                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Failed to enqueue scheduled mint recovery"
+                    );
+                }
             }
             DriveOutcome::Done | DriveOutcome::Exhausted => {}
         }
     }
 
     debug!(target: "mint", count, "Mint recovery complete");
+}
+
+/// Interval between periodic mint-recovery reconciliation passes.
+const MINT_RECOVERY_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Periodically re-enqueues recoverable mints that lack a recovery job, closing
+/// the window where a mint whose enqueue failed (a transient SQLite outage at
+/// confirm/admin time) would otherwise sit in `MintingFailed` until the next
+/// process restart re-scanned it.
+fn spawn_mint_recovery_reconciler(
+    pool: Pool<Sqlite>,
+    apalis_pool: ApalisSqlitePool,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MINT_RECOVERY_RECONCILE_INTERVAL).await;
+            reconcile_recoverable_mints(&pool, &apalis_pool).await;
+        }
+    });
+}
+
+/// Ensures every currently-recoverable mint has a recovery job. Pushes a job for
+/// EVERY recoverable mint and leans on apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` to dedup — the insert is
+/// a silent no-op for any mint that already has a job row (`Pending`, `Running`,
+/// `Done`, or `Killed`), so only a mint that genuinely lost its job gets a fresh
+/// one. Unlike [`run_mint_recovery`] this neither vacuums nor drives
+/// synchronously and — crucially — pushes WITHOUT releasing terminal jobs
+/// ([`push_mint_recovery_job`]), so a mint whose recovery was deliberately
+/// abandoned (`Killed`) dedups against its terminal row rather than being
+/// retried every pass; the worker drives the jobs this re-enqueues.
+async fn reconcile_recoverable_mints(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
+) {
+    let recoverable_mints = match find_all_recoverable_mints(pool).await {
+        Ok(mints) => mints,
+        Err(err) => {
+            error!(target: "mint", error = %err,
+                "Failed to query recoverable mints during reconcile"
+            );
+            return;
+        }
+    };
+
+    if recoverable_mints.is_empty() {
+        return;
+    }
+
+    let count = recoverable_mints.len();
+    for (issuer_request_id, _view) in recoverable_mints {
+        if let Err(error) =
+            push_mint_recovery_job(apalis_pool, issuer_request_id.clone()).await
+        {
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Failed to re-enqueue recoverable mint during reconcile"
+            );
+        }
+    }
+
+    debug!(target: "mint", recoverable_mints = count,
+        "Reconcile pass pushed an idempotent recovery job for each recoverable \
+         mint; pushes for mints that already have a Pending, Running, Done, or \
+         Killed job are silent no-ops"
+    );
 }
 
 async fn run_redemption_recovery(
@@ -710,12 +839,13 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// cancelled to prevent concurrent side effects.
 async fn run_recovery_with_timeout(
     pool: &Pool<Sqlite>,
+    apalis_pool: &ApalisSqlitePool,
     mint_store: &Arc<Store<Mint>>,
     managers: &RedemptionManagers,
     vaults: &[Address],
 ) {
     let recovery = async {
-        run_mint_recovery(pool, mint_store).await;
+        run_mint_recovery(pool, apalis_pool, mint_store).await;
         run_redemption_recovery(
             &managers.redeem_call,
             &managers.journal,
@@ -1018,10 +1148,97 @@ where
 }
 
 async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
+    // WAL lets the apalis (sqlx 0.8) and event-store (sqlx 0.9) pools read and
+    // write the same SQLite file concurrently; busy_timeout makes a writer wait
+    // out the single-writer lock instead of failing with "database is locked".
+    let options = SqliteConnectOptions::from_str(&config.database_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+
     SqlitePoolOptions::new()
         .max_connections(config.database_max_connections)
-        .connect(&config.database_url)
+        .connect_with(options)
         .await
+}
+
+/// Opens the apalis-sqlite (sqlx 0.8) pool used by the recovery job store.
+/// Separate from [`create_pool`]'s sqlx 0.9 pool because apalis-sqlite is built
+/// against a different sqlx major, but addresses the same SQLite file. Sets WAL
+/// explicitly (rather than relying on [`create_pool`] having run first) so two
+/// pools can write the same file concurrently regardless of open order;
+/// `busy_timeout` lets this writer wait out the single-writer lock. Setting WAL
+/// on an already-WAL file is a no-op, so this is safe to set unconditionally.
+async fn create_apalis_pool(
+    config: &Config,
+) -> Result<ApalisSqlitePool, anyhow::Error> {
+    let options =
+        apalis_sqlite::SqliteConnectOptions::from_str(&config.database_url)?
+            .pragma("journal_mode", "WAL")
+            .busy_timeout(Duration::from_secs(5));
+
+    Ok(ApalisSqlitePool::connect_with(options).await?)
+}
+
+/// Backoff between restarts of the supervised mint-recovery worker. Keeps a
+/// persistent failure (e.g. the apalis pool is unreachable) from hot-looping
+/// while still recovering quickly from a transient blip.
+const MINT_RECOVERY_WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Spawns the apalis worker that drains [`MintRecoveryJob`]s. Each job runs the
+/// per-mint recovery budget loop to a terminal or exhausted state.
+///
+/// The apalis `Monitor` is supervised by an in-process restart loop: if it
+/// exits with an error (worker panic, stream error, heartbeat failure), the
+/// loop rebuilds and re-runs it after a bounded backoff. Without this a single
+/// transient apalis/SQLite failure would permanently strand every queued
+/// recovery job until the whole process restarted, even while HTTP endpoints
+/// keep accepting traffic and enqueueing new jobs. No shutdown signal is wired
+/// in, so the SQLite-polling worker runs until the process exits; the clean-exit
+/// (`Ok(())`) arm that ends the loop is a defensive fall-through, not an
+/// expected graceful-shutdown path.
+fn spawn_mint_recovery_worker(
+    apalis_pool: ApalisSqlitePool,
+    mint_store: Arc<Store<Mint>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let apalis_pool = apalis_pool.clone();
+            let mint_store = mint_store.clone();
+            let monitor = Monitor::new().register(move |_worker_index| {
+                // A fresh worker id per registration is load-bearing for crash
+                // recovery — see [`MintRecoveryWorkerId`].
+                WorkerBuilder::new(MintRecoveryWorkerId::new().to_string())
+                    .backend(MintRecoveryQueue::new(&apalis_pool))
+                    .data(mint_store.clone())
+                    .build(MintRecoveryJob::run)
+            });
+
+            match monitor.run().await {
+                Ok(()) => {
+                    info!(
+                        target: "mint",
+                        "Mint recovery worker stopped cleanly"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    // Degraded but self-recovering (the loop restarts the
+                    // worker after a backoff), so WARN, not ERROR — an ERROR
+                    // here would raise a false unrecoverable alert during a
+                    // transient, self-retrying outage.
+                    warn!(
+                        target: "mint",
+                        error = %error,
+                        backoff_secs =
+                            MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
+                        "Mint recovery worker crashed; restarting after backoff"
+                    );
+                    tokio::time::sleep(MINT_RECOVERY_WORKER_RESTART_BACKOFF)
+                        .await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

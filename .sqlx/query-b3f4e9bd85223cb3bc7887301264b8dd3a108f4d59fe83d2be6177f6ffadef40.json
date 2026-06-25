@@ -1,0 +1,46 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT aggregate_id, event_type, sequence\n            FROM events\n            WHERE aggregate_id = ? AND aggregate_type = 'Account'\n            ORDER BY sequence\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "aggregate_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "aggregate_id"
+          }
+        }
+      },
+      {
+        "name": "event_type",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "name": "sequence",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "sequence"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [false, false, false]
+  },
+  "hash": "b3f4e9bd85223cb3bc7887301264b8dd3a108f4d59fe83d2be6177f6ffadef40"
+}

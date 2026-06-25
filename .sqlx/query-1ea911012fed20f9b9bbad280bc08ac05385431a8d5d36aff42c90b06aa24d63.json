@@ -1,0 +1,19 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT COUNT(*) as \"count: i64\"\n        FROM events\n        WHERE aggregate_type = 'ReceiptInventory'\n          AND aggregate_id = ?\n          AND event_type = 'ReceiptInventoryEvent::Discovered'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "count: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [false]
+  },
+  "hash": "1ea911012fed20f9b9bbad280bc08ac05385431a8d5d36aff42c90b06aa24d63"
+}

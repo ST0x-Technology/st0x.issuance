@@ -1,0 +1,35 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT event_type, sequence\n            FROM events\n            WHERE aggregate_id = ? AND aggregate_type = 'Mint'\n            ORDER BY sequence\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "event_type",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "name": "sequence",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "sequence"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [false, false]
+  },
+  "hash": "cf37fac168c36922087505e9937f20f600988d9f82feba7e6ffb4ef9c62a7296"
+}

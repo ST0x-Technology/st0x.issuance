@@ -234,6 +234,7 @@ mod tests {
             account_store,
             asset_store: tokenized_asset_store,
             mint_store,
+            ..
         } = harness;
 
         tokenized_asset_store
@@ -324,6 +325,7 @@ mod tests {
             account_store,
             asset_store: tokenized_asset_store,
             mint_store,
+            ..
         } = harness;
 
         // Keep an Arc handle so we can dispatch Unfreeze after Rocket takes

@@ -130,11 +130,13 @@ audit trail, enable time-travel debugging, and provide a single source of truth.
 - `sqlx migrate revert` - Revert last migration
 - `sqlx db reset -y` - Drop the database and re-run all migrations
 - Database URL configured via `DATABASE_URL` environment variable
-- **CRITICAL: For ANY sqlx macro / compile-time DB error, the fix is
-  `sqlx db reset -y` inside `nix develop` — apply it directly, never
-  improvise.** Do NOT probe `DATABASE_URL`, look for a `.sqlx` cache, check for
-  `data.db`, or use an in-memory URL. After editing a migration:
-  `sqlx db reset -y`, then `cargo test`. Run all sqlx/cargo in `nix develop`.
+- **CRITICAL: the build is OFFLINE sqlx** — `query!` macros use the committed
+  `.sqlx/` cache (`SQLX_OFFLINE=true`), so apalis-sqlite (sqlx 0.8) and the
+  event store (sqlx 0.9) coexist with no live DB. Stale cache → regenerate (not
+  reset DB): set `SQLX_OFFLINE="false"`, `sqlx db reset -y`,
+  `cargo sqlx prepare --database-url "sqlite:///ABS/path/issuance.db" --
+  --all-targets`,
+  restore `"true"`, commit.
 
 ### Development Tools
 
