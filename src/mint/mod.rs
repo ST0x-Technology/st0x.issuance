@@ -798,6 +798,136 @@ impl Mint {
         }])
     }
 
+    /// Records a successful on-chain mint submission reported by a durable
+    /// `SubmitMintJob`. Pure — emits `FireblocksSubmitted` from the payload.
+    /// Idempotent: a no-op once the mint has advanced past `Minting`, so an
+    /// at-least-once job re-run cannot double-record the submission.
+    fn handle_record_fireblocks_submitted(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        external_tx_id: String,
+        fireblocks_tx_id: String,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::FireblocksSubmitted {
+                    issuer_request_id,
+                    external_tx_id,
+                    fireblocks_tx_id,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            Self::FireblocksSubmitted { .. }
+            | Self::CallbackPending { .. }
+            | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInMintingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a confirmed on-chain mint reported by a durable `ConfirmMintJob`.
+    /// Pure — emits `TokensMinted` from the payload. Idempotent: a no-op once
+    /// the mint has advanced past `FireblocksSubmitted`.
+    fn handle_record_tokens_minted(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        gas_used: u64,
+        block_number: u64,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::FireblocksSubmitted {
+                issuer_request_id: expected_id,
+                ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::TokensMinted {
+                    issuer_request_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    gas_used,
+                    block_number,
+                    minted_at: Utc::now(),
+                }])
+            }
+            Self::CallbackPending { .. } | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInFireblocksSubmittedState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a sent Alpaca callback reported by a durable `SendCallbackJob`.
+    /// Pure — emits `MintCompleted`. Idempotent: a no-op once the mint is
+    /// already `Completed`.
+    fn handle_record_callback_sent(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::CallbackPending {
+                issuer_request_id: expected_id, ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintCompleted {
+                    issuer_request_id,
+                    completed_at: Utc::now(),
+                }])
+            }
+            Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInCallbackPendingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records a mint side-effect failure reported by a durable submission or
+    /// confirmation job. Pure — emits `MintingFailed` from the payload.
+    /// Idempotent and lenient: a stale failure report for a mint that already
+    /// failed or advanced is ignored, so an at-least-once job re-run is safe.
+    fn handle_record_mint_failed(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        error: String,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::FireblocksSubmitted {
+                issuer_request_id: expected_id,
+                ..
+            } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintingFailed {
+                    issuer_request_id,
+                    error,
+                    failed_at: Utc::now(),
+                }])
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
     async fn handle_recover(
         &self,
         services: &MintServices,
@@ -1877,6 +2007,22 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
+            MintCommand::RecordFireblocksSubmitted { .. } => {
+                Err(MintError::NotInMintingState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
+            MintCommand::RecordTokensMinted { .. } => {
+                Err(MintError::NotInFireblocksSubmittedState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
+            MintCommand::RecordCallbackSent { .. } => {
+                Err(MintError::NotInCallbackPendingState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
+            MintCommand::RecordMintFailed { .. } => Ok(vec![]),
             MintCommand::Recover { .. }
             | MintCommand::RecoverFromReceipt { .. }
             | MintCommand::CloseMint { .. } => Err(MintError::NotRecoverable {
@@ -1944,6 +2090,36 @@ impl EventSourced for Mint {
             }
             MintCommand::SendCallback { issuer_request_id } => {
                 self.handle_send_callback(services, issuer_request_id).await
+            }
+            MintCommand::RecordFireblocksSubmitted {
+                issuer_request_id,
+                external_tx_id,
+                fireblocks_tx_id,
+            } => self.handle_record_fireblocks_submitted(
+                issuer_request_id,
+                external_tx_id,
+                fireblocks_tx_id,
+            ),
+            MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+            } => self.handle_record_tokens_minted(
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                gas_used,
+                block_number,
+            ),
+            MintCommand::RecordCallbackSent { issuer_request_id } => {
+                self.handle_record_callback_sent(issuer_request_id)
+            }
+            MintCommand::RecordMintFailed { issuer_request_id, error } => {
+                self.handle_record_mint_failed(issuer_request_id, error)
             }
             MintCommand::Recover { issuer_request_id, mode } => {
                 self.handle_recover(services, issuer_request_id, mode).await
@@ -2457,6 +2633,237 @@ pub(crate) mod tests {
                 failed_at,
             },
         ]
+    }
+
+    fn events_through_minting(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let now = Utc::now();
+        vec![
+            MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok-123"),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: now,
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: now,
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: now,
+            },
+        ]
+    }
+
+    fn events_through_fireblocks_submitted(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_minting(issuer_request_id);
+        events.push(MintEvent::FireblocksSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: "ext-1".to_string(),
+            fireblocks_tx_id: "fb-1".to_string(),
+            submitted_at: Utc::now(),
+        });
+        events
+    }
+
+    fn events_through_tokens_minted(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_fireblocks_submitted(issuer_request_id);
+        events.push(MintEvent::TokensMinted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: b256!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            receipt_id: uint!(42_U256),
+            shares_minted: uint!(100_000000000000000000_U256),
+            gas_used: 21_000,
+            block_number: 1_000,
+            minted_at: Utc::now(),
+        });
+        events
+    }
+
+    fn events_through_completed(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> Vec<MintEvent> {
+        let mut events = events_through_tokens_minted(issuer_request_id);
+        events.push(MintEvent::MintCompleted {
+            issuer_request_id: issuer_request_id.clone(),
+            completed_at: Utc::now(),
+        });
+        events
+    }
+
+    #[tokio::test]
+    async fn record_fireblocks_submitted_from_minting_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RecordFireblocksSubmitted {
+                issuer_request_id: issuer_request_id.clone(),
+                external_tx_id: "ext-1".to_string(),
+                fireblocks_tx_id: "fb-1".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::FireblocksSubmitted { fireblocks_tx_id, .. }
+                if fireblocks_tx_id == "fb-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_fireblocks_submitted_is_idempotent_once_submitted() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_fireblocks_submitted(&issuer_request_id))
+            .when(MintCommand::RecordFireblocksSubmitted {
+                issuer_request_id,
+                external_tx_id: "ext-1".to_string(),
+                fireblocks_tx_id: "fb-1".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording an already-submitted mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_from_fireblocks_submitted_emits_event() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_fireblocks_submitted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], MintEvent::TokensMinted { .. }));
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_is_idempotent_once_minted() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tokens_minted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording an already-minted mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_callback_sent_from_callback_pending_completes() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tokens_minted(&issuer_request_id))
+            .when(MintCommand::RecordCallbackSent {
+                issuer_request_id: issuer_request_id.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], MintEvent::MintCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn record_callback_sent_is_idempotent_once_completed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_completed(&issuer_request_id))
+            .when(MintCommand::RecordCallbackSent { issuer_request_id })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "re-recording the callback for a completed mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_from_minting_emits_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "submission rejected".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintingFailed { error, .. }
+                if error == "submission rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_is_ignored_once_completed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_completed(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "stale failure report".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "a stale failure report for a completed mint must be ignored"
+        );
     }
 
     prop_compose! {
