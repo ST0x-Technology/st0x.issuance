@@ -1,6 +1,6 @@
 use alloy::primitives::TxHash;
-use apalis::prelude::{AbortError, Data, TaskBuilder, TaskSink};
-use apalis_sqlite::{SqlitePool, SqliteStorage};
+use apalis::prelude::AbortError;
+use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::AggregateError;
@@ -17,6 +17,7 @@ use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, MintError,
     MintRecoveryMode,
 };
+use crate::jobs::{Job, JobQueue};
 use crate::receipt_inventory::ItnReceiptHandler;
 
 /// Production handler that triggers mint recovery when an ITN receipt is
@@ -125,16 +126,19 @@ pub(crate) struct MintRecoveryJob {
     issuer_request_id: IssuerMintRequestId,
 }
 
-impl MintRecoveryJob {
-    pub(crate) async fn run(
-        self,
-        mint_store: Data<Arc<Store<Mint>>>,
+impl Job<Store<Mint>> for MintRecoveryJob {
+    type Output = ();
+    type Error = AbortError;
+
+    async fn perform(
+        &self,
+        mint_store: &Store<Mint>,
     ) -> Result<(), AbortError> {
         let issuer_request_id = self.issuer_request_id.clone();
 
         match recover_mint_until_automatic_budget_exhausted(
-            &mint_store,
-            self.issuer_request_id,
+            mint_store,
+            issuer_request_id.clone(),
             SCHEDULED_RECOVERY_BACKOFF,
             MAX_SCHEDULED_RECOVERY_PENDING_POLLS,
         )
@@ -159,11 +163,6 @@ impl MintRecoveryJob {
         }
     }
 }
-
-/// The apalis storage that persists and drains [`MintRecoveryJob`]s. Backed by
-/// the apalis-sqlite (sqlx 0.8) pool, distinct from the event store's sqlx 0.9
-/// pool but addressing the same SQLite file.
-pub(crate) type MintRecoveryQueue = SqliteStorage<MintRecoveryJob, (), ()>;
 
 /// A unique apalis worker id for one [`MintRecoveryJob`] worker registration.
 ///
@@ -259,21 +258,23 @@ pub(crate) async fn push_mint_recovery_job(
     issuer_request_id: IssuerMintRequestId,
 ) -> Result<(), anyhow::Error> {
     let mut attempt = 0;
-    // The storage handle is reusable across attempts (`push_task` takes
-    // `&mut self`); only the `task` is consumed per iteration, so build the
-    // queue once rather than reconstructing it on every retry.
-    let mut queue = MintRecoveryQueue::new(apalis_pool);
+    // The queue handle is reusable across attempts
+    // (`push_with_idempotency_key` takes `&mut self`); build it once rather
+    // than reconstructing it on every retry.
+    let mut queue = JobQueue::<MintRecoveryJob>::new(apalis_pool);
 
     loop {
         attempt += 1;
 
-        let task = TaskBuilder::new(MintRecoveryJob {
-            issuer_request_id: issuer_request_id.clone(),
-        })
-        .with_idempotency_key(issuer_request_id.to_string())
-        .build();
-
-        match queue.push_task(task).await {
+        match queue
+            .push_with_idempotency_key(
+                MintRecoveryJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+                issuer_request_id.to_string(),
+            )
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(error) if attempt < ENQUEUE_ATTEMPTS => {
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -1547,9 +1548,9 @@ mod tests {
         );
     }
 
-    /// `MintRecoveryJob::run` resolves cleanly (`Ok`) when there is nothing to
-    /// recover — an absent mint — so apalis records the job as Done. Also
-    /// exercises the job's `Data`-injected dispatch into the budget loop.
+    /// `MintRecoveryJob::perform` resolves cleanly (`Ok`) when there is nothing
+    /// to recover — an absent mint — so apalis records the job as Done. Also
+    /// exercises the job's dispatch into the budget loop.
     #[traced_test]
     #[tokio::test]
     async fn run_resolves_when_mint_absent() {
@@ -1557,7 +1558,7 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
 
         let result = MintRecoveryJob { issuer_request_id }
-            .run(Data::new(fixture.mint_store.clone()))
+            .perform(fixture.mint_store.as_ref())
             .await;
 
         assert!(
@@ -1575,11 +1576,11 @@ mod tests {
         );
     }
 
-    /// `MintRecoveryJob::run` returns `Err(AbortError)` when recovery abandons a
-    /// still-incomplete mint (here, automatic retries exhausted), so apalis marks
-    /// the job Killed instead of a `Done` that would hide the stuck mint. This is
-    /// the load-bearing Abandoned→Err arm; without it a stuck mint looks like a
-    /// successful recovery.
+    /// `MintRecoveryJob::perform` returns `Err(AbortError)` when recovery
+    /// abandons a still-incomplete mint (here, automatic retries exhausted), so
+    /// apalis marks the job Killed instead of a `Done` that would hide the stuck
+    /// mint. This is the load-bearing Abandoned→Err arm; without it a stuck mint
+    /// looks like a successful recovery.
     #[traced_test]
     #[tokio::test]
     async fn run_returns_abort_error_when_recovery_abandons() {
@@ -1600,7 +1601,7 @@ mod tests {
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let error = MintRecoveryJob { issuer_request_id }
-            .run(Data::new(fixture.mint_store.clone()))
+            .perform(fixture.mint_store.as_ref())
             .await
             .expect_err("an exhausted mint must abort, not resolve");
 
