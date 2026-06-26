@@ -3,7 +3,7 @@
 //! Each job runs one step of the on-chain mint flow off the command handler:
 //! it performs the external call (`vault.submit_mint` / `vault.confirm_mint` /
 //! `alpaca.send_mint_callback`), reports the result back as an idempotent
-//! outcome command (`RecordFireblocksSubmitted` / `RecordTokensMinted` /
+//! outcome command (`RecordTxSubmitted` / `RecordTokensMinted` /
 //! `RecordCallbackSent` / `RecordMintFailed`), and enqueues the next step. The
 //! handlers stay pure; the jobs are the only place I/O happens.
 //!
@@ -11,9 +11,9 @@
 //! a `MintingFailed` event that the recovery budget loop retries on its own
 //! schedule, and an infrastructure failure surfaces as a job error that apalis
 //! re-drives. Re-runs are safe — `submit_mint` derives a deterministic
-//! `external_tx_id` from the `issuer_request_id` (Fireblocks dedups duplicate
-//! submissions), and every outcome command is a no-op once its event is
-//! recorded.
+//! `external_tx_id` from the `issuer_request_id` (the signing backend dedups
+//! duplicate submissions), and every outcome command is a no-op once its event
+//! is recorded.
 
 use std::sync::Arc;
 
@@ -109,19 +109,19 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                         ctx.mint_store
                             .send(
                                 &self.issuer_request_id,
-                                MintCommand::RecordFireblocksSubmitted {
+                                MintCommand::RecordTxSubmitted {
                                     issuer_request_id: self
                                         .issuer_request_id
                                         .clone(),
                                     external_tx_id: submitted.external_tx_id,
-                                    fireblocks_tx_id: submitted
-                                        .fireblocks_tx_id
+                                    tx_id: submitted
+                                        .tx_id
                                         .clone(),
                                 },
                             )
                             .await?;
 
-                        self.enqueue_confirm(ctx, submitted.fireblocks_tx_id)
+                        self.enqueue_confirm(ctx, submitted.tx_id)
                             .await?;
                     }
                     Err(error) => {
@@ -149,8 +149,8 @@ impl Job<SubmitMintContext> for SubmitMintJob {
             // A re-run after the submission was already recorded: the
             // confirm job may not have been enqueued before a crash, so
             // keep the chain moving.
-            Mint::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-                self.enqueue_confirm(ctx, fireblocks_tx_id.clone()).await?;
+            Mint::TxSubmitted { tx_id, .. } => {
+                self.enqueue_confirm(ctx, tx_id.clone()).await?;
             }
             // Past confirmation, failed (recovery owns retries), or terminal.
             _ => {}
@@ -164,7 +164,7 @@ impl SubmitMintJob {
     async fn enqueue_confirm(
         &self,
         ctx: &SubmitMintContext,
-        fireblocks_tx_id: String,
+        tx_id: String,
     ) -> Result<(), MintJobError> {
         ctx.confirm_queue
             .clone()
@@ -172,7 +172,7 @@ impl SubmitMintJob {
                 ConfirmMintJob {
                     issuer_request_id: self.issuer_request_id.clone(),
                     vault: self.vault,
-                    fireblocks_tx_id,
+                    tx_id,
                 },
                 self.issuer_request_id.to_string(),
             )
@@ -188,7 +188,7 @@ impl SubmitMintJob {
 pub(crate) struct ConfirmMintJob {
     pub(crate) issuer_request_id: IssuerMintRequestId,
     pub(crate) vault: Address,
-    pub(crate) fireblocks_tx_id: String,
+    pub(crate) tx_id: String,
 }
 
 pub(crate) struct ConfirmMintContext {
@@ -211,7 +211,7 @@ impl Job<ConfirmMintContext> for ConfirmMintJob {
             return Ok(());
         };
 
-        let Mint::FireblocksSubmitted {
+        let Mint::TxSubmitted {
             tokenization_request_id,
             quantity,
             underlying,
@@ -227,7 +227,7 @@ impl Job<ConfirmMintContext> for ConfirmMintJob {
             return Ok(());
         };
 
-        match ctx.vault.confirm_mint(&self.fireblocks_tx_id).await {
+        match ctx.vault.confirm_mint(&self.tx_id).await {
             Ok(result) => {
                 let receipt_info = ReceiptInformation::new(
                     tokenization_request_id.clone(),

@@ -74,19 +74,19 @@ pub(crate) enum MintCommand {
     },
 
     /// Records the outcome of a successful on-chain mint submission performed
-    /// by a durable `SubmitMintJob`. Pure: produces `FireblocksSubmitted` from
+    /// by a durable `SubmitMintJob`. Pure: produces `MintTxSubmitted` from
     /// the payload, no I/O. Idempotent — a no-op if the mint already advanced
     /// past `Minting` (an at-least-once job re-run is safe).
-    RecordFireblocksSubmitted {
+    RecordTxSubmitted {
         issuer_request_id: IssuerMintRequestId,
         external_tx_id: String,
-        fireblocks_tx_id: String,
+        tx_id: String,
     },
 
     /// Records the outcome of a successful on-chain mint confirmation performed
     /// by a durable `ConfirmMintJob`. Pure: produces `TokensMinted` from the
     /// payload, no I/O. Idempotent — a no-op if the mint already advanced past
-    /// `FireblocksSubmitted`.
+    /// `TxSubmitted`.
     RecordTokensMinted {
         issuer_request_id: IssuerMintRequestId,
         tx_hash: B256,
@@ -106,7 +106,7 @@ pub(crate) enum MintCommand {
     /// Records a mint side-effect failure reported by a durable job (submission
     /// or confirmation). Pure: produces `MintingFailed` from the payload, no
     /// I/O. Idempotent — a no-op if the mint already left `Minting` /
-    /// `FireblocksSubmitted`.
+    /// `TxSubmitted`.
     RecordMintFailed {
         issuer_request_id: IssuerMintRequestId,
         error: String,

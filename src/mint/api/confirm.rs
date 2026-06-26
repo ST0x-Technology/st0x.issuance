@@ -3,16 +3,16 @@ use event_sorcery::Store;
 use rocket::{post, serde::json::Json};
 use serde::Deserialize;
 use sqlx::{Pool, Sqlite};
-use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::IssuerAuth;
+use crate::jobs::JobQueue;
+use crate::mint::job::SubmitMintJob;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
-    recovery::enqueue_scheduled_mint_recovery,
 };
-use crate::vault::{NetworkVaultServices, VaultService};
+use crate::tokenized_asset::view::find_vault;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -29,7 +29,7 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(_auth, mint_store, vault_services, pool, apalis_pool), fields(
+#[tracing::instrument(skip(_auth, mint_store, pool, apalis_pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id,
     status = ?request.status
@@ -38,7 +38,6 @@ pub(crate) enum JournalStatus {
 pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
     mint_store: &rocket::State<Arc<Store<Mint>>>,
-    vault_services: &rocket::State<NetworkVaultServices>,
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     request: Json<JournalConfirmationRequest>,
@@ -103,26 +102,6 @@ pub(crate) async fn confirm_journal(
         }
 
         JournalStatus::Completed => {
-            let Some(network) = mint.network() else {
-                error!(target: "mint",
-                    issuer_request_id = %issuer_request_id,
-                    "Mint has no network — cannot select a vault service"
-                );
-                return rocket::http::Status::InternalServerError;
-            };
-
-            let vault_service = match vault_services.service(network) {
-                Ok(vault_service) => vault_service.clone(),
-                Err(error) => {
-                    error!(target: "mint",
-                        issuer_request_id = %issuer_request_id,
-                        error = %error,
-                        "Cannot confirm mint on an unconfigured network"
-                    );
-                    return rocket::http::Status::UnprocessableEntity;
-                }
-            };
-
             let command = MintCommand::ConfirmJournal {
                 issuer_request_id: issuer_request_id.clone(),
             };
@@ -141,7 +120,6 @@ pub(crate) async fn confirm_journal(
             let apalis_pool = apalis_pool.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
                 mint_store,
-                vault_service,
                 pool,
                 apalis_pool,
                 issuer_request_id,
@@ -152,12 +130,11 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
-#[tracing::instrument(skip(mint_store, vault_service, pool, apalis_pool), fields(
+#[tracing::instrument(skip(mint_store, pool, apalis_pool), fields(
     issuer_request_id = %issuer_request_id
 ))]
 async fn process_journal_completion(
     mint_store: Arc<Store<Mint>>,
-    vault_service: Arc<dyn VaultService>,
     pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
     issuer_request_id: IssuerMintRequestId,
@@ -182,234 +159,73 @@ async fn process_journal_completion(
         return;
     }
 
-    // The shared wallet lock spans preparation, durable event persistence,
-    // and initial broadcast. The real provider reads the pending chain nonce
-    // while this guard is held, so a failed signing/event append cannot consume
-    // a process-local nonce and concurrent wallet operations cannot prepare a
-    // replacement before the exact intent is durable.
-    let wallet_guard = vault_service.lock_wallet().await;
-
-    // Step 2: Prepare and persist the exact signed transaction before any
-    // broadcast (PrepareMint → MintIntended).
-    if let Err(err) = mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::PrepareMint {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-    {
-        error!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "PrepareMint command failed — scheduling recovery"
-        );
-        schedule_recovery(&pool, &apalis_pool, &issuer_request_id).await;
-        return;
-    }
-
-    let Some(prepared) = prepared_mint_after_load(
-        mint_store.load(&issuer_request_id).await,
-        &pool,
-        &apalis_pool,
-        &issuer_request_id,
-    )
-    .await
-    else {
-        return;
-    };
-
-    if !matches!(prepared, Mint::TxIntended { .. }) {
-        if matches!(prepared, Mint::MintingFailed { .. }) {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint preparation failed — scheduling automatic recovery"
-            );
-            schedule_recovery(&pool, &apalis_pool, &issuer_request_id).await;
+    // Step 2: Resolve the vault and enqueue the submission job. The durable
+    // job chain (submit -> confirm -> callback) drives the mint to completion
+    // off the request path; each job records its outcome via an idempotent
+    // command and enqueues the next. A domain failure flips the mint to
+    // `MintingFailed`, which recovery retries on its own schedule.
+    let (underlying, network) = match mint_store.load(&issuer_request_id).await {
+        Ok(Some(Mint::Minting { underlying, network, .. })) => {
+            (underlying, network)
         }
-        return;
-    }
-
-    // Step 3: Broadcast only the persisted transaction.
-    if let Err(err) = mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::SubmitMint {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-    {
-        warn!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "SubmitMint command failed — keeping persisted intent for recovery"
-        );
-        schedule_recovery(&pool, &apalis_pool, &issuer_request_id).await;
-        return;
-    }
-    drop(wallet_guard);
-
-    // Step 4: Load the tx_id from the aggregate and confirm.
-    let mint = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(mint)) => mint,
-        Ok(None) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint aggregate not found after SubmitMint"
-            );
-            return;
-        }
-        Err(err) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "Failed to load aggregate after SubmitMint"
-            );
-            return;
-        }
-    };
-
-    if let Mint::TxSubmitted { tx_id, .. } = &mint {
-        if let Err(err) = mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::ConfirmMint {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tx_id: tx_id.clone(),
-                },
-            )
-            .await
-        {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "ConfirmMint command failed"
-            );
-            return;
-        }
-    } else {
-        let state = mint.state_name();
-        match &mint {
-            Mint::MintingFailed { .. } => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Mint submission failed — scheduling automatic recovery"
-                );
-                schedule_recovery(&pool, &apalis_pool, &issuer_request_id)
-                    .await;
-            }
-            Mint::CallbackPending { .. } | Mint::Completed { .. } => {
-                info!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Aggregate already advanced by concurrent recovery — skipping"
-                );
-            }
-            _ => {
-                error!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Unexpected aggregate state after SubmitMint — ConfirmMint skipped"
-                );
-            }
-        }
-        return;
-    }
-
-    let mint = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(mint)) => mint,
-        Ok(None) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint aggregate not found after ConfirmMint"
-            );
-            return;
-        }
-        Err(err) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "Failed to load aggregate after ConfirmMint"
-            );
-            return;
-        }
-    };
-
-    match &mint {
-        Mint::MintingFailed { .. } => {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint confirmation failed — scheduling automatic recovery"
-            );
-            schedule_recovery(&pool, &apalis_pool, &issuer_request_id).await;
-            return;
-        }
-        Mint::CallbackPending { .. } => {}
-        Mint::Completed { .. } => {
+        Ok(Some(mint)) => {
+            // Concurrent recovery may have already advanced the mint.
             info!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint already completed by recovery"
+                state = %mint.state_name(),
+                "Mint not in Minting after Deposit — recovery owns it, \
+                 skipping enqueue"
             );
             return;
         }
-        state => {
+        Ok(None) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
-                state = %state.state_name(),
-                "Unexpected aggregate state after ConfirmMint"
+                "Mint aggregate not found after Deposit"
             );
             return;
         }
-    }
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = ?err,
+                "Failed to load aggregate after Deposit"
+            );
+            return;
+        }
+    };
 
-    // Step 4: Send callback to Alpaca.
-    if let Err(err) = mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::SendCallback {
+    let vault = match find_vault(&pool, &underlying, &network).await {
+        Ok(Some(vault)) => vault,
+        Ok(None) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                underlying = %underlying,
+                network = %network,
+                "Vault not found for mint — cannot enqueue submission"
+            );
+            return;
+        }
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Vault lookup failed — cannot enqueue submission"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = JobQueue::<SubmitMintJob>::new(&apalis_pool)
+        .push_with_idempotency_key(
+            SubmitMintJob {
                 issuer_request_id: issuer_request_id.clone(),
+                vault,
             },
+            issuer_request_id.to_string(),
         )
         .await
     {
-        error!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "SendCallback command failed"
-        );
-    }
-}
-
-async fn prepared_mint_after_load<LoadError: Debug>(
-    result: Result<Option<Mint>, LoadError>,
-    pool: &Pool<Sqlite>,
-    apalis_pool: &ApalisSqlitePool,
-    issuer_request_id: &IssuerMintRequestId,
-) -> Option<Mint> {
-    match result {
-        Ok(Some(mint)) => Some(mint),
-        Ok(None) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint aggregate not found after PrepareMint"
-            );
-            None
-        }
-        Err(error) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?error,
-                "Failed to load aggregate after PrepareMint — scheduling recovery"
-            );
-            schedule_recovery(pool, apalis_pool, issuer_request_id).await;
-            None
-        }
-    }
-}
-
-async fn schedule_recovery(
-    pool: &Pool<Sqlite>,
-    apalis_pool: &ApalisSqlitePool,
-    issuer_request_id: &IssuerMintRequestId,
-) {
-    if let Err(error) = enqueue_scheduled_mint_recovery(
-        pool,
-        apalis_pool,
-        issuer_request_id.clone(),
-    )
-    .await
-    {
-        // The reconciler re-enqueues recoverable mints, so this delays
-        // recovery rather than losing it: degraded but continuing.
+        // The reconciler re-enqueues recoverable mints, so a failed enqueue
+        // here delays the submission rather than losing it.
         warn!(target: "mint", issuer_request_id = %issuer_request_id,
             error = %error,
-            "Failed to enqueue scheduled mint recovery"
+            "Failed to enqueue mint submission job"
         );
     }
 }
@@ -420,148 +236,17 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
-    use std::sync::Arc;
     use std::time::Duration;
-    use tracing::Level;
-    use tracing_test::traced_test;
 
-    use super::{
-        confirm_journal, prepared_mint_after_load, process_journal_completion,
-    };
+    use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        TestAccountAndAsset, TestHarness, network_vault_services, test_config,
+        TestAccountAndAsset, TestHarness, test_config,
     };
     use crate::mint::{
-        IssuerMintRequestId, Mint, MintCommand, MintView, Quantity,
+        IssuerMintRequestId, MintCommand, MintView, Quantity,
         TokenizationRequestId, view::find_by_issuer_request_id,
     };
-    use crate::test_utils::log_count_at;
-    use crate::vault::VaultService;
-    use crate::vault::mock::MockVaultService;
-
-    #[traced_test]
-    #[tokio::test]
-    async fn prepared_mint_load_failure_enqueues_recovery() {
-        let harness = TestHarness::new().await;
-        let TestHarness { pool, apalis_pool, .. } = harness;
-        let issuer_request_id = IssuerMintRequestId::random();
-
-        let prepared = prepared_mint_after_load(
-            Err::<Option<Mint>, _>("transient load failure"),
-            &pool,
-            &apalis_pool,
-            &issuer_request_id,
-        )
-        .await;
-
-        assert!(prepared.is_none());
-        let aggregate_id = issuer_request_id.to_string();
-        let enqueued = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
-        )
-        .bind(&aggregate_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(enqueued, 1);
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[
-                    "Failed to load aggregate after PrepareMint — scheduling recovery",
-                    &issuer_request_id.to_string(),
-                ]
-            ),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn concurrent_mints_share_the_wallet_preparation_lock() {
-        let vault = Arc::new(MockVaultService::new_success().with_delay(500));
-        let harness = TestHarness::new_with_mint_vault(vault.clone()).await;
-        let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
-        } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
-        let first_id = IssuerMintRequestId::random();
-        let second_id = IssuerMintRequestId::random();
-
-        for (issuer_request_id, request_id) in [
-            (first_id.clone(), "concurrent-first"),
-            (second_id.clone(), "concurrent-second"),
-        ] {
-            mint_store
-                .send(
-                    &issuer_request_id,
-                    MintCommand::Initiate {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tokenization_request_id: TokenizationRequestId::new(
-                            request_id,
-                        ),
-                        quantity: Quantity::new(Decimal::from(100)),
-                        underlying: underlying.clone(),
-                        token: token.clone(),
-                        network,
-                        client_id,
-                        wallet: address!(
-                            "0x1234567890abcdef1234567890abcdef12345678"
-                        ),
-                    },
-                )
-                .await
-                .unwrap();
-            mint_store
-                .send(
-                    &issuer_request_id,
-                    MintCommand::ConfirmJournal {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-        }
-
-        let initial_guard = vault.lock_wallet().await;
-        let first = tokio::spawn(process_journal_completion(
-            mint_store.clone(),
-            vault.clone(),
-            pool.clone(),
-            apalis_pool.clone(),
-            first_id.clone(),
-        ));
-        let second = tokio::spawn(process_journal_completion(
-            mint_store.clone(),
-            vault.clone(),
-            pool,
-            apalis_pool,
-            second_id.clone(),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(vault.get_call_count(), 0);
-        drop(initial_guard);
-        tokio::time::sleep(Duration::from_millis(650)).await;
-        assert_eq!(
-            vault.get_call_count(),
-            1,
-            "only one concurrent mint may prepare while the shared guard is held"
-        );
-
-        first.await.unwrap();
-        second.await.unwrap();
-        assert_eq!(vault.get_call_count(), 2);
-        assert!(matches!(
-            mint_store.load(&first_id).await.unwrap(),
-            Some(Mint::Completed { .. })
-        ));
-        assert!(matches!(
-            mint_store.load(&second_id).await.unwrap(),
-            Some(Mint::Completed { .. })
-        ));
-    }
 
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
@@ -570,7 +255,7 @@ mod tests {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
 
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -597,7 +282,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -631,7 +315,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -659,7 +343,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -694,7 +377,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -722,7 +405,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -768,25 +450,22 @@ mod tests {
         assert_eq!(events[1].event_type, "MintEvent::JournalConfirmed");
     }
 
-    /// A confirm whose minting fails at submission drives the mint to
-    /// `MintingFailed`, and `process_journal_completion` must enqueue a durable
-    /// recovery job — the apalis integration's reason for existing. The handler
-    /// does that work in a spawned task, so poll the shared `Jobs` table.
-    #[traced_test]
+    /// A completed-journal confirm spawns `process_journal_completion`, which
+    /// records the deposit and enqueues a durable `SubmitMintJob`. The durable
+    /// job chain (submit -> confirm -> callback) drives the mint from there off
+    /// the request path; the handler enqueues in a spawned task, so poll the
+    /// shared `Jobs` table.
     #[tokio::test]
-    async fn confirm_enqueues_recovery_when_minting_fails() {
-        let harness = TestHarness::new_with_mint_vault(Arc::new(
-            MockVaultService::new_submit_failure(),
-        ))
-        .await;
+    async fn confirm_enqueues_submit_job() {
+        let harness = TestHarness::new().await;
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
-            TokenizationRequestId::new("alp-fail-123");
+            TokenizationRequestId::new("alp-enqueue-123");
 
         mint_store
             .send(
@@ -813,7 +492,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -841,7 +519,7 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
 
         // `process_journal_completion` runs in a spawned task, so poll for the
-        // recovery job rather than asserting synchronously.
+        // enqueued submit job rather than asserting synchronously.
         let aggregate_id = issuer_request_id.to_string();
         let enqueued = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -863,129 +541,7 @@ mod tests {
 
         assert_eq!(
             enqueued, 1,
-            "a mint that fails submission must enqueue exactly one recovery job"
-        );
-
-        assert_eq!(
-            log_count_at!(
-                Level::WARN,
-                &[
-                    "SubmitMint command failed — keeping persisted intent for recovery"
-                ]
-            ),
-            1,
-            "the submission-failure path must log the scheduling of recovery"
-        );
-    }
-
-    /// A confirm whose submission SUCCEEDS but whose on-chain confirmation
-    /// reverts drives the mint to `MintingFailed` via the SECOND
-    /// `process_journal_completion` branch (the one after `ConfirmMint`), which
-    /// must also enqueue a durable recovery job.
-    /// `confirm_enqueues_recovery_when_minting_fails` covers the first
-    /// (submission-failure) branch; this covers the second so a future refactor
-    /// cannot silently drop the confirmation-failure enqueue.
-    #[traced_test]
-    #[tokio::test]
-    async fn confirm_enqueues_recovery_when_confirmation_reverts() {
-        let harness = TestHarness::new_with_mint_vault(Arc::new(
-            MockVaultService::new_confirm_revert(),
-        ))
-        .await;
-        let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
-        } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
-
-        let issuer_request_id = IssuerMintRequestId::random();
-        let tokenization_request_id =
-            TokenizationRequestId::new("alp-confirm-revert-123");
-
-        mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Initiate {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying,
-                    token,
-                    network,
-                    client_id,
-                    wallet: address!(
-                        "0x1234567890abcdef1234567890abcdef12345678"
-                    ),
-                },
-            )
-            .await
-            .expect("Failed to initiate mint");
-
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_store)
-            .manage(pool.clone())
-            .manage(apalis_pool)
-            .manage(network_vault_services(vault))
-            .mount("/", routes![confirm_journal]);
-
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
-
-        let request_body = serde_json::json!({
-            "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.to_string(),
-            "status": "completed"
-        });
-
-        let response = client
-            .post("/inkind/issuance/confirm")
-            .header(ContentType::JSON)
-            .header(Header::new(
-                "X-API-KEY",
-                "test-key-12345678901234567890123456",
-            ))
-            .remote("127.0.0.1:8000".parse().unwrap())
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
-
-        assert_eq!(response.status(), Status::Ok);
-
-        // `process_journal_completion` runs in a spawned task, so poll for the
-        // recovery job rather than asserting synchronously.
-        let aggregate_id = issuer_request_id.to_string();
-        let enqueued = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let enqueued = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
-                )
-                .bind(&aggregate_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                if enqueued > 0 {
-                    break enqueued;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("job not enqueued within 5s");
-
-        assert_eq!(
-            enqueued, 1,
-            "a mint whose confirmation reverts must enqueue exactly one recovery job"
-        );
-
-        assert_eq!(
-            log_count_at!(
-                Level::WARN,
-                &["Mint confirmation failed — scheduling automatic recovery"]
-            ),
-            1,
-            "the confirmation-failure path must log the scheduling of recovery"
+            "a confirmed journal must enqueue exactly one submit job"
         );
     }
 
@@ -995,7 +551,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -1023,7 +579,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1077,7 +632,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -1105,7 +660,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1157,7 +711,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -1185,7 +739,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1241,7 +794,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let correct_tokenization_request_id =
@@ -1271,7 +824,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1302,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
+        let TestHarness { pool, apalis_pool, mint_store, .. } =
             TestHarness::new().await;
 
         let rocket = rocket::build()
@@ -1311,7 +863,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1341,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
+        let TestHarness { pool, apalis_pool, mint_store, .. } =
             TestHarness::new().await;
 
         let rocket = rocket::build()
@@ -1350,7 +901,6 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
