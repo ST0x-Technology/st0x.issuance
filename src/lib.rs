@@ -25,10 +25,11 @@ use crate::auth::FailedAuthRateLimiter;
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
 };
+use crate::jobs::JobQueue;
 use crate::mint::{
     Mint, MintServices, MintView, find_all_recoverable_mints,
     recovery::{
-        DriveOutcome, MintRecoveryHandler, MintRecoveryJob, MintRecoveryQueue,
+        DriveOutcome, MintRecoveryHandler, MintRecoveryJob,
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
         prune_unreferenced_recovery_workers, reconcile_recoverable_mints,
         recover_mint, reset_orphaned_recovery_jobs,
@@ -73,6 +74,7 @@ pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod chain;
 pub(crate) mod config;
+pub(crate) mod jobs;
 mod openapi;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
@@ -1542,7 +1544,10 @@ fn spawn_mint_recovery_worker(
                 // A fresh worker id per registration is load-bearing for crash
                 // recovery — see [`MintRecoveryWorkerId`].
                 WorkerBuilder::new(MintRecoveryWorkerId::new().to_string())
-                    .backend(MintRecoveryQueue::new(&apalis_pool))
+                    .backend(
+                        JobQueue::<MintRecoveryJob>::new(&apalis_pool)
+                            .into_storage(),
+                    )
                     .data(mint_store.clone())
                     .data(vault_service.clone())
                     .build(MintRecoveryJob::run)
