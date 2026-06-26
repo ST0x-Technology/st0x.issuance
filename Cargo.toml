@@ -72,6 +72,8 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["rocket"] }
 # migration as above) before this service goes to production.
 apalis = "=1.0.0-rc.9"
 apalis-sqlite = "=1.0.0-rc.8"
+apalis-core = "=1.0.0-rc.9"
+apalis-codec = "=0.1.0-rc.9"
 
 [dev-dependencies]
 alloy-node-bindings = "1.0.41"

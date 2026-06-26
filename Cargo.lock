@@ -5887,6 +5887,8 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "apalis",
+ "apalis-codec",
+ "apalis-core",
  "apalis-sqlite",
  "async-trait",
  "backon",
