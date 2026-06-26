@@ -1,6 +1,7 @@
 mod api;
 mod cmd;
 mod event;
+pub(crate) mod job;
 pub(crate) mod recovery;
 mod view;
 
