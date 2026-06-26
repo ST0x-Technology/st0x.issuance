@@ -7,10 +7,12 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::IssuerAuth;
+use crate::jobs::JobQueue;
+use crate::mint::job::SubmitMintJob;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
-    recovery::enqueue_scheduled_mint_recovery,
 };
+use crate::tokenized_asset::view::find_vault_by_underlying;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -157,166 +159,70 @@ async fn process_journal_completion(
         return;
     }
 
-    // Step 2: Submit mint transaction (SubmitMint → FireblocksSubmitted).
-    if let Err(err) = mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::SubmitMint {
-                issuer_request_id: issuer_request_id.clone(),
-            },
-        )
-        .await
-    {
-        error!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "SubmitMint command failed"
-        );
-        return;
-    }
-
-    // Step 3: Load the fireblocks_tx_id from the aggregate and confirm
-    let mint = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(mint)) => mint,
-        Ok(None) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint aggregate not found after SubmitMint"
-            );
-            return;
-        }
-        Err(err) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "Failed to load aggregate after SubmitMint"
-            );
-            return;
-        }
-    };
-
-    if let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } = &mint {
-        if let Err(err) = mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::ConfirmMint {
-                    issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: fireblocks_tx_id.clone(),
-                },
-            )
-            .await
-        {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "ConfirmMint command failed"
-            );
-            return;
-        }
-    } else {
-        let state = mint.state_name();
-        match &mint {
-            Mint::MintingFailed { .. } => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Mint submission failed — scheduling automatic recovery"
-                );
-                if let Err(error) = enqueue_scheduled_mint_recovery(
-                    &pool,
-                    &apalis_pool,
-                    issuer_request_id.clone(),
-                )
-                .await
-                {
-                    // Reconciler re-enqueues recoverable mints, so a failed
-                    // enqueue here delays recovery rather than losing it:
-                    // degraded-but-continuing (WARN), not unrecoverable (ERROR).
-                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        error = %error,
-                        "Failed to enqueue scheduled mint recovery"
-                    );
-                }
-            }
-            Mint::CallbackPending { .. } | Mint::Completed { .. } => {
-                info!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Aggregate already advanced by concurrent recovery — skipping"
-                );
-            }
-            _ => {
-                error!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %state,
-                    "Unexpected aggregate state after SubmitMint — ConfirmMint skipped"
-                );
-            }
-        }
-        return;
-    }
-
-    let mint = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(mint)) => mint,
-        Ok(None) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint aggregate not found after ConfirmMint"
-            );
-            return;
-        }
-        Err(err) => {
-            error!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = ?err,
-                "Failed to load aggregate after ConfirmMint"
-            );
-            return;
-        }
-    };
-
-    match &mint {
-        Mint::MintingFailed { .. } => {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint confirmation failed — scheduling automatic recovery"
-            );
-            if let Err(error) = enqueue_scheduled_mint_recovery(
-                &pool,
-                &apalis_pool,
-                issuer_request_id.clone(),
-            )
-            .await
-            {
-                // Reconciler re-enqueues recoverable mints, so a failed
-                // enqueue here delays recovery rather than losing it:
-                // degraded-but-continuing (WARN), not unrecoverable (ERROR).
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    error = %error,
-                    "Failed to enqueue scheduled mint recovery"
-                );
-            }
-            return;
-        }
-        Mint::CallbackPending { .. } => {}
-        Mint::Completed { .. } => {
+    // Step 2: Resolve the vault and enqueue the submission job. The durable
+    // job chain (submit -> confirm -> callback) drives the mint to completion
+    // off the request path; each job records its outcome via an idempotent
+    // command and enqueues the next. A domain failure flips the mint to
+    // `MintingFailed`, which recovery retries on its own schedule.
+    let underlying = match mint_store.load(&issuer_request_id).await {
+        Ok(Some(Mint::Minting { underlying, .. })) => underlying,
+        Ok(Some(mint)) => {
+            // Concurrent recovery may have already advanced the mint.
             info!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint already completed by recovery"
+                state = %mint.state_name(),
+                "Mint not in Minting after Deposit — recovery owns it, \
+                 skipping enqueue"
             );
             return;
         }
-        state => {
+        Ok(None) => {
             error!(target: "mint", issuer_request_id = %issuer_request_id,
-                state = %state.state_name(),
-                "Unexpected aggregate state after ConfirmMint"
+                "Mint aggregate not found after Deposit"
             );
             return;
         }
-    }
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = ?err,
+                "Failed to load aggregate after Deposit"
+            );
+            return;
+        }
+    };
 
-    // Step 4: Send callback to Alpaca.
-    if let Err(err) = mint_store
-        .send(
-            &issuer_request_id,
-            MintCommand::SendCallback {
+    let vault = match find_vault_by_underlying(&pool, &underlying).await {
+        Ok(Some(vault)) => vault,
+        Ok(None) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                underlying = %underlying,
+                "Vault not found for mint — cannot enqueue submission"
+            );
+            return;
+        }
+        Err(err) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %err,
+                "Vault lookup failed — cannot enqueue submission"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = JobQueue::<SubmitMintJob>::new(&apalis_pool)
+        .push_with_idempotency_key(
+            SubmitMintJob {
                 issuer_request_id: issuer_request_id.clone(),
+                vault,
             },
+            issuer_request_id.to_string(),
         )
         .await
     {
-        error!(target: "mint", issuer_request_id = %issuer_request_id,
-            error = ?err,
-            "SendCallback command failed"
+        // The reconciler re-enqueues recoverable mints, so a failed enqueue
+        // here delays the submission rather than losing it.
+        warn!(target: "mint", issuer_request_id = %issuer_request_id,
+            error = %error,
+            "Failed to enqueue mint submission job"
         );
     }
 }
@@ -327,10 +233,7 @@ mod tests {
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
     use rust_decimal::Decimal;
-    use std::sync::Arc;
     use std::time::Duration;
-    use tracing::Level;
-    use tracing_test::traced_test;
 
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
@@ -341,8 +244,6 @@ mod tests {
         IssuerMintRequestId, MintCommand, MintView, Quantity,
         TokenizationRequestId, view::find_by_issuer_request_id,
     };
-    use crate::test_utils::log_count_at;
-    use crate::vault::mock::MockVaultService;
 
     #[tokio::test]
     async fn test_confirm_journal_completed_returns_ok() {
@@ -546,17 +447,14 @@ mod tests {
         assert_eq!(events[1].event_type, "MintEvent::JournalConfirmed");
     }
 
-    /// A confirm whose minting fails at submission drives the mint to
-    /// `MintingFailed`, and `process_journal_completion` must enqueue a durable
-    /// recovery job — the apalis integration's reason for existing. The handler
-    /// does that work in a spawned task, so poll the shared `Jobs` table.
-    #[traced_test]
+    /// A completed-journal confirm spawns `process_journal_completion`, which
+    /// records the deposit and enqueues a durable `SubmitMintJob`. The durable
+    /// job chain (submit -> confirm -> callback) drives the mint from there off
+    /// the request path; the handler enqueues in a spawned task, so poll the
+    /// shared `Jobs` table.
     #[tokio::test]
-    async fn confirm_enqueues_recovery_when_minting_fails() {
-        let harness = TestHarness::new_with_mint_vault(Arc::new(
-            MockVaultService::new_submit_failure(),
-        ))
-        .await;
+    async fn confirm_enqueues_submit_job() {
+        let harness = TestHarness::new().await;
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
@@ -564,7 +462,7 @@ mod tests {
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
-            TokenizationRequestId::new("alp-fail-123");
+            TokenizationRequestId::new("alp-enqueue-123");
 
         mint_store
             .send(
@@ -618,7 +516,7 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
 
         // `process_journal_completion` runs in a spawned task, so poll for the
-        // recovery job rather than asserting synchronously.
+        // enqueued submit job rather than asserting synchronously.
         let aggregate_id = issuer_request_id.to_string();
         let mut enqueued = 0;
         for _ in 0..100 {
@@ -637,123 +535,7 @@ mod tests {
 
         assert_eq!(
             enqueued, 1,
-            "a mint that fails submission must enqueue exactly one recovery job"
-        );
-
-        assert_eq!(
-            log_count_at!(
-                Level::WARN,
-                &["Mint submission failed — scheduling automatic recovery"]
-            ),
-            1,
-            "the submission-failure path must log the scheduling of recovery"
-        );
-    }
-
-    /// A confirm whose submission SUCCEEDS but whose on-chain confirmation
-    /// reverts drives the mint to `MintingFailed` via the SECOND
-    /// `process_journal_completion` branch (the one after `ConfirmMint`), which
-    /// must also enqueue a durable recovery job.
-    /// `confirm_enqueues_recovery_when_minting_fails` covers the first
-    /// (submission-failure) branch; this covers the second so a future refactor
-    /// cannot silently drop the confirmation-failure enqueue.
-    #[traced_test]
-    #[tokio::test]
-    async fn confirm_enqueues_recovery_when_confirmation_reverts() {
-        let harness = TestHarness::new_with_mint_vault(Arc::new(
-            MockVaultService::new_confirm_revert(),
-        ))
-        .await;
-        let TestAccountAndAsset {
-            client_id, underlying, token, network, ..
-        } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
-
-        let issuer_request_id = IssuerMintRequestId::random();
-        let tokenization_request_id =
-            TokenizationRequestId::new("alp-confirm-revert-123");
-
-        mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Initiate {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    quantity: Quantity::new(Decimal::from(100)),
-                    underlying,
-                    token,
-                    network,
-                    client_id,
-                    wallet: address!(
-                        "0x1234567890abcdef1234567890abcdef12345678"
-                    ),
-                },
-            )
-            .await
-            .expect("Failed to initiate mint");
-
-        let rocket = rocket::build()
-            .manage(test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(mint_store)
-            .manage(pool.clone())
-            .manage(apalis_pool)
-            .mount("/", routes![confirm_journal]);
-
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
-
-        let request_body = serde_json::json!({
-            "tokenization_request_id": tokenization_request_id.0,
-            "issuer_request_id": issuer_request_id.to_string(),
-            "status": "completed"
-        });
-
-        let response = client
-            .post("/inkind/issuance/confirm")
-            .header(ContentType::JSON)
-            .header(Header::new(
-                "X-API-KEY",
-                "test-key-12345678901234567890123456",
-            ))
-            .remote("127.0.0.1:8000".parse().unwrap())
-            .body(request_body.to_string())
-            .dispatch()
-            .await;
-
-        assert_eq!(response.status(), Status::Ok);
-
-        // `process_journal_completion` runs in a spawned task, so poll for the
-        // recovery job rather than asserting synchronously.
-        let aggregate_id = issuer_request_id.to_string();
-        let mut enqueued = 0;
-        for _ in 0..100 {
-            enqueued = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
-            )
-            .bind(&aggregate_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if enqueued > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        assert_eq!(
-            enqueued, 1,
-            "a mint whose confirmation reverts must enqueue exactly one recovery job"
-        );
-
-        assert_eq!(
-            log_count_at!(
-                Level::WARN,
-                &["Mint confirmation failed — scheduling automatic recovery"]
-            ),
-            1,
-            "the confirmation-failure path must log the scheduling of recovery"
+            "a confirmed journal must enqueue exactly one submit job"
         );
     }
 

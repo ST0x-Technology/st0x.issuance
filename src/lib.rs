@@ -18,11 +18,16 @@ use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
 
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
 use crate::jobs::{JobQueue, work};
+use crate::mint::job::{
+    ConfirmMintContext, ConfirmMintJob, SendCallbackContext, SendCallbackJob,
+    SubmitMintContext, SubmitMintJob,
+};
 use crate::mint::{
     Mint, MintServices, find_all_recoverable_mints,
     recovery::{
@@ -34,7 +39,7 @@ use crate::mint::{
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
 use crate::receipt_inventory::reconcile::run_startup_reconciliation;
 use crate::receipt_inventory::{
-    CqrsReceiptService, ItnReceiptHandler, ReceiptInventory,
+    CqrsReceiptService, ItnReceiptHandler, ReceiptInventory, ReceiptService,
     burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
@@ -339,6 +344,20 @@ pub async fn initialize_rocket(
     // recovery budget loop for each enqueued job. Spawned before recovery so the
     // deferred jobs the synchronous pass enqueues start draining immediately.
     spawn_mint_recovery_worker(apalis_pool.clone(), mint_store.clone());
+
+    // Drain the per-step mint side-effect jobs (submit -> confirm -> callback).
+    // Each job performs one external call off the command handler and enqueues
+    // the next; the handlers stay pure.
+    spawn_mint_job_workers(MintJobWorkers {
+        apalis_pool: apalis_pool.clone(),
+        mint_store: mint_store.clone(),
+        vault: vault_service_for_rocket.clone(),
+        alpaca: alpaca_service.clone(),
+        receipts: Arc::new(CqrsReceiptService::new(
+            receipt_inventory_store.clone(),
+        )),
+        bot: bot_wallet,
+    });
 
     // Periodically re-enqueue recoverable mints that lost their recovery job
     // (e.g. an enqueue that failed during a transient SQLite outage at confirm
@@ -1330,6 +1349,125 @@ fn spawn_mint_recovery_worker(
             }
         }
     });
+}
+
+/// Spawns a drainer worker for one mint side-effect job type, mirroring
+/// [`spawn_mint_recovery_worker`]: a fresh worker id per registration
+/// (load-bearing for crash recovery) and an in-process restart loop on transient
+/// apalis/SQLite failures. A macro (not a generic fn) because apalis's
+/// `.build()` yields a deeply-nested worker type with no public alias, so the
+/// concrete job/context types must appear at the expansion site. Drainer-style:
+/// no apalis retry layer — a domain failure is recorded as a `MintingFailed`
+/// event that recovery retries.
+macro_rules! spawn_drainer_worker {
+    (
+        ::<$ctx:ty, $job:ty>,
+        $apalis_pool:expr,
+        $ctx_val:expr,
+        $worker_name:expr $(,)?
+    ) => {{
+        let apalis_pool: ApalisSqlitePool = $apalis_pool;
+        let ctx: Arc<$ctx> = $ctx_val;
+        let worker_name: &'static str = $worker_name;
+        tokio::spawn(async move {
+            loop {
+                let apalis_pool = apalis_pool.clone();
+                let ctx = ctx.clone();
+                let monitor = Monitor::new().register(move |_index| {
+                    WorkerBuilder::new(format!(
+                        "{worker_name}-{}",
+                        Uuid::new_v4()
+                    ))
+                    .backend(
+                        JobQueue::<$job>::with_fast_poll(&apalis_pool)
+                            .into_storage(),
+                    )
+                    .data(ctx.clone())
+                    .build(work::<$ctx, $job>)
+                });
+
+                match monitor.run().await {
+                    Ok(()) => {
+                        info!(
+                            target: "mint",
+                            worker = worker_name,
+                            "Mint job worker stopped cleanly"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "mint",
+                            worker = worker_name,
+                            error = %error,
+                            backoff_secs =
+                                MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
+                            "Mint job worker crashed; restarting after backoff"
+                        );
+                        tokio::time::sleep(
+                            MINT_RECOVERY_WORKER_RESTART_BACKOFF,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }};
+}
+
+/// Dependencies for the per-step mint side-effect job workers.
+struct MintJobWorkers {
+    apalis_pool: ApalisSqlitePool,
+    mint_store: Arc<Store<Mint>>,
+    vault: Arc<dyn vault::VaultService>,
+    alpaca: Arc<dyn AlpacaService>,
+    receipts: Arc<dyn ReceiptService>,
+    bot: Address,
+}
+
+/// Spawns the three drainer workers for the mint side-effect job chain. Each
+/// gets the per-step context its job needs to perform its external call and
+/// enqueue the next step.
+fn spawn_mint_job_workers(workers: MintJobWorkers) {
+    let MintJobWorkers {
+        apalis_pool,
+        mint_store,
+        vault,
+        alpaca,
+        receipts,
+        bot,
+    } = workers;
+
+    spawn_drainer_worker!(
+        ::<SubmitMintContext, SubmitMintJob>,
+        apalis_pool.clone(),
+        Arc::new(SubmitMintContext {
+            mint_store: mint_store.clone(),
+            vault: vault.clone(),
+            bot,
+            confirm_queue: JobQueue::new(&apalis_pool),
+        }),
+        "mint-submit-worker",
+    );
+
+    spawn_drainer_worker!(
+        ::<ConfirmMintContext, ConfirmMintJob>,
+        apalis_pool.clone(),
+        Arc::new(ConfirmMintContext {
+            mint_store: mint_store.clone(),
+            vault,
+            receipts,
+            callback_queue: JobQueue::new(&apalis_pool),
+        }),
+        "mint-confirm-worker",
+    );
+
+    spawn_drainer_worker!(
+        ::<SendCallbackContext, SendCallbackJob>,
+        apalis_pool.clone(),
+        Arc::new(SendCallbackContext { mint_store, alpaca }),
+        "mint-callback-worker",
+    );
 }
 
 #[cfg(test)]
