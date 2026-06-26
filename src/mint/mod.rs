@@ -929,6 +929,32 @@ impl Mint {
         }
     }
 
+    /// Retries a failed mint by transitioning `MintingFailed` -> `Minting`,
+    /// advancing the automatic-retry attempt counter. Pure — emits
+    /// `MintRetryStarted`. Recovery sends this before re-enqueuing a
+    /// `SubmitMintJob`. Idempotent: a no-op if the mint already left
+    /// `MintingFailed` (e.g. a concurrent retry already started).
+    fn handle_retry_mint(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::MintingFailed { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::MintRetryStarted {
+                    issuer_request_id,
+                    tx_hash: None,
+                    started_at: Utc::now(),
+                }])
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
     async fn handle_recover(
         &self,
         services: &MintServices,
@@ -2023,7 +2049,8 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::RecordMintFailed { .. } => Ok(vec![]),
+            MintCommand::RecordMintFailed { .. }
+            | MintCommand::RetryMint { .. } => Ok(vec![]),
             MintCommand::Recover { .. }
             | MintCommand::RecoverFromReceipt { .. }
             | MintCommand::CloseMint { .. } => Err(MintError::NotRecoverable {
@@ -2121,6 +2148,9 @@ impl EventSourced for Mint {
             }
             MintCommand::RecordMintFailed { issuer_request_id, error } => {
                 self.handle_record_mint_failed(issuer_request_id, error)
+            }
+            MintCommand::RetryMint { issuer_request_id } => {
+                self.handle_retry_mint(issuer_request_id)
             }
             MintCommand::Recover { issuer_request_id, mode } => {
                 self.handle_recover(services, issuer_request_id, mode).await
@@ -2864,6 +2894,44 @@ pub(crate) mod tests {
         assert!(
             events.is_empty(),
             "a stale failure report for a completed mint must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_mint_from_minting_failed_emits_retry_started() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(minting_events_for_retry(
+                &issuer_request_id,
+                "ext-1".to_string(),
+                failed_at,
+            ))
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintRetryStarted { tx_hash: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_mint_is_idempotent_when_not_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_minting(&issuer_request_id))
+            .when(MintCommand::RetryMint { issuer_request_id })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "retrying a mint that is not in MintingFailed must be a no-op"
         );
     }
 

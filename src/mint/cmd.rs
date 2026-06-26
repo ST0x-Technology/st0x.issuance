@@ -105,6 +105,15 @@ pub(crate) enum MintCommand {
         error: String,
     },
 
+    /// Retries a failed mint by transitioning `MintingFailed` -> `Minting`,
+    /// advancing the automatic-retry attempt counter. Pure: produces
+    /// `MintRetryStarted` (no I/O). Recovery sends this before re-enqueuing a
+    /// `SubmitMintJob`. Idempotent — a no-op if the mint already left
+    /// `MintingFailed`.
+    RetryMint {
+        issuer_request_id: IssuerMintRequestId,
+    },
+
     /// Recovers a mint stuck in an incomplete state.
     ///
     /// For mints in `Minting` or `MintingFailed` state:
