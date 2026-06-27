@@ -519,9 +519,7 @@ where
         );
 
         if let ReceiptSource::Itn { issuer_request_id } = source {
-            self.handler
-                .on_itn_receipt_discovered(issuer_request_id, discovery.tx_hash)
-                .await;
+            self.handler.on_itn_receipt_discovered(issuer_request_id).await;
         }
 
         Ok(ProcessOutcome::Processed)
@@ -580,15 +578,16 @@ enum ProcessOutcome {
 /// Called when the receipt backfiller discovers an ITN receipt (a receipt
 /// with a valid `issuer_request_id` in its receiptInformation).
 ///
-/// Production implementation triggers mint recovery for the associated mint.
-/// The `tx_hash` is the on-chain transaction that created the receipt,
-/// serving as compiler-enforced evidence that the mint succeeded on-chain.
+/// Invoked only after `DiscoverReceipt` has already persisted the receipt
+/// (including `tx_hash`) to inventory. On-chain evidence therefore lives in
+/// the inventory aggregate; this callback only needs the mint id so recovery
+/// can re-drive via the per-state jobs, which load the receipt (and its
+/// `tx_hash`) from inventory before recording or re-submitting.
 #[async_trait]
 pub(crate) trait ItnReceiptHandler: Send + Sync {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        tx_hash: TxHash,
     );
 }
 
@@ -597,9 +596,8 @@ impl<T: ItnReceiptHandler + Sync> ItnReceiptHandler for &T {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        tx_hash: TxHash,
     ) {
-        (*self).on_itn_receipt_discovered(issuer_request_id, tx_hash).await;
+        (*self).on_itn_receipt_discovered(issuer_request_id).await;
     }
 }
 
@@ -613,7 +611,6 @@ impl ItnReceiptHandler for NoOpItnHandler {
     async fn on_itn_receipt_discovered(
         &self,
         _issuer_request_id: IssuerMintRequestId,
-        _tx_hash: TxHash,
     ) {
     }
 }

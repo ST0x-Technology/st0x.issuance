@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::Address;
 use apalis::prelude::AbortError;
 use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
@@ -42,10 +42,11 @@ pub(crate) struct MintRecoveryContext {
 /// discovered by the receipt monitor.
 ///
 /// Enqueues the scheduled recovery job for faster pickup than the periodic
-/// reconciler. Recovery re-drives the mint via the per-state jobs; a
-/// re-submission is double-mint-safe through the deterministic `external_tx_id`
-/// (the signing backend dedups), so the discovered `tx_hash` is not needed
-/// here.
+/// reconciler. On-chain evidence (`tx_hash`, receipt id, shares) is already
+/// in inventory from the preceding `DiscoverReceipt`; the recovery /
+/// `SubmitMintJob` path loads that receipt and records it via
+/// `RecordExistingMint` (or re-submits only when no receipt exists — the
+/// signer does not dedup on `external_tx_id`).
 #[derive(Clone)]
 pub(crate) struct MintRecoveryHandler {
     pool: Pool<Sqlite>,
@@ -66,7 +67,6 @@ impl ItnReceiptHandler for MintRecoveryHandler {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        _tx_hash: TxHash,
     ) {
         if let Err(error) = enqueue_scheduled_mint_recovery(
             &self.pool,
@@ -637,7 +637,7 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 // existing mint (the per-state job's receipt check turns this
                 // into a record, not a re-submission). Otherwise honour the
                 // backoff so a genuinely failed mint is not hammered.
-                if minting_failed_receipt_exists(ctx, &mint, &issuer_request_id)
+                if minting_failed_receipt_exists(ctx, &mint, issuer_request_id)
                     .await
                 {
                     no_progress_polls += 1;
@@ -652,7 +652,7 @@ async fn recover_mint_until_automatic_budget_exhausted(
                     }
 
                     if let Err(error) =
-                        drive_one_step(ctx, &mint, &issuer_request_id).await
+                        drive_one_step(ctx, &mint, issuer_request_id).await
                     {
                         debug!(target: "mint", issuer_request_id = %issuer_request_id,
                             error = %error,
@@ -684,7 +684,7 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 }
 
                 if let Err(error) =
-                    drive_one_step(ctx, &mint, &issuer_request_id).await
+                    drive_one_step(ctx, &mint, issuer_request_id).await
                 {
                     debug!(target: "mint", issuer_request_id = %issuer_request_id,
                         error = %error,
@@ -1121,7 +1121,7 @@ mod tests {
         events.push(MintEvent::MintTxSubmitted {
             issuer_request_id: issuer_request_id.clone(),
             external_tx_id: format!("mint-{issuer_request_id}"),
-            tx_id: "fb-tx-123".to_string(),
+            tx_id: TxId::Legacy("fb-tx-123".to_string()),
             submitted_at: now,
         });
 
@@ -1400,7 +1400,8 @@ mod tests {
             "a mint that outlasts its budget must abandon, not resolve"
         );
 
-        let test = "budget_loop_reports_abandoned_when_no_progress_budget_spent";
+        let test =
+            "budget_loop_reports_abandoned_when_no_progress_budget_spent";
         assert!(
             log_count_at!(
                 Level::WARN,

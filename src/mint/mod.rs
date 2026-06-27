@@ -781,10 +781,7 @@ impl Mint {
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::Minting { issuer_request_id: expected_id, .. }
-            | Self::TxSubmitted {
-                issuer_request_id: expected_id,
-                ..
-            }
+            | Self::TxSubmitted { issuer_request_id: expected_id, .. }
             | Self::MintingFailed { issuer_request_id: expected_id, .. } => {
                 Self::validate_issuer_request_id(
                     expected_id,

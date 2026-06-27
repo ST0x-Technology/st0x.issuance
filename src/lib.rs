@@ -36,9 +36,8 @@ use crate::mint::{
     recovery::{
         MintRecoveryContext, MintRecoveryHandler, MintRecoveryJob,
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
-        prune_unreferenced_recovery_workers,
-        reconcile_recoverable_mints, reset_orphaned_recovery_jobs,
-        vacuum_terminal_mint_side_effect_jobs,
+        prune_unreferenced_recovery_workers, reconcile_recoverable_mints,
+        reset_orphaned_recovery_jobs, vacuum_terminal_mint_side_effect_jobs,
         vacuum_terminal_recovery_jobs,
     },
 };
