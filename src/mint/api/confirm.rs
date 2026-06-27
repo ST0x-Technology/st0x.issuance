@@ -13,6 +13,7 @@ use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
 };
 use crate::tokenized_asset::view::find_vault;
+use crate::vault::NetworkVaultServices;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -29,7 +30,7 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(_auth, mint_store, pool, apalis_pool), fields(
+#[tracing::instrument(skip(_auth, mint_store, vault_services, pool, apalis_pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id,
     status = ?request.status
@@ -38,6 +39,7 @@ pub(crate) enum JournalStatus {
 pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
     mint_store: &rocket::State<Arc<Store<Mint>>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     request: Json<JournalConfirmationRequest>,
@@ -116,10 +118,12 @@ pub(crate) async fn confirm_journal(
             }
 
             let mint_store = mint_store.inner().clone();
+            let vault_services = vault_services.inner().clone();
             let pool = pool.inner().clone();
             let apalis_pool = apalis_pool.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
                 mint_store,
+                vault_services,
                 pool,
                 apalis_pool,
                 issuer_request_id,
@@ -130,11 +134,12 @@ pub(crate) async fn confirm_journal(
     rocket::http::Status::Ok
 }
 
-#[tracing::instrument(skip(mint_store, pool, apalis_pool), fields(
+#[tracing::instrument(skip(mint_store, vault_services, pool, apalis_pool), fields(
     issuer_request_id = %issuer_request_id
 ))]
 async fn process_journal_completion(
     mint_store: Arc<Store<Mint>>,
+    vault_services: NetworkVaultServices,
     pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
     issuer_request_id: IssuerMintRequestId,
@@ -165,8 +170,14 @@ async fn process_journal_completion(
     // command and enqueues the next. A domain failure flips the mint to
     // `MintingFailed`, which recovery retries on its own schedule.
     let (underlying, network) = match mint_store.load(&issuer_request_id).await {
-        Ok(Some(Mint::Minting { underlying, network, .. })) => {
-            (underlying, network)
+        Ok(Some(mint @ Mint::Minting { underlying, .. })) => {
+            let Some(network) = mint.network() else {
+                error!(target: "mint", issuer_request_id = %issuer_request_id,
+                    "Minting mint missing network — cannot enqueue submission"
+                );
+                return;
+            };
+            (underlying.clone(), network)
         }
         Ok(Some(mint)) => {
             // Concurrent recovery may have already advanced the mint.
@@ -211,11 +222,24 @@ async fn process_journal_completion(
         }
     };
 
+    let chain_id = match vault_services.chain_id(network) {
+        Ok(chain_id) => chain_id,
+        Err(error) => {
+            error!(target: "mint", issuer_request_id = %issuer_request_id,
+                network = %network,
+                error = %error,
+                "No vault service for mint network — cannot enqueue submission"
+            );
+            return;
+        }
+    };
+
     if let Err(error) = JobQueue::<SubmitMintJob>::new(&apalis_pool)
         .push_with_idempotency_key(
             SubmitMintJob {
                 issuer_request_id: issuer_request_id.clone(),
                 vault,
+                chain_id,
             },
             issuer_request_id.to_string(),
         )
@@ -241,7 +265,7 @@ mod tests {
     use super::confirm_journal;
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        TestAccountAndAsset, TestHarness, test_config,
+        TestAccountAndAsset, TestHarness, network_vault_services, test_config,
     };
     use crate::mint::{
         IssuerMintRequestId, MintCommand, MintView, Quantity,
@@ -255,7 +279,7 @@ mod tests {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
 
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-ok-test");
@@ -282,6 +306,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -315,7 +340,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -343,6 +368,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -377,7 +403,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -405,6 +431,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -461,7 +488,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -492,6 +519,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -551,7 +579,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -579,6 +607,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -632,7 +661,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -660,6 +689,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -711,7 +741,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id =
@@ -739,6 +769,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -794,7 +825,7 @@ mod tests {
         let TestAccountAndAsset {
             client_id, underlying, token, network, ..
         } = harness.setup_account_and_asset().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } = harness;
 
         let issuer_request_id = IssuerMintRequestId::random();
         let correct_tokenization_request_id =
@@ -824,6 +855,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -854,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_journal_for_nonexistent_mint_returns_internal_server_error()
      {
-        let TestHarness { pool, apalis_pool, mint_store, .. } =
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
             TestHarness::new().await;
 
         let rocket = rocket::build()
@@ -863,6 +895,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -892,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_journal_without_auth_returns_401() {
-        let TestHarness { pool, apalis_pool, mint_store, .. } =
+        let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
             TestHarness::new().await;
 
         let rocket = rocket::build()
@@ -901,6 +934,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)

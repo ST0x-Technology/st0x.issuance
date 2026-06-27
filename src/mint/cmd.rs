@@ -1,12 +1,11 @@
 use alloy::primitives::{Address, B256, TxHash, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::vault::TxId;
-
 use super::{
-    ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
-    TokenizationRequestId, UnderlyingSymbol,
+    ClientId, IssuerMintRequestId, MintExternalTxId, Network, Quantity,
+    TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
 };
+use crate::vault::TxId;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum MintRecoveryMode {
@@ -79,8 +78,8 @@ pub(crate) enum MintCommand {
     /// past `Minting` (an at-least-once job re-run is safe).
     RecordTxSubmitted {
         issuer_request_id: IssuerMintRequestId,
-        external_tx_id: String,
-        tx_id: String,
+        external_tx_id: MintExternalTxId,
+        tx_id: TxId,
     },
 
     /// Records the outcome of a successful on-chain mint confirmation performed
@@ -89,6 +88,10 @@ pub(crate) enum MintCommand {
     /// `TxSubmitted`.
     RecordTokensMinted {
         issuer_request_id: IssuerMintRequestId,
+        /// The signing-backend transaction the report belongs to. The handler
+        /// rejects a mismatch against the stored submission so a stale
+        /// confirm job cannot record an old transaction's result.
+        tx_id: TxId,
         tx_hash: B256,
         receipt_id: U256,
         shares_minted: U256,

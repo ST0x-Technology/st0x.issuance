@@ -27,6 +27,7 @@ use apalis_sqlite::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::any::type_name;
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +105,7 @@ fn build_poll_config<Task: 'static>() -> Config {
         )
         .build();
 
-    Config::new(std::any::type_name::<Task>()).with_poll_interval(strategy)
+    Config::new(type_name::<Task>()).with_poll_interval(strategy)
 }
 
 /// A persistent, durable unit of work backed by apalis storage.

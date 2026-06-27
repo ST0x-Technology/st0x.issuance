@@ -208,6 +208,197 @@ fn setup_redemption_mocks_with_shared_state(
     (redeem_mock, poll_mock)
 }
 
+async fn verify_burn_records_created(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    expected_burned: U256,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(5);
+    let poll_interval = tokio::time::Duration::from_millis(100);
+
+    let burn_records = loop {
+        let records = sqlx::query_scalar::<_, String>(
+            "
+            SELECT payload
+            FROM receipt_burns_view
+            WHERE json_extract(payload, '$.Burned') IS NOT NULL
+            ",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if !records.is_empty() {
+            break records;
+        }
+
+        assert!(
+            start.elapsed() <= timeout,
+            "Timeout waiting for burn record in receipt_burns_view"
+        );
+
+        tokio::time::sleep(poll_interval).await;
+    };
+
+    let burn_payload: serde_json::Value =
+        serde_json::from_str(&burn_records[0])?;
+    let burned_shares_hex = burn_payload["Burned"]["burns"][0]["shares_burned"]
+        .as_str()
+        .expect("Should have shares_burned");
+    let burned_shares =
+        U256::from_str_radix(burned_shares_hex.trim_start_matches("0x"), 16)?;
+
+    assert_eq!(
+        burned_shares, expected_burned,
+        "Burn record should show expected shares were burned"
+    );
+
+    Ok(())
+}
+
+/// Tests that burn tracking correctly computes available balance.
+///
+/// The architecture uses two separate views:
+/// - `ReceiptInventoryView`: tracks mints (keyed by mint's issuer_request_id)
+/// - `ReceiptBurnsView`: tracks burns (keyed by redemption aggregate_id)
+///
+/// Available balance is computed at query time by joining these views.
+/// This avoids the cross-aggregate update problem where cqrs-es GenericQuery
+/// uses aggregate_id as view_id.
+#[tokio::test]
+async fn test_burn_tracking_computes_available_balance_correctly()
+-> Result<(), Box<dyn std::error::Error>> {
+    let evm = LocalEvm::new().await?;
+    let mock_alpaca = MockServer::start();
+
+    let bot_wallet = evm.wallet_address;
+    let user_private_key = b256!(
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    );
+    let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
+    let user_wallet = user_signer.address();
+
+    // Use file-based database so we can query it directly
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test_receipt_inventory.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let mint_callback_mock =
+        harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
+    let (_redeem_mock, _poll_mock) =
+        harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
+
+    harness::preseed_tokenized_asset(
+        &db_url,
+        evm.vault_address,
+        "AAPL",
+        "tAAPL",
+    )
+    .await?;
+
+    let (config, _mock_subgraph) =
+        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+
+    let rocket = initialize_rocket(config).await?;
+    let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
+
+    evm.grant_deposit_role(user_wallet).await?;
+    evm.grant_withdraw_role(bot_wallet).await?;
+    evm.grant_certify_role(evm.wallet_address).await?;
+    evm.certify_vault(U256::MAX).await?;
+
+    // Setup user provider
+    let user_wallet_instance = EthereumWallet::from(user_signer);
+    let user_provider = create_provider()
+        .wallet(user_wallet_instance)
+        .connect(&evm.endpoint)
+        .await?;
+    let vault = OffchainAssetReceiptVaultInstance::new(
+        evm.vault_address,
+        &user_provider,
+    );
+
+    // Setup account and perform mint
+    let link_body = harness::setup_account(&client, user_wallet).await;
+    let issuer_request_id = harness::perform_mint_and_confirm(
+        &client,
+        user_wallet,
+        &link_body.client_id.to_string(),
+        "alp-mint-inventory",
+        "50.0",
+    )
+    .await?;
+
+    // Wait for shares to be minted
+    let shares_minted = harness::wait_for_shares(&vault, user_wallet).await?;
+    assert!(shares_minted > U256::ZERO, "Mint should create shares");
+
+    // The mint's side effects now run in async durable jobs, so `wait_for_shares`
+    // can return before `TokensMinted` is recorded and projected into the
+    // receipt inventory view. Wait for the mint callback (the flow's final step)
+    // before reading the view.
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
+
+    // Query receipt_inventory_view to get initial state
+    let query_pool =
+        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
+
+    let initial_view: (String,) = sqlx::query_as(
+        "SELECT payload FROM receipt_inventory_view WHERE view_id = ?",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(&query_pool)
+    .await?;
+
+    let initial_payload: serde_json::Value =
+        serde_json::from_str(&initial_view.0)?;
+    let initial_balance = initial_payload["Active"]["current_balance"]
+        .as_str()
+        .expect("Should have current_balance");
+
+    assert_eq!(
+        initial_balance,
+        format!("{shares_minted:#x}"),
+        "Initial balance should match minted shares"
+    );
+
+    // Transfer all shares to bot wallet to trigger redemption
+    vault
+        .transfer(bot_wallet, shares_minted)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Wait for burn to complete
+    harness::wait_for_burn(&vault, bot_wallet).await?;
+
+    // Verify burns are tracked correctly
+    verify_burn_records_created(&query_pool, shares_minted).await?;
+
+    // Verify receipt_inventory_view was NOT updated (expected with new architecture)
+    let after_burn_view: (String,) = sqlx::query_as(
+        "SELECT payload FROM receipt_inventory_view WHERE view_id = ?",
+    )
+    .bind(&issuer_request_id)
+    .fetch_one(&query_pool)
+    .await?;
+
+    let after_burn_payload: serde_json::Value =
+        serde_json::from_str(&after_burn_view.0)?;
+    let view_balance_hex = after_burn_payload["Active"]["current_balance"]
+        .as_str()
+        .expect("Should still be Active state");
+    let view_balance =
+        U256::from_str_radix(view_balance_hex.trim_start_matches("0x"), 16)?;
+
+    assert_eq!(
+        view_balance, shares_minted,
+        "ReceiptInventoryView.current_balance should remain at initial value"
+    );
+
+    Ok(())
+}
+
 /// Tests that redemption recovery works after a simulated restart.
 ///
 /// This test simulates a scenario where:

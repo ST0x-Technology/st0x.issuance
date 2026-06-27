@@ -179,6 +179,26 @@ impl std::str::FromStr for IssuerMintRequestId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct MintExternalTxId(String);
+
+impl MintExternalTxId {
+    pub(crate) const fn from_string(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MintExternalTxId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Mint {
     Initiated {
@@ -229,6 +249,14 @@ pub(crate) enum Mint {
         initiated_at: DateTime<Utc>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
+        /// Failure history carried across a retry transition
+        /// (`MintingFailed` -> `Minting` via `MintRetryStarted`); `None` on
+        /// the first submission attempt. Preserving it keeps the automatic
+        /// retry schedule escalating and the retry `external_tx_id` correct
+        /// when the retry itself fails. `serde(default)` keeps pre-retry
+        /// snapshots deserializable.
+        #[serde(default)]
+        retry: Option<MintRetryContext>,
     },
     /// Exact signed transaction persisted before broadcast.
     TxIntended {
@@ -364,6 +392,26 @@ struct KnownMintTx {
     tx_id: TxId,
 }
 
+struct ConfirmedMint {
+    tx_id: TxId,
+    tx_hash: B256,
+    receipt_id: U256,
+    shares_minted: U256,
+    gas_used: u64,
+    block_number: u64,
+}
+
+/// Failure history preserved across a `MintRetryStarted` transition
+/// (`MintingFailed` -> `Minting`). Without it a failed retry would restart
+/// the automatic-retry schedule at attempt 1 and lose the
+/// `TxSubmitted` predecessor that the retry `external_tx_id` is
+/// derived from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MintRetryContext {
+    attempts: u32,
+    failed_from: Box<Mint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutomaticRetryDecision {
     Ready,
@@ -392,11 +440,17 @@ impl Mint {
     }
 
     /// Traverses the `failed_from` chain to find the last state before
-    /// any failure. If this mint is not in `MintingFailed`, returns `self`.
+    /// any failure. A `Minting` state that resumed from a failure delegates
+    /// to the preserved chain so retry derivations (attempt number, known
+    /// Fireblocks tx) survive the retry transition. If this mint carries no
+    /// failure history, returns `self`.
     fn non_failed_predecessor(&self) -> &Self {
         match self {
             Self::MintingFailed { failed_from, .. } => {
                 failed_from.non_failed_predecessor()
+            }
+            Self::Minting { retry: Some(context), .. } => {
+                context.failed_from.non_failed_predecessor()
             }
             _ => self,
         }
@@ -451,6 +505,24 @@ impl Mint {
             })
             .unwrap_or(0)
             + 1
+    }
+
+    /// `external_tx_id` override for a durable `SubmitMintJob`: `Some(retry-N)`
+    /// when this `Minting` state resumed from a failure (so Fireblocks does not
+    /// dedupe the retry against the failed submission), `None` for a first
+    /// submission (the backend derives the base deterministic id).
+    pub(super) fn retry_submission_external_tx_id(
+        &self,
+    ) -> Option<MintExternalTxId> {
+        let Self::Minting { issuer_request_id, retry: Some(_), .. } = self
+        else {
+            return None;
+        };
+
+        Some(MintExternalTxId::from_string(Self::retry_mint_external_tx_id(
+            issuer_request_id,
+            self.next_retry_attempt(),
+        )))
     }
 
     const fn automatic_retry_delay(attempt: u32) -> Option<ChronoDuration> {
@@ -1020,8 +1092,8 @@ impl Mint {
     fn handle_record_tx_submitted(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        external_tx_id: String,
-        tx_id: String,
+        external_tx_id: MintExternalTxId,
+        tx_id: TxId,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::Minting { issuer_request_id: expected_id, .. } => {
@@ -1032,7 +1104,7 @@ impl Mint {
 
                 Ok(vec![MintEvent::MintTxSubmitted {
                     issuer_request_id,
-                    external_tx_id,
+                    external_tx_id: external_tx_id.into_string(),
                     tx_id,
                     submitted_at: Utc::now(),
                 }])
@@ -1048,25 +1120,41 @@ impl Mint {
 
     /// Records a confirmed on-chain mint reported by a durable `ConfirmMintJob`.
     /// Pure — emits `TokensMinted` from the payload. Idempotent: a no-op once
-    /// the mint has advanced past `TxSubmitted`.
+    /// the mint has advanced past `TxSubmitted`. Rejects a report
+    /// whose `tx_id` does not match the stored submission, so a
+    /// stale confirm job re-driven after a retry cannot record an old
+    /// transaction's result against a newer submission.
     fn handle_record_tokens_minted(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        tx_hash: B256,
-        receipt_id: U256,
-        shares_minted: U256,
-        gas_used: u64,
-        block_number: u64,
+        confirmed: ConfirmedMint,
     ) -> Result<Vec<MintEvent>, MintError> {
+        let ConfirmedMint {
+            tx_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+        } = confirmed;
+
         match self {
             Self::TxSubmitted {
                 issuer_request_id: expected_id,
+                tx_id: stored_tx_id,
                 ..
             } => {
                 Self::validate_issuer_request_id(
                     expected_id,
                     &issuer_request_id,
                 )?;
+
+                if stored_tx_id != &tx_id {
+                    return Err(MintError::TxIdMismatch {
+                        expected: stored_tx_id.clone(),
+                        provided: tx_id,
+                    });
+                }
 
                 Ok(vec![MintEvent::TokensMinted {
                     issuer_request_id,
@@ -1124,10 +1212,7 @@ impl Mint {
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
             Self::Minting { issuer_request_id: expected_id, .. }
-            | Self::TxSubmitted {
-                issuer_request_id: expected_id,
-                ..
-            } => {
+            | Self::TxSubmitted { issuer_request_id: expected_id, .. } => {
                 Self::validate_issuer_request_id(
                     expected_id,
                     &issuer_request_id,
@@ -1742,6 +1827,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at: started_at,
+            retry: None,
         };
     }
 
@@ -1769,6 +1855,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: _,
         }
         | Self::TxIntended {
             issuer_request_id,
@@ -1819,6 +1906,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: _,
         } = self.clone()
         else {
             return;
@@ -1937,17 +2025,21 @@ impl Mint {
 
         // First failure from a live state: seed the attempt counter from the
         // TxSubmitted predecessor's retry number when present, else 1
-        // (a submission that failed before RPC accepted it).
-        let attempts = match self {
-            Self::TxSubmitted { external_tx_id, .. } => {
+        // (a submission that failed before the tx was accepted). A retrying
+        // Minting state keeps escalating the preserved failure history and
+        // its predecessor chain instead of restarting from scratch.
+        let (attempts, failed_from) = match self {
+            Self::TxSubmitted { external_tx_id, .. } => (
                 Self::retry_attempt_from_external_tx_id(external_tx_id)
                     .unwrap_or(0)
-                    + 1
+                    + 1,
+                Box::new(self.clone()),
+            ),
+            Self::Minting { retry: Some(context), .. } => {
+                (context.attempts + 1, context.failed_from.clone())
             }
-            _ => 1,
+            _ => (1, Box::new(self.clone())),
         };
-
-        let failed_from = Box::new(self.clone());
 
         let (Self::Minting {
             issuer_request_id,
@@ -2137,6 +2229,8 @@ impl Mint {
             wallet,
             initiated_at,
             journal_confirmed_at,
+            attempts,
+            failed_from,
             ..
         } = self.clone()
         else {
@@ -2155,6 +2249,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at: started_at,
+            retry: Some(MintRetryContext { attempts, failed_from }),
         };
     }
     fn handle_close_mint(
@@ -2269,7 +2364,8 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::PrepareMint { .. } => {
+            MintCommand::PrepareMint { .. }
+            | MintCommand::RecordTxSubmitted { .. } => {
                 Err(MintError::NotInMintingState {
                     current_state: "Uninitialized".to_string(),
                 })
@@ -2279,27 +2375,14 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::ConfirmMint { .. } => {
+            MintCommand::ConfirmMint { .. }
+            | MintCommand::RecordTokensMinted { .. } => {
                 Err(MintError::NotInSubmittedState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::SendCallback { .. } => {
-                Err(MintError::NotInCallbackPendingState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordTxSubmitted { .. } => {
-                Err(MintError::NotInMintingState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordTokensMinted { .. } => {
-                Err(MintError::NotInSubmittedState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordCallbackSent { .. } => {
+            MintCommand::SendCallback { .. }
+            | MintCommand::RecordCallbackSent { .. } => {
                 Err(MintError::NotInCallbackPendingState {
                     current_state: "Uninitialized".to_string(),
                 })
@@ -2382,6 +2465,7 @@ impl EventSourced for Mint {
             ),
             MintCommand::RecordTokensMinted {
                 issuer_request_id,
+                tx_id,
                 tx_hash,
                 receipt_id,
                 shares_minted,
@@ -2389,11 +2473,14 @@ impl EventSourced for Mint {
                 block_number,
             } => self.handle_record_tokens_minted(
                 issuer_request_id,
-                tx_hash,
-                receipt_id,
-                shares_minted,
-                gas_used,
-                block_number,
+                ConfirmedMint {
+                    tx_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    gas_used,
+                    block_number,
+                },
             ),
             MintCommand::RecordCallbackSent { issuer_request_id } => {
                 self.handle_record_callback_sent(issuer_request_id)
@@ -2642,9 +2729,9 @@ pub(crate) mod tests {
 
     use super::{
         AutomaticRetryDecision, ClientId, IssuerMintRequestId, Mint,
-        MintCommand, MintError, MintEvent, MintRecoveryMode, MintServices,
-        MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
-        UnderlyingSymbol, find_by_issuer_request_id,
+        MintCommand, MintError, MintEvent, MintExternalTxId, MintRecoveryMode,
+        MintServices, MintView, Network, Quantity, TokenSymbol,
+        TokenizationRequestId, UnderlyingSymbol, find_by_issuer_request_id,
         has_unresolved_mint_intent,
     };
     use crate::alpaca::mock::MockAlpacaService;
@@ -2983,7 +3070,7 @@ pub(crate) mod tests {
         ]
     }
 
-    fn events_through_minting(
+    pub(super) fn events_through_minting(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
         let now = Utc::now();
@@ -2992,7 +3079,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -3010,20 +3097,20 @@ pub(crate) mod tests {
         ]
     }
 
-    fn events_through_tx_submitted(
+    pub(super) fn events_through_tx_submitted(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
         let mut events = events_through_minting(issuer_request_id);
         events.push(MintEvent::MintTxSubmitted {
             issuer_request_id: issuer_request_id.clone(),
             external_tx_id: "ext-1".to_string(),
-            tx_id: "fb-1".to_string(),
+            tx_id: TxId::Legacy("fb-1".to_string()),
             submitted_at: Utc::now(),
         });
         events
     }
 
-    fn events_through_tokens_minted(
+    pub(super) fn events_through_tokens_minted(
         issuer_request_id: &IssuerMintRequestId,
     ) -> Vec<MintEvent> {
         let mut events = events_through_tx_submitted(issuer_request_id);
@@ -3060,8 +3147,10 @@ pub(crate) mod tests {
             .given(events_through_minting(&issuer_request_id))
             .when(MintCommand::RecordTxSubmitted {
                 issuer_request_id: issuer_request_id.clone(),
-                external_tx_id: "ext-1".to_string(),
-                tx_id: "fb-1".to_string(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
             })
             .await
             .events();
@@ -3070,7 +3159,7 @@ pub(crate) mod tests {
         assert!(matches!(
             &events[0],
             MintEvent::MintTxSubmitted { tx_id, .. }
-                if tx_id == "fb-1"
+                if tx_id == &TxId::Legacy("fb-1".to_string())
         ));
     }
 
@@ -3082,8 +3171,10 @@ pub(crate) mod tests {
             .given(events_through_tx_submitted(&issuer_request_id))
             .when(MintCommand::RecordTxSubmitted {
                 issuer_request_id,
-                external_tx_id: "ext-1".to_string(),
-                tx_id: "fb-1".to_string(),
+                external_tx_id: MintExternalTxId::from_string(
+                    "ext-1".to_string(),
+                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
             })
             .await
             .events();
@@ -3097,14 +3188,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn record_tokens_minted_from_tx_submitted_emits_event() {
         let issuer_request_id = IssuerMintRequestId::random();
+        let expected_tx_hash = b256!(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
 
         let events = TestHarness::<Mint>::with(test_mint_services().await)
             .given(events_through_tx_submitted(&issuer_request_id))
             .when(MintCommand::RecordTokensMinted {
                 issuer_request_id,
-                tx_hash: b256!(
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                ),
+                tx_id: TxId::Legacy("fb-1".to_string()),
+                tx_hash: expected_tx_hash,
                 receipt_id: uint!(7_U256),
                 shares_minted: uint!(100_000000000000000000_U256),
                 gas_used: 21_000,
@@ -3114,7 +3207,23 @@ pub(crate) mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], MintEvent::TokensMinted { .. }));
+        let MintEvent::TokensMinted {
+            issuer_request_id: _,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            gas_used,
+            block_number,
+            minted_at: _,
+        } = &events[0]
+        else {
+            panic!("Expected TokensMinted, got {:?}", events[0]);
+        };
+        assert_eq!(*tx_hash, expected_tx_hash);
+        assert_eq!(*receipt_id, uint!(7_U256));
+        assert_eq!(*shares_minted, uint!(100_000000000000000000_U256));
+        assert_eq!(*gas_used, 21_000);
+        assert_eq!(*block_number, 1_234);
     }
 
     #[tokio::test]
@@ -3125,6 +3234,7 @@ pub(crate) mod tests {
             .given(events_through_tokens_minted(&issuer_request_id))
             .when(MintCommand::RecordTokensMinted {
                 issuer_request_id,
+                tx_id: TxId::Legacy("fb-1".to_string()),
                 tx_hash: b256!(
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 ),
@@ -3139,6 +3249,98 @@ pub(crate) mod tests {
         assert!(
             events.is_empty(),
             "re-recording an already-minted mint must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_tokens_minted_rejects_mismatched_tx_id() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let error = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordTokensMinted {
+                issuer_request_id,
+                tx_id: TxId::Legacy("fb-stale".to_string()),
+                tx_hash: b256!(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                receipt_id: uint!(7_U256),
+                shares_minted: uint!(100_000000000000000000_U256),
+                gas_used: 21_000,
+                block_number: 1_234,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(MintError::TxIdMismatch { .. })
+            ),
+            "a confirm report for a different signing-backend tx must be \
+             rejected, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn retry_transition_preserves_attempts_and_predecessor_chain() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let now = Utc::now();
+
+        let mut mint =
+            replay::<Mint>(events_through_minting(&issuer_request_id))
+                .unwrap()
+                .unwrap();
+
+        mint.apply_event(MintEvent::MintTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: MintExternalTxId::base(&issuer_request_id).into_string(),
+            tx_id: TxId::Legacy("fb-1".to_string()),
+            submitted_at: now,
+        });
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "terminal signer failure".to_string(),
+            failed_at: now,
+        });
+
+        mint.apply_event(MintEvent::MintRetryStarted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: None,
+            started_at: now,
+        });
+
+        assert!(
+            matches!(mint.non_failed_predecessor(), Mint::TxSubmitted { .. }),
+            "the retry transition must preserve the failed predecessor chain"
+        );
+        assert_eq!(
+            mint.retry_submission_external_tx_id(),
+            Some(MintExternalTxId::from_string(format!(
+                "mint-{issuer_request_id}-retry-1"
+            ))),
+            "a retry submission must not reuse the failed submission's \
+             external_tx_id (the signing backend would dedupe it away)"
+        );
+
+        // The retry's own submission failing must escalate the schedule,
+        // not restart it at attempt 1.
+        mint.apply_event(MintEvent::MintingFailed {
+            issuer_request_id,
+            error: "retry submission rejected".to_string(),
+            failed_at: now,
+        });
+
+        let Mint::MintingFailed { attempts, failed_from, .. } = &mint else {
+            panic!("Expected MintingFailed after a failed retry, got {mint:?}");
+        };
+        assert_eq!(
+            *attempts, 2,
+            "the attempt counter must survive the retry transition"
+        );
+        assert!(
+            matches!(failed_from.as_ref(), Mint::TxSubmitted { .. }),
+            "the predecessor chain must survive a failed retry"
         );
     }
 
@@ -3192,6 +3394,27 @@ pub(crate) mod tests {
             &events[0],
             MintEvent::MintingFailed { error, .. }
                 if error == "submission rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_mint_failed_from_fireblocks_submitted_emits_failed() {
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        let events = TestHarness::<Mint>::with(test_mint_services().await)
+            .given(events_through_tx_submitted(&issuer_request_id))
+            .when(MintCommand::RecordMintFailed {
+                issuer_request_id,
+                error: "confirmation failed".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MintEvent::MintingFailed { error, .. }
+                if error == "confirmation failed"
         ));
     }
 
@@ -3908,10 +4131,15 @@ pub(crate) mod tests {
             initiated_at: state_initiated_at,
             journal_confirmed_at: state_journal_confirmed_at,
             minting_started_at: state_minting_started_at,
+            retry: state_retry,
         } = mint
         else {
             panic!("Expected Minting state, got {mint:?}");
         };
+        assert!(
+            state_retry.is_none(),
+            "a first MintingStarted must not carry retry history"
+        );
 
         assert_eq!(state_issuer_id, issuer_request_id);
         assert_eq!(state_tok_id, tokenization_request_id);
@@ -3952,6 +4180,7 @@ pub(crate) mod tests {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: None,
         };
 
         let tx_hash = b256!(
@@ -4022,6 +4251,7 @@ pub(crate) mod tests {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
+            retry: None,
         };
 
         let error_message = "Transaction failed: insufficient gas";

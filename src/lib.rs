@@ -308,7 +308,7 @@ pub async fn initialize_rocket(
             &pool,
             &receipt_inventory_store,
             &network_vault_services,
-            alpaca_service,
+            alpaca_service.clone(),
             bot_wallet,
         )
         .await?;
@@ -398,6 +398,7 @@ pub async fn initialize_rocket(
     // submit/confirm/callback job row from a crash and the re-scan would
     // otherwise drive the same mint's side effects concurrently.
     spawn_mint_job_workers(MintJobWorkers {
+        pool: pool.clone(),
         apalis_pool: apalis_pool.clone(),
         mint_store: mint_store.clone(),
         vault: vault_service_for_rocket.clone(),
@@ -1678,6 +1679,7 @@ macro_rules! spawn_drainer_worker {
 
 /// Dependencies for the per-step mint side-effect job workers.
 struct MintJobWorkers {
+    pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
     mint_store: Arc<Store<Mint>>,
     vault: Arc<dyn vault::VaultService>,
@@ -1691,6 +1693,7 @@ struct MintJobWorkers {
 /// enqueue the next step.
 fn spawn_mint_job_workers(workers: MintJobWorkers) {
     let MintJobWorkers {
+        pool,
         apalis_pool,
         mint_store,
         vault,
@@ -1707,6 +1710,8 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
             vault: vault.clone(),
             bot,
             confirm_queue: JobQueue::new(&apalis_pool),
+            pool: pool.clone(),
+            apalis_pool: apalis_pool.clone(),
         }),
         "mint-submit-worker",
     );
@@ -1719,13 +1724,15 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
             vault,
             receipts,
             callback_queue: JobQueue::new(&apalis_pool),
+            pool,
+            apalis_pool: apalis_pool.clone(),
         }),
         "mint-confirm-worker",
     );
 
     spawn_drainer_worker!(
         ::<SendCallbackContext, SendCallbackJob>,
-        apalis_pool.clone(),
+        apalis_pool,
         Arc::new(SendCallbackContext { mint_store, alpaca }),
         "mint-callback-worker",
     );
