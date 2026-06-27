@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, B256, address};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
-use event_sorcery::{Store, StoreBuilder, test_store};
+use event_sorcery::{Store, StoreBuilder};
 use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,16 +10,12 @@ use url::Url;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
-use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, Environment, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
-use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+use crate::mint::{Mint, Network, TokenSymbol, UnderlyingSymbol};
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
-use crate::vault::VaultService;
-use crate::vault::mock::MockVaultService;
 
 pub(crate) fn test_config() -> Config {
     Config {
@@ -54,15 +50,6 @@ pub(crate) struct TestHarness {
 
 impl TestHarness {
     pub(crate) async fn new() -> Self {
-        Self::new_with_mint_vault(Arc::new(MockVaultService::new_success()))
-            .await
-    }
-
-    /// Like [`new`](Self::new), but with a caller-chosen vault so failure-path
-    /// tests can drive a mint into `MintingFailed`.
-    pub(crate) async fn new_with_mint_vault(
-        vault: Arc<dyn VaultService>,
-    ) -> Self {
         // Both pools must address the SAME SQLite file: the apalis-sqlite (0.8)
         // pool needs the `Jobs`/`Workers` tables our migrations create on the
         // event-store (0.9) pool, and the two sqlx majors do not share a private
@@ -109,23 +96,9 @@ impl TestHarness {
                 .await
                 .expect("Failed to build tokenized asset store");
 
-        let receipt_inventory_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-
-        let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let mint_services = MintServices {
-            vault,
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            pool: pool.clone(),
-            bot,
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_inventory_store,
-            )),
-        };
-
         let (mint_store, _mint_projection) =
             StoreBuilder::<Mint>::new(pool.clone())
-                .build(mint_services)
+                .build(())
                 .await
                 .expect("Failed to build mint store");
 

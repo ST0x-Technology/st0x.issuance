@@ -9,6 +9,7 @@ use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
+#[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod service;
 

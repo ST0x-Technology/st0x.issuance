@@ -1036,11 +1036,10 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool, apalis_pool))]
+#[tracing::instrument(skip(_auth, pool, apalis_pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
-    store: &rocket::State<Arc<Store<Mint>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     aggregate_id: &str,
@@ -1080,35 +1079,10 @@ pub(crate) async fn reprocess_mint(
         }
     };
 
-    store
-        .send(
-            &issuer_request_id,
-            MintCommand::Recover {
-                issuer_request_id: issuer_request_id.clone(),
-                mode: crate::mint::MintRecoveryMode::Manual,
-            },
-        )
-        .await
-        .map_err(|err| {
-            error!(target: "admin", aggregate_id = aggregate_id,
-                error = %err,
-                "Failed to reprocess mint"
-            );
-            match err {
-                AggregateError::UserError(_) => Status::UnprocessableEntity,
-                _ => Status::InternalServerError,
-            }
-        })?;
-
-    info!(target: "admin", aggregate_id = aggregate_id,
-        previous_state = %current_state,
-        "Mint reprocessed successfully"
-    );
-
-    // A single manual Recover advances the mint by one step (e.g. submits the
-    // next retry, leaving it in FireblocksSubmitted). Enqueue a durable recovery
-    // job so it is driven to completion instead of stalling until the next
-    // restart or another manual reprocess.
+    // Manual reprocess enqueues a durable recovery job — the same path the
+    // automatic startup re-scan and the periodic reconciler use. It frees any
+    // terminal recovery job for this mint and re-drives it through the per-state
+    // jobs to completion.
     enqueue_scheduled_mint_recovery(
         pool.inner(),
         apalis_pool.inner(),
@@ -1118,10 +1092,15 @@ pub(crate) async fn reprocess_mint(
     .map_err(|error| {
         error!(target: "admin", aggregate_id = aggregate_id,
             error = %error,
-            "Failed to enqueue scheduled mint recovery after reprocess"
+            "Failed to enqueue scheduled mint recovery"
         );
         Status::InternalServerError
     })?;
+
+    info!(target: "admin", aggregate_id = aggregate_id,
+        previous_state = %current_state,
+        "Mint reprocess enqueued successfully"
+    );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,

@@ -33,6 +33,14 @@ use serde::de::DeserializeOwned;
 /// `Jobs` encoding.
 type Storage<Task> = SqliteStorage<Task, JsonCodec<CompactType>, SqliteFetcher>;
 
+/// The `job_type` apalis-sqlite assigns to `Task`: `SqliteStorage::new` derives
+/// it from `std::any::type_name::<Task>()` and binds that on both push and fetch.
+/// Cleanup queries that scope a `DELETE` to one job type must derive it the same
+/// way, so they match exactly the rows apalis actually wrote.
+pub(crate) fn job_type<Task>() -> &'static str {
+    std::any::type_name::<Task>()
+}
+
 /// Handler-facing durable job queue backed by apalis `SqliteStorage`.
 ///
 /// Constructed against the apalis-sqlite (sqlx 0.8) pool, distinct from the
