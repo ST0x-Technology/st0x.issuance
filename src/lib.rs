@@ -34,10 +34,10 @@ use crate::mint::job::{
 use crate::mint::{
     Mint, MintServices, MintView, find_all_recoverable_mints,
     recovery::{
-        DriveOutcome, MintRecoveryHandler, MintRecoveryJob, MintRecoveryJobCtx,
+        MintRecoveryContext, MintRecoveryHandler, MintRecoveryJob,
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
-        prune_unreferenced_recovery_workers, reconcile_recoverable_mints,
-        recover_mint, reset_orphaned_recovery_jobs,
+        prune_unreferenced_recovery_workers, push_mint_recovery_job,
+        reconcile_recoverable_mints, reset_orphaned_recovery_jobs,
         vacuum_terminal_recovery_jobs,
     },
 };
@@ -387,8 +387,9 @@ pub async fn initialize_rocket(
     // draining moments later.
     spawn_mint_recovery_worker(
         apalis_pool.clone(),
+        pool.clone(),
         mint_store.clone(),
-        vault_service_for_rocket.clone(),
+        network_vault_services.clone(),
     );
 
     // Drain the per-step mint side-effect jobs (submit -> confirm -> callback).
@@ -426,11 +427,7 @@ pub async fn initialize_rocket(
             bot_wallet,
             backfill_start_block: runtime.backfill_start_block,
             receipt_poll_interval: config.receipt_poll_interval,
-            handler: MintRecoveryHandler::new(
-                mint_store.clone(),
-                pool.clone(),
-                apalis_pool.clone(),
-            ),
+            handler: MintRecoveryHandler::new(pool.clone(), apalis_pool.clone()),
         });
     }
 
@@ -751,8 +748,6 @@ fn setup_redemption_managers(
 async fn run_mint_recovery(
     pool: &Pool<Sqlite>,
     apalis_pool: &ApalisSqlitePool,
-    mint_store: &Arc<Store<Mint>>,
-    vault_service: &Arc<dyn vault::VaultService>,
 ) {
     info!(target: "mint", "Running mint recovery");
 
@@ -808,35 +803,27 @@ async fn run_mint_recovery(
     debug!(target: "mint", count, "Recovering mints");
 
     for (issuer_request_id, _view) in recoverable_mints {
-        // Drive one synchronous pass so mints that can finish immediately
-        // (e.g. an on-chain receipt already exists) complete before the HTTP
-        // server starts. If the pass does not reach a terminal/exhausted state
-        // — waiting on a retry window, or a transient failure — hand the mint
-        // to a background scheduled-recovery task so it keeps progressing while
-        // the service runs instead of waiting for the next restart.
-        match recover_mint(mint_store, vault_service, issuer_request_id.clone())
-            .await
+        // Hand each recoverable mint to the durable scheduled-recovery worker,
+        // which re-drives it via the per-state jobs. Recovery is no longer
+        // driven inline before the server starts — its safety rests on cqrs-es
+        // optimistic concurrency and the deterministic signer externalTxId,
+        // not on completing before HTTP is up.
+        if let Err(error) = enqueue_scheduled_mint_recovery(
+            pool,
+            apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
         {
-            DriveOutcome::RetryNotDue | DriveOutcome::Failed => {
-                if let Err(error) = enqueue_scheduled_mint_recovery(
-                    pool,
-                    apalis_pool,
-                    issuer_request_id.clone(),
-                )
-                .await
-                {
-                    // Degraded but self-recovering: the periodic reconciler
-                    // re-scans recoverable mints and re-enqueues this one, so a
-                    // failed enqueue here delays recovery rather than losing it.
-                    // WARN, not ERROR — an ERROR would raise a false
-                    // unrecoverable alert for a transient, self-healing miss.
-                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        error = %error,
-                        "Failed to enqueue scheduled mint recovery"
-                    );
-                }
-            }
-            DriveOutcome::Done | DriveOutcome::Exhausted => {}
+            // Degraded but self-recovering: the periodic reconciler re-scans
+            // recoverable mints and re-enqueues this one, so a failed enqueue
+            // here delays recovery rather than losing it. WARN, not ERROR — an
+            // ERROR would raise a false unrecoverable alert for a transient,
+            // self-healing miss.
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Failed to enqueue scheduled mint recovery"
+            );
         }
     }
 
@@ -930,12 +917,7 @@ async fn run_recovery_with_timeout(
 ) {
     let recovery = async {
         tokio::join!(
-            Box::pin(run_mint_recovery(
-                pool,
-                apalis_pool,
-                mint_store,
-                vault_service,
-            )),
+            Box::pin(run_mint_recovery(pool, apalis_pool)),
             Box::pin(run_redemption_recovery(
                 &managers.redeem_call,
                 &managers.journal,
@@ -1555,27 +1537,36 @@ const MINT_RECOVERY_WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 /// restarts the monitor after the same backoff.
 fn spawn_mint_recovery_worker(
     apalis_pool: ApalisSqlitePool,
+    pool: Pool<Sqlite>,
     mint_store: Arc<Store<Mint>>,
-    vault_service: Arc<dyn vault::VaultService>,
+    vault_services: NetworkVaultServices,
 ) {
     tokio::spawn(async move {
         loop {
             let apalis_pool = apalis_pool.clone();
+            let pool = pool.clone();
             let mint_store = mint_store.clone();
-            let vault_service = vault_service.clone();
+            let vault_services = vault_services.clone();
             let monitor = Monitor::new().register(move |_worker_index| {
                 // A fresh worker id per registration is load-bearing for crash
                 // recovery — see [`MintRecoveryWorkerId`].
+                let ctx = Arc::new(MintRecoveryContext {
+                    mint_store: mint_store.clone(),
+                    pool: pool.clone(),
+                    vault_services: vault_services.clone(),
+                    submit_queue: JobQueue::new(&apalis_pool),
+                    confirm_queue: JobQueue::new(&apalis_pool),
+                    callback_queue: JobQueue::new(&apalis_pool),
+                });
                 WorkerBuilder::new(MintRecoveryWorkerId::new().to_string())
                     .backend(
-                        JobQueue::<MintRecoveryJob>::new(&apalis_pool)
-                            .into_storage(),
+                        JobQueue::<MintRecoveryJob>::with_fast_poll(
+                            &apalis_pool,
+                        )
+                        .into_storage(),
                     )
-                    .data(Arc::new(MintRecoveryJobCtx {
-                        mint_store: mint_store.clone(),
-                        vault_service: vault_service.clone(),
-                    }))
-                    .build(work::<MintRecoveryJobCtx, MintRecoveryJob>)
+                    .data(ctx)
+                    .build(work::<MintRecoveryContext, MintRecoveryJob>)
             });
 
             match monitor.run().await {
@@ -1718,8 +1709,10 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
         Arc::new(SubmitMintContext {
             mint_store: mint_store.clone(),
             vaults: vaults.clone(),
+            receipts: receipts.clone(),
             bot,
             confirm_queue: JobQueue::new(&apalis_pool),
+            callback_queue: JobQueue::new(&apalis_pool),
             pool: pool.clone(),
             apalis_pool: apalis_pool.clone(),
         }),

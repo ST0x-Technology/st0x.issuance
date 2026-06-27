@@ -30,7 +30,7 @@ use super::{IssuerMintRequestId, Mint, MintCommand};
 use crate::alpaca::{AlpacaError, AlpacaService, MintCallbackRequest};
 use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::{
-    MintedReceiptParams, ReceiptId, ReceiptService, Shares,
+    MintedReceiptParams, ReceiptId, ReceiptLookupError, ReceiptService, Shares,
 };
 use crate::tokenized_asset::Network;
 use crate::vault::{
@@ -49,6 +49,8 @@ pub(crate) enum MintJobError {
     Enqueue(#[from] QueuePushError),
     #[error(transparent)]
     Alpaca(#[from] AlpacaError),
+    #[error(transparent)]
+    ReceiptLookup(#[from] ReceiptLookupError),
 }
 
 /// Submits the on-chain mint to the signing backend, then hands off to
@@ -67,8 +69,10 @@ pub(crate) struct SubmitMintContext {
     /// shared `VaultService` would submit every mint against the default
     /// (Base) chain.
     pub(crate) vaults: NetworkVaultServices,
+    pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) bot: Address,
     pub(crate) confirm_queue: JobQueue<ConfirmMintJob>,
+    pub(crate) callback_queue: JobQueue<SendCallbackJob>,
     /// Event-store pool; the post-failure recovery enqueue releases terminal
     /// job rows on it (see [`enqueue_scheduled_mint_recovery`]).
     pub(crate) pool: Pool<Sqlite>,
@@ -108,6 +112,38 @@ impl Job<SubmitMintContext> for SubmitMintJob {
                 journal_confirmed_at,
                 ..
             } => {
+                // Defence against double-mint: if the on-chain mint already
+                // succeeded (a receipt exists for this mint), record it instead
+                // of re-submitting. Re-submission would mint again where the
+                // signer does not dedup on the external_tx_id.
+                if let Some(receipt) = ctx
+                    .receipts
+                    .find_by_issuer_request_id(
+                        self.chain_id,
+                        &self.vault,
+                        &self.issuer_request_id,
+                    )
+                    .await?
+                {
+                    ctx.mint_store
+                        .send(
+                            &self.issuer_request_id,
+                            MintCommand::RecordExistingMint {
+                                issuer_request_id: self
+                                    .issuer_request_id
+                                    .clone(),
+                                tx_hash: receipt.tx_hash,
+                                receipt_id: receipt.receipt_id,
+                                shares_minted: receipt.shares,
+                                block_number: receipt.block_number,
+                            },
+                        )
+                        .await?;
+
+                    self.enqueue_callback(ctx).await?;
+                    return Ok(());
+                }
+
                 let Some(vault) =
                     self.resolve_vault_service(ctx, *network).await?
                 else {
@@ -339,6 +375,25 @@ impl SubmitMintJob {
                     vault: self.vault,
                     chain_id: self.chain_id,
                     tx_id,
+                },
+                self.issuer_request_id.to_string(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Enqueued after recording an already-succeeded mint
+    /// (`RecordExistingMint` advances it straight to `CallbackPending`).
+    async fn enqueue_callback(
+        &self,
+        ctx: &SubmitMintContext,
+    ) -> Result<(), MintJobError> {
+        ctx.callback_queue
+            .clone()
+            .push_with_idempotency_key(
+                SendCallbackJob {
+                    issuer_request_id: self.issuer_request_id.clone(),
                 },
                 self.issuer_request_id.to_string(),
             )
@@ -708,8 +763,10 @@ mod tests {
                 ANVIL_CHAIN_ID,
                 vault,
             ),
+            receipts: cqrs_receipts(&harness.pool),
             bot: BOT,
             confirm_queue: JobQueue::new(&harness.apalis_pool),
+            callback_queue: JobQueue::new(&harness.apalis_pool),
             pool: harness.pool.clone(),
             apalis_pool: harness.apalis_pool.clone(),
         }
@@ -888,8 +945,10 @@ mod tests {
                     },
                 ),
             ])),
+            receipts: cqrs_receipts(&harness.pool),
             bot: BOT,
             confirm_queue: JobQueue::new(&harness.apalis_pool),
+            callback_queue: JobQueue::new(&harness.apalis_pool),
             pool: harness.pool.clone(),
             apalis_pool: harness.apalis_pool.clone(),
         };

@@ -1,10 +1,9 @@
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use apalis::prelude::AbortError;
 use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
 use chrono::Utc;
-use cqrs_es::AggregateError;
-use event_sorcery::{LifecycleError, Store};
+use event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::fmt;
@@ -13,30 +12,51 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::job::{ConfirmMintJob, SendCallbackJob, SubmitMintJob};
 use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, MintError,
-    MintRecoveryMode, find_all_recoverable_mints,
+    MintRecoveryMode, Network, UnderlyingSymbol, find_all_recoverable_mints,
 };
-use crate::jobs::{Job, JobQueue};
+use crate::jobs::{Job, JobQueue, QueuePushError};
 use crate::receipt_inventory::ItnReceiptHandler;
-use crate::vault::VaultService;
+use crate::tokenized_asset::view::{
+    TokenizedAssetViewError, find_vault,
+};
+use crate::vault::{
+    NetworkVaultServices, TxId, UnconfiguredNetworkError, VaultService,
+};
+
+/// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
+/// failed mint by enqueuing the appropriate per-state job.
+pub(crate) struct MintRecoveryContext {
+    pub(crate) mint_store: Arc<Store<Mint>>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) vault_services: NetworkVaultServices,
+    pub(crate) submit_queue: JobQueue<SubmitMintJob>,
+    pub(crate) confirm_queue: JobQueue<ConfirmMintJob>,
+    pub(crate) callback_queue: JobQueue<SendCallbackJob>,
+}
 
 /// Production handler that triggers mint recovery when an ITN receipt is
 /// discovered by the receipt monitor.
+///
+/// Enqueues the scheduled recovery job for faster pickup than the periodic
+/// reconciler. Recovery re-drives the mint via the per-state jobs; a
+/// re-submission is double-mint-safe through the deterministic `external_tx_id`
+/// (the signing backend dedups), so the discovered `tx_hash` is not needed
+/// here.
 #[derive(Clone)]
 pub(crate) struct MintRecoveryHandler {
-    mint_store: Arc<Store<Mint>>,
     pool: Pool<Sqlite>,
     apalis_pool: SqlitePool,
 }
 
 impl MintRecoveryHandler {
     pub(crate) const fn new(
-        mint_store: Arc<Store<Mint>>,
         pool: Pool<Sqlite>,
         apalis_pool: SqlitePool,
     ) -> Self {
-        Self { mint_store, pool, apalis_pool }
+        Self { pool, apalis_pool }
     }
 }
 
@@ -45,66 +65,30 @@ impl ItnReceiptHandler for MintRecoveryHandler {
     async fn on_itn_receipt_discovered(
         &self,
         issuer_request_id: IssuerMintRequestId,
-        tx_hash: TxHash,
+        _tx_hash: TxHash,
     ) {
-        let mint_store = self.mint_store.clone();
-        let pool = self.pool.clone();
-        let apalis_pool = self.apalis_pool.clone();
-        tokio::spawn(async move {
-            let result = mint_store
-                .send(
-                    &issuer_request_id,
-                    MintCommand::RecoverFromReceipt {
-                        issuer_request_id: issuer_request_id.clone(),
-                        tx_hash,
-                    },
-                )
-                .await;
-            match result {
-                Ok(()) => {
-                    if let Err(error) = enqueue_scheduled_mint_recovery(
-                        &pool,
-                        &apalis_pool,
-                        issuer_request_id.clone(),
-                    )
-                    .await
-                    {
-                        warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                            %error,
-                            "Failed to enqueue receipt-triggered mint recovery"
-                        );
-                    }
-                }
-                Err(AggregateError::UserError(LifecycleError::Apply(
-                    MintError::NotRecoverable { current_state },
-                ))) => {
-                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                        current_state,
-                        "Receipt discovery ignored for current mint state"
-                    );
-                }
-                Err(error) => {
-                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        %error,
-                        "Receipt-triggered mint recovery failed"
-                    );
-                }
-            }
-        });
+        if let Err(error) = enqueue_scheduled_mint_recovery(
+            &self.pool,
+            &self.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        {
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Failed to enqueue recovery for a discovered receipt"
+            );
+        }
     }
 }
 
-/// Why a [`drive_recovery`] pass stopped. Lets the scheduled recovery loop
-/// decide whether to wait, back off, or give up.
+/// Why a [`drive_recovery`] pass stopped. Lets manual recovery report whether
+/// it completed, paused, exhausted its retry budget, or failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriveOutcome {
-    /// Reached a terminal or non-recoverable state — no further work.
     Done,
-    /// Paused until the next automatic retry window elapses.
     RetryNotDue,
-    /// Automatic retry budget is exhausted.
     Exhausted,
-    /// A command failed unexpectedly, or recovery did not converge.
     Failed,
 }
 
@@ -119,35 +103,6 @@ enum ClassifiedRecoveryOutcome {
     Done { current_state: &'static str },
     RetryNotDue { wait: Duration },
     Exhausted,
-}
-
-/// Drives a mint through recovery to completion using `MintCommand::Recover`.
-pub(crate) async fn recover_mint(
-    mint_store: &Store<Mint>,
-    vault_service: &Arc<dyn VaultService>,
-    issuer_request_id: IssuerMintRequestId,
-) -> DriveOutcome {
-    drive_recovery(
-        mint_store,
-        vault_service,
-        issuer_request_id,
-        RetryPolicy::Enforce,
-        recovery_step_requires_wallet,
-        |_, id, wallet_locked| {
-            if wallet_locked {
-                MintCommand::RecoverWalletStep {
-                    issuer_request_id: id,
-                    mode: MintRecoveryMode::Automatic,
-                }
-            } else {
-                MintCommand::Recover {
-                    issuer_request_id: id,
-                    mode: MintRecoveryMode::Automatic,
-                }
-            }
-        },
-    )
-    .await
 }
 
 /// Drives an operator-requested recovery, holding the shared wallet lock only
@@ -184,18 +139,17 @@ pub(crate) async fn recover_mint_manually(
 /// a transient error (e.g. RPC blip) occurred. Keeps the loop from spinning while waiting.
 const SCHEDULED_RECOVERY_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Budget for retry-window wakeups (`Wait` / `RetryNotDue`). The automatic
-/// schedule already terminates healthy retries via `Exhausted` after the
-/// attempt cap; this bounds the degenerate case where a mint keeps re-failing
-/// at the same attempt (e.g. submission errors before tx acceptance),
-/// so the task gives up and the next restart re-picks it instead of looping.
-const MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS: usize =
-    (Mint::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT as usize) * 2 + 4;
-
 /// Budget for consecutive transient-failure backoffs (e.g. RPC blips) before
 /// giving up. Small: a persistent error should surface for investigation, not
 /// be hammered indefinitely. The next restart re-picks the mint.
 const MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS: usize = 8;
+
+/// Budget for recovery polls that observe no state change. A slow-but-healthy
+/// step (e.g. a submitted tx awaiting confirmation) is not something we
+/// control, so this is sized generously — ~6h at
+/// [`SCHEDULED_RECOVERY_BACKOFF`] — separate from the transient-failure
+/// budget, so slow finalization is not abandoned prematurely.
+const MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS: usize = 360;
 
 /// Durable apalis job that resumes one mint's automatic recovery.
 ///
@@ -217,29 +171,19 @@ pub(crate) struct MintRecoveryJob {
     issuer_request_id: IssuerMintRequestId,
 }
 
-/// Runtime dependencies injected into the [`MintRecoveryJob`] worker.
-///
-/// Bundled so the generic [`crate::jobs::work`] adapter can take a single
-/// `Data<Arc<Ctx>>` while recovery still needs both the mint store and the
-/// vault service for on-chain retry.
-pub(crate) struct MintRecoveryJobCtx {
-    pub(crate) mint_store: Arc<Store<Mint>>,
-    pub(crate) vault_service: Arc<dyn VaultService>,
-}
-
-impl Job<MintRecoveryJobCtx> for MintRecoveryJob {
+impl Job<MintRecoveryContext> for MintRecoveryJob {
     type Output = ();
     type Error = AbortError;
 
     async fn perform(
         &self,
-        ctx: &MintRecoveryJobCtx,
+        ctx: &MintRecoveryContext,
     ) -> Result<(), AbortError> {
         match recover_mint_until_automatic_budget_exhausted(
-            &ctx.mint_store,
-            &ctx.vault_service,
+            ctx,
             &self.issuer_request_id,
             SCHEDULED_RECOVERY_BACKOFF,
+            MAX_SCHEDULED_RECOVERY_NO_PROGRESS_POLLS,
         )
         .await
         {
@@ -588,10 +532,9 @@ enum AbandonReason {
     FailedToLoadMint,
     /// The aggregate's automatic-retry attempts ran out.
     AutomaticRetriesExhausted,
-    /// The transient-failure backoff budget was spent.
-    TransientFailureBudgetExhausted,
-    /// The retry-wakeup budget was spent.
-    RetryWakeupBudgetExhausted,
+    /// The mint stayed in the same recoverable state across the maximum number
+    /// of polls — the enqueued job is not making progress.
+    NoProgressBudgetExhausted,
 }
 
 impl fmt::Display for AbandonReason {
@@ -599,10 +542,7 @@ impl fmt::Display for AbandonReason {
         let text = match self {
             Self::FailedToLoadMint => "failed to load mint",
             Self::AutomaticRetriesExhausted => "automatic retries exhausted",
-            Self::TransientFailureBudgetExhausted => {
-                "transient failure budget exhausted"
-            }
-            Self::RetryWakeupBudgetExhausted => "retry wakeup budget exhausted",
+            Self::NoProgressBudgetExhausted => "no-progress budget exhausted",
         };
 
         formatter.write_str(text)
@@ -622,20 +562,18 @@ enum RecoveryConclusion {
 }
 
 async fn recover_mint_until_automatic_budget_exhausted(
-    mint_store: &Store<Mint>,
-    vault_service: &Arc<dyn VaultService>,
+    ctx: &MintRecoveryContext,
     issuer_request_id: &IssuerMintRequestId,
     backoff: Duration,
+    max_no_progress_polls: usize,
 ) -> RecoveryConclusion {
-    let mut retry_wakeups = 0;
     let mut failure_backoffs = 0;
+    let mut no_progress_polls = 0;
+    let mut last_state: Option<&'static str> = None;
 
     loop {
-        let mint = match mint_store.load(issuer_request_id).await {
+        let mint = match ctx.mint_store.load(issuer_request_id).await {
             Ok(Some(mint)) => mint,
-            // A missing mint cannot be recovered — the same outcome the old
-            // default (`Uninitialized`) aggregate produced via
-            // `AutomaticRetryDecision::NotRecoverable`.
             Ok(None) => {
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     "Mint not found for scheduled recovery"
@@ -643,14 +581,12 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 return RecoveryConclusion::Resolved;
             }
             // A load failure is transient (e.g. a SQLite blip): back off and
-            // retry within the same budget as `DriveOutcome::Failed` rather than
-            // abandoning the mint immediately and killing the durable job over a
-            // single read error.
-            Err(err) => {
+            // retry rather than killing the durable job over a single read error.
+            Err(error) => {
                 failure_backoffs += 1;
                 if failure_backoffs > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS {
                     warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        error = %err,
+                        error = %error,
                         max_failure_backoffs = MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS,
                         "Failed to load mint for scheduled recovery after maximum backoffs"
                     );
@@ -660,7 +596,7 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 }
 
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    error = %err,
+                    error = %error,
                     backoff_ms = backoff.as_millis(),
                     "Failed to load mint for scheduled recovery; backing off"
                 );
@@ -669,94 +605,88 @@ async fn recover_mint_until_automatic_budget_exhausted(
             }
         };
 
+        // Reset the no-progress budget whenever the mint advances to a new
+        // state, so a healthy multi-step recovery is not abandoned for taking
+        // several backoffs overall.
+        let state = mint.state_name();
+        if Some(state) != last_state {
+            no_progress_polls = 0;
+            last_state = Some(state);
+        }
+
         match mint.automatic_retry_decision(Utc::now()) {
-            AutomaticRetryDecision::Ready => {
-                match recover_mint(
-                    mint_store,
-                    vault_service,
-                    issuer_request_id.clone(),
-                )
-                .await
-                {
-                    DriveOutcome::Done => {
-                        return RecoveryConclusion::Resolved;
-                    }
-                    DriveOutcome::Exhausted => {
-                        return RecoveryConclusion::Abandoned {
-                            reason: AbandonReason::AutomaticRetriesExhausted,
-                        };
-                    }
-                    // A transient error: back off and retry a bounded number of
-                    // times so a persistent error surfaces rather than looping.
-                    DriveOutcome::Failed => {
-                        failure_backoffs += 1;
-                        if failure_backoffs
-                            > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS
-                        {
-                            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                                max_failure_backoffs = MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS,
-                                "Scheduled mint recovery stopped after maximum failure backoffs"
-                            );
-                            return RecoveryConclusion::Abandoned {
-                                reason: AbandonReason::TransientFailureBudgetExhausted,
-                            };
-                        }
-
-                        debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                            backoff_ms = backoff.as_millis(),
-                            "Scheduled recovery backing off after a transient failure"
-                        );
-                        tokio::time::sleep(backoff).await;
-                    }
-                    // The retry window passed between the decision and the
-                    // submit-time re-check; sleep so a clock race does not spin
-                    // the wakeup budget, then re-evaluate (next decision Waits).
-                    DriveOutcome::RetryNotDue => {
-                        retry_wakeups += 1;
-                        if retry_wakeups > MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS
-                        {
-                            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                                max_retry_wakeups = MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS,
-                                "Scheduled mint recovery stopped after maximum retry wakeups"
-                            );
-                            return RecoveryConclusion::Abandoned {
-                                reason:
-                                    AbandonReason::RetryWakeupBudgetExhausted,
-                            };
-                        }
-
-                        tokio::time::sleep(backoff).await;
-                    }
-                }
+            AutomaticRetryDecision::NotRecoverable => {
+                info!(target: "mint", issuer_request_id = %issuer_request_id,
+                    current_state = state,
+                    "Mint recovery complete"
+                );
+                return RecoveryConclusion::Resolved;
+            }
+            AutomaticRetryDecision::Exhausted => {
+                warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                    "Automatic mint retries exhausted"
+                );
+                return RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::AutomaticRetriesExhausted,
+                };
             }
             AutomaticRetryDecision::Wait(wait) => {
-                retry_wakeups += 1;
-                if retry_wakeups > MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS {
-                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        max_retry_wakeups = MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS,
-                        "Scheduled mint recovery stopped after maximum retry wakeups"
-                    );
-                    return RecoveryConclusion::Abandoned {
-                        reason: AbandonReason::RetryWakeupBudgetExhausted,
-                    };
-                }
-
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     wait_ms = wait.as_millis(),
                     "Waiting for next automatic mint retry window"
                 );
                 tokio::time::sleep(wait).await;
             }
-            AutomaticRetryDecision::Exhausted => {
-                return RecoveryConclusion::Abandoned {
-                    reason: AbandonReason::AutomaticRetriesExhausted,
-                };
-            }
-            AutomaticRetryDecision::NotRecoverable => {
-                return RecoveryConclusion::Resolved;
+            // The state is recoverable and due: enqueue the per-state job that
+            // advances it, then poll for progress on the next iteration.
+            AutomaticRetryDecision::Ready => {
+                no_progress_polls += 1;
+                if no_progress_polls > max_no_progress_polls {
+                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                        max_no_progress_polls,
+                        "Scheduled mint recovery stopped after maximum polls without progress"
+                    );
+                    return RecoveryConclusion::Abandoned {
+                        reason: AbandonReason::NoProgressBudgetExhausted,
+                    };
+                }
+
+                if let Err(error) =
+                    drive_one_step(ctx, &mint, &issuer_request_id).await
+                {
+                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Scheduled recovery step failed; backing off"
+                    );
+                }
+
+                tokio::time::sleep(backoff).await;
             }
         }
     }
+}
+
+/// Why a [`drive_one_step`] call failed. Recovery treats these as transient and
+/// re-polls; the durable jobs and outcome commands are idempotent, so a retried
+/// step cannot double-apply.
+#[derive(Debug, thiserror::Error)]
+enum MintRecoveryStepError {
+    #[error(transparent)]
+    Store(#[from] SendError<Mint>),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    AssetView(#[from] TokenizedAssetViewError),
+    #[error(transparent)]
+    UnconfiguredNetwork(#[from] UnconfiguredNetworkError),
+    #[error("no vault configured for {underlying} on {network}")]
+    VaultNotFound { underlying: UnderlyingSymbol, network: Network },
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedVault {
+    address: Address,
+    chain_id: u64,
 }
 
 const MAX_RECOVERY_ATTEMPTS: usize = 10;
@@ -905,6 +835,130 @@ async fn drive_recovery(
     );
 
     DriveOutcome::Failed
+}
+
+/// Advances a recoverable mint one step by enqueuing the appropriate per-state
+/// job (or issuing the pure transition that precedes it). The durable jobs
+/// perform the actual I/O; recovery only schedules them. The deterministic
+/// `external_tx_id` keeps a re-submission double-mint-safe.
+async fn drive_one_step(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), MintRecoveryStepError> {
+    match mint {
+        // The deposit was never recorded: do the pure transition; the next poll
+        // enqueues the submission.
+        Mint::JournalConfirmed { .. } => {
+            ctx.mint_store
+                .send(
+                    issuer_request_id,
+                    MintCommand::Deposit {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await?;
+        }
+        Mint::Minting { underlying, network, .. }
+        | Mint::TxIntended { underlying, network, .. } => {
+            let vault = resolve_vault(ctx, underlying, *network).await?;
+            enqueue_submit(ctx, issuer_request_id, vault).await?;
+        }
+        // Retry a failed mint: transition back to Minting (advancing the attempt
+        // counter), then enqueue a fresh submission.
+        Mint::MintingFailed { underlying, network, .. } => {
+            ctx.mint_store
+                .send(
+                    issuer_request_id,
+                    MintCommand::RetryMint {
+                        issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await?;
+            let vault = resolve_vault(ctx, underlying, *network).await?;
+            enqueue_submit(ctx, issuer_request_id, vault).await?;
+        }
+        Mint::TxSubmitted { underlying, network, tx_id, .. } => {
+            let vault = resolve_vault(ctx, underlying, *network).await?;
+            enqueue_confirm(ctx, issuer_request_id, vault, tx_id.clone())
+                .await?;
+        }
+        Mint::CallbackPending { .. } => {
+            enqueue_callback(ctx, issuer_request_id).await?;
+        }
+        // Initiated / JournalRejected / Completed / Closed are not driven here
+        // (NotRecoverable, or recovery doesn't start before journal confirm).
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn resolve_vault(
+    ctx: &MintRecoveryContext,
+    underlying: &UnderlyingSymbol,
+    network: Network,
+) -> Result<ResolvedVault, MintRecoveryStepError> {
+    let address = find_vault(&ctx.pool, underlying, &network)
+        .await?
+        .ok_or_else(|| MintRecoveryStepError::VaultNotFound {
+            underlying: underlying.clone(),
+            network,
+        })?;
+    let chain_id = ctx.vault_services.chain_id(network)?;
+
+    Ok(ResolvedVault { address, chain_id })
+}
+
+async fn enqueue_submit(
+    ctx: &MintRecoveryContext,
+    issuer_request_id: &IssuerMintRequestId,
+    vault: ResolvedVault,
+) -> Result<(), QueuePushError> {
+    ctx.submit_queue
+        .clone()
+        .push_with_idempotency_key(
+            SubmitMintJob {
+                issuer_request_id: issuer_request_id.clone(),
+                vault: vault.address,
+                chain_id: vault.chain_id,
+            },
+            issuer_request_id.to_string(),
+        )
+        .await
+}
+
+async fn enqueue_confirm(
+    ctx: &MintRecoveryContext,
+    issuer_request_id: &IssuerMintRequestId,
+    vault: ResolvedVault,
+    tx_id: TxId,
+) -> Result<(), QueuePushError> {
+    ctx.confirm_queue
+        .clone()
+        .push_with_idempotency_key(
+            ConfirmMintJob {
+                issuer_request_id: issuer_request_id.clone(),
+                vault: vault.address,
+                chain_id: vault.chain_id,
+                tx_id,
+            },
+            issuer_request_id.to_string(),
+        )
+        .await
+}
+
+async fn enqueue_callback(
+    ctx: &MintRecoveryContext,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), QueuePushError> {
+    ctx.callback_queue
+        .clone()
+        .push_with_idempotency_key(
+            SendCallbackJob { issuer_request_id: issuer_request_id.clone() },
+            issuer_request_id.to_string(),
+        )
+        .await
 }
 
 fn classify_recovery(
