@@ -38,6 +38,7 @@ use crate::mint::{
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
         prune_unreferenced_recovery_workers, push_mint_recovery_job,
         reconcile_recoverable_mints, reset_orphaned_recovery_jobs,
+        vacuum_terminal_mint_side_effect_jobs,
         vacuum_terminal_recovery_jobs,
     },
 };
@@ -390,6 +391,7 @@ pub async fn initialize_rocket(
         pool.clone(),
         mint_store.clone(),
         network_vault_services.clone(),
+        Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone())),
     );
 
     // Drain the per-step mint side-effect jobs (submit -> confirm -> callback).
@@ -775,6 +777,15 @@ async fn run_mint_recovery(
     if let Err(error) = prune_unreferenced_recovery_workers(pool).await {
         warn!(target: "mint", error = %error,
             "Failed to prune unreferenced mint-recovery workers"
+        );
+    }
+
+    // Free the per-state side-effect jobs' idempotency keys from any terminal
+    // rows left by a prior run, so a restart-driven recovery of a rolled-back
+    // mint can re-enqueue them instead of colliding with the prior `Done` row.
+    if let Err(error) = vacuum_terminal_mint_side_effect_jobs(pool).await {
+        warn!(target: "mint", error = %error,
+            "Failed to vacuum terminal mint side-effect jobs"
         );
     }
 
@@ -1540,6 +1551,7 @@ fn spawn_mint_recovery_worker(
     pool: Pool<Sqlite>,
     mint_store: Arc<Store<Mint>>,
     vault_services: NetworkVaultServices,
+    receipts: Arc<dyn ReceiptService>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1547,6 +1559,7 @@ fn spawn_mint_recovery_worker(
             let pool = pool.clone();
             let mint_store = mint_store.clone();
             let vault_services = vault_services.clone();
+            let receipts = receipts.clone();
             let monitor = Monitor::new().register(move |_worker_index| {
                 // A fresh worker id per registration is load-bearing for crash
                 // recovery — see [`MintRecoveryWorkerId`].
@@ -1554,6 +1567,7 @@ fn spawn_mint_recovery_worker(
                     mint_store: mint_store.clone(),
                     pool: pool.clone(),
                     vault_services: vault_services.clone(),
+                    receipts: receipts.clone(),
                     submit_queue: JobQueue::new(&apalis_pool),
                     confirm_queue: JobQueue::new(&apalis_pool),
                     callback_queue: JobQueue::new(&apalis_pool),
