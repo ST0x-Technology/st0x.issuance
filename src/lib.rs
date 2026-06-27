@@ -29,7 +29,7 @@ use crate::mint::job::{
     SubmitMintContext, SubmitMintJob,
 };
 use crate::mint::{
-    Mint, MintServices, find_all_recoverable_mints,
+    Mint, find_all_recoverable_mints,
     recovery::{
         MintRecoveryContext, MintRecoveryHandler, MintRecoveryJob,
         MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
@@ -270,14 +270,8 @@ pub async fn initialize_rocket(
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
 
     let AggregateCqrsSetup { mint_store, redemption_store } =
-        setup_aggregate_cqrs(
-            &pool,
-            &receipt_inventory_store,
-            blockchain_setup.vault_service.clone(),
-            alpaca_service.clone(),
-            bot_wallet,
-        )
-        .await?;
+        setup_aggregate_cqrs(&pool, blockchain_setup.vault_service.clone())
+            .await?;
 
     let managers = setup_redemption_managers(
         &config,
@@ -371,14 +365,7 @@ pub async fn initialize_rocket(
     // waiting for the next process restart.
     spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
 
-    run_recovery_with_timeout(
-        &pool,
-        &apalis_pool,
-        &mint_store,
-        &managers,
-        &vaults,
-    )
-    .await;
+    run_recovery_with_timeout(&pool, &apalis_pool, &managers, &vaults).await;
 
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
@@ -519,29 +506,17 @@ fn mount_api_docs(
 
 async fn setup_aggregate_cqrs(
     pool: &Pool<Sqlite>,
-    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     vault_service: Arc<dyn vault::VaultService>,
-    alpaca_service: Arc<dyn AlpacaService>,
-    bot_wallet: Address,
 ) -> Result<AggregateCqrsSetup, anyhow::Error> {
-    // Create MintServices with all dependencies
-    let receipt_service =
-        Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
-    let mint_services = MintServices {
-        vault: vault_service.clone(),
-        alpaca: alpaca_service,
-        pool: pool.clone(),
-        bot: bot_wallet,
-        receipts: receipt_service,
-    };
-
-    // Mint's canonical `mint_view` projection is auto-wired by StoreBuilder; the
-    // secondary `receipt_inventory_view` (formerly a View<Mint> GenericQuery) is
-    // maintained by the registered reactor.
+    // The Mint aggregate's command handlers are pure (its side effects run in
+    // durable jobs), so it needs no services. Its canonical `mint_view`
+    // projection is auto-wired by StoreBuilder; the secondary
+    // `receipt_inventory_view` (formerly a View<Mint> GenericQuery) is maintained
+    // by the registered reactor.
     prepare_event_sourced_startup::<Mint>(pool).await?;
     let (mint_store, mint_projection) = StoreBuilder::<Mint>::new(pool.clone())
         .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
-        .build(mint_services)
+        .build(())
         .await?;
 
     // Rebuild `mint_view` from scratch so it reflects the current event log even
@@ -865,7 +840,6 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 async fn run_recovery_with_timeout(
     pool: &Pool<Sqlite>,
     apalis_pool: &ApalisSqlitePool,
-    mint_store: &Arc<Store<Mint>>,
     managers: &RedemptionManagers,
     vaults: &[Address],
 ) {

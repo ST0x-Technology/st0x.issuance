@@ -18,7 +18,6 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::account::Account;
-use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
 use crate::bindings::{
@@ -27,15 +26,12 @@ use crate::bindings::{
 };
 use crate::config::{Config, Environment, LogLevel};
 use crate::fireblocks::SignerConfig;
-use crate::mint::{Mint, MintServices};
-use crate::receipt_inventory::{
-    CqrsReceiptService, ReceiptInventory, view::ReceiptInventoryViewReactor,
-};
+use crate::mint::Mint;
+use crate::receipt_inventory::view::ReceiptInventoryViewReactor;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
-use crate::vault::mock::MockVaultService;
 
 /// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
@@ -103,26 +99,12 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
-    // Setup ReceiptInventory (needed by MintServices for receipt lookups and registration)
-    let receipt_inventory_store =
-        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
-
-    // Create mock services for Mint aggregate
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let mint_services = MintServices {
-        vault: Arc::new(MockVaultService::new_success()),
-        alpaca: Arc::new(MockAlpacaService::new_success()),
-        pool: pool.clone(),
-        bot,
-        receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
-    };
-
     // Setup Mint store (event-sorcery), mirroring the production wiring: the
     // reactor keeps receipt_inventory_view in sync with Mint events.
     let (mint_store, _mint_projection) =
         StoreBuilder::<Mint>::new(pool.clone())
             .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
-            .build(mint_services)
+            .build(())
             .await?;
 
     // Seed initial assets

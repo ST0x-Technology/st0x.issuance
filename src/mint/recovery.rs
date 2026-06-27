@@ -773,68 +773,43 @@ async fn enqueue_callback(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address, b256, uint};
+    use alloy::primitives::address;
     use chrono::Utc;
-    use event_sorcery::{StoreBuilder, test_store};
+    use event_sorcery::test_store;
     use rust_decimal::Decimal;
-    use sqlx::sqlite::SqlitePoolOptions;
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::api::test_utils::TestHarness;
-    use crate::mint::tests::{BOT, VAULT};
+    use crate::mint::tests::VAULT;
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, MintServices, Network,
-        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptSource, Shares,
-    };
+    use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::log_count_at;
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
-    use crate::vault::mock::MockVaultService;
-    use crate::vault::{
-        BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
-        MultiBurnResult, ReceiptInformation, SubmittedTx, VaultError,
-        VaultService,
-    };
+    use crate::tokenized_asset::TokenizedAssetCommand;
 
-    /// Builds a real event-sorcery [`Store<Mint>`] backed by an in-memory
-    /// SQLite pool, wired with the same services the production recovery flow
-    /// uses (vault, Alpaca, receipt inventory). The [`TokenizedAsset`]
-    /// projection is populated with the AAPL -> [`VAULT`] mapping so the
-    /// recovery vault lookup (`find_vault_by_underlying`) resolves.
+    /// Builds a real event-sorcery [`Store<Mint>`] over a file-backed SQLite
+    /// pool shared with an apalis-sqlite pool (so the durable per-state queues
+    /// see the `Jobs` table), seeding the AAPL -> [`VAULT`] mapping so the
+    /// recovery vault lookup (`find_vault_by_underlying`) resolves. The `Mint`
+    /// aggregate is pure (`Services = ()`); the recovery worker's I/O
+    /// dependencies are assembled on demand via [`Self::context`].
     struct MintRecoveryFixture {
         mint_store: Arc<Store<Mint>>,
         receipt_store: Arc<Store<ReceiptInventory>>,
-        pool: sqlx::SqlitePool,
+        pool: Pool<Sqlite>,
+        apalis_pool: SqlitePool,
     }
 
     impl MintRecoveryFixture {
         async fn new() -> Self {
-            Self::new_with_vault(Arc::new(MockVaultService::new_success()))
-                .await
-        }
+            let harness = TestHarness::new().await;
 
-        async fn new_with_vault(vault: Arc<dyn VaultService>) -> Self {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(":memory:")
-                .await
-                .unwrap();
-
-            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-            let (asset_store, _asset_projection) =
-                StoreBuilder::<TokenizedAsset>::new(pool.clone())
-                    .build(())
-                    .await
-                    .unwrap();
-
-            asset_store
+            harness
+                .asset_store
                 .send(
                     &UnderlyingSymbol::new("AAPL"),
                     TokenizedAssetCommand::Add {
@@ -847,23 +822,31 @@ mod tests {
                 .await
                 .unwrap();
 
-            let receipt_store =
-                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+            let receipt_store = Arc::new(test_store::<ReceiptInventory>(
+                harness.pool.clone(),
+                (),
+            ));
 
-            let services = MintServices {
-                vault,
-                alpaca: Arc::new(MockAlpacaService::new_success()),
+            let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
+
+            Self { mint_store, receipt_store, pool, apalis_pool }
+        }
+
+        /// Assembles the recovery worker's I/O dependencies against the shared
+        /// pools: the event-store pool, a [`CqrsReceiptService`] over the
+        /// fixture's receipt inventory, and the three per-state job queues on
+        /// the apalis pool.
+        fn context(&self) -> MintRecoveryContext {
+            MintRecoveryContext {
+                mint_store: self.mint_store.clone(),
+                pool: self.pool.clone(),
                 receipts: Arc::new(CqrsReceiptService::new(
-                    receipt_store.clone(),
+                    self.receipt_store.clone(),
                 )),
-                pool: pool.clone(),
-                bot: BOT,
-            };
-
-            let mint_store =
-                Arc::new(test_store::<Mint>(pool.clone(), services));
-
-            Self { mint_store, receipt_store, pool }
+                submit_queue: JobQueue::new(&self.apalis_pool),
+                confirm_queue: JobQueue::new(&self.apalis_pool),
+                callback_queue: JobQueue::new(&self.apalis_pool),
+            }
         }
 
         /// Seeds the event store with raw `Mint` events, putting the aggregate
@@ -910,71 +893,6 @@ mod tests {
                 .await
                 .unwrap();
             }
-        }
-    }
-
-    /// Vault whose Fireblocks transaction never finalizes — every status check
-    /// returns `Pending`. Used to exercise the scheduled-recovery backoff.
-    struct PendingMintVault;
-
-    #[async_trait]
-    impl VaultService for PendingMintVault {
-        async fn submit_mint(
-            &self,
-            _vault: Address,
-            _assets: U256,
-            _bot: Address,
-            _user: Address,
-            _receipt_info: ReceiptInformation,
-            _external_tx_id: Option<String>,
-        ) -> Result<SubmittedTx, VaultError> {
-            Err(VaultError::InvalidReceipt)
-        }
-
-        async fn confirm_mint(
-            &self,
-            _fireblocks_tx_id: &str,
-        ) -> Result<MintResult, VaultError> {
-            Err(VaultError::InvalidReceipt)
-        }
-
-        async fn get_share_balance(
-            &self,
-            _vault: Address,
-            _owner: Address,
-        ) -> Result<U256, VaultError> {
-            Ok(U256::ZERO)
-        }
-
-        async fn check_fireblocks_tx(
-            &self,
-            _fireblocks_tx_id: &str,
-        ) -> Result<Option<FireblocksTxStatus>, VaultError> {
-            Ok(Some(FireblocksTxStatus::Pending))
-        }
-
-        async fn submit_burn(
-            &self,
-            _params: MultiBurnParams,
-        ) -> Result<SubmittedTx, VaultError> {
-            Err(VaultError::InvalidReceipt)
-        }
-
-        async fn confirm_burn(
-            &self,
-            _fireblocks_tx_id: &str,
-            _expected_dust_shares: U256,
-        ) -> Result<MultiBurnResult, VaultError> {
-            Err(VaultError::InvalidReceipt)
-        }
-
-        async fn verify_burn_tx(
-            &self,
-            _vault: Address,
-            _owner: Address,
-            _tx_hash: B256,
-        ) -> Result<BurnVerification, VaultError> {
-            Err(VaultError::InvalidReceipt)
         }
     }
 
@@ -1043,339 +961,29 @@ mod tests {
         events
     }
 
-    fn minting_failed_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = minting_events(issuer_request_id);
-
-        events.push(MintEvent::MintingFailed {
-            issuer_request_id: issuer_request_id.clone(),
-            error: "timeout".to_string(),
-            failed_at: now,
-        });
-
-        events
-    }
-
-    fn callback_pending_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = minting_failed_events(issuer_request_id);
-
-        events.push(MintEvent::ExistingMintRecovered {
-            issuer_request_id: issuer_request_id.clone(),
-            tx_hash: b256!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            receipt_id: uint!(42_U256),
-            shares_minted: uint!(100_000000000000000000_U256),
-            block_number: 1000,
-            recovered_at: now,
-        });
-
-        events
-    }
-
-    fn completed_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = callback_pending_events(issuer_request_id);
-
-        events.push(MintEvent::MintCompleted {
-            issuer_request_id: issuer_request_id.clone(),
-            completed_at: now,
-        });
-
-        events
-    }
-
-    async fn setup_with_receipt_and_events(
-        events: Vec<MintEvent>,
-    ) -> MintRecoveryFixture {
-        let issuer_request_id = test_issuer_request_id();
-        let fixture = MintRecoveryFixture::new().await;
-
-        let receipt_info = ReceiptInformation::new(
-            TokenizationRequestId::new("tok-123"),
-            issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
-            Quantity::new(Decimal::from(100)),
-            Utc::now(),
-            None,
-        );
-
-        fixture
-            .receipt_store
-            .send(
-                &VAULT,
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: ReceiptId::from(uint!(42_U256)),
-                    balance: Shares::from(
-                        uint!(100_000000000000000000_U256),
-                    ),
-                    block_number: 1000,
-                    tx_hash: b256!(
-                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    ),
-                    source: ReceiptSource::Itn {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                    receipt_info: Some(Box::new(receipt_info)),
-                    receipt_info_bytes: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        fixture
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn minting_failed_with_receipt_recovers_to_completed() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
-            .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-        let test = "minting_failed_with_receipt_recovers_to_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-        // A single Recover command advances MintingFailed → CallbackPending
-        // → Completed atomically via advance_through_callback, so the
-        // drive_recovery loop only needs one successful step.
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn callback_pending_recovers_to_completed() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = callback_pending_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
-            .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-        let test = "callback_pending_recovers_to_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            1,
-        );
-    }
-
-    /// A single `Recover` command on a mint stuck in `Minting` must reach
-    /// `Completed` in one execution when an on-chain receipt is already
-    /// present — the deposit event and the callback must be committed
-    /// together so the aggregate never lingers in `CallbackPending`.
-    #[traced_test]
-    #[tokio::test]
-    async fn single_recover_command_from_minting_reaches_completed() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state after one Recover, got: {}",
-            mint.state_name()
-        );
-        let test = "single_recover_command_from_minting_reaches_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    /// Same invariant for the `MintingFailed` starting state.
-    #[traced_test]
-    #[tokio::test]
-    async fn single_recover_command_from_minting_failed_reaches_completed() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state after one Recover, got: {}",
-            mint.state_name()
-        );
-        let test =
-            "single_recover_command_from_minting_failed_reaches_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    /// Same invariant for the `FireblocksSubmitted` starting state — the
-    /// mock vault's `confirm_mint` succeeds, so `TokensMinted` and
-    /// `MintCompleted` must be emitted in one command.
-    #[traced_test]
-    #[tokio::test]
-    async fn single_recover_command_from_fireblocks_submitted_reaches_completed()
-     {
-        let issuer_request_id = test_issuer_request_id();
-        let events = fireblocks_submitted_events(&issuer_request_id);
-        // No pre-existing receipt — the mock confirm path produces TokensMinted.
-        let fixture = MintRecoveryFixture::new().await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state after one Recover, got: {}",
-            mint.state_name()
-        );
-        let test = "single_recover_command_from_fireblocks_submitted_reaches_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn completed_mint_returns_cleanly() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = completed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        recover_mint(fixture.mint_store.as_ref(), issuer_request_id.clone())
-            .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-
-        let test = "completed_mint_returns_cleanly";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_mint_returns_pending_while_fireblocks_tx_pending() {
-        let issuer_request_id = test_issuer_request_id();
-        let failed_at = Utc::now() - chrono::Duration::minutes(2);
-        let events = fireblocks_failed_events(&issuer_request_id, failed_at);
-        let fixture =
-            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
-                .await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome =
-            recover_mint(fixture.mint_store.as_ref(), issuer_request_id).await;
-
-        assert_eq!(outcome, DriveOutcome::Pending);
-    }
-
-    /// A pending Fireblocks transaction must make the scheduled loop back off
-    /// between wakeups rather than spinning through its budget instantly. The
-    /// loop sleeps the backoff on every pending wakeup, so total elapsed time
-    /// must be at least one backoff per wakeup — a spinning loop would finish
-    /// in microseconds.
+    /// The budget loop must sleep the backoff on every no-progress poll rather
+    /// than spinning through its budget instantly, so total elapsed time is at
+    /// least one backoff per poll — a spinning loop would finish in
+    /// microseconds. Here a `MintingFailed` mint whose re-submission never
+    /// completes (no worker drains the enqueued `SubmitMintJob`) keeps the loop
+    /// driving until the no-progress budget is spent.
     #[traced_test]
     #[tokio::test]
     async fn scheduled_recovery_backs_off_while_fireblocks_tx_pending() {
         let issuer_request_id = test_issuer_request_id();
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
         let events = fireblocks_failed_events(&issuer_request_id, failed_at);
-        let fixture =
-            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
-                .await;
+        let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let backoff = Duration::from_millis(5);
-        let max_pending_polls = 8;
+        let max_no_progress_polls = 8;
         let start = tokio::time::Instant::now();
         let conclusion = recover_mint_until_automatic_budget_exhausted(
-            fixture.mint_store.as_ref(),
+            &fixture.context(),
             issuer_request_id.clone(),
             backoff,
-            max_pending_polls,
+            max_no_progress_polls,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1384,24 +992,26 @@ mod tests {
             matches!(
                 conclusion,
                 RecoveryConclusion::Abandoned {
-                    reason: AbandonReason::PendingPollBudgetExhausted
+                    reason: AbandonReason::NoProgressBudgetExhausted
                 }
             ),
-            "Pending-poll budget exhaustion must report Abandoned, not Resolved"
+            "No-progress budget exhaustion must report Abandoned, not Resolved"
         );
 
         assert!(
             elapsed
-                >= backoff * (u32::try_from(max_pending_polls).unwrap() - 1),
-            "Scheduled recovery must sleep the backoff on each pending \
+                >= backoff
+                    * (u32::try_from(max_no_progress_polls).unwrap() - 1),
+            "Scheduled recovery must sleep the backoff on each no-progress \
              poll, elapsed={elapsed:?}"
         );
 
         let mint =
             fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
         assert!(
-            matches!(mint, Mint::MintingFailed { .. }),
-            "Mint stays MintingFailed while the tx remains pending, got: {}",
+            matches!(mint, Mint::Minting { .. }),
+            "drive_one_step retries MintingFailed into Minting and re-enqueues \
+             the submission, got: {}",
             mint.state_name()
         );
 
@@ -1409,38 +1019,9 @@ mod tests {
         assert!(
             log_count_at!(
                 Level::WARN,
-                &[test, "stopped after maximum pending polls"]
+                &[test, "stopped after maximum polls without progress"]
             ) >= 1,
-            "Loop must stop with a warning once the pending-poll budget is spent"
-        );
-    }
-
-    /// A mint already in `FireblocksSubmitted` whose tx is still pending must
-    /// pause recovery (DriveOutcome::Pending) via the non-blocking pre-check
-    /// rather than blocking in confirm_mint or flipping to MintingFailed.
-    #[tokio::test]
-    async fn fireblocks_submitted_pending_tx_pauses_recovery() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = fireblocks_submitted_events(&issuer_request_id);
-        let fixture =
-            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
-                .await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            issuer_request_id.clone(),
-        )
-        .await;
-
-        assert_eq!(outcome, DriveOutcome::Pending);
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, Mint::FireblocksSubmitted { .. }),
-            "A pending tx must leave the mint in FireblocksSubmitted, got: {}",
-            mint.state_name()
+            "Loop must stop with a warning once the no-progress budget is spent"
         );
     }
 
@@ -1621,23 +1202,21 @@ mod tests {
         );
     }
 
-    /// The budget loop must report `Abandoned` — not a clean conclusion — when it
-    /// gives up on a still-incomplete mint (here a pending Fireblocks tx that
-    /// outlasts the poll budget), so the job is recorded as Killed rather than a
-    /// success that hides a stuck mint.
+    /// The budget loop must report `Abandoned` — not a clean conclusion — when
+    /// it gives up on a still-incomplete mint (here a re-submission that never
+    /// completes, outlasting the no-progress budget), so the job is recorded as
+    /// Killed rather than a success that hides a stuck mint.
     #[traced_test]
     #[tokio::test]
     async fn budget_loop_reports_abandoned_when_pending_budget_spent() {
         let issuer_request_id = test_issuer_request_id();
         let failed_at = Utc::now() - chrono::Duration::minutes(2);
         let events = fireblocks_failed_events(&issuer_request_id, failed_at);
-        let fixture =
-            MintRecoveryFixture::new_with_vault(Arc::new(PendingMintVault))
-                .await;
+        let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let conclusion = recover_mint_until_automatic_budget_exhausted(
-            fixture.mint_store.as_ref(),
+            &fixture.context(),
             issuer_request_id,
             Duration::from_millis(1),
             2,
@@ -1648,19 +1227,19 @@ mod tests {
             matches!(
                 conclusion,
                 RecoveryConclusion::Abandoned {
-                    reason: AbandonReason::PendingPollBudgetExhausted
+                    reason: AbandonReason::NoProgressBudgetExhausted
                 }
             ),
-            "a pending tx that outlasts its budget must abandon, not resolve"
+            "a mint that outlasts its budget must abandon, not resolve"
         );
 
         let test = "budget_loop_reports_abandoned_when_pending_budget_spent";
         assert!(
             log_count_at!(
                 Level::WARN,
-                &[test, "stopped after maximum pending polls"]
+                &[test, "stopped after maximum polls without progress"]
             ) >= 1,
-            "abandoning on the pending-poll budget must log the WARN"
+            "abandoning on the no-progress budget must log the WARN"
         );
     }
 
@@ -1674,7 +1253,7 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
 
         let result = MintRecoveryJob { issuer_request_id }
-            .perform(fixture.mint_store.as_ref())
+            .perform(&fixture.context())
             .await;
 
         assert!(
@@ -1717,7 +1296,7 @@ mod tests {
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let error = MintRecoveryJob { issuer_request_id }
-            .perform(fixture.mint_store.as_ref())
+            .perform(&fixture.context())
             .await
             .expect_err("an exhausted mint must abort, not resolve");
 

@@ -10,6 +10,7 @@ use crate::mint::{
 };
 use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
 
+#[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod rain_meta;
 pub(crate) mod service;
