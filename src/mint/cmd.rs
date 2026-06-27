@@ -114,6 +114,19 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
     },
 
+    /// Records a mint whose on-chain transaction already succeeded, as evidenced
+    /// by a receipt the `SubmitMintJob` found before submitting. Pure: produces
+    /// `ExistingMintRecovered` (no I/O) and advances to `CallbackPending`,
+    /// avoiding a double-mint where re-submission would mint again. Idempotent —
+    /// a no-op once the mint is already minted.
+    RecordExistingMint {
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        block_number: u64,
+    },
+
     /// Recovers a mint stuck in an incomplete state.
     ///
     /// For mints in `Minting` or `MintingFailed` state:

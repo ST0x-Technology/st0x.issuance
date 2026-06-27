@@ -955,6 +955,46 @@ impl Mint {
         }
     }
 
+    /// Records a mint whose on-chain transaction already succeeded (a receipt
+    /// exists), reported by the `SubmitMintJob` before it re-submitted. Pure —
+    /// emits `ExistingMintRecovered`, advancing to `CallbackPending` without
+    /// re-minting. Idempotent: a no-op once the mint is already minted.
+    fn handle_record_existing_mint(
+        &self,
+        issuer_request_id: IssuerMintRequestId,
+        tx_hash: B256,
+        receipt_id: U256,
+        shares_minted: U256,
+        block_number: u64,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        match self {
+            Self::Minting { issuer_request_id: expected_id, .. }
+            | Self::FireblocksSubmitted {
+                issuer_request_id: expected_id,
+                ..
+            }
+            | Self::MintingFailed { issuer_request_id: expected_id, .. } => {
+                Self::validate_issuer_request_id(
+                    expected_id,
+                    &issuer_request_id,
+                )?;
+
+                Ok(vec![MintEvent::ExistingMintRecovered {
+                    issuer_request_id,
+                    tx_hash,
+                    receipt_id,
+                    shares_minted,
+                    block_number,
+                    recovered_at: Utc::now(),
+                }])
+            }
+            Self::CallbackPending { .. } | Self::Completed { .. } => Ok(vec![]),
+            _ => Err(MintError::NotInMintingState {
+                current_state: self.state_name().to_string(),
+            }),
+        }
+    }
+
     async fn handle_recover(
         &self,
         services: &MintServices,
@@ -2039,6 +2079,11 @@ impl EventSourced for Mint {
             }
             MintCommand::RecordMintFailed { .. }
             | MintCommand::RetryMint { .. } => Ok(vec![]),
+            MintCommand::RecordExistingMint { .. } => {
+                Err(MintError::NotInMintingState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
             MintCommand::Recover { .. }
             | MintCommand::RecoverFromReceipt { .. }
             | MintCommand::CloseMint { .. } => Err(MintError::NotRecoverable {
@@ -2140,6 +2185,19 @@ impl EventSourced for Mint {
             MintCommand::RetryMint { issuer_request_id } => {
                 self.handle_retry_mint(issuer_request_id)
             }
+            MintCommand::RecordExistingMint {
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                block_number,
+            } => self.handle_record_existing_mint(
+                issuer_request_id,
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                block_number,
+            ),
             MintCommand::Recover { issuer_request_id, mode } => {
                 self.handle_recover(services, issuer_request_id, mode).await
             }
