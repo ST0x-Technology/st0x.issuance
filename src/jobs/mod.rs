@@ -12,12 +12,18 @@
 //! failure-injection arrive with their first request→outcome consumers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use apalis::prelude::{Data, TaskBuilder, TaskSink};
 use apalis_codec::json::JsonCodec;
 use apalis_core::backend::TaskSinkError;
+use apalis_core::backend::poll_strategy::{
+    BackoffConfig, IntervalStrategy, StrategyBuilder,
+};
 use apalis_sqlite::fetcher::SqliteFetcher;
-use apalis_sqlite::{CompactType, SqlitePool, SqliteStorage, SqlxError};
+use apalis_sqlite::{
+    CompactType, Config, SqlitePool, SqliteStorage, SqlxError,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -52,6 +58,16 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static>
         Self(SqliteStorage::new(pool))
     }
 
+    /// Like [`new`](Self::new) but caps the worker poll interval at ~1s instead
+    /// of apalis's default exponential backoff to 60s after an idle period. Use
+    /// for the backend of a worker draining latency-sensitive jobs (the mint
+    /// side-effect chain), where a freshly enqueued job must be picked up
+    /// promptly. The `job_type` is unchanged, so it stays compatible with rows
+    /// pushed through [`new`](Self::new).
+    pub(crate) fn with_fast_poll(pool: &SqlitePool) -> Self {
+        Self(SqliteStorage::new_with_config(pool, &build_poll_config::<Task>()))
+    }
+
     /// Enqueues `task` keyed by `idempotency_key`. apalis collapses the insert
     /// against any existing row sharing `(job_type, idempotency_key)` via
     /// `ON CONFLICT DO NOTHING`, so a re-enqueue for a job that is still
@@ -71,6 +87,20 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static>
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0
     }
+}
+
+/// Worker poll strategy capped at ~1s (100ms base, 1s backoff cap), so a
+/// freshly enqueued job is picked up promptly rather than after apalis's
+/// default exponential backoff to 60s following an idle period.
+fn build_poll_config<Task: 'static>() -> Config {
+    let strategy = StrategyBuilder::new()
+        .apply(
+            IntervalStrategy::new(Duration::from_millis(100))
+                .with_backoff(BackoffConfig::new(Duration::from_secs(1))),
+        )
+        .build();
+
+    Config::new(std::any::type_name::<Task>()).with_poll_interval(strategy)
 }
 
 /// A persistent, durable unit of work backed by apalis storage.

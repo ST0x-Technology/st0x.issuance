@@ -282,7 +282,7 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     let db_path = temp_dir.path().join("test_receipt_inventory.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let _mint_callback_mock =
+    let mint_callback_mock =
         harness::alpaca_mocks::setup_mint_mocks(&mock_alpaca);
     let (_redeem_mock, _poll_mock) =
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
@@ -331,6 +331,12 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     // Wait for shares to be minted
     let shares_minted = harness::wait_for_shares(&vault, user_wallet).await?;
     assert!(shares_minted > U256::ZERO, "Mint should create shares");
+
+    // The mint's side effects now run in async durable jobs, so `wait_for_shares`
+    // can return before `TokensMinted` is recorded and projected into the
+    // receipt inventory view. Wait for the mint callback (the flow's final step)
+    // before reading the view.
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     // Query receipt_inventory_view to get initial state
     let query_pool =
