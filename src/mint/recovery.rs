@@ -17,8 +17,8 @@ use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand,
     UnderlyingSymbol,
 };
-use crate::jobs::{Job, JobQueue, QueuePushError};
-use crate::receipt_inventory::ItnReceiptHandler;
+use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
+use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
 };
@@ -28,6 +28,7 @@ use crate::tokenized_asset::view::{
 pub(crate) struct MintRecoveryContext {
     pub(crate) mint_store: Arc<Store<Mint>>,
     pub(crate) pool: Pool<Sqlite>,
+    pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) submit_queue: JobQueue<SubmitMintJob>,
     pub(crate) confirm_queue: JobQueue<ConfirmMintJob>,
     pub(crate) callback_queue: JobQueue<SendCallbackJob>,
@@ -276,13 +277,14 @@ pub(crate) async fn push_mint_recovery_job(
     }
 }
 
-/// Deletes a TERMINAL recovery job for one mint so its idempotency key is free
-/// to re-enqueue, leaving any active (`Pending`/`Running`) job so the
-/// re-enqueue still dedups against it. Runs on the event-store pool (same
-/// SQLite file as the apalis pool).
-async fn release_terminal_recovery_job(
+/// Deletes a TERMINAL apalis job row for one mint and one `job_type` so its
+/// idempotency key is free to re-enqueue, leaving any active (`Pending`/
+/// `Running`) row so the re-enqueue still dedups against it. Runs on the
+/// event-store pool (same SQLite file as the apalis pool).
+async fn release_terminal_job(
     pool: &Pool<Sqlite>,
-    issuer_request_id: &IssuerMintRequestId,
+    job_type: &str,
+    idempotency_key: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "
@@ -296,12 +298,26 @@ async fn release_terminal_recovery_job(
             )
         ",
     )
-    .bind(mint_recovery_job_type())
-    .bind(issuer_request_id.to_string())
+    .bind(job_type)
+    .bind(idempotency_key)
     .execute(pool)
     .await?;
 
     Ok(())
+}
+
+/// Frees a mint's [`MintRecoveryJob`] idempotency key from any terminal prior
+/// job before re-enqueuing it (see [`release_terminal_job`]).
+async fn release_terminal_recovery_job(
+    pool: &Pool<Sqlite>,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), sqlx::Error> {
+    release_terminal_job(
+        pool,
+        mint_recovery_job_type(),
+        &issuer_request_id.to_string(),
+    )
+    .await
 }
 
 /// Deletes terminal apalis recovery jobs (`Done`/`Killed`, and `Failed` rows
@@ -344,6 +360,43 @@ pub(crate) async fn vacuum_terminal_recovery_jobs(
     .bind(mint_recovery_job_type())
     .execute(pool)
     .await?;
+
+    Ok(())
+}
+
+/// Deletes terminal apalis rows for the per-state mint side-effect jobs
+/// (`SubmitMintJob` / `ConfirmMintJob` / `SendCallbackJob`), mirroring
+/// [`vacuum_terminal_recovery_jobs`] for the recovery job. Two purposes: it
+/// bounds the `Jobs` table across restarts, and it frees the per-state
+/// idempotency keys (which are scoped to the mint's `issuer_request_id`) that a
+/// completed normal-flow job would otherwise hold — so a restart-driven recovery
+/// of a rolled-back mint can re-enqueue its side-effect jobs rather than collide
+/// with the prior run's `Done` row. Only terminal rows are removed, so an
+/// orphaned `Pending`/`Running` job apalis will re-pick is left untouched. Runs
+/// on the event-store pool because both pools address the same SQLite file.
+pub(crate) async fn vacuum_terminal_mint_side_effect_jobs(
+    pool: &Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    for side_effect_job_type in [
+        job_type::<SubmitMintJob>(),
+        job_type::<ConfirmMintJob>(),
+        job_type::<SendCallbackJob>(),
+    ] {
+        sqlx::query(
+            "
+            DELETE FROM Jobs
+            WHERE
+                job_type = ?
+                AND (
+                    status IN ('Done', 'Killed')
+                    OR (status = 'Failed' AND max_attempts <= attempts)
+                )
+            ",
+        )
+        .bind(side_effect_job_type)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }
@@ -456,11 +509,43 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 };
             }
             AutomaticRetryDecision::Wait(wait) => {
-                debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    wait_ms = wait.as_millis(),
-                    "Waiting for next automatic mint retry window"
-                );
-                tokio::time::sleep(wait).await;
+                // The retry backoff only spaces out re-submissions. If a receipt
+                // already exists, the mint actually succeeded on-chain, so there
+                // is nothing to wait for — drive immediately to record the
+                // existing mint (the per-state job's receipt check turns this
+                // into a record, not a re-submission). Otherwise honour the
+                // backoff so a genuinely failed mint is not hammered.
+                if minting_failed_receipt_exists(ctx, &mint, &issuer_request_id)
+                    .await
+                {
+                    no_progress_polls += 1;
+                    if no_progress_polls > max_no_progress_polls {
+                        warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                            max_no_progress_polls,
+                            "Scheduled mint recovery stopped after maximum polls without progress"
+                        );
+                        return RecoveryConclusion::Abandoned {
+                            reason: AbandonReason::NoProgressBudgetExhausted,
+                        };
+                    }
+
+                    if let Err(error) =
+                        drive_one_step(ctx, &mint, &issuer_request_id).await
+                    {
+                        debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                            error = %error,
+                            "Scheduled recovery step failed; backing off"
+                        );
+                    }
+
+                    tokio::time::sleep(backoff).await;
+                } else {
+                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                        wait_ms = wait.as_millis(),
+                        "Waiting for next automatic mint retry window"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
             }
             // The state is recoverable and due: enqueue the per-state job that
             // advances it, then poll for progress on the next iteration.
@@ -500,6 +585,8 @@ enum MintRecoveryStepError {
     Store(#[from] SendError<Mint>),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     AssetView(#[from] TokenizedAssetViewError),
     #[error("no vault configured for underlying {underlying}")]
@@ -576,11 +663,50 @@ async fn resolve_vault(
     })
 }
 
+/// Whether a `MintingFailed` mint already has a discovered receipt — i.e. its
+/// on-chain transaction actually succeeded after the mint was marked failed.
+/// When true, recovery should record the existing mint now rather than wait out
+/// the re-submission backoff. A non-`MintingFailed` state, an unresolved vault,
+/// or a lookup error is treated as "no receipt" so recovery falls back to the
+/// normal retry schedule.
+async fn minting_failed_receipt_exists(
+    ctx: &MintRecoveryContext,
+    mint: &Mint,
+    issuer_request_id: &IssuerMintRequestId,
+) -> bool {
+    let Mint::MintingFailed { underlying, .. } = mint else {
+        return false;
+    };
+
+    let Ok(vault) = resolve_vault(ctx, underlying).await else {
+        return false;
+    };
+
+    matches!(
+        ctx.receipts.find_by_issuer_request_id(&vault, issuer_request_id).await,
+        Ok(Some(_))
+    )
+}
+
+/// Enqueues a per-state job for a recovering mint, first freeing the mint's
+/// idempotency key from any TERMINAL prior job of the same type (see
+/// [`release_terminal_job`]). Without the release, a normal-flow job that
+/// already ran to `Done` would hold the key and apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` would silently drop the
+/// re-enqueue, stranding recovery. A still-active (`Pending`/`Running`) job is
+/// left in place so the push still dedups against it.
 async fn enqueue_submit(
     ctx: &MintRecoveryContext,
     issuer_request_id: &IssuerMintRequestId,
     vault: Address,
-) -> Result<(), QueuePushError> {
+) -> Result<(), MintRecoveryStepError> {
+    release_terminal_job(
+        &ctx.pool,
+        job_type::<SubmitMintJob>(),
+        &issuer_request_id.to_string(),
+    )
+    .await?;
+
     ctx.submit_queue
         .clone()
         .push_with_idempotency_key(
@@ -590,7 +716,9 @@ async fn enqueue_submit(
             },
             issuer_request_id.to_string(),
         )
-        .await
+        .await?;
+
+    Ok(())
 }
 
 async fn enqueue_confirm(
@@ -598,7 +726,14 @@ async fn enqueue_confirm(
     issuer_request_id: &IssuerMintRequestId,
     vault: Address,
     fireblocks_tx_id: String,
-) -> Result<(), QueuePushError> {
+) -> Result<(), MintRecoveryStepError> {
+    release_terminal_job(
+        &ctx.pool,
+        job_type::<ConfirmMintJob>(),
+        &issuer_request_id.to_string(),
+    )
+    .await?;
+
     ctx.confirm_queue
         .clone()
         .push_with_idempotency_key(
@@ -609,20 +744,31 @@ async fn enqueue_confirm(
             },
             issuer_request_id.to_string(),
         )
-        .await
+        .await?;
+
+    Ok(())
 }
 
 async fn enqueue_callback(
     ctx: &MintRecoveryContext,
     issuer_request_id: &IssuerMintRequestId,
-) -> Result<(), QueuePushError> {
+) -> Result<(), MintRecoveryStepError> {
+    release_terminal_job(
+        &ctx.pool,
+        job_type::<SendCallbackJob>(),
+        &issuer_request_id.to_string(),
+    )
+    .await?;
+
     ctx.callback_queue
         .clone()
         .push_with_idempotency_key(
             SendCallbackJob { issuer_request_id: issuer_request_id.clone() },
             issuer_request_id.to_string(),
         )
-        .await
+        .await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
