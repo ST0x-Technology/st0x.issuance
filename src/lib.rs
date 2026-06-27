@@ -1464,7 +1464,7 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
 
     spawn_drainer_worker!(
         ::<SendCallbackContext, SendCallbackJob>,
-        apalis_pool.clone(),
+        apalis_pool,
         Arc::new(SendCallbackContext { mint_store, alpaca }),
         "mint-callback-worker",
     );

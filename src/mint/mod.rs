@@ -2019,32 +2019,20 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::SubmitMint { .. } => {
+            MintCommand::SubmitMint { .. }
+            | MintCommand::RecordFireblocksSubmitted { .. } => {
                 Err(MintError::NotInMintingState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::ConfirmMint { .. } => {
+            MintCommand::ConfirmMint { .. }
+            | MintCommand::RecordTokensMinted { .. } => {
                 Err(MintError::NotInFireblocksSubmittedState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::SendCallback { .. } => {
-                Err(MintError::NotInCallbackPendingState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordFireblocksSubmitted { .. } => {
-                Err(MintError::NotInMintingState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordTokensMinted { .. } => {
-                Err(MintError::NotInFireblocksSubmittedState {
-                    current_state: "Uninitialized".to_string(),
-                })
-            }
-            MintCommand::RecordCallbackSent { .. } => {
+            MintCommand::SendCallback { .. }
+            | MintCommand::RecordCallbackSent { .. } => {
                 Err(MintError::NotInCallbackPendingState {
                     current_state: "Uninitialized".to_string(),
                 })
