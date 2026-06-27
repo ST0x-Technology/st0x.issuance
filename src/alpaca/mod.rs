@@ -10,6 +10,7 @@ use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 pub(crate) mod itn;
+#[cfg(test)]
 pub(crate) mod mock;
 pub(crate) mod service;
 

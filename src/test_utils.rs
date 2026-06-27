@@ -19,7 +19,6 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::account::Account;
-use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
 use crate::bindings::{
@@ -27,15 +26,12 @@ use crate::bindings::{
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
 use crate::config::{Config, Environment, LogLevel};
-use crate::mint::{Mint, MintServices};
-use crate::receipt_inventory::{
-    CqrsReceiptService, ReceiptInventory, view::ReceiptInventoryViewReactor,
-};
+use crate::mint::Mint;
+use crate::receipt_inventory::view::ReceiptInventoryViewReactor;
 use crate::tokenized_asset::{
     AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
-use crate::vault::mock::MockVaultService;
 use crate::wallet::SignerConfig;
 
 /// Builds Anvil with startup output enabled when stdout is piped by Alloy.
@@ -139,28 +135,12 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
-    // Setup ReceiptInventory (needed by MintServices for receipt lookups and registration)
-    let receipt_inventory_store =
-        StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
-
-    // Create mock services for Mint aggregate
-    let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let mint_services = MintServices::with_single_vault(
-        Network::Base,
-        ANVIL_CHAIN_ID,
-        Arc::new(MockVaultService::new_success()),
-        Arc::new(MockAlpacaService::new_success()),
-        Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
-        pool.clone(),
-        bot,
-    );
-
     // Setup Mint store (event-sorcery), mirroring the production wiring: the
     // reactor keeps receipt_inventory_view in sync with Mint events.
     let (mint_store, _mint_projection) =
         StoreBuilder::<Mint>::new(pool.clone())
             .with(Arc::new(ReceiptInventoryViewReactor::new(pool.clone())))
-            .build(mint_services)
+            .build(())
             .await?;
 
     // Seed initial assets

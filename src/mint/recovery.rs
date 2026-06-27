@@ -3,7 +3,7 @@ use apalis::prelude::AbortError;
 use apalis_sqlite::SqlitePool;
 use async_trait::async_trait;
 use chrono::Utc;
-use event_sorcery::{AggregateError, LifecycleError, SendError, Store};
+use event_sorcery::{SendError, Store};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::fmt;
@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::job::{ConfirmMintJob, SendCallbackJob, SubmitMintJob};
 use super::{
-    AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, MintError,
-    MintRecoveryMode, Network, UnderlyingSymbol, find_all_recoverable_mints,
+    AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, Network,
+    UnderlyingSymbol, find_all_recoverable_mints,
 };
 use crate::jobs::{Job, JobQueue, QueuePushError, job_type};
 use crate::receipt_inventory::{ItnReceiptHandler, ReceiptService};
@@ -23,7 +23,7 @@ use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault,
 };
 use crate::vault::{
-    NetworkVaultServices, TxId, UnconfiguredNetworkError, VaultService,
+    NetworkVaultServices, TxId, UnconfiguredNetworkError,
 };
 
 /// Dependencies the scheduled mint-recovery worker needs to re-drive a stuck or
@@ -81,59 +81,6 @@ impl ItnReceiptHandler for MintRecoveryHandler {
             );
         }
     }
-}
-
-/// Why a [`drive_recovery`] pass stopped. Lets manual recovery report whether
-/// it completed, paused, exhausted its retry budget, or failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DriveOutcome {
-    Done,
-    RetryNotDue,
-    Exhausted,
-    Failed,
-}
-
-#[derive(Clone, Copy)]
-enum RetryPolicy {
-    Enforce,
-    Bypass,
-}
-
-#[derive(Clone, Copy)]
-enum ClassifiedRecoveryOutcome {
-    Done { current_state: &'static str },
-    RetryNotDue { wait: Duration },
-    Exhausted,
-}
-
-/// Drives an operator-requested recovery, holding the shared wallet lock only
-/// for transitions that may prepare or broadcast a transaction.
-pub(crate) async fn recover_mint_manually(
-    mint_store: &Store<Mint>,
-    vault_service: &Arc<dyn VaultService>,
-    issuer_request_id: IssuerMintRequestId,
-) -> DriveOutcome {
-    drive_recovery(
-        mint_store,
-        vault_service,
-        issuer_request_id,
-        RetryPolicy::Bypass,
-        recovery_step_requires_wallet,
-        |_, id, wallet_locked| {
-            if wallet_locked {
-                MintCommand::RecoverWalletStep {
-                    issuer_request_id: id,
-                    mode: MintRecoveryMode::Manual,
-                }
-            } else {
-                MintCommand::Recover {
-                    issuer_request_id: id,
-                    mode: MintRecoveryMode::Manual,
-                }
-            }
-        },
-    )
-    .await
 }
 
 /// Fixed backoff applied when a scheduled recovery pass cannot make progress —
@@ -776,154 +723,6 @@ struct ResolvedVault {
     chain_id: u64,
 }
 
-const MAX_RECOVERY_ATTEMPTS: usize = 10;
-
-/// Drives a mint through recovery to completion by repeatedly sending
-/// commands built by `make_command` until the mint reaches a terminal state.
-///
-/// A single recovery command advances the mint by one step (e.g.,
-/// `MintingFailed` -> `CallbackPending`). The aggregate state is classified
-/// before each command and after every successful step so terminal states and
-/// retry windows do not need to be discovered through expected command errors.
-///
-/// Bounded to [`MAX_RECOVERY_ATTEMPTS`] iterations to prevent infinite
-/// spinning if a command returns `Ok(())` without advancing state.
-async fn drive_recovery(
-    mint_store: &Store<Mint>,
-    vault_service: &Arc<dyn VaultService>,
-    issuer_request_id: IssuerMintRequestId,
-    retry_policy: RetryPolicy,
-    requires_wallet: impl Fn(&Mint) -> bool,
-    make_command: impl Fn(Option<&Mint>, IssuerMintRequestId, bool) -> MintCommand,
-) -> DriveOutcome {
-    for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
-        let mut loaded_mint = match mint_store.load(&issuer_request_id).await {
-            Ok(Some(mint)) => mint,
-            Ok(None) => {
-                debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    "Mint not found for recovery"
-                );
-                return DriveOutcome::Done;
-            }
-            Err(err) => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Failed to load mint before recovery step"
-                );
-                return DriveOutcome::Failed;
-            }
-        };
-
-        if let Some(outcome) = classify_recovery(&loaded_mint, retry_policy) {
-            return finish_classified_recovery(&issuer_request_id, outcome);
-        }
-
-        let mut wallet_guard = None;
-        if requires_wallet(&loaded_mint) {
-            wallet_guard = vault_service.lock_wallet().await;
-            loaded_mint = match mint_store.load(&issuer_request_id).await {
-                Ok(Some(mint)) => mint,
-                Ok(None) => {
-                    debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                        "Mint not found after acquiring wallet lock for recovery"
-                    );
-                    return DriveOutcome::Done;
-                }
-                Err(err) => {
-                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                        error = %err,
-                        "Failed to reload mint under wallet lock before recovery step"
-                    );
-                    return DriveOutcome::Failed;
-                }
-            };
-
-            if let Some(outcome) = classify_recovery(&loaded_mint, retry_policy)
-            {
-                drop(wallet_guard);
-                return finish_classified_recovery(&issuer_request_id, outcome);
-            }
-
-            if !requires_wallet(&loaded_mint) {
-                drop(wallet_guard.take());
-            }
-        }
-
-        let result = mint_store
-            .send(
-                &issuer_request_id,
-                make_command(
-                    Some(&loaded_mint),
-                    issuer_request_id.clone(),
-                    wallet_guard.is_some(),
-                ),
-            )
-            .await;
-        drop(wallet_guard);
-
-        match result {
-            Ok(()) => {
-                debug!(target: "mint", issuer_request_id = %issuer_request_id,
-                    attempt,
-                    "Recovery step succeeded, continuing"
-                );
-
-                if let Some(outcome) = recovery_outcome_after_step(
-                    mint_store,
-                    &issuer_request_id,
-                    retry_policy,
-                )
-                .await
-                {
-                    return outcome;
-                }
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                MintError::NotRecoverable { current_state },
-            ))) => {
-                info!(target: "mint", issuer_request_id = %issuer_request_id,
-                    current_state,
-                    "Mint recovery complete"
-                );
-                return DriveOutcome::Done;
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                MintError::RetryNotDue { retry_at },
-            ))) => {
-                info!(target: "mint", issuer_request_id = %issuer_request_id,
-                    %retry_at,
-                    "Mint recovery paused until retry window"
-                );
-                return DriveOutcome::RetryNotDue;
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                MintError::AutomaticRetriesExhausted { attempts },
-            ))) => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    attempts,
-                    "Automatic mint retries exhausted"
-                );
-                return DriveOutcome::Exhausted;
-            }
-            Err(err) => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Mint recovery failed"
-                );
-                return DriveOutcome::Failed;
-            }
-        }
-    }
-
-    error!(target: "mint", issuer_request_id = %issuer_request_id,
-        aggregate_id = %issuer_request_id,
-        max_attempts = MAX_RECOVERY_ATTEMPTS,
-        "Mint recovery exceeded maximum attempts without reaching terminal state"
-    );
-
-    DriveOutcome::Failed
-}
-
 /// Advances a recoverable mint one step by enqueuing the appropriate per-state
 /// job (or issuing the pure transition that precedes it). The durable jobs
 /// perform the actual I/O; recovery only schedules them. The deterministic
@@ -1113,175 +912,45 @@ async fn enqueue_callback(
     Ok(())
 }
 
-fn classify_recovery(
-    mint: &Mint,
-    retry_policy: RetryPolicy,
-) -> Option<ClassifiedRecoveryOutcome> {
-    match mint.automatic_retry_decision(Utc::now()) {
-        AutomaticRetryDecision::Ready => None,
-        AutomaticRetryDecision::Wait(wait)
-            if matches!(retry_policy, RetryPolicy::Enforce) =>
-        {
-            Some(ClassifiedRecoveryOutcome::RetryNotDue { wait })
-        }
-        AutomaticRetryDecision::Exhausted
-            if matches!(retry_policy, RetryPolicy::Enforce) =>
-        {
-            Some(ClassifiedRecoveryOutcome::Exhausted)
-        }
-        AutomaticRetryDecision::NotRecoverable => {
-            Some(ClassifiedRecoveryOutcome::Done {
-                current_state: mint.state_name(),
-            })
-        }
-        AutomaticRetryDecision::Wait(_) | AutomaticRetryDecision::Exhausted => {
-            None
-        }
-    }
-}
-
-fn finish_classified_recovery(
-    issuer_request_id: &IssuerMintRequestId,
-    outcome: ClassifiedRecoveryOutcome,
-) -> DriveOutcome {
-    match outcome {
-        ClassifiedRecoveryOutcome::Done { current_state } => {
-            info!(target: "mint", issuer_request_id = %issuer_request_id,
-                current_state,
-                "Mint recovery complete"
-            );
-            DriveOutcome::Done
-        }
-        ClassifiedRecoveryOutcome::RetryNotDue { wait } => {
-            info!(target: "mint", issuer_request_id = %issuer_request_id,
-                wait_ms = wait.as_millis(),
-                "Mint recovery paused until retry window"
-            );
-            DriveOutcome::RetryNotDue
-        }
-        ClassifiedRecoveryOutcome::Exhausted => {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Automatic mint retries exhausted"
-            );
-            DriveOutcome::Exhausted
-        }
-    }
-}
-
-async fn recovery_outcome_after_step(
-    mint_store: &Store<Mint>,
-    issuer_request_id: &IssuerMintRequestId,
-    retry_policy: RetryPolicy,
-) -> Option<DriveOutcome> {
-    let mint = match mint_store.load(issuer_request_id).await {
-        Ok(Some(mint)) => mint,
-        Ok(None) => {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                "Mint disappeared during recovery"
-            );
-            return Some(DriveOutcome::Failed);
-        }
-        Err(err) => {
-            warn!(target: "mint", issuer_request_id = %issuer_request_id,
-                error = %err,
-                "Failed to load mint after recovery step"
-            );
-            return Some(DriveOutcome::Failed);
-        }
-    };
-
-    classify_recovery(&mint, retry_policy)
-        .map(|outcome| finish_classified_recovery(issuer_request_id, outcome))
-}
-
-const fn recovery_step_requires_wallet(mint: &Mint) -> bool {
-    !matches!(
-        mint,
-        Mint::JournalRejected { .. }
-            | Mint::CallbackPending { .. }
-            | Mint::Completed { .. }
-            | Mint::Closed { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256, uint};
-    use chrono::{Duration as ChronoDuration, Utc};
-    use event_sorcery::{StoreBuilder, test_store};
+    use alloy::primitives::address;
+    use chrono::Utc;
+    use event_sorcery::test_store;
     use rust_decimal::Decimal;
-    use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::alpaca::AlpacaService;
-    use crate::alpaca::mock::MockAlpacaService;
     use crate::mint::api::test_utils::{TestAccountAndAsset, TestHarness};
-    use crate::mint::tests::{BOT, VAULT};
+    use crate::mint::tests::VAULT;
     use crate::mint::{
-        ClientId, IssuerMintRequestId, MintEvent, MintServices, Network,
-        Quantity, TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
+        ClientId, IssuerMintRequestId, MintEvent, Network, Quantity,
+        TokenSymbol, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptSource, ReceiptVaultKey, Shares,
-    };
-    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
-    use crate::tokenized_asset::{
-        AssetKey, TokenizedAsset, TokenizedAssetCommand,
-    };
-    use crate::vault::mock::MockVaultService;
-    use crate::vault::{
-        PreparedMintTx, ReceiptInformation, TxId, VaultService,
-    };
+    use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at};
+    use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
 
-    /// Builds a real event-sorcery [`Store<Mint>`] backed by an in-memory
-    /// SQLite pool, wired with the same services the production recovery flow
-    /// uses (vault, Alpaca, receipt inventory). The [`TokenizedAsset`]
-    /// projection is populated with the AAPL -> [`VAULT`] mapping so the
-    /// recovery vault lookup (`find_vault`) resolves.
+    /// Builds a real event-sorcery [`Store<Mint>`] over a file-backed SQLite
+    /// pool shared with an apalis-sqlite pool (so the durable per-state queues
+    /// see the `Jobs` table), seeding the AAPL -> [`VAULT`] mapping so the
+    /// recovery vault lookup (`find_vault_by_underlying`) resolves. The `Mint`
+    /// aggregate is pure (`Services = ()`); the recovery worker's I/O
+    /// dependencies are assembled on demand via [`Self::context`].
     struct MintRecoveryFixture {
         mint_store: Arc<Store<Mint>>,
         receipt_store: Arc<Store<ReceiptInventory>>,
-        pool: sqlx::SqlitePool,
-        vault: Arc<dyn VaultService>,
+        pool: Pool<Sqlite>,
+        apalis_pool: SqlitePool,
     }
 
     impl MintRecoveryFixture {
         async fn new() -> Self {
-            Self::new_with_vault(Arc::new(MockVaultService::new_success()))
-                .await
-        }
+            let harness = TestHarness::new().await;
 
-        async fn new_with_vault(vault: Arc<dyn VaultService>) -> Self {
-            Self::new_with_services(
-                vault,
-                Arc::new(MockAlpacaService::new_success()),
-            )
-            .await
-        }
-
-        async fn new_with_services(
-            vault: Arc<dyn VaultService>,
-            alpaca: Arc<dyn AlpacaService>,
-        ) -> Self {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(":memory:")
-                .await
-                .unwrap();
-
-            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-            let (asset_store, _asset_projection) =
-                StoreBuilder::<TokenizedAsset>::new(pool.clone())
-                    .build(())
-                    .await
-                    .unwrap();
-
-            asset_store
+            harness
+                .asset_store
                 .send(
                     &AssetKey::new(
                         UnderlyingSymbol::new("AAPL").unwrap(),
@@ -1297,23 +966,38 @@ mod tests {
                 .await
                 .unwrap();
 
-            let receipt_store =
-                Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+            let receipt_store = Arc::new(test_store::<ReceiptInventory>(
+                harness.pool.clone(),
+                (),
+            ));
 
-            let services = MintServices::with_single_vault(
-                Network::Base,
-                ANVIL_CHAIN_ID,
-                vault.clone(),
-                alpaca,
-                Arc::new(CqrsReceiptService::new(receipt_store.clone())),
-                pool.clone(),
-                BOT,
-            );
+            let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
 
-            let mint_store =
-                Arc::new(test_store::<Mint>(pool.clone(), services));
+            Self {
+                mint_store,
+                receipt_store,
+                pool,
+                apalis_pool,
+                vault_services,
+            }
+        }
 
-            Self { mint_store, receipt_store, pool, vault }
+        /// Assembles the recovery worker's I/O dependencies against the shared
+        /// pools: the event-store pool, a [`CqrsReceiptService`] over the
+        /// fixture's receipt inventory, and the three per-state job queues on
+        /// the apalis pool.
+        fn context(&self) -> MintRecoveryContext {
+            MintRecoveryContext {
+                mint_store: self.mint_store.clone(),
+                pool: self.pool.clone(),
+                vault_services: self.vault_services.clone(),
+                receipts: Arc::new(CqrsReceiptService::new(
+                    self.receipt_store.clone(),
+                )),
+                submit_queue: JobQueue::new(&self.apalis_pool),
+                confirm_queue: JobQueue::new(&self.apalis_pool),
+                callback_queue: JobQueue::new(&self.apalis_pool),
+            }
         }
 
         /// Seeds the event store with raw `Mint` events, putting the aggregate
@@ -1371,6 +1055,20 @@ mod tests {
         }
     }
 
+    fn tx_failed_events(
+        issuer_request_id: &IssuerMintRequestId,
+        failed_at: chrono::DateTime<Utc>,
+    ) -> Vec<MintEvent> {
+        let mut events = tx_submitted_events(issuer_request_id);
+        events.push(MintEvent::MintingFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "terminal signer failure".to_string(),
+            failed_at,
+        });
+
+        events
+    }
+
     fn test_issuer_request_id() -> IssuerMintRequestId {
         IssuerMintRequestId::new(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
@@ -1423,1127 +1121,74 @@ mod tests {
         events.push(MintEvent::MintTxSubmitted {
             issuer_request_id: issuer_request_id.clone(),
             external_tx_id: format!("mint-{issuer_request_id}"),
-            tx_id: TxId::random(),
+            tx_id: "fb-tx-123".to_string(),
             submitted_at: now,
         });
 
         events
     }
 
-    fn mint_intended_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let mut events = minting_events(issuer_request_id);
-        events.push(MintEvent::MintTxIntended {
-            issuer_request_id: issuer_request_id.clone(),
-            prepared_tx: PreparedMintTx::valid_for_test(
-                1,
-                format!("mint-{issuer_request_id}"),
-            ),
-            intended_at: Utc::now(),
-        });
-
-        events
-    }
-
-    fn minting_failed_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = minting_events(issuer_request_id);
-
-        events.push(MintEvent::MintingFailed {
-            issuer_request_id: issuer_request_id.clone(),
-            error: "timeout".to_string(),
-            failed_at: now,
-        });
-
-        events
-    }
-
-    fn callback_pending_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = minting_failed_events(issuer_request_id);
-
-        events.push(MintEvent::ExistingMintRecovered {
-            issuer_request_id: issuer_request_id.clone(),
-            tx_hash: b256!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            receipt_id: uint!(42_U256),
-            shares_minted: uint!(100_000000000000000000_U256),
-            block_number: 1000,
-            recovered_at: now,
-        });
-
-        events
-    }
-
-    fn completed_events(
-        issuer_request_id: &IssuerMintRequestId,
-    ) -> Vec<MintEvent> {
-        let now = Utc::now();
-        let mut events = callback_pending_events(issuer_request_id);
-
-        events.push(MintEvent::MintCompleted {
-            issuer_request_id: issuer_request_id.clone(),
-            completed_at: now,
-        });
-
-        events
-    }
-
-    async fn setup_with_receipt_and_events(
-        events: Vec<MintEvent>,
-    ) -> MintRecoveryFixture {
-        setup_with_receipt_and_events_and_vault(
-            events,
-            Arc::new(MockVaultService::new_success()),
-        )
-        .await
-    }
-
-    async fn setup_with_receipt_and_events_and_vault(
-        events: Vec<MintEvent>,
-        vault: Arc<dyn VaultService>,
-    ) -> MintRecoveryFixture {
-        let fixture = MintRecoveryFixture::new_with_vault(vault).await;
-        setup_fixture_with_receipt_and_events(fixture, events).await
-    }
-
-    async fn setup_fixture_with_receipt_and_events(
-        fixture: MintRecoveryFixture,
-        events: Vec<MintEvent>,
-    ) -> MintRecoveryFixture {
-        let issuer_request_id = test_issuer_request_id();
-
-        let receipt_info = ReceiptInformation::new(
-            TokenizationRequestId::new("tok-123"),
-            issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL").unwrap(),
-            Quantity::new(Decimal::from(100)),
-            Utc::now(),
-            None,
-        );
-
-        fixture
-            .receipt_store
-            .send(
-                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, VAULT),
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: ReceiptId::from(uint!(42_U256)),
-                    balance: Shares::from(
-                        uint!(100_000000000000000000_U256),
-                    ),
-                    block_number: 1000,
-                    tx_hash: b256!(
-                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    ),
-                    source: ReceiptSource::Itn {
-                        issuer_request_id: issuer_request_id.clone(),
-                    },
-                    receipt_info: Some(Box::new(receipt_info)),
-                    receipt_info_bytes: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        fixture
-    }
-
+    /// The budget loop must sleep the backoff on every no-progress poll rather
+    /// than spinning through its budget instantly, so total elapsed time is at
+    /// least one backoff per poll — a spinning loop would finish in
+    /// microseconds. Here a `MintingFailed` mint whose re-submission never
+    /// completes (no worker drains the enqueued `SubmitMintJob`) keeps the loop
+    /// driving until the no-progress budget is spent.
     #[traced_test]
     #[tokio::test]
-    async fn receipt_scan_bypasses_retry_window_and_recovers_to_completed() {
+    async fn scheduled_recovery_backs_off_without_progress() {
         let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        drive_recovery(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-            RetryPolicy::Bypass,
-            recovery_step_requires_wallet,
-            |_, id, _wallet_locked| MintCommand::Recover {
-                issuer_request_id: id,
-                mode: MintRecoveryMode::Automatic,
-            },
-        )
-        .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-        let test =
-            "receipt_scan_bypasses_retry_window_and_recovers_to_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-        );
-        // Receipt recovery and callback delivery are separate durable steps,
-        // so the wallet guard is released before the Alpaca request.
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            2,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn mint_intended_with_receipt_recovers_without_rebroadcast() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = mint_intended_events(&issuer_request_id);
-        let vault = Arc::new(MockVaultService::new_submit_failure());
-        let fixture =
-            setup_with_receipt_and_events_and_vault(events, vault.clone())
-                .await;
-
-        recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-        )
-        .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "receipt proof must complete MintIntended, got {}",
-            mint.state_name()
-        );
-        assert_eq!(
-            vault.get_call_count(),
-            0,
-            "receipt-first recovery must not prepare a replacement transaction"
-        );
-        assert!(
-            log_count_at!(
-                Level::INFO,
-                &["Found existing receipt, recording recovery"]
-            ) > 0
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn callback_pending_recovers_to_completed() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = callback_pending_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-        let wallet_guard = fixture.vault.lock_wallet().await;
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recover_mint(
-                fixture.mint_store.as_ref(),
-                &fixture.vault,
-                issuer_request_id.clone(),
-            ),
-        )
-        .await
-        .expect("callback-only recovery must not wait for the wallet lock");
-        drop(wallet_guard);
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-        let test = "callback_pending_recovers_to_completed";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            1,
-        );
-    }
-
-    /// Recovery from `Minting` persists the receipt proof before delivering
-    /// the callback in a second command.
-    #[traced_test]
-    #[tokio::test]
-    async fn minting_receipt_recovery_persists_before_callback() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::CallbackPending { .. }),
-            "Expected CallbackPending after receipt recovery, got: {}",
-            mint.state_name()
-        );
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let completed =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(completed, Mint::Completed { .. }));
-        let test = "minting_receipt_recovery_persists_before_callback";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    /// The same durable boundary applies from `MintingFailed`.
-    #[traced_test]
-    #[tokio::test]
-    async fn failed_mint_receipt_recovery_persists_before_callback() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::CallbackPending { .. }),
-            "Expected CallbackPending after receipt recovery, got: {}",
-            mint.state_name()
-        );
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let completed =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(completed, Mint::Completed { .. }));
-        let test = "failed_mint_receipt_recovery_persists_before_callback";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    /// Same invariant for the `TxSubmitted` starting state.
-    #[traced_test]
-    #[tokio::test]
-    async fn tx_submitted_recovery_persists_before_callback() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = tx_submitted_events(&issuer_request_id);
-        // No pre-existing receipt — the mock confirm path produces TokensMinted.
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_events(&issuer_request_id, failed_at);
         let fixture = MintRecoveryFixture::new().await;
         fixture.seed_mint_events(&issuer_request_id, events).await;
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
 
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
-        assert!(
-            matches!(mint, Mint::CallbackPending { .. }),
-            "Expected CallbackPending after one Recover, got: {}",
-            mint.state_name()
-        );
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .unwrap();
-
-        let completed =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(completed, Mint::Completed { .. }));
-        let test = "tx_submitted_recovery_persists_before_callback";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Alpaca callback succeeded"]),
-            1,
-        );
-    }
-
-    /// Receipt-monitor recovery must durably record the receipt before making
-    /// the Alpaca callback.
-    #[traced_test]
-    #[tokio::test]
-    async fn receipt_command_persists_recovery_before_callback() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::RecoverFromReceipt {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tx_hash: b256!(
-                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    ),
-                },
-            )
-            .await
-            .unwrap();
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, Mint::CallbackPending { .. }),
-            "Expected CallbackPending after receipt command, got: {}",
-            mint.state_name()
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::INFO,
-                &[
-                    "receipt_command_persists_recovery_before_callback",
-                    "Alpaca callback succeeded"
-                ]
-            ),
-            0,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn receipt_discovery_does_not_send_callback_from_callback_pending() {
-        let issuer_request_id = test_issuer_request_id();
-        let harness = TestHarness::new().await;
-        let TestHarness { pool, apalis_pool, mint_store, .. } = harness;
-        seed_mint_events(
-            &pool,
+        let backoff = Duration::from_millis(5);
+        let max_no_progress_polls = 8;
+        let start = tokio::time::Instant::now();
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
             &issuer_request_id,
-            callback_pending_events(&issuer_request_id),
+            backoff,
+            max_no_progress_polls,
         )
         .await;
-        let handler = MintRecoveryHandler::new(
-            mint_store.clone(),
-            pool.clone(),
-            apalis_pool,
-        );
-
-        handler
-            .on_itn_receipt_discovered(
-                issuer_request_id.clone(),
-                b256!(
-                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                ),
-            )
-            .await;
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !logs_contain_at!(
-                Level::DEBUG,
-                &[
-                    "receipt_discovery_does_not_send_callback_from_callback_pending",
-                    "Receipt discovery ignored for current mint state",
-                ]
-            ) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("receipt-triggered recovery should finish");
-
-        let mint = mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(mint, Mint::CallbackPending { .. }));
-        let queued: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
-        )
-        .bind(issuer_request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(queued, 0);
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn completed_mint_returns_cleanly() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = completed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-
-        recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-        )
-        .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        let elapsed = start.elapsed();
 
         assert!(
-            matches!(mint, Mint::Completed { .. }),
-            "Expected Completed state, got: {}",
-            mint.state_name()
-        );
-
-        let test = "completed_mint_returns_cleanly";
-        assert_eq!(
-            log_count_at!(Level::INFO, &[test, "Mint recovery complete"]),
-            1,
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn journal_confirmed_recovery_waits_for_wallet_lock() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = journal_confirmed_events(&issuer_request_id);
-        let fixture = setup_with_receipt_and_events(events).await;
-        let wallet_guard = fixture.vault.lock_wallet().await;
-
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(100),
-            recover_mint(
-                fixture.mint_store.as_ref(),
-                &fixture.vault,
-                issuer_request_id.clone(),
-            ),
-        )
-        .await;
-
-        assert!(blocked.is_err(), "recovery must wait for the wallet lock");
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, Mint::JournalConfirmed { .. }),
-            "recovery must not advance toward signing without the wallet lock"
-        );
-
-        drop(wallet_guard);
-        recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-        )
-        .await;
-
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(mint, Mint::Completed { .. }));
-        assert_eq!(
-            log_count_at!(
-                Level::INFO,
-                &[
-                    "journal_confirmed_recovery_waits_for_wallet_lock",
-                    "Mint recovery complete",
-                ]
-            ),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn recovery_reloads_state_and_releases_obsolete_wallet_lock() {
-        let issuer_request_id = test_issuer_request_id();
-        let vault = Arc::new(MockVaultService::new_success());
-        let alpaca =
-            Arc::new(MockAlpacaService::new_success().with_callback_delay(500));
-        let fixture = MintRecoveryFixture::new_with_services(
-            vault.clone(),
-            alpaca.clone(),
-        )
-        .await;
-        let fixture = setup_fixture_with_receipt_and_events(
-            fixture,
-            minting_events(&issuer_request_id),
-        )
-        .await;
-        let wallet_guard = fixture.vault.lock_wallet().await;
-        let mint_store = fixture.mint_store.clone();
-        let recovery_vault = fixture.vault.clone();
-        let recovery_id = issuer_request_id.clone();
-        let recovery = tokio::spawn(async move {
-            recover_mint(mint_store.as_ref(), &recovery_vault, recovery_id)
-                .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while vault.get_wallet_lock_call_count() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("recovery must begin waiting for the wallet lock");
-
-        fixture
-            .mint_store
-            .send(
-                &issuer_request_id,
-                MintCommand::Recover {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            )
-            .await
-            .expect("concurrent receipt recovery should advance the mint");
-        drop(wallet_guard);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while alpaca.get_call_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("callback must start after the aggregate reload");
-
-        let available_guard = tokio::time::timeout(
-            Duration::from_millis(100),
-            fixture.vault.lock_wallet(),
-        )
-        .await
-        .expect("callback delivery must not retain the obsolete wallet lock");
-        drop(available_guard);
-
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), recovery)
-                .await
-                .expect("recovery should finish after callback delivery")
-                .expect("recovery task should not panic"),
-            DriveOutcome::Done,
-        );
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(mint, Mint::Completed { .. }));
-        assert_eq!(
-            log_count_at!(
-                Level::INFO,
-                &[
-                    "recovery_reloads_state_and_releases_obsolete_wallet_lock",
-                    "Mint recovery complete",
-                ]
-            ),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn wallet_recovery_step_defers_concurrent_callback_state() {
-        let issuer_request_id = test_issuer_request_id();
-        let vault = Arc::new(MockVaultService::new_success());
-        let alpaca =
-            Arc::new(MockAlpacaService::new_success().with_callback_delay(500));
-        let fixture =
-            MintRecoveryFixture::new_with_services(vault, alpaca.clone()).await;
-        fixture
-            .seed_mint_events(
-                &issuer_request_id,
-                callback_pending_events(&issuer_request_id),
-            )
-            .await;
-
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            fixture.mint_store.send(
-                &issuer_request_id,
-                MintCommand::RecoverWalletStep {
-                    issuer_request_id: issuer_request_id.clone(),
-                    mode: MintRecoveryMode::Automatic,
-                },
-            ),
-        )
-        .await
-        .expect("wallet recovery step must not call Alpaca")
-        .expect("callback deferral should be a successful no-op");
-
-        assert_eq!(alpaca.get_call_count(), 0);
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(mint, Mint::CallbackPending { .. }));
-        assert_eq!(
-            log_count_at!(
-                Level::DEBUG,
-                &[
-                    "wallet_recovery_step_defers_concurrent_callback_state",
-                    "Deferring callback from wallet-locked recovery step",
-                ]
-            ),
-            1,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn wallet_recovery_noop_converges_on_next_unlocked_iteration() {
-        let issuer_request_id = test_issuer_request_id();
-        let vault = Arc::new(MockVaultService::new_success());
-        let alpaca = Arc::new(MockAlpacaService::new_success());
-        let fixture =
-            MintRecoveryFixture::new_with_services(vault, alpaca.clone()).await;
-        fixture
-            .seed_mint_events(
-                &issuer_request_id,
-                callback_pending_events(&issuer_request_id),
-            )
-            .await;
-        let classifications = Arc::new(AtomicUsize::new(0));
-        let classifier_calls = classifications.clone();
-
-        let outcome = drive_recovery(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-            RetryPolicy::Bypass,
-            move |_| classifier_calls.fetch_add(1, Ordering::Relaxed) < 2,
-            |_, id, wallet_locked| {
-                if wallet_locked {
-                    MintCommand::RecoverWalletStep {
-                        issuer_request_id: id,
-                        mode: MintRecoveryMode::Automatic,
-                    }
-                } else {
-                    MintCommand::Recover {
-                        issuer_request_id: id,
-                        mode: MintRecoveryMode::Automatic,
-                    }
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::NoProgressBudgetExhausted
                 }
-            },
-        )
-        .await;
-
-        assert_eq!(outcome, DriveOutcome::Done);
-        assert_eq!(alpaca.get_call_count(), 1);
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(matches!(mint, Mint::Completed { .. }));
-        assert_eq!(
-            log_count_at!(
-                Level::DEBUG,
-                &[
-                    "wallet_recovery_noop_converges_on_next_unlocked_iteration",
-                    "Deferring callback from wallet-locked recovery step",
-                ]
             ),
-            1,
+            "No-progress budget exhaustion must report Abandoned, not Resolved"
         );
-        assert_eq!(
-            log_count_at!(
-                Level::INFO,
-                &[
-                    "wallet_recovery_noop_converges_on_next_unlocked_iteration",
-                    "Mint recovery complete",
-                ]
-            ),
-            1,
+
+        assert!(
+            elapsed
+                >= backoff
+                    * (u32::try_from(max_no_progress_polls).unwrap() - 1),
+            "Scheduled recovery must sleep the backoff on each no-progress \
+             poll, elapsed={elapsed:?}"
         );
-    }
-
-    /// When a mint is in `TxSubmitted` and `confirm_mint` fails, the recovery
-    /// pass emits `MintingFailed` (attempts=1) and succeeds. Post-step
-    /// classification observes the 1-minute backoff window and returns
-    /// `RetryNotDue` without sending another command.
-    #[traced_test]
-    #[tokio::test]
-    async fn tx_submitted_confirm_failure_transitions_to_minting_failed_then_retry_not_due()
-     {
-        let issuer_request_id = test_issuer_request_id();
-        let events = tx_submitted_events(&issuer_request_id);
-        let fixture = MintRecoveryFixture::new_with_vault(Arc::new(
-            MockVaultService::new_failure(),
-        ))
-        .await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        // First pass: confirm_mint fails → MintingFailed emitted. The step
-        // succeeds, then classification observes that the retry is not due.
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-        )
-        .await;
 
         let mint =
             fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-
         assert!(
-            matches!(mint, Mint::MintingFailed { .. }),
-            "Expected MintingFailed after confirm failure, got: {}",
-            mint.state_name()
-        );
-        assert_eq!(
-            outcome,
-            DriveOutcome::RetryNotDue,
-            "Expected RetryNotDue after immediate re-check of fresh failure"
-        );
-        assert!(
-            log_count_at!(
-                Level::WARN,
-                &["On-chain deposit confirmation failed"]
-            ) > 0,
-            "Expected confirmation-failure warning"
-        );
-        let test = "tx_submitted_confirm_failure_transitions_to_minting_failed_then_retry_not_due";
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            1,
-            "post-step classification must stop without a second command"
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-            "RetryNotDue is expected control flow, not a command error"
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn initial_retry_wait_returns_without_sending_command() {
-        let issuer_request_id = test_issuer_request_id();
-        let events = minting_failed_events(&issuer_request_id);
-        let fixture = MintRecoveryFixture::new().await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id,
-        )
-        .await;
-
-        assert_eq!(outcome, DriveOutcome::RetryNotDue);
-        let test = "initial_retry_wait_returns_without_sending_command";
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            0,
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn initial_retry_exhaustion_returns_without_sending_command() {
-        let issuer_request_id = test_issuer_request_id();
-        let failed_at = Utc::now() - ChronoDuration::hours(24);
-        let mut events = minting_events(&issuer_request_id);
-        for _ in 0..=Mint::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT {
-            events.push(MintEvent::MintingFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "timeout".to_string(),
-                failed_at,
-            });
-        }
-        let fixture = MintRecoveryFixture::new().await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id,
-        )
-        .await;
-
-        assert_eq!(outcome, DriveOutcome::Exhausted);
-        let test = "initial_retry_exhaustion_returns_without_sending_command";
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            0,
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-        );
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn failed_final_attempt_returns_exhausted_without_extra_command() {
-        let issuer_request_id = test_issuer_request_id();
-        let failed_at = Utc::now() - ChronoDuration::hours(24);
-        let mut events = minting_events(&issuer_request_id);
-        for _ in 0..Mint::MAX_AUTOMATIC_MINT_RETRY_ATTEMPT {
-            events.push(MintEvent::MintingFailed {
-                issuer_request_id: issuer_request_id.clone(),
-                error: "timeout".to_string(),
-                failed_at,
-            });
-        }
-        let fixture = MintRecoveryFixture::new_with_vault(Arc::new(
-            MockVaultService::new_prepare_tx_failure(),
-        ))
-        .await;
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id,
-        )
-        .await;
-
-        assert_eq!(outcome, DriveOutcome::Exhausted);
-        let test =
-            "failed_final_attempt_returns_exhausted_without_extra_command";
-        assert_eq!(
-            log_count_at!(Level::DEBUG, &[test, "Recovery step succeeded"]),
-            1,
-        );
-        assert_eq!(
-            log_count_at!(
-                Level::ERROR,
-                &[test, "Command handler returned domain error"]
-            ),
-            0,
-        );
-    }
-
-    /// When a known `tx_id` is in the `MintingFailed` predecessor and the retry
-    /// window has elapsed (`failed_at` old enough for `Ready`), a transient
-    /// `confirm_mint` failure must NOT trigger a new submission — it must return
-    /// `RetryNotDue` so the next recovery pass retries confirming the same tx.
-    ///
-    /// Without the fix, the old code called `submit_recovery_mint` unconditionally
-    /// on any confirm error, which would submit a fresh tx while the original was
-    /// still pending, creating duplicate backed tokens for one journal.
-    #[traced_test]
-    #[tokio::test]
-    async fn minting_failed_with_known_tx_transient_confirm_error_does_not_resubmit()
-     {
-        let issuer_request_id = test_issuer_request_id();
-        // new_failure() makes confirm_mint return Err(VaultError::InvalidReceipt),
-        // a non-terminal error.
-        let fixture = MintRecoveryFixture::new_with_vault(Arc::new(
-            MockVaultService::new_failure(),
-        ))
-        .await;
-
-        // Seed: Initiated → JournalConfirmed → MintingStarted → MintTxSubmitted
-        //       → MintingFailed with failed_at 24h ago (retry window: Ready).
-        let failed_at = Utc::now() - ChronoDuration::hours(24);
-        let mut events = tx_submitted_events(&issuer_request_id);
-        events.push(MintEvent::MintingFailed {
-            issuer_request_id: issuer_request_id.clone(),
-            error: "timeout".to_string(),
-            failed_at,
-        });
-        fixture.seed_mint_events(&issuer_request_id, events).await;
-
-        let outcome = recover_mint(
-            fixture.mint_store.as_ref(),
-            &fixture.vault,
-            issuer_request_id.clone(),
-        )
-        .await;
-
-        // Must back off, not submit a new tx.
-        assert_eq!(
-            outcome,
-            DriveOutcome::RetryNotDue,
-            "transient confirm error must not submit a replacement tx"
-        );
-
-        // No new mint transaction was submitted.
-        let mint =
-            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, Mint::MintingFailed { .. }),
-            "Aggregate must stay in MintingFailed, got: {}",
+            matches!(mint, Mint::Minting { .. }),
+            "drive_one_step retries MintingFailed into Minting and re-enqueues \
+             the submission, got: {}",
             mint.state_name()
         );
 
+        let test = "scheduled_recovery_backs_off_without_progress";
         assert!(
             log_count_at!(
                 Level::WARN,
-                &["Mint confirm returned transient error"]
-            ) > 0,
-            "Expected transient-error warning"
-        );
-    }
-
-    /// `recover_mint_until_automatic_budget_exhausted` stops and logs a warning
-    /// after exceeding `MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS` consecutive
-    /// `DriveOutcome::Failed` outcomes. This uses a mint whose underlying asset
-    /// is not registered in the `TokenizedAsset` projection, causing every
-    /// `Recover` command to fail with `AssetNotFound` (surfacing as `Failed`).
-    #[traced_test]
-    #[tokio::test]
-    async fn scheduled_recovery_stops_after_max_failure_backoffs() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-        // Intentionally skip TokenizedAsset registration so that every
-        // Recover command fails with AssetNotFound → DriveOutcome::Failed.
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-        let vault: Arc<dyn VaultService> =
-            Arc::new(MockVaultService::new_success());
-        let services = MintServices::with_single_vault(
-            Network::Base,
-            ANVIL_CHAIN_ID,
-            vault.clone(),
-            Arc::new(MockAlpacaService::new_success()),
-            Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool.clone(),
-            BOT,
-        );
-        let mint_store = Arc::new(test_store::<Mint>(pool.clone(), services));
-
-        let issuer_request_id = test_issuer_request_id();
-
-        // Seed a MintingFailed with failed_at 24h in the past so the retry
-        // window is always Ready, and attempts=0 so exhaustion is not hit.
-        let failed_at = Utc::now() - ChronoDuration::hours(24);
-        let mut events = minting_events(&issuer_request_id);
-        events.push(MintEvent::MintingFailed {
-            issuer_request_id: issuer_request_id.clone(),
-            error: "timeout".to_string(),
-            failed_at,
-        });
-
-        let aggregate_id = issuer_request_id.to_string();
-        for (offset, event) in events.into_iter().enumerate() {
-            let sequence = i64::try_from(offset).unwrap() + 1;
-            let payload = serde_json::to_value(&event).unwrap();
-            let variant = payload
-                .as_object()
-                .and_then(|map| map.keys().next())
-                .expect("MintEvent serializes as an externally-tagged enum")
-                .clone();
-            let event_type = format!("MintEvent::{variant}");
-            let payload_str = payload.to_string();
-
-            sqlx::query(
-                "
-                INSERT INTO events (
-                    aggregate_type,
-                    aggregate_id,
-                    sequence,
-                    event_type,
-                    event_version,
-                    payload,
-                    metadata
-                )
-                VALUES ('Mint', ?, ?, ?, '1.0', ?, '{}')
-                ",
-            )
-            .bind(&aggregate_id)
-            .bind(sequence)
-            .bind(&event_type)
-            .bind(&payload_str)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        // Zero backoff so the test does not sleep.
-        recover_mint_until_automatic_budget_exhausted(
-            mint_store.as_ref(),
-            &vault,
-            &issuer_request_id,
-            Duration::ZERO,
-        )
-        .await;
-
-        assert!(
-            log_count_at!(
-                Level::WARN,
-                &[
-                    "Scheduled mint recovery stopped after maximum failure backoffs"
-                ]
-            ) > 0,
-            "Expected exhaustion warning after max failure backoffs"
+                &[test, "stopped after maximum polls without progress"]
+            ) >= 1,
+            "Loop must stop with a warning once the no-progress budget is spent"
         );
     }
 
@@ -2724,6 +1369,47 @@ mod tests {
         );
     }
 
+    /// The budget loop must report `Abandoned` — not a clean conclusion — when
+    /// it gives up on a still-incomplete mint (here a re-submission that never
+    /// completes, outlasting the no-progress budget), so the job is recorded as
+    /// Killed rather than a success that hides a stuck mint.
+    #[traced_test]
+    #[tokio::test]
+    async fn budget_loop_reports_abandoned_when_no_progress_budget_spent() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::minutes(2);
+        let events = tx_failed_events(&issuer_request_id, failed_at);
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let conclusion = recover_mint_until_automatic_budget_exhausted(
+            &fixture.context(),
+            &issuer_request_id,
+            Duration::from_millis(1),
+            2,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                conclusion,
+                RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::NoProgressBudgetExhausted
+                }
+            ),
+            "a mint that outlasts its budget must abandon, not resolve"
+        );
+
+        let test = "budget_loop_reports_abandoned_when_no_progress_budget_spent";
+        assert!(
+            log_count_at!(
+                Level::WARN,
+                &[test, "stopped after maximum polls without progress"]
+            ) >= 1,
+            "abandoning on the no-progress budget must log the WARN"
+        );
+    }
+
     /// `MintRecoveryJob::perform` resolves cleanly (`Ok`) when there is nothing
     /// to recover — an absent mint — so apalis records the job as Done. Also
     /// exercises the job's dispatch into the budget loop.
@@ -2734,10 +1420,7 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
 
         let result = MintRecoveryJob { issuer_request_id }
-            .perform(&MintRecoveryJobCtx {
-                mint_store: fixture.mint_store.clone(),
-                vault_service: fixture.vault.clone(),
-            })
+            .perform(&fixture.context())
             .await;
 
         assert!(
@@ -2780,10 +1463,7 @@ mod tests {
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let error = MintRecoveryJob { issuer_request_id }
-            .perform(&MintRecoveryJobCtx {
-                mint_store: fixture.mint_store.clone(),
-                vault_service: fixture.vault.clone(),
-            })
+            .perform(&fixture.context())
             .await
             .expect_err("an exhausted mint must abort, not resolve");
 
