@@ -56,18 +56,19 @@ resource "digitalocean_firewall" "st0x_issuance" {
 
   # Tailscale WireGuard -- must be publicly reachable for NAT traversal.
   # Authentication is handled by WireGuard's Noise protocol, not by IP filtering.
-  # All other access (SSH, issuance API) goes through the tailnet.
+  # Operator access (SSH/admin) goes through the tailnet.
   inbound_rule {
     protocol         = "udp"
     port_range       = "41641"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
-  # Public HTTPS for Alpaca callbacks (/accounts/connect, /inkind/issuance, /inkind/issuance/confirm)
-  # Ideally restricted to Alpaca's IP ranges for enhanced security.
+  # Public issuance API for Alpaca callbacks. Keep port 8000 to preserve the
+  # pre-NixOS Docker endpoint and avoid requiring an Alpaca configuration change.
+  # App-level auth still enforces X-API-KEY and ALPACA_IP_RANGES.
   inbound_rule {
     protocol         = "tcp"
-    port_range       = "443"
+    port_range       = "8000"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 

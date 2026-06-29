@@ -93,7 +93,7 @@ let
     commonArgs
     // {
       inherit cargoArtifacts;
-      cargoExtraArgs = "--bin st0x-issuance --bin issuer";
+      cargoExtraArgs = "--bin st0x-issuance --bin issuer --bin validate-config";
     }
   );
 

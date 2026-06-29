@@ -21,7 +21,7 @@ moved {
 }
 moved {
   from = digitalocean_firewall.st0x
-  to   = module.prod.digitalocean_firewall.st0x
+  to   = module.prod.digitalocean_firewall.st0x_issuance
 }
 
 module "prod" {

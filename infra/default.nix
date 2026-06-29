@@ -222,7 +222,7 @@ let
           ${resolveHost}
           trap _cleanup_identity EXIT
           # shellcheck disable=SC2029
-          exec ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
         '';
       };
 

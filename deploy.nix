@@ -53,6 +53,13 @@ let
       pkg = self.packages.${system}.${cfg.package};
       envSecretsFile = ./secret + "/${name}-${env}.env.age";
       fireblocksKeyFile = ./secret + "/fireblocks-secret-issuance-${env}.key.age";
+      deploymentEnvironment =
+        if env == "prod" then
+          "production"
+        else if env == "staging" then
+          "staging"
+        else
+          throw "Unsupported environment '${env}'";
     in
     activate.custom pkg (
       builtins.concatStringsSep " && " [
@@ -69,6 +76,10 @@ let
 
         # Decrypt Fireblocks RSA private key
         "${rage} -d -i ${hostKey} ${fireblocksKeyFile} | install -D -m 0440 -o root -g st0x /dev/stdin ${cfg.decryptedFireblocksKeyPath}"
+
+        # Validate config + secrets before restarting. If validation fails,
+        # deploy-rs exits non-zero and rolls back instead of starting bad config.
+        "set -a; . ${cfg.decryptedEnvPath}; set +a; DATABASE_URL=sqlite:///mnt/data/issuance.db FIREBLOCKS_SECRET_PATH=${cfg.decryptedFireblocksKeyPath} ENVIRONMENT=${deploymentEnvironment} ${cfg.profilePath}/bin/validate-config"
 
         # Chown existing data files so st0x user can open them after a fresh deploy
         "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
@@ -214,6 +225,7 @@ in
               export NIX_SSHOPTS="-i $identity"
               ssh_flag="--ssh-opts=-i $identity"
             fi
+            trap _cleanup_identity EXIT
           '';
 
           mkDeployScript =
