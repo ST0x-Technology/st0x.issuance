@@ -325,7 +325,7 @@
 
                 export env flake_config host_key_field identity
 
-                exec ${./scripts/bootstrap.sh} "$@"
+                ${./scripts/bootstrap.sh} "$@"
               '';
             };
 
@@ -347,7 +347,7 @@
               text = ''
                 ${infraPkgs.parseIdentity}
                 trap _cleanup_identity EXIT
-                exec ${rekeySecrets}
+                ${rekeySecrets}
               '';
             };
           }

@@ -1,12 +1,11 @@
 # Tailscale stack for deployed issuance hosts: enrolls the node onto
 # our tailnet via a per-environment agenix-encrypted auth key, opens
 # the WireGuard port, and marks `tailscale0` as a trusted firewall
-# interface so SSH and the issuance HTTP API are reachable over the
-# tailnet without any public exposure.
+# interface so SSH/admin traffic can remain private.
 #
 # Unlike the liquidity host there is no nginx / TLS cert step here —
-# the issuance API is served plain HTTP on port 8000 and WireGuard
-# provides transport-layer encryption within the tailnet.
+# the issuance API preserves the existing public plain-HTTP Alpaca endpoint
+# on port 8000, while operators use the same service over the tailnet.
 #
 # `tailscaled.ExecStartPre` deletes the stale `tailscale0` TUN device
 # so the unit doesn't crash-loop when a previous tailscaled hasn't

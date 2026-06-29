@@ -118,11 +118,9 @@ in
 
   networking.firewall = {
     enable = true;
-    # All inbound access is gated by the DO Cloud Firewall (infra/modules/stack)
-    # which only permits Tailscale WireGuard. SSH and the issuance API are
-    # reached exclusively over tailscale0, which is configured as a trusted
-    # interface in tailscale.nix and bypasses the NixOS firewall entirely.
-    allowedTCPPorts = [ 443 ];
+    # Public Alpaca callbacks keep the pre-NixOS Docker endpoint on port 8000.
+    # SSH/admin traffic remains tailnet-only via trustedInterfaces in tailscale.nix.
+    allowedTCPPorts = [ 8000 ];
   };
 
   fileSystems."/mnt/data" = {

@@ -21,7 +21,7 @@ rec {
     ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIARWUchVuQvkFm2tzspdC79hhRyYbWzRjs5iimhxewUy";
     # purpose: initial key for Digital Ocean to include when first creating
     # the instance and it's matched by name in their dashboard
-    st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5d194pWSWEibDbihvi/QaV11DIZNTGeuUuZ24mCm2Z";
+    st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
 
     # purpose: used by the remote host to decrypt ragenix secrets we need for
     # the system to work at all. auto-generated during bootstrap when
