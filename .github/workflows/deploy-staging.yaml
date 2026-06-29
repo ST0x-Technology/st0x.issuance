@@ -31,13 +31,13 @@ jobs:
       - name: Verify tag is on main
         run: |
           git fetch --tags origin main
-          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
-            echo "ERROR: '${{ inputs.tag }}' is not an existing tag" >&2
+          if ! git rev-parse -q --verify "refs/tags/${{ inputs.ref }}" >/dev/null; then
+            echo "ERROR: '${{ inputs.ref }}' is not an existing tag" >&2
             exit 1
           fi
-          tag_commit="$(git rev-list -n 1 "refs/tags/${{ inputs.tag }}")"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${{ inputs.ref }}")"
           if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "ERROR: tag ${{ inputs.tag }} is not on main" >&2
+            echo "ERROR: tag ${{ inputs.ref }} is not on main" >&2
             exit 1
           fi
 
