@@ -1,10 +1,9 @@
 let
   inherit (import ../keys.nix) roles;
   # services.nix is `{ lib }: { byName, enabled }`. These rules only read each
-  # service's `kind`/`encryptedEnvSecret`/`encryptedFireblocksKey` from the
-  # `byName` map; `enabled` (the sole consumer of `lib`) is never forced here,
-  # so a stub `lib` keeps this rules file evaluable under ragenix's pure,
-  # NIX_PATH-free eval.
+  # service's `kind` from the `byName` map; `enabled` (the sole consumer of
+  # `lib`) is never forced here, so a stub `lib` keeps this rules file
+  # evaluable under ragenix's pure, NIX_PATH-free eval.
   services =
     (import ../services.nix {
       lib = {
@@ -12,38 +11,35 @@ let
       };
     }).byName;
 
-  # Deduplicate keys across environments (st0x-op appears in both roles).
-  dedup = builtins.foldl' (acc: key: if builtins.elem key acc then acc else acc ++ [ key ]) [ ];
-  allServiceKeys = dedup (roles.prod.service ++ roles.staging.service);
+  envNames = [
+    "prod"
+    "staging"
+  ];
 
-  # Service secrets are encrypted to both environments' service roles.
-  # Each environment's deploy.nix decrypts with its own host key.
   issuanceServiceNames = builtins.filter (name: services.${name}.kind == "st0x") (
     builtins.attrNames services
   );
 
-  # For each issuance-kind service, create rules for both the env file
-  # and the fireblocks key (deduplicated since all services share one key file).
-  fireblocksKeyNames = builtins.foldl' (
-    acc: name:
-    let
-      keyName = services.${name}.encryptedFireblocksKey;
-    in
-    if builtins.elem keyName acc then acc else acc ++ [ keyName ]
-  ) [ ] issuanceServiceNames;
-
+  # Each environment's env file is encrypted only to that environment's host
+  # key — a staging compromise cannot decrypt production credentials.
   envSecretRules = builtins.listToAttrs (
-    map (name: {
-      name = services.${name}.encryptedEnvSecret;
-      value.publicKeys = allServiceKeys;
-    }) issuanceServiceNames
+    builtins.concatLists (
+      map (
+        env:
+        map (name: {
+          name = "${name}-${env}.env.age";
+          value.publicKeys = roles.${env}.service;
+        }) issuanceServiceNames
+      ) envNames
+    )
   );
 
+  # One Fireblocks signing key per environment, scoped to that environment only.
   fireblocksKeyRules = builtins.listToAttrs (
-    map (keyName: {
-      name = keyName;
-      value.publicKeys = allServiceKeys;
-    }) fireblocksKeyNames
+    map (env: {
+      name = "fireblocks-secret-issuance-${env}.key.age";
+      value.publicKeys = roles.${env}.service;
+    }) envNames
   );
 
 in

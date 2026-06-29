@@ -21,25 +21,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ inputs.ref }}
           submodules: recursive
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Verify tag is on main
+        run: |
+          git fetch --tags origin main
+          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
+            echo "ERROR: '${{ inputs.tag }}' is not an existing tag" >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-list -n 1 "refs/tags/${{ inputs.tag }}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "ERROR: tag ${{ inputs.tag }} is not on main" >&2
+            exit 1
+          fi
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25  # v22
         with:
           extra-conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d  # v14
         continue-on-error: true
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
 

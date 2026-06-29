@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM tokenized_asset_view\n        WHERE json_extract(payload, '$.Live.status') IN ('Enabled', 'Frozen')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "live: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1a60b023e9b4d01b97c9ea1a353d09b477dd2caad6f20ae5c20a73cf9d401053"
+}

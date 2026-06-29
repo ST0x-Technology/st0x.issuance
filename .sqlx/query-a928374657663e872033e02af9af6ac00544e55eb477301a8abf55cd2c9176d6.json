@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT view_id as \"view_id!: String\", payload as \"payload!: String\"\n        FROM redemption_view\n        WHERE json_extract(payload, '$.BurnFailed') IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "view_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "redemption_view",
+            "name": "view_id"
+          }
+        }
+      },
+      {
+        "name": "payload!: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "redemption_view",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "a928374657663e872033e02af9af6ac00544e55eb477301a8abf55cd2c9176d6"
+}

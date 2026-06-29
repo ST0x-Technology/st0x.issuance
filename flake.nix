@@ -321,6 +321,7 @@
                 esac
 
                 ${infraPkgs.parseIdentity}
+                trap _cleanup_identity EXIT
 
                 export env flake_config host_key_field identity
 
@@ -345,6 +346,7 @@
               runtimeInputs = [ ragenixPkg ];
               text = ''
                 ${infraPkgs.parseIdentity}
+                trap _cleanup_identity EXIT
                 exec ${rekeySecrets}
               '';
             };

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM receipt_burns_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "490dda713c30140964cd32fbbe1266ffaeb736db8e81174dd7317390b18f75c5"
+}

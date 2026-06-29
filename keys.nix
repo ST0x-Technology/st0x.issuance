@@ -21,12 +21,12 @@ rec {
     ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIARWUchVuQvkFm2tzspdC79hhRyYbWzRjs5iimhxewUy";
     # purpose: initial key for Digital Ocean to include when first creating
     # the instance and it's matched by name in their dashboard
-    st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
+    st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5d194pWSWEibDbihvi/QaV11DIZNTGeuUuZ24mCm2Z";
 
     # purpose: used by the remote host to decrypt ragenix secrets we need for
     # the system to work at all. auto-generated during bootstrap when
     # nixos-anywhere turns the initially ubuntu instance into nixos.
-    # PLACEHOLDER: replace with real key after `nix run .#prodBootstrap` (see BOOTSTRAP.md).
+    # PLACEHOLDER: replace with real key after `nix run .#prodBootstrap`
     host-prod = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     # PLACEHOLDER: replace with real key after `nix run .#stagingBootstrap`.
     host-staging = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -36,7 +36,6 @@ rec {
     # access to terraform state and encrypted vars (shared across environments)
     infra = [
       st0x-op
-      ci
     ];
 
     prod = {

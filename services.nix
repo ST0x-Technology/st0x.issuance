@@ -18,9 +18,11 @@ let
   # issuance-kind services carry an encrypted env file (all secret env vars)
   # plus an encrypted Fireblocks RSA private key, both installed by deploy.nix
   # before the unit restarts.
+  # Encrypted file names are per-environment (${name}-{env}.env.age /
+  # fireblocks-secret-issuance-{env}.key.age) and computed in deploy.nix where
+  # the target environment is known. Decrypted runtime paths are the same on
+  # every host since each environment runs on its own machine.
   issuanceFields = name: {
-    encryptedEnvSecret = "${name}.env.age";
-    encryptedFireblocksKey = "fireblocks-secret-issuance.key.age";
     decryptedEnvPath = "/run/agenix/${name}.env";
     decryptedFireblocksKeyPath = "/run/agenix/fireblocks-secret-issuance.key";
   };

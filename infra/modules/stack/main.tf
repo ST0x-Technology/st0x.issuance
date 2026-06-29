@@ -63,6 +63,14 @@ resource "digitalocean_firewall" "st0x_issuance" {
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
+  # Public HTTPS for Alpaca callbacks (/accounts/connect, /inkind/issuance, /inkind/issuance/confirm)
+  # Ideally restricted to Alpaca's IP ranges for enhanced security.
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "443"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
   # All outbound
   outbound_rule {
     protocol              = "tcp"

@@ -1,3 +1,29 @@
+# Migrate existing root-level resources into module.prod
+moved {
+  from = digitalocean_droplet.nixos
+  to   = module.prod.digitalocean_droplet.nixos
+}
+moved {
+  from = digitalocean_volume.data
+  to   = module.prod.digitalocean_volume.data
+}
+moved {
+  from = digitalocean_volume_attachment.data
+  to   = module.prod.digitalocean_volume_attachment.data
+}
+moved {
+  from = digitalocean_reserved_ip.nixos
+  to   = module.prod.digitalocean_reserved_ip.nixos
+}
+moved {
+  from = digitalocean_reserved_ip_assignment.nixos
+  to   = module.prod.digitalocean_reserved_ip_assignment.nixos
+}
+moved {
+  from = digitalocean_firewall.st0x
+  to   = module.prod.digitalocean_firewall.st0x
+}
+
 module "prod" {
   source = "./modules/stack"
 
