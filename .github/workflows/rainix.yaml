@@ -28,13 +28,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: nixbuild/nix-quick-install-action@v34
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
           # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
-          # of this action only shipped up to 2.26, so use v34 and pin a
+          # of this action only shipped up to 2.26, so use v35 and pin a
           # working release.
-          nix_version: "2.31.2"
+          nix_version: "2.31.5"
           nix_conf: |
             accept-flake-config = true
             fallback = true
@@ -82,9 +82,9 @@ jobs:
         with:
           # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
           # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
-          # of this action only shipped up to 2.26, so use v34 and pin a
+          # of this action only shipped up to 2.26, so use v35 and pin a
           # working release.
-          nix_version: "2.31.2"
+          nix_version: "2.31.5"
           nix_conf: |
             accept-flake-config = true
             fallback = true
