@@ -59,5 +59,11 @@ in
     "flakes"
   ];
 
+  # Must match os.nix. The broker implementation cannot be live-switched, so
+  # it must be present from the first boot (installed by nixos-anywhere) so
+  # the initial switch-to-configuration from prodDeployAll/stagingDeployAll
+  # finds it already active and does not attempt to change it.
+  services.dbus.implementation = "broker";
+
   system.stateVersion = "24.11";
 }

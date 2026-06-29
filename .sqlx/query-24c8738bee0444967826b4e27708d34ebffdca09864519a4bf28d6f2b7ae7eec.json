@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM account_view\n        WHERE json_extract(payload, '$.Live.Registered.email') = ?\n           OR json_extract(payload, '$.Live.LinkedToAlpaca.email') = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "live: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "24c8738bee0444967826b4e27708d34ebffdca09864519a4bf28d6f2b7ae7eec"
+}

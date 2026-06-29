@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM receipt_inventory_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "020cbdc0b57d268e4ccce8d128bd50b3f1121c54a96742b0781fd09690cc76a8"
+}

@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            aggregate_id as \"aggregate_id!: String\",\n            payload as \"payload!: String\"\n        FROM events\n        WHERE aggregate_type = 'Redemption'\n        ORDER BY aggregate_id, sequence\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "aggregate_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "aggregate_id"
+          }
+        }
+      },
+      {
+        "name": "payload!: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b05283fb40a113c82d1ce23046d4c14c3da54cb41812f70970b8d09a40f51425"
+}

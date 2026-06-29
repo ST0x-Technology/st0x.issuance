@@ -109,10 +109,11 @@ let
       shift 2
     elif [ -n "''${SSH_IDENTITY:-}" ]; then
       identity="$SSH_IDENTITY"
-    elif [ -f "$HOME/.ssh/id_ed25519" ]; then
-      identity="$HOME/.ssh/id_ed25519"
+    elif [ -f "${"HOME:-"}/.ssh/id_ed25519" ]; then
+      identity="${"HOME:-"}/.ssh/id_ed25519"
     else
-      identity=""
+      echo "ERROR: no identity found -- pass -i <path>, set SSH_IDENTITY, or use --op" >&2
+      exit 1
     fi
   '';
 
@@ -151,9 +152,9 @@ let
   preambleWithEncrypt = ''
     ${parseIdentity}
     on_exit() {
-      ${syncRemotes}
-      ${state.encrypt}
-      ${cleanupWithPlan}
+      (${syncRemotes}) || true
+      (${state.encrypt}) || true
+      ${cleanupWithPlan} || true
       _cleanup_identity
     }
     trap on_exit EXIT
@@ -193,6 +194,23 @@ let
         fi
       '';
 
+      requireDecryptedSecrets = ''
+        # shellcheck disable=SC2029
+        ssh ''${identity:+-i "$identity"} "root@$host_ip" '
+          activate=/nix/var/nix/profiles/per-service/st0x-issuance/deploy-rs-activate
+          if [ ! -f /run/agenix/st0x-issuance.env ] || [ ! -f /run/agenix/fireblocks-secret-issuance.key ]; then
+            echo "Decrypted secrets missing (tmpfs cleared after reboot); trying to re-run service activation to restore them..." >&2
+            if [ ! -x "$activate" ]; then
+              echo "ERROR: $activate not found!" >&2
+              echo "Run ${env}-deploy-service st0x-issuance to decrypt and install runtime secrets, then retry," >&2
+              echo "or alternatively run the full service deployment via deploy.nix instead." >&2
+              exit 1
+            fi
+            "$activate"
+          fi
+        '
+      '';
+
     in
     {
       inherit resolveIp resolveHost;
@@ -214,6 +232,7 @@ let
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
+          ${requireDecryptedSecrets}
           echo "Starting st0x-issuance on ${env}..."
           ssh ''${identity:+-i "$identity"} "root@$host_ip" \
             "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
@@ -240,6 +259,7 @@ let
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
+          ${requireDecryptedSecrets}
           echo "Restarting st0x-issuance on ${env}..."
           ssh ''${identity:+-i "$identity"} "root@$host_ip" \
             "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl restart st0x-issuance"
@@ -307,8 +327,10 @@ let
             ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-issuance.ready && systemctl start st0x-issuance"
             ssh_remote systemctl is-active st0x-issuance
             trap - EXIT
+            _cleanup_identity
           else
             trap - EXIT
+            _cleanup_identity
             echo "Bot left stopped (--stopped flag). Start manually with ${env}-service-start."
           fi
 

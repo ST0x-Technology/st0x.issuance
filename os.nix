@@ -92,6 +92,7 @@ in
 
     openssh = {
       enable = true;
+      openFirewall = false;
       settings = {
         PasswordAuthentication = false;
         PermitRootLogin = "prohibit-password";
@@ -121,7 +122,7 @@ in
     # which only permits Tailscale WireGuard. SSH and the issuance API are
     # reached exclusively over tailscale0, which is configured as a trusted
     # interface in tailscale.nix and bypasses the NixOS firewall entirely.
-    allowedTCPPorts = [ ];
+    allowedTCPPorts = [ 443 ];
   };
 
   fileSystems."/mnt/data" = {

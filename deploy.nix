@@ -47,15 +47,19 @@ let
   #
   # If any step fails, deploy-rs exits non-zero and rolls back automatically.
   mkIssuanceProfile =
-    _env: name:
+    env: name:
     let
       cfg = enabled.${name};
       pkg = self.packages.${system}.${cfg.package};
-      envSecretsFile = ./secret/${cfg.encryptedEnvSecret};
-      fireblocksKeyFile = ./secret/${cfg.encryptedFireblocksKey};
+      envSecretsFile = ./secret + "/${name}-${env}.env.age";
+      fireblocksKeyFile = ./secret + "/fireblocks-secret-issuance-${env}.key.age";
     in
     activate.custom pkg (
       builtins.concatStringsSep " && " [
+        # pipefail makes the rage | install pipes fail if rage exits non-zero,
+        # preventing an empty credential file from being written and the service
+        # restarted with empty creds.
+        "set -o pipefail"
         "systemctl stop ${name} || true"
         "rm -f ${cfg.markerFile}"
         "mkdir -p /run/st0x /run/agenix"
