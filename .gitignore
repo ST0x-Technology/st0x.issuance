@@ -1,7 +1,6 @@
 .direnv/
 .DS_Store
 .idea/
-.sqlx/
 target/
 .env
 .pre-commit-config.yaml
@@ -14,3 +13,4 @@ claude-local-ctx/
 .tmp/
 /result
 /result-*
+/abis

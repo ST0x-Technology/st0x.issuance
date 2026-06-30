@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT payload as \"payload!: String\"\n            FROM receipt_inventory_view\n            WHERE view_id = ?\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "payload!: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "receipt_inventory_view",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a0e7fd4ad322954aadcb28e53fa73ceff9322223ac20b389465e745625f4ff2e"
+}
