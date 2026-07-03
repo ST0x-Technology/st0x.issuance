@@ -62,7 +62,9 @@ impl std::fmt::Display for TokenSymbol {
 /// values already persisted in the event store are unchanged. Modeling it as an
 /// enum (rather than an opaque `String`) means an unsupported network is now a
 /// deserialization error instead of a value that silently flows through.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Network {

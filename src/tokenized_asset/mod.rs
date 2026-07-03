@@ -96,7 +96,7 @@ impl EventSourced for TokenizedAsset {
             } => Some(Self {
                 underlying: underlying.clone(),
                 token: token.clone(),
-                network: network.clone(),
+                network: *network,
                 vault: *vault,
                 status: AssetStatus::Enabled,
                 added_at: *added_at,
@@ -144,7 +144,7 @@ impl EventSourced for TokenizedAsset {
             } => Ok(Some(Self {
                 underlying: underlying.clone(),
                 token: token.clone(),
-                network: network.clone(),
+                network: *network,
                 vault: *vault,
                 added_at: *added_at,
                 // Preserve only the freeze `status`; everything else comes from
@@ -284,7 +284,7 @@ mod tests {
             .when(TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
                 token: token.clone(),
-                network: network.clone(),
+                network,
                 vault,
             })
             .await
@@ -557,7 +557,7 @@ mod tests {
             replay::<TokenizedAsset>(vec![TokenizedAssetEvent::Added {
                 underlying: underlying.clone(),
                 token: token.clone(),
-                network: network.clone(),
+                network,
                 vault,
                 added_at,
             }])

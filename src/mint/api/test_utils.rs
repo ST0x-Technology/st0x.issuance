@@ -198,7 +198,7 @@ impl TestHarness {
         let asset_cmd = TokenizedAssetCommand::Add {
             underlying: underlying.clone(),
             token: token.clone(),
-            network: network.clone(),
+            network,
             vault,
         };
 

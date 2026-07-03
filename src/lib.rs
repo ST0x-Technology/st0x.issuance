@@ -61,6 +61,7 @@ pub(crate) mod admin;
 pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
+pub(crate) mod chain;
 pub(crate) mod config;
 mod openapi;
 pub(crate) mod poll_checkpoint;
@@ -256,18 +257,26 @@ pub async fn initialize_rocket(
     let receipt_inventory_store =
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
-    let blockchain_setup = config.create_blockchain_setup().await?;
+    let chain_registry = config.create_chain_registry().await?;
+    let base = chain_registry.base()?;
     let alpaca_service = config.alpaca.service()?;
     let bot_wallet = config.signer.address()?;
+    info!(
+        target: "startup",
+        network = %base.network,
+        chain_id = base.chain_id,
+        subgraph_url = %base.subgraph_url,
+        "Chain runtime configured"
+    );
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
-    let vault_service_for_rocket = blockchain_setup.vault_service.clone();
+    let vault_service_for_rocket = base.vault_service.clone();
 
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(
             &pool,
             &receipt_inventory_store,
-            blockchain_setup.vault_service.clone(),
+            base.vault_service.clone(),
             alpaca_service.clone(),
             bot_wallet,
         )
@@ -275,7 +284,7 @@ pub async fn initialize_rocket(
 
     let managers = setup_redemption_managers(
         &config,
-        blockchain_setup.vault_service,
+        base.vault_service.clone(),
         &redemption_store,
         &receipt_inventory_store,
         &pool,
@@ -290,14 +299,17 @@ pub async fn initialize_rocket(
     rebuild_redemption_view(&pool).await?;
     rebuild_receipt_burns_view(&pool).await?;
 
+    crate::chain::validate_configured_asset_networks(&pool, &chain_registry)
+        .await?;
+
     // Receipt backfill must run before recovery so that recovery can check
     // receipt inventory to detect already-minted receipts (prevents double-mints).
     let vault_configs = run_all_receipt_backfills(
         &pool,
-        blockchain_setup.http_provider.clone(),
+        base.http_provider.clone(),
         &receipt_inventory_store,
         bot_wallet,
-        config.backfill_start_block,
+        base.backfill_start_block,
     )
     .await?;
 
@@ -309,7 +321,7 @@ pub async fn initialize_rocket(
         .collect();
 
     if let Err(error) = run_startup_reconciliation(
-        blockchain_setup.http_provider.clone(),
+        base.http_provider.clone(),
         &vault_receipt_pairs,
         &receipt_inventory_store,
         bot_wallet,
@@ -369,10 +381,10 @@ pub async fn initialize_rocket(
 
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
-        provider: blockchain_setup.http_provider.clone(),
+        provider: base.http_provider.clone(),
         receipt_inventory_store: receipt_inventory_store.clone(),
         bot_wallet,
-        backfill_start_block: config.backfill_start_block,
+        backfill_start_block: base.backfill_start_block,
         receipt_poll_interval: config.receipt_poll_interval,
         handler: MintRecoveryHandler::new(
             mint_store.clone(),
@@ -389,9 +401,9 @@ pub async fn initialize_rocket(
         );
 
         let poller = TransferPoller::new(TransferPollerConfig {
-            provider: blockchain_setup.http_provider,
+            provider: base.http_provider.clone(),
             bot_wallet,
-            backfill_start_block: config.backfill_start_block,
+            backfill_start_block: base.backfill_start_block,
             store: redemption_store.clone(),
             pool: pool.clone(),
             redeem_call_manager: managers.redeem_call.clone(),
