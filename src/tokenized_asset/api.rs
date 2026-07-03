@@ -280,6 +280,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph")
                 .expect("valid test URL"),
+            chains: Vec::new(),
         }
     }
 

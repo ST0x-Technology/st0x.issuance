@@ -22,12 +22,14 @@ use crate::tokenized_asset::view::{
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{VaultService, service::RealBlockchainService};
 
-pub(crate) struct ChainConfig {
-    pub(crate) network: Network,
-    pub(crate) chain_id: u64,
-    pub(crate) rpc_url: Url,
-    pub(crate) subgraph_url: Url,
-    pub(crate) backfill_start_block: u64,
+/// Per-chain RPC, vault, and subgraph settings for [`ChainRegistry`].
+#[derive(Clone)]
+pub struct ChainConfig {
+    pub network: Network,
+    pub chain_id: u64,
+    pub rpc_url: Url,
+    pub subgraph_url: Url,
+    pub backfill_start_block: u64,
 }
 
 pub(crate) struct ChainRuntime<P> {
@@ -105,6 +107,17 @@ impl<P> ChainRegistry<P> {
 
     pub(crate) fn base(&self) -> Result<&ChainRuntime<P>, ChainRegistryError> {
         self.get_required(&Network::Base)
+    }
+
+    pub(crate) fn clone_vault_services(
+        &self,
+    ) -> HashMap<Network, Arc<dyn VaultService>> {
+        self.runtimes
+            .iter()
+            .map(|(network, runtime)| {
+                (network.clone(), runtime.vault_service.clone())
+            })
+            .collect()
     }
 }
 
@@ -243,6 +256,26 @@ mod tests {
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 1,
         }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_chain_id_across_networks() {
+        let configs = vec![
+            base_config(8453),
+            ChainConfig {
+                network: Network::Ethereum,
+                chain_id: 8453,
+                rpc_url: Url::parse("wss://localhost:8546").unwrap(),
+                subgraph_url: Url::parse("http://localhost:0/subgraph")
+                    .unwrap(),
+                backfill_start_block: 1,
+            },
+        ];
+
+        assert!(matches!(
+            validate_chain_configs(&configs),
+            Err(ChainRegistryError::DuplicateChainId { .. })
+        ));
     }
 
     #[test]

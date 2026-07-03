@@ -27,8 +27,8 @@ use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
 };
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
-    LogLevel, SignerConfig,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
+    IpWhitelist, LogLevel, Network, SignerConfig,
 };
 
 pub async fn wait_for_shares<T>(
@@ -286,14 +286,31 @@ pub async fn preseed_tokenized_asset_into_pool(
     underlying: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let aggregate_id = format!("{underlying}:base");
+    preseed_tokenized_asset_into_pool_with_network(
+        pool,
+        vault,
+        underlying,
+        token,
+        Network::Base,
+    )
+    .await
+}
+
+pub async fn preseed_tokenized_asset_into_pool_with_network(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    vault: Address,
+    underlying: &str,
+    token: &str,
+    network: Network,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let aggregate_id = format!("{underlying}:{}", network.as_str());
     let now = Utc::now();
 
     let event_payload = json!({
         "Added": {
             "underlying": underlying,
             "token": token,
-            "network": "base",
+            "network": network.as_str(),
             "vault": vault,
             "added_at": now
         }
@@ -493,12 +510,13 @@ pub fn create_config_with_db(
     let mock_subgraph = setup_mock_subgraph(&vault_schemas);
     let subgraph_url =
         Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+    let rpc_url = Url::parse(&evm.endpoint)?;
 
     Ok((
         Config {
             database_url: db_path.to_string(),
             database_max_connections: 5,
-            rpc_url: Url::parse(&evm.endpoint)?,
+            rpc_url: rpc_url.clone(),
             chain_id: ANVIL_CHAIN_ID,
             signer: SignerConfig::Local(evm.private_key),
             backfill_start_block: 0,
@@ -525,10 +543,56 @@ pub fn create_config_with_db(
                 connect_timeout_secs: 10,
                 request_timeout_secs: 30,
             },
-            subgraph_url,
+            subgraph_url: subgraph_url.clone(),
+            chains: vec![ChainConfig {
+                network: Network::Base,
+                chain_id: ANVIL_CHAIN_ID,
+                rpc_url,
+                subgraph_url,
+                backfill_start_block: 0,
+            }],
         },
         mock_subgraph,
     ))
+}
+
+/// Builds a [`Config`] wired to two Anvil chains: Base and Ethereum, both
+/// entries in `Config::chains`. Both chains share the mock subgraph.
+pub fn create_multichain_config_with_db(
+    db_path: &str,
+    mock_alpaca: &MockServer,
+    base_evm: &LocalEvm,
+    eth_evm: &LocalEvm,
+) -> Result<(Config, MockServer), Box<dyn std::error::Error>> {
+    let vault_schemas = HashMap::from([
+        (base_evm.vault_address, TEST_OA_SCHEMA_HASH),
+        (eth_evm.vault_address, TEST_OA_SCHEMA_HASH),
+    ]);
+    let mock_subgraph = setup_mock_subgraph(&vault_schemas);
+    let subgraph_url =
+        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+
+    let (mut base_config, _) =
+        create_config_with_db(db_path, mock_alpaca, base_evm)?;
+    base_config.subgraph_url = subgraph_url.clone();
+    base_config.chains = vec![
+        ChainConfig {
+            network: Network::Base,
+            chain_id: ANVIL_CHAIN_ID,
+            rpc_url: Url::parse(&base_evm.endpoint)?,
+            subgraph_url: subgraph_url.clone(),
+            backfill_start_block: 0,
+        },
+        ChainConfig {
+            network: Network::Ethereum,
+            chain_id: eth_evm.chain_id,
+            rpc_url: Url::parse(&eth_evm.endpoint)?,
+            subgraph_url,
+            backfill_start_block: 0,
+        },
+    ];
+
+    Ok((base_config, mock_subgraph))
 }
 
 pub async fn setup_roles(
@@ -564,6 +628,15 @@ pub async fn setup_roles_on_vault(
     Ok(())
 }
 
+pub struct MintFlowRequest<'a> {
+    pub client_id: &'a str,
+    pub tokenization_request_id: &'a str,
+    pub quantity: &'a str,
+    pub underlying: &'a str,
+    pub token: &'a str,
+    pub network: Network,
+}
+
 pub async fn perform_mint_and_confirm(
     client: &Client,
     wallet: Address,
@@ -574,11 +647,14 @@ pub async fn perform_mint_and_confirm(
     perform_mint_and_confirm_with(
         client,
         wallet,
-        client_id,
-        tokenization_request_id,
-        quantity,
-        "AAPL",
-        "tAAPL",
+        MintFlowRequest {
+            client_id,
+            tokenization_request_id,
+            quantity,
+            underlying: "AAPL",
+            token: "tAAPL",
+            network: Network::Base,
+        },
     )
     .await
 }
@@ -586,12 +662,16 @@ pub async fn perform_mint_and_confirm(
 pub async fn perform_mint_and_confirm_with(
     client: &Client,
     wallet: Address,
-    client_id: &str,
-    tokenization_request_id: &str,
-    quantity: &str,
-    underlying: &str,
-    token: &str,
+    request: MintFlowRequest<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let MintFlowRequest {
+        client_id,
+        tokenization_request_id,
+        quantity,
+        underlying,
+        token,
+        network,
+    } = request;
     let mint_response = client
         .post("/inkind/issuance")
         .header(rocket::http::ContentType::JSON)
@@ -606,7 +686,7 @@ pub async fn perform_mint_and_confirm_with(
                 "qty": quantity,
                 "underlying_symbol": underlying,
                 "token_symbol": token,
-                "network": "base",
+                "network": network.as_str(),
                 "client_id": client_id,
                 "wallet_address": wallet
             })

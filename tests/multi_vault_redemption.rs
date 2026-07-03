@@ -9,8 +9,8 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::{Network, initialize_rocket};
 
 /// Tests that redemptions are detected and completed on ALL vaults, not just one.
 ///
@@ -85,11 +85,14 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-mint-aapl",
-        "50.0",
-        "AAPL",
-        "tAAPL",
+        harness::MintFlowRequest {
+            client_id: &link_body.client_id.to_string(),
+            tokenization_request_id: "alp-mint-aapl",
+            quantity: "50.0",
+            underlying: "AAPL",
+            token: "tAAPL",
+            network: Network::Base,
+        },
     )
     .await?;
 
@@ -97,11 +100,14 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-mint-tsla",
-        "30.0",
-        "TSLA",
-        "tTSLA",
+        harness::MintFlowRequest {
+            client_id: &link_body.client_id.to_string(),
+            tokenization_request_id: "alp-mint-tsla",
+            quantity: "30.0",
+            underlying: "TSLA",
+            token: "tTSLA",
+            network: Network::Base,
+        },
     )
     .await?;
 
@@ -250,11 +256,14 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-mint-tsla-backfill",
-        "30.0",
-        "TSLA",
-        "tTSLA",
+        harness::MintFlowRequest {
+            client_id: &link_body.client_id.to_string(),
+            tokenization_request_id: "alp-mint-tsla-backfill",
+            quantity: "30.0",
+            underlying: "TSLA",
+            token: "tTSLA",
+            network: Network::Base,
+        },
     )
     .await?;
 

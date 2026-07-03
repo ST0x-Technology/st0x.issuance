@@ -33,6 +33,7 @@ pub(crate) fn test_config() -> Config {
         alpaca: AlpacaConfig::test_default(),
         subgraph_url: Url::parse("http://localhost:0/subgraph")
             .expect("valid test URL"),
+        chains: Vec::new(),
     }
 }
 
@@ -72,15 +73,14 @@ impl TestHarness {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let mint_services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            pool: pool.clone(),
+        let mint_services = MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+            pool.clone(),
             bot,
-            receipts: Arc::new(CqrsReceiptService::new(
-                receipt_inventory_store,
-            )),
-        };
+        );
 
         let (mint_store, _mint_projection) =
             StoreBuilder::<Mint>::new(pool.clone())

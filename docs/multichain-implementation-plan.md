@@ -254,7 +254,8 @@ One deploy cycle after staging and production have moved to the multichain
 config format:
 
 - [ ] Migrate staging and prod `.env` to the `[[chains]]` / `CHAIN_*` format.
-- [ ] Delete `legacy_base_chain_config` and the flat-var -> registry mapping.
+- [ ] Delete the flat-var mapping in `Env::into_config` that seeds the single
+      Base entry of `Config::chains`.
 - [ ] Delete the legacy `transfer_poll` checkpoint fallback read.
 - [ ] Drop the "Base (legacy block)" section from `.env.example` and the staging
       runbook.

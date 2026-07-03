@@ -406,15 +406,14 @@ mod tests {
             let receipt_store =
                 Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-            let services = MintServices {
+            let services = MintServices::with_single_vault(
+                Network::Base,
                 vault,
-                alpaca: Arc::new(MockAlpacaService::new_success()),
-                receipts: Arc::new(CqrsReceiptService::new(
-                    receipt_store.clone(),
-                )),
-                pool: pool.clone(),
-                bot: BOT,
-            };
+                Arc::new(MockAlpacaService::new_success()),
+                Arc::new(CqrsReceiptService::new(receipt_store.clone())),
+                pool.clone(),
+                BOT,
+            );
 
             let mint_store =
                 Arc::new(test_store::<Mint>(pool.clone(), services));

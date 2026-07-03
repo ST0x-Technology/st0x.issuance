@@ -79,16 +79,15 @@ impl std::fmt::Display for TokenSymbol {
 
 /// Blockchain network a tokenized asset lives on.
 ///
-/// A closed set -- only `base` is supported today. Serialized as the lowercase
-/// wire string (`"base"`) it has always used, so the JSON contract and the
-/// values already persisted in the event store are unchanged. Modeling it as an
-/// enum (rather than an opaque `String`) means an unsupported network is now a
-/// deserialization error instead of a value that silently flows through.
+/// Supported ITN networks. Serialized as the lowercase wire string (`"base"`,
+/// `"ethereum"`, ...) used in JSON and the event store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Network {
     Base,
+    /// Ethereum L1 ([RAI-1094](https://linear.app/makeitrain/issue/RAI-1094)).
+    Ethereum,
 }
 
 impl Network {
@@ -97,6 +96,7 @@ impl Network {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Base => "base",
+            Self::Ethereum => "ethereum",
         }
     }
 }
@@ -119,6 +119,7 @@ impl FromStr for Network {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "base" => Ok(Self::Base),
+            "ethereum" => Ok(Self::Ethereum),
             other => {
                 Err(NetworkParseError::Unsupported { value: other.to_string() })
             }
@@ -331,6 +332,10 @@ mod tests {
             json!("tSGOV")
         );
         assert_eq!(serde_json::to_value(Network::Base).unwrap(), json!("base"));
+        assert_eq!(
+            serde_json::to_value(Network::Ethereum).unwrap(),
+            json!("ethereum")
+        );
     }
 
     #[test]
@@ -347,6 +352,10 @@ mod tests {
             serde_json::from_value::<Network>(json!("base")).unwrap(),
             Network::Base
         );
+        assert_eq!(
+            serde_json::from_value::<Network>(json!("ethereum")).unwrap(),
+            Network::Ethereum
+        );
     }
 
     // `Network` is a closed enum, so an unsupported or wrong-cased network must
@@ -355,7 +364,7 @@ mod tests {
     #[test]
     fn network_rejects_unknown_and_non_snake_case_variants() {
         for invalid in
-            [json!("ethereum"), json!("Base"), json!("BASE"), json!("")]
+            [json!("arbitrum"), json!("Base"), json!("BASE"), json!("")]
         {
             assert!(
                 serde_json::from_value::<Network>(invalid.clone()).is_err(),
@@ -369,12 +378,13 @@ mod tests {
         assert_eq!(UnderlyingSymbol::new("SGOV").to_string(), "SGOV");
         assert_eq!(TokenSymbol::new("tSGOV").to_string(), "tSGOV");
         assert_eq!(Network::Base.to_string(), "base");
+        assert_eq!(Network::Ethereum.to_string(), "ethereum");
     }
 
     #[test]
     fn network_from_str_parses_wire_values() {
         assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
-        assert!("ethereum".parse::<Network>().is_err());
+        assert_eq!("ethereum".parse::<Network>().unwrap(), Network::Ethereum);
     }
 
     #[test]
@@ -506,6 +516,11 @@ mod tests {
         assert_eq!(key.to_string(), "SGOV:base");
         assert_eq!(serde_json::to_value(&key).unwrap(), json!("SGOV:base"));
         assert_eq!("SGOV:base".parse::<AssetKey>().unwrap(), key);
+
+        let eth_key =
+            AssetKey::new(UnderlyingSymbol::new("TSLA"), Network::Ethereum);
+        assert_eq!(eth_key.to_string(), "TSLA:ethereum");
+        assert_eq!("TSLA:ethereum".parse::<AssetKey>().unwrap(), eth_key);
     }
 
     #[test]
@@ -523,7 +538,7 @@ mod tests {
             AssetKeyParseError::InvalidFormat { .. }
         ));
         assert!(matches!(
-            "SGOV:ethereum".parse::<AssetKey>().unwrap_err(),
+            "SGOV:solana".parse::<AssetKey>().unwrap_err(),
             AssetKeyParseError::UnsupportedNetwork { .. }
         ));
     }

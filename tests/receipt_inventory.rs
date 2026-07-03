@@ -18,8 +18,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
-    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
-    LogLevel, SignerConfig, initialize_rocket,
+    ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
+    IpWhitelist, LogLevel, Network, SignerConfig, initialize_rocket,
 };
 
 async fn wait_for_receipt_depleted(
@@ -283,10 +283,14 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
         HashMap::from([(evm.vault_address, harness::TEST_OA_SCHEMA_HASH)]);
     let mock_subgraph = harness::setup_mock_subgraph(&vault_schemas);
 
+    let rpc_url = Url::parse(&evm.endpoint)?;
+    let subgraph_url =
+        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
+
     let config = Config {
         database_url,
         database_max_connections: 5,
-        rpc_url: Url::parse(&evm.endpoint)?,
+        rpc_url: rpc_url.clone(),
         chain_id: ANVIL_CHAIN_ID,
         signer: SignerConfig::Local(evm.private_key),
         backfill_start_block: 0,
@@ -313,8 +317,14 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
-        subgraph_url: Url::parse(&mock_subgraph.base_url())
-            .expect("valid mock subgraph URL"),
+        subgraph_url: subgraph_url.clone(),
+        chains: vec![ChainConfig {
+            network: Network::Base,
+            chain_id: ANVIL_CHAIN_ID,
+            rpc_url,
+            subgraph_url,
+            backfill_start_block: 0,
+        }],
     };
 
     // Start rocket - backfill should run and discover the TSLA receipt

@@ -2794,6 +2794,7 @@ mod tests {
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            chains: Vec::new(),
         };
 
         let pool = setup_pool().await;
@@ -2965,6 +2966,7 @@ mod tests {
             hyperdx: None,
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            chains: Vec::new(),
         };
 
         rocket::build()
@@ -3278,6 +3280,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
+            chains: Vec::new(),
         };
 
         rocket::build()

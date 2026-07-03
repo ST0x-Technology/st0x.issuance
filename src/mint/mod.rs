@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use event_sorcery::{EventSourced, Table};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -31,12 +32,53 @@ pub(crate) use view::{
 };
 
 /// Services required by the Mint aggregate for command handling.
+///
+/// Mint side effects resolve [`VaultService`] per aggregate `network` via
+/// [`Self::vault_for`] ([RAI-1206]).
 pub(crate) struct MintServices {
-    pub(crate) vault: Arc<dyn VaultService>,
+    vaults: HashMap<Network, Arc<dyn VaultService>>,
     pub(crate) alpaca: Arc<dyn AlpacaService>,
     pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) bot: Address,
+}
+
+impl MintServices {
+    pub(crate) fn new(
+        vaults: HashMap<Network, Arc<dyn VaultService>>,
+        alpaca: Arc<dyn AlpacaService>,
+        receipts: Arc<dyn ReceiptService>,
+        pool: Pool<Sqlite>,
+        bot: Address,
+    ) -> Self {
+        Self { vaults, alpaca, receipts, pool, bot }
+    }
+
+    pub(crate) fn with_single_vault(
+        network: Network,
+        vault: Arc<dyn VaultService>,
+        alpaca: Arc<dyn AlpacaService>,
+        receipts: Arc<dyn ReceiptService>,
+        pool: Pool<Sqlite>,
+        bot: Address,
+    ) -> Self {
+        Self::new(
+            HashMap::from([(network, vault)]),
+            alpaca,
+            receipts,
+            pool,
+            bot,
+        )
+    }
+
+    fn vault_for(
+        &self,
+        network: &Network,
+    ) -> Result<&Arc<dyn VaultService>, MintError> {
+        self.vaults.get(network).ok_or_else(|| {
+            MintError::NetworkNotConfigured { network: network.clone() }
+        })
+    }
 }
 
 pub(crate) use crate::account::ClientId;
@@ -557,6 +599,7 @@ impl Mint {
             receipt_note,
             external_tx_id,
         } = input;
+        let vault_service = services.vault_for(network)?;
         let vault = find_vault(&services.pool, underlying, network)
             .await
             .map_err(|e| MintError::AssetView { message: e.to_string() })?
@@ -579,8 +622,7 @@ impl Mint {
 
         let now = Utc::now();
 
-        match services
-            .vault
+        match vault_service
             .submit_mint(
                 vault,
                 assets,
@@ -659,7 +701,9 @@ impl Mint {
 
         let now = Utc::now();
 
-        match services.vault.confirm_mint(&fireblocks_tx_id).await {
+        let vault_service = services.vault_for(network)?;
+
+        match vault_service.confirm_mint(&fireblocks_tx_id).await {
             Ok(result) => {
                 info!(
                     target: "mint",
@@ -814,14 +858,14 @@ impl Mint {
                 // Recover again, which hits the Minting arm to submit.
                 self.handle_deposit(issuer_request_id)
             }
-            Self::FireblocksSubmitted { fireblocks_tx_id, .. } => {
+            Self::FireblocksSubmitted { fireblocks_tx_id, network, .. } => {
+                let vault_service = services.vault_for(network)?;
                 // Non-blocking pre-check: a pending tx must pause recovery (so
                 // the scheduled loop backs off) instead of blocking in
                 // confirm_mint's long poll, which the bounded startup recovery
                 // would cancel before any follow-up is scheduled.
                 if matches!(
-                    services
-                        .vault
+                    vault_service
                         .check_fireblocks_tx(fireblocks_tx_id)
                         .await
                         .map_err(|e| MintError::Vault {
@@ -1037,6 +1081,7 @@ impl Mint {
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
+        let vault_service = services.vault_for(network)?;
         let vault = find_vault(&services.pool, underlying, network)
             .await
             .map_err(|e| MintError::AssetView { message: e.to_string() })?
@@ -1074,8 +1119,7 @@ impl Mint {
                 "Resuming confirmation of previously submitted mint"
             );
 
-            if let Some(status) = services
-                .vault
+            if let Some(status) = vault_service
                 .check_fireblocks_tx(&known_tx.fireblocks_tx_id)
                 .await
                 .map_err(|e| MintError::Vault { message: e.to_string() })?
@@ -1123,8 +1167,7 @@ impl Mint {
                 }
             }
 
-            return match services
-                .vault
+            return match vault_service
                 .confirm_mint(&known_tx.fireblocks_tx_id)
                 .await
             {
@@ -2120,6 +2163,8 @@ pub(crate) enum MintError {
         "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
     )]
     FireblocksTxIdMismatch { expected: String, provided: String },
+    #[error("Network {network} is not configured for mint")]
+    NetworkNotConfigured { network: Network },
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: UnderlyingSymbol },
     #[error("Quantity conversion: {message}")]
@@ -2147,6 +2192,7 @@ pub(crate) mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::{Pool, Sqlite};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing::Level;
     use tracing_test::traced_test;
@@ -2375,13 +2421,14 @@ pub(crate) mod tests {
             let receipt_store =
                 Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-            let services = MintServices {
+            let services = MintServices::with_single_vault(
+                Network::Base,
                 vault,
-                alpaca: Arc::new(MockAlpacaService::new_success()),
-                receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
-                pool: pool.clone(),
-                bot: BOT,
-            };
+                Arc::new(MockAlpacaService::new_success()),
+                Arc::new(CqrsReceiptService::new(receipt_store)),
+                pool.clone(),
+                BOT,
+            );
 
             let mint_store =
                 Arc::new(test_store::<Mint>(pool.clone(), services));
@@ -2512,13 +2559,36 @@ pub(crate) mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-        MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+        MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
             bot,
-        }
+        )
+    }
+
+    #[tokio::test]
+    async fn vault_for_errors_when_network_not_configured() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(":memory:")
+            .expect("Failed to create in-memory database");
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        let services = MintServices::new(
+            HashMap::new(),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool,
+            BOT,
+        );
+
+        assert!(matches!(
+            services.vault_for(&Network::Base),
+            Err(MintError::NetworkNotConfigured { .. })
+        ));
     }
 
     #[tokio::test]
@@ -3429,13 +3499,14 @@ pub(crate) mod tests {
         let receipt_store =
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-        let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool: pool.clone(),
-            bot: BOT,
-        };
+        let services = MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool.clone(),
+            BOT,
+        );
 
         let (mint_store, _mint_projection) =
             StoreBuilder::<Mint>::new(pool.clone())
@@ -3612,13 +3683,14 @@ pub(crate) mod tests {
         let receipt_store =
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-        let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool: pool.clone(),
-            bot: BOT,
-        };
+        let services = MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool.clone(),
+            BOT,
+        );
 
         prepare_event_sourced_startup::<Mint>(&pool).await.unwrap();
         StoreBuilder::<Mint>::new(pool.clone()).build(services).await.unwrap();
@@ -3811,13 +3883,14 @@ pub(crate) mod tests {
         let receipt_store =
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-        let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool: pool.clone(),
-            bot: BOT,
-        };
+        let services = MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool.clone(),
+            BOT,
+        );
 
         prepare_event_sourced_startup::<Mint>(&pool).await.unwrap();
         StoreBuilder::<Mint>::new(pool.clone()).build(services).await.unwrap();
@@ -4519,13 +4592,14 @@ pub(crate) mod tests {
         let receipt_store =
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
-        let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
+        let services = MintServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
-            bot: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        };
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
 
         let result = mint
             .handle_recover_from_receipt(
