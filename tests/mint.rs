@@ -5,6 +5,7 @@ mod harness;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
 use alloy::providers::ProviderBuilder;
+use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
@@ -76,6 +77,11 @@ async fn perform_mint_flow(
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .with_gas_estimation()
+        .filler(BlobGasFiller)
+        .with_simple_nonce_management()
+        .filler(ChainIdFiller::default())
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

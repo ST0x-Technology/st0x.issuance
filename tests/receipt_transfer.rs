@@ -4,7 +4,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
@@ -15,6 +14,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+use crate::harness::create_provider;
 
 /// Helper: set up a second wallet from Anvil's test accounts (account index 1).
 fn second_wallet() -> (PrivateKeySigner, Address) {
@@ -82,7 +83,7 @@ async fn test_inbound_receipt_transfer_discovered_by_monitor()
 
     // We need to mint as other_wallet, so use their provider
     let other_evm_wallet = EthereumWallet::from(other_signer.clone());
-    let other_provider = ProviderBuilder::new()
+    let other_provider = create_provider()
         .wallet(other_evm_wallet.clone())
         .connect(&evm.endpoint)
         .await?;
@@ -257,10 +258,8 @@ async fn test_outbound_receipt_transfer_reconciles_balance()
     // Bot transfers the receipt out to other_wallet
     let bot_signer = PrivateKeySigner::from_bytes(&evm.private_key)?;
     let bot_evm_wallet = EthereumWallet::from(bot_signer);
-    let bot_provider = ProviderBuilder::new()
-        .wallet(bot_evm_wallet)
-        .connect(&evm.endpoint)
-        .await?;
+    let bot_provider =
+        create_provider().wallet(bot_evm_wallet).connect(&evm.endpoint).await?;
 
     let receipt_contract_addr = {
         let vault = OffchainAssetReceiptVaultInstance::new(
@@ -386,7 +385,7 @@ async fn test_mint_transfer_not_double_counted()
     );
 
     // Verify on-chain: bot holds the minted receipt with expected balance
-    let provider = ProviderBuilder::new().connect(&evm.endpoint).await?;
+    let provider = create_provider().connect(&evm.endpoint).await?;
     let vault_contract =
         OffchainAssetReceiptVaultInstance::new(evm.vault_address, &provider);
     let receipt_contract_addr =
@@ -425,7 +424,7 @@ async fn test_inbound_transfer_discovered_by_backfill()
 
     // Mint as other_wallet
     let other_evm_wallet = EthereumWallet::from(other_signer.clone());
-    let other_provider = ProviderBuilder::new()
+    let other_provider = create_provider()
         .wallet(other_evm_wallet)
         .connect(&evm.endpoint)
         .await?;
@@ -622,10 +621,8 @@ async fn test_unrelated_transfer_ignored()
 
     // Mint receipt to wallet_a
     let wallet_a_evm = EthereumWallet::from(wallet_a_signer.clone());
-    let wallet_a_provider = ProviderBuilder::new()
-        .wallet(wallet_a_evm)
-        .connect(&evm.endpoint)
-        .await?;
+    let wallet_a_provider =
+        create_provider().wallet(wallet_a_evm).connect(&evm.endpoint).await?;
 
     let vault = OffchainAssetReceiptVaultInstance::new(
         evm.vault_address,
@@ -748,7 +745,7 @@ async fn test_inbound_transfer_with_zero_balance_skipped()
 
     // Step 1: Other wallet mints receipt
     let other_evm_wallet = EthereumWallet::from(other_signer.clone());
-    let other_provider = ProviderBuilder::new()
+    let other_provider = create_provider()
         .wallet(other_evm_wallet)
         .connect(&evm.endpoint)
         .await?;
@@ -810,7 +807,7 @@ async fn test_inbound_transfer_with_zero_balance_skipped()
     evm.withdraw_directly(receipt_id, shares, bot_wallet).await?;
 
     // Verify on-chain: bot has 0 receipt balance
-    let bot_provider = ProviderBuilder::new()
+    let bot_provider = create_provider()
         .wallet(EthereumWallet::from(PrivateKeySigner::from_bytes(
             &evm.private_key,
         )?))

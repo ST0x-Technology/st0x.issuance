@@ -5,7 +5,7 @@ use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::Quantity;
 use crate::mint::TokenizationRequestId;
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-use crate::vault::MultiBurnEntry;
+use crate::vault::{MultiBurnEntry, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum RedemptionCommand {
@@ -58,14 +58,14 @@ pub(crate) enum RedemptionCommand {
     /// Polls the signing backend and produces `TokensBurned` or error.
     ConfirmBurn {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: String,
+        fireblocks_tx_id: TxId,
         dust_shares: U256,
     },
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
-        fireblocks_tx_id: Option<String>,
+        fireblocks_tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         planned_burns: Vec<super::BurnRecord>,
     },
@@ -83,7 +83,7 @@ pub(crate) enum RedemptionCommand {
     /// succeeded on-chain but the bot timed out before recording it.
     RecordExistingBurn {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: String,
+        fireblocks_tx_id: TxId,
         tx_hash: B256,
         planned_burns: Vec<super::BurnRecord>,
         block_number: u64,
@@ -95,10 +95,11 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
     },
-    /// Admin-terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose
-    /// burn already landed on-chain. The admin layer verifies `burn_tx_hash`
-    /// on-chain before issuing this command; the aggregate records it as the
-    /// proving tx hash and transitions to `Completed`.
+    /// Admin-terminalizes a redemption stuck in
+    /// `Burning`/`BurnIntended`/`BurnSubmitted` whose burn already landed
+    /// on-chain. The admin layer verifies `burn_tx_hash` before issuing this
+    /// command; the aggregate records it as proof and transitions to
+    /// `Completed`.
     ForceCompleteBurn {
         issuer_request_id: IssuerRedemptionRequestId,
         burn_tx_hash: B256,
@@ -121,6 +122,18 @@ pub(crate) enum RedemptionCommand {
         /// Optional deterministic Fireblocks `externalTxId` for the next burn
         /// submission. Persisted through `BurnResumed` so a retry submission
         /// that fails before Fireblocks accepts it can be retried idempotently.
+        #[serde(default)]
+        external_tx_id: Option<BurnExternalTxId>,
+    },
+    IntendBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        vault: Address,
+        /// Burns to execute (receipt_id + amount for each)
+        burns: Vec<MultiBurnEntry>,
+        /// Dust to return to user
+        dust_shares: U256,
+        owner: Address,
+        /// Optional deterministic `externalTxId` override.
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
     },

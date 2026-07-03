@@ -4,7 +4,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
@@ -17,6 +16,8 @@ use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
     LogLevel, SignerConfig, initialize_rocket,
 };
+
+use crate::harness::create_provider;
 
 #[tokio::test]
 async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
@@ -94,7 +95,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
     .await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

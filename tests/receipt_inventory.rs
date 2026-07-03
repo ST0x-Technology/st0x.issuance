@@ -4,7 +4,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
@@ -21,6 +20,8 @@ use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
     LogLevel, SignerConfig, initialize_rocket,
 };
+
+use crate::harness::create_provider;
 
 async fn wait_for_receipt_depleted(
     db_url: &str,
@@ -448,7 +449,7 @@ async fn test_startup_reconciliation_detects_stale_receipts()
     let client = Client::tracked(rocket).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -557,7 +558,7 @@ async fn test_external_burn_detected_by_withdraw_monitor()
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

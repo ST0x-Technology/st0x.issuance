@@ -25,8 +25,8 @@ use crate::redemption::BurnExternalTxId;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{
     BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
-    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
-    VaultService, verify_burn_in_receipt,
+    MultiBurnResultEntry, ReceiptInformation, SendableTxWithHash, SubmittedTx,
+    TxId, VaultError, VaultService, verify_burn_in_receipt,
 };
 
 /// Fireblocks-specific errors that can occur during vault operations.
@@ -732,12 +732,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     async fn submit_burn(
         &self,
         params: MultiBurnParams,
-    ) -> Result<SubmittedTx, VaultError> {
+        _prepared_tx: Option<SendableTxWithHash>,
+    ) -> Result<SubmittedTx<BurnExternalTxId, TxId>, VaultError> {
         let vault_contract =
             OffchainAssetReceiptVault::new(params.vault, &self.read_provider);
 
-        let needs_encoding = params.burns.iter().any(|b| {
-            b.receipt_info_bytes.is_none() && b.receipt_info.is_some()
+        let needs_encoding = params.burns.iter().any(|burn| {
+            burn.receipt_info_bytes.is_none() && burn.receipt_info.is_some()
         });
 
         let oa_schema = if needs_encoding {
@@ -792,7 +793,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             vault_contract.multicall(calls).calldata().clone();
 
         // Submit CONTRACT_CALL to Fireblocks
-        let total_burn: U256 = params.burns.iter().map(|b| b.burn_shares).sum();
+        let total_burn: U256 =
+            params.burns.iter().map(|burn| burn.burn_shares).sum();
 
         let note = format!(
             "Burn {total_burn} shares from {} receipts (issuer_request_id: {})",
@@ -819,16 +821,19 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
             .await?;
 
         Ok(SubmittedTx {
-            external_tx_id: external_tx_id.into_string(),
-            fireblocks_tx_id,
+            external_tx_id,
+            fireblocks_tx_id: TxId::Legacy(fireblocks_tx_id),
         })
     }
 
     async fn confirm_burn(
         &self,
-        fireblocks_tx_id: &str,
+        fireblocks_tx_id: &TxId,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError> {
+        let TxId::Legacy(fireblocks_tx_id) = fireblocks_tx_id else {
+            return Err(VaultError::InvalidReceipt);
+        };
         let tx_hash = self.wait_for_completion(fireblocks_tx_id).await?;
 
         self.parse_burn_receipt(tx_hash, dust_shares).await

@@ -252,7 +252,9 @@ async fn load_reprocess_context(
                 ..
             } => {
                 burning_failed = Some(BurningFailedData {
-                    fireblocks_tx_id: fireblocks_tx_id.clone(),
+                    fireblocks_tx_id: fireblocks_tx_id
+                        .as_ref()
+                        .map(ToString::to_string),
                     planned_burns: planned_burns.clone(),
                 });
             }
@@ -644,7 +646,9 @@ async fn inspect_prior_fireblocks_burn(
                     issuer_request_id,
                     RedemptionCommand::RecordExistingBurn {
                         issuer_request_id: issuer_request_id.clone(),
-                        fireblocks_tx_id: fb_tx_id.clone(),
+                        fireblocks_tx_id: crate::vault::TxId::Legacy(
+                            fb_tx_id.clone(),
+                        ),
                         tx_hash,
                         planned_burns: bf_data.planned_burns.clone(),
                         block_number,
@@ -1612,7 +1616,7 @@ fn redemption_history_summary_from_events(
                 fireblocks_tx_id: Some(fireblocks_tx_id),
                 ..
             } => {
-                summary.fireblocks_tx_id = Some(fireblocks_tx_id);
+                summary.fireblocks_tx_id = Some(fireblocks_tx_id.to_string());
             }
             _ => {}
         }
@@ -1934,7 +1938,9 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{FireblocksTxStatus, MultiBurnEntry, VaultService};
+    use crate::vault::{
+        FireblocksTxStatus, MultiBurnEntry, SendableTxWithHash, VaultService,
+    };
 
     use super::{AggregateKind, StuckAggregate};
 
@@ -2356,6 +2362,30 @@ mod tests {
         store
             .send(
                 &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(99),
+                        burn_shares: U256::from(100),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id: Some(BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    )),
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     vault: address!(
@@ -2383,7 +2413,9 @@ mod tests {
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     error: "burn terminally failed".to_string(),
-                    fireblocks_tx_id: Some("mock-fb-burn".to_string()),
+                    fireblocks_tx_id: Some(crate::vault::TxId::Legacy(
+                        "mock-fb-burn".to_string(),
+                    )),
                     planned_burns: vec![],
                 },
             )
@@ -3483,14 +3515,20 @@ mod tests {
         async fn submit_burn(
             &self,
             _params: crate::vault::MultiBurnParams,
-        ) -> Result<crate::vault::SubmittedTx, crate::vault::VaultError>
-        {
+            _prepared_tx: Option<SendableTxWithHash>,
+        ) -> Result<
+            crate::vault::SubmittedTx<
+                crate::redemption::BurnExternalTxId,
+                crate::vault::TxId,
+            >,
+            crate::vault::VaultError,
+        > {
             unimplemented!("not used in enrichment tests")
         }
 
         async fn confirm_burn(
             &self,
-            _fireblocks_tx_id: &str,
+            _fireblocks_tx_id: &crate::vault::TxId,
             _dust_shares: alloy::primitives::U256,
         ) -> Result<crate::vault::MultiBurnResult, crate::vault::VaultError>
         {
@@ -4171,7 +4209,9 @@ mod tests {
                 external_tx_id: BurnExternalTxId::from_string(format!(
                     "burn-{tx_hash}"
                 )),
-                fireblocks_tx_id: "fb-old-attempt".to_string(),
+                fireblocks_tx_id: crate::vault::TxId::Legacy(
+                    "fb-old-attempt".to_string(),
+                ),
                 planned_burns: vec![],
                 submitted_at: now,
             },
@@ -4179,7 +4219,9 @@ mod tests {
                 issuer_request_id: issuer.clone(),
                 error: "fireblocks failed".to_string(),
                 failed_at: now,
-                fireblocks_tx_id: Some("fb-old-attempt".to_string()),
+                fireblocks_tx_id: Some(crate::vault::TxId::Legacy(
+                    "fb-old-attempt".to_string(),
+                )),
                 planned_burns: vec![],
             },
             RedemptionEvent::RedemptionFailed {

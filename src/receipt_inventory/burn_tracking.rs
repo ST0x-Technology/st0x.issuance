@@ -477,7 +477,9 @@ mod tests {
                 issuer_request_id.clone(),
                 RedemptionEvent::ExistingBurnRecovered {
                     issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: "fb-tx-123".to_string(),
+                    fireblocks_tx_id: crate::vault::TxId::Legacy(
+                        "fb-tx-123".to_string(),
+                    ),
                     tx_hash: b256!(
                         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),

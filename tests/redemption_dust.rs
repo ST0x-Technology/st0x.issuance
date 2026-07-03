@@ -16,7 +16,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::Mock;
 use httpmock::prelude::*;
@@ -29,6 +28,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
+
+use crate::harness::create_provider;
 
 /// Quantity with >9 decimal precision (18 decimals on-chain).
 /// Represents: 0.450574852280275235 shares
@@ -134,7 +135,7 @@ async fn perform_mint_flow(
     );
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -318,7 +319,7 @@ async fn test_redemption_returns_dust_to_user()
     mint_callback_mock.assert();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -417,7 +418,7 @@ async fn test_redemption_no_dust_when_9_decimals()
     mint_callback_mock.assert();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
