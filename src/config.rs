@@ -1,28 +1,18 @@
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::Level;
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
-use crate::fireblocks::{
-    FireblocksVaultService, SignerConfig, SignerConfigError, SignerEnv,
-    resolve_local_signer,
+use crate::chain::{
+    ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
 };
+use crate::fireblocks::{SignerConfig, SignerConfigError, SignerEnv};
 use crate::telemetry::HyperDxConfig;
-use crate::vault::rain_meta::OaSchemaCache;
-use crate::vault::{VaultService, service::RealBlockchainService};
-
-pub(crate) struct BlockchainSetup<HttpP> {
-    pub(crate) vault_service: Arc<dyn VaultService>,
-    /// HTTP provider — used for all non-subscription RPC calls (backfill,
-    /// reconciliation, vault service balance checks, etc.). Receipt monitors
-    /// and redemption detectors create their own WSS connections.
-    pub(crate) http_provider: HttpP,
-}
+use crate::tokenized_asset::Network;
 
 /// Default chain ID (Base mainnet)
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
@@ -67,59 +57,28 @@ impl Config {
         env.into_config()
     }
 
-    /// Creates the HTTP provider and vault service.
-    ///
-    /// Initializes an HTTP provider for non-subscription RPC calls (backfill,
-    /// reconciliation, vault service) and builds the appropriate VaultService
-    /// (local signer or Fireblocks). Receipt monitors and redemption detectors
-    /// create their own WSS connections independently.
-    pub(crate) async fn create_blockchain_setup(
+    /// Builds a [`ChainRegistry`] from legacy single-chain env vars (one `base`
+    /// entry). All startup paths use `registry.base()` until later slices route
+    /// by aggregate `network`.
+    pub(crate) async fn create_chain_registry(
         &self,
-    ) -> Result<BlockchainSetup<impl Provider + Clone + use<>>, ConfigError>
-    {
-        let http_url = wss_to_http(&self.rpc_url)?;
-        let http_provider = ProviderBuilder::new().connect_http(http_url);
+    ) -> Result<ChainRegistry<impl Provider + Clone + use<>>, ConfigError> {
+        build_chain_registry(
+            vec![self.legacy_base_chain_config()],
+            &self.signer,
+        )
+        .await
+        .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
+    }
 
-        let rpc_chain_id = http_provider.get_chain_id().await?;
-        if rpc_chain_id != self.chain_id {
-            return Err(ConfigError::ChainIdMismatch {
-                configured: self.chain_id,
-                from_rpc: rpc_chain_id,
-            });
+    fn legacy_base_chain_config(&self) -> ChainConfig {
+        ChainConfig {
+            network: Network::Base,
+            chain_id: self.chain_id,
+            rpc_url: self.rpc_url.clone(),
+            subgraph_url: self.subgraph_url.clone(),
+            backfill_start_block: self.backfill_start_block,
         }
-
-        let oa_schema_cache =
-            Arc::new(OaSchemaCache::new(self.subgraph_url.clone())?);
-
-        let vault_service: Arc<dyn VaultService> = match &self.signer {
-            SignerConfig::Local(key) => {
-                let resolved = resolve_local_signer(key, self.chain_id)
-                    .map_err(|err| ConfigError::SignerResolve(Box::new(err)))?;
-
-                let signing_provider = ProviderBuilder::new()
-                    .wallet(resolved.wallet)
-                    .connect_http(wss_to_http(&self.rpc_url)?);
-
-                Arc::new(RealBlockchainService::new(
-                    signing_provider,
-                    oa_schema_cache,
-                ))
-            }
-
-            SignerConfig::Fireblocks(env) => {
-                let service = FireblocksVaultService::new(
-                    env,
-                    http_provider.clone(),
-                    self.chain_id,
-                    oa_schema_cache,
-                )
-                .map_err(|err| ConfigError::FireblocksVault(Box::new(err)))?;
-
-                Arc::new(service)
-            }
-        };
-
-        Ok(BlockchainSetup { vault_service, http_provider })
     }
 }
 
@@ -320,6 +279,8 @@ pub enum ConfigError {
     Reqwest(#[from] reqwest::Error),
     #[error("SUBGRAPH_URL must use http or https scheme, got: {0}")]
     InvalidSubgraphScheme(String),
+    #[error("chain registry initialization failed")]
+    ChainRegistry(#[source] Box<ChainRegistryError>),
     #[error(
         "Chain ID mismatch: configured {configured}, RPC returned {from_rpc}"
     )]
@@ -329,9 +290,7 @@ pub enum ConfigError {
 }
 
 /// Derives an HTTP URL from a WebSocket URL by replacing the scheme.
-///
-/// `wss://` → `https://`, `ws://` → `http://`. Leaves HTTP URLs unchanged.
-fn wss_to_http(url: &Url) -> Result<Url, ConfigError> {
+pub(crate) fn wss_to_http(url: &Url) -> Result<Url, ConfigError> {
     let new_scheme = match url.scheme() {
         "wss" => "https",
         "ws" => "http",

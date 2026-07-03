@@ -167,6 +167,7 @@ st0x.issuance/
 │   ├── redemption/          # Redemption aggregate and managers
 │   ├── tokenized_asset/     # TokenizedAsset aggregate
 │   ├── receipt_inventory/   # Receipt tracking aggregate
+│   ├── chain/               # ChainRegistry: per-chain RPC, vault, backfill config
 │   ├── alpaca/              # Alpaca API service
 │   ├── vault/               # On-chain vault service
 │   ├── fireblocks/          # Fireblocks signing backend
