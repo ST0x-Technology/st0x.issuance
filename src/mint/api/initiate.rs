@@ -863,6 +863,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initiate_mint_rejects_unknown_network() {
+        let harness = TestHarness::new().await;
+        let TestAccountAndAsset { client_id, underlying, token, .. } =
+            harness.setup_account_and_asset().await;
+        let TestHarness {
+            pool,
+            account_store,
+            asset_store: tokenized_asset_store,
+            mint_store,
+            ..
+        } = harness;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(mint_store)
+            .manage(account_store)
+            .manage(tokenized_asset_store)
+            .manage(pool)
+            .mount("/", routes![initiate_mint]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "tokenization_request_id": "alp-123",
+            "qty": "100.5",
+            "underlying_symbol": underlying.as_str(),
+            "token_symbol": token.0,
+            "network": "arbitrum",
+            "client_id": client_id,
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+        });
+
+        let response = client
+            .post("/inkind/issuance")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[tokio::test]
     async fn test_initiate_mint_rejects_wrong_network() {
         let harness = TestHarness::new().await;
         let TestAccountAndAsset { client_id, underlying, token, .. } =
@@ -910,12 +961,14 @@ mod tests {
             .dispatch()
             .await;
 
-        // `Network` is a closed enum, so an unsupported network is
-        // unrepresentable: the request is rejected at JSON deserialization
-        // (Rocket's data guard -> 422) before the handler's asset-availability
-        // check runs. A mismatched-but-parseable network can no longer be
-        // expressed, so the old handler-level 400 path is unreachable here.
-        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert_eq!(response.status(), Status::BadRequest);
+        assert!(
+            response
+                .into_string()
+                .await
+                .unwrap()
+                .contains("Token not available on the network")
+        );
     }
 
     #[tokio::test]

@@ -43,6 +43,11 @@ pub struct Config {
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
     pub subgraph_url: Url,
+    /// All chain runtimes the registry is built from, Base first. The legacy
+    /// flat env vars populate the single Base entry today; the multichain
+    /// `CHAIN_<NETWORK>_*` config format extends this list (see the SPEC.md
+    /// Multi-chain section, which also specifies the legacy-var sunset).
+    pub chains: Vec<ChainConfig>,
 }
 
 impl Config {
@@ -56,27 +61,16 @@ impl Config {
         env.into_config()
     }
 
-    /// Builds a [`ChainRegistry`] from legacy single-chain env vars, producing
-    /// a registry with a single `base` entry.
+    /// Builds a [`ChainRegistry`] from `chains`. Consumers route per-chain
+    /// side effects through `registry.get(network)`; anything not yet
+    /// migrated to network-aware routing pins itself to `registry.base()`
+    /// at its own call site.
     pub(crate) async fn create_chain_registry(
         &self,
     ) -> Result<ChainRegistry<impl Provider + Clone + use<>>, ConfigError> {
-        build_chain_registry(
-            vec![self.legacy_base_chain_config()],
-            &self.signer,
-        )
-        .await
-        .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
-    }
-
-    fn legacy_base_chain_config(&self) -> ChainConfig {
-        ChainConfig {
-            network: Network::Base,
-            chain_id: self.chain_id,
-            rpc_url: self.rpc_url.clone(),
-            subgraph_url: self.subgraph_url.clone(),
-            backfill_start_block: self.backfill_start_block,
-        }
+        build_chain_registry(self.chains.clone(), &self.signer)
+            .await
+            .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
     }
 }
 
@@ -170,6 +164,14 @@ impl Env {
             }
         }
 
+        let chains = vec![ChainConfig {
+            network: Network::Base,
+            chain_id: self.chain_id,
+            rpc_url: self.rpc_url.clone(),
+            subgraph_url: self.subgraph_url.clone(),
+            backfill_start_block: self.backfill_start_block,
+        }];
+
         Ok(Config {
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
@@ -184,6 +186,7 @@ impl Env {
             hyperdx,
             alpaca: self.alpaca,
             subgraph_url: self.subgraph_url,
+            chains,
         })
     }
 }

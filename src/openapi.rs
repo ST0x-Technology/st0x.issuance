@@ -182,7 +182,10 @@ mod tests {
         // must be a string enum over the exact lowercase wire values clients
         // switch on, not an open string or a struct.
         assert_eq!(schemas["Network"]["type"], "string");
-        assert_eq!(schemas["Network"]["enum"], serde_json::json!(["base"]));
+        assert_eq!(
+            schemas["Network"]["enum"],
+            serde_json::json!(["base", "ethereum"])
+        );
         assert_eq!(schemas["TokenizedAssetStatus"]["type"], "string");
         assert_eq!(
             schemas["TokenizedAssetStatus"]["enum"],

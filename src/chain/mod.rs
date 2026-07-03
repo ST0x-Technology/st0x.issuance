@@ -10,7 +10,7 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use sqlx::{Pool, Sqlite};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -29,12 +29,14 @@ use crate::wallet::{
 
 const MAX_CHAIN_RUNTIME_BUILD_CONCURRENCY: usize = 4;
 
-pub(crate) struct ChainConfig {
-    pub(crate) network: Network,
-    pub(crate) chain_id: u64,
-    pub(crate) rpc_url: Url,
-    pub(crate) subgraph_url: Url,
-    pub(crate) backfill_start_block: u64,
+/// Per-chain RPC, vault, and subgraph settings for [`ChainRegistry`].
+#[derive(Clone)]
+pub struct ChainConfig {
+    pub network: Network,
+    pub chain_id: u64,
+    pub rpc_url: Url,
+    pub subgraph_url: Url,
+    pub backfill_start_block: u64,
 }
 
 pub(crate) struct ChainRuntime<P> {
@@ -48,6 +50,24 @@ pub(crate) struct ChainRuntime<P> {
 
 pub(crate) struct ChainRegistry<P> {
     runtimes: HashMap<Network, ChainRuntime<P>>,
+}
+
+/// Networks that have a chain configuration, extracted from
+/// [`ChainRegistry`] so HTTP handlers can reject asset registrations for
+/// unconfigured networks without holding the provider-generic registry.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredNetworks(HashSet<Network>);
+
+impl ConfiguredNetworks {
+    pub(crate) fn contains(&self, network: Network) -> bool {
+        self.0.contains(&network)
+    }
+}
+
+impl FromIterator<Network> for ConfiguredNetworks {
+    fn from_iter<I: IntoIterator<Item = Network>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
 }
 
 pub(crate) async fn validate_configured_asset_networks<P: Sync>(
@@ -129,6 +149,19 @@ impl<P> ChainRegistry<P> {
 
     pub(crate) fn base(&self) -> Result<&ChainRuntime<P>, ChainRegistryError> {
         self.get_required(Network::Base)
+    }
+
+    pub(crate) fn configured_networks(&self) -> ConfiguredNetworks {
+        self.runtimes.keys().copied().collect()
+    }
+
+    pub(crate) fn clone_vault_services(
+        &self,
+    ) -> HashMap<Network, Arc<dyn VaultService>> {
+        self.runtimes
+            .iter()
+            .map(|(network, runtime)| (*network, runtime.vault_service.clone()))
+            .collect()
     }
 }
 
@@ -267,6 +300,26 @@ mod tests {
     }
 
     #[traced_test]
+    #[test]
+    fn validate_rejects_duplicate_chain_id_across_networks() {
+        let configs = vec![
+            base_config(8453),
+            ChainConfig {
+                network: Network::Ethereum,
+                chain_id: 8453,
+                rpc_url: Url::parse("wss://localhost:8546").unwrap(),
+                subgraph_url: Url::parse("http://localhost:0/subgraph")
+                    .unwrap(),
+                backfill_start_block: 1,
+            },
+        ];
+
+        assert!(matches!(
+            validate_chain_configs(&configs),
+            Err(ChainRegistryError::DuplicateChainId { .. })
+        ));
+    }
+
     #[test]
     fn validate_rejects_duplicate_network() {
         let configs = vec![base_config(8453), base_config(8453)];

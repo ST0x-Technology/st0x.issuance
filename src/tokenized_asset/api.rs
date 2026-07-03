@@ -10,13 +10,14 @@ use st0x_issuance_dto::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::{
     Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
+use crate::chain::ConfiguredNetworks;
 
 fn merge_token_listing(
     views: Vec<TokenizedAssetView>,
@@ -198,12 +199,13 @@ pub(crate) async fn list_tokenized_assets(
     responses(
         (status = 201, description = "Asset added (idempotent: also 201 if it already existed)",
             body = AddTokenizedAssetResponse),
-        (status = 422, description = "Empty underlying symbol"),
+        (status = 422, description = "Empty underlying symbol, or network \
+            without a chain configuration"),
         (status = 500, description = "Failed to add asset")
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store), fields(
+#[tracing::instrument(skip(_auth, store, configured_networks), fields(
     underlying = %request.underlying,
     token = %request.token,
     network = %request.network,
@@ -213,8 +215,21 @@ pub(crate) async fn list_tokenized_assets(
 pub(crate) async fn add_tokenized_asset(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<TokenizedAsset>>>,
+    configured_networks: &rocket::State<ConfiguredNetworks>,
     request: Json<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
+    // An asset on a network with no chain config would make the next boot
+    // abort in `validate_configured_asset_networks`, bricking the service
+    // until the chain is configured or the asset removed. Reject upfront.
+    if !configured_networks.contains(request.network) {
+        warn!(
+            target: "asset",
+            network = %request.network,
+            "Rejected tokenized-asset registration for unconfigured network"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
+
     let command = TokenizedAssetCommand::Add {
         underlying: request.underlying.clone(),
         token: request.token.clone(),
@@ -283,6 +298,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph")
                 .expect("valid test URL"),
+            chains: Vec::new(),
         }
     }
 
@@ -520,6 +536,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store)
             .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -574,6 +591,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store)
             .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -636,6 +654,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store)
             .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -744,6 +763,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store)
             .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -765,6 +785,55 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_add_asset_on_unconfigured_network_returns_422() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(store.clone())
+            .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "AAPL",
+            "token": "tAAPL",
+            "network": "ethereum",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["unconfigured network", "ethereum"]
+        ));
+
+        // The rejected registration must not have written the aggregate — a
+        // written-but-rejected asset would still brick the next boot.
+        let key =
+            AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Ethereum);
+        let asset = store.load(&key).await.expect("load must succeed");
+        assert!(asset.is_none(), "aggregate must not exist: {asset:?}");
     }
 
     async fn migrated_in_memory_pool() -> sqlx::Pool<sqlx::Sqlite> {

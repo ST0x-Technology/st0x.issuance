@@ -22,6 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
+use crate::chain::{ChainRegistry, ConfiguredNetworks};
 use crate::mint::{
     Mint, MintServices, MintView, find_all_recoverable_mints,
     recovery::{
@@ -74,9 +75,11 @@ pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
+pub use chain::ChainConfig;
 pub use config::{Config, Environment, LogLevel, setup_tracing};
+pub use st0x_issuance_dto::Network;
 pub use telemetry::TelemetryGuard;
-pub use test_utils::ANVIL_CHAIN_ID;
+pub use test_utils::{ANVIL_CHAIN_ID, ETHEREUM_TEST_CHAIN_ID};
 pub use tokenized_asset::cli::run_issuer_cli;
 pub use wallet::SignerConfig;
 
@@ -271,12 +274,13 @@ pub async fn initialize_rocket(
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
     let vault_service_for_rocket = base.vault_service.clone();
+    let configured_networks = chain_registry.configured_networks();
 
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(
             &pool,
             &receipt_inventory_store,
-            base.vault_service.clone(),
+            &chain_registry,
             alpaca_service.clone(),
             bot_wallet,
         )
@@ -429,6 +433,7 @@ pub async fn initialize_rocket(
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_service: vault_service_for_rocket,
+        configured_networks,
     }))
 }
 
@@ -444,6 +449,7 @@ struct RocketState {
     alpaca_service: Arc<dyn AlpacaService>,
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
     vault_service: Arc<dyn vault::VaultService>,
+    configured_networks: ConfiguredNetworks,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -469,6 +475,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.alpaca_service)
         .manage(state.burn_recovery)
         .manage(state.vault_service)
+        .manage(state.configured_networks)
         .manage(state.pool)
         .manage(state.apalis_pool)
         .mount(
@@ -519,23 +526,26 @@ fn mount_api_docs(
     )
 }
 
-async fn setup_aggregate_cqrs(
+async fn setup_aggregate_cqrs<P>(
     pool: &Pool<Sqlite>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
-    vault_service: Arc<dyn vault::VaultService>,
+    chain_registry: &ChainRegistry<P>,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
-) -> Result<AggregateCqrsSetup, anyhow::Error> {
+) -> Result<AggregateCqrsSetup, anyhow::Error>
+where
+    P: Provider + Clone,
+{
     // Create MintServices with all dependencies
     let receipt_service =
         Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
-    let mint_services = MintServices {
-        vault: vault_service.clone(),
-        alpaca: alpaca_service,
-        pool: pool.clone(),
-        bot: bot_wallet,
-        receipts: receipt_service,
-    };
+    let mint_services = MintServices::new(
+        chain_registry.clone_vault_services(),
+        alpaca_service.clone(),
+        receipt_service,
+        pool.clone(),
+        bot_wallet,
+    );
 
     // Mint's canonical `mint_view` projection is auto-wired by StoreBuilder; the
     // secondary `receipt_inventory_view` (formerly a View<Mint> GenericQuery) is
@@ -563,7 +573,7 @@ async fn setup_aggregate_cqrs(
     let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
         .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
         .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
-        .build(vault_service)
+        .build(chain_registry.base()?.vault_service.clone())
         .await?;
 
     Ok(AggregateCqrsSetup { mint_store, redemption_store })
