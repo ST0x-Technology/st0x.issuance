@@ -911,31 +911,43 @@ Alpaca needs to query which assets we support:
 **Our Response:**
 
 ```json
-[
-  {
-    "underlying_symbol": "AAPL",
-    "token_symbol": "AAPL0x",
-    "network": "base"
-  },
-  {
-    "underlying_symbol": "TSLA",
-    "token_symbol": "TSLA0x",
-    "network": "base"
-  }
-]
+{
+  "tokens": [
+    {
+      "underlying": "AAPL",
+      "token": "tAAPL",
+      "networks": ["base"]
+    },
+    {
+      "underlying": "TSLA",
+      "token": "tTSLA",
+      "networks": ["base"]
+    }
+  ]
+}
 ```
 
 **Data Structure:**
 
 ```rust
-struct TokenizedAsset {
-    #[serde(rename = "underlying_symbol")]
+struct TokenizedAssetsListResponse {
+    tokens: Vec<TokenizedAssetResponse>,
+}
+
+struct TokenizedAssetResponse {
     underlying: UnderlyingSymbol,
-    #[serde(rename = "token_symbol")]
     token: TokenSymbol,
-    network: Network,
+    networks: Vec<Network>,
 }
 ```
+
+With multichain registration
+([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205), see the Multi-chain
+section) responses **merge rows** when the same `(underlying, token)` is
+registered on multiple chains (union of `networks[]`) -- a breaking semantic
+change for clients that relied on one row per network -- and `tokens` are sorted
+by underlying, each `networks[]` by `Network` wire value for deterministic
+ordering.
 
 #### Adding Tokenized Assets
 
@@ -970,6 +982,12 @@ rebalance guard (RAI-1038) to skip frozen assets before starting a rebalancing
 flow. Returns the asset's `status` (`enabled` or `frozen`), or `404` if the
 asset is unknown.
 
+From the multichain cutover
+([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205), see the Multi-chain
+section) this endpoint and `GET /tokenized-assets/{underlying}` require a
+`?network=` query parameter and return `422` when it is missing; the liquidity
+freeze guard fail-closes on 422.
+
 **Response:**
 
 ```json
@@ -989,6 +1007,8 @@ asset is unknown.
 - `200`: asset found — returns its `status` (`"enabled"` or `"frozen"`)
 - `401`: missing or invalid internal API key
 - `404`: asset unknown
+- `422`: missing `?network=` (from the multichain cutover -- see the Multi-chain
+  section). Consumers must treat this as fail-closed, never as `"enabled"`
 - `500`: database or view-deserialization failure — the status is
   **indeterminate**. A consumer must NOT treat any non-`404` failure as
   `"enabled"`; treat `500` as "unknown, retry" rather than proceeding.
@@ -2259,3 +2279,84 @@ detail including:
 - Separation between minting and burning keys if needed
 
 This is a critical security consideration that requires careful planning.
+
+### Multi-chain (RAI-1098)
+
+See `docs/multichain-implementation-plan.md` for the delivery plan, deploy
+constraints, and PR stack; the design gate is tracked in
+[RAI-1200](https://linear.app/makeitrain/issue/RAI-1200).
+
+**MVP scope:** Full multichain operation of the issuance service -- mints,
+redemptions, burns, token listing, receipt inventory, and transfer polling
+routed by aggregate `network`. Contract deployment on new chains is prerequisite
+work ([RAI-1095](https://linear.app/makeitrain/issue/RAI-1095),
+[RAI-1096](https://linear.app/makeitrain/issue/RAI-1096),
+[RAI-1211](https://linear.app/makeitrain/issue/RAI-1211)) via `st0x.deploy`;
+issuance registers deployed vaults and routes all side effects through
+`ChainRegistry`. Base-only config stays identical until each multichain PR
+merges.
+
+**Token listing ([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205)):**
+Alpaca ITN `GET /tokenized-assets` keeps the `{ tokens, networks[] }` JSON
+shape, but **row cardinality changes**: when the same `(underlying, token)` is
+registered on multiple chains, responses merge into one row with the union of
+`networks[]` (single-chain deployments emit one row per registered network).
+`tokens` are sorted by underlying ascending; `networks[]` within each row are
+sorted by network wire string. Add-asset registers vaults per `network`.
+
+**Redemption + burn
+([RAI-1207](https://linear.app/makeitrain/issue/RAI-1207)):** Detect, Alpaca
+orchestration, aggregate `BurnTokens`/`ConfirmBurn`, and BurnManager recovery
+all sign on the aggregate's `network` runtime -- not Base by default.
+
+**Architecture:** One issuance process; `ChainRegistry` maps `Network` ->
+`ChainRuntime` (HTTP provider, `VaultService`, `backfill_start_block`, and
+per-chain config fields carried forward from legacy startup). Alpaca calls a
+single issuer URL; payload `network` selects the runtime.
+
+**ChainRegistry ([RAI-1204](https://linear.app/makeitrain/issue/RAI-1204)):**
+Legacy env vars (`RPC_URL`, `CHAIN_ID`, `SUBGRAPH_URL`, `BACKFILL_START_BLOCK`)
+map to one `base` registry entry. Behaviour identical to single-chain
+production.
+
+**Asset identity ([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205) --
+breaking):** `TokenizedAsset` aggregate id becomes `{underlying}:{network}`
+(e.g. `AAPL:base`). Internal endpoints `GET /tokenized-assets/{underlying}` and
+`.../status` require `?network=` (422 if missing). This is a **lockstep break**
+with `st0x-issuance-client` and liquidity
+([RAI-1212](https://linear.app/makeitrain/issue/RAI-1212)) -- no dual-read or
+optional-default transition. Alpaca ITN list (`GET /tokenized-assets`) keeps
+`{ tokens, networks[] }`; see token listing above for merge semantics.
+
+**Cutover:** Lockstep deploy -- issuance, `st0x-issuance-client`, and liquidity
+(freeze guard, [RAI-1212](https://linear.app/makeitrain/issue/RAI-1212)) must
+ship in the same deploy window. No dual-read or versioned transition; callers
+without `?network=` get **422** immediately after cutover. Liquidity freeze
+guard **fail-closes** on 422 (rebalancing stops) if it calls issuance without
+`?network=` after cutover.
+
+**Rollback:** Roll back all three deployables together. If issuance rolls back
+alone while liquidity still sends `?network=`, freeze/status calls succeed. If
+liquidity rolls back alone while issuance requires `?network=`, freeze guard
+gets 422 and rebalancing **fail-closes** until liquidity is restored or issuance
+is rolled back. Do not leave a mixed-version window in production. RAI-1205 also
+applies the aggregate-store rekey: a code rollback after the rekey has run must
+be accompanied by a database restore from the pre-deployment backup -- reverted
+code looks assets up by the old `{underlying}` keys and silently finds nothing
+against a rekeyed store. See `docs/runbooks/tokenized-asset-aggregate-rekey.md`
+for the backup/restore procedure.
+
+**Invariants:**
+
+1. Every on-chain side effect uses the aggregate's persisted `network` runtime.
+2. `registry.get(network)` miss -> typed failure; never fall back to Base.
+3. Startup fails if a live asset's `network` has no chain config entry.
+
+**Alternatives considered:**
+
+| Alternative                                               | Rejected because                                                                                        |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| One process per chain                                     | Duplicate SQLite/event store; Alpaca expects one issuer URL                                             |
+| Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
+| Shared `VaultService` with runtime chain_id switch        | Fireblocks binds `chain_id` at construction; error-prone                                                |
+| Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |

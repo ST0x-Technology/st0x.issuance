@@ -308,8 +308,10 @@ SQLite for event store and views, with an async runtime for coordination.
 
 1. `POST /v1/accounts/{account_id}/tokenization/callback/mint` - Confirm mint
    completed
-2. `POST /v1/accounts/{account_id}/tokenization/redeem` - Initiate redemption
-3. `GET /v1/accounts/{account_id}/tokenization/requests` - List/poll requests
+2. `POST /v1/accounts/{account_id}/tokenization/callback/redeem` - Initiate
+   redemption
+3. `GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}` -
+   Poll request status
 
 ### Blockchain Integration
 
