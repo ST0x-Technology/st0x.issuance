@@ -21,6 +21,7 @@ pub(crate) use view::TokenizedAssetView;
 // The asset wire newtypes are defined once in the shared `st0x-issuance-dto`
 // crate so the API DTOs, Rust clients, and the TypeScript dashboard all share a
 // single definition.
+pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
@@ -67,7 +68,7 @@ pub(crate) struct TokenizedAsset {
 
 #[async_trait]
 impl EventSourced for TokenizedAsset {
-    type Id = UnderlyingSymbol;
+    type Id = AssetKey;
     type Event = TokenizedAssetEvent;
     type Command = TokenizedAssetCommand;
     type Error = Never;
@@ -76,7 +77,7 @@ impl EventSourced for TokenizedAsset {
 
     const AGGREGATE_TYPE: &'static str = "TokenizedAsset";
     const PROJECTION: Table = Table("tokenized_asset_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -274,7 +275,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_add_asset_creates_new_asset() {
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -322,14 +323,14 @@ mod tests {
 
         TestHarness::<TokenizedAsset>::with(())
             .given(vec![TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault,
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::Add {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault,
@@ -351,14 +352,14 @@ mod tests {
 
         let events = TestHarness::<TokenizedAsset>::with(())
             .given(vec![TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             }])
             .when(TokenizedAssetCommand::Add {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault: vault_b,
@@ -390,7 +391,7 @@ mod tests {
 
     fn added_event(vault: Address) -> TokenizedAssetEvent {
         TokenizedAssetEvent::Added {
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::Base,
             vault,
@@ -547,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_apply_asset_added_updates_state() {
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let network = Network::Base;
         let vault = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
@@ -588,7 +589,7 @@ mod tests {
 
         let asset = replay::<TokenizedAsset>(vec![
             TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault: vault_a,
@@ -618,14 +619,14 @@ mod tests {
 
         let asset = replay::<TokenizedAsset>(vec![
             TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault: vault_a,
                 added_at: chrono::Utc::now(),
             },
             TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL2"),
                 network: Network::Base,
                 vault: vault_b,
@@ -650,7 +651,7 @@ mod tests {
 
         let asset = replay::<TokenizedAsset>(vec![
             TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 vault: vault_a,
@@ -658,7 +659,7 @@ mod tests {
             },
             TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
             TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL2"),
                 network: Network::Base,
                 vault: vault_b,
@@ -674,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_underlying_symbol_display() {
-        let symbol = UnderlyingSymbol::new("AAPL");
+        let symbol = UnderlyingSymbol::new("AAPL").unwrap();
         assert_eq!(format!("{symbol}"), "AAPL");
     }
 
@@ -690,6 +691,202 @@ mod tests {
         assert_eq!(format!("{network}"), "base");
     }
 
+    /// Executes the real migration file (via `include_str!`) so the test
+    /// cannot drift from what production runs. Running the sequence twice
+    /// proves both the rekey and its idempotency: legacy bare-ticker ids gain
+    /// `:base` exactly once, already-rekeyed ids are untouched, and the view
+    /// is cleared for projection catch-up.
+    #[tokio::test]
+    async fn rekey_migration_rekeys_legacy_ids_and_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'TokenizedAsset',
+                'AAPL',
+                1,
+                'TokenizedAssetEvent::Added',
+                '1.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                payload,
+                timestamp
+            )
+            VALUES ('TokenizedAsset', 'AAPL', 1, '{}', 1)
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{}')
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        const REKEY_MIGRATION: &str = include_str!(
+            "../../migrations/20260703235904_rekey_tokenized_asset_aggregate_id.sql"
+        );
+
+        for pass in 1..=2 {
+            sqlx::raw_sql(REKEY_MIGRATION).execute(&pool).await.unwrap();
+
+            let event_ids: Vec<(String,)> = sqlx::query_as(
+                "
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'TokenizedAsset'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                event_ids,
+                vec![("AAPL:base".to_string(),)],
+                "event aggregate_id wrong after pass {pass}"
+            );
+
+            let snapshot_ids: Vec<(String,)> = sqlx::query_as(
+                "
+                SELECT aggregate_id
+                FROM snapshots
+                WHERE aggregate_type = 'TokenizedAsset'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot_ids,
+                vec![("AAPL:base".to_string(),)],
+                "snapshot aggregate_id wrong after pass {pass}"
+            );
+
+            let view_rows: Vec<(String,)> =
+                sqlx::query_as("SELECT view_id FROM tokenized_asset_view")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                view_rows.is_empty(),
+                "view must be cleared after pass {pass}"
+            );
+        }
+    }
+
+    /// Precondition guard: unexpected aggregate ids must abort before any row
+    /// is rekeyed. Each case seeds one violating id plus a legacy `AAPL` row;
+    /// the migration must fail and leave both ids untouched.
+    #[tokio::test]
+    async fn rekey_migration_aborts_on_unexpected_aggregate_ids() {
+        const REKEY_MIGRATION: &str = include_str!(
+            "../../migrations/20260703235904_rekey_tokenized_asset_aggregate_id.sql"
+        );
+
+        for unexpected_id in ["", "AAPL:BASE", "NVDA:ethereum", ":base"] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(":memory:")
+                .await
+                .unwrap();
+
+            sqlx::migrate!().run(&pool).await.unwrap();
+
+            for aggregate_id in ["AAPL", unexpected_id] {
+                sqlx::query(
+                    "
+                    INSERT INTO events (
+                        aggregate_type,
+                        aggregate_id,
+                        sequence,
+                        event_type,
+                        event_version,
+                        payload,
+                        metadata
+                    )
+                    VALUES (
+                        'TokenizedAsset',
+                        ?,
+                        1,
+                        'TokenizedAssetEvent::Added',
+                        '1.0',
+                        '{}',
+                        '{}'
+                    )
+                    ",
+                )
+                .bind(aggregate_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            let migration_result =
+                sqlx::raw_sql(REKEY_MIGRATION).execute(&pool).await;
+            assert!(
+                migration_result.is_err(),
+                "migration must abort when unexpected id {unexpected_id:?} is present"
+            );
+
+            let mut event_ids: Vec<String> = sqlx::query_as::<_, (String,)>(
+                "
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'TokenizedAsset'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(aggregate_id,)| aggregate_id)
+            .collect();
+            event_ids.sort();
+            let mut expected_ids =
+                vec!["AAPL".to_string(), unexpected_id.to_string()];
+            expected_ids.sort();
+            assert_eq!(
+                event_ids, expected_ids,
+                "ids must be unchanged after aborted migration for {unexpected_id:?}"
+            );
+        }
+    }
+
     /// Regression: pre-event-sorcery snapshot and `tokenized_asset_view` payloads
     /// must be cleared before `StoreBuilder::build` projection catch-up.
     #[tokio::test]
@@ -703,6 +900,7 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let underlying = "AAPL";
+        let aggregate_id = "AAPL:base";
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let now = Utc::now();
 
@@ -760,7 +958,7 @@ mod tests {
             )
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(
             serde_json::json!({
                 "Added": {
@@ -806,7 +1004,7 @@ mod tests {
             )
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(stale.to_string())
         .execute(&pool)
         .await
@@ -818,7 +1016,7 @@ mod tests {
             VALUES (?, 1, ?)
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(stale.to_string())
         .execute(&pool)
         .await
@@ -838,7 +1036,7 @@ mod tests {
               AND aggregate_id = ?
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -851,7 +1049,7 @@ mod tests {
         let view_payload: String = sqlx::query_scalar(
             "SELECT payload FROM tokenized_asset_view WHERE view_id = ?",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .fetch_one(&pool)
         .await
         .unwrap();

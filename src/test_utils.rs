@@ -31,7 +31,7 @@ use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptInventory, view::ReceiptInventoryViewReactor,
 };
 use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
@@ -166,7 +166,7 @@ async fn seed_test_assets(
     ];
 
     for (underlying, token, vault) in assets {
-        let underlying = UnderlyingSymbol::new(underlying);
+        let underlying = UnderlyingSymbol::new(underlying)?;
         let command = TokenizedAssetCommand::Add {
             underlying: underlying.clone(),
             token: TokenSymbol::new(token),
@@ -174,7 +174,8 @@ async fn seed_test_assets(
             vault,
         };
 
-        match store.send(&underlying, command).await {
+        let key = AssetKey::new(underlying.clone(), Network::Base);
+        match store.send(&key, command).await {
             Ok(()) | Err(event_sorcery::AggregateError::AggregateConflict) => {}
             Err(err) => {
                 return Err(err.into());

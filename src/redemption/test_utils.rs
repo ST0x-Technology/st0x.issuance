@@ -11,7 +11,7 @@ use crate::account::{
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
 
@@ -35,13 +35,13 @@ pub(crate) async fn setup_test_db_with_asset(
             .await
             .unwrap();
 
-    let underlying = UnderlyingSymbol::new("AAPL");
+    let underlying = UnderlyingSymbol::new("AAPL").unwrap();
     let token = TokenSymbol::new("tAAPL");
     let network = Network::Base;
 
     asset_store
         .send(
-            &underlying,
+            &AssetKey::new(underlying.clone(), network),
             TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
                 token,

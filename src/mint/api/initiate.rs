@@ -34,7 +34,7 @@ pub(crate) struct MintRequest {
 
 #[tracing::instrument(skip(_auth, mint_store, pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
-    underlying = %request.underlying.0,
+    underlying = %request.underlying.as_str(),
     client_id = %request.client_id,
     quantity = %request.quantity
 ))]
@@ -119,7 +119,7 @@ mod tests {
         view::find_by_issuer_request_id,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::TokenizedAssetCommand;
+    use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
 
     #[tokio::test]
     async fn test_initiate_mint_returns_issuer_request_id() {
@@ -160,7 +160,7 @@ mod tests {
             .await
             .expect("Failed to whitelist wallet");
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -172,7 +172,7 @@ mod tests {
             vault,
         };
         tokenized_asset_store
-            .send(&underlying, asset_cmd)
+            .send(&AssetKey::new(underlying.clone(), network), asset_cmd)
             .await
             .expect("Failed to add asset");
 
@@ -238,7 +238,10 @@ mod tests {
         } = harness;
 
         tokenized_asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 
@@ -258,7 +261,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
@@ -333,7 +336,10 @@ mod tests {
         let asset_store = tokenized_asset_store.clone();
 
         asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 
@@ -353,7 +359,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
@@ -385,7 +391,10 @@ mod tests {
         // Unfreezing must let new mints through again — the whole point of the
         // toggle is that issuance resumes after Unfreeze.
         asset_store
-            .send(&underlying, TokenizedAssetCommand::Unfreeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Unfreeze,
+            )
             .await
             .expect("Failed to unfreeze asset");
 
@@ -566,7 +575,7 @@ mod tests {
             ..
         } = TestHarness::new().await;
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -578,7 +587,7 @@ mod tests {
             vault,
         };
         tokenized_asset_store
-            .send(&underlying, asset_cmd)
+            .send(&AssetKey::new(underlying.clone(), network), asset_cmd)
             .await
             .expect("Failed to add asset");
 
@@ -662,7 +671,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-events-test",
             "qty": "50.0",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
@@ -741,7 +750,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": tokenization_request_id,
             "qty": "75.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
@@ -831,7 +840,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,
@@ -882,7 +891,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": "ethereum",
             "client_id": client_id,
@@ -1017,7 +1026,7 @@ mod tests {
         let request_body = serde_json::json!({
             "tokenization_request_id": "alp-123",
             "qty": "100.5",
-            "underlying_symbol": underlying.0,
+            "underlying_symbol": underlying.as_str(),
             "token_symbol": token.0,
             "network": network.as_str(),
             "client_id": client_id,

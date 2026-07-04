@@ -654,10 +654,11 @@ stateDiagram-v2
 ### TokenizedAsset Aggregate
 
 The `TokenizedAsset` aggregate manages which assets are supported for
-tokenization. The aggregate id is the `UnderlyingSymbol` today; the multichain
-cutover rekeys it to `{underlying}:{network}` (`AssetKey`) so the same
-underlying can be listed per network — see the [Multi-chain](#multi-chain)
-section for the target identity model and the migration/rollback story.
+tokenization. The aggregate id is the `AssetKey` — `{underlying}:{network}`
+(e.g. `AAPL:base`) — so the same underlying can be listed per network. See the
+[Multi-chain](#multi-chain) section for the identity model, and
+`docs/runbooks/tokenized-asset-aggregate-rekey.md` for migrating a
+pre-multichain store keyed by bare `UnderlyingSymbol`.
 
 **Aggregate State:**
 

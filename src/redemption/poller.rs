@@ -596,7 +596,7 @@ mod tests {
     use crate::redemption::{IssuerRedemptionRequestId, Redemption};
     use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
@@ -695,12 +695,13 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let msft = UnderlyingSymbol::new("MSFT");
+        let msft = UnderlyingSymbol::new("MSFT").unwrap();
+        let key = AssetKey::new(msft.clone(), Network::Base);
         asset_store
             .send(
-                &msft,
+                &key,
                 TokenizedAssetCommand::Add {
-                    underlying: msft.clone(),
+                    underlying: msft,
                     token: TokenSymbol::new("tMSFT"),
                     network: Network::Base,
                     vault,

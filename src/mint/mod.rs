@@ -19,7 +19,9 @@ use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptService, Shares,
 };
 use crate::redemption::has_unresolved_burn_intent;
-use crate::tokenized_asset::view::find_vault_by_underlying;
+use crate::tokenized_asset::view::{
+    TokenizedAssetViewError, TokenizedAssetViewFailure, find_vault,
+};
 use crate::vault::{
     PreparedMintTx, ReceiptInformation, TxId, VaultError, VaultService,
 };
@@ -301,6 +303,7 @@ struct MintSubmissionInput<'a> {
     tokenization_request_id: &'a TokenizationRequestId,
     quantity: &'a Quantity,
     underlying: &'a UnderlyingSymbol,
+    network: &'a Network,
     wallet: Address,
     journal_confirmed_at: DateTime<Utc>,
     receipt_note: Option<&'a str>,
@@ -553,6 +556,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -572,6 +576,7 @@ impl Mint {
                 tokenization_request_id,
                 quantity,
                 underlying,
+                network,
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: None,
@@ -594,31 +599,38 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             receipt_note,
             external_tx_id,
         } = input;
-
         let unresolved_mint = has_unresolved_mint_intent(
             &services.pool,
             Some(&issuer_request_id),
         )
         .await
-        .map_err(|error| MintError::AssetView { message: error.to_string() })?;
-        let unresolved_burn =
-            has_unresolved_burn_intent(&services.pool, None).await.map_err(
-                |error| MintError::AssetView { message: error.to_string() },
-            )?;
+        .map_err(|error| {
+            MintError::AssetView(TokenizedAssetViewFailure::Database {
+                message: error.to_string(),
+            })
+        })?;
+        let unresolved_burn = has_unresolved_burn_intent(&services.pool, None)
+            .await
+            .map_err(|error| {
+                MintError::AssetView(TokenizedAssetViewFailure::Database {
+                    message: error.to_string(),
+                })
+            })?;
         if unresolved_mint || unresolved_burn {
             return Err(MintError::PendingWalletIntent);
         }
 
-        let vault = find_vault_by_underlying(&services.pool, underlying)
-            .await
-            .map_err(|e| MintError::AssetView { message: e.to_string() })?
+        let vault = find_vault(&services.pool, underlying, network)
+            .await?
             .ok_or_else(|| MintError::AssetNotFound {
                 underlying: underlying.clone(),
+                network: *network,
             })?;
 
         let assets = quantity.to_u256_with_18_decimals().map_err(|e| {
@@ -766,6 +778,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             journal_confirmed_at,
             tx_id: stored_tx_id,
             ..
@@ -800,8 +813,7 @@ impl Mint {
 
                 // Best-effort receipt registration — vault lookup failure
                 // must not prevent TokensMinted from being emitted.
-                match find_vault_by_underlying(&services.pool, underlying).await
-                {
+                match find_vault(&services.pool, underlying, network).await {
                     Ok(Some(vault)) => {
                         let receipt_info = ReceiptInformation::new(
                             tokenization_request_id.clone(),
@@ -830,6 +842,8 @@ impl Mint {
                             warn!(
                                 target: "mint",
                                 issuer_request_id = %issuer_request_id,
+                                underlying = %underlying,
+                                network = %network,
                                 error = %err,
                                 "Failed to register minted receipt \
                                  (monitor/backfill will discover it)"
@@ -841,6 +855,7 @@ impl Mint {
                             target: "mint",
                             issuer_request_id = %issuer_request_id,
                             underlying = %underlying,
+                            network = %network,
                             "Vault not found for receipt registration \
                              (monitor/backfill will discover it)"
                         );
@@ -849,6 +864,8 @@ impl Mint {
                         warn!(
                             target: "mint",
                             issuer_request_id = %issuer_request_id,
+                            underlying = %underlying,
+                            network = %network,
                             error = %err,
                             "Vault lookup failed for receipt registration \
                              (monitor/backfill will discover it)"
@@ -943,16 +960,13 @@ impl Mint {
                 // Recover again, which hits the Minting arm to submit.
                 self.handle_deposit(issuer_request_id)
             }
-            Self::TxIntended { underlying, .. } => {
-                let vault =
-                    find_vault_by_underlying(&services.pool, underlying)
-                        .await
-                        .map_err(|error| MintError::AssetView {
-                            message: error.to_string(),
-                        })?
-                        .ok_or_else(|| MintError::AssetNotFound {
-                            underlying: underlying.clone(),
-                        })?;
+            Self::TxIntended { underlying, network, .. } => {
+                let vault = find_vault(&services.pool, underlying, network)
+                    .await?
+                    .ok_or_else(|| MintError::AssetNotFound {
+                        underlying: underlying.clone(),
+                        network: *network,
+                    })?;
 
                 if let Some(deposit_events) =
                     Self::recover_from_existing_receipt(
@@ -1047,16 +1061,13 @@ impl Mint {
         tx_hash: TxHash,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
-            Self::TxIntended { underlying, .. } => {
-                let vault =
-                    find_vault_by_underlying(&services.pool, underlying)
-                        .await
-                        .map_err(|error| MintError::AssetView {
-                            message: error.to_string(),
-                        })?
-                        .ok_or_else(|| MintError::AssetNotFound {
-                            underlying: underlying.clone(),
-                        })?;
+            Self::TxIntended { underlying, network, .. } => {
+                let vault = find_vault(&services.pool, underlying, network)
+                    .await?
+                    .ok_or_else(|| MintError::AssetNotFound {
+                        underlying: underlying.clone(),
+                        network: *network,
+                    })?;
                 let deposit_events = Self::recover_from_existing_receipt(
                     services,
                     &vault,
@@ -1107,6 +1118,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -1116,6 +1128,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -1128,11 +1141,11 @@ impl Mint {
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
-        let vault = find_vault_by_underlying(&services.pool, underlying)
-            .await
-            .map_err(|e| MintError::AssetView { message: e.to_string() })?
+        let vault = find_vault(&services.pool, underlying, network)
+            .await?
             .ok_or_else(|| MintError::AssetNotFound {
                 underlying: underlying.clone(),
+                network: *network,
             })?;
 
         if let Some(events) = Self::recover_from_existing_receipt(
@@ -1193,6 +1206,8 @@ impl Mint {
                         warn!(
                             target: "mint",
                             issuer_request_id = %issuer_request_id,
+                            underlying = %underlying,
+                            network = %network,
                             error = %err,
                             "Failed to register recovered receipt \
                              (monitor/backfill will discover it)"
@@ -1260,6 +1275,7 @@ impl Mint {
                             tokenization_request_id,
                             quantity,
                             underlying,
+                            network,
                             wallet: *wallet,
                             journal_confirmed_at: *journal_confirmed_at,
                             receipt_note: Some("Recovery mint"),
@@ -1283,6 +1299,7 @@ impl Mint {
                 tokenization_request_id,
                 quantity,
                 underlying,
+                network,
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: Some("Recovery mint"),
@@ -2283,12 +2300,14 @@ pub(crate) enum MintError {
         "Vault returned transaction metadata that differs from mint intent"
     )]
     SubmittedTransactionMismatch,
-    #[error("Asset not found for underlying: {underlying}")]
-    AssetNotFound { underlying: UnderlyingSymbol },
+    #[error(
+        "Asset not found for underlying: {underlying} on network: {network}"
+    )]
+    AssetNotFound { underlying: UnderlyingSymbol, network: Network },
     #[error("Quantity conversion: {message}")]
     QuantityConversion { message: String },
-    #[error("Asset view: {message}")]
-    AssetView { message: String },
+    #[error(transparent)]
+    AssetView(#[from] TokenizedAssetViewFailure),
     #[error("Alpaca: {message}")]
     Alpaca { message: String },
     #[error("Receipt lookup: {message}")]
@@ -2301,6 +2320,12 @@ pub(crate) enum MintError {
     PendingWalletIntent,
     #[error("Vault: {message}")]
     Vault { message: String },
+}
+
+impl From<TokenizedAssetViewError> for MintError {
+    fn from(error: TokenizedAssetViewError) -> Self {
+        Self::AssetView(error.into())
+    }
 }
 
 #[cfg(test)]
@@ -2333,7 +2358,9 @@ pub(crate) mod tests {
     use crate::prepare_event_sourced_startup;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::{log_count_at, logs_contain_at};
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        AssetKey, TokenizedAsset, TokenizedAssetCommand,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
@@ -2548,10 +2575,11 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
 
-            let underlying = UnderlyingSymbol::new("AAPL");
+            let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+            let asset_key = AssetKey::new(underlying.clone(), Network::Base);
             asset_store
                 .send(
-                    &underlying,
+                    &asset_key,
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new("tAAPL"),
@@ -2631,7 +2659,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -2716,7 +2744,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -2782,7 +2810,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-123");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -2827,7 +2855,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(50));
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -2879,7 +2907,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -2923,7 +2951,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -2971,7 +2999,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3018,7 +3046,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3057,7 +3085,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3119,7 +3147,7 @@ pub(crate) mod tests {
         let wrong_issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3160,7 +3188,7 @@ pub(crate) mod tests {
         let wrong_issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3200,7 +3228,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3262,7 +3290,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3332,7 +3360,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3394,7 +3422,7 @@ pub(crate) mod tests {
         let issuer_request_id = IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3467,7 +3495,7 @@ pub(crate) mod tests {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-flow-456");
         let quantity = Quantity::new(Decimal::from(100));
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -3576,7 +3604,7 @@ pub(crate) mod tests {
                     "alp-integration-456",
                 ),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -3615,9 +3643,12 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
                 TokenizedAssetCommand::Add {
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::Base,
                     vault: VAULT,
@@ -3949,9 +3980,12 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
                 TokenizedAssetCommand::Add {
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::Base,
                     vault: VAULT,
@@ -4148,9 +4182,12 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
                 TokenizedAssetCommand::Add {
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::Base,
                     vault: VAULT,
@@ -4377,7 +4414,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -4851,7 +4888,7 @@ pub(crate) mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -4927,7 +4964,7 @@ pub(crate) mod tests {
                         "tok-123",
                     ),
                     quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::Base,
                     client_id: ClientId::new(),
@@ -4970,7 +5007,7 @@ pub(crate) mod tests {
                         "tok-123",
                     ),
                     quantity: Quantity::new(Decimal::from(100)),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     network: Network::Base,
                     client_id: ClientId::new(),
@@ -5014,7 +5051,7 @@ pub(crate) mod tests {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: TokenizationRequestId::new("tok-123"),
             quantity: Quantity::new(Decimal::from(100)),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::Base,
             client_id: ClientId::new(),
@@ -5027,7 +5064,7 @@ pub(crate) mod tests {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: TokenizationRequestId::new("tok-123"),
             quantity: Quantity::new(Decimal::from(100)),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::Base,
             client_id: ClientId::new(),

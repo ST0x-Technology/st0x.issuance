@@ -23,10 +23,8 @@ use crate::receipt_inventory::{
 use crate::redemption::{
     BurnRecord, RedemptionMetadata, has_unresolved_burn_intent,
 };
-use crate::tokenized_asset::UnderlyingSymbol;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, find_vault_by_underlying,
-};
+use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnTxStatus, BurnVerification, MultiBurnEntry, SendableTxWithHash, TxId,
     VaultError, VaultService, VerifiedBurn, VerifiedShareTransfer,
@@ -278,7 +276,9 @@ impl BurnManager {
             }
         };
 
-        let vault = find_vault_by_underlying(&self.view_pool, &underlying)
+        // Burn routing is still Base-only in this PR; network-aware detect →
+        // Alpaca → burn lands in the upstack redemption PR (#215).
+        let vault = find_vault(&self.view_pool, &underlying, &Network::Base)
             .await?
             .ok_or(BurnManagerError::AssetNotFound { underlying })?;
 
@@ -490,7 +490,7 @@ impl BurnManager {
             return Ok(());
         }
 
-        let vault = find_vault_by_underlying(&self.view_pool, underlying)
+        let vault = find_vault(&self.view_pool, underlying, &Network::Base)
             .await?
             .ok_or_else(|| BurnManagerError::AssetNotFound {
                 underlying: underlying.clone(),
@@ -766,7 +766,7 @@ impl BurnManager {
         has_submitted: bool,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
         let vault =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
                 .await?
                 .ok_or_else(|| BurnManagerError::AssetNotFound {
                     underlying: metadata.underlying.clone(),
@@ -953,7 +953,7 @@ impl BurnManager {
         let action_already_reserved =
             pending_recovery == Some(PendingBurnRecovery::Reserved(action));
         let vault =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
                 .await?
                 .ok_or_else(|| BurnManagerError::AssetNotFound {
                     underlying: metadata.underlying.clone(),
@@ -1042,31 +1042,7 @@ impl BurnManager {
         command_result?;
 
         if status == BurnTxStatus::ProvablyDead {
-            let Some(Redemption::BurnIntended {
-                planned_burns,
-                sendable_tx,
-                external_tx_id,
-                ..
-            }) = self.store.load(issuer_request_id).await?
-            else {
-                return Err(BurnManagerError::InvalidAggregateState {
-                    current_state: "expected replacement BurnIntended"
-                        .to_string(),
-                });
-            };
-            let replacement_burns = recovery_burn_entries(&planned_burns);
-            self.store
-                .send(
-                    issuer_request_id,
-                    RedemptionCommand::BurnTokens {
-                        issuer_request_id: issuer_request_id.clone(),
-                        vault,
-                        burns: replacement_burns,
-                        dust_shares: sendable_tx.dust_shares,
-                        owner: self.bot_wallet,
-                        external_tx_id,
-                    },
-                )
+            self.submit_replacement_after_dead_burn(issuer_request_id, vault)
                 .await?;
         }
         drop(wallet_guard);
@@ -1080,6 +1056,39 @@ impl BurnManager {
         Ok(RecoveryOutcome::Executed)
     }
 
+    async fn submit_replacement_after_dead_burn(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+    ) -> Result<(), BurnManagerError> {
+        let Some(Redemption::BurnIntended {
+            planned_burns,
+            sendable_tx,
+            external_tx_id,
+            ..
+        }) = self.store.load(issuer_request_id).await?
+        else {
+            return Err(BurnManagerError::InvalidAggregateState {
+                current_state: "expected replacement BurnIntended".to_string(),
+            });
+        };
+        let replacement_burns = recovery_burn_entries(&planned_burns);
+        self.store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault,
+                    burns: replacement_burns,
+                    dust_shares: sendable_tx.dust_shares,
+                    owner: self.bot_wallet,
+                    external_tx_id,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn submit_prepared_replacement(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -1089,7 +1098,7 @@ impl BurnManager {
         external_tx_id: Option<BurnExternalTxId>,
     ) -> Result<(), BurnManagerError> {
         let vault =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
                 .await?
                 .ok_or_else(|| BurnManagerError::AssetNotFound {
                     underlying: metadata.underlying.clone(),
@@ -1204,9 +1213,10 @@ impl BurnManager {
                 external_tx_id,
                 ..
             } => {
-                let vault = find_vault_by_underlying(
+                let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
+                    &Network::Base,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -1327,7 +1337,7 @@ impl BurnManager {
         };
 
         let Some(vault) =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
                 .await?
         else {
             let error_msg = format!(
@@ -2438,7 +2448,8 @@ mod tests {
     };
     use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
-        TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -2791,10 +2802,13 @@ mod tests {
         ) {
             self.asset_store
                 .send(
-                    underlying,
+                    &AssetKey::new(underlying.clone(), Network::Base),
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
-                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        token: TokenSymbol::new(format!(
+                            "t{}",
+                            underlying.as_str()
+                        )),
                         network: Network::Base,
                         vault,
                     },
@@ -2839,7 +2853,7 @@ mod tests {
     ) -> Redemption {
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-456");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -2955,7 +2969,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3016,7 +3030,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
         harness
             .discover_receipt(
@@ -3141,7 +3155,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3268,7 +3282,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -3366,7 +3380,9 @@ mod tests {
             let harness =
                 TestHarness::with_vault_mock(vault_mock.clone()).await;
             let TestHarness { store, receipt_service, pool, .. } = &harness;
-            harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+            harness
+                .add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault)
+                .await;
             let manager = BurnManager::new(
                 vault_mock.clone(),
                 pool.clone(),
@@ -3454,7 +3470,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3519,7 +3535,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3651,7 +3667,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3759,7 +3775,7 @@ mod tests {
         } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3775,7 +3791,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-mint-99"),
             IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(Decimal::new(10000, 2)),
             Utc::now(),
             None,
@@ -3844,7 +3860,7 @@ mod tests {
         } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3860,7 +3876,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-bytes-test"),
             IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(Decimal::from(50)),
             Utc::now(),
             None,
@@ -3922,7 +3938,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -3997,7 +4013,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
@@ -4058,7 +4074,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
@@ -4119,7 +4135,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
@@ -4180,7 +4196,7 @@ mod tests {
                 inner: receipt_service.clone(),
             });
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock,
             pool.clone(),
@@ -4242,7 +4258,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
@@ -4297,7 +4313,7 @@ mod tests {
         );
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
         let quantity = Quantity::new(Decimal::from(50));
@@ -4344,7 +4360,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -4393,7 +4409,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying_symbol = UnderlyingSymbol::new("AAPL");
+        let underlying_symbol = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying_symbol, vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
@@ -4418,7 +4434,7 @@ mod tests {
 
         let tokenization_request_id =
             TokenizationRequestId::new("alp-partial-burn");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(50));
@@ -4488,7 +4504,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
@@ -4535,7 +4551,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
@@ -4590,7 +4606,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
@@ -4654,7 +4670,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -4698,7 +4714,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         // Configure mock to return balance less than required (100 shares = 100e18)
@@ -4758,7 +4774,7 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -4806,7 +4822,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
@@ -4877,7 +4893,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         // Configure mock to return balance less than required (100 shares = 100e18)
@@ -4952,7 +4968,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         // Configure mock to return 0 balance (burn already happened on-chain)
@@ -5027,7 +5043,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
         let manager = BurnManager::new(
@@ -5122,7 +5138,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
         let manager = BurnManager::new(
@@ -5223,7 +5239,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
         let manager = BurnManager::new(
@@ -5434,7 +5450,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5544,7 +5560,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5606,7 +5622,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5696,7 +5712,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5793,7 +5809,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5879,7 +5895,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -5969,7 +5985,7 @@ mod tests {
         let TestHarness { store, receipt_service, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
@@ -6279,7 +6295,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -6353,7 +6369,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
@@ -6545,7 +6561,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -6721,7 +6737,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -6888,7 +6904,7 @@ mod tests {
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -7039,7 +7055,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let manager = BurnManager::new(
             vault_mock,
@@ -7115,7 +7131,7 @@ mod tests {
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let manager = BurnManager::new(
             vault_mock,
@@ -7171,7 +7187,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
         let manager = BurnManager::new(
@@ -7325,7 +7341,7 @@ mod tests {
                 inner: receipt_service.clone(),
             });
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let manager = BurnManager::new(
             vault_mock.clone(),
@@ -7396,7 +7412,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
 
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
@@ -7526,7 +7542,7 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
@@ -7704,7 +7720,7 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_failure());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
@@ -7766,7 +7782,7 @@ mod tests {
     async fn test_recover_stuck_reservations_warns_and_leaves_unknown() {
         let harness = TestHarness::new().await;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;

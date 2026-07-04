@@ -251,7 +251,8 @@ mod tests {
     use super::*;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
@@ -346,10 +347,11 @@ mod tests {
                 .await
                 .expect("Failed to build tokenized asset store");
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let key = AssetKey::new(underlying.clone(), Network::Base);
         store
             .send(
-                &underlying,
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: underlying.clone(),
                     token: TokenSymbol::new("tAAPL"),
@@ -400,10 +402,11 @@ mod tests {
                 .await
                 .expect("Failed to build tokenized asset store");
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let key = AssetKey::new(underlying.clone(), Network::Base);
         store
             .send(
-                &underlying,
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: underlying.clone(),
                     token: TokenSymbol::new("tAAPL"),

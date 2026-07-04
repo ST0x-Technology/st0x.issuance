@@ -935,7 +935,7 @@ mod tests {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
             IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(dec!(100.5)),
             Utc::now(),
             Some("test mint".to_string()),
@@ -983,7 +983,7 @@ mod tests {
         let info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
             IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(dec!(100.5)),
             Utc::now(),
             None,

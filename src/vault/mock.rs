@@ -1167,7 +1167,7 @@ mod tests {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
             IssuerMintRequestId::random(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(Decimal::from(100)),
             Utc::now(),
             None,

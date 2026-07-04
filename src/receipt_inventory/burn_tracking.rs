@@ -516,7 +516,7 @@ mod tests {
         let events = vec![
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 wallet: address!("0x1111111111111111111111111111111111111111"),
                 quantity: Quantity::new(dec!(10)),
