@@ -129,6 +129,11 @@ pub enum ChainRegistryError {
 }
 
 impl<P> ChainRegistry<P> {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests(_provider: &P) -> Self {
+        Self { runtimes: HashMap::new() }
+    }
+
     pub(crate) fn get(&self, network: Network) -> Option<&ChainRuntime<P>> {
         self.runtimes.get(&network)
     }

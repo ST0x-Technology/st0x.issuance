@@ -58,27 +58,41 @@ pub fn setup_redemption_mocks_with_states(
         then.status(200).respond_with(
             move |req: &httpmock::HttpMockRequest| {
                 let body: serde_json::Value =
-                    serde_json::from_slice(req.body().as_ref()).unwrap();
-                let issuer_request_id =
-                    body["issuer_request_id"].as_str().unwrap().to_string();
-                let tx_hash =
-                    body["tx_hash"].as_str().unwrap().to_string();
-                let qty = body["qty"].as_str().unwrap().to_string();
+                    serde_json::from_slice(req.body().as_ref())
+                        .expect("redeem request body must be valid JSON");
+                let issuer_request_id = body["issuer_request_id"]
+                    .as_str()
+                    .expect("redeem request must include issuer_request_id")
+                    .to_string();
+                let tx_hash = body["tx_hash"]
+                    .as_str()
+                    .expect("redeem request must include tx_hash")
+                    .to_string();
+                let qty = body["qty"]
+                    .as_str()
+                    .expect("redeem request must include qty")
+                    .to_string();
                 let underlying_symbol = body["underlying_symbol"]
                     .as_str()
-                    .unwrap()
+                    .expect("redeem request must include underlying_symbol")
                     .to_string();
-                let token_symbol =
-                    body["token_symbol"].as_str().unwrap().to_string();
+                let token_symbol = body["token_symbol"]
+                    .as_str()
+                    .expect("redeem request must include token_symbol")
+                    .to_string();
                 let wallet_address = body["wallet_address"]
                     .as_str()
-                    .unwrap()
+                    .expect("redeem request must include wallet_address")
                     .to_string();
-                let network =
-                    body["network"].as_str().unwrap().to_string();
+                let network = body["network"]
+                    .as_str()
+                    .expect("redeem request must include network")
+                    .to_string();
 
-                shared_state_redeem.lock().unwrap().push(
-                    RedemptionState {
+                shared_state_redeem
+                    .lock()
+                    .expect("redemption mock state mutex must not be poisoned")
+                    .push(RedemptionState {
                         issuer_request_id: issuer_request_id.clone(),
                         tx_hash: tx_hash.clone(),
                         qty: qty.clone(),
@@ -86,8 +100,7 @@ pub fn setup_redemption_mocks_with_states(
                         token_symbol: token_symbol.clone(),
                         wallet_address: wallet_address.clone(),
                         network: network.clone(),
-                    },
-                );
+                    });
 
                 let response_body = serde_json::to_string(&json!({
                     "tokenization_request_id": format!("tok-redeem-{}", issuer_request_id),
@@ -105,7 +118,7 @@ pub fn setup_redemption_mocks_with_states(
                     "tx_hash": tx_hash,
                     "fees": "0.5"
                 }))
-                .unwrap();
+                .expect("redeem mock response must serialize");
 
                 httpmock::HttpMockResponse {
                     status: Some(200),
@@ -143,7 +156,7 @@ pub fn setup_redemption_mocks_with_states(
 
                 let matched = shared_state
                     .lock()
-                    .unwrap()
+                    .expect("redemption mock state mutex must not be poisoned")
                     .iter()
                     .find(|s| {
                         format!("tok-redeem-{}", s.issuer_request_id) == tok_id
@@ -177,7 +190,7 @@ pub fn setup_redemption_mocks_with_states(
                     "tx_hash": state.tx_hash,
                     "fees": "0.5"
                 }))
-                .unwrap();
+                .expect("poll mock response must serialize");
 
                 httpmock::HttpMockResponse {
                     status: Some(200),

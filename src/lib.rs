@@ -54,7 +54,7 @@ use crate::redemption::{
 };
 use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
-    view::list_enabled_assets,
+    validate_no_cross_network_vault_collisions, view::list_enabled_assets,
 };
 use poll_checkpoint::load_receipt_backfill;
 
@@ -338,12 +338,7 @@ pub async fn initialize_rocket(
     )
     .await
     {
-        error!(
-            target: "receipt",
-            error = %error,
-            "Startup reconciliation failed — receipt balances may be stale \
-             until the next withdraw event triggers reconciliation"
-        );
+        error.log();
     }
 
     // The synchronous recovery pass runs with a timeout before the HTTP server
@@ -984,6 +979,8 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
         return Ok(vec![]);
     }
 
+    validate_no_cross_network_vault_collisions(&assets)?;
+
     info!(
         target: "receipt",
         asset_count = assets.len(),
@@ -993,7 +990,17 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
     stream::iter(assets)
         .then(
             |TokenizedAssetView { vault, underlying, network, .. }| async move {
-                let runtime = chain_registry.get_required(network)?;
+                let runtime = chain_registry.get_required(network).inspect_err(
+                    |error| {
+                        warn!(
+                            target: "receipt",
+                            %network,
+                            %vault,
+                            error = %error,
+                            "Chain registry miss while preparing receipt backfill"
+                        );
+                    },
+                )?;
                 run_single_vault_backfill(
                     &VaultBackfillCtx {
                         pool,
@@ -1077,6 +1084,90 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
     Ok(VaultBackfillConfig { chain_id, network, vault, receipt_contract })
 }
 
+struct ReconciliationFailures {
+    first: Option<ReconciliationFailure>,
+    count: usize,
+}
+
+struct ReconciliationFailure {
+    network: Network,
+    vault: Address,
+    source: anyhow::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "startup reconciliation failed for {failed_vaults} of {total_vaults} vaults"
+)]
+struct StartupReconciliationError {
+    failed_vaults: usize,
+    total_vaults: usize,
+    first_network: Network,
+    first_vault: Address,
+    #[source]
+    source: anyhow::Error,
+}
+
+impl StartupReconciliationError {
+    fn log(&self) {
+        warn!(
+            target: "receipt",
+            failed_vaults = self.failed_vaults,
+            total_vaults = self.total_vaults,
+            first_network = %self.first_network,
+            first_vault = %self.first_vault,
+            error = %self.source,
+            "Startup reconciliation failed — receipt balances may be stale \
+             until the next withdraw event triggers reconciliation"
+        );
+    }
+}
+
+impl ReconciliationFailures {
+    const fn new() -> Self {
+        Self { first: None, count: 0 }
+    }
+
+    fn record(
+        &mut self,
+        network: Network,
+        vault: Address,
+        source: anyhow::Error,
+    ) {
+        debug!(
+            target: "receipt",
+            %network,
+            %vault,
+            error = %source,
+            "Startup reconciliation failed for vault; continuing with the \
+             remaining vaults"
+        );
+
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(ReconciliationFailure { network, vault, source });
+        }
+    }
+
+    fn finish(
+        self,
+        total_vaults: usize,
+    ) -> Result<(), StartupReconciliationError> {
+        let Some(ReconciliationFailure { network, vault, source }) = self.first
+        else {
+            return Ok(());
+        };
+
+        Err(StartupReconciliationError {
+            failed_vaults: self.count,
+            total_vaults,
+            first_network: network,
+            first_vault: vault,
+            source,
+        })
+    }
+}
+
 /// Attempts reconciliation for every vault even when earlier vaults fail —
 /// a transient RPC failure on one network must not leave the remaining
 /// networks' receipt inventories unreconciled at boot.
@@ -1085,8 +1176,8 @@ async fn run_startup_reconciliation_for_vaults<P: Provider + Clone>(
     vault_configs: &[VaultBackfillConfig],
     store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
-) -> Result<(), anyhow::Error> {
-    let mut failed_vaults = 0_usize;
+) -> Result<(), StartupReconciliationError> {
+    let mut failures = ReconciliationFailures::new();
 
     for &VaultBackfillConfig { chain_id, network, vault, receipt_contract } in
         vault_configs
@@ -1105,26 +1196,11 @@ async fn run_startup_reconciliation_for_vaults<P: Provider + Clone>(
         .await;
 
         if let Err(error) = outcome {
-            failed_vaults += 1;
-            warn!(
-                target: "receipt",
-                %network,
-                %vault,
-                error = %error,
-                "Startup reconciliation failed for vault; continuing with \
-                 the remaining vaults"
-            );
+            failures.record(network, vault, error);
         }
     }
 
-    if failed_vaults > 0 {
-        return Err(anyhow::anyhow!(
-            "startup reconciliation failed for {failed_vaults} of {} vaults",
-            vault_configs.len()
-        ));
-    }
-
-    Ok(())
+    failures.finish(vault_configs.len())
 }
 
 fn next_receipt_backfill_block(
@@ -1512,23 +1588,31 @@ fn spawn_mint_recovery_worker(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, address, uint};
+    use alloy::primitives::{Address, U256, address, uint};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use event_sorcery::test_store;
     use rust_decimal::Decimal;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
     use super::{
         BURN_RECOVERY_RECONCILE_INTERVAL, Environment, Quantity,
-        QuantityConversionError, ReceiptContractAddress, VaultAddress,
+        QuantityConversionError, ReceiptContractAddress,
+        ReconciliationFailures, VaultAddress, VaultBackfillConfig,
         cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
-        run_burn_recovery_reconciler,
+        run_burn_recovery_reconciler, run_startup_reconciliation_for_vaults,
     };
+    use crate::chain::{ChainRegistry, ChainRegistryError};
+    use crate::receipt_inventory::ReceiptInventory;
+    use crate::test_utils::{log_count_at, logs_contain_at};
 
     #[tokio::test]
     async fn burn_recovery_reconciler_repeats_after_each_interval() {
@@ -1853,5 +1937,104 @@ mod tests {
         let start_block = next_receipt_backfill_block(Some(20), 50).unwrap();
 
         assert_eq!(start_block, 50);
+    }
+
+    mod receipt_inventory_reconciliation {
+        use super::*;
+
+        #[traced_test]
+        #[test]
+        fn reconciliation_failures_log_details_once_per_level() {
+            let base_vault =
+                address!("0x1111111111111111111111111111111111111111");
+            let ethereum_vault =
+                address!("0x2222222222222222222222222222222222222222");
+            let mut failures = ReconciliationFailures::new();
+
+            failures.record(
+                crate::Network::Base,
+                base_vault,
+                anyhow::anyhow!("Base RPC unavailable"),
+            );
+            failures.record(
+                crate::Network::Ethereum,
+                ethereum_vault,
+                anyhow::anyhow!("Ethereum RPC unavailable"),
+            );
+
+            let error = failures.finish(2).unwrap_err();
+            error.log();
+
+            assert_eq!(error.failed_vaults, 2);
+            assert_eq!(error.total_vaults, 2);
+            assert_eq!(error.first_network, crate::Network::Base);
+            assert_eq!(error.first_vault, base_vault);
+            assert_eq!(error.source.to_string(), "Base RPC unavailable");
+            assert_eq!(
+                log_count_at!(
+                    Level::DEBUG,
+                    &["Startup reconciliation failed for vault"]
+                ),
+                2
+            );
+            assert!(logs_contain_at!(
+                Level::WARN,
+                &["Startup reconciliation failed", "Base RPC unavailable", "2"]
+            ));
+        }
+
+        #[traced_test]
+        #[tokio::test]
+        async fn unconfigured_network_failure_keeps_context_and_logs() {
+            let provider =
+                ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let registry = ChainRegistry::empty_for_tests(&provider);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_lazy(":memory:")
+                .unwrap();
+            let store = Arc::new(test_store::<ReceiptInventory>(pool, ()));
+            let vault = address!("0x3333333333333333333333333333333333333333");
+            let receipt_contract =
+                address!("0x4444444444444444444444444444444444444444");
+            let configs = [VaultBackfillConfig {
+                chain_id: 1,
+                network: crate::Network::Ethereum,
+                vault,
+                receipt_contract,
+            }];
+
+            let error = run_startup_reconciliation_for_vaults(
+                &registry,
+                &configs,
+                &store,
+                Address::ZERO,
+            )
+            .await
+            .unwrap_err();
+            error.log();
+
+            assert!(matches!(
+                error.source.downcast_ref::<ChainRegistryError>(),
+                Some(ChainRegistryError::NetworkNotConfigured {
+                    network: crate::Network::Ethereum
+                })
+            ));
+            assert!(logs_contain_at!(
+                Level::DEBUG,
+                &[
+                    "Startup reconciliation failed for vault",
+                    "ethereum",
+                    "network ethereum is not configured"
+                ]
+            ));
+            assert!(logs_contain_at!(
+                Level::WARN,
+                &[
+                    "Startup reconciliation failed",
+                    "network ethereum is not configured"
+                ]
+            ));
+        }
     }
 }

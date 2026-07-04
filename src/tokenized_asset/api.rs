@@ -199,13 +199,14 @@ pub(crate) async fn list_tokenized_assets(
     responses(
         (status = 201, description = "Asset added (idempotent: also 201 if it already existed)",
             body = AddTokenizedAssetResponse),
-        (status = 422, description = "Empty underlying symbol, or network \
-            without a chain configuration"),
+        (status = 422, description = "Empty underlying symbol, network \
+            without a chain configuration, or vault address already used on \
+            another network"),
         (status = 500, description = "Failed to add asset")
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, configured_networks), fields(
+#[tracing::instrument(skip(_auth, store, pool, configured_networks), fields(
     underlying = %request.underlying,
     token = %request.token,
     network = %request.network,
@@ -215,6 +216,7 @@ pub(crate) async fn list_tokenized_assets(
 pub(crate) async fn add_tokenized_asset(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<TokenizedAsset>>>,
+    pool: &rocket::State<Pool<Sqlite>>,
     configured_networks: &rocket::State<ConfiguredNetworks>,
     request: Json<AddTokenizedAssetRequest>,
 ) -> Result<(Status, Json<AddTokenizedAssetResponse>), Status> {
@@ -228,6 +230,40 @@ pub(crate) async fn add_tokenized_asset(
             target: "asset",
             network = %request.network,
             "Rejected tokenized-asset registration for unconfigured network"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
+
+    // Same guard as boot-time backfill: reject before the Add lands so a
+    // shared vault across networks never waits until the next restart to fail.
+    let mut assets = super::view::list_enabled_assets(pool.inner())
+        .await
+        .map_err(|error| {
+            error!(
+                target: "asset",
+                error = %error,
+                "Failed to list enabled assets before add"
+            );
+            Status::InternalServerError
+        })?;
+    assets.push(TokenizedAssetView {
+        underlying: request.underlying.clone(),
+        token: request.token.clone(),
+        network: request.network,
+        vault: request.vault,
+        status: super::AssetStatus::Enabled,
+        added_at: chrono::Utc::now(),
+    });
+    if let Err(collision) =
+        super::validate_no_cross_network_vault_collisions(&assets)
+    {
+        warn!(
+            target: "asset",
+            vault = %collision.vault,
+            first = %collision.first,
+            second = %collision.second,
+            "Rejected tokenized-asset registration: vault address already \
+             used on another network"
         );
         return Err(Status::UnprocessableEntity);
     }
@@ -835,6 +871,75 @@ mod tests {
         // written-but-rejected asset would still brick the next boot.
         let key = AssetKey::new(
             UnderlyingSymbol::new("AAPL").unwrap(),
+            Network::Ethereum,
+        );
+        let asset = store.load(&key).await.expect("load must succeed");
+        assert!(asset.is_none(), "aggregate must not exist: {asset:?}");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_add_asset_rejects_vault_shared_across_networks() {
+        let pool = migrated_in_memory_pool().await;
+        let store = setup_tokenized_asset_store(&pool).await;
+        let shared_vault =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        store
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Add {
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault: shared_vault,
+                },
+            )
+            .await
+            .expect("base asset should add");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(store.clone())
+            .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([
+                Network::Base,
+                Network::Ethereum,
+            ]))
+            .mount("/", routes![add_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let request_body = serde_json::json!({
+            "underlying": "MSFT",
+            "token": "tMSFT",
+            "network": "ethereum",
+            "vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let response = client
+            .post("/tokenized-assets")
+            .header(ContentType::JSON)
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(request_body.to_string())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["vault address already", "another network"]
+        ));
+
+        let key = AssetKey::new(
+            UnderlyingSymbol::new("MSFT").unwrap(),
             Network::Ethereum,
         );
         let asset = store.load(&key).await.expect("load must succeed");
