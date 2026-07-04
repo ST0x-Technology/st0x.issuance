@@ -71,6 +71,25 @@ settlement layer between Authorized Participants (APs) and us.
 - On-chain address where APs send tokens to redeem
 - We monitor this address for incoming transfers
 
+**ST0xOrchestrator Contract:**
+
+- A singleton contract that holds custody of **all** ERC-1155 receipts across
+  every vault, replacing the bot-wallet receipt custody model for the vaults it
+  covers. Exposes role-gated `mint()`/`burn()` entry points guarded by
+  `MINT_ROLE`, `BURN_ROLE`, and an `EMERGENCY_ROLE` for manual recovery actions
+  (e.g. moving receipts, adjusting the burn pointer).
+- **Dual-mode, config-selected per asset, default vault-direct.** Each asset
+  operates in `vault_direct` mode (today's direct `OffchainAssetReceiptVault`
+  multicall flow, described above and in "Complete Mint Flow" / "Complete
+  Redemption Flow") or `orchestrator` mode (this contract). The mode is a
+  per-asset configuration choice (`[assets.<UNDERLYING>]` in the TOML config
+  file, see "Configuration" -> "TOML Configuration File"), not a per-request
+  choice. It defaults to `vault_direct` for every asset, so the orchestrator can
+  be dark-deployed and exercised before cutover; cutover moves assets into
+  orchestrator mode incrementally — a single pilot asset first, then the rest —
+  and rollback flips a single asset back. See "Orchestrator Migration
+  (ST0xOrchestrator)" for the full design.
+
 ### ES/CQRS Architecture
 
 The issuance bot uses **Event Sourcing (ES)** and **Command Query Responsibility
@@ -174,8 +193,18 @@ initial request through journal confirmation to on-chain minting and callback.
 - `tokenization_request_id`: Alpaca's identifier
 - `quantity`, `underlying`, `token`, `network`, `client_id`, `wallet`: Request
   details
+- `mint_mode: VaultMode`: the asset's resolved `VaultMode` at initiate time.
+  Anchors mode-derivation for this mint — see "Orchestrator Migration" ->
+  "Recipient Authorization"
+- `mint_authorization` (orchestrator mode only): the `MintAuthV1` the liquidity
+  bot supplied for this mint via the internal mint-authorization call, absent
+  until that call arrives — see "Orchestrator Migration" -> "Recipient
+  Authorization"
 - `status`: Current state in the mint lifecycle
-- `tx_hash`, `receipt_id`, `shares_minted`: On-chain transaction details
+- `tx_hash`, `receipt_id`, `shares_minted`: On-chain transaction details.
+  Orchestrator-mode mints populate the analogous on-chain proof (`nonce` instead
+  of `receipt_id`) — lifecycle state names stay backend-agnostic; only the
+  audit-data shape differs
 - Timestamps for each lifecycle stage
 
 **Durable jobs vs pure commands:** On-chain I/O and Alpaca callbacks are
@@ -193,6 +222,13 @@ plus enqueue of the next job), not a wallet-locked aggregate command.
   transfer
 - `RejectJournal { issuer_request_id, reason }` - Alpaca rejected shares journal
   transfer
+- `AuthorizeMint { issuer_request_id, mint_authorization }` (orchestrator mode
+  only) - Associate the liquidity bot's `MintAuthV1` with this mint, delivered
+  out-of-band via the internal mint-authorization call after `Initiate`.
+  Validates the EIP-712 signature and nonce (see "Recipient Authorization"),
+  rejects delivery when this mint's `mint_mode` is `VaultDirect`, and is
+  idempotent on redelivery of an identical authorization. Produces
+  `MintAuthorizationReceived`. Does not change the lifecycle state
 - `Deposit { issuer_request_id }` - Record intent to mint. Pure state transition
   from `JournalConfirmed` to `Minting` — no network call. Produces
   `MintingStarted`. Intent is persisted before the network call so that a crash
@@ -270,7 +306,19 @@ authoritative statement of what each observation records.
 
 **Events:**
 
-- `Initiated` - Mint request created (carries all request details)
+- `Initiated` - Mint request created (carries all request details). Gains one
+  additive optional `mint_mode` field (`#[serde(default)]`, `VaultMode`,
+  defaulting to `VaultDirect` for historical events, which all predate
+  orchestrator mode and so could only have been vault-direct) recording the
+  asset's resolved `VaultMode` at initiate time, before any possible mint
+  submission; this anchors mode-derivation for the mint the same way
+  `RedemptionDetected.burn_mode` anchors it for Redemption
+- `MintAuthorizationReceived` (orchestrator mode only) - The liquidity bot's
+  validated `MintAuthV1` for this mint, delivered via the internal
+  mint-authorization call. Carries
+  `{issuer_request_id, mint_authorization, received_at}`. This is the
+  persistence point for the nonce — `Initiated` is written on the Alpaca POST,
+  strictly before the authorization exists, so it cannot carry one
 - `JournalConfirmed` - Alpaca journal transfer confirmed
 - `JournalRejected` - Alpaca journal transfer rejected (terminal)
 - `MintingStarted` - Mint intent recorded (aggregate moves to `Minting`)
@@ -279,7 +327,13 @@ authoritative statement of what each observation records.
 - `MintTxSubmitted` - Persisted signed mint transaction broadcast (carries
   `external_tx_id` and `tx_id` — the on-chain tx hash — for crash recovery)
 - `TokensMinted` - On-chain mint succeeded (carries tx details)
-- `MintingFailed` - On-chain mint failed
+- `MintingFailed` - On-chain mint failed. Gains one additive optional
+  `classification` field (`#[serde(default)]`, `MintFailureClassification`,
+  default `Unclassified`) — see "Orchestrator Migration" -> "Failure States" for
+  the decodable on-chain-revert variants (and "Recipient Authorization" ->
+  "Nonce" for `NonceConsumedByOtherMint` and `NonceReplayUnresolved`, both
+  assigned by recovery's own full-match check rather than decoded from a revert)
+  and how retry-exclusion and logging key off it
 - `MintCompleted` - Alpaca callback sent, mint fully completed (terminal)
 - `ExistingMintRecovered` - Existing on-chain mint discovered during recovery
   (carries tx details)
@@ -288,6 +342,27 @@ authoritative statement of what each observation records.
   correlating the command with the event it commits, so queue dispatch can
   distinguish a successful transition from an idempotent no-op against
   already-advanced state
+- `MintClosed` - Admin-closed mint (terminal). Carries the operator `reason`,
+  `closed_at`, and optional `acknowledged_unresolved_mint_nonce` (present only
+  when closing a `NonceReplayUnresolved` mint). Closed mints do not appear in
+  stuck queries
+- `OrchestratorTokensMinted` (orchestrator mode only) - On-chain orchestrator
+  mint succeeded. Carries
+  `{issuer_request_id, tx_hash, nonce, shares_minted,
+  gas_used, block_number, minted_at}`
+  — nonce replaces `receipt_id` since the orchestrator, not the bot, owns
+  receipt custody
+- `OrchestratorMintRecovered` (orchestrator mode only) - Existing on-chain
+  orchestrator mint discovered during recovery, via a proactive `Minted`-log
+  query keyed on `(wallet, nonce)` and confirmed by an exact match on this
+  mint's own `token` and `amount` (see "Nonce" below — the nonce-uniqueness view
+  is `(wallet, nonce)` only, so a bare hit is not sufficient proof) — mirroring
+  vault-direct recovery's proactive receipt-inventory check
+  (`RecordExistingMint`, see "Recovery orchestration" above). A `NonceReplayed`
+  revert is only the fallback signal for a submit/query race, not the primary
+  discovery path. Carries
+  `{issuer_request_id, tx_hash, nonce, shares_minted, block_number,
+  recovered_at}`
 
 Newly persisted transaction IDs use an explicitly tagged `hash` or `legacy`
 representation so replay preserves the original `TxId` variant, including a
@@ -498,6 +573,47 @@ rebroadcasting. Automated recovery persists the `CallbackPending` boundary
 before delivering the callback, so receipt polling and Alpaca requests do not
 hold the wallet transaction lock.
 
+**Orchestrator mode** adds exactly one new command — `AuthorizeMint`, which
+delivers the recipient authorization (see "Recipient Authorization") — and
+introduces no new submission or recovery commands: `Deposit`, the pure `Record*`
+commands, and the `SubmitMintJob`/`ConfirmMintJob`/`MintRecoveryJob` chain are
+reused unchanged, with the jobs branching on `VaultMode` internally to submit
+`orchestrator.mint()` calldata instead of the vault multicall and to emit the
+orchestrator-mode events above. An orchestrator-mode mint creates no bot-held
+receipt for the receipt monitor to discover (the orchestrator custodies it — see
+"Orchestrator Migration" -> "Dual-Mode Operation and Cutover"), so the
+inventory-backed `RecordExistingMint` short-circuit does not apply; the submit
+and recovery paths' existing-mint check instead queries the orchestrator's
+`Minted` log by `(wallet, nonce)`, emitting `OrchestratorMintRecovered` only
+when the log's `token`/`amount` also exactly match this mint's own request facts
+(see "Nonce" below for the full-match rule and its manual-failure fallback). See
+"Orchestrator Migration" for the mint flow, failure states
+(`BadRecipientSignature`, `RecipientCallbackRejected`, `VaultAmountMismatch`,
+`VaultLogicMismatch`/`ReceiptLogicMismatch`), and the full event reuse/new
+rationale.
+
+Mirroring the mode-scoping rule given for Redemption below, a mint's mode does
+not follow later `VaultMode` flips of its asset: the submit, confirm, and
+recovery paths determine which mode to use for a given mint from that mint's own
+event history — the `mint_mode` field persisted on its `Initiated` event,
+resolved from configuration at initiate time — never re-resolved from the
+asset's currently-configured `VaultMode`. This ensures a mint `Initiated` while
+its asset was in `vault_direct` mode is still recovered as a vault-direct mint
+even after that asset's configured `vault_mode` is later flipped to
+orchestrator, exactly as Redemption's persisted `burn_mode` (captured on
+`RedemptionDetected`) prevents the analogous mismatch on the Redemption side.
+
+The mode anchor is deliberately **not** the presence of `mint_authorization`.
+`Initiated` is written synchronously on Alpaca's `POST /inkind/issuance`, before
+the liquidity bot delivers the authorization on the internal mint-authorization
+call, and events are immutable — an already-persisted `Initiated` can never grow
+an authorization field. Mode (known from config at initiate time) and
+authorization (arriving later, on `MintAuthorizationReceived`) are therefore
+orthogonal facts on two separate events. An orchestrator-mode mint whose
+authorization has not yet arrived is `mint_mode: Orchestrator` with no
+`mint_authorization` — it is not, and must never be read as, a vault-direct
+mint.
+
 ### Redemption Aggregate
 
 The `Redemption` aggregate manages the redemption lifecycle, from detecting an
@@ -511,13 +627,23 @@ on-chain transfer through calling Alpaca to burning tokens.
   API)
 - `underlying`, `token`, `wallet`, `quantity`: Redemption details
 - `detected_tx_hash`: On-chain transfer that triggered redemption
+- `burn_mode` (orchestrator migration only): the asset's resolved `VaultMode` at
+  detection time, captured on `RedemptionDetected` — the earliest possible point
+  in the redemption's lifecycle, before any burn submission. Every
+  mode-dependent command (`BurnTokens`, `ConfirmBurn`, `ResumeBurn`,
+  `ForceCompleteBurn`) derives mode from this persisted fact, never re-resolved
+  from the asset's currently-configured `VaultMode` — see "Orchestrator
+  Migration"
 - `status`: Current state in the redemption lifecycle
-- `burn_tx_hash`, `receipt_id`, `shares_burned`: Burn transaction details
+- `burn_tx_hash`, `receipt_id`, `shares_burned`: Burn transaction details.
+  Orchestrator-mode burns populate the analogous on-chain proof (a consumed
+  receipt pointer range instead of a per-receipt list) — lifecycle state names
+  stay backend-agnostic; only the audit-data shape differs
 - Timestamps for each lifecycle stage
 
 **Commands:**
 
-- `DetectRedemption` - Transfer to redemption wallet detected
+- `Detect` - Transfer to redemption wallet detected
 - `RecordAlpacaCall` - Alpaca redeem API called successfully
 - `RecordAlpacaFailure` - Alpaca redeem API call failed
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
@@ -527,7 +653,13 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `BurnTokens` - Broadcast the exact transaction persisted by `IntendBurn`.
   Produces `BurnTxSubmitted` on success; it never signs a replacement.
 - `ConfirmBurn { tx_id, dust_shares }` - Confirm a previously submitted burn
-  transaction. Produces `TokensBurned` on success
+  transaction. Produces `TokensBurned` on success. `dust_shares` is
+  vault-direct-shaped (the atomic multicall dust-return amount); in orchestrator
+  mode it is unused (always `0`) — dust is instead recorded via
+  `OrchestratorTokensBurned.dust_retained`, derived by the confirm handler from
+  this redemption's own persisted `AlpacaCalled.dust_quantity` (already computed
+  and stored well before any burn submission), not from this command's
+  `dust_shares` input
 - `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before its
   external side effect
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
@@ -565,7 +697,9 @@ on-chain transfer through calling Alpaca to burning tokens.
   `burn-{detected_tx_hash}-retry-{n}`. If a retry submission fails before the
   transaction lands, recovery reuses the same retry id. Emits `BurnResumed`
   event. The admin recovery path immediately invokes burn recovery in-process so
-  the on-chain burn does not wait for a service restart.
+  the on-chain burn does not wait for a service restart. The subsequent burn
+  submission derives its mode from this redemption's persisted `burn_mode` (see
+  "Aggregate State" above), never from the asset's current `VaultMode`.
 - `CloseRedemption { issuer_request_id, reason,
   acknowledged_unresolved_burn_tx_hash }` -
   Admin-close a redemption that cannot be automatically recovered, recording an
@@ -588,25 +722,31 @@ on-chain transfer through calling Alpaca to burning tokens.
   persisted exact burn transaction **already landed on-chain** but was never
   recorded (e.g. the bot crashed between the burn and `TokensBurned`). The admin
   layer verifies the operator-supplied `burn_tx_hash` on-chain first — the
-  receipt must have succeeded and contain a real burn
-  (`Transfer(bot_wallet -> 0x0)`) of the vault's shares — then records the
-  proving tx hash and block number. The receipt reservation is settled (mirror
-  reduced) just like a normal burn completion. Emits `BurnForceCompleted`,
-  transitioning to `Completed`. The persisted bytes must decode with matching
-  hash and nonce and recover the configured bot wallet as signer; the supplied
-  hash must then equal that exact transaction hash unless the operator
-  explicitly acknowledges the persisted hash with
-  `acknowledged_unresolved_burn_tx_hash`. A different proving hash is rejected
-  by default while the persisted transaction may still land. The acknowledgement
-  must equal the persisted hash exactly and is recorded in the terminal event.
-  The alternate transaction's per-receipt withdrawals, recipient wallet, and
-  dust share transfer must also match the persisted burn semantics exactly,
-  including the aggregate burned-share total. Its signer nonce must equal the
-  persisted transaction's nonce, proving it is a mined replacement rather than
-  an unrelated burn and ensuring the acknowledged transaction can no longer
-  land. This prevents another redemption's same-vault burn from being used as
-  proof. A `Failed` redemption that still carries a persisted signed burn is
-  held to the same binding and acknowledgement rules. A legacy `Failed`
+  receipt must have succeeded and contain a real burn of the vault's shares, in
+  the shape this redemption's own persisted `burn_mode` expects
+  (`Transfer(bot_wallet -> 0x0)` for vault-direct; see "Orchestrator Migration"
+  for the orchestrator-mode proof shape) — then records the proving tx hash and
+  block number. Settlement is mode-specific: for a vault-direct redemption the
+  receipt reservation is settled (mirror reduced) just like a normal burn
+  completion; an orchestrator-mode redemption holds no reservation to settle —
+  its burn path skips the reserve/settle/release lifecycle entirely (see
+  "Redemption Aggregate" above) — so its force completion mutates no receipt
+  inventory state. Emits `BurnForceCompleted`, transitioning to `Completed`. The
+  persisted bytes must decode with matching hash and nonce and recover the
+  configured bot wallet as signer; the supplied hash must then equal that exact
+  transaction hash unless the operator explicitly acknowledges the persisted
+  hash with `acknowledged_unresolved_burn_tx_hash`. A different proving hash is
+  rejected by default while the persisted transaction may still land. The
+  acknowledgement must equal the persisted hash exactly and is recorded in the
+  terminal event. The alternate transaction's mode-specific calldata and
+  resulting transfers (for vault-direct: the per-receipt withdrawals, recipient
+  wallet, and dust share transfer) must also match the persisted burn semantics
+  exactly, including the aggregate burned-share total. Its signer nonce must
+  equal the persisted transaction's nonce, proving it is a mined replacement
+  rather than an unrelated burn and ensuring the acknowledged transaction can no
+  longer land. This prevents another redemption's same-vault burn from being
+  used as proof. A `Failed` redemption that still carries a persisted signed
+  burn is held to the same binding and acknowledgement rules. A legacy `Failed`
   redemption with **no** persisted signed transaction — a custodian-era burn
   identified only by a backend transaction id the current backend cannot look up
   — is force-completed offline via `issuer force-complete-redemption`: the
@@ -614,13 +754,21 @@ on-chain transfer through calling Alpaca to burning tokens.
   burn on the redemption's vault whose per-receipt withdrawals match the burn
   plan persisted by the latest `BurningFailed` event exactly, with the owner
   recovered from the transaction's own signature, and refuses a hash any other
-  redemption's history already mentions. Pre-intent states with no persisted
-  burn plan at all are **not** force-completed; ops use `CloseRedemption` after
-  off-chain reconciliation instead.
+  redemption's history already mentions (custodian-era burns predate
+  orchestrator mode, so the CLI's vault-direct proof shape is the only one that
+  applies). Pre-intent states with no persisted burn plan at all are **not**
+  force-completed; ops use `CloseRedemption` after off-chain reconciliation
+  instead.
 
 **Events:**
 
-- `RedemptionDetected` - Transfer to redemption wallet detected
+- `RedemptionDetected` - Transfer to redemption wallet detected. Gains one
+  additive optional `burn_mode` field (`#[serde(default)]`, `VaultMode`,
+  defaulting to `VaultDirect` for historical events, which all predate
+  orchestrator mode and so could only have been vault-direct) recording the
+  asset's resolved `VaultMode` at detection time, before any possible burn
+  submission; this anchors mode-derivation for the redemption the same way
+  `Initiated.mint_mode` anchors it for Mint
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
@@ -657,8 +805,15 @@ on-chain transfer through calling Alpaca to burning tokens.
   has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
   single redemption spans multiple ERC-1155 receipts
 - `BurningFailed` - On-chain burn failed. Carries optional `tx_id` and
-  `planned_burns` for recovery of previously submitted transactions
+  `planned_burns` for recovery of previously submitted transactions. Gains one
+  additive optional `classification` field (`#[serde(default)]`,
+  `BurnFailureClassification`, default `Unclassified`) — see "Orchestrator
+  Migration" -> "Failure States" for the decodable variants and how
+  retry-exclusion and logging key off it
 - `ExistingBurnRecovered` - Existing on-chain burn discovered during recovery
+- `RedemptionFailed` - Redemption marked failed (from `MarkFailed`, any
+  non-`Failed` state, or to re-classify an existing `Failed` redemption).
+  Carries `reason` and `failed_at`
 - `RedemptionClosed` - Admin-closed redemption (terminal). Carries the operator
   `reason`, `closed_at`, and optional `acknowledged_unresolved_burn_tx_hash`.
   Closed redemptions do not appear in stuck queries. Receipt reservations remain
@@ -682,29 +837,67 @@ on-chain transfer through calling Alpaca to burning tokens.
   `AlpacaCalled` event), `alpaca_journal_completed_at`, optional retry
   `external_tx_id`, and `resumed_at` timestamp. Used for post-Alpaca recovery
   where the journal already completed.
+- `OrchestratorBurnSubmitted` (orchestrator mode only) - Burn transaction
+  submitted to the signing backend. Carries
+  `{issuer_request_id,
+  external_tx_id, tx_id, submitted_at}` — no
+  `planned_burns`, since there is no per-receipt plan to reserve
+- `OrchestratorTokensBurned` (orchestrator mode only) - On-chain orchestrator
+  burn succeeded, redemption complete (terminal success). Carries
+  `{issuer_request_id, tx_hash, shares_burned, burn_range: (start_id,
+  end_id), dust_retained, gas_used, block_number, burned_at}`
+  — a consumed receipt pointer range instead of a per-receipt `burns` list;
+  `shares_burned` keeps the established field name used by `TokensBurned`,
+  `BurnRecord`, and the aggregate's own `shares_burned` state field.
+  `dust_retained` records the sub-10⁻⁹-token residue kept in the bot wallet:
+  derived directly from this redemption's own persisted
+  `AlpacaCalled.dust_quantity` (already computed and stored at Alpaca-call time,
+  well before any burn submission), converted to share-wei — not recomputed from
+  the on-chain `Burned` event or from `ConfirmBurn`'s `dust_shares` input, which
+  is always `0` in orchestrator mode (see `ConfirmBurn` above). The
+  orchestrator's `burn()` has no multicall to atomically return dust through
+  (unlike vault-direct's `withdraw()` + `transfer()` multicall), so returning it
+  would require a separate non-atomic transaction plus a new
+  arbitrary-destination transfer surface in the signing policy —
+  disproportionate for an amount below 10⁻⁹ tokens by construction (Alpaca's
+  9-decimal truncation). This is an accepted AP-visible behavior change (by <
+  10⁻⁹ tokens); see Decision 6 in "Design Decisions" above for the full
+  alternative analysis
+- `OrchestratorBurnRecovered` (orchestrator mode only) - Existing on-chain
+  orchestrator burn discovered during recovery. Carries
+  `{issuer_request_id,
+  tx_hash, shares_burned, burn_range: (start_id, end_id), dust_retained,
+  block_number, recovered_at}`
+  — `dust_retained` is derived the same way as on `OrchestratorTokensBurned`
+  above (from this redemption's own persisted `AlpacaCalled.dust_quantity`), so
+  both paths to the same terminal-success state carry identical audit data
 
 **Command -> Event Mappings:**
 
-| Command                                  | Events                             | Notes                                             |
-| ---------------------------------------- | ---------------------------------- | ------------------------------------------------- |
-| `DetectRedemption`                       | `RedemptionDetected`               | Transfer detected                                 |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                 |
-| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                  |
-| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                  |
-| `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting       |
-| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction           |
-| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                   |
-| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action     |
-| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation           |
-| `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement |
-| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                   |
-| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                  |
-| `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata         |
-| `RecordExistingBurn`                     | `ExistingBurnRecovered`            | Recovery from Failed with known tx                |
-| `Reprocess`                              | `Reprocessed`                      | Reset to Detected for reprocessing                |
-| `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery        |
-| `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption              |
-| `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a verified-on-chain burn        |
+| Command                                  | Events                             | Notes                                                                                          |
+| ---------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                              |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                                                              |
+| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                               |
+| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                               |
+| `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                    |
+| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction                                                        |
+| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                                                                |
+| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action                                                  |
+| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation                                                        |
+| `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement                                              |
+| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                                                                |
+| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                                                               |
+| `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata and `classification`                                 |
+| `RecordExistingBurn`                     | `ExistingBurnRecovered`            | Recovery from Failed with known tx                                                             |
+| `MarkFailed`                             | `RedemptionFailed`                 | Marks or reclassifies a failed redemption                                                      |
+| `Reprocess`                              | `Reprocessed`                      | Reset to Detected for reprocessing                                                             |
+| `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery                                                     |
+| `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption                                                           |
+| `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a burn verified against this redemption's persisted `burn_mode`              |
+| `BurnTokens` (orchestrator mode)         | `OrchestratorBurnSubmitted`        | No per-receipt plan to reserve first                                                           |
+| `ConfirmBurn` (orchestrator mode)        | `OrchestratorTokensBurned`         | New success event; carries the consumed pointer range and `dust_retained`                      |
+| `RecordExistingBurn` (orchestrator mode) | `OrchestratorBurnRecovered`        | Recovery via the orchestrator's `Burned` log; carries `dust_retained` for success-event parity |
 
 Burn transaction recovery runs once during startup and every five minutes while
 the service is running. Before any recovery side effect, the issuer classifies
@@ -753,7 +946,55 @@ exact transaction identity long enough to persist exhaustion safely. An
 exhausted persisted intent cannot be re-armed through the admin recover
 endpoint: the operator must force-complete a verified landed burn or close only
 after off-chain reconciliation. At every point there is at most one transaction
-hash that can still land for a redemption.
+hash that can still land for a redemption. **Orchestrator mode** introduces no
+new command names: `BurnTokens`, `ConfirmBurn`, `RecordBurnFailure`, and
+`RecordExistingBurn` are reused, with the handler branching on `VaultMode`
+internally to call `submit_orchestrator_burn` / `confirm_orchestrator_burn` (see
+"VaultService" below) instead of the vault multicall, and to emit the
+orchestrator-mode events above. This differs from the Mint side, where the pure
+`Record*` commands already carry backend-agnostic, job-supplied payloads, so
+"reused unchanged" holds exactly — on the Redemption side, `BurnTokens`'s
+`vault`/`burns`/ `dust_shares`/`owner` fields and
+`RecordExistingBurn`/`RecordBurnFailure`'s `planned_burns` field mirror the
+vault-direct `MultiBurnParams` shape, and orchestrator mode has no per-receipt
+plan to populate them from: `BurnManager` skips `plan_burn` and the entire
+reserve/settle/release reservation lifecycle — the orchestrator custodies
+receipts directly, so there is no bot-side inventory to reserve against — and
+derives the burn amount from redemption state to call
+`submit_orchestrator_burn(token, amount, burn_info,
+external_tx_id)` directly
+rather than constructing a `MultiBurnParams`. Because commands (unlike events)
+are not persisted and may change freely per AGENTS.md, RAI-1220/1221 may adjust
+`BurnTokens`'s field shape for orchestrator mode (e.g. mode-specific fields, or
+unused vault-direct fields) as needed during implementation without touching any
+event schema. `RecordBurnFailure`'s existing `planned_burns` field carries
+`vec![]` for an orchestrator-mode failure (already `#[serde(default)]`-tolerant
+of that), and its `classification` field (see "Failure States") carries
+`InsufficientReceipts { shortfall }` or `AllowanceInsufficient` as appropriate.
+`BurnTokens`, `ConfirmBurn`, and `ResumeBurn` all derive which mode to use for a
+given redemption from its own persisted `burn_mode` (captured on
+`RedemptionDetected`), never re-resolved from the asset's currently-configured
+`VaultMode` — see `ForceCompleteBurn` below for why this matters across a
+cutover.
+
+`ForceCompleteBurn`'s on-chain verification (`verify_burn_tx`) is broadened to
+additionally recognize `Transfer(bot -> orchestrator)` +
+`Transfer(orchestrator -> 0x0)` as orchestrator-mode burn proof — but this
+broadening is **mode-scoped, not global**: the admin handler passes the
+redemption's own persisted `burn_mode` (captured on `RedemptionDetected` — see
+"Aggregate State" above — never re-derived from the asset's currently-configured
+`VaultMode`) to `verify_burn_tx`, which accepts only the proof shape matching
+that mode. A vault-direct redemption's force-complete is never satisfied by an
+orchestrator-shaped burn proof, or vice versa, even while orchestrator-mode
+assets run alongside vault-direct assets (see "Dual-Mode Operation and
+Cutover"), and even for a redemption that crashed before any submitted-event was
+recorded (e.g. mid-`AllowanceInsufficient`) and is only later force-completed
+after its asset's cutover or rollback — `burn_mode` was already durably
+persisted at detection time, before that crash. Vault-direct verification
+(`Transfer(bot_wallet -> 0x0)`) is otherwise unchanged. See "Orchestrator
+Migration" for the burn flow, failure states (`InsufficientReceipts`,
+`AllowanceInsufficient`, `VaultLogicMismatch`/`ReceiptLogicMismatch`), and the
+full event reuse/new rationale.
 
 ### Account Aggregate
 
@@ -1222,6 +1463,823 @@ action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
 
+## Orchestrator Migration (ST0xOrchestrator)
+
+This section specifies `orchestrator` mode, introduced under "Architecture" ->
+"On-Chain Infrastructure" -> "ST0xOrchestrator Contract" above: the contract
+summary, recipient authorization and approval mechanics, the dual-mode cutover
+story, the mint and burn flows it replaces, its failure modes, and the
+command/event mapping the aggregates use in orchestrator mode
+(`VaultMode::Orchestrator { address }` — see "VaultService" -> "Mode selection"
+below for the enum; the per-asset `vault_mode` entries in the TOML config file
+select which assets resolve to it, see "Configuration"). Vault-direct mode
+(today's `OffchainAssetReceiptVault` multicall flow) is unchanged and remains
+fully documented in "Complete Mint Flow" and "Complete Redemption Flow" above.
+
+**Signer backend and sequencing.** This migration is sequenced to land _after_
+the issuer wallet moved onto Turnkey (RAI-1123, since landed); the whole
+orchestrator stack ships with Turnkey as the production signing backend. Turnkey
+resolves into a standard Alloy signing provider (see "VaultService" below), so
+the mint/burn flows here are signer-agnostic — they call `orchestrator.mint` /
+`orchestrator.burn` through the ordinary sign-and-broadcast path regardless of
+who signs. Only the ops and cutover work (RAI-1221, RAI-1222) carries the hard
+dependency on Turnkey being live.
+
+### Design Decisions
+
+The seven decisions this migration settles are recorded here (also mirrored in
+the RAI-1216 Linear decision log). All seven are settled. Later sections
+reference these as "Decision N".
+
+1. **Recipient authorization for ITN mints** — _settled._ For ST0x-operated
+   orchestrator-mode mints, the liquidity bot is both the AP and the mint
+   recipient — it controls `to`. It therefore produces
+   `MintAuthV1 { nonce,
+   signature }` itself, by picking a random `bytes32`
+   nonce and signing `(token, to, amount, nonce)` with the recipient wallet's
+   key, and delivers it to us via the internal mint-authorization call — a small
+   addition to the existing internal service-to-service channel the liquidity
+   bot already uses to query asset status
+   (`GET /tokenized-assets/<underlying>/status`, `InternalAuth`), **not** a
+   field on Alpaca's `POST /inkind/issuance`. This removes the prior blocker
+   (whether Alpaca's ITN flow can carry an AP-produced signature through to us):
+   the signature never goes through Alpaca. We validate the authorization
+   (EIP-712/1271 signer check + `nonceUsed()` view) when the liquidity bot
+   delivers it, and associate it with the corresponding mint (e.g. by
+   `tokenization_request_id`) before the on-chain mint step. It is persisted by
+   its own `AuthorizeMint` -> `MintAuthorizationReceived` pair, not on
+   `Initiated`, which is already written by the time it arrives. The exact
+   internal-call wire shape and correlation key are implementation details owned
+   by RAI-1220 (issuance side) plus the liquidity bot. **The launch scope is
+   deliberately staged:** this migration implements only the liquidity-bot
+   signature path (liquidity bot as the sole AP and recipient). A later phase
+   (the Atomic Bridge project) adds an atomic-bridge contract as a second
+   recipient type, using the orchestrator's `IMintRecipient.authorizeMint`
+   callback path — for that recipient `MintAuthV1.signature` is **empty** and
+   the orchestrator gates the mint on the contract's own on-chain intent instead
+   of a signature. We do not build that now, but we must not preclude it: the
+   issuance bot's authorization handling must treat the signature as opaque,
+   tolerate an **empty** signature (the callback case), and must not hardcode
+   "the recipient is always the liquidity bot." (A third option, the bot
+   self-signing and forwarding, stays a last resort only — it defeats the
+   compromised-mint-key protection this feature exists for.) Blocks RAI-1220.
+2. **Nonce strategy** — _settled._ The nonce is fixed per mint, persisted in the
+   event stream on `MintAuthorizationReceived` (before the first submission),
+   and reused unchanged on retry, so `NonceReplayed` means the earlier mint
+   already landed. Who _chooses_ the nonce follows from Decision 1: since the
+   liquidity bot is the recipient producing the signature, it picks the nonce
+   itself — a random `bytes32`, inside the signed struct — and delivers it
+   alongside the signature via the internal mint-authorization call, before the
+   on-chain mint step; a bot-signed or `IMintRecipient` fallback path (see
+   Decision 1) would instead derive it deterministically from
+   `issuer_request_id`. Recovery still needs an on-chain `Minted`-log lookup
+   keyed on the full mint facts (see the `NonceReplayed` failure handling
+   below), not just `(to, nonce)`.
+3. **VaultService shape** — _settled._ Extend the existing trait with
+   orchestrator-mode submit/confirm methods rather than adding a second trait;
+   the concrete service implements them under either signing backend (local
+   signer or Turnkey), because the signer and the contract path are orthogonal
+   axes. Mode is a `VaultMode` config enum resolved **per asset** from the TOML
+   config file (`[orchestrator]` + per-asset `vault_mode`, default vault-direct
+   for every asset — see Decision 7) threaded to `MintServices` / `BurnManager`,
+   which resolve an operation's mode once, at its anchoring point (`Initiated` /
+   `RedemptionDetected`), and branch on it. Shared methods (`get_share_balance`,
+   `verify_burn_tx`, backend status checks) stay in one place, which the
+   recovery/admin layer (RAI-1219) needs across both modes.
+4. **Event schema** — _settled._ Add new events only where the existing shape is
+   genuinely per-receipt: `OrchestratorTokensMinted`,
+   `OrchestratorMintRecovered`, `OrchestratorBurnSubmitted`,
+   `OrchestratorTokensBurned`, `OrchestratorBurnRecovered` — plus
+   `MintAuthorizationReceived`, which exists because the authorization arrives
+   after `Initiated` is already persisted and events are immutable. Existing
+   events are reused unchanged except for four additive optional
+   `#[serde(default)]` fields (the established pattern): `Initiated` gains
+   `mint_mode`, `RedemptionDetected` gains `burn_mode`, and `MintingFailed` /
+   `BurningFailed` gain a typed `classification` (see "Command -> Event Mapping
+   (Orchestrator Mode)"). No existing event is otherwise modified and no new
+   shortfall event is added.
+5. **ERC-20 approvals** — _settled._ One-time unlimited approval per token at
+   onboarding (an ops step, RAI-1221), not a per-burn approval (which would
+   double the signer-backend transaction count on the redemption hot path). It
+   grants no trust beyond `BURN_ROLE` (bot-only). The bot also does a pre-burn
+   allowance check so a missing approval fails with an actionable error instead
+   of an opaque ERC-20 revert.
+6. **Dust disposition** — _settled._ Do not return dust to the AP in
+   orchestrator mode. Dust is < 10⁻⁹ tokens by construction (9-decimal
+   truncation); returning it needs a separate non-atomic transfer per redemption
+   plus a new arbitrary-destination transfer policy surface, disproportionate
+   for a sub-nanotoken amount. Keep it in the bot wallet and record it as
+   `dust_retained` on `OrchestratorTokensBurned`. This is an accepted AP-visible
+   behavior change (by < 10⁻⁹ tokens). Alternative, should exact return ever be
+   required: a separate post-burn transfer with its own idempotency id and
+   events.
+7. **Cutover granularity** — _settled._ `VaultMode` is resolved **per asset**,
+   not per deployment, from a TOML configuration file (the same pattern the
+   liquidity bot uses): each `[assets.<UNDERLYING>]` table may set
+   `vault_mode = "orchestrator"`, and `[orchestrator].default_vault_mode` covers
+   assets without an override (defaults to `"vault_direct"`; see "Configuration"
+   -> "TOML Configuration File"). This exists so the orchestrator can be piloted
+   on a single low-volume asset in production — its receipts migrated, its
+   mints/burns routed through the orchestrator — while all other assets keep the
+   proven vault-direct path, and so rollback is per-asset (flip that asset's
+   `vault_mode` back) rather than all-or-nothing. Everything mode-dependent is
+   already anchored per operation (Decision 4's `RedemptionDetected.burn_mode`
+   and `Initiated.mint_mode` fields), so per-asset resolution adds no new event
+   machinery — only the resolution point changes (asset-keyed lookup instead of
+   a global). Receipts migrate per token during that asset's cutover window (see
+   "Dual-Mode Operation and Cutover"), and the receipt-inventory machinery keeps
+   running until the **last** asset leaves vault-direct mode.
+
+The classified failure states (`InsufficientReceipts`, `VaultLogicMismatch` /
+`ReceiptLogicMismatch`, `BadRecipientSignature` / `RecipientCallbackRejected`,
+`VaultAmountMismatch`) and their recovery paths are specified in "Failure
+States" below.
+
+### Contract Summary
+
+Authoritative source: `src/interface/IST0xOrchestratorV1.sol` /
+`src/concrete/ST0xOrchestrator.sol` on st0x.deploy `main` (merged via PR #222;
+later "st0x.deploy PR #222" citations name that PR as provenance). The summary
+below pins the bot-relevant surface only — consult the merged Solidity source
+directly for the full ABI (indexed event fields, exact error field shapes)
+before implementing against it. The same PR ships integration tests worth
+reading as a behavioral spec (`test/src/concrete/integration/`) and the May 2026
+st0x.deploy audit report covering the orchestrator.
+
+`ST0xOrchestrator` exposes:
+
+- `mint(token, to, amount, MintAuthV1 mintAuth, bytes receiptInformation)` -
+  role-gated by `MINT_ROLE`. Mints `amount` shares of `token` to `to`,
+  authorized by `mintAuth` (see "Recipient Authorization" below), and stores
+  `receiptInformation` on the underlying receipt the same way vault-direct mode
+  does today.
+- `burn(token, amount, bytes burnInfo)` - role-gated by `BURN_ROLE`. Pulls
+  `amount` shares of `token` from the bot wallet via `transferFrom` (see "ERC-20
+  Approval for Burns" below), consumes ERC-1155 receipts the orchestrator
+  custodies in ascending receipt-ID order, and advances the per-token burn
+  pointer.
+- **Units:** `amount` in both `mint()` and `burn()` is a `U256` in 18-decimal
+  ERC-20 share-wei (`Quantity::to_u256_with_18_decimals()`, the existing
+  vault-direct conversion helper), matching `vault.balanceOf` semantics and
+  today's 1:1 `minShareRatio = 1e18` — never a raw asset-quantity string or an
+  Alpaca 9-decimal value. Confirmed in `IST0xOrchestratorV1.sol` (st0x.deploy PR
+  #222): `mint()` passes `amount` straight through as the vault's own `mint()`
+  shares argument, and `burn()`'s receipt walk calls `vault.redeem()` with the
+  same shares-unit `amount` — both assert `assets == amount`
+  (`VaultAmountMismatch` otherwise), i.e. share-wei, not asset-wei. The
+  mint/burn flow diagrams below show human-readable quantities (e.g. "10 AAPL")
+  for readability only.
+- Views: `nonceUsed(address to, bytes32 nonce) -> bool`,
+  `vaultLogicIsExpected() -> bool`,
+  `nextBurnReceiptId(address token) ->
+  uint256`.
+- Events: `Minted(token, to, amount, nonce, ...)`,
+  `Burned(token, amount, burn_range,
+  ...)` — per `IST0xOrchestratorV1.sol`
+  (st0x.deploy PR #222) this is
+  `Burned(caller, token, amount, firstReceiptId, nextBurnReceiptIdAfter)`. The
+  mapping to `burn_range: (start_id, end_id)` below is
+  `start_id = firstReceiptId`, `end_id = nextBurnReceiptIdAfter`, and the spec
+  mandates the **half-open** reading `[start_id, end_id)`: `end_id` is the burn
+  pointer's new value — the receipt id the _next_ burn resumes from, the same
+  value `nextBurnReceiptId(token)` subsequently returns — so the receipt at
+  `end_id` is not fully consumed by this burn, and may have been partially
+  consumed by it.
+
+  Two consequences the implementation must not confuse. First, the pair records
+  **how far the burn pointer moved, not a per-receipt balance proof**. Receipts
+  strictly inside `[start_id, end_id)` are drained by this burn; the receipt at
+  `end_id` is the partially-consumed boundary, if any, and `start_id` may itself
+  have been partially consumed by an _earlier_ burn. Nothing may reconstruct
+  per-receipt balances from the range. Second, `shares_burned` — the event's
+  `amount`, in share-wei — is the **authoritative burned quantity**, the fact
+  that backs 1:1 accounting and the one `OrchestratorTokensBurned` carries as
+  its economic value. `burn_range` is audit-trail provenance only: no burned
+  quantity may ever be derived from the range width.
+
+  **RAI-1220 acceptance criterion.** This reading is the one the spec requires,
+  inferred from the field name `nextBurnReceiptIdAfter` and the
+  `nextBurnReceiptId(token)` view — it is **not yet verified against the merged
+  contract**. Before wiring the `Burned` decoder, assert against the merged
+  `IST0xOrchestratorV1.sol` that (a) `nextBurnReceiptIdAfter` is exclusive of
+  the receipts this burn fully drained, and (b) it names the receipt a
+  subsequent burn resumes from. Encode both in a decoder test against a real
+  `Burned` log. If the merged ABI disagrees, correct this section first — do not
+  work around it in the decoder.
+- Roles: `MINT_ROLE` and `BURN_ROLE` (held by the bot wallet, gating the two
+  entry points above), `EMERGENCY_ROLE` (manual recovery: moving receipts
+  between wallets, adjusting the burn pointer).
+- Decodable revert reasons: `NonceReplayed`, `BadRecipientSignature`,
+  `RecipientCallbackRejected`, `InsufficientReceipts`, `VaultLogicMismatch`,
+  `ReceiptLogicMismatch`, `VaultAmountMismatch`. See "Failure States" below for
+  how the six failure reverts are handled. `NonceReplayed` is not one of them —
+  it is not itself a failure classification, but a signal that triggers
+  reconciliation (which itself may conclude success or failure) — see "Recipient
+  Authorization" -> "Nonce" below.
+
+### Recipient Authorization
+
+**Settled — see Decision 1.** The orchestrator requires an EIP-712
+`MintAuthV1 { nonce, signature }` proving the recipient (`to`) authorized the
+mint, so that a compromised mint-signing key alone cannot materialize backed
+tokens to an arbitrary address. For ST0x-operated orchestrator-mode mints, the
+liquidity bot is both the AP and the recipient: it controls `to`, so it produces
+`MintAuthV1` itself — picking a random `bytes32` nonce and signing
+`(token, to, amount, nonce)` with the recipient wallet's key — and delivers
+`{nonce, signature}` to us via the internal mint-authorization call, the same
+internal service-to-service channel the liquidity bot already uses to query
+per-asset status (`GET /tokenized-assets/<underlying>/status`, `InternalAuth`).
+This is an addition to that existing inter-bot channel, **not** a field on
+Alpaca's `POST /inkind/issuance` — the Alpaca-facing ITN flow never carries the
+signature.
+
+We validate the authorization when the liquidity bot delivers it — recovering
+the EIP-712 signer and requiring it to equal `to` (or an EIP-1271 check for
+contract wallets), and querying `nonceUsed(to, nonce)` to reject an
+already-consumed nonce — and associate it with the corresponding mint by
+`tokenization_request_id` before the on-chain mint step. The issuance bot must
+mint with exactly the signed `(token, to, amount, nonce)` values, since the
+orchestrator verifies the signature against them exactly.
+
+**Correlation key.** Two identifiers operate at two boundaries, deliberately.
+`tokenization_request_id` — Alpaca's identifier for the request — is the
+**wire** correlation key of the internal mint-authorization call, because it is
+the only identifier the liquidity bot holds: Alpaca's AP-facing responses expose
+it, never the issuer-generated id (see the Alpaca AP guide). `issuer_request_id`
+is the Mint aggregate's own **internal** identity, minted by the issuance bot,
+carried by `AuthorizeMint` and `MintAuthorizationReceived`, and never leaving
+the Alpaca channel. The endpoint resolves the delivered
+`tokenization_request_id` to exactly one mint and dispatches `AuthorizeMint`
+with that mint's own `issuer_request_id`. Three rules make the association safe:
+
+- **Resolution.** The `tokenization_request_id` must resolve to exactly ONE live
+  Mint aggregate. An unknown id is rejected with an actionable error; an
+  ambiguous id (e.g. duplicate issuance POSTs leaving two accepting mints) fails
+  closed rather than guessing, because attaching a valid authorization to the
+  wrong mint would mint backed tokens against another request's facts. In
+  neither case is an authorization stored or an aggregate created.
+- **Uniqueness.** At most one `MintAuthorizationReceived` per mint. A second
+  `AuthorizeMint` for a mint that already has one is rejected rather than
+  overwriting — the nonce is the on-chain idempotency key for that mint's
+  submissions (see "Nonce" below), so silently replacing it would strand the
+  original nonce and break recovery's ability to reconcile a submission that had
+  already gone out. An exact byte-identical redelivery of the same
+  `mint_authorization` is idempotent (accepted, no second event), so a retrying
+  caller is safe.
+- **Mismatch.** The authorization must be signed over the mint's own request
+  facts — its asset's token address, its `wallet_address`, and its `qty` scaled
+  to 18 decimals. This is enforced by construction: on-chain validation recovers
+  the signer over the orchestrator's digest of the RESOLVED mint's
+  `(token, to, amount, nonce)`, so a signature over any other tuple fails signer
+  recovery and is rejected without storing. Rejection on mode grounds
+  (`mint_mode: VaultDirect`) is covered under "Per-asset scope" below.
+
+**Wire shape (settled).** The internal mint-authorization call is
+`POST /internal/mints/<tokenization_request_id>/authorization` with body
+`{ "nonce": <bytes32 hex>, "signature": <hex bytes> }`, authenticated like the
+rest of the internal channel (`InternalAuth`, `X-API-KEY`). The correlation key
+is the `tokenization_request_id` — the only mint identifier the liquidity bot
+shares with us; `issuer_request_id` is minted here and never leaves the Alpaca
+channel. Responses: `200` authorization validated and recorded (idempotent —
+redelivering the identical authorization is a no-op `200`); `404` no mint exists
+for the tokenization request; `409` a conflicting authorization is already
+recorded, or the mint has advanced past intent (its signed transaction already
+binds a nonce); `422` the mint is vault-direct, the signer does not recover to
+the recipient (or a contract recipient rejects the signature via ERC-1271
+`isValidSignature`), or the nonce is already consumed on-chain; `502` the
+on-chain validation read failed (retryable).
+
+The authorization is persisted by its own command and event — `AuthorizeMint` ->
+`MintAuthorizationReceived` (see "Mint Aggregate" above) — never on `Initiated`.
+`Initiated` is written synchronously on Alpaca's `POST /inkind/issuance`, which
+strictly precedes this internal call, and events are immutable once written.
+
+**Per-asset scope.** Authorization is required exactly for the assets that
+resolve to `VaultMode::Orchestrator` (Decision 7) — a vault-direct asset's mints
+neither need nor accept one. The liquidity bot learns which is which from the
+same internal per-asset status endpoint it already polls: the
+`GET /tokenized-assets/<underlying>/status` response carries the asset's
+`vault_mode` (see "Per-Asset Freeze Status"), so the issuance bot's TOML config
+stays the single source of truth and the two bots cannot silently disagree
+during an incremental cutover. `AuthorizeMint` on a mint whose `Initiated`
+carries `mint_mode: VaultDirect` is **rejected with an actionable error**, not
+stored — the mode anchor (see "Mint Aggregate") decides what an authorization is
+allowed to attach to, not the other way round. Conversely, an orchestrator-mode
+mint whose authorization has not arrived by the on-chain mint step does not
+submit — it waits (or fails actionably on the internal-call path), never falls
+back to vault-direct.
+
+**Staged scope / forward compatibility.** This migration implements only the
+liquidity-bot signature path. The orchestrator natively supports a second
+recipient shape: when `MintAuthV1.signature` is **empty**, it calls
+`IMintRecipient.authorizeMint(digest)` on `to` instead of checking a signature,
+letting a keyless contract gate the mint on its own on-chain intent. A future
+phase (the Atomic Bridge project) will use that path for an atomic-bridge
+contract recipient. We do not build it now, but the issuance-bot authorization
+handling must not preclude it: treat the `signature` as opaque bytes, accept an
+**empty** signature as valid input (deferring the actual check to the
+orchestrator's callback rather than doing an EIP-712 recovery), and avoid
+hardcoding "the recipient is always the liquidity bot" anywhere on the mint
+path. In practice that means the signer-validation step described above is
+skipped for an empty signature, and `to` may be a contract address.
+
+**EIP-712 typed data.** Domain:
+`{ name: "ST0xOrchestrator", version: "1",
+chainId, verifyingContract: <orchestrator address> }`.
+Struct:
+`MintAuth(address token, address recipient, uint256 amount, bytes32 nonce)` —
+`nonce` is `bytes32` everywhere it appears on-chain (the struct field, and the
+`nonceUsed(address, bytes32)` view above); the persisted Rust/domain type for
+`MintAuthV1.nonce` and the `nonce` field on `OrchestratorTokensMinted` /
+`OrchestratorMintRecovered` is `B256`, matching the existing `tx_hash: B256`
+convention used elsewhere in this document. The signature binds `token`,
+`recipient` (`to`), and `amount`, not just `nonce`, so an authorization cannot
+be replayed across a different token, recipient, or amount. The wire-level
+`MintAuthV1 { nonce, signature }` only carries `nonce` and the signature itself;
+the orchestrator reconstructs the full struct hash from its own
+`mint(token, to, amount, ...)` call parameters plus `mintAuth.nonce`, then
+recovers the signer from `mintAuth.signature` against that hash. See
+`IST0xOrchestratorV1.sol` (st0x.deploy PR #222) for the exact typehash.
+
+**If a recipient other than the liquidity bot is ever needed** (e.g. a future
+non-liquidity-bot AP), the fallback is the bot signing its own authorization (a
+weaker security property: the bot's key becomes sufficient to both mint and
+authorize) or a dedicated `IMintRecipient` callback contract that approves
+mints. See Decision 1 in "Design Decisions" above for the full alternative
+analysis.
+
+**Nonce.** The nonce is fixed per mint operation, chosen by whichever party
+produces the signature — today, the liquidity bot, as recipient/signer, under
+`MintAuthV1` — persisted on `MintAuthorizationReceived` (inside the
+`mint_authorization`), which is written when the internal mint-authorization
+call arrives and therefore strictly before the first on-chain submission, and
+reused unchanged on every retry. It cannot be persisted on `Initiated`, which is
+already written by the time the liquidity bot supplies it. A mint with no
+`MintAuthorizationReceived` in its history has no nonce and has never submitted,
+so recovery has nothing to reconcile on-chain for it: recovery skips the
+`Minted`-log query entirely and the mint simply waits for its authorization.
+This is what makes `NonceReplayed` a reliable "an earlier mint already landed"
+signal — the nonce acts as an on-chain deterministic idempotency key for mint
+submissions. **`NonceReplayed` is treated as a recovery-success signal, not an
+ordinary failure**: on a mint retry it means the nonce was already consumed by
+an earlier transaction, so recovery attempts to reconcile it as
+`OrchestratorMintRecovered` via the proactive `Minted`-log lookup below — but
+only once the full-match requirement immediately below confirms that earlier
+transaction was in fact _this_ mint (never bare `MintingFailed` either way — see
+"Full-match requirement" for the alternative outcome). Recovering the details of
+that earlier mint (`tx_hash`, `shares_minted`, `block_number`) still requires
+querying the orchestrator's `Minted` event log filtered by `(to, nonce)` —
+simpler than today's `ReceiptService` mirror, but not lookup-free.
+
+**Full-match requirement.** The nonce-uniqueness view is keyed only on
+`(to, nonce)`, but the EIP-712 signature — and this mint's own intent — binds
+`token` and `amount` too. Recovery must therefore not treat a `Minted` log at
+`(to, nonce)` as proof that _this_ mint landed unless its `token` and exact
+18-decimal `amount` also match this mint's own request facts. If
+`nonceUsed(to, nonce)` is true (via a `NonceReplayed` revert on submit, or the
+proactive check) but no `Minted` log matching `(to, nonce, token, amount)` can
+be found, recovery does **not** emit `OrchestratorMintRecovered`: this mint's
+shares are not provably backed on-chain, and treating an unverified replay as
+success would risk a mis-backed issuance.
+
+**Two outcomes, never conflated.** A failed full match has two causes with
+opposite safe responses, so the classification must record which one was
+actually observed rather than assuming the worse-understood case:
+
+- **Proven mismatch.** A `Minted` log at `(to, nonce)` _was_ found and its
+  `token` or `amount` disagrees with this mint's request facts. That log is
+  affirmative proof another mint consumed the pair, so this mint can never land.
+  Recorded as `MintingFailed` with
+  `classification:
+  MintFailureClassification::NonceConsumedByOtherMint`, a
+  non-retryable, manual-intervention failure. The nonce can never be reused for
+  this mint, so — exactly like `BadRecipientSignature` below — the only
+  resolution is `CloseMint` on the stranded (already-journaled) aggregate
+  followed by a brand-new `Initiate` paired with fresh authorization (and a
+  fresh nonce) from the liquidity bot via the internal mint-authorization call.
+- **Inconclusive lookup.** _No_ `Minted` log at `(to, nonce)` was found at all,
+  while `nonceUsed(to, nonce)` reports the nonce consumed. The two statements
+  cannot both be true of a healthy chain view, so the query itself is untrusted
+  — an insufficient block window, an RPC error, or indexer lag. This is an
+  **unknown outcome, not proof of anything**, and must never be recorded as
+  `NonceConsumedByOtherMint`: this mint may well have landed. Recorded as
+  `MintingFailed` with
+  `classification:
+  MintFailureClassification::NonceReplayUnresolved`, which is
+  likewise non-retryable for _submission_ — the nonce is consumed either way, so
+  resubmitting can only revert — but is **retryable for reconciliation**:
+  recovery re-runs the `Minted`-log query on its normal schedule over a widened
+  block window, and a later successful match resolves the mint forward to
+  `OrchestratorMintRecovered` exactly as a first-attempt match would. A mint in
+  this classification stays visible to stuck queries and **`CloseMint` is
+  rejected on it** — closing would defeat the guarded-closure requirement under
+  `CloseMint`, since the guard is the very query that just failed, and a
+  replacement issuance against an unverified nonce is precisely the double-mint
+  this check exists to prevent. Because the bot's own chain view is the very
+  thing in doubt, it cannot obtain that proof itself; resolution requires an
+  operator who has independently verified the chain state (e.g. against a second
+  RPC provider or a block explorer). If the mint did land, they resolve it
+  forward through the admin reprocess re-drive once the log is visible again. If
+  they confirm the mint genuinely never landed, they close it with an explicit
+  acknowledgement parameter on `CloseMint` — mirroring the redemption side's
+  `acknowledged_unresolved_burn_tx_hash` (see "Redemption Aggregate" ->
+  `ForceCompleteBurn`) — so the override is a deliberate, recorded operator act
+  rather than a silent re-read of the failed query.
+
+`ConfirmMintJob` applies this same full-match check, and the same two-outcome
+split, when it is the one to observe a `NonceReplayed` revert on a submitted
+transaction, rather than recovery.
+
+### ERC-20 Approval for Burns
+
+The orchestrator's `burn()` pulls shares from the bot wallet via `transferFrom`,
+so the bot must approve the orchestrator to spend the vault's ERC-20 shares.
+This is a **one-time unlimited approval**
+(`token.approve(orchestrator, type(uint256).max)`), executed **manually by ops**
+as a RAI-1221 runbook step at token onboarding (alongside `TokenizedAsset::Add`)
+— **not** automated inside the bot's `TokenizedAsset::Add` command handling, and
+not on the per-burn hot path. A per-burn exact approval would double the
+policy-gated transaction count on the redemption hot path for no additional
+trust boundary beyond what `BURN_ROLE` (held only by the bot wallet) already
+implies. The approval itself is a one-off transaction issued by ops through the
+Turnkey-signed wallet (its own signing-policy entry, per RAI-1221), not a
+`VaultService` method — the bot has no runtime code path that submits
+`approve()`. On the local-signing/Anvil dark-deploy exercise path (see
+"Dual-Mode Operation and Cutover"), the same one-time
+`approve(orchestrator, max)` is issued directly with the local test key (e.g. as
+an e2e/setup step) — the mechanism follows the active signing backend either
+way. Ops verifies the approval landed as part of the onboarding runbook before
+marking a token available in orchestrator mode; the bot does not surface
+approval status itself. Before submitting an orchestrator burn, the bot checks
+`token.allowance(bot, orchestrator) >= amount`; a missing approval fails as
+`AllowanceInsufficient` instead of an opaque ERC-20 allowance revert — see
+"Failure States" -> "`AllowanceInsufficient`" below for the exact event, log
+level, and recovery path.
+
+### Dual-Mode Operation and Cutover
+
+`VaultMode` (Rust enum: `VaultDirect` | `Orchestrator { address }`; see
+"VaultService" -> "Mode selection" below) is resolved **per asset** (Decision 7)
+from the TOML configuration file (see "Configuration" -> "TOML Configuration
+File"): an asset whose `[assets.<UNDERLYING>]` table sets
+`vault_mode = "orchestrator"` routes its mints and burns through the
+orchestrator; an asset without an override takes
+`[orchestrator].default_vault_mode`, which itself defaults to `"vault_direct"`.
+The mapping is loaded once at startup (changing it is a config change + restart,
+like any other deploy-time setting) and threaded to the two call sites that
+resolve it — `MintServices` and `BurnManager`, each of which resolves a given
+operation's mode at that operation's anchoring point (see the mode-scoping rules
+under "Mint Aggregate" and "Redemption Aggregate") and never re-resolves it
+later. With no config file (or no orchestrator entries) every asset is
+vault-direct, so the orchestrator can be dark-deployed and exercised (e.g.
+against Anvil) before any cutover without touching production mint/burn traffic.
+
+**Cutover is incremental, one asset at a time.** The intended rollout is a
+single low-volume pilot asset first: freeze the asset, drain its in-flight
+mints/redemptions, migrate that token's receipts into the orchestrator, set
+`vault_mode = "orchestrator"` in its `[assets.<UNDERLYING>]` config table,
+redeploy, unfreeze, and observe real production mints and burns for that one
+asset while every other asset continues on the proven vault-direct path (the
+runbook is authored and executed for the pilot in RAI-1222). Subsequent assets
+follow the same per-asset procedure (RAI-1246); the end state flips
+`[orchestrator].default_vault_mode` to `"orchestrator"` and drops the per-asset
+overrides. Rollback is the same procedure in reverse for just the affected
+asset: freeze, flip its `vault_mode` back to `"vault_direct"`, return that
+token's receipts to the bot wallet via `EMERGENCY_ROLE`, redeploy, unfreeze — no
+other asset is touched. Vault-direct mode's flows, aggregate states, and events
+are completely unchanged by this migration.
+
+**Both modes run side by side for the whole rollout.** While any asset remains
+vault-direct, `ReceiptInventory` and the receipt-monitoring/backfill machinery
+described under "ReceiptService" keep running for those assets exactly as today.
+The machinery needs no per-asset gating: a cutover asset's receipts are
+transferred out of the bot wallet during its migration step, and the existing
+outbound-transfer monitoring/reconciliation observes those transfers and drains
+that vault's inventory mirror to zero on its own — after which there is simply
+nothing left for the receipt machinery to track or plan against for that asset
+(orchestrator-mode mints create no bot-held receipts, and orchestrator-mode
+burns never call `plan_burn`). Only once the **last** asset leaves vault-direct
+mode does the receipt subsystem become **historical only** — the orchestrator
+custodies receipts and plans burns directly, so no new `ReceiptInventoryEvent`s
+are produced. Retiring the aggregate is out of scope for this document (see
+RAI-1223, which is gated on the full rollout, RAI-1246 — not on the pilot).
+
+### Orchestrator Mint Flow
+
+```mermaid
+sequenceDiagram
+    participant AP as Authorized Participant (Liquidity Bot)
+    participant Alpaca as Alpaca ITN
+    participant Us as Issuance Bot
+    participant Orchestrator as ST0xOrchestrator
+
+    AP->>Alpaca: Mint request (10 AAPL)
+    Alpaca->>Us: POST /inkind/issuance {...}
+    Note right of Us: Initiate command<br/>Event: Initiated<br/>Status: pending_journal
+    Us->>Alpaca: {issuer_request_id, status: "created"}
+
+    AP->>Us: Internal mint-authorization call:<br/>MintAuthV1 { nonce, signature } for (token, to, amount)
+    Us->>Us: Recover EIP-712 signer == to (or EIP-1271 check);<br/>query nonceUsed(to, nonce) - reject if invalid/used
+    Note right of Us: AuthorizeMint command<br/>Event: MintAuthorizationReceived<br/>Nonce persisted here, not on Initiated<br/>Status unchanged: pending_journal
+
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP -> To: Issuer account
+    Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
+    Note right of Us: ConfirmJournal command<br/>Event: JournalConfirmed
+    Note right of Us: Deposit command (no network call)<br/>Event: MintingStarted<br/>Status: minting
+
+    Us->>Orchestrator: vaultLogicIsExpected()?
+    alt halted (VaultLogicMismatch / ReceiptLogicMismatch)
+        Note right of Us: No submission, no event,<br/>WARN log, retry later
+    else healthy
+        Us->>Orchestrator: mint(token, wallet, 10 AAPL, mintAuth, receiptInformation)
+        alt reverts (BadRecipientSignature / RecipientCallbackRejected /<br/>VaultAmountMismatch)
+            Note right of Us: SubmitMintJob/ConfirmMintJob / RecordMintFailed<br/>Event: MintingFailed (classified, not auto-retried)
+        else reverts (NonceReplayed)
+            Note right of Us: ConfirmMintJob applies the full-match check (to, nonce, token, amount)<br/>Match: Event OrchestratorMintRecovered. Log found but token/amount disagree:<br/>Event MintingFailed (classified NonceConsumedByOtherMint).<br/>No log found at all: Event MintingFailed (classified NonceReplayUnresolved)
+        else reverts (VaultLogicMismatch / ReceiptLogicMismatch - post-hoc race)
+            Note right of Us: SubmitMintJob/ConfirmMintJob<br/>Event: MintingFailed (classified,<br/>attempts NOT advanced, auto-resumes once healthy)
+        else succeeds
+            Orchestrator->>Us: Minted(token, wallet, amount, nonce)
+            Note right of Us: SubmitMintJob/ConfirmMintJob<br/>Event: OrchestratorTokensMinted
+            Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
+            Note right of Us: SendCallbackJob / RecordCallbackSent<br/>Event: MintCompleted
+            Alpaca->>AP: Mint completed ✓
+        end
+    end
+```
+
+### Orchestrator Burn Flow
+
+```mermaid
+sequenceDiagram
+    participant AP as Authorized Participant
+    participant Blockchain as Blockchain
+    participant Us as Issuance Bot
+    participant Orchestrator as ST0xOrchestrator
+    participant Alpaca as Alpaca ITN
+
+    AP->>Blockchain: Transfer 10 AAPL0x shares to bot wallet
+    Blockchain->>Us: Transfer event detected
+    Note right of Us: Detect command<br/>Event: RedemptionDetected
+
+    Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
+    Alpaca->>Us: {tokenization_request_id, status: "pending"}
+    Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled
+
+    Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: Issuer account -> To: AP
+    loop Poll for completion
+        Us->>Alpaca: GET .../requests/{tokenization_request_id}
+    end
+    Note right of Us: ConfirmAlpacaComplete command<br/>Event: AlpacaJournalCompleted
+
+    Us->>Us: token.allowance(bot, orchestrator) >= amount?
+    alt insufficient
+        Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (AllowanceInsufficient, not auto-retried)
+    else sufficient
+        Us->>Orchestrator: vaultLogicIsExpected()?
+        alt halted (VaultLogicMismatch / ReceiptLogicMismatch)
+            Note right of Us: No submission, no event,<br/>WARN log, retry later
+        else healthy
+            Us->>Orchestrator: burn(token, amount, burnInfo)
+            alt reverts (InsufficientReceipts)
+                Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified, not auto-retried)
+            else reverts (VaultLogicMismatch / ReceiptLogicMismatch - post-hoc race)
+                Note right of Us: RecordBurnFailure command<br/>Event: BurningFailed (classified,<br/>not auto-retried; re-driven via ResumeBurn once healthy)
+            else succeeds
+                Orchestrator->>Orchestrator: transferFrom(bot, orchestrator, amount);<br/>consume receipts in order; advance nextBurnReceiptId
+                Orchestrator->>Us: Burned(token, amount, burn_range)
+                Note right of Us: BurnTokens/ConfirmBurn command<br/>Event: OrchestratorTokensBurned<br/>(dust_retained recorded, not returned)
+                Us->>AP: Redemption completed ✓
+            end
+        end
+    end
+```
+
+### Failure States
+
+Beyond the state machines in "Mint Aggregate" and "Redemption Aggregate",
+orchestrator mode introduces five on-chain/pre-submit failure modes with
+distinct recovery treatment, none of which are reachable in vault-direct mode.
+Every failure mode that actually reaches a `MintingFailed`/`BurningFailed` event
+is recorded as a typed `classification` field (`MintFailureClassification` on
+`MintingFailed`, `BurnFailureClassification` on `BurningFailed` — see "Mint
+Aggregate" / "Redemption Aggregate" above) — retry-exclusion, log-level
+selection, and admin grouping are always keyed off that typed field, never off
+parsing the free-text `error: String`. The one exception is
+`VaultLogicMismatch`/`ReceiptLogicMismatch`'s **pre-submit** halt gate below,
+which never reaches a submitted transaction and therefore never produces a
+`MintingFailed`/`BurningFailed` event at all; its **post-submit** case, covered
+in the same subsection, does carry a classification like every other reverted
+submission.
+
+#### `InsufficientReceipts(token, shortfall)` — token-global, manual recovery
+
+Reverts when the orchestrator's per-token receipt walk cannot cover the
+requested burn amount. Once an asset is cut over, the orchestrator holds **all**
+receipts for that token, so a shortfall is a token-global anomaly (e.g. an
+emergency withdrawal or an external receipt transfer drained the pool, or the
+asset was switched to orchestrator mode before its receipt migration completed)
+— it fails every redemption of that token, not just the one that triggered the
+revert.
+
+- Recorded via the existing `RecordBurnFailure` command, producing
+  `BurningFailed` with
+  `classification:
+  BurnFailureClassification::InsufficientReceipts { shortfall }`
+  (`token` is already the aggregate's own `token` field, so it is not duplicated
+  in the classification; `planned_burns: vec![]` — the field is already
+  `#[serde(default)]`-tolerant of an orchestrator-mode redemption that never had
+  a per-receipt plan) and an ERROR-level structured log. Confirmed decodable:
+  `IST0xOrchestratorV1.sol` (st0x.deploy PR #222) declares
+  `error InsufficientReceipts(address token, uint256 shortfall)`, so `shortfall`
+  is a plain ABI-decoded `uint256`, not a guessed field.
+- **Never auto-retried.** The burn manager classifies this failure as
+  not-retryable, the same treatment as the existing
+  `RecoveryOutcome::SkippedManualIntervention` path: redemption recovery (run at
+  startup, and via the manual admin recovery endpoint) does not resubmit a
+  deterministically-reverting burn — only the manual re-drive below does, once
+  the underlying shortfall is fixed.
+- Recovery is a manual `EMERGENCY_ROLE` action (moving receipts back in, or
+  adjusting the burn pointer). Once the operator fixes the shortfall on-chain,
+  the existing admin path — `POST /admin/recover/redemption/<id>` ->
+  `ResumeBurn` — resumes the redemption. No new recovery machinery.
+- Affected redemptions are individually visible today via the existing
+  `GET /admin/stuck` (`Failed` state) and are identifiable by their
+  `classification: BurnFailureClassification::InsufficientReceipts` field. A
+  dedicated per-token grouped admin view is **not yet specified** — deferred to
+  RAI-1219 (admin/recovery surface work).
+
+#### `AllowanceInsufficient` — pre-submit gate, ops-recoverable
+
+The bot's pre-submit `token.allowance(bot, orchestrator) >= amount` check (see
+"ERC-20 Approval for Burns" above) is a bot-side gate, not an on-chain revert.
+Unlike the silent `vaultLogicIsExpected()` halt gate below, it is surfaced as an
+actionable failure, because recovery requires ops to grant an approval, not
+merely to wait out a transient condition.
+
+- Recorded via the existing `RecordBurnFailure` command, producing
+  `BurningFailed` with
+  `classification:
+  BurnFailureClassification::AllowanceInsufficient`
+  (`planned_burns: vec![]`, as with `InsufficientReceipts`) and an ERROR-level
+  structured log (token, required amount, current allowance).
+- **Never auto-retried** — deterministic until ops acts, same not-retryable
+  treatment as `InsufficientReceipts`.
+- The burn is **not submitted**; no funds are at risk. This check runs after the
+  Alpaca journal completed, so the redemption is economically committed but
+  fully recoverable, never lost.
+- **Re-drive path**: once ops grants the approval (RAI-1221 runbook), the
+  existing admin recovery — `POST /admin/recover/redemption/<id>` ->
+  `ResumeBurn` — resumes the redemption. No new recovery machinery.
+
+#### `VaultLogicMismatch` / `ReceiptLogicMismatch` — per-orchestrator halt
+
+Revert when the production vault or receipt beacon was upgraded ahead of the
+orchestrator's expectations. This is a halt condition scoped to one orchestrator
+deployment — one `(network, orchestrator)` pair — not a per-operation failure,
+and must not consume any aggregate's retry budget: whether the halt is caught
+before submission or discovered as a revert on a transaction that was already
+submitted. Under multichain operation each `ChainRuntime` carries its own
+`VaultService` and orchestrator (see "Multi-chain"), so the health gate, retry
+suppression, and recovery re-checks below all apply per
+`(network, orchestrator)`: a mismatch on one chain halts that chain's
+orchestrator submissions only and must not suppress submissions, retries, or
+recovery on any other chain.
+
+- **Pre-submit health gate (no submission, no event):** before submitting any
+  orchestrator mint or burn, the bot checks `vaultLogicIsExpected()`. If it
+  returns `false`, the bot does not submit — there is no transaction to record,
+  so no `MintingFailed`/`BurningFailed` event is produced, the `attempts`
+  counter and its bounded 1m/10m/30m/1h exhaustion schedule do not advance, and
+  the bot logs at WARN. Recovery is deferred the same way it already is for each
+  aggregate: for mint, the existing background scheduled-recovery task re-checks
+  health before its next attempt; for burn (which has no automatic retry loop —
+  see "InsufficientReceipts" above), the next startup or manual admin recovery
+  attempt re-checks health before resubmitting. No aggregate state changes;
+  "orchestrator halted" is an environmental condition of that one
+  `(network, orchestrator)` pair, not a domain fact about any one mint or
+  redemption.
+- **Post-submit revert (transaction was submitted, then reverts):** if the
+  beacon upgrade instead lands _between_ the health check and submission, the
+  aggregate has already committed `MintTxSubmitted` (mint) or
+  `OrchestratorBurnSubmitted` (burn) before the on-chain revert occurs. Both
+  entry points are gated by the same on-chain health check
+  (`vaultLogicIsExpected()`, see "Contract Summary"), so either can revert with
+  **either** `VaultLogicMismatch` or `ReceiptLogicMismatch` — `mint()` writes
+  `receiptInformation` onto the receipt as well as touching the vault, and
+  `burn()` pulls the vault's ERC-20 shares as well as consuming receipts
+  (confirm the exact reachability against `IST0xOrchestratorV1.sol`, st0x.deploy
+  PR #222, before implementing). This resolves like any other on-chain revert of
+  a submitted transaction: `ConfirmMintJob`/`ConfirmBurn` records it via the
+  existing failure-recording path, producing `MintingFailed` with
+  `classification:
+  MintFailureClassification::VaultLogicMismatch` or
+  `MintFailureClassification::ReceiptLogicMismatch` (mint) or `BurningFailed`
+  with `classification: BurnFailureClassification::ReceiptLogicMismatch` or
+  `BurnFailureClassification::VaultLogicMismatch` (burn) — whichever the revert
+  actually decodes to; both classifications receive **identical** halt/recovery
+  treatment on both aggregates. This classification is an **environmental halt,
+  not a mint/burn defect** — as an explicit exception to the "`attempts`
+  advances on every failure" rule stated under "Mint Aggregate" -> "Recovery
+  orchestration", a `VaultLogicMismatch`- or `ReceiptLogicMismatch`-classified
+  `MintingFailed` does **not** advance the `attempts` counter, mirroring the
+  pre-submit case's no-counter-advance treatment (burn failures have no
+  analogous automatic-retry counter to begin with — see `InsufficientReceipts`
+  above). Recovery resumes the same way once `vaultLogicIsExpected()` reports
+  healthy again: for mint, the next scheduled or manual recovery attempt
+  resubmits the deterministic retry (same `external_tx_id` scheme) without
+  having consumed a retry slot; for burn, the existing manual `ResumeBurn`
+  re-drive resumes it, exactly as it does for
+  `InsufficientReceipts`/`AllowanceInsufficient`.
+- **Observable signal:** `vaultLogicIsExpected()` (plus per-token
+  `nextBurnReceiptId`) is the concrete data an admin health surface should
+  expose so a halted orchestrator is visibly distinct from an ordinary stuck
+  transaction. No such endpoint is specified by this document today — it is
+  **deferred to RAI-1219** (admin/recovery surface work), which owns the
+  concrete route and response shape.
+
+#### `BadRecipientSignature` / `RecipientCallbackRejected` / `VaultAmountMismatch` — mint-path on-chain failures
+
+`MintAuthV1` validation when the liquidity bot delivers it (see "Recipient
+Authorization") makes these unlikely but not impossible: the on-chain check runs
+at **mint** time, after journal confirmation, so an authorization valid when
+delivered can still fail on-chain (nonce consumed by an unrelated flow, an
+EIP-1271 or `IMintRecipient` callback's authorization logic changed between
+authorization and mint, or a rebase mid-flight breaking the 1:1 assertion).
+
+- `BadRecipientSignature` and `RecipientCallbackRejected` are both deterministic
+  recipient-authorization reverts — retrying with the same `mint_authorization`
+  fails identically. The mint lands in `MintingFailed` with
+  `classification:
+  MintFailureClassification::BadRecipientSignature` (or
+  `RecipientCallbackRejected`), excluded from the automatic retry schedule by
+  that typed field. Because shares are already journaled, this is a
+  stranded-journal failure — but unlike the other classified failures above, it
+  **cannot be resumed on the same aggregate**: the manual admin reprocess path
+  (`POST /admin/reprocess/mint/<aggregate_id>` -> recovery re-drive) only
+  resubmits the same stored `mint_authorization`/nonce (see "Recipient
+  Authorization" -> "Nonce" above — the authorization is fixed per mint and
+  persisted on `MintAuthorizationReceived` before the first submission), which
+  would fail identically. The only resolution is `CloseMint` on the stranded
+  aggregate, followed by a brand-new `Initiate` request (through the normal ITN
+  flow), paired with fresh authorization from the liquidity bot via the internal
+  mint-authorization call. (The manual reprocess recovery re-drive remains the
+  correct re-drive path for _transient_ on-chain failures where the same
+  authorization is still valid — it is only these two deterministic
+  authorization reverts that need a fresh authorization instead.)
+- `VaultAmountMismatch` means the orchestrator's on-chain 1:1 assertion failed —
+  a vault/orchestrator invariant break (e.g. a share-ratio rebase landing
+  between journal and mint). The mint lands in `MintingFailed` with
+  `classification: MintFailureClassification::VaultAmountMismatch`. Not
+  auto-retryable; alert-and-investigate. The existing per-asset freeze mechanism
+  (see "Per-Asset Freeze Status") is the tool that gates mints during a rebase
+  window; the corporate-action/dividend scheduler is expected to freeze the
+  asset before triggering one. Unlike `BadRecipientSignature`/
+  `RecipientCallbackRejected` above, this revert does not invalidate the AP's
+  authorization — only the vault's ratio was temporarily wrong — so once
+  investigation confirms the ratio is restored (the freeze lifted), the **same**
+  aggregate resumes via the existing manual admin reprocess path
+  (`POST /admin/reprocess/mint/<aggregate_id>` -> recovery re-drive), which
+  resubmits the identical `mint()` call under the same stored
+  authorization/nonce; a fresh `Initiate` is not required.
+
+### Command -> Event Mapping (Orchestrator Mode)
+
+Every event listed below as "reused unchanged" is emitted with the identical
+shape it has today; only the additions are new. See "Mint Aggregate" and
+"Redemption Aggregate" for how each command's existing event list and mapping
+table are extended for orchestrator mode.
+
+**Mint:**
+
+| Event                                                                                                                         | Orchestrator mode                                                                                            | Why                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Initiated`                                                                                                                   | Reused, plus one additive optional `mint_mode` field (`#[serde(default)]`, `VaultMode`)                      | Anchors mode-derivation for this mint at the earliest possible point, before any mint submission                                                                                                                                                                                                                                                                                                                                               |
+| —                                                                                                                             | New: `MintAuthorizationReceived`                                                                             | The `MintAuthV1` (and its nonce) arrives on the internal mint-authorization call, strictly after `Initiated` is persisted; immutable events cannot grow a field, so the authorization needs its own event                                                                                                                                                                                                                                      |
+| `JournalConfirmed`, `JournalRejected`, `MintingStarted`, `MintCompleted`, `MintClosed`, `MintRetryStarted`, `MintTxSubmitted` | Reused unchanged                                                                                             | No vault-multicall-specific fields; already backend-agnostic                                                                                                                                                                                                                                                                                                                                                                                   |
+| `MintingFailed`                                                                                                               | Reused, plus one additive optional `classification` field (`#[serde(default)]`, `MintFailureClassification`) | Carries values decoded from on-chain reverts (`BadRecipientSignature`/`RecipientCallbackRejected`/`VaultAmountMismatch`/`VaultLogicMismatch`/`ReceiptLogicMismatch` — post-submit race) or assigned by recovery's own full-match check (`NonceConsumedByOtherMint` for a proven mismatch, `NonceReplayUnresolved` for an inconclusive lookup — see "Nonce") so retry-exclusion and admin grouping key off a typed field, never `error: String` |
+| `TokensMinted`                                                                                                                | New: `OrchestratorTokensMinted`                                                                              | Existing shape carries `receipt_id`, meaningless once the orchestrator owns receipt custody                                                                                                                                                                                                                                                                                                                                                    |
+| `ExistingMintRecovered`                                                                                                       | New: `OrchestratorMintRecovered`                                                                             | Nonce-keyed, discovered via a proactive `Minted`-log query confirmed by an exact `token`/`amount` match (mirrors vault-direct's proactive `find_by_issuer_request_id` check); `NonceReplayed` is only the fallback signal for a submit/query race, not the primary discovery path                                                                                                                                                              |
+
+**Redemption:**
+
+| Event                                                                | Orchestrator mode                                                                                            | Why                                                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RedemptionDetected`                                                 | Reused, plus one additive optional `burn_mode` field (`#[serde(default)]`, `VaultMode`)                      | Anchors mode-derivation for this redemption at the earliest possible point, before any burn submission                                                                                                                                                                             |
+| `AlpacaCalled`, `AlpacaCallFailed`, `AlpacaJournalCompleted`         | Reused unchanged                                                                                             | Pure Alpaca facts, pre-burn                                                                                                                                                                                                                                                        |
+| `RedemptionFailed`, `Reprocessed`, `RedemptionClosed`, `BurnResumed` | Reused unchanged                                                                                             | Lifecycle/admin facts that carry no mode-specific burn data. `RedemptionFailed` and `BurnResumed` do span burn states (`MarkFailed` fires from `Burning`/`BurnSubmitted` too), but record only the failure/resume fact, never per-receipt burn detail                              |
+| `BurningFailed`                                                      | Reused, plus one additive optional `classification` field (`#[serde(default)]`, `BurnFailureClassification`) | Decodes `InsufficientReceipts`/`AllowanceInsufficient`/`ReceiptLogicMismatch`/`VaultLogicMismatch` (post-submit race) so retry-exclusion and admin grouping key off a typed field, never `error: String`; `planned_burns` is already `#[serde(default)]`-tolerant of an empty plan |
+| `BurnTxSubmitted`                                                    | New: `OrchestratorBurnSubmitted`                                                                             | Existing `planned_burns: Vec<BurnRecord>` is a required per-receipt plan; orchestrator mode has none                                                                                                                                                                               |
+| `TokensBurned`                                                       | New: `OrchestratorTokensBurned`                                                                              | Existing `burns: Vec<BurnRecord>` is per-receipt; the orchestrator's `Burned` event exposes a consumed pointer range plus `dust_retained`                                                                                                                                          |
+| `ExistingBurnRecovered`                                              | New: `OrchestratorBurnRecovered`                                                                             | Same reasoning — existing `burns` field is required and per-receipt; also carries `dust_retained` for parity with `OrchestratorTokensBurned`                                                                                                                                       |
+| `BurnForceCompleted`                                                 | Reused unchanged; verification mode-scoped                                                                   | `verify_burn_tx` accepts `Transfer(bot -> orchestrator)` + `Transfer(orchestrator -> 0x0)` only when this redemption's own persisted `burn_mode` is `Orchestrator`; vault-direct's `Transfer(bot_wallet -> 0x0)` check is otherwise unchanged                                      |
+
+No new `BurnShortfallDetected` event: `InsufficientReceipts` is recorded via the
+existing `BurningFailed` event, the existing `Failed` state, and the existing
+`ResumeBurn` re-drive (see "Failure States" above) — adding a permanent event
+for it would violate the events-are-forever discipline for a condition already
+expressible with existing machinery.
+
 ## Services
 
 Aggregates use services to interact with external systems while keeping business
@@ -1237,16 +2295,92 @@ handlers, making aggregates testable with mock services.
 
 ### VaultService
 
-- RPC client for on-chain vault interaction
-- Methods: `deposit()`, `withdraw()`
-- Two implementations: local key signing — `EVM_PRIVATE_KEY` or Turnkey —
-  `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS` (prod)
-- Turnkey transaction signing uses `ACTIVITY_TYPE_SIGN_TRANSACTION_V2` with the
-  exact unsigned EIP-2718 transaction bytes. The returned signed envelope is
-  decoded locally and its signature must recover `TURNKEY_ADDRESS` over those
-  exact bytes before the transaction is accepted for broadcast. Decode,
-  recovery, content, or signer mismatches fail closed, and signed transaction
-  response bodies are never logged or embedded in decode errors.
+RPC client for on-chain vault (and, in orchestrator mode, `ST0xOrchestrator`)
+interaction, implemented by `RealBlockchainService`. Which signing backend is
+active is controlled by `SignerConfig` (`Local` — `EVM_PRIVATE_KEY` — or
+`Turnkey` — `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS`,
+prod), **independently** of `VaultMode` (`VaultDirect` |
+`Orchestrator {
+address }`) — the signing backend and the contract target are
+orthogonal axes, so orchestrator mode still needs local signing on Anvil and a
+policy-gated backend in production, exactly like vault-direct mode today; the
+orchestrator methods below do not care which backend signs.
+
+Turnkey transaction signing uses `ACTIVITY_TYPE_SIGN_TRANSACTION_V2` with the
+exact unsigned EIP-2718 transaction bytes. The returned signed envelope is
+decoded locally and its signature must recover `TURNKEY_ADDRESS` over those
+exact bytes before the transaction is accepted for broadcast. Decode, recovery,
+content, or signer mismatches fail closed, and signed transaction response
+bodies are never logged or embedded in decode errors.
+
+**Vault-direct methods** (multicall-shaped, matching "Complete Mint Flow" /
+"Complete Redemption Flow" above):
+
+- `submit_mint(vault, assets, bot, user, receipt_info, external_tx_id)` /
+  `confirm_mint(tx_id)` - deposit + share-transfer multicall, parses the vault's
+  `Deposit` event
+- `submit_burn(MultiBurnParams)` / `confirm_burn(tx_id,
+  dust_shares)` -
+  multi-receipt redeem + dust-transfer multicall, parses `Withdraw` events
+- `get_share_balance(vault, owner)`, `check_tx(tx_id)` - mode-independent;
+  recovery/admin needs these working identically regardless of `VaultMode`
+- `verify_burn_tx(vault, owner, tx_hash, expected_proof)` - one implementation
+  serving recovery/admin in both modes, **not** an unconditional either-shape
+  check: `expected_proof: BurnProofKind` (`VaultDirect` |
+  `Orchestrator {
+  address }`, matching `VaultMode`'s field naming) is supplied
+  by the caller, which only accepts the proof shape matching that value
+  (`Transfer(bot_wallet -> 0x0)` for `VaultDirect`;
+  `Transfer(bot -> orchestrator)` + `Transfer(orchestrator ->
+  0x0)` for
+  `Orchestrator`). See "Redemption Aggregate" -> `ForceCompleteBurn` for how the
+  caller determines a given redemption's expected proof kind, so a vault-direct
+  redemption's force-complete is never satisfied by an orchestrator-shaped burn
+  proof, or vice versa. The caller always derives `expected_proof` from the
+  redemption's own persisted `burn_mode` (captured on `RedemptionDetected`),
+  never re-resolved from the asset's current `VaultMode` — that per-redemption
+  mode is authoritative even while both modes are live side by side during the
+  incremental per-asset cutover. This is a **breaking signature change** to the
+  existing 3-argument `verify_burn_tx(vault, owner, tx_hash)`: the added
+  `expected_proof` parameter must land atomically across the trait, the concrete
+  implementation, and every caller in the same change (RAI-1219). A transitional
+  overload defaulting `expected_proof` is forbidden — it would silently restore
+  the unconditional either-shape check this parameter exists to prevent
+
+**Orchestrator methods** (added by this migration; see "Orchestrator Migration
+(ST0xOrchestrator)" for the mint/burn flows and failure modes they serve):
+
+- `submit_orchestrator_mint(token, to, amount, mint_auth, receipt_info,
+  external_tx_id) -> SubmittedTx`
+  / `confirm_orchestrator_mint(tx_id)
+  -> OrchestratorMintResult` -
+  submits/confirms `ST0xOrchestrator.mint()`
+- `submit_orchestrator_burn(token, amount, burn_info, external_tx_id) ->
+  SubmittedTx`
+  / `confirm_orchestrator_burn(tx_id) ->
+  OrchestratorBurnResult` -
+  submits/confirms `ST0xOrchestrator.burn()`
+
+Both method families live on the same trait rather than a second trait:
+splitting them would force the mode-independent methods above to be duplicated
+across two traits, or force the recovery/admin layer to juggle two trait
+objects. New orchestrator-specific result/param types (`OrchestratorMintResult`,
+`OrchestratorBurnResult`, and friends) live in a new `src/vault/orchestrator.rs`
+module; the existing `MultiBurnParams`/`MultiBurnEntry` etc. are untouched until
+the receipt subsystem is retired (RAI-1223).
+
+**Mode selection.** `VaultMode` (`VaultDirect` | `Orchestrator { address }`) is
+resolved **per asset** in `Config` from the TOML configuration file's
+`[orchestrator]` table and per-asset `vault_mode` entries (see "Configuration"
+-> "TOML Configuration File"; assets with no entry take the configured default,
+itself defaulting to `VaultDirect`) — e.g. a
+`Config::vault_mode_for(&UnderlyingSymbol) -> VaultMode` lookup — and threaded
+to the two call sites that branch on it: `MintServices` and `BurnManager`. Each
+resolves an operation's `VaultMode` once, at its anchoring point (`Initiated` /
+`RedemptionDetected` — see the mode-scoping rules in "Mint Aggregate" /
+"Redemption Aggregate"), and picks the corresponding submit/confirm methods and
+event types; vault-direct code paths are untouched by the presence of
+orchestrator mode.
 
 ### ReceiptService
 
@@ -1679,7 +2813,8 @@ status.
 ```json
 {
   "underlying": "SGOV",
-  "status": "frozen"
+  "status": "frozen",
+  "vault_mode": "vault_direct"
 }
 ```
 
@@ -1687,6 +2822,14 @@ status.
   when new mints are gated (the rebalance guard skips frozen assets). A frozen
   asset stays supported/listed (see the freeze invariant under "Underlying
   Aggregate") — freezing gates only new minting, it never de-lists.
+- `vault_mode` — `"vault_direct"` or `"orchestrator"`: the asset's resolved
+  `VaultMode` (orchestrator migration; see "Orchestrator Migration" ->
+  "Recipient Authorization"). The liquidity bot uses this to decide whether a
+  mint for this asset requires a `MintAuthV1` recipient authorization
+  (`"orchestrator"`) or not (`"vault_direct"`), so the issuance bot's TOML
+  config is the single source of truth for mode during an incremental cutover.
+  Additive field; reflects startup config, not projected view state, so the
+  freshness caveat below does not apply to it.
 
 **Status Codes:**
 
@@ -1765,22 +2908,22 @@ sequenceDiagram
     Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
     Note right of Us: ConfirmJournal command<br/>Event: JournalConfirmed
     Note right of Us: Deposit command<br/>Event: MintingStarted
-    Note right of Us: PrepareMint command<br/>Event: MintTxIntended<br/>(signed transaction persisted)
+    Note right of Us: SubmitMintJob / RecordTxIntended<br/>Event: MintTxIntended<br/>(signed transaction persisted)
 
     rect rgb(200, 220, 250)
         Note over Us,Blockchain: Single Atomic Transaction (multicall)
-        Us->>Blockchain: SubmitMint: broadcast persisted transaction
-        Note right of Us: Event: MintTxSubmitted
+        Us->>Blockchain: SubmitMintJob: broadcast persisted transaction
+        Note right of Us: RecordTxSubmitted<br/>Event: MintTxSubmitted
         Note right of Blockchain: 1. deposit(10 AAPL, bot_wallet)
         Note right of Blockchain: Bot receives shares + receipts
         Note right of Blockchain: 2. transfer(ap_wallet, 10 AAPL)
         Note right of Blockchain: Bot transfers shares to AP<br/>(keeps receipts)
     end
     Blockchain->>Us: Transaction confirmed (both steps succeeded)
-    Note right of Us: ConfirmMint command<br/>Event: TokensMinted
+    Note right of Us: ConfirmMintJob / RecordTokensMinted<br/>Event: TokensMinted
 
     Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
-    Note right of Us: SendCallback command<br/>Event: MintCompleted<br/>Status: completed
+    Note right of Us: SendCallbackJob / RecordCallbackSent<br/>Event: MintCompleted<br/>Status: completed
 
     Alpaca->>AP: Mint completed ✓
     Note left of AP: AP now has 10 AAPL0x<br/>share tokens in their wallet<br/>(Bot holds receipts)
@@ -1806,6 +2949,14 @@ sequenceDiagram
 
 **Note:** The JSON uses `qty` but our internal code uses `quantity` with
 `#[serde(rename = "qty")]` to maintain API compatibility.
+
+**Note (orchestrator mode only — see "Orchestrator Migration" -> "Recipient
+Authorization"):** this request never carries `mint_authorization`. For
+ST0x-operated orchestrator-mode mints, the liquidity bot (the AP and recipient)
+delivers the `MintAuthV1 { nonce, signature }` for this mint out-of-band, via
+the internal mint-authorization call, validated there (EIP-712/1271 signer
+check + `nonceUsed()` view) and associated with this mint before the on-chain
+mint step — not as part of this endpoint's request or validation.
 
 **Our Validation:**
 
@@ -1838,6 +2989,20 @@ in Step 2, we'll find out in Step 3.
   - "Invalid Token: Token not available on the network"
   - "Insufficient Eligibility: Client not eligible"
   - "Failed Validation: Invalid data payload"
+
+  (Orchestrator mode only: this endpoint never validates `mint_authorization`,
+  and an authorization problem is never reported here. The two cases are
+  distinct. An **invalid** authorization — a bad signature, a
+  `(token, to, amount)` mismatch, or an already-used nonce — is one that did
+  arrive, and is rejected synchronously by the internal mint-authorization call,
+  so the liquidity bot learns of it on that call and can remediate and
+  redeliver. A **missing** authorization is the absence of that call: there is
+  nothing to reject, and the mint instead proceeds normally until the on-chain
+  mint step, where it waits rather than submitting and never falls back to
+  vault-direct. A mint left waiting there surfaces through the ordinary
+  stuck-mint queries, so the operator response is to chase the liquidity bot for
+  the missing authorization, not to retry anything on this endpoint. See
+  "Orchestrator Migration" -> "Recipient Authorization" for both paths.)
 
 **Data Storage:** Store in database with status `pending_journal`
 
@@ -2124,7 +3289,7 @@ sequenceDiagram
     AP->>Blockchain: Transfer 10 AAPL0x shares to bot wallet
     Note right of Us: Bot now has BOTH<br/>shares + receipts
     Blockchain->>Us: Transfer event detected
-    Note right of Us: DetectRedemption command<br/>Event: RedemptionDetected<br/>Status: detected
+    Note right of Us: Detect command<br/>Event: RedemptionDetected<br/>Status: detected
 
     Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
@@ -2439,7 +3604,7 @@ struct BurnResult {
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Detected: DetectRedemption
+    [*] --> Detected: Detect
     Detected --> AlpacaCalled: RecordAlpacaCall
     Detected --> Failed: MarkFailed
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
@@ -2710,14 +3875,22 @@ events.
 
 - Listens to: `Initiated`, `JournalConfirmed`, `MintingStarted`, `TokensMinted`,
   `MintingFailed`, `MintCompleted`, `JournalRejected`, `ExistingMintRecovered`,
-  `MintRetryStarted`
+  `MintRetryStarted`, `MintClosed`. In orchestrator mode, also
+  `MintAuthorizationReceived` (records that authorization arrived; leaves status
+  unchanged), `OrchestratorTokensMinted`, and `OrchestratorMintRecovered` (see
+  "Orchestrator Migration"). The view is rebuilt from the event store on deploy
+  per the existing view-rebuild pattern (see "Framework Wiring"), so adding
+  these event handlers needs no separate data migration.
 - Updates: Status, timestamps, transaction details
 - Used for: Querying current mint status, operational dashboards, API responses
 
 **RedemptionView** - Maintains current state of redemptions:
 
 - Listens to: `RedemptionDetected`, `AlpacaCalled`, `AlpacaJournalCompleted`,
-  `TokensBurned`, `AlpacaCallFailed`, `BurningFailed`
+  `TokensBurned`, `AlpacaCallFailed`, `BurningFailed`. In orchestrator mode,
+  also `OrchestratorBurnSubmitted`, `OrchestratorTokensBurned`, and
+  `OrchestratorBurnRecovered` (see "Orchestrator Migration"), rebuilt from the
+  event store the same way as `MintView`.
 - Updates: Status, timestamps, transaction details
 - Used for: Tracking redemption progress, status queries
 
@@ -2731,10 +3904,19 @@ events.
   lifecycle from creation through complete depletion
 - Used for: Selecting which receipt to burn from during redemptions, inventory
   management
+- **Vault-direct only.** Once the last asset is cut over this view goes
+  historical: orchestrator mode produces no new `ReceiptInventoryEvent`s (see
+  "Orchestrator Migration" -> "Dual-Mode Operation and Cutover"), so it does not
+  gain any of the new orchestrator events. During the incremental cutover it
+  keeps serving the assets still in vault-direct mode.
 
 **InventorySnapshotView** - Periodic inventory metrics:
 
-- Listens to: `TokensMinted`, `TokensBurned`
+- Listens to: `TokensMinted`, `TokensBurned`. In orchestrator mode, also
+  `OrchestratorTokensMinted`/`OrchestratorTokensBurned`/`OrchestratorBurnRecovered`,
+  for on-chain vs off-chain parity across both modes, including cumulative
+  `dust_retained` per token (dust is retained, not returned — see "Orchestrator
+  Migration" -> "Design Decisions" -> Decision 6).
 - Updates: Calculates periodic snapshots of on-chain vs off-chain inventory
 - Used for: Grafana dashboards, monitoring, alerting
 
@@ -2989,6 +4171,50 @@ no longer land. The held receipt reservation is settled after the terminal
 event; operators must reconcile the acknowledged transaction before using this
 override.
 
+### Close Mint
+
+Closes a mint that cannot be automatically recovered (e.g., a stranded-journal
+`BadRecipientSignature`/`RecipientCallbackRejected`/`NonceConsumedByOtherMint`
+failure that needs a fresh authorization from the liquidity bot — see
+"Orchestrator Migration" -> "Failure States" / "Recipient Authorization" ->
+"Nonce"), recording an operator-supplied reason. Valid from `PendingJournal`,
+`JournalConfirmed`, `Minting`, `TxSubmitted`, or `MintingFailed` only — never
+from `CallbackPending` (an on-chain mint is already recorded there) or a
+terminal state, and never when a matching on-chain mint is found for this
+`issuer_request_id` (vault-direct) or `(to, nonce, token, amount)`
+(orchestrator). Two further rejections apply, both because an absence read at
+one instant is not proof of an absence: a mint whose history holds a persisted
+transaction with no recorded terminal on-chain outcome requires positive proof
+that transaction can no longer land (confirmed revert, or the wallet nonce
+confirmed past it), and a `NonceReplayUnresolved` mint is closable only with an
+explicit operator acknowledgement that the absence was verified against a
+trusted chain view outside this bot. See "Mint Aggregate" -> `CloseMint` and
+"Recipient Authorization" -> "Nonce".
+
+**Endpoint:** `POST /admin/close/mint/<aggregate_id>`
+
+**Request body:**
+`{ "reason": "string", "acknowledged_unresolved_mint_nonce": "0x..." }`. The
+acknowledgement is required only to close a `NonceReplayUnresolved` mint, and
+must exactly echo that mint's persisted nonce; it is rejected on any other mint.
+The terminal event, response, and structured logs record it, so the override is
+attributable.
+
+**Commands/Events:**
+
+- `CloseMint` → `MintClosed` event → `Closed` state (terminal)
+
+**Status Codes:**
+
+- `200`: Mint closed
+- `400`: `aggregate_id` is not a valid UUID
+- `409`: Already completed or closed
+- `422`: Invalid state transition (`CallbackPending`, or a matching on-chain
+  mint was found — reconcile via the admin reprocess re-drive instead, or a
+  persisted transaction is still unresolved, or the mint is classified
+  `NonceReplayUnresolved` and no matching `acknowledged_unresolved_mint_nonce`
+  was supplied)
+
 ### List Stuck Aggregates
 
 Lists all non-completed aggregates that may need manual intervention.
@@ -3026,6 +4252,8 @@ RPC_WS_URL=<ethereum_websocket_url>
 CHAIN_ID=8453  # Base
 CHAIN_NAME=base
 REDEMPTION_WALLET_ADDRESS=<address_where_aps_send_tokens_to_redeem>
+# Orchestrator-migration settings live in the TOML configuration file, not in
+# environment variables — see "TOML Configuration File" below.
 
 # Database
 DATABASE_URL=sqlite:issuance.db
@@ -3043,6 +4271,42 @@ ALPACA_STATUS_POLL_TIMEOUT=3600  # max seconds to wait for redemption completion
 LOG_LEVEL=info
 METRICS_PORT=9090
 ```
+
+### TOML Configuration File
+
+The orchestrator migration introduces a TOML configuration file, passed via a
+`--config <path>` CLI argument — the same pattern the liquidity bot uses. It is
+the home for structured, per-asset configuration that environment variables
+express poorly; today it carries only the orchestrator-migration settings
+(migrating the environment variables above into it is out of scope for the
+migration). The flag is optional: with no config file (or one containing no
+orchestrator entries) every asset is vault-direct, which is the dark-deploy
+default.
+
+```toml
+[orchestrator]
+# ST0xOrchestrator contract address. Required when any asset resolves to
+# orchestrator mode; rejected as a startup error if that is the case and it
+# is missing or malformed.
+address = "0x..."
+# Mode for assets without a per-asset override below:
+# "vault_direct" (the default when omitted) | "orchestrator".
+# The full-rollout end state sets this to "orchestrator" and drops the
+# per-asset overrides, so newly onboarded assets default to the orchestrator.
+default_vault_mode = "vault_direct"
+
+# Per-asset override, keyed by underlying symbol. During the pilot exactly one
+# asset carries this; every other asset stays on the default.
+[assets.RKLB]
+vault_mode = "orchestrator"
+```
+
+Parsing is strict (unknown keys and invalid `vault_mode` strings are startup
+errors — no silent fallback defaults), and
+`Config::vault_mode_for(&UnderlyingSymbol) -> VaultMode` resolves an asset's
+mode as: per-asset override if present, else `default_vault_mode`, else
+`VaultDirect`. See "Orchestrator Migration" -> "Dual-Mode Operation and Cutover"
+for how this drives the incremental per-asset rollout.
 
 ### Private Key Management
 
