@@ -124,6 +124,12 @@ impl std::fmt::Display for TokenSymbol {
 pub enum Network {
     Base,
     /// Ethereum L1.
+    ///
+    /// The wire value `"ethereum"` follows the Alpaca ITN issuer guide's
+    /// `network` enum
+    /// (<https://docs.alpaca.markets/docs/tokenization-guide-for-issuer>);
+    /// the staging sandbox mint/redeem validation confirms it against live
+    /// Alpaca before any production cutover.
     Ethereum,
 }
 
@@ -500,6 +506,7 @@ mod tests {
     fn network_from_str_parses_wire_values() {
         assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
         assert_eq!("ethereum".parse::<Network>().unwrap(), Network::Ethereum);
+        assert!("arbitrum".parse::<Network>().is_err());
     }
 
     #[test]
