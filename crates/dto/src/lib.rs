@@ -87,6 +87,11 @@ impl std::fmt::Display for TokenSymbol {
 pub enum Network {
     Base,
     /// Ethereum L1 ([RAI-1094](https://linear.app/makeitrain/issue/RAI-1094)).
+    ///
+    /// The wire value `"ethereum"` follows the Alpaca ITN issuer guide's
+    /// `network` enum as recorded in `docs/multichain-implementation-plan.md`
+    /// ("External gates"); the RAI-1210 staging sandbox mint/redeem confirms
+    /// it against live Alpaca before any production cutover.
     Ethereum,
 }
 
@@ -385,6 +390,7 @@ mod tests {
     fn network_from_str_parses_wire_values() {
         assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
         assert_eq!("ethereum".parse::<Network>().unwrap(), Network::Ethereum);
+        assert!("arbitrum".parse::<Network>().is_err());
     }
 
     #[test]

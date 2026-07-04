@@ -199,6 +199,12 @@ just a SQL migration/view rebuild.
 ### RAI-1210 -- Staging close-out
 
 - Alpaca sandbox E2E mint + redeem on second `network` wire.
+- **Runbook (gate):**
+  [`docs/runbooks/multichain-staging-validation.md`](runbooks/multichain-staging-validation.md)
+  -- preflight script, Base parity, chain B registration, Alpaca sandbox
+  mint/redeem, close-out checklist. Helper:
+  `scripts/multichain-staging-smoke.nu` (requires
+  [nushell](https://www.nushell.sh/)).
 - Deploy runbook executed;
   [RAI-1098](https://linear.app/makeitrain/issue/RAI-1098) and
   [RAI-1200](https://linear.app/makeitrain/issue/RAI-1200) closed with PR links.
