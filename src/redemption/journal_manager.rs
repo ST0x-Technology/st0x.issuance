@@ -195,6 +195,7 @@ impl JournalManager {
             underlying: req_underlying,
             token: req_token,
             quantity: req_quantity,
+            network: req_network,
             wallet: req_wallet,
             tx_hash: req_tx_hash,
             status,
@@ -257,6 +258,12 @@ impl JournalManager {
             "Quantity",
             alpaca_quantity,
             req_quantity,
+        )?;
+        Self::check_field_match(
+            issuer_request_id,
+            "Network",
+            &metadata.network,
+            req_network,
         )?;
         Self::check_field_match(
             issuer_request_id,
@@ -602,10 +609,11 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
-        Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
+        Redemption, RedemptionCommand, RedemptionServices, RedemptionView,
+        UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::TokenSymbol;
+    use crate::tokenized_asset::{Network, TokenSymbol};
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
@@ -635,7 +643,10 @@ mod tests {
             Arc::new(MockVaultService::new_success());
         let store = StoreBuilder::<Redemption>::new(pool.clone())
             .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-            .build(vault_service)
+            .build(RedemptionServices::with_single_vault(
+                Network::Base,
+                vault_service,
+            ))
             .await
             .expect("Failed to build redemption store");
 
@@ -654,6 +665,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -739,6 +751,7 @@ mod tests {
                 underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(Decimal::from(100)),
+                network: Network::Base,
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 tx_hash,
                 updated_at: Some(chrono::Utc::now()),
@@ -1354,6 +1367,7 @@ mod tests {
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     quantity: Quantity::new(Decimal::from(999)),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -1401,6 +1415,109 @@ mod tests {
             assert!(
                 reason.contains("Quantity mismatch"),
                 "Expected quantity mismatch error, got: {reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validation_fails_on_network_mismatch() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-validation-network");
+
+        struct NetworkMismatchMock {
+            issuer_request_id: IssuerRedemptionRequestId,
+        }
+
+        #[async_trait]
+        impl AlpacaService for NetworkMismatchMock {
+            async fn send_mint_callback(
+                &self,
+                _request: crate::alpaca::MintCallbackRequest,
+            ) -> Result<(), AlpacaError> {
+                Ok(())
+            }
+
+            async fn call_redeem_endpoint(
+                &self,
+                _request: crate::alpaca::RedeemRequest,
+            ) -> Result<crate::alpaca::RedeemResponse, AlpacaError>
+            {
+                unreachable!()
+            }
+
+            async fn poll_request_status(
+                &self,
+                _tokenization_request_id: &TokenizationRequestId,
+            ) -> Result<TokenizationRequest, AlpacaError> {
+                Ok(TokenizationRequest::Redeem {
+                    id: TokenizationRequestId::new("mock-tok"),
+                    issuer_request_id: self.issuer_request_id.clone(),
+                    status: RedeemRequestStatus::Completed,
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
+                    token: TokenSymbol::new("tAAPL"),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    network: Network::Ethereum,
+                    wallet: address!(
+                        "0x1234567890abcdef1234567890abcdef12345678"
+                    ),
+                    tx_hash: Some(b256!(
+                        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    )),
+                    updated_at: Some(chrono::Utc::now()),
+                })
+            }
+
+            async fn list_dividend_announcements(
+                &self,
+                _since: chrono::NaiveDate,
+                _until: chrono::NaiveDate,
+            ) -> Result<
+                Vec<crate::alpaca::DividendAnnouncement>,
+                AlpacaError,
+            > {
+                unreachable!("not used in journal manager tests")
+            }
+        }
+
+        let mock = Arc::new(NetworkMismatchMock {
+            issuer_request_id: issuer_request_id.clone(),
+        });
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::ValidationFailed { .. })),
+            "Expected ValidationFailed error, got {result:?}"
+        );
+
+        if let Err(JournalManagerError::ValidationFailed { reason, .. }) =
+            result
+        {
+            assert!(
+                reason.contains("Network mismatch"),
+                "Expected network mismatch error, got: {reason}"
             );
         }
     }
@@ -1772,6 +1889,7 @@ mod tests {
             tokenization_request_id,
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: quantity.clone(),
             alpaca_quantity: quantity.clone(),

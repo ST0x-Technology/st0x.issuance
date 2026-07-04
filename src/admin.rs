@@ -9,6 +9,7 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -33,7 +34,7 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
-use crate::tokenized_asset::UnderlyingSymbol;
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{BurnVerification, TxId, VaultError, VaultService};
 
 #[async_trait]
@@ -81,6 +82,33 @@ impl RedemptionBurnRecovery for BurnManager {
     }
 }
 
+/// Per-network vault services held in Rocket managed state for mint confirm,
+/// admin recovery, and stuck triage. Mirrors the map the live redemption path
+/// threads through `RedemptionServices`/`BurnManager`, so those routes query
+/// the same signing backend as the flow that submitted the transaction.
+pub(crate) struct NetworkVaultServices(HashMap<Network, Arc<dyn VaultService>>);
+
+impl NetworkVaultServices {
+    pub(crate) fn new(
+        services: HashMap<Network, Arc<dyn VaultService>>,
+    ) -> Self {
+        Self(services)
+    }
+
+    pub(crate) fn get(
+        &self,
+        network: Network,
+    ) -> Result<&Arc<dyn VaultService>, UnconfiguredNetworkError> {
+        self.0.get(&network).ok_or(UnconfiguredNetworkError { network })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no vault service configured for network {network}")]
+pub(crate) struct UnconfiguredNetworkError {
+    network: Network,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregateKind {
@@ -112,6 +140,13 @@ pub(crate) struct StuckAggregate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = String)]
     quantity: Option<Quantity>,
+    /// Network the aggregate's on-chain activity lives on. Tells operators
+    /// which chain to inspect (and which signing backend the Fireblocks
+    /// enrichment queried). `None` when neither the view variant nor the
+    /// event history records a network (the redemption `Failed` view variant
+    /// carries none, so it falls back to the history's detection event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<Network>,
     /// Primary on-chain transaction hash for this aggregate, when known.
     /// For redemptions this is the detected transfer tx hash. For mints this
     /// is the successful mint tx hash.
@@ -120,8 +155,8 @@ pub(crate) struct StuckAggregate {
     tx_hash: Option<B256>,
     /// Transaction ID associated with this aggregate's current
     /// stuck step. For mints, sourced from the most recent
-    /// `MintTxSubmitted` event. For redemptions, populated from the persisted
-    /// burn intent or a later submission/failure event.
+    /// `MintTxSubmitted` event. For redemptions, populated only on
+    /// `BurnFailed` (the view carries it for that variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     tx_id: Option<String>,
 }
@@ -151,7 +186,8 @@ struct ReprocessContext {
     /// Present means Alpaca was already called — reprocessing back to Detected
     /// would cause a duplicate call. Absent means safe to reprocess.
     alpaca_called: Option<AlpacaCalledData>,
-    /// Data from the most recent BurningFailed event, if one exists.
+    /// Data from the latest BurningFailed event, if any — carries the possibly
+    /// in-flight tx id and planned burns for verified recovery.
     burning_failed: Option<BurningFailedData>,
     /// Replacement externalTxId for a retry burn, when event
     /// history shows a prior accepted burn or an unaccepted retry attempt.
@@ -216,6 +252,7 @@ async fn load_reprocess_context(
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -227,6 +264,7 @@ async fn load_reprocess_context(
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
                         token: token.clone(),
+                        network: *network,
                         wallet: *wallet,
                         quantity: quantity.clone(),
                         detected_tx_hash: *tx_hash,
@@ -279,19 +317,11 @@ async fn load_reprocess_context(
             Status::InternalServerError
         })?;
     let burn_recovery_exhausted = events.iter().any(|event| {
-        matches!(
-            event,
-            RedemptionEvent::BurnRecoveryExhausted { .. }
-                | RedemptionEvent::BurnPreparationRecoveryExhausted { .. }
-        )
+        matches!(event, RedemptionEvent::BurnRecoveryExhausted { .. })
     }) || events
         .iter()
         .filter(|event| {
-            matches!(
-                event,
-                RedemptionEvent::BurnRecoveryAttempted { .. }
-                    | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
-            )
+            matches!(event, RedemptionEvent::BurnRecoveryAttempted { .. })
         })
         .count()
         >= usize::try_from(MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS).map_err(
@@ -335,7 +365,9 @@ async fn load_reprocess_context(
         (status = 409, description = "Redemption already completed"),
         (status = 422,
             description = "Cannot recover: Alpaca journal pending/rejected, \
-                prior burn not confirmed reverted, or invalid aggregate state"),
+                prior burn not confirmed reverted, transaction burn still \
+                pending, invalid aggregate state, or \
+                the redemption's network has no configured vault service"),
         (status = 502,
             description = "Alpaca poll or burn execution failed"),
         (status = 500, description = "Event load/deserialize or internal failure")
@@ -347,7 +379,7 @@ async fn load_reprocess_context(
     store,
     pool,
     alpaca_service,
-    vault_service,
+    vault_services,
     burn_recovery
 ))]
 #[post("/admin/recover/redemption/<issuer_request_id>")]
@@ -356,7 +388,7 @@ pub(crate) async fn recover_redemption(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -383,11 +415,23 @@ pub(crate) async fn recover_redemption(
         .await;
     };
 
+    // Burn recovery signs on the redemption's own network runtime, so the
+    // network must have a configured vault service before any recovery step
+    // runs — otherwise fail closed with a 422.
+    let vault_service =
+        vault_services.get(context.metadata.network).map_err(|error| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %error,
+                "Cannot recover redemption on an unconfigured network"
+            );
+            Status::UnprocessableEntity
+        })?;
+
     // Post-Alpaca failure: verify with Alpaca before burning.
     recover_post_alpaca(
         store,
         alpaca_service,
-        vault_service.inner(),
+        vault_service,
         burn_recovery.inner(),
         PostAlpacaRecoveryInput {
             aggregate_id,
@@ -462,7 +506,6 @@ async fn recover_post_alpaca(
         alpaca_data,
         burning_failed,
         burn_retry_external_tx_id,
-        ..
     } = input;
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
@@ -479,6 +522,10 @@ async fn recover_post_alpaca(
                 AlpacaError::ResponseIdMismatch { .. } => (
                     Status::BadGateway,
                     "Alpaca returned a mismatched tokenization request id",
+                ),
+                AlpacaError::UnsupportedTokenizationNetwork { .. } => (
+                    Status::UnprocessableEntity,
+                    "Network is not a published Alpaca TokenizationNetwork value",
                 ),
                 AlpacaError::Reqwest(_)
                 | AlpacaError::Parse { .. }
@@ -504,6 +551,7 @@ async fn recover_post_alpaca(
             underlying: req_underlying,
             token: req_token,
             quantity: req_quantity,
+            network: req_network,
             wallet: req_wallet,
             updated_at,
             ..
@@ -514,6 +562,7 @@ async fn recover_post_alpaca(
                 || req_underlying != &metadata.underlying
                 || req_token != &metadata.token
                 || req_quantity != &alpaca_data.alpaca_quantity
+                || req_network != &metadata.network
                 || req_wallet != &metadata.wallet
             {
                 error!(target: "admin", aggregate_id = %aggregate_id,
@@ -728,6 +777,9 @@ async fn inspect_prior_burn(
             Ok(PriorBurnDisposition::ResumeWith(retry_external_tx_id))
         }
         Err(VaultError::MissingBlockNumber { tx_hash }) => {
+            // A successful receipt without inclusion proof is a data-integrity
+            // failure, not an ambiguous prior-burn outcome — operators must
+            // investigate the RPC/receipt, not treat it as a 422 resume block.
             error!(target: "admin", aggregate_id = %aggregate_id,
                 %tx_hash,
                 "Completed burn transaction receipt is missing block number"
@@ -973,7 +1025,6 @@ pub(crate) async fn force_complete_redemption(
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         burn_tx_hash = ?burn_tx_hash,
-        acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
         block_number = verification.block_number,
         previous_state = %previous_state,
         "Redemption force-completed"
@@ -983,17 +1034,9 @@ pub(crate) async fn force_complete_redemption(
         aggregate_type: AggregateKind::Redemption,
         aggregate_id,
         previous_state,
-        message: acknowledged_unresolved_burn_tx_hash.map_or_else(
-            || {
-                format!(
-                    "Force-completed: burn verified on-chain at block {} ({} shares)",
-                    verification.block_number, verification.shares_burned
-                )
-            },
-            |acknowledged_hash| format!(
-                "Force-completed: burn {burn_tx_hash:#x} verified on-chain at block {} ({} shares) after acknowledging unresolved burn {acknowledged_hash:#x}",
-                verification.block_number, verification.shares_burned
-            ),
+        message: format!(
+            "Force-completed: burn verified on-chain at block {} ({} shares)",
+            verification.block_number, verification.shares_burned
         ),
     }))
 }
@@ -1074,8 +1117,6 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
             | VaultError::Reverted { .. },
         )
         | BurnManagerError::InvalidAggregateState { .. }
-        | BurnManagerError::Redemption(_)
-        | BurnManagerError::AlternateBurnSemanticsMismatch { .. }
         | BurnManagerError::Cqrs(AggregateError::UserError(_)) => {
             Status::UnprocessableEntity
         }
@@ -1102,12 +1143,12 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, vault_service, pool))]
+#[tracing::instrument(skip(_auth, store, vault_services, pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<Mint>>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     pool: &rocket::State<Pool<Sqlite>>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -1117,7 +1158,7 @@ pub(crate) async fn reprocess_mint(
         .map_err(|_| Status::BadRequest)?;
 
     // Check current state via view
-    let current_state = match find_by_issuer_request_id(
+    let (current_state, network) = match find_by_issuer_request_id(
         pool.inner(),
         &issuer_request_id,
     )
@@ -1138,7 +1179,14 @@ pub(crate) async fn reprocess_mint(
                 MintView::CallbackPending { .. } => "CallbackPending",
                 MintView::MintingFailed { .. } => "MintingFailed",
             };
-            state.to_string()
+            let (_, _, network) = mint_view_asset(&view);
+            let Some(network) = network else {
+                error!(target: "admin", aggregate_id = aggregate_id,
+                    "Mint view has no network — cannot select a vault service"
+                );
+                return Err(Status::InternalServerError);
+            };
+            (state.to_string(), network)
         }
         Ok(None) => return Err(Status::NotFound),
         Err(err) => {
@@ -1147,9 +1195,17 @@ pub(crate) async fn reprocess_mint(
         }
     };
 
+    let vault_service = vault_services.get(network).map_err(|error| {
+        error!(target: "admin", aggregate_id = aggregate_id,
+            error = %error,
+            "Cannot reprocess mint on an unconfigured network"
+        );
+        Status::UnprocessableEntity
+    })?;
+
     let outcome = recover_mint_manually(
         store.inner().as_ref(),
-        vault_service.inner(),
+        vault_service,
         issuer_request_id,
     )
     .await;
@@ -1259,12 +1315,12 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, _vault_service))]
+#[tracing::instrument(skip(_auth, pool, _vault_services))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-    _vault_service: &rocket::State<Arc<dyn VaultService>>,
+    _vault_services: &rocket::State<NetworkVaultServices>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
     let mut stuck = Vec::new();
@@ -1309,7 +1365,7 @@ pub(crate) async fn list_stuck(
             continue;
         }
 
-        let (underlying, quantity) = mint_view_asset(&view);
+        let (underlying, quantity, network) = mint_view_asset(&view);
         let mint_history =
             mint_history_summary(pool.inner(), &issuer_mint_request_id).await;
 
@@ -1322,6 +1378,7 @@ pub(crate) async fn list_stuck(
             timestamp: summary.timestamp,
             underlying,
             quantity,
+            network,
             tx_hash: mint_history.tx_hash,
             tx_id: mint_history.tx_id.map(|tx_id| tx_id.to_string()),
         });
@@ -1397,12 +1454,14 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        network,
         tx_hash,
         tx_id,
     ) = match view {
         RedemptionView::Detected {
             underlying,
             quantity,
+            network,
             tx_hash,
             detected_entered_at,
             ..
@@ -1413,6 +1472,7 @@ fn stuck_redemption_entry(
             detected_entered_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             history.tx_id,
         ),
@@ -1420,6 +1480,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             called_at,
             ..
@@ -1430,6 +1491,7 @@ fn stuck_redemption_entry(
             called_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             history.tx_id,
         ),
@@ -1437,6 +1499,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             burning_entered_at,
             ..
@@ -1457,6 +1520,7 @@ fn stuck_redemption_entry(
                 burning_entered_at,
                 Some(underlying),
                 Some(quantity),
+                Some(network),
                 Some(tx_hash),
                 history.tx_id,
             )
@@ -1468,6 +1532,7 @@ fn stuck_redemption_entry(
             failed_at,
             history.underlying,
             history.quantity,
+            history.network,
             history.tx_hash,
             history.tx_id,
         ),
@@ -1475,6 +1540,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             error,
             failed_at,
@@ -1487,6 +1553,7 @@ fn stuck_redemption_entry(
             failed_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             tx_id.or(history.tx_id),
         ),
@@ -1506,6 +1573,7 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        network,
         tx_hash,
         tx_id: tx_id.map(|tx_id| tx_id.to_string()),
     })
@@ -1516,6 +1584,7 @@ struct RedemptionHistorySummary {
     tokenization_request_id: Option<TokenizationRequestId>,
     underlying: Option<UnderlyingSymbol>,
     quantity: Option<Quantity>,
+    network: Option<Network>,
     tx_hash: Option<B256>,
     tx_id: Option<TxId>,
 }
@@ -1585,26 +1654,34 @@ fn redemption_history_summary_from_events(
     for event in events {
         match event {
             RedemptionEvent::Detected {
-                underlying, quantity, tx_hash, ..
+                underlying,
+                quantity,
+                network,
+                tx_hash,
+                ..
             } => {
                 summary.underlying = Some(underlying);
                 summary.quantity = Some(quantity);
+                summary.network = Some(network);
                 summary.tx_hash = Some(tx_hash);
             }
             RedemptionEvent::Reprocessed {
                 underlying,
                 quantity,
+                network,
                 tx_hash,
                 ..
             }
             | RedemptionEvent::BurnResumed {
                 underlying,
                 quantity,
+                network,
                 tx_hash,
                 ..
             } => {
                 summary.underlying = Some(underlying);
                 summary.quantity = Some(quantity);
+                summary.network = Some(network);
                 summary.tx_hash = Some(tx_hash);
                 // Reprocess/Resume starts a fresh attempt — any prior
                 // tx submission belongs to the previous attempt
@@ -1622,11 +1699,6 @@ fn redemption_history_summary_from_events(
             | RedemptionEvent::ExistingBurnRecovered { tx_id, .. }
             | RedemptionEvent::BurningFailed { tx_id: Some(tx_id), .. } => {
                 summary.tx_id = Some(tx_id);
-            }
-            RedemptionEvent::BurnIntended { sendable_tx, .. }
-                if !sendable_tx.tx.is_empty() =>
-            {
-                summary.tx_id = Some(TxId::Hash(sendable_tx.hash));
             }
             _ => {}
         }
@@ -1746,21 +1818,23 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
 
 fn mint_view_asset(
     view: &MintView,
-) -> (Option<UnderlyingSymbol>, Option<Quantity>) {
+) -> (Option<UnderlyingSymbol>, Option<Quantity>, Option<Network>) {
     match view {
-        MintView::Initiated { underlying, quantity, .. }
-        | MintView::JournalConfirmed { underlying, quantity, .. }
-        | MintView::JournalRejected { underlying, quantity, .. }
-        | MintView::Minting { underlying, quantity, .. }
-        | MintView::MintIntended { underlying, quantity, .. }
-        | MintView::MintTxSubmitted { underlying, quantity, .. }
-        | MintView::MintingFailed { underlying, quantity, .. }
-        | MintView::CallbackPending { underlying, quantity, .. } => {
-            (Some(underlying.clone()), Some(quantity.clone()))
+        MintView::Initiated { underlying, quantity, network, .. }
+        | MintView::JournalConfirmed {
+            underlying, quantity, network, ..
+        }
+        | MintView::JournalRejected { underlying, quantity, network, .. }
+        | MintView::Minting { underlying, quantity, network, .. }
+        | MintView::MintIntended { underlying, quantity, network, .. }
+        | MintView::MintTxSubmitted { underlying, quantity, network, .. }
+        | MintView::MintingFailed { underlying, quantity, network, .. }
+        | MintView::CallbackPending { underlying, quantity, network, .. } => {
+            (Some(underlying.clone()), Some(quantity.clone()), Some(*network))
         }
         MintView::NotFound
         | MintView::Completed { .. }
-        | MintView::Closed { .. } => (None, None),
+        | MintView::Closed { .. } => (None, None, None),
     }
 }
 
@@ -1857,15 +1931,15 @@ mod tests {
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::Utc;
-    use event_sorcery::{Store, StoreBuilder, test_store};
+    use event_sorcery::{Store, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
-    use url::Url;
 
     use super::{
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
@@ -1878,31 +1952,25 @@ mod tests {
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
-        service::AlpacaConfig,
     };
-    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-    use crate::config::{Config, Environment, LogLevel};
     use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::receipt_inventory::ReceiptVaultKey;
     use crate::receipt_inventory::{
-        CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptService, ReceiptSource,
-        ReceiptVaultKey, Shares,
+        ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
+        Shares,
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
         BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId, Redemption,
-        RedemptionCommand, RedemptionEvent, RedemptionMetadata, RedemptionView,
+        RedemptionCommand, RedemptionEvent, RedemptionMetadata,
+        RedemptionServices, RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{
-        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
-        UnderlyingSymbol,
-    };
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MultiBurnEntry, SendableTxWithHash, TxId, VaultService, VerifiedBurn,
+        MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
     };
-    use crate::wallet::SignerConfig;
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -1936,6 +2004,13 @@ mod tests {
                 Bloom::default(),
             )),
         }
+    }
+
+    fn mock_network_vault_services() -> super::NetworkVaultServices {
+        super::NetworkVaultServices::new(HashMap::from([(
+            Network::Base,
+            mock_vault_service(),
+        )]))
     }
 
     /// Configurable poll response for the test mock.
@@ -2103,6 +2178,7 @@ mod tests {
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
             quantity: alpaca_data.alpaca_quantity.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             tx_hash: None,
             updated_at: Some(Utc::now()),
@@ -2164,6 +2240,7 @@ mod tests {
             issuer_request_id: IssuerRedemptionRequestId::random(),
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: Quantity::new(Decimal::from(100)),
             detected_tx_hash: b256!(
@@ -2203,6 +2280,7 @@ mod tests {
                 timestamp: Utc::now(),
                 underlying: None,
                 quantity: None,
+                network: None,
                 tx_hash: None,
                 tx_id: Some(expected.clone()),
             };
@@ -2228,6 +2306,7 @@ mod tests {
             tokenization_request_id: Some(tokenization_request_id.clone()),
             underlying: Some(metadata.underlying.clone()),
             quantity: Some(metadata.quantity.clone()),
+            network: Some(metadata.network),
             tx_hash: Some(metadata.detected_tx_hash),
             tx_id: Some(tx_id.clone()),
         };
@@ -2247,6 +2326,7 @@ mod tests {
         );
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
+        assert_eq!(entry.network, Some(metadata.network));
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
         assert_eq!(entry.tx_id, Some(tx_id.to_string()));
         assert_eq!(entry.timestamp, failed_at);
@@ -2263,6 +2343,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -2293,6 +2374,7 @@ mod tests {
         assert_eq!(entry.tx_id, Some(tx_id.to_string()));
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
+        assert_eq!(entry.network, Some(metadata.network));
     }
 
     async fn setup_pool() -> sqlx::Pool<sqlx::Sqlite> {
@@ -2324,7 +2406,10 @@ mod tests {
         pool: &sqlx::Pool<sqlx::Sqlite>,
         vault_service: Arc<dyn VaultService>,
     ) -> Arc<Store<Redemption>> {
-        Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
+        Arc::new(test_store::<Redemption>(
+            pool.clone(),
+            RedemptionServices::with_single_vault(Network::Base, vault_service),
+        ))
     }
 
     /// Sets up an in-memory redemption store with a redemption in Failed
@@ -2349,6 +2434,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network,
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2391,12 +2477,116 @@ mod tests {
     async fn test_load_reprocess_context_derives_retry_id_from_history() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
+
+        let metadata = test_metadata();
+        let alpaca_data = test_alpaca_data();
         let tx_id = TxId::random();
 
         // Drive the redemption through a real burn submission that then fails,
         // so event history carries a BurnTxSubmitted event the
         // derivation must scan — rather than injecting the retry id directly.
-        let (metadata, _) = setup_burn_failure(&store, tx_id.clone()).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: metadata.network,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ConfirmAlpacaComplete {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ConfirmAlpacaComplete failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(99),
+                        burn_shares: U256::from(100),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id: Some(BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    )),
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(99),
+                        burn_shares: U256::from(100),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id: Some(BurnExternalTxId::base(
+                        &metadata.detected_tx_hash,
+                    )),
+                },
+            )
+            .await
+            .expect("BurnTokens failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    error: "burn terminally failed".to_string(),
+                    tx_id: Some(tx_id.clone()),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
 
         let context =
             load_reprocess_context(&pool, &metadata.issuer_request_id)
@@ -2809,7 +2999,7 @@ mod tests {
             .manage(store.clone())
             .manage(pool.clone())
             .manage(alpaca)
-            .manage(mock_vault_service())
+            .manage(mock_network_vault_services())
             .manage(mock_burn_recovery())
             .mount("/", rocket::routes![super::recover_redemption]);
 
@@ -2830,6 +3020,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network,
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2867,6 +3058,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network,
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -3104,7 +3296,10 @@ mod tests {
             .manage(store)
             .manage(pool)
             .manage(alpaca)
-            .manage(vault_service)
+            .manage(super::NetworkVaultServices::new(HashMap::from([(
+                Network::Base,
+                vault_service,
+            )])))
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::recover_redemption])
     }
@@ -3549,7 +3744,7 @@ mod tests {
         let (metadata, alpaca_data) =
             setup_burn_failure(&store, tx_id.clone()).await;
         let aggregate_id = metadata.issuer_request_id.to_string();
-        let (receipt_inventory_store, vault) =
+        let (_receipt_inventory_store, _vault) =
             seed_receipt_reservation(&pool, &metadata.issuer_request_id).await;
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -3562,11 +3757,7 @@ mod tests {
             Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
                 checked_burn_receipt(tx_hash, Some(12_345), false),
             ));
-        let burn_recovery = Arc::new(ReservationTrackingBurnRecovery {
-            calls: AtomicUsize::new(0),
-            receipt_inventory_store: receipt_inventory_store.clone(),
-            vault,
-        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
         let rocket = post_alpaca_rocket(
@@ -3596,15 +3787,6 @@ mod tests {
                 1,
             ))
         );
-        let receipt_inventory = receipt_inventory_store
-            .load(&ReceiptVaultKey::new(
-                crate::test_utils::ANVIL_CHAIN_ID,
-                vault,
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(receipt_inventory.reserved_redemptions().is_empty());
         let resumed_events: i64 = sqlx::query_scalar(
             "
             SELECT COUNT(*)
@@ -3804,6 +3986,97 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn test_endpoint_post_alpaca_recovery_unconfigured_network_returns_422()
+     {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let mut metadata = test_metadata();
+        metadata.network = Network::Ethereum;
+        let alpaca_data = test_alpaca_data();
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::Detect {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    underlying: metadata.underlying.clone(),
+                    token: metadata.token.clone(),
+                    network: metadata.network,
+                    wallet: metadata.wallet,
+                    quantity: metadata.quantity.clone(),
+                    tx_hash: metadata.detected_tx_hash,
+                    block_number: metadata.block_number,
+                },
+            )
+            .await
+            .expect("Detect failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordAlpacaCall {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tokenization_request_id: alpaca_data
+                        .tokenization_request_id
+                        .clone(),
+                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
+                    dust_quantity: alpaca_data.dust_quantity.clone(),
+                },
+            )
+            .await
+            .expect("RecordAlpacaCall failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::MarkFailed {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    reason: "Journal timed out".to_string(),
+                },
+            )
+            .await
+            .expect("MarkFailed failed");
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(
+            burn_recovery.calls(),
+            0,
+            "Burn recovery must not run for an unconfigured network"
+        );
+        assert!(
+            logs_contain_at!(
+                Level::ERROR,
+                &["Cannot recover redemption on an unconfigured network"]
+            ),
+            "Expected error log for unconfigured network"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_response_id_mismatch_returns_502()
      {
         let pool = setup_pool().await;
@@ -3866,6 +4139,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network,
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -3903,47 +4177,18 @@ mod tests {
         metadata
     }
 
-    async fn setup_burn_intended(
-        store: &Store<Redemption>,
-        persisted_tx: &SendableTxWithHash,
-        vault: Address,
-    ) -> RedemptionMetadata {
-        setup_burn_intended_with_dust(store, persisted_tx, vault, U256::ZERO)
-            .await
-    }
+    fn force_complete_rocket(
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
+    ) -> rocket::Rocket<rocket::Build> {
+        use crate::alpaca::service::AlpacaConfig;
+        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
+        use crate::config::{Config, Environment, LogLevel};
+        use crate::wallet::SignerConfig;
+        use alloy::primitives::B256;
+        use url::Url;
 
-    async fn setup_burn_intended_with_dust(
-        store: &Store<Redemption>,
-        persisted_tx: &SendableTxWithHash,
-        vault: Address,
-        dust_shares: U256,
-    ) -> RedemptionMetadata {
-        let metadata = setup_burning(store).await;
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::IntendBurn {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(42),
-                        burn_shares: U256::from(17),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares,
-                    owner: persisted_tx.signer_for_test(),
-                    external_tx_id: None,
-                },
-            )
-            .await
-            .expect("IntendBurn failed");
-
-        metadata
-    }
-
-    fn admin_test_config() -> Config {
-        Config {
+        let config = Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
@@ -3958,254 +4203,14 @@ mod tests {
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             chains: Vec::new(),
-        }
-    }
+        };
 
-    fn close_redemption_rocket(
-        store: Arc<Store<Redemption>>,
-        pool: sqlx::Pool<sqlx::Sqlite>,
-    ) -> rocket::Rocket<rocket::Build> {
         rocket::build()
-            .manage(admin_test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(store)
-            .manage(pool)
-            .mount("/", rocket::routes![super::close_redemption])
-    }
-
-    async fn dispatch_close_redemption(
-        rocket: rocket::Rocket<rocket::Build>,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        body: &str,
-    ) -> (Status, String) {
-        let client =
-            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
-        let response = client
-            .post(format!("/admin/close/redemption/{issuer_request_id}"))
-            .header(rocket::http::ContentType::JSON)
-            .header(rocket::http::Header::new(
-                "X-API-KEY",
-                "test-key-12345678901234567890123456",
-            ))
-            .remote("127.0.0.1:8000".parse().unwrap())
-            .body(body)
-            .dispatch()
-            .await;
-
-        let status = response.status();
-        let body = response.into_string().await.unwrap();
-        (status, body)
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn close_endpoint_rejects_unacknowledged_persisted_burn() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let vault_service: Arc<dyn VaultService> = Arc::new(
-            MockVaultService::new_success()
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let store = setup_store_with_vault(&pool, vault_service);
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-
-        let rocket = close_redemption_rocket(store.clone(), pool);
-        let (status, _) = dispatch_close_redemption(
-            rocket,
-            &metadata.issuer_request_id,
-            r#"{"reason":"operator reconciled externally"}"#,
-        )
-        .await;
-
-        assert_eq!(status, Status::UnprocessableEntity);
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::BurnIntended { .. })
-        ));
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &[
-                "Failed to close redemption",
-                "requires explicit operator acknowledgement",
-                &persisted_hash,
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn close_endpoint_records_and_reports_burn_acknowledgement() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let vault_service: Arc<dyn VaultService> = Arc::new(
-            MockVaultService::new_success()
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let store = setup_store_with_vault(&pool, vault_service);
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-        receipt_store
-            .send(
-                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: ReceiptId::from(U256::from(42)),
-                    balance: Shares::new(U256::from(17)),
-                    block_number: 1,
-                    tx_hash: B256::random(),
-                    source: ReceiptSource::External,
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                },
-            )
-            .await
-            .expect("receipt discovery should succeed");
-        let receipt_service = CqrsReceiptService::new(receipt_store);
-        receipt_service
-            .reserve_burn(
-                crate::test_utils::ANVIL_CHAIN_ID,
-                vault,
-                metadata.issuer_request_id.clone(),
-                vec![BurnRecord {
-                    receipt_id: U256::from(42),
-                    shares_burned: U256::from(17),
-                }],
-            )
-            .await
-            .expect("reservation should seed");
-
-        let rocket = close_redemption_rocket(store.clone(), pool);
-        let body = format!(
-            r#"{{"reason":"operator reconciled externally","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
-            persisted_tx.hash
-        );
-        let (status, response_body) = dispatch_close_redemption(
-            rocket,
-            &metadata.issuer_request_id,
-            &body,
-        )
-        .await;
-
-        assert_eq!(status, Status::Ok);
-        assert!(
-            response_body.contains(&format!("{:#x}", persisted_tx.hash)),
-            "body: {response_body}"
-        );
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::Closed { .. })
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![metadata.issuer_request_id.clone()],
-            "acknowledged close must retain the unresolved reservation"
-        );
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        assert!(logs_contain_at!(
-            Level::INFO,
-            &[
-                "Redemption closed",
-                "acknowledged_unresolved_burn_tx_hash",
-                &persisted_hash,
-            ]
-        ));
-    }
-
-    fn force_complete_rocket(
-        pool: sqlx::Pool<sqlx::Sqlite>,
-        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
-    ) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
-            .manage(admin_test_config())
+            .manage(config)
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool)
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::force_complete_redemption])
-    }
-
-    async fn real_burn_recovery(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
-        store: Arc<Store<Redemption>>,
-        vault_service: Arc<dyn VaultService>,
-        vault: Address,
-        owner: Address,
-        issuer_request_id: &IssuerRedemptionRequestId,
-    ) -> (Arc<dyn super::RedemptionBurnRecovery>, Arc<CqrsReceiptService>) {
-        let (asset_store, _asset_projection) =
-            StoreBuilder::<TokenizedAsset>::new(pool.clone())
-                .build(())
-                .await
-                .expect("tokenized asset store should build");
-        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
-        let key = AssetKey::new(underlying.clone(), Network::Base);
-        asset_store
-            .send(
-                &key,
-                TokenizedAssetCommand::Add {
-                    underlying: underlying.clone(),
-                    token: TokenSymbol::new("tAAPL"),
-                    network: Network::Base,
-                    vault,
-                },
-            )
-            .await
-            .expect("tokenized asset should seed");
-
-        let receipt_store =
-            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
-        receipt_store
-            .send(
-                &ReceiptVaultKey::new(crate::test_utils::ANVIL_CHAIN_ID, vault),
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: ReceiptId::from(U256::from(42)),
-                    balance: Shares::new(U256::from(17)),
-                    block_number: 1,
-                    tx_hash: B256::random(),
-                    source: ReceiptSource::External,
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                },
-            )
-            .await
-            .expect("receipt should seed");
-        let receipt_service = Arc::new(CqrsReceiptService::new(receipt_store));
-        receipt_service
-            .reserve_burn(
-                crate::test_utils::ANVIL_CHAIN_ID,
-                vault,
-                issuer_request_id.clone(),
-                vec![BurnRecord {
-                    receipt_id: U256::from(42),
-                    shares_burned: U256::from(17),
-                }],
-            )
-            .await
-            .expect("reservation should seed");
-        let burn_recovery: Arc<dyn super::RedemptionBurnRecovery> =
-            Arc::new(super::BurnManager::new(
-                vault_service,
-                pool.clone(),
-                store,
-                receipt_service.clone(),
-                owner,
-                crate::test_utils::ANVIL_CHAIN_ID,
-            ));
-
-        (burn_recovery, receipt_service)
     }
 
     async fn dispatch_force_complete(
@@ -4235,91 +4240,6 @@ mod tests {
         (status, body)
     }
 
-    fn stuck_rocket(
-        pool: sqlx::Pool<sqlx::Sqlite>,
-        vault_service: Arc<dyn VaultService>,
-    ) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
-            .manage(admin_test_config())
-            .manage(FailedAuthRateLimiter::new().unwrap())
-            .manage(pool)
-            .manage(vault_service)
-            .mount("/", rocket::routes![super::list_stuck])
-    }
-
-    #[tokio::test]
-    async fn stuck_endpoint_exposes_persisted_burn_intent_hash() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let vault_service = Arc::new(
-            MockVaultService::new_success()
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let alpaca = test_alpaca_data();
-        let old_timestamp = Utc::now() - chrono::Duration::hours(2);
-        let view = RedemptionView::Burning {
-            issuer_request_id: metadata.issuer_request_id.clone(),
-            tokenization_request_id: alpaca.tokenization_request_id,
-            underlying: metadata.underlying,
-            token: metadata.token,
-            wallet: metadata.wallet,
-            quantity: metadata.quantity,
-            alpaca_quantity: alpaca.alpaca_quantity,
-            dust_quantity: alpaca.dust_quantity,
-            tx_hash: metadata.detected_tx_hash,
-            block_number: metadata.block_number,
-            detected_at: metadata.detected_at,
-            called_at: old_timestamp,
-            alpaca_journal_completed_at: old_timestamp,
-            burning_entered_at: old_timestamp,
-        };
-        let payload = serde_json::to_string(&view).unwrap();
-        sqlx::query(
-            "
-            INSERT INTO redemption_view (
-                view_id,
-                version,
-                payload
-            )
-            VALUES (?, 4, ?)
-            ",
-        )
-        .bind(metadata.issuer_request_id.to_string())
-        .bind(payload)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let client = rocket::local::asynchronous::Client::tracked(
-            stuck_rocket(pool, vault_service),
-        )
-        .await
-        .unwrap();
-        let response = client
-            .get("/admin/stuck")
-            .header(rocket::http::Header::new(
-                "X-API-KEY",
-                "test-key-12345678901234567890123456",
-            ))
-            .remote("127.0.0.1:8000".parse().unwrap())
-            .dispatch()
-            .await;
-
-        assert_eq!(response.status(), Status::Ok);
-        let body = response.into_string().await.unwrap();
-        assert!(
-            body.contains(&format!("{:#x}", persisted_tx.hash)),
-            "body: {body}"
-        );
-    }
-
     #[traced_test]
     #[tokio::test]
     async fn test_endpoint_force_complete_records_verified_burn() {
@@ -4330,25 +4250,55 @@ mod tests {
             vault,
             Bytes::from_static(&[0xde, 0xad]),
         );
-        let vault_mock = Arc::new(
+        let vault_service: Arc<dyn VaultService> = Arc::new(
             MockVaultService::new_success()
-                .with_verified_burn(45_989_009, U256::from(17))
                 .with_prepared_tx(persisted_tx.clone()),
         );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
+        let store = setup_store_with_vault(&pool, vault_service);
+        let metadata = setup_burning(&store).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(42),
+                        burn_shares: U256::from(17),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: persisted_tx.signer_for_test(),
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
 
-        let rocket = force_complete_rocket(pool, burn_recovery);
+        // In production `force_complete_burn` appends `BurnForceCompleted` before
+        // the endpoint reads the prior state; the mock can't, so append it here
+        // to reproduce the real on-disk shape (terminal event = `BurnForceCompleted`,
+        // so `redemption_state_before_last_event` resolves to `Burning`).
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::ForceCompleteBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    burn_tx_hash: persisted_tx.hash,
+                    block_number: 45_989_009,
+                    reason: "burn confirmed on-chain".to_string(),
+                    acknowledged_unresolved_burn_tx_hash: None,
+                },
+            )
+            .await
+            .expect("ForceCompleteBurn failed");
+
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+
+        let rocket = force_complete_rocket(pool, burn_recovery_state);
         let body = format!(
             r#"{{"burn_tx_hash":"{:#x}","reason":"burn confirmed on-chain"}}"#,
             persisted_tx.hash
@@ -4363,412 +4313,8 @@ mod tests {
         assert!(body.contains("Force-completed"), "body: {body}");
         assert!(body.contains("45989009"), "body: {body}");
         assert!(body.contains("BurnIntended"), "body: {body}");
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::Completed { .. })
-        ));
-        assert!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(vault_mock.verify_burn_call_count(), 1);
+        assert_eq!(burn_recovery.force_calls(), 1);
         assert!(logs_contain_at!(Level::INFO, &["Redemption force-completed"]));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_endpoint_passes_and_reports_burn_acknowledgement() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let proving_burn_tx_hash = B256::random();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: persisted_tx.signer_for_test(),
-                        receiver: test_metadata().wallet,
-                        receipt_id: U256::from(42),
-                        shares_burned: U256::from(17),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
-        let rocket = force_complete_rocket(pool, burn_recovery);
-        let body = format!(
-            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn reconciled","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
-            persisted_tx.hash
-        );
-
-        let (status, response_body) =
-            dispatch_force_complete(rocket, &metadata.issuer_request_id, &body)
-                .await;
-
-        assert_eq!(status, Status::Ok);
-        assert!(
-            response_body.contains(&format!("{proving_burn_tx_hash:#x}")),
-            "body: {response_body}"
-        );
-        assert!(
-            response_body.contains(&format!("{:#x}", persisted_tx.hash)),
-            "body: {response_body}"
-        );
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::Completed { burn_tx_hash, .. })
-                if burn_tx_hash == proving_burn_tx_hash
-        ));
-        assert!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(vault_mock.verify_burn_call_count(), 1);
-        let proving_hash = format!("{proving_burn_tx_hash:?}");
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        assert!(logs_contain_at!(
-            Level::INFO,
-            &[
-                "Redemption force-completed",
-                "acknowledged_unresolved_burn_tx_hash",
-                &proving_hash,
-                &persisted_hash,
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_endpoint_rejects_alternate_burn_missing_dust() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let dust_shares = U256::from(3);
-        let mut persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        persisted_tx.dust_shares = dust_shares;
-        let proving_burn_tx_hash = B256::random();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: persisted_tx.signer_for_test(),
-                        receiver: test_metadata().wallet,
-                        receipt_id: U256::from(42),
-                        shares_burned: U256::from(17),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended_with_dust(
-            &store,
-            &persisted_tx,
-            vault,
-            dust_shares,
-        )
-        .await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
-        let body = format!(
-            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn omitted dust","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
-            persisted_tx.hash
-        );
-
-        let (status, _) = dispatch_force_complete(
-            force_complete_rocket(pool, burn_recovery),
-            &metadata.issuer_request_id,
-            &body,
-        )
-        .await;
-
-        assert_eq!(status, Status::UnprocessableEntity);
-        assert_eq!(vault_mock.verify_burn_call_count(), 1);
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::BurnIntended { .. })
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![metadata.issuer_request_id]
-        );
-        let proving_hash = format!("{proving_burn_tx_hash:?}");
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &[
-                "Failed to force-complete redemption",
-                "Alternate proving transaction does not match",
-                "expected nonce 7",
-                "dust 3",
-                &proving_hash,
-                &persisted_hash,
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_endpoint_rejects_mismatched_aggregate_burn_total() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let proving_burn_tx_hash = B256::random();
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns_and_total(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    U256::from(18),
-                    vec![VerifiedBurn {
-                        sender: persisted_tx.signer_for_test(),
-                        receiver: test_metadata().wallet,
-                        receipt_id: U256::from(42),
-                        shares_burned: U256::from(17),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
-        let body = format!(
-            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn has mismatched total","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
-            persisted_tx.hash
-        );
-
-        let (status, _) = dispatch_force_complete(
-            force_complete_rocket(pool, burn_recovery),
-            &metadata.issuer_request_id,
-            &body,
-        )
-        .await;
-
-        assert_eq!(status, Status::UnprocessableEntity);
-        assert_eq!(vault_mock.verify_burn_call_count(), 1);
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::BurnIntended { .. })
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![metadata.issuer_request_id]
-        );
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &[
-                "Failed to force-complete redemption",
-                "expected nonce 7",
-                "total shares 17",
-                "verified nonce 7",
-                "total shares 18",
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_endpoint_rejects_wrong_burn_acknowledgement() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: persisted_tx.signer_for_test(),
-                        receiver: test_metadata().wallet,
-                        receipt_id: U256::from(42),
-                        shares_burned: U256::from(17),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
-        let proving_hash = B256::random();
-        let wrong_acknowledgement = B256::random();
-        let body = format!(
-            r#"{{"burn_tx_hash":"{proving_hash:#x}","reason":"wrong acknowledgement","acknowledged_unresolved_burn_tx_hash":"{wrong_acknowledgement:#x}"}}"#
-        );
-
-        let (status, _) = dispatch_force_complete(
-            force_complete_rocket(pool, burn_recovery),
-            &metadata.issuer_request_id,
-            &body,
-        )
-        .await;
-
-        assert_eq!(status, Status::UnprocessableEntity);
-        assert_eq!(vault_mock.verify_burn_call_count(), 0);
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::BurnIntended { .. })
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![metadata.issuer_request_id]
-        );
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        let wrong_hash = format!("{wrong_acknowledgement:?}");
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &[
-                "Failed to force-complete redemption",
-                &persisted_hash,
-                &wrong_hash,
-            ]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn force_complete_endpoint_rejects_redundant_burn_acknowledgement() {
-        let pool = setup_pool().await;
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let persisted_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let vault_mock = Arc::new(
-            MockVaultService::new_success()
-                .with_verified_burns(
-                    45_989_009,
-                    persisted_tx.nonce,
-                    vec![VerifiedBurn {
-                        sender: persisted_tx.signer_for_test(),
-                        receiver: test_metadata().wallet,
-                        receipt_id: U256::from(42),
-                        shares_burned: U256::from(17),
-                    }],
-                    vec![],
-                )
-                .with_prepared_tx(persisted_tx.clone()),
-        );
-        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
-        let store = setup_store_with_vault(&pool, vault_service.clone());
-        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
-        let (burn_recovery, receipt_service) = real_burn_recovery(
-            &pool,
-            store.clone(),
-            vault_service,
-            vault,
-            persisted_tx.signer_for_test(),
-            &metadata.issuer_request_id,
-        )
-        .await;
-        let body = format!(
-            r#"{{"burn_tx_hash":"{0:#x}","reason":"persisted burn verified","acknowledged_unresolved_burn_tx_hash":"{0:#x}"}}"#,
-            persisted_tx.hash
-        );
-
-        let (status, _) = dispatch_force_complete(
-            force_complete_rocket(pool, burn_recovery),
-            &metadata.issuer_request_id,
-            &body,
-        )
-        .await;
-
-        assert_eq!(status, Status::UnprocessableEntity);
-        assert_eq!(vault_mock.verify_burn_call_count(), 0);
-        assert!(matches!(
-            store.load(&metadata.issuer_request_id).await.unwrap(),
-            Some(Redemption::BurnIntended { .. })
-        ));
-        assert_eq!(
-            receipt_service
-                .reserved_redemptions(crate::test_utils::ANVIL_CHAIN_ID, vault)
-                .await
-                .unwrap(),
-            vec![metadata.issuer_request_id]
-        );
-        let persisted_hash = format!("{:?}", persisted_tx.hash);
-        assert!(logs_contain_at!(
-            Level::ERROR,
-            &[
-                "Failed to force-complete redemption",
-                "redundant because the proving burn is the persisted signed burn",
-                &persisted_hash,
-            ]
-        ));
     }
 
     #[traced_test]
@@ -4825,15 +4371,6 @@ mod tests {
                     current_state: "Completed".to_string()
                 }
             ),
-            Status::UnprocessableEntity
-        );
-        assert_eq!(
-            map_burn_manager_error(&super::BurnManagerError::Redemption(
-                crate::redemption::RedemptionError::UnresolvedBurnAcknowledgementMismatch {
-                    expected: tx,
-                    provided: B256::random(),
-                },
-            )),
             Status::UnprocessableEntity
         );
         // A hash that resolves to no receipt (or one that doesn't prove a burn)
@@ -4919,6 +4456,7 @@ mod tests {
             issuer_request_id: issuer.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             tx_hash,
@@ -4937,6 +4475,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             alpaca_quantity: quantity.clone(),
@@ -4960,6 +4499,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             alpaca_quantity: quantity.clone(),
             quantity: quantity.clone(),
@@ -4995,6 +4535,7 @@ mod tests {
             tokenization_request_id: tok_id,
             underlying,
             token,
+            network: Network::Base,
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             alpaca_quantity: quantity,
@@ -5047,6 +4588,7 @@ mod tests {
             issuer_request_id: metadata.issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             tx_hash: metadata.detected_tx_hash,
@@ -5078,6 +4620,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -5108,6 +4651,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -5141,6 +4685,7 @@ mod tests {
             tokenization_request_id: tok_id,
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -5382,6 +4927,7 @@ mod tests {
                 issuer_request_id: issuer.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -5426,6 +4972,7 @@ mod tests {
                 issuer_request_id: issuer,
                 underlying,
                 token,
+                network: Network::Base,
                 wallet,
                 quantity,
                 tx_hash,
@@ -5452,24 +4999,5 @@ mod tests {
         );
         // tokenization_request_id is preserved (it doesn't reset).
         assert_eq!(summary.tokenization_request_id, Some(tok_id));
-    }
-
-    #[test]
-    fn redemption_history_summary_exposes_persisted_burn_intent_hash() {
-        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        let sendable_tx = SendableTxWithHash::valid_for_test(
-            7,
-            vault,
-            Bytes::from_static(&[0xde, 0xad]),
-        );
-        let summary = super::redemption_history_summary_from_events([
-            RedemptionEvent::BurnIntended {
-                issuer_request_id: IssuerRedemptionRequestId::random(),
-                sendable_tx: sendable_tx.clone(),
-                planned_burns: vec![],
-            },
-        ]);
-
-        assert_eq!(summary.tx_id, Some(TxId::Hash(sendable_tx.hash)));
     }
 }

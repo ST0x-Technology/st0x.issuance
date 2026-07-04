@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::Quantity;
 use crate::mint::TokenizationRequestId;
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{MultiBurnEntry, TxId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +13,7 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         tx_hash: B256,

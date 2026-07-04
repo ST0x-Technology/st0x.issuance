@@ -13,7 +13,7 @@ use super::{
 };
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::IssuerRedemptionRequestId;
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 /// Mock Alpaca service for testing.
 ///
@@ -181,6 +181,7 @@ impl AlpacaService for MockAlpacaService {
                     underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     quantity: Quantity::new(Decimal::from(100)),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -220,6 +221,7 @@ impl AlpacaService for MockAlpacaService {
                 underlying,
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(rust_decimal::Decimal::from(100)),
+                network: Network::Base,
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 tx_hash: Some(b256!(
                     "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"

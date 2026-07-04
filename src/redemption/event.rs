@@ -3,9 +3,11 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use super::{BurnExternalTxId, IssuerRedemptionRequestId};
+use super::{
+    BurnExternalTxId, IssuerRedemptionRequestId, default_redemption_network,
+};
 use crate::mint::{Quantity, TokenizationRequestId};
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{SendableTxWithHash, TxId};
 
 /// A single burn operation within a multi-receipt burn.
@@ -106,6 +108,8 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         tx_hash: B256,
@@ -157,6 +161,8 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         tx_hash: B256,
@@ -222,6 +228,8 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         tx_hash: B256,
@@ -679,6 +687,33 @@ mod tests {
         assert_eq!(dust_returned, U256::ZERO);
     }
 
+    /// Pre-multichain `Detected` payloads carry no `network` field; replaying
+    /// them must default to Base via `default_redemption_network`, or every
+    /// in-flight Base redemption would fail deserialization on upgrade.
+    #[test]
+    fn test_backwards_compat_detected_without_network_defaults_to_base() {
+        let json = r#"{
+            "Detected": {
+                "issuer_request_id": "red-abcdef12",
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "quantity": "1",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "block_number": 1,
+                "detected_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::Detected { network, .. } = event else {
+            panic!("Expected Detected variant");
+        };
+
+        assert_eq!(network, Network::Base);
+    }
+
     /// Tests that old BurnResumed events without external_tx_id default to None.
     #[test]
     fn test_backwards_compat_burn_resumed_without_external_tx_id() {
@@ -703,10 +738,13 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::BurnResumed { external_tx_id, .. } = event else {
+        let RedemptionEvent::BurnResumed { external_tx_id, network, .. } =
+            event
+        else {
             panic!("Expected BurnResumed variant");
         };
 
         assert_eq!(external_tx_id, None);
+        assert_eq!(network, Network::Base);
     }
 }

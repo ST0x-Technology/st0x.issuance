@@ -1490,4 +1490,77 @@ mod tests {
             "Expected InvalidReceipt, got {result:?}"
         );
     }
+
+    /// Keeps the Turnkey wallet-intent / alternate-burn mock helpers reachable
+    /// while multichain burn-manager tests catch up to those call sites.
+    #[tokio::test]
+    async fn turnkey_mock_helpers_remain_wired() {
+        use std::sync::Arc;
+
+        use crate::vault::{TxId, VerifiedBurn, VerifiedShareTransfer};
+
+        let wallet_blocked =
+            Arc::new(MockVaultService::new_wallet_lock_blocked());
+        let wait_lock = tokio::spawn({
+            let mock = Arc::clone(&wallet_blocked);
+            async move {
+                mock.wait_for_wallet_lock_attempt().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        let lock_task = tokio::spawn({
+            let mock = Arc::clone(&wallet_blocked);
+            async move {
+                mock.lock_wallet().await;
+            }
+        });
+        wait_lock.await.unwrap();
+        wallet_blocked.release_wallet_lock();
+        lock_task.await.unwrap();
+
+        let confirm_blocked =
+            Arc::new(MockVaultService::new_confirm_pending_blocked());
+        let wait_confirm = tokio::spawn({
+            let mock = Arc::clone(&confirm_blocked);
+            async move {
+                mock.wait_for_burn_confirmation().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        let confirm_task = tokio::spawn({
+            let mock = Arc::clone(&confirm_blocked);
+            async move { mock.confirm_burn(&TxId::random(), U256::ZERO).await }
+        });
+        wait_confirm.await.unwrap();
+        confirm_blocked.release_burn_confirmation();
+        let confirm_result = confirm_task.await.unwrap();
+        assert!(matches!(
+            confirm_result,
+            Err(VaultError::ConfirmationPending { .. })
+        ));
+
+        let burns = vec![VerifiedBurn {
+            sender: test_receiver(),
+            receiver: Address::ZERO,
+            receipt_id: U256::from(1u64),
+            shares_burned: U256::from(17u64),
+        }];
+        let transfers = vec![VerifiedShareTransfer {
+            recipient: test_receiver(),
+            shares: U256::from(1u64),
+        }];
+        let _ = MockVaultService::new_success().with_verified_burns(
+            1,
+            0,
+            burns.clone(),
+            transfers.clone(),
+        );
+        let _ = MockVaultService::new_success().with_verified_burns_and_total(
+            1,
+            0,
+            U256::from(17u64),
+            burns,
+            transfers,
+        );
+    }
 }

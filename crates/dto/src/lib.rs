@@ -112,8 +112,10 @@ impl std::fmt::Display for TokenSymbol {
 
 /// Blockchain network a tokenized asset lives on.
 ///
-/// Supported ITN networks. Serialized as the lowercase wire string (`"base"`,
-/// `"ethereum"`, ...) used in JSON and the event store.
+/// Variants we issue on today. Each serializes to the lowercase Alpaca ITN
+/// `TokenizationNetwork` wire string (`"base"`, `"ethereum"`, ...). Valid
+/// values are enumerated in Alpaca's redeem-callback OpenAPI:
+/// <https://docs.alpaca.markets/reference/posttokenizationredeem>
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS,
 )]

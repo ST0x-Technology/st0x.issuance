@@ -9,6 +9,7 @@ use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::IssuerRedemptionRequestId;
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
+pub(crate) mod itn;
 pub(crate) mod mock;
 pub(crate) mod service;
 
@@ -76,6 +77,13 @@ pub(crate) struct MintCallbackRequest {
     pub(crate) network: Network,
 }
 
+/// Request payload for Alpaca's redeem callback endpoint.
+///
+/// Serialized to JSON and sent to:
+/// `POST /v1/accounts/{account_id}/tokenization/callback/redeem`
+///
+/// The `network` field must be a `TokenizationNetwork` wire string per Alpaca
+/// ITN OpenAPI: <https://docs.alpaca.markets/reference/posttokenizationredeem>
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RedeemRequest {
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
@@ -153,6 +161,7 @@ pub(crate) enum TokenizationRequest {
         token: TokenSymbol,
         #[serde(rename = "qty")]
         quantity: Quantity,
+        network: Network,
         #[serde(rename = "wallet_address")]
         wallet: Address,
         #[serde(
@@ -217,6 +226,11 @@ pub(crate) enum AlpacaError {
         requested: TokenizationRequestId,
         returned: TokenizationRequestId,
     },
+    /// `network` is not listed in Alpaca ITN `TokenizationNetwork` OpenAPI.
+    #[error(
+        "Network {network} is not a published Alpaca TokenizationNetwork value — see {reference}"
+    )]
+    UnsupportedTokenizationNetwork { network: Network, reference: &'static str },
 }
 
 impl AlpacaError {
@@ -229,7 +243,8 @@ impl AlpacaError {
             Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
-            | Self::ResponseIdMismatch { .. } => false,
+            | Self::ResponseIdMismatch { .. }
+            | Self::UnsupportedTokenizationNetwork { .. } => false,
         }
     }
 }
@@ -245,7 +260,10 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
-    use super::{MintCallbackRequest, RedeemRequest, TokenizationRequest};
+    use super::{
+        MintCallbackRequest, RedeemRequest, TokenizationRequest,
+        itn::{REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string},
+    };
 
     #[test]
     fn test_mint_callback_request_serialization() {
@@ -335,6 +353,35 @@ mod tests {
     }
 
     #[test]
+    fn test_redeem_request_serialization_ethereum_network() {
+        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        let request = RedeemRequest {
+            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
+            underlying: UnderlyingSymbol::new("TSLA").unwrap(),
+            token: TokenSymbol::new("tTSLA"),
+            client_id,
+            quantity: Quantity::new(Decimal::from(10)),
+            network: Network::Ethereum,
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            tx_hash,
+        };
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        let wire = serialized["network"].as_str().unwrap();
+
+        assert!(
+            accepts_network_wire_string(wire),
+            "redeem callback network must be a published Alpaca TokenizationNetwork \
+             value — see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+        assert_eq!(wire, "ethereum");
+    }
+
+    #[test]
     fn test_address_serialization_includes_0x_prefix() {
         let request = MintCallbackRequest {
             tokenization_request_id: TokenizationRequestId::new("test"),
@@ -385,6 +432,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "qty": "50.00",
+            "network": "base",
             "wallet_address": "0x9999999999999999999999999999999999999999",
             "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "updated_at": "2025-09-12T17:30:00.000000-04:00"
@@ -417,6 +465,7 @@ mod tests {
                 "underlying_symbol": "AAPL",
                 "token_symbol": "tAAPL",
                 "qty": "50.00",
+                "network": "base",
                 "wallet_address": "0x9999999999999999999999999999999999999999",
                 "tx_hash": "",
                 "updated_at": "2025-09-12T17:30:00.000000-04:00"
@@ -436,7 +485,7 @@ mod tests {
         // (observed); JSON null and an omitted field are tolerated
         // defensively. All three must deserialize to None rather than a
         // non-retryable Parse error that would stall the redemption.
-        let base = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"pending","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.1","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-06-11T04:02:33.530523Z""#;
+        let base = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"pending","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.1","network":"base","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-06-11T04:02:33.530523Z""#;
 
         for tx_hash_field in ["", r#","tx_hash":null"#, r#","tx_hash":"""#] {
             let json = format!("{base}{tx_hash_field}}}");

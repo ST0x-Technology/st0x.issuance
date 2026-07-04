@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::admin::NetworkVaultServices;
 use crate::auth::IssuerAuth;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
@@ -29,7 +30,7 @@ pub(crate) enum JournalStatus {
     Rejected,
 }
 
-#[tracing::instrument(skip(_auth, mint_store, vault_service, pool, apalis_pool), fields(
+#[tracing::instrument(skip(_auth, mint_store, vault_services, pool, apalis_pool), fields(
     tokenization_request_id = %request.tokenization_request_id.0,
     issuer_request_id = %request.issuer_request_id,
     status = ?request.status
@@ -38,7 +39,7 @@ pub(crate) enum JournalStatus {
 pub(crate) async fn confirm_journal(
     _auth: IssuerAuth,
     mint_store: &rocket::State<Arc<Store<Mint>>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     pool: &rocket::State<Pool<Sqlite>>,
     apalis_pool: &rocket::State<ApalisSqlitePool>,
     request: Json<JournalConfirmationRequest>,
@@ -103,6 +104,26 @@ pub(crate) async fn confirm_journal(
         }
 
         JournalStatus::Completed => {
+            let Some(network) = mint.network() else {
+                error!(target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    "Mint has no network — cannot select a vault service"
+                );
+                return rocket::http::Status::InternalServerError;
+            };
+
+            let vault_service = match vault_services.get(network) {
+                Ok(vault) => vault.clone(),
+                Err(error) => {
+                    error!(target: "mint",
+                        issuer_request_id = %issuer_request_id,
+                        error = %error,
+                        "Cannot confirm mint on an unconfigured network"
+                    );
+                    return rocket::http::Status::UnprocessableEntity;
+                }
+            };
+
             let command = MintCommand::ConfirmJournal {
                 issuer_request_id: issuer_request_id.clone(),
             };
@@ -117,7 +138,6 @@ pub(crate) async fn confirm_journal(
             }
 
             let mint_store = mint_store.inner().clone();
-            let vault_service = vault_service.inner().clone();
             let pool = pool.inner().clone();
             let apalis_pool = apalis_pool.inner().clone();
             rocket::tokio::spawn(process_journal_completion(
@@ -411,7 +431,7 @@ mod tests {
     };
     use crate::auth::FailedAuthRateLimiter;
     use crate::mint::api::test_utils::{
-        TestAccountAndAsset, TestHarness, test_config,
+        TestAccountAndAsset, TestHarness, network_vault_services, test_config,
     };
     use crate::mint::{
         IssuerMintRequestId, Mint, MintCommand, MintView, Quantity,
@@ -578,7 +598,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -640,7 +660,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -703,7 +723,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -794,7 +814,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -907,7 +927,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1004,7 +1024,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1086,7 +1106,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1166,7 +1186,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool.clone())
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1252,7 +1272,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1292,7 +1312,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -1331,7 +1351,7 @@ mod tests {
             .manage(mint_store)
             .manage(pool)
             .manage(apalis_pool)
-            .manage(vault)
+            .manage(network_vault_services(vault))
             .mount("/", routes![confirm_journal]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
