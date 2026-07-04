@@ -614,6 +614,44 @@ authorization has not yet arrived is `mint_mode: Orchestrator` with no
 `mint_authorization` — it is not, and must never be read as, a vault-direct
 mint.
 
+**Orchestrator mode** introduces no new commands: `Deposit`, `SubmitMint`,
+`ConfirmMint`, and `Recover` are reused unchanged, with the handler branching on
+`VaultMode` internally to submit `orchestrator.mint()` calldata instead of the
+vault multicall and to emit the orchestrator-mode events above. An
+orchestrator-mode mint creates no bot-held receipt for the receipt monitor to
+discover (the orchestrator custodies it — see "Orchestrator Migration" ->
+"Dual-Mode Operation and Cutover"), so `RecoverFromReceipt` does not apply;
+`Recover`'s existing-mint check instead queries the orchestrator's `Minted` log
+by `(wallet, nonce)`, emitting `OrchestratorMintRecovered` only when the log's
+`token`/`amount` also exactly match this mint's own request facts (see "Nonce"
+below for the full-match rule and its manual-failure fallback). See
+"Orchestrator Migration" for the mint flow, failure states
+(`BadRecipientSignature`, `RecipientCallbackRejected`, `VaultAmountMismatch`,
+`VaultLogicMismatch`/`ReceiptLogicMismatch`), and the full event reuse/new
+rationale.
+
+Mirroring the mode-scoping rule given for Redemption below, a mint's mode does
+not follow later `VaultMode` flips of its asset: `Recover`, `SubmitMint`, and
+`ConfirmMint` determine which mode to use for a given mint from that mint's own
+event history — the `mint_mode` field persisted on its `Initiated` event,
+resolved from configuration at initiate time — never re-resolved from the
+asset's currently-configured `VaultMode`. This ensures a mint `Initiated` while
+its asset was in `vault_direct` mode is still recovered as a vault-direct mint
+even after that asset's configured `vault_mode` is later flipped to
+orchestrator, exactly as Redemption's persisted `burn_mode` (captured on
+`RedemptionDetected`) prevents the analogous mismatch on the Redemption side.
+
+The mode anchor is deliberately **not** the presence of `mint_authorization`.
+`Initiated` is written synchronously on Alpaca's `POST /inkind/issuance`, before
+the liquidity bot delivers the authorization on the internal mint-authorization
+call, and events are immutable — an already-persisted `Initiated` can never grow
+an authorization field. Mode (known from config at initiate time) and
+authorization (arriving later, on `MintAuthorizationReceived`) are therefore
+orthogonal facts on two separate events. An orchestrator-mode mint whose
+authorization has not yet arrived is `mint_mode: Orchestrator` with no
+`mint_authorization` — it is not, and must never be read as, a vault-direct
+mint.
+
 ### Redemption Aggregate
 
 The `Redemption` aggregate manages the redemption lifecycle, from detecting an
