@@ -99,7 +99,10 @@ pub async fn wait_for_mock_hits(
     expected: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(5);
+    // Must comfortably exceed the transfer poller's 5s POLL_INTERVAL: a
+    // transfer landing just after a poll pass is only detected on the next
+    // tick, so a 5s wait races the poller by construction.
+    let timeout = tokio::time::Duration::from_secs(15);
     let poll_interval = tokio::time::Duration::from_millis(50);
 
     loop {

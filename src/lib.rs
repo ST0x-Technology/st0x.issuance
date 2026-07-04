@@ -16,7 +16,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::account::Account;
 use crate::alpaca::AlpacaService;
 use crate::auth::FailedAuthRateLimiter;
-use crate::chain::ChainRegistry;
+use crate::chain::{ChainRegistry, ChainRegistryError};
 use crate::mint::{
     Mint, MintServices, find_all_recoverable_mints,
     recovery::{
@@ -25,7 +25,7 @@ use crate::mint::{
     },
 };
 use crate::receipt_inventory::backfill::{NoOpItnHandler, ReceiptBackfiller};
-use crate::receipt_inventory::reconcile::run_startup_reconciliation;
+use crate::receipt_inventory::reconcile::{self, run_startup_reconciliation};
 use crate::receipt_inventory::{
     CqrsReceiptService, ItnReceiptHandler, ReceiptInventory,
     burn_tracking::{ReceiptBurnsViewReactor, rebuild_receipt_burns_view},
@@ -290,23 +290,15 @@ pub async fn initialize_rocket(
     // receipt inventory to detect already-minted receipts (prevents double-mints).
     let vault_configs = run_all_receipt_backfills(
         &pool,
-        base.http_provider.clone(),
+        &chain_registry,
         &receipt_inventory_store,
         bot_wallet,
-        base.backfill_start_block,
     )
     .await?;
 
-    // Reconcile receipt balances with on-chain state after backfill. This detects
-    // external burns (manual burns by stakeholders) that the service didn't track.
-    let vault_receipt_pairs: Vec<_> = vault_configs
-        .iter()
-        .map(|config| (config.vault, config.receipt_contract))
-        .collect();
-
-    if let Err(error) = run_startup_reconciliation(
-        base.http_provider.clone(),
-        &vault_receipt_pairs,
+    if let Err(error) = run_startup_reconciliation_for_vaults(
+        &chain_registry,
+        &vault_configs,
         &receipt_inventory_store,
         bot_wallet,
     )
@@ -333,16 +325,28 @@ pub async fn initialize_rocket(
 
     run_recovery_with_timeout(&pool, &mint_store, &managers, &vaults).await;
 
-    spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
-        pool: pool.clone(),
-        provider: base.http_provider.clone(),
-        vault_configs: vault_configs.clone(),
-        receipt_inventory_store: receipt_inventory_store.clone(),
-        bot_wallet,
-        backfill_start_block: base.backfill_start_block,
-        receipt_poll_interval: config.receipt_poll_interval,
-        handler: MintRecoveryHandler::new(mint_store.clone()),
-    });
+    for (network, runtime) in chain_registry.runtimes() {
+        let network_vault_configs: Vec<_> = vault_configs
+            .iter()
+            .filter(|config| &config.network == network)
+            .cloned()
+            .collect();
+
+        if network_vault_configs.is_empty() {
+            continue;
+        }
+
+        spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
+            pool: pool.clone(),
+            provider: runtime.http_provider.clone(),
+            vault_configs: network_vault_configs,
+            receipt_inventory_store: receipt_inventory_store.clone(),
+            bot_wallet,
+            backfill_start_block: runtime.backfill_start_block,
+            receipt_poll_interval: config.receipt_poll_interval,
+            handler: MintRecoveryHandler::new(mint_store.clone()),
+        });
+    }
 
     {
         let assets = list_enabled_assets(&pool).await?;
@@ -778,10 +782,25 @@ async fn run_recovery_with_timeout(
 }
 
 /// Configuration for a single vault, extracted from TokenizedAssetView.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VaultBackfillConfig {
+    network: Network,
     vault: Address,
     receipt_contract: Address,
+}
+
+struct VaultBackfillCtx<'a, P> {
+    pool: &'a Pool<Sqlite>,
+    provider: &'a P,
+    receipt_inventory_store: &'a Arc<Store<ReceiptInventory>>,
+    bot_wallet: Address,
+}
+
+struct VaultBackfillRequest<'a> {
+    network: Network,
+    vault: Address,
+    underlying: &'a str,
+    backfill_start_block: u64,
 }
 
 /// Runs receipt backfill for ALL enabled tokenized assets.
@@ -789,10 +808,9 @@ struct VaultBackfillConfig {
 /// Returns the vault configurations needed for live monitoring.
 async fn run_all_receipt_backfills<P: Provider + Clone>(
     pool: &Pool<Sqlite>,
-    provider: P,
+    chain_registry: &ChainRegistry<P>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
-    backfill_start_block: u64,
 ) -> Result<Vec<VaultBackfillConfig>, anyhow::Error> {
     let assets = list_enabled_assets(pool).await?;
 
@@ -808,43 +826,51 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
     );
 
     stream::iter(assets)
-        .then(|TokenizedAssetView { vault, underlying, .. }| {
-            let provider = provider.clone();
-            async move {
+        .then(
+            |TokenizedAssetView { vault, underlying, network, .. }| async move {
+                let runtime = chain_registry
+                    .get_required(&network)
+                    .map_err(anyhow::Error::new)?;
                 run_single_vault_backfill(
-                    pool,
-                    &provider,
-                    vault,
-                    backfill_start_block,
-                    &underlying.0,
-                    receipt_inventory_store,
-                    bot_wallet,
+                    &VaultBackfillCtx {
+                        pool,
+                        provider: &runtime.http_provider,
+                        receipt_inventory_store,
+                        bot_wallet,
+                    },
+                    VaultBackfillRequest {
+                        network,
+                        vault,
+                        underlying: &underlying.0,
+                        backfill_start_block: runtime.backfill_start_block,
+                    },
                 )
                 .await
-            }
-        })
+            },
+        )
         .try_collect()
         .await
 }
 
 /// Runs receipt backfill for a single vault.
 async fn run_single_vault_backfill<P: Provider + Clone>(
-    pool: &Pool<Sqlite>,
-    provider: &P,
-    vault: Address,
-    backfill_start_block: u64,
-    underlying: &str,
-    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
-    bot_wallet: Address,
+    ctx: &VaultBackfillCtx<'_, P>,
+    request: VaultBackfillRequest<'_>,
 ) -> Result<VaultBackfillConfig, anyhow::Error> {
+    let VaultBackfillRequest {
+        network,
+        vault,
+        underlying,
+        backfill_start_block,
+    } = request;
+
     let vault_contract =
-        bindings::OffchainAssetReceiptVault::new(vault, provider);
+        bindings::OffchainAssetReceiptVault::new(vault, ctx.provider);
     let receipt_contract =
         Address::from(vault_contract.receipt().call().await?.0);
 
-    let last_block = crate::poll_checkpoint::load(
-        pool,
-        &crate::poll_checkpoint::receipt_backfill_name(vault),
+    let last_block = crate::poll_checkpoint::load_receipt_backfill(
+        ctx.pool, &network, vault,
     )
     .await?;
     let from_block =
@@ -852,25 +878,27 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
 
     info!(
         target: "receipt",
+        network = %network,
         underlying,
         vault = %vault,
         receipt_contract = %receipt_contract,
-        bot_wallet = %bot_wallet,
+        bot_wallet = %ctx.bot_wallet,
         from_block,
         "Running receipt backfill for vault"
     );
 
-    let backfiller = ReceiptBackfiller::new(
-        provider.clone(),
+    let backfiller = ReceiptBackfiller {
+        provider: ctx.provider.clone(),
+        network: network.clone(),
         receipt_contract,
-        bot_wallet,
+        bot_wallet: ctx.bot_wallet,
         vault,
-        receipt_inventory_store.clone(),
-        pool.clone(),
-        NoOpItnHandler,
-    );
+        store: ctx.receipt_inventory_store.clone(),
+        pool: ctx.pool.clone(),
+        handler: NoOpItnHandler,
+    };
 
-    let head_block = provider.get_block_number().await?;
+    let head_block = ctx.provider.get_block_number().await?;
     let result = backfiller.backfill_receipts(from_block, head_block).await?;
 
     info!(
@@ -882,7 +910,57 @@ async fn run_single_vault_backfill<P: Provider + Clone>(
         "Receipt backfill complete for vault"
     );
 
-    Ok(VaultBackfillConfig { vault, receipt_contract })
+    Ok(VaultBackfillConfig { network, vault, receipt_contract })
+}
+
+/// `reconcile::ReconcileError` is the receipt-inventory reconciliation error;
+/// the unqualified `ReconcileError` in this module is `event_sorcery`'s.
+#[derive(Debug, thiserror::Error)]
+enum StartupReconciliationError {
+    #[error(transparent)]
+    ChainRegistry(#[from] ChainRegistryError),
+    #[error(transparent)]
+    Reconcile(#[from] reconcile::ReconcileError),
+}
+
+async fn run_startup_reconciliation_for_vaults<P: Provider + Clone>(
+    chain_registry: &ChainRegistry<P>,
+    vault_configs: &[VaultBackfillConfig],
+    receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
+    bot_wallet: Address,
+) -> Result<(), StartupReconciliationError> {
+    // Every vault reconciles even when an earlier one fails (each failure is
+    // logged); only then does the first error propagate.
+    stream::iter(vault_configs)
+        .then(|config| async move {
+            // Every config came from `run_all_receipt_backfills`, which
+            // resolved its network via `get_required`, so a miss here is a
+            // programming error worth failing startup reconciliation over,
+            // not a skippable runtime condition.
+            let runtime = chain_registry.get_required(&config.network)?;
+
+            run_startup_reconciliation(
+                runtime.http_provider.clone(),
+                &[(config.vault, config.receipt_contract)],
+                receipt_inventory_store,
+                bot_wallet,
+            )
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    target: "receipt",
+                    network = %config.network,
+                    vault = %config.vault,
+                    error = %error,
+                    "Startup reconciliation failed for vault"
+                );
+            })
+            .map_err(StartupReconciliationError::from)
+        })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
 }
 
 fn next_receipt_backfill_block(
@@ -918,9 +996,10 @@ where
     P: Provider + Clone,
     H: ItnReceiptHandler,
 {
-    let last_block = crate::poll_checkpoint::load(
+    let last_block = crate::poll_checkpoint::load_receipt_backfill(
         ctx.pool,
-        &crate::poll_checkpoint::receipt_backfill_name(config.vault),
+        &config.network,
+        config.vault,
     )
     .await?;
     let from_block =
@@ -934,15 +1013,16 @@ where
         "Running periodic receipt backfill for vault"
     );
 
-    let backfiller = ReceiptBackfiller::new(
-        ctx.provider.clone(),
-        config.receipt_contract,
-        ctx.bot_wallet,
-        config.vault,
-        ctx.receipt_inventory_store.clone(),
-        ctx.pool.clone(),
-        ctx.handler,
-    );
+    let backfiller = ReceiptBackfiller {
+        provider: ctx.provider.clone(),
+        network: config.network.clone(),
+        receipt_contract: config.receipt_contract,
+        bot_wallet: ctx.bot_wallet,
+        vault: config.vault,
+        store: ctx.receipt_inventory_store.clone(),
+        pool: ctx.pool.clone(),
+        handler: ctx.handler,
+    };
 
     let result = backfiller.backfill_receipts(from_block, head_block).await?;
 
@@ -1037,7 +1117,9 @@ where
 
             for config in &vault_configs {
                 if let Err(error) = run_periodic_receipt_backfill_for_config(
-                    &ctx, *config, head_block,
+                    &ctx,
+                    config.clone(),
+                    head_block,
                 )
                 .await
                 {
@@ -1063,14 +1145,29 @@ async fn create_pool(config: &Config) -> Result<Pool<Sqlite>, sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, uint};
+    use alloy::network::EthereumWallet;
+    use alloy::primitives::{U256, address, uint};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::signers::local::PrivateKeySigner;
+    use event_sorcery::test_store;
     use rust_decimal::Decimal;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use tracing_test::traced_test;
+    use url::Url;
 
     use super::{
-        Environment, Quantity, QuantityConversionError, mount_api_docs,
-        next_receipt_backfill_block,
+        Environment, Quantity, QuantityConversionError,
+        StartupReconciliationError, VaultBackfillConfig, mount_api_docs,
+        next_receipt_backfill_block, run_startup_reconciliation_for_vaults,
     };
+    use crate::chain::{ChainRegistry, ChainRuntime};
+    use crate::receipt_inventory::ReceiptInventory;
+    use crate::tokenized_asset::Network;
+    use crate::vault::mock::MockVaultService;
 
     #[test]
     fn api_docs_mounted_only_outside_production() {
@@ -1318,5 +1415,93 @@ mod tests {
         let start_block = next_receipt_backfill_block(Some(20), 50).unwrap();
 
         assert_eq!(start_block, 50);
+    }
+
+    /// Every vault must get its own reconciliation attempt and an
+    /// operator-visible WARN line even when an earlier vault already failed;
+    /// only the first error is returned.
+    #[tokio::test]
+    #[traced_test]
+    async fn startup_reconciliation_warns_for_every_failing_vault() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let receipt_inventory_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+
+        // Closing the pool makes every aggregate load fail, so both vaults'
+        // reconciliations error without any RPC involvement.
+        pool.close().await;
+
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::random()))
+            .connect_mocked_client(Asserter::new());
+
+        let runtime = ChainRuntime {
+            network: Network::Base,
+            chain_id: 8453,
+            vault_service: Arc::new(MockVaultService::new_success()),
+            http_provider: provider,
+            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
+            backfill_start_block: 0,
+        };
+        let chain_registry = ChainRegistry::from_runtimes(HashMap::from([(
+            Network::Base,
+            runtime,
+        )]));
+
+        let vault_configs = vec![
+            VaultBackfillConfig {
+                network: Network::Base,
+                vault: address!("0x00000000000000000000000000000000000000aa"),
+                receipt_contract: address!(
+                    "0x00000000000000000000000000000000000000ab"
+                ),
+            },
+            VaultBackfillConfig {
+                network: Network::Base,
+                vault: address!("0x00000000000000000000000000000000000000bb"),
+                receipt_contract: address!(
+                    "0x00000000000000000000000000000000000000bc"
+                ),
+            },
+        ];
+
+        let result = run_startup_reconciliation_for_vaults(
+            &chain_registry,
+            &vault_configs,
+            &receipt_inventory_store,
+            address!("0x00000000000000000000000000000000000000cc"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                StartupReconciliationError::Reconcile(_)
+            ),
+            "the first vault's reconciliation error must be returned"
+        );
+
+        let logs = {
+            let buf = tracing_test::internal::global_buf().lock().unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let test = "startup_reconciliation_warns_for_every_failing_vault";
+        let warned_vaults = logs
+            .lines()
+            .filter(|line| {
+                line.contains(test)
+                    && line.contains("WARN")
+                    && line.contains("Startup reconciliation failed for vault")
+            })
+            .count();
+        assert_eq!(
+            warned_vaults, 2,
+            "every failing vault must produce its own WARN line"
+        );
     }
 }

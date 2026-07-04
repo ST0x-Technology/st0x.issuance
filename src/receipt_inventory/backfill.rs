@@ -17,7 +17,8 @@ use super::{
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::IssuerMintRequestId;
-use crate::poll_checkpoint::{self, CheckpointError, receipt_backfill_name};
+use crate::poll_checkpoint::{self, CheckpointError};
+use crate::tokenized_asset::Network;
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
@@ -49,13 +50,14 @@ pub(crate) struct ReceiptBackfiller<ProviderType, Handler>
 where
     Handler: ItnReceiptHandler,
 {
-    provider: ProviderType,
-    receipt_contract: Address,
-    bot_wallet: Address,
-    vault: Address,
-    store: Arc<Store<ReceiptInventory>>,
-    pool: Pool<Sqlite>,
-    handler: Handler,
+    pub(crate) provider: ProviderType,
+    pub(crate) network: Network,
+    pub(crate) receipt_contract: Address,
+    pub(crate) bot_wallet: Address,
+    pub(crate) vault: Address,
+    pub(crate) store: Arc<Store<ReceiptInventory>>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) handler: Handler,
 }
 
 #[derive(Debug)]
@@ -87,31 +89,6 @@ pub(crate) enum BackfillError {
 
 impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
 where
-    Handler: ItnReceiptHandler,
-{
-    pub(crate) const fn new(
-        provider: ProviderType,
-        receipt_contract: Address,
-        bot_wallet: Address,
-        vault: Address,
-        store: Arc<Store<ReceiptInventory>>,
-        pool: Pool<Sqlite>,
-        handler: Handler,
-    ) -> Self {
-        Self {
-            provider,
-            receipt_contract,
-            bot_wallet,
-            vault,
-            store,
-            pool,
-            handler,
-        }
-    }
-}
-
-impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
-where
     ProviderType: alloy::providers::Provider + Clone + Send + Sync,
     Handler: ItnReceiptHandler,
 {
@@ -126,7 +103,7 @@ where
     /// `from_block` is the block to start scanning from. On first run, pass
     /// the configured backfill start block. On subsequent runs, read the
     /// previous checkpoint via
-    /// `poll_checkpoint::load(pool, &receipt_backfill_name(vault))`.
+    /// `poll_checkpoint::load_receipt_backfill(pool, network, vault)`.
     ///
     /// `head_block` is the chain head to scan up to. The caller fetches it so
     /// a single `eth_blockNumber` can be shared across every vault in one
@@ -216,9 +193,10 @@ where
             self.reconcile_receipt(receipt_id).await?;
         }
 
-        poll_checkpoint::advance(
+        poll_checkpoint::advance_receipt_backfill(
             &self.pool,
-            &receipt_backfill_name(self.vault),
+            &self.network,
+            self.vault,
             current_block,
         )
         .await?;
@@ -658,6 +636,7 @@ mod tests {
         Shares, load_inventory,
     };
     use crate::test_utils::logs_contain_at;
+    use crate::tokenized_asset::Network;
 
     async fn setup_test_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -778,15 +757,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -846,15 +826,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter1);
 
-        let backfiller1 = ReceiptBackfiller::new(
-            provider1,
+        let backfiller1 = ReceiptBackfiller {
+            provider: provider1,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result1 =
             backfiller1.backfill_receipts(0, current_block).await.unwrap();
@@ -870,9 +851,10 @@ mod tests {
             "first run should produce exactly one receipt"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_receipt_backfill(
                 &pool,
-                &poll_checkpoint::receipt_backfill_name(vault),
+                &Network::Base,
+                vault,
             )
             .await
             .unwrap(),
@@ -890,15 +872,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter2);
 
-        let backfiller2 = ReceiptBackfiller::new(
-            provider2,
+        let backfiller2 = ReceiptBackfiller {
+            provider: provider2,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result2 =
             backfiller2.backfill_receipts(0, current_block).await.unwrap();
@@ -915,9 +898,10 @@ mod tests {
             "second run must not produce a duplicate receipt"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            poll_checkpoint::load_receipt_backfill(
                 &pool,
-                &poll_checkpoint::receipt_backfill_name(vault),
+                &Network::Base,
+                vault,
             )
             .await
             .unwrap(),
@@ -963,15 +947,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1033,15 +1018,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1107,15 +1093,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1160,21 +1147,23 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         backfiller.backfill_receipts(0, current_block).await.unwrap();
 
-        let recorded = poll_checkpoint::load(
+        let recorded = poll_checkpoint::load_receipt_backfill(
             &pool,
-            &poll_checkpoint::receipt_backfill_name(vault),
+            &Network::Base,
+            vault,
         )
         .await
         .unwrap();
@@ -1405,15 +1394,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1489,15 +1479,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1573,15 +1564,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1673,15 +1665,16 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller {
             provider,
+            network: Network::Base,
             receipt_contract,
             bot_wallet,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        };
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();

@@ -92,6 +92,15 @@ impl From<ConfigError> for ChainRegistryError {
 }
 
 impl<P> ChainRegistry<P> {
+    /// Test-only constructor building a registry from explicit runtimes,
+    /// bypassing the RPC validation in `build_chain_registry`.
+    #[cfg(test)]
+    pub(crate) const fn from_runtimes(
+        runtimes: HashMap<Network, ChainRuntime<P>>,
+    ) -> Self {
+        Self { runtimes }
+    }
+
     pub(crate) fn get(&self, network: &Network) -> Option<&ChainRuntime<P>> {
         self.runtimes.get(network)
     }

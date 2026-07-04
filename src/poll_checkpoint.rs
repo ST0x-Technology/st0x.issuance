@@ -47,9 +47,46 @@ pub(crate) async fn advance_transfer_poll(
     advance(pool, &transfer_poll_name(network), block_number).await
 }
 
-/// Checkpoint name for the receipt backfiller for a given vault.
-pub(crate) fn receipt_backfill_name(vault: Address) -> String {
-    format!("receipt_backfill:{vault:#x}")
+/// Per-network checkpoint name for the receipt backfiller for a given vault.
+///
+/// Block numbers are chain-specific, so the same vault address on two
+/// networks must track independent checkpoints -- a shared key would let one
+/// chain's head block skip the other chain's backfill entirely.
+pub(crate) fn receipt_backfill_name(
+    network: &Network,
+    vault: Address,
+) -> String {
+    format!("receipt_backfill:{network}:{vault:#x}")
+}
+
+/// Loads the receipt backfill checkpoint for `vault` on `network`, falling
+/// back to the legacy vault-only name when backfilling Base.
+pub(crate) async fn load_receipt_backfill(
+    pool: &Pool<Sqlite>,
+    network: &Network,
+    vault: Address,
+) -> Result<Option<u64>, CheckpointError> {
+    if let Some(block) =
+        load(pool, &receipt_backfill_name(network, vault)).await?
+    {
+        return Ok(Some(block));
+    }
+
+    if network == &Network::Base {
+        load(pool, &legacy_receipt_backfill_name(vault)).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Advances the per-network receipt backfill checkpoint.
+pub(crate) async fn advance_receipt_backfill(
+    pool: &Pool<Sqlite>,
+    network: &Network,
+    vault: Address,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    advance(pool, &receipt_backfill_name(network, vault), block_number).await
 }
 
 /// Returns the highest block number recorded for `name`, or `None` if no
@@ -94,6 +131,12 @@ pub(crate) async fn advance(
     .await?;
 
     Ok(())
+}
+
+/// Legacy single-chain (Base only) checkpoint name, seeded by the
+/// `poll_checkpoints` migration from `BackfillCheckpoint` events.
+fn legacy_receipt_backfill_name(vault: Address) -> String {
+    format!("receipt_backfill:{vault:#x}")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,19 +208,58 @@ mod tests {
         let pool = setup_pool().await;
         let vault_a = address!("00000000000000000000000000000000000000aa");
         let vault_b = address!("00000000000000000000000000000000000000bb");
-        advance(&pool, &receipt_backfill_name(vault_a), 100).await.unwrap();
-        advance(&pool, &receipt_backfill_name(vault_b), 500).await.unwrap();
+        advance(&pool, &receipt_backfill_name(&Network::Base, vault_a), 100)
+            .await
+            .unwrap();
+        advance(&pool, &receipt_backfill_name(&Network::Base, vault_b), 500)
+            .await
+            .unwrap();
         advance(&pool, TRANSFER_POLL, 999).await.unwrap();
 
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault_a)).await.unwrap(),
+            load(&pool, &receipt_backfill_name(&Network::Base, vault_a))
+                .await
+                .unwrap(),
             Some(100)
         );
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault_b)).await.unwrap(),
+            load(&pool, &receipt_backfill_name(&Network::Base, vault_b))
+                .await
+                .unwrap(),
             Some(500)
         );
         assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(999));
+    }
+
+    /// Block numbers are chain-specific, so the same vault address deployed
+    /// on two networks must keep independent backfill checkpoints -- a shared
+    /// key would let the chain with the higher head block permanently skip
+    /// the other chain's backfill.
+    #[tokio::test]
+    async fn receipt_backfill_checkpoints_are_independent_per_network() {
+        let pool = setup_pool().await;
+        let vault = address!("00000000000000000000000000000000000000aa");
+
+        advance_receipt_backfill(&pool, &Network::Base, vault, 100)
+            .await
+            .unwrap();
+        advance_receipt_backfill(&pool, &Network::Ethereum, vault, 50)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_receipt_backfill(&pool, &Network::Base, vault).await.unwrap(),
+            Some(100),
+            "Base must keep its own checkpoint for the shared vault address"
+        );
+        assert_eq!(
+            load_receipt_backfill(&pool, &Network::Ethereum, vault)
+                .await
+                .unwrap(),
+            Some(50),
+            "Ethereum must keep its own checkpoint for the shared vault \
+             address"
+        );
     }
 
     /// The Base poller must fall back to the legacy single-chain
@@ -215,7 +297,11 @@ mod tests {
     async fn receipt_backfill_name_uses_lowercase_hex() {
         let vault = address!("AaBbCcDdEeFf00112233445566778899aAbBcCdD");
         assert_eq!(
-            receipt_backfill_name(vault),
+            receipt_backfill_name(&Network::Base, vault),
+            "receipt_backfill:base:0xaabbccddeeff00112233445566778899aabbccdd"
+        );
+        assert_eq!(
+            legacy_receipt_backfill_name(vault),
             "receipt_backfill:0xaabbccddeeff00112233445566778899aabbccdd"
         );
     }
@@ -223,8 +309,8 @@ mod tests {
     /// Production aggregate IDs were written via `Address::to_string()`, which
     /// produces EIP-55 mixed-case hex. The migration that seeds
     /// `poll_checkpoints` from existing `BackfillCheckpoint` events must
-    /// normalize that to lowercase so the seeded row matches the runtime key
-    /// built by `receipt_backfill_name`.
+    /// normalize that to lowercase so the seeded row matches the legacy key
+    /// that `load_receipt_backfill` falls back to for Base.
     #[tokio::test]
     async fn migration_seeds_receipt_backfill_with_lowercase_key() {
         let pool = setup_pool().await;
@@ -272,7 +358,7 @@ mod tests {
 
         // Re-run the receipt_backfill seeding step verbatim from the
         // migration. If the SQL is ever changed and no longer matches the
-        // runtime key format, this assertion fails.
+        // legacy key format the Base fallback reads, this assertion fails.
         sqlx::query(
             "
             INSERT INTO poll_checkpoints (name, block_number)
@@ -293,9 +379,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault)).await.unwrap(),
+            load_receipt_backfill(&pool, &Network::Base, vault).await.unwrap(),
             Some(12345),
-            "seeded checkpoint must be readable via the runtime key"
+            "seeded legacy checkpoint must be readable via the Base fallback"
+        );
+        assert_eq!(
+            load_receipt_backfill(&pool, &Network::Ethereum, vault)
+                .await
+                .unwrap(),
+            None,
+            "non-Base networks must not inherit the legacy Base checkpoint"
         );
     }
 }
