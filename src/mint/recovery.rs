@@ -345,7 +345,9 @@ mod tests {
         ReceiptInventoryCommand, ReceiptSource, Shares,
     };
     use crate::test_utils::log_count_at;
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        AssetKey, TokenizedAsset, TokenizedAssetCommand,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
@@ -387,7 +389,10 @@ mod tests {
 
             asset_store
                 .send(
-                    &UnderlyingSymbol::new("AAPL"),
+                    &AssetKey::new(
+                        UnderlyingSymbol::new("AAPL"),
+                        Network::Base,
+                    ),
                     TokenizedAssetCommand::Add {
                         underlying: UnderlyingSymbol::new("AAPL"),
                         token: TokenSymbol::new("tAAPL"),

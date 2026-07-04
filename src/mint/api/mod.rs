@@ -12,7 +12,7 @@ use super::{
     UnderlyingSymbol,
 };
 use crate::account::{AccountView, view::find_by_client_id};
-use crate::tokenized_asset::view::load_asset_by_underlying;
+use crate::tokenized_asset::view::load_asset_by_network;
 
 mod confirm;
 mod initiate;
@@ -195,7 +195,7 @@ pub(crate) async fn validate_asset_exists(
     token: &TokenSymbol,
     network: &Network,
 ) -> Result<(), MintApiError> {
-    let asset = load_asset_by_underlying(pool, underlying)
+    let asset = load_asset_by_network(pool, underlying, network)
         .await
         .map_err(|query_error| {
             error!(target: "mint", error = %query_error, "Failed to query asset");

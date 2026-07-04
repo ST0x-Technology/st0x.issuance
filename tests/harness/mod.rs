@@ -286,7 +286,7 @@ pub async fn preseed_tokenized_asset_into_pool(
     underlying: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let aggregate_id = underlying;
+    let aggregate_id = format!("{underlying}:base");
     let now = Utc::now();
 
     let event_payload = json!({
@@ -369,7 +369,7 @@ pub async fn preseed_frozen_tokenized_asset(
         )
         ",
     )
-    .bind(underlying)
+    .bind(format!("{underlying}:base"))
     .bind(&frozen_payload)
     .execute(&pool)
     .await?;

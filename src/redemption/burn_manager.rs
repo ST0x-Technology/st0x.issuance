@@ -19,10 +19,8 @@ use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
     Shares,
 };
-use crate::tokenized_asset::UnderlyingSymbol;
-use crate::tokenized_asset::view::{
-    TokenizedAssetViewError, find_vault_by_underlying,
-};
+use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnVerification, FireblocksTxStatus, MultiBurnEntry, VaultError,
     VaultService,
@@ -201,7 +199,7 @@ impl BurnManager {
             }
         };
 
-        let vault = find_vault_by_underlying(&self.view_pool, &underlying)
+        let vault = find_vault(&self.view_pool, &underlying, &Network::Base)
             .await?
             .ok_or(BurnManagerError::AssetNotFound { underlying })?;
 
@@ -362,7 +360,7 @@ impl BurnManager {
             return Ok(());
         };
 
-        let vault = find_vault_by_underlying(&self.view_pool, underlying)
+        let vault = find_vault(&self.view_pool, underlying, &Network::Base)
             .await?
             .ok_or_else(|| BurnManagerError::AssetNotFound {
                 underlying: underlying.clone(),
@@ -629,9 +627,10 @@ impl BurnManager {
             } => {
                 let dust_shares = dust_quantity.to_u256_with_18_decimals()?;
 
-                let vault = find_vault_by_underlying(
+                let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
+                    &Network::Base,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -723,9 +722,10 @@ impl BurnManager {
                 external_tx_id,
                 ..
             } => {
-                let vault = find_vault_by_underlying(
+                let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
+                    &Network::Base,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -839,7 +839,7 @@ impl BurnManager {
         };
 
         let Some(vault) =
-            find_vault_by_underlying(&self.view_pool, &metadata.underlying)
+            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
                 .await?
         else {
             let error_msg = format!(
@@ -1427,7 +1427,8 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -1572,7 +1573,7 @@ mod tests {
         ) {
             self.asset_store
                 .send(
-                    underlying,
+                    &AssetKey::new(underlying.clone(), Network::Base),
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),

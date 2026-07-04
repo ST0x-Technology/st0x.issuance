@@ -14,7 +14,7 @@ use crate::config::{Config, Environment, LogLevel};
 use crate::fireblocks::SignerConfig;
 use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
 
 pub(crate) fn test_config() -> Config {
@@ -144,7 +144,10 @@ impl TestHarness {
         };
 
         self.asset_store
-            .send(&underlying, asset_cmd)
+            .send(
+                &AssetKey::new(underlying.clone(), network.clone()),
+                asset_cmd,
+            )
             .await
             .expect("Failed to add asset");
 

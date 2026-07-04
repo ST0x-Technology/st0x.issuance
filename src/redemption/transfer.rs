@@ -330,7 +330,8 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        AssetKey, Network, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
 
@@ -400,7 +401,10 @@ mod tests {
                 .await
                 .unwrap();
         asset_store
-            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 

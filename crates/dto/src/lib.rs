@@ -13,8 +13,19 @@ use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Underlying equity symbol, e.g. `SGOV`. Also the `TokenizedAsset` aggregate id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+/// Underlying equity symbol, e.g. `SGOV`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    TS,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct UnderlyingSymbol(pub String);
 
@@ -39,7 +50,18 @@ impl FromStr for UnderlyingSymbol {
 }
 
 /// Tokenized share symbol, e.g. `tSGOV`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    TS,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenSymbol(pub String);
 
@@ -82,6 +104,109 @@ impl Network {
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NetworkParseError {
+    #[error("unsupported network: {value}")]
+    Unsupported { value: String },
+}
+
+impl FromStr for Network {
+    type Err = NetworkParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "base" => Ok(Self::Base),
+            other => {
+                Err(NetworkParseError::Unsupported { value: other.to_string() })
+            }
+        }
+    }
+}
+
+/// Composite `TokenizedAsset` aggregate id and lookup key: `{underlying}:{network}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TS)]
+#[ts(type = "string")]
+pub struct AssetKey {
+    pub underlying: UnderlyingSymbol,
+    pub network: Network,
+}
+
+/// `AssetKey` serializes as the plain `{underlying}:{network}` string, so its
+/// OpenAPI schema must be a string as well -- the derived `ToSchema` would
+/// advertise an object with `underlying`/`network` properties that never
+/// appears on the wire.
+#[cfg(feature = "utoipa")]
+impl utoipa::PartialSchema for AssetKey {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+#[cfg(feature = "utoipa")]
+impl utoipa::ToSchema for AssetKey {}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AssetKeyParseError {
+    #[error("asset key must be {{underlying}}:{{network}}, got: {value}")]
+    InvalidFormat { value: String },
+    #[error("unsupported network wire value in asset key: {value}")]
+    UnsupportedNetwork { value: String },
+}
+
+impl AssetKey {
+    #[must_use]
+    pub const fn new(underlying: UnderlyingSymbol, network: Network) -> Self {
+        Self { underlying, network }
+    }
+}
+
+impl std::fmt::Display for AssetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.underlying, self.network.as_str())
+    }
+}
+
+impl FromStr for AssetKey {
+    type Err = AssetKeyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (underlying, network_str) =
+            value.rsplit_once(':').ok_or_else(|| {
+                AssetKeyParseError::InvalidFormat { value: value.to_string() }
+            })?;
+        if underlying.is_empty() || network_str.is_empty() {
+            return Err(AssetKeyParseError::InvalidFormat {
+                value: value.to_string(),
+            });
+        }
+        let network = network_str.parse().map_err(|_| {
+            AssetKeyParseError::UnsupportedNetwork {
+                value: network_str.to_string(),
+            }
+        })?;
+        Ok(Self::new(UnderlyingSymbol::new(underlying), network))
+    }
+}
+
+impl Serialize for AssetKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -174,6 +299,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     UnderlyingSymbol::export_all_to(out_dir)?;
     TokenSymbol::export_all_to(out_dir)?;
     Network::export_all_to(out_dir)?;
+    AssetKey::export_all_to(out_dir)?;
     TokenizedAssetDetailResponse::export_all_to(out_dir)?;
     TokenizedAssetStatus::export_all_to(out_dir)?;
     TokenizedAssetStatusResponse::export_all_to(out_dir)?;
@@ -243,6 +369,12 @@ mod tests {
         assert_eq!(UnderlyingSymbol::new("SGOV").to_string(), "SGOV");
         assert_eq!(TokenSymbol::new("tSGOV").to_string(), "tSGOV");
         assert_eq!(Network::Base.to_string(), "base");
+    }
+
+    #[test]
+    fn network_from_str_parses_wire_values() {
+        assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
+        assert!("ethereum".parse::<Network>().is_err());
     }
 
     #[test]
@@ -369,6 +501,34 @@ mod tests {
     }
 
     #[test]
+    fn asset_key_serializes_as_underlying_colon_network() {
+        let key = AssetKey::new(UnderlyingSymbol::new("SGOV"), Network::Base);
+        assert_eq!(key.to_string(), "SGOV:base");
+        assert_eq!(serde_json::to_value(&key).unwrap(), json!("SGOV:base"));
+        assert_eq!("SGOV:base".parse::<AssetKey>().unwrap(), key);
+    }
+
+    #[test]
+    fn asset_key_from_str_rejects_invalid_inputs() {
+        assert!(matches!(
+            "SGOV".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::InvalidFormat { .. }
+        ));
+        assert!(matches!(
+            ":base".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::InvalidFormat { .. }
+        ));
+        assert!(matches!(
+            "SGOV:".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::InvalidFormat { .. }
+        ));
+        assert!(matches!(
+            "SGOV:ethereum".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::UnsupportedNetwork { .. }
+        ));
+    }
+
+    #[test]
     fn add_response_uses_snake_case_wire_format() {
         let response = AddTokenizedAssetResponse {
             underlying: UnderlyingSymbol::new("SGOV"),
@@ -422,6 +582,15 @@ mod tests {
         assert!(
             network_ts.contains("\"base\""),
             "Network must be a \"base\" string-literal union in TS:\n{network_ts}"
+        );
+
+        // `AssetKey` serializes as `"underlying:network"`; pin the TS alias so
+        // ts_rs can't regress to a struct shape the dashboard can't consume.
+        let asset_key_ts =
+            std::fs::read_to_string(out_dir.join("AssetKey.ts")).unwrap();
+        assert!(
+            asset_key_ts.contains("= string"),
+            "AssetKey must be a string alias in TS:\n{asset_key_ts}"
         );
 
         // The newtypes must resolve to a bare `string`, matching their

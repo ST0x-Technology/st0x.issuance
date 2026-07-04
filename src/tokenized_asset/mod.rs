@@ -21,6 +21,7 @@ pub(crate) use view::TokenizedAssetView;
 // The asset wire newtypes are defined once in the shared `st0x-issuance-dto`
 // crate so the API DTOs, Rust clients, and the TypeScript dashboard all share a
 // single definition.
+pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
@@ -67,7 +68,7 @@ pub(crate) struct TokenizedAsset {
 
 #[async_trait]
 impl EventSourced for TokenizedAsset {
-    type Id = UnderlyingSymbol;
+    type Id = AssetKey;
     type Event = TokenizedAssetEvent;
     type Command = TokenizedAssetCommand;
     type Error = Never;
@@ -76,7 +77,7 @@ impl EventSourced for TokenizedAsset {
 
     const AGGREGATE_TYPE: &'static str = "TokenizedAsset";
     const PROJECTION: Table = Table("tokenized_asset_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -690,6 +691,139 @@ mod tests {
         assert_eq!(format!("{network}"), "base");
     }
 
+    /// The statements below are copied verbatim from
+    /// `migrations/20260703235904_rekey_tokenized_asset_aggregate_id.sql`; if
+    /// the migration changes, this test must change with it. Running the
+    /// sequence twice proves both the rekey and its idempotency: legacy
+    /// bare-ticker ids gain `:base` exactly once, already-rekeyed ids are
+    /// untouched, and the view is cleared for projection catch-up.
+    #[tokio::test]
+    async fn rekey_migration_rekeys_legacy_ids_and_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'TokenizedAsset',
+                'AAPL',
+                1,
+                'TokenizedAssetEvent::Added',
+                '1.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                payload,
+                timestamp
+            )
+            VALUES ('TokenizedAsset', 'AAPL', 1, '{}', 1)
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO tokenized_asset_view (view_id, version, payload)
+            VALUES ('AAPL', 1, '{}')
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rekey_statements = [
+            "
+            UPDATE events
+            SET aggregate_id = aggregate_id || ':base'
+            WHERE aggregate_type = 'TokenizedAsset'
+              AND aggregate_id NOT LIKE '%:%'
+            ",
+            "
+            UPDATE snapshots
+            SET aggregate_id = aggregate_id || ':base'
+            WHERE aggregate_type = 'TokenizedAsset'
+              AND aggregate_id NOT LIKE '%:%'
+            ",
+            "DELETE FROM tokenized_asset_view",
+        ];
+
+        for pass in 1..=2 {
+            for statement in rekey_statements {
+                sqlx::query(statement).execute(&pool).await.unwrap();
+            }
+
+            let event_ids: Vec<(String,)> = sqlx::query_as(
+                "
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'TokenizedAsset'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                event_ids,
+                vec![("AAPL:base".to_string(),)],
+                "event aggregate_id wrong after pass {pass}"
+            );
+
+            let snapshot_ids: Vec<(String,)> = sqlx::query_as(
+                "
+                SELECT aggregate_id
+                FROM snapshots
+                WHERE aggregate_type = 'TokenizedAsset'
+                ",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot_ids,
+                vec![("AAPL:base".to_string(),)],
+                "snapshot aggregate_id wrong after pass {pass}"
+            );
+
+            let view_rows: Vec<(String,)> =
+                sqlx::query_as("SELECT view_id FROM tokenized_asset_view")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                view_rows.is_empty(),
+                "view must be cleared after pass {pass}"
+            );
+        }
+    }
+
     /// Regression: pre-event-sorcery snapshot and `tokenized_asset_view` payloads
     /// must be cleared before `StoreBuilder::build` projection catch-up.
     #[tokio::test]
@@ -703,6 +837,7 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let underlying = "AAPL";
+        let aggregate_id = "AAPL:base";
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
         let now = Utc::now();
 
@@ -760,7 +895,7 @@ mod tests {
             )
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(
             serde_json::json!({
                 "Added": {
@@ -806,7 +941,7 @@ mod tests {
             )
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(stale.to_string())
         .execute(&pool)
         .await
@@ -818,7 +953,7 @@ mod tests {
             VALUES (?, 1, ?)
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .bind(stale.to_string())
         .execute(&pool)
         .await
@@ -838,7 +973,7 @@ mod tests {
               AND aggregate_id = ?
             ",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -851,7 +986,7 @@ mod tests {
         let view_payload: String = sqlx::query_scalar(
             "SELECT payload FROM tokenized_asset_view WHERE view_id = ?",
         )
-        .bind(underlying)
+        .bind(aggregate_id)
         .fetch_one(&pool)
         .await
         .unwrap();

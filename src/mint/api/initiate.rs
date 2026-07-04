@@ -119,7 +119,7 @@ mod tests {
         view::find_by_issuer_request_id,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::TokenizedAssetCommand;
+    use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
 
     #[tokio::test]
     async fn test_initiate_mint_returns_issuer_request_id() {
@@ -172,7 +172,10 @@ mod tests {
             vault,
         };
         tokenized_asset_store
-            .send(&underlying, asset_cmd)
+            .send(
+                &AssetKey::new(underlying.clone(), network.clone()),
+                asset_cmd,
+            )
             .await
             .expect("Failed to add asset");
 
@@ -237,7 +240,10 @@ mod tests {
         } = harness;
 
         tokenized_asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 
@@ -331,7 +337,10 @@ mod tests {
         let asset_store = tokenized_asset_store.clone();
 
         asset_store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 
@@ -383,7 +392,10 @@ mod tests {
         // Unfreezing must let new mints through again — the whole point of the
         // toggle is that issuance resumes after Unfreeze.
         asset_store
-            .send(&underlying, TokenizedAssetCommand::Unfreeze)
+            .send(
+                &AssetKey::new(underlying.clone(), Network::Base),
+                TokenizedAssetCommand::Unfreeze,
+            )
             .await
             .expect("Failed to unfreeze asset");
 
@@ -576,7 +588,10 @@ mod tests {
             vault,
         };
         tokenized_asset_store
-            .send(&underlying, asset_cmd)
+            .send(
+                &AssetKey::new(underlying.clone(), network.clone()),
+                asset_cmd,
+            )
             .await
             .expect("Failed to add asset");
 

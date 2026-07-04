@@ -4,18 +4,56 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use sqlx::{Pool, Sqlite};
 use st0x_issuance_dto::{
-    AddTokenizedAssetRequest, AddTokenizedAssetResponse,
+    AddTokenizedAssetRequest, AddTokenizedAssetResponse, AssetKey,
     TokenizedAssetDetailResponse, TokenizedAssetResponse,
     TokenizedAssetStatusResponse, TokenizedAssetsListResponse,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::error;
 
 use super::{
-    TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
-    view::TokenizedAssetView,
+    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    UnderlyingSymbol, view::TokenizedAssetView,
 };
 use crate::auth::{InternalAuth, IssuerAuth};
+
+fn require_network_query(network: Option<&str>) -> Result<Network, Status> {
+    let Some(wire) = network else {
+        return Err(Status::UnprocessableEntity);
+    };
+
+    wire.parse().map_err(|_| Status::UnprocessableEntity)
+}
+
+fn merge_token_listing(
+    views: Vec<TokenizedAssetView>,
+) -> Vec<TokenizedAssetResponse> {
+    let mut merged: BTreeMap<
+        (UnderlyingSymbol, TokenSymbol),
+        TokenizedAssetResponse,
+    > = BTreeMap::new();
+
+    for TokenizedAssetView { underlying, token, network, .. } in views {
+        let row_key = (underlying.clone(), token.clone());
+        merged
+            .entry(row_key)
+            .or_insert_with(|| TokenizedAssetResponse {
+                underlying: underlying.clone(),
+                token: token.clone(),
+                networks: Vec::new(),
+            })
+            .networks
+            .push(network);
+    }
+
+    let mut tokens: Vec<_> = merged.into_values().collect();
+    for row in &mut tokens {
+        row.networks.sort_by_key(|network| network.as_str().to_string());
+    }
+    tokens.sort_by(|left, right| left.underlying.0.cmp(&right.underlying.0));
+    tokens
+}
 
 #[utoipa::path(
     get,
@@ -23,28 +61,34 @@ use crate::auth::{InternalAuth, IssuerAuth};
     tag = "tokenized-assets",
     params(
         ("underlying" = String, Path,
-            description = "Underlying equity symbol, e.g. SGOV")
+            description = "Underlying equity symbol, e.g. SGOV"),
+        ("network" = String, Query,
+            description = "Blockchain network wire value, e.g. base")
     ),
     responses(
         (status = 200, description = "Asset detail including freeze status",
             body = TokenizedAssetDetailResponse),
         (status = 404, description = "Unknown asset"),
+        (status = 422, description = "Missing or unsupported `network` query parameter"),
         (status = 500, description = "View load or deserialization failure")
     ),
     security(("internal_api_key" = []))
 )]
 #[tracing::instrument(skip(_auth, pool))]
-#[get("/tokenized-assets/<underlying>")]
+#[get("/tokenized-assets/<underlying>?<network>")]
 pub(crate) async fn get_tokenized_asset(
     underlying: &str,
+    network: Option<&str>,
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetDetailResponse>, Status> {
+    let network = require_network_query(network)?;
     let underlying_symbol = UnderlyingSymbol::new(underlying);
 
-    let view = super::view::load_asset_by_underlying(
+    let view = super::view::load_asset_by_network(
         pool.inner(),
         &underlying_symbol,
+        &network,
     )
     .await
     .map_err(|err| {
@@ -77,35 +121,43 @@ pub(crate) async fn get_tokenized_asset(
     tag = "tokenized-assets",
     params(
         ("underlying" = String, Path,
-            description = "Underlying equity symbol, e.g. SGOV")
+            description = "Underlying equity symbol, e.g. SGOV"),
+        ("network" = String, Query,
+            description = "Blockchain network wire value, e.g. base")
     ),
     responses(
         (status = 200, description = "Per-asset freeze status",
             body = TokenizedAssetStatusResponse),
         (status = 404, description = "Unknown asset"),
+        (status = 422, description = "Missing or unsupported `network` query parameter"),
         (status = 500,
             description = "Indeterminate (view load failure); retry, do not treat as enabled")
     ),
     security(("internal_api_key" = []))
 )]
 #[tracing::instrument(skip(_auth, pool))]
-#[get("/tokenized-assets/<underlying>/status")]
+#[get("/tokenized-assets/<underlying>/status?<network>")]
 pub(crate) async fn get_tokenized_asset_status(
     underlying: &str,
+    network: Option<&str>,
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
 ) -> Result<Json<TokenizedAssetStatusResponse>, Status> {
+    let network = require_network_query(network)?;
     let underlying_symbol = UnderlyingSymbol::new(underlying);
 
-    let view =
-        super::view::load_asset_by_underlying(pool.inner(), &underlying_symbol)
-            .await
-            .map_err(|err| {
-                error!(target: "asset", error = %err,
-                    "Failed to load tokenized asset status"
-                );
-                Status::InternalServerError
-            })?;
+    let view = super::view::load_asset_by_network(
+        pool.inner(),
+        &underlying_symbol,
+        &network,
+    )
+    .await
+    .map_err(|err| {
+        error!(target: "asset", error = %err,
+            "Failed to load tokenized asset status"
+        );
+        Status::InternalServerError
+    })?;
 
     match view {
         Some(TokenizedAssetView { underlying, status, .. }) => {
@@ -130,16 +182,7 @@ pub(crate) async fn list_tokenized_assets(
             rocket::http::Status::InternalServerError
         })?;
 
-    let tokens = views
-        .into_iter()
-        .map(|TokenizedAssetView { underlying, token, network, .. }| {
-            TokenizedAssetResponse {
-                underlying,
-                token,
-                networks: vec![network],
-            }
-        })
-        .collect();
+    let tokens = merge_token_listing(views);
 
     Ok(Json(TokenizedAssetsListResponse { tokens }))
 }
@@ -175,8 +218,11 @@ pub(crate) async fn add_tokenized_asset(
         vault: request.vault,
     };
 
+    let asset_key =
+        AssetKey::new(request.underlying.clone(), request.network.clone());
+
     store
-        .send(&request.underlying, command)
+        .send(&asset_key, command)
         .await
         .or_else(|err| match err {
             AggregateError::AggregateConflict => Ok(()),
@@ -198,6 +244,7 @@ pub(crate) async fn add_tokenized_asset(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, address};
+    use chrono::Utc;
     use event_sorcery::StoreBuilder;
     use rocket::http::{ContentType, Header, Status};
     use rocket::routes;
@@ -213,7 +260,8 @@ mod tests {
     use crate::fireblocks::SignerConfig;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, AssetStatus, Network, TokenSymbol, TokenizedAsset,
+        TokenizedAssetCommand,
     };
 
     fn test_config() -> Config {
@@ -235,6 +283,59 @@ mod tests {
         }
     }
 
+    fn base_view(underlying: &str, token: &str) -> TokenizedAssetView {
+        TokenizedAssetView {
+            underlying: UnderlyingSymbol::new(underlying),
+            token: TokenSymbol::new(token),
+            network: Network::Base,
+            vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            status: AssetStatus::Enabled,
+            added_at: Utc::now(),
+        }
+    }
+
+    // Only one `Network` variant exists today, so the multi-chain collapse is
+    // exercised with two rows sharing the same (underlying, token) key: both
+    // must accumulate into a single response row via the map entry. When a
+    // second network variant lands, the projection produces exactly this shape
+    // with distinct networks.
+    #[test]
+    fn merge_token_listing_merges_rows_sharing_underlying_and_token() {
+        let merged = merge_token_listing(vec![
+            base_view("AAPL", "tAAPL"),
+            base_view("AAPL", "tAAPL"),
+        ]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].underlying, UnderlyingSymbol::new("AAPL"));
+        assert_eq!(merged[0].token, TokenSymbol::new("tAAPL"));
+        assert_eq!(merged[0].networks, vec![Network::Base, Network::Base]);
+    }
+
+    #[test]
+    fn merge_token_listing_sorts_rows_by_underlying() {
+        let merged = merge_token_listing(vec![
+            base_view("MSFT", "tMSFT"),
+            base_view("AAPL", "tAAPL"),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].underlying, UnderlyingSymbol::new("AAPL"));
+        assert_eq!(merged[0].networks, vec![Network::Base]);
+        assert_eq!(merged[1].underlying, UnderlyingSymbol::new("MSFT"));
+        assert_eq!(merged[1].networks, vec![Network::Base]);
+    }
+
+    #[test]
+    fn merge_token_listing_passes_single_asset_through() {
+        let merged = merge_token_listing(vec![base_view("SGOV", "tSGOV")]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].underlying, UnderlyingSymbol::new("SGOV"));
+        assert_eq!(merged[0].token, TokenSymbol::new("tSGOV"));
+        assert_eq!(merged[0].networks, vec![Network::Base]);
+    }
+
     #[tokio::test]
     async fn test_list_tokenized_assets_returns_added_assets() {
         let pool = SqlitePoolOptions::new()
@@ -250,9 +351,10 @@ mod tests {
 
         let store = setup_tokenized_asset_store(&pool).await;
 
+        let key = AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base);
         store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -633,9 +735,10 @@ mod tests {
         let pool = migrated_in_memory_pool().await;
         let store = setup_tokenized_asset_store(&pool).await;
 
+        let key = AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base);
         store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -659,7 +762,7 @@ mod tests {
             .expect("valid rocket instance");
 
         let before = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -678,7 +781,7 @@ mod tests {
         );
 
         store
-            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .send(&key, TokenizedAssetCommand::Freeze)
             .await
             .expect("Failed to freeze asset");
 
@@ -688,7 +791,7 @@ mod tests {
         ));
 
         let after = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -709,10 +812,7 @@ mod tests {
         // the guard's lifecycle, exercised through the same HTTP + projection
         // path.
         store
-            .send(
-                &UnderlyingSymbol::new("AAPL"),
-                TokenizedAssetCommand::Unfreeze,
-            )
+            .send(&key, TokenizedAssetCommand::Unfreeze)
             .await
             .expect("Failed to unfreeze asset");
 
@@ -722,7 +822,7 @@ mod tests {
         ));
 
         let unfrozen = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -744,9 +844,10 @@ mod tests {
         let pool = migrated_in_memory_pool().await;
         let store = setup_tokenized_asset_store(&pool).await;
 
+        let key = AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base);
         store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -770,7 +871,7 @@ mod tests {
             .expect("valid rocket instance");
 
         let enabled = client
-            .get("/tokenized-assets/AAPL")
+            .get("/tokenized-assets/AAPL?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -795,7 +896,7 @@ mod tests {
         );
 
         store
-            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .send(&key, TokenizedAssetCommand::Freeze)
             .await
             .expect("Failed to freeze asset");
 
@@ -805,7 +906,7 @@ mod tests {
         ));
 
         let frozen = client
-            .get("/tokenized-assets/AAPL")
+            .get("/tokenized-assets/AAPL?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -841,7 +942,7 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{"Live": {"bad_field": 1}}')
+            VALUES ('AAPL:base', 1, '{"Live": {"bad_field": 1}}')
             "#,
         )
         .execute(&pool)
@@ -859,7 +960,7 @@ mod tests {
             .expect("valid rocket instance");
 
         let response = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -888,7 +989,7 @@ mod tests {
             .expect("valid rocket instance");
 
         let response = client
-            .get("/tokenized-assets/UNKNOWN/status")
+            .get("/tokenized-assets/UNKNOWN/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -921,7 +1022,7 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{"Live": null}')
+            VALUES ('AAPL:base', 1, '{"Live": null}')
             "#,
         )
         .execute(&pool)
@@ -939,7 +1040,7 @@ mod tests {
             .expect("valid rocket instance");
 
         let response = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(internal_api_key())
             .remote("127.0.0.1:8000".parse().unwrap())
             .dispatch()
@@ -964,12 +1065,94 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{"Live": null}')
+            VALUES ('AAPL:base', 1, '{"Live": null}')
             "#,
         )
         .execute(&pool)
         .await
         .expect("Failed to insert non-live view row");
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL?network=base")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        assert!(logs_contain_at!(
+            tracing::Level::ERROR,
+            &["Failed to load tokenized asset"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_status_missing_network_returns_422() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL/status")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    // A present-but-unrecognised network wire value must map to 422 (the
+    // documented contract), not 404 -- it is a malformed query, not a missing
+    // asset.
+    #[tokio::test]
+    async fn test_get_status_unsupported_network_returns_422() {
+        let pool = migrated_in_memory_pool().await;
+
+        let rocket = rocket::build()
+            .manage(test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .mount("/", routes![get_tokenized_asset_status]);
+
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/tokenized-assets/AAPL/status?network=solana")
+            .header(internal_api_key())
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    // The detail route binds `?<network>` independently of the status route, so
+    // its 422 contract for an absent network parameter needs its own guard.
+    #[tokio::test]
+    async fn test_get_detail_missing_network_returns_422() {
+        let pool = migrated_in_memory_pool().await;
 
         let rocket = rocket::build()
             .manage(test_config())
@@ -988,12 +1171,7 @@ mod tests {
             .dispatch()
             .await;
 
-        assert_eq!(response.status(), Status::InternalServerError);
-
-        assert!(logs_contain_at!(
-            tracing::Level::ERROR,
-            &["Failed to load tokenized asset"]
-        ));
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 
     #[tokio::test]
@@ -1035,7 +1213,7 @@ mod tests {
         // `InternalAuth` validates the key value, so knowing the header name is
         // not enough to reach the endpoint.
         let response = client
-            .get("/tokenized-assets/AAPL/status")
+            .get("/tokenized-assets/AAPL/status?network=base")
             .header(Header::new(
                 "X-API-KEY",
                 "wrong-key-00000000000000000000000000",

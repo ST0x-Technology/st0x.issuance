@@ -9,9 +9,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::view::{TokenizedAssetViewError, load_asset_by_underlying};
+use super::view::{TokenizedAssetViewError, load_asset_by_network};
 use super::{
-    AssetStatus, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+    AssetKey, AssetStatus, Network, TokenizedAsset, TokenizedAssetCommand,
+    UnderlyingSymbol,
 };
 use crate::config::{
     DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, LogLevel,
@@ -57,6 +58,9 @@ struct AssetArgs {
     /// Underlying symbol, e.g. SGOV.
     #[arg(value_parser = parse_underlying)]
     underlying: UnderlyingSymbol,
+    /// Blockchain network wire value, e.g. base.
+    #[arg(long = "network", default_value = "base", value_parser = parse_network)]
+    network: Network,
     #[arg(
         long = "database-url",
         env = "DATABASE_URL",
@@ -108,7 +112,8 @@ async fn run_asset_command(
         AssetAdmin::connect(&args.database_url, args.database_max_connections)
             .await?;
 
-    execute(&admin, action, &args.underlying, prompt_confirm).await
+    execute(&admin, action, &args.underlying, &args.network, prompt_confirm)
+        .await
 }
 
 /// Orchestrates a single action against an already-connected admin. The
@@ -119,6 +124,7 @@ async fn execute(
     admin: &AssetAdmin,
     action: AssetAction,
     underlying: &UnderlyingSymbol,
+    network: &Network,
     confirm: impl Fn(&str) -> io::Result<bool>,
 ) -> anyhow::Result<()> {
     // Display the current status for the operator to confirm against, and reject
@@ -126,7 +132,7 @@ async fn execute(
     // not-found check — the freeze/unfreeze decision is NOT derived from it (see
     // `freeze`/`unfreeze`), so a concurrent write landing in the confirmation
     // window can never leave the asset in the wrong persisted state.
-    let report = admin.status(underlying).await?.ok_or_else(|| {
+    let report = admin.status(underlying, network).await?.ok_or_else(|| {
         AssetAdminError::NotFound { underlying: underlying.clone() }
     })?;
     println!("{report}");
@@ -137,7 +143,7 @@ async fn execute(
             if !confirm(&format!("Freeze {underlying}?"))? {
                 anyhow::bail!("aborted by operator");
             }
-            match admin.freeze(underlying).await? {
+            match admin.freeze(underlying, network).await? {
                 FreezeOutcome::Froze => println!("Froze {underlying}."),
                 FreezeOutcome::AlreadyFrozen => {
                     println!("{underlying} was already frozen.");
@@ -149,7 +155,7 @@ async fn execute(
             if !confirm(&format!("Unfreeze {underlying}?"))? {
                 anyhow::bail!("aborted by operator");
             }
-            match admin.unfreeze(underlying).await? {
+            match admin.unfreeze(underlying, network).await? {
                 UnfreezeOutcome::Unfroze => println!("Unfroze {underlying}."),
                 UnfreezeOutcome::AlreadyEnabled => {
                     println!("{underlying} was already enabled.");
@@ -261,8 +267,9 @@ impl AssetAdmin {
     pub(crate) async fn status(
         &self,
         underlying: &UnderlyingSymbol,
+        network: &Network,
     ) -> Result<Option<AssetStatusReport>, AssetAdminError> {
-        Ok(load_asset_by_underlying(&self.pool, underlying).await?.map(
+        Ok(load_asset_by_network(&self.pool, underlying, network).await?.map(
             |view| AssetStatusReport {
                 underlying: underlying.clone(),
                 status: view.status,
@@ -283,13 +290,15 @@ impl AssetAdmin {
     pub(crate) async fn freeze(
         &self,
         underlying: &UnderlyingSymbol,
+        network: &Network,
     ) -> Result<FreezeOutcome, AssetAdminError> {
         let already_frozen = matches!(
-            self.status(underlying).await?.map(|report| report.status),
+            self.status(underlying, network).await?.map(|report| report.status),
             Some(AssetStatus::Frozen)
         );
 
-        self.dispatch(underlying, TokenizedAssetCommand::Freeze).await?;
+        self.dispatch(underlying, network, TokenizedAssetCommand::Freeze)
+            .await?;
 
         Ok(if already_frozen {
             FreezeOutcome::AlreadyFrozen
@@ -307,13 +316,15 @@ impl AssetAdmin {
     pub(crate) async fn unfreeze(
         &self,
         underlying: &UnderlyingSymbol,
+        network: &Network,
     ) -> Result<UnfreezeOutcome, AssetAdminError> {
         let already_enabled = matches!(
-            self.status(underlying).await?.map(|report| report.status),
+            self.status(underlying, network).await?.map(|report| report.status),
             Some(AssetStatus::Enabled)
         );
 
-        self.dispatch(underlying, TokenizedAssetCommand::Unfreeze).await?;
+        self.dispatch(underlying, network, TokenizedAssetCommand::Unfreeze)
+            .await?;
 
         Ok(if already_enabled {
             UnfreezeOutcome::AlreadyEnabled
@@ -325,11 +336,20 @@ impl AssetAdmin {
     async fn dispatch(
         &self,
         underlying: &UnderlyingSymbol,
+        network: &Network,
         command: TokenizedAssetCommand,
     ) -> Result<(), AssetAdminError> {
-        self.store.send(underlying, command).await?;
+        let key = AssetKey::new(underlying.clone(), network.clone());
+        self.store.send(&key, command).await?;
         Ok(())
     }
+}
+
+/// Delegates to `Network`'s `FromStr` so the CLI accepts exactly the wire
+/// values the HTTP layer and event store use, with no separately-maintained
+/// network registry.
+fn parse_network(value: &str) -> Result<Network, String> {
+    value.parse::<Network>().map_err(|error| error.to_string())
 }
 
 /// Rejects an empty or whitespace-only underlying at the CLI boundary so a typo
@@ -404,9 +424,10 @@ mod tests {
                 .expect("Failed to build tokenized asset store");
 
         let underlying = UnderlyingSymbol::new(underlying);
+        let key = AssetKey::new(underlying.clone(), Network::Base);
         store
             .send(
-                &underlying,
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: underlying.clone(),
                     token: TokenSymbol::new(format!("t{underlying}")),
@@ -428,16 +449,23 @@ mod tests {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
 
-        let report =
-            admin.status(&underlying).await.unwrap().expect("asset exists");
+        let report = admin
+            .status(&underlying, &Network::Base)
+            .await
+            .unwrap()
+            .expect("asset exists");
         assert_eq!(report.status, AssetStatus::Enabled);
         assert_eq!(format!("{report}"), "SGOV is enabled");
 
         assert_eq!(
-            admin.freeze(&underlying).await.unwrap(),
+            admin.freeze(&underlying, &Network::Base).await.unwrap(),
             FreezeOutcome::Froze
         );
-        let frozen = admin.status(&underlying).await.unwrap().expect("exists");
+        let frozen = admin
+            .status(&underlying, &Network::Base)
+            .await
+            .unwrap()
+            .expect("exists");
         assert_eq!(frozen.status, AssetStatus::Frozen);
         assert_eq!(format!("{frozen}"), "SGOV is frozen");
         assert!(logs_contain_at!(
@@ -446,11 +474,16 @@ mod tests {
         ));
 
         assert_eq!(
-            admin.unfreeze(&underlying).await.unwrap(),
+            admin.unfreeze(&underlying, &Network::Base).await.unwrap(),
             UnfreezeOutcome::Unfroze
         );
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Enabled
         );
         assert!(logs_contain_at!(
@@ -468,20 +501,20 @@ mod tests {
         // already-enabled one) is a zero-event no-op the aggregate dedups, and is
         // reported as the AlreadyFrozen / AlreadyEnabled label.
         assert_eq!(
-            admin.freeze(&underlying).await.unwrap(),
+            admin.freeze(&underlying, &Network::Base).await.unwrap(),
             FreezeOutcome::Froze
         );
         assert_eq!(
-            admin.freeze(&underlying).await.unwrap(),
+            admin.freeze(&underlying, &Network::Base).await.unwrap(),
             FreezeOutcome::AlreadyFrozen
         );
 
         assert_eq!(
-            admin.unfreeze(&underlying).await.unwrap(),
+            admin.unfreeze(&underlying, &Network::Base).await.unwrap(),
             UnfreezeOutcome::Unfroze
         );
         assert_eq!(
-            admin.unfreeze(&underlying).await.unwrap(),
+            admin.unfreeze(&underlying, &Network::Base).await.unwrap(),
             UnfreezeOutcome::AlreadyEnabled
         );
     }
@@ -491,7 +524,7 @@ mod tests {
         let admin = admin_with_asset("SGOV").await;
         assert!(
             admin
-                .status(&UnderlyingSymbol::new("UNKNOWN"))
+                .status(&UnderlyingSymbol::new("UNKNOWN"), &Network::Base)
                 .await
                 .unwrap()
                 .is_none()
@@ -505,9 +538,15 @@ mod tests {
 
         // The not-found rejection is `execute`'s entry-point behavior for all
         // three subcommands; assert the operator-facing message.
-        let err = execute(&admin, AssetAction::Freeze, &unknown, |_| Ok(true))
-            .await
-            .expect_err("an unknown asset must be rejected");
+        let err = execute(
+            &admin,
+            AssetAction::Freeze,
+            &unknown,
+            &Network::Base,
+            |_| Ok(true),
+        )
+        .await
+        .expect_err("an unknown asset must be rejected");
         assert!(
             err.to_string().contains("is not a supported tokenized asset"),
             "unexpected error: {err}"
@@ -519,13 +558,23 @@ mod tests {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
 
-        let result =
-            execute(&admin, AssetAction::Freeze, &underlying, |_| Ok(false))
-                .await;
+        let result = execute(
+            &admin,
+            AssetAction::Freeze,
+            &underlying,
+            &Network::Base,
+            |_| Ok(false),
+        )
+        .await;
 
         assert!(result.is_err(), "declined freeze must return an error");
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Enabled,
             "a declined freeze must not change state"
         );
@@ -536,12 +585,23 @@ mod tests {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
 
-        execute(&admin, AssetAction::Freeze, &underlying, |_| Ok(true))
-            .await
-            .expect("confirmed freeze succeeds");
+        execute(
+            &admin,
+            AssetAction::Freeze,
+            &underlying,
+            &Network::Base,
+            |_| Ok(true),
+        )
+        .await
+        .expect("confirmed freeze succeeds");
 
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Frozen,
             "a confirmed freeze must change state"
         );
@@ -551,15 +611,28 @@ mod tests {
     async fn execute_unfreeze_aborts_without_dispatching_when_declined() {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
-        admin.freeze(&underlying).await.expect("freeze succeeds");
+        admin
+            .freeze(&underlying, &Network::Base)
+            .await
+            .expect("freeze succeeds");
 
-        let result =
-            execute(&admin, AssetAction::Unfreeze, &underlying, |_| Ok(false))
-                .await;
+        let result = execute(
+            &admin,
+            AssetAction::Unfreeze,
+            &underlying,
+            &Network::Base,
+            |_| Ok(false),
+        )
+        .await;
 
         assert!(result.is_err(), "declined unfreeze must return an error");
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Frozen,
             "a declined unfreeze must not change state"
         );
@@ -569,14 +642,28 @@ mod tests {
     async fn execute_unfreeze_dispatches_when_confirmed() {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
-        admin.freeze(&underlying).await.expect("freeze succeeds");
-
-        execute(&admin, AssetAction::Unfreeze, &underlying, |_| Ok(true))
+        admin
+            .freeze(&underlying, &Network::Base)
             .await
-            .expect("confirmed unfreeze succeeds");
+            .expect("freeze succeeds");
+
+        execute(
+            &admin,
+            AssetAction::Unfreeze,
+            &underlying,
+            &Network::Base,
+            |_| Ok(true),
+        )
+        .await
+        .expect("confirmed unfreeze succeeds");
 
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Enabled,
             "a confirmed unfreeze must change state"
         );
@@ -587,14 +674,23 @@ mod tests {
         let admin = admin_with_asset("SGOV").await;
         let underlying = UnderlyingSymbol::new("SGOV");
 
-        execute(&admin, AssetAction::Status, &underlying, |_| {
-            panic!("status must not prompt for confirmation")
-        })
+        execute(
+            &admin,
+            AssetAction::Status,
+            &underlying,
+            &Network::Base,
+            |_| panic!("status must not prompt for confirmation"),
+        )
         .await
         .expect("status succeeds");
 
         assert_eq!(
-            admin.status(&underlying).await.unwrap().expect("exists").status,
+            admin
+                .status(&underlying, &Network::Base)
+                .await
+                .unwrap()
+                .expect("exists")
+                .status,
             AssetStatus::Enabled
         );
     }

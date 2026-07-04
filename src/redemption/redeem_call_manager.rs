@@ -340,7 +340,7 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
@@ -435,7 +435,7 @@ mod tests {
         ) {
             self.asset_store
                 .send(
-                    underlying,
+                    &AssetKey::new(underlying.clone(), network.clone()),
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),

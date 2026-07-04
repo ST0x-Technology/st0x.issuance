@@ -18,7 +18,7 @@ use crate::alpaca::{AlpacaService, MintCallbackRequest};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptService, Shares,
 };
-use crate::tokenized_asset::view::find_vault_by_underlying;
+use crate::tokenized_asset::view::find_vault;
 use crate::vault::{FireblocksTxStatus, ReceiptInformation, VaultService};
 
 pub use api::MintResponse;
@@ -246,6 +246,7 @@ struct MintSubmissionInput<'a> {
     tokenization_request_id: &'a TokenizationRequestId,
     quantity: &'a Quantity,
     underlying: &'a UnderlyingSymbol,
+    network: &'a Network,
     wallet: Address,
     journal_confirmed_at: DateTime<Utc>,
     receipt_note: Option<&'a str>,
@@ -507,6 +508,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -526,6 +528,7 @@ impl Mint {
                 tokenization_request_id,
                 quantity,
                 underlying,
+                network,
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: None,
@@ -548,12 +551,13 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             receipt_note,
             external_tx_id,
         } = input;
-        let vault = find_vault_by_underlying(&services.pool, underlying)
+        let vault = find_vault(&services.pool, underlying, network)
             .await
             .map_err(|e| MintError::AssetView { message: e.to_string() })?
             .ok_or_else(|| MintError::AssetNotFound {
@@ -633,6 +637,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             journal_confirmed_at,
             fireblocks_tx_id: stored_tx_id,
             ..
@@ -667,8 +672,7 @@ impl Mint {
 
                 // Best-effort receipt registration — vault lookup failure
                 // must not prevent TokensMinted from being emitted.
-                match find_vault_by_underlying(&services.pool, underlying).await
-                {
+                match find_vault(&services.pool, underlying, network).await {
                     Ok(Some(vault)) => {
                         let receipt_info = ReceiptInformation::new(
                             tokenization_request_id.clone(),
@@ -1010,6 +1014,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -1019,6 +1024,7 @@ impl Mint {
             tokenization_request_id,
             quantity,
             underlying,
+            network,
             wallet,
             journal_confirmed_at,
             ..
@@ -1031,7 +1037,7 @@ impl Mint {
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
-        let vault = find_vault_by_underlying(&services.pool, underlying)
+        let vault = find_vault(&services.pool, underlying, network)
             .await
             .map_err(|e| MintError::AssetView { message: e.to_string() })?
             .ok_or_else(|| MintError::AssetNotFound {
@@ -1103,6 +1109,7 @@ impl Mint {
                                     tokenization_request_id,
                                     quantity,
                                     underlying,
+                                    network,
                                     wallet: *wallet,
                                     journal_confirmed_at: *journal_confirmed_at,
                                     receipt_note: Some("Recovery mint"),
@@ -1211,6 +1218,7 @@ impl Mint {
                 tokenization_request_id,
                 quantity,
                 underlying,
+                network,
                 wallet: *wallet,
                 journal_confirmed_at: *journal_confirmed_at,
                 receipt_note: Some("Recovery mint"),
@@ -2154,7 +2162,9 @@ pub(crate) mod tests {
     use crate::prepare_event_sourced_startup;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::test_utils::{log_count_at, logs_contain_at};
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        AssetKey, TokenizedAsset, TokenizedAssetCommand,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
@@ -2348,9 +2358,10 @@ pub(crate) mod tests {
                     .unwrap();
 
             let underlying = UnderlyingSymbol::new("AAPL");
+            let asset_key = AssetKey::new(underlying.clone(), Network::Base);
             asset_store
                 .send(
-                    &underlying,
+                    &asset_key,
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new("tAAPL"),
@@ -3404,7 +3415,7 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base),
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -3587,7 +3598,7 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base),
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
@@ -3786,7 +3797,7 @@ pub(crate) mod tests {
 
         asset_store
             .send(
-                &UnderlyingSymbol::new("AAPL"),
+                &AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Base),
                 TokenizedAssetCommand::Add {
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),

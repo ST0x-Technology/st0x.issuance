@@ -11,7 +11,7 @@ use crate::account::{
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::tokenized_asset::{
-    Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+    AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     UnderlyingSymbol,
 };
 
@@ -41,7 +41,7 @@ pub(crate) async fn setup_test_db_with_asset(
 
     asset_store
         .send(
-            &underlying,
+            &AssetKey::new(underlying.clone(), network.clone()),
             TokenizedAssetCommand::Add {
                 underlying: underlying.clone(),
                 token,

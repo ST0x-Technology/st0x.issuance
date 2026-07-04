@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use super::{AssetStatus, Network, TokenSymbol, UnderlyingSymbol};
+use super::{AssetKey, AssetStatus, Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenizedAssetViewError {
@@ -12,9 +12,9 @@ pub(crate) enum TokenizedAssetViewError {
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
     #[error(
-        "tokenized asset {underlying} has a non-live (null `$.Live`) projection row"
+        "tokenized asset {key} has a non-live (null `$.Live`) projection row"
     )]
-    NonLiveRow { underlying: UnderlyingSymbol },
+    NonLiveRow { key: AssetKey },
 }
 
 /// Read model for a tokenized asset, projected from the
@@ -62,16 +62,16 @@ pub(crate) async fn list_enabled_assets(
         .collect()
 }
 
-/// Loads the full tokenized asset view for a given underlying symbol.
+/// Loads the full tokenized asset view for a composite asset key.
 ///
 /// Returns `Ok(Some(view))` for a live asset, `Ok(None)` if no row exists
 /// (unknown asset), or an error — including
 /// [`TokenizedAssetViewError::NonLiveRow`] when a row exists but its `$.Live`
 /// is null (a non-live or corrupt projection: known but indeterminate, not
 /// "unknown").
-pub(crate) async fn load_asset_by_underlying(
+pub(crate) async fn load_asset(
     pool: &Pool<Sqlite>,
-    underlying: &UnderlyingSymbol,
+    key: &AssetKey,
 ) -> Result<Option<TokenizedAssetView>, TokenizedAssetViewError> {
     let row = sqlx::query!(
         r#"
@@ -79,7 +79,7 @@ pub(crate) async fn load_asset_by_underlying(
         FROM tokenized_asset_view
         WHERE view_id = ?
         "#,
-        underlying.0
+        key.to_string()
     )
     .fetch_optional(pool)
     .await?;
@@ -88,15 +88,8 @@ pub(crate) async fn load_asset_by_underlying(
         return Ok(None);
     };
 
-    // A row whose `$.Live` is NULL is a non-live lifecycle state (e.g. a
-    // `Failed` lifecycle) or a corrupt projection: the asset is *known* but its
-    // state is indeterminate, which is distinct from an unknown asset. Surface
-    // it as an error so the status endpoint returns 500 ("indeterminate,
-    // retry") rather than 404 ("unknown"). See SPEC.md's status-code semantics.
     let Some(live) = row.live else {
-        return Err(TokenizedAssetViewError::NonLiveRow {
-            underlying: underlying.clone(),
-        });
+        return Err(TokenizedAssetViewError::NonLiveRow { key: key.clone() });
     };
 
     let view: TokenizedAssetView = serde_json::from_str(&live)?;
@@ -104,22 +97,29 @@ pub(crate) async fn load_asset_by_underlying(
     Ok(Some(view))
 }
 
-/// Finds the vault address for a given underlying symbol.
-///
-/// Delegates to [`load_asset_by_underlying`] and so inherits its contract:
-/// `Ok(Some(vault))` if a supported asset with that underlying exists
-/// (including a frozen one — in-flight redemptions and mints of a frozen asset
-/// must still resolve their vault), `Ok(None)` only when no row exists (unknown
-/// asset), or an error on database/deserialization failure — including
-/// [`TokenizedAssetViewError::NonLiveRow`] when a row exists but its `$.Live`
-/// is null (known but indeterminate, not "not found"). Callers in the mint and
-/// redemption flows therefore see a propagated error, not `Ok(None)`, for a
-/// non-live row.
-pub(crate) async fn find_vault_by_underlying(
+/// Loads an asset by underlying symbol and network.
+pub(crate) async fn load_asset_by_network(
     pool: &Pool<Sqlite>,
     underlying: &UnderlyingSymbol,
+    network: &Network,
+) -> Result<Option<TokenizedAssetView>, TokenizedAssetViewError> {
+    load_asset(pool, &AssetKey::new(underlying.clone(), network.clone())).await
+}
+
+/// Finds the vault address for a given underlying symbol on a specific network.
+///
+/// Delegates to [`load_asset_by_network`] and so inherits its contract:
+/// `Ok(Some(vault))` if a supported asset with that key exists (including a
+/// frozen one), `Ok(None)` only when no row exists (unknown asset), or an error
+/// on database/deserialization failure -- including
+/// [`TokenizedAssetViewError::NonLiveRow`] when a row exists but its `$.Live`
+/// is null.
+pub(crate) async fn find_vault(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+    network: &Network,
 ) -> Result<Option<Address>, TokenizedAssetViewError> {
-    Ok(load_asset_by_underlying(pool, underlying)
+    Ok(load_asset_by_network(pool, underlying, network)
         .await?
         .map(|asset| asset.vault))
 }
@@ -135,7 +135,8 @@ mod tests {
     use super::*;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        AssetStatus, TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
+        AssetKey, AssetStatus, TokenizedAsset, TokenizedAssetCommand,
+        TokenizedAssetEvent,
     };
 
     struct TestHarness {
@@ -167,9 +168,10 @@ mod tests {
 
         async fn add_asset(&self, underlying: &str, vault: Address) {
             let underlying = UnderlyingSymbol::new(underlying);
+            let key = AssetKey::new(underlying.clone(), Network::Base);
             self.store
                 .send(
-                    &underlying,
+                    &key,
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
                         token: TokenSymbol::new(format!("t{}", underlying.0)),
@@ -233,7 +235,7 @@ mod tests {
         harness.add_asset("AAPL", expected_vault).await;
 
         let result =
-            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+            find_vault(pool, &UnderlyingSymbol::new("AAPL"), &Network::Base)
                 .await
                 .expect("Query should succeed");
 
@@ -246,7 +248,7 @@ mod tests {
         let TestHarness { pool, .. } = &harness;
 
         let result =
-            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+            find_vault(pool, &UnderlyingSymbol::new("AAPL"), &Network::Base)
                 .await
                 .expect("Query should succeed");
 
@@ -296,7 +298,7 @@ mod tests {
                 payload,
                 metadata
             )
-            VALUES ('TokenizedAsset', 'AAPL', 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')
+            VALUES ('TokenizedAsset', 'AAPL:base', 1, 'TokenizedAssetEvent::Added', '1.0', ?, '{}')
             ",
         )
         .bind(&event_payload)
@@ -389,7 +391,7 @@ mod tests {
                     payload,
                     metadata
                 )
-                VALUES ('TokenizedAsset', 'AAPL', ?, ?, '1.0', ?, '{}')
+                VALUES ('TokenizedAsset', 'AAPL:base', ?, ?, '1.0', ?, '{}')
                 ",
             )
             .bind(sequence)
@@ -409,17 +411,20 @@ mod tests {
 
         // `Frozen` applied on top of `Added` proves in-order replay across the
         // gap -- an out-of-order or dropped event could not yield `Frozen`.
-        let asset =
-            load_asset_by_underlying(&pool, &UnderlyingSymbol::new("AAPL"))
-                .await
-                .unwrap()
-                .expect("asset rebuilt despite the sequence gap");
+        let asset = load_asset_by_network(
+            &pool,
+            &UnderlyingSymbol::new("AAPL"),
+            &Network::Base,
+        )
+        .await
+        .unwrap()
+        .expect("asset rebuilt despite the sequence gap");
         assert_eq!(asset.status, AssetStatus::Frozen);
         assert_eq!(asset.vault, vault);
 
         // The view advances to the max event sequence, not the event count.
         let (version,): (i64,) = sqlx::query_as(
-            "SELECT version FROM tokenized_asset_view WHERE view_id = 'AAPL'",
+            "SELECT version FROM tokenized_asset_view WHERE view_id = 'AAPL:base'",
         )
         .fetch_one(&pool)
         .await
@@ -440,16 +445,19 @@ mod tests {
         sqlx::query(
             "
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{\"Live\": {\"bad_field\": 1}}')
+            VALUES ('AAPL:base', 1, '{\"Live\": {\"bad_field\": 1}}')
             ",
         )
         .execute(pool)
         .await
         .unwrap();
 
-        let result =
-            load_asset_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
-                .await;
+        let result = load_asset_by_network(
+            pool,
+            &UnderlyingSymbol::new("AAPL"),
+            &Network::Base,
+        )
+        .await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -471,21 +479,24 @@ mod tests {
         sqlx::query(
             "
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{\"Live\": null}')
+            VALUES ('AAPL:base', 1, '{\"Live\": null}')
             ",
         )
         .execute(pool)
         .await
         .unwrap();
 
-        let result =
-            load_asset_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
-                .await;
+        let result = load_asset_by_network(
+            pool,
+            &UnderlyingSymbol::new("AAPL"),
+            &Network::Base,
+        )
+        .await;
 
         assert!(matches!(
             result.unwrap_err(),
-            TokenizedAssetViewError::NonLiveRow { underlying }
-                if underlying.0 == "AAPL"
+            TokenizedAssetViewError::NonLiveRow { key }
+                if key.to_string() == "AAPL:base"
         ));
     }
 
@@ -501,7 +512,7 @@ mod tests {
         sqlx::query(
             "
             INSERT INTO tokenized_asset_view (view_id, version, payload)
-            VALUES ('AAPL', 1, '{\"Live\": null}')
+            VALUES ('AAPL:base', 1, '{\"Live\": null}')
             ",
         )
         .execute(pool)
@@ -509,13 +520,13 @@ mod tests {
         .unwrap();
 
         let result =
-            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+            find_vault(pool, &UnderlyingSymbol::new("AAPL"), &Network::Base)
                 .await;
 
         assert!(matches!(
             result.unwrap_err(),
-            TokenizedAssetViewError::NonLiveRow { underlying }
-                if underlying.0 == "AAPL"
+            TokenizedAssetViewError::NonLiveRow { key }
+                if key.to_string() == "AAPL:base"
         ));
     }
 
@@ -533,7 +544,7 @@ mod tests {
         harness.add_asset("AAPL", vault_b).await;
 
         let result =
-            find_vault_by_underlying(pool, &UnderlyingSymbol::new("AAPL"))
+            find_vault(pool, &UnderlyingSymbol::new("AAPL"), &Network::Base)
                 .await
                 .expect("Query should succeed");
 
@@ -556,18 +567,19 @@ mod tests {
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         harness.add_asset("AAPL", vault).await;
 
-        let before = load_asset_by_underlying(pool, &underlying)
+        let key = AssetKey::new(underlying.clone(), Network::Base);
+        let before = load_asset(pool, &key)
             .await
             .unwrap()
             .expect("asset exists before freeze");
         assert_eq!(before.status, AssetStatus::Enabled);
 
         store
-            .send(&underlying, TokenizedAssetCommand::Freeze)
+            .send(&key, TokenizedAssetCommand::Freeze)
             .await
             .expect("Failed to freeze asset");
 
-        let after = load_asset_by_underlying(pool, &underlying)
+        let after = load_asset(pool, &key)
             .await
             .unwrap()
             .expect("asset exists after freeze");
@@ -580,7 +592,7 @@ mod tests {
 
         // A frozen asset must still resolve its vault so in-flight redemptions
         // and mints can complete.
-        let resolved = find_vault_by_underlying(pool, &underlying)
+        let resolved = find_vault(pool, &underlying, &Network::Base)
             .await
             .expect("Query should succeed");
         assert_eq!(resolved, Some(vault));

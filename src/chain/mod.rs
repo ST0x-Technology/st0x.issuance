@@ -231,7 +231,8 @@ mod tests {
 
     use super::*;
     use crate::tokenized_asset::{
-        TokenSymbol, TokenizedAsset, TokenizedAssetCommand, UnderlyingSymbol,
+        AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
     };
 
     fn base_config(chain_id: u64) -> ChainConfig {
@@ -304,9 +305,10 @@ mod tests {
                 .expect("Failed to build tokenized asset store");
 
         let underlying = UnderlyingSymbol::new("AAPL");
+        let key = AssetKey::new(underlying.clone(), Network::Base);
         store
             .send(
-                &underlying,
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: underlying.clone(),
                     token: TokenSymbol::new("tAAPL"),
