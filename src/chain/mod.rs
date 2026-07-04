@@ -119,6 +119,12 @@ impl<P> ChainRegistry<P> {
             })
             .collect()
     }
+
+    pub(crate) fn runtimes(
+        &self,
+    ) -> impl Iterator<Item = (&Network, &ChainRuntime<P>)> {
+        self.runtimes.iter()
+    }
 }
 
 pub(crate) fn validate_chain_configs(

@@ -11,8 +11,41 @@
 use alloy::primitives::Address;
 use sqlx::{Pool, Sqlite};
 
-/// Checkpoint name for the global transfer poller.
+use crate::tokenized_asset::Network;
+
+/// Legacy checkpoint name for the single-chain transfer poller (Base only).
 pub(crate) const TRANSFER_POLL: &str = "transfer_poll";
+
+/// Per-network transfer poller checkpoint name.
+pub(crate) fn transfer_poll_name(network: &Network) -> String {
+    format!("transfer_poll:{network}")
+}
+
+/// Loads the transfer poll checkpoint for `network`, falling back to the legacy
+/// global name when polling Base.
+pub(crate) async fn load_transfer_poll(
+    pool: &Pool<Sqlite>,
+    network: &Network,
+) -> Result<Option<u64>, CheckpointError> {
+    if let Some(block) = load(pool, &transfer_poll_name(network)).await? {
+        return Ok(Some(block));
+    }
+
+    if network == &Network::Base {
+        load(pool, TRANSFER_POLL).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Advances the per-network transfer poll checkpoint.
+pub(crate) async fn advance_transfer_poll(
+    pool: &Pool<Sqlite>,
+    network: &Network,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    advance(pool, &transfer_poll_name(network), block_number).await
+}
 
 /// Checkpoint name for the receipt backfiller for a given vault.
 pub(crate) fn receipt_backfill_name(vault: Address) -> String {
@@ -145,6 +178,37 @@ mod tests {
             Some(500)
         );
         assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(999));
+    }
+
+    /// The Base poller must fall back to the legacy single-chain
+    /// `transfer_poll` key when no per-network checkpoint exists yet --
+    /// otherwise an upgraded deployment restarts from `backfill_start_block`
+    /// and re-processes all historical blocks. Once the per-network key is
+    /// written, it takes precedence, and non-Base networks must never see the
+    /// legacy value.
+    #[tokio::test]
+    async fn load_transfer_poll_falls_back_to_legacy_key_for_base_only() {
+        let pool = setup_pool().await;
+        advance(&pool, TRANSFER_POLL, 123).await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&pool, &Network::Base).await.unwrap(),
+            Some(123),
+            "Base must fall back to the legacy transfer_poll checkpoint"
+        );
+        assert_eq!(
+            load_transfer_poll(&pool, &Network::Ethereum).await.unwrap(),
+            None,
+            "non-Base networks must not inherit the legacy Base checkpoint"
+        );
+
+        advance_transfer_poll(&pool, &Network::Base, 456).await.unwrap();
+
+        assert_eq!(
+            load_transfer_poll(&pool, &Network::Base).await.unwrap(),
+            Some(456),
+            "the per-network key must take precedence over the legacy key"
+        );
     }
 
     #[tokio::test]

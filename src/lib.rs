@@ -8,6 +8,7 @@ use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
+use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
@@ -31,7 +32,7 @@ use crate::receipt_inventory::{
     view::{ReceiptInventoryViewReactor, rebuild_receipt_inventory_view},
 };
 use crate::redemption::{
-    Redemption,
+    Redemption, RedemptionServices,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     poller::{TransferPoller, TransferPollerConfig},
@@ -255,8 +256,6 @@ pub async fn initialize_rocket(
     );
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
-    let vault_service_for_rocket = base.vault_service.clone();
-
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(
             &pool,
@@ -269,7 +268,7 @@ pub async fn initialize_rocket(
 
     let managers = setup_redemption_managers(
         &config,
-        base.vault_service.clone(),
+        chain_registry.clone_vault_services(),
         &redemption_store,
         &receipt_inventory_store,
         &pool,
@@ -346,27 +345,43 @@ pub async fn initialize_rocket(
     });
 
     {
-        info!(
-            target: "redemption",
-            vault_count = vaults.len(),
-            "Spawning transfer poller (eth_getLogs across all vaults)"
-        );
+        let assets = list_enabled_assets(&pool).await?;
 
-        let poller = TransferPoller::new(TransferPollerConfig {
-            provider: base.http_provider.clone(),
-            bot_wallet,
-            vaults,
-            backfill_start_block: base.backfill_start_block,
-            store: redemption_store.clone(),
-            pool: pool.clone(),
-            redeem_call_manager: managers.redeem_call.clone(),
-            journal_manager: managers.journal.clone(),
-            burn_manager: managers.burn.clone(),
-        });
+        for (network, runtime) in chain_registry.runtimes() {
+            let vaults: Vec<Address> = assets
+                .iter()
+                .filter(|asset| &asset.network == network)
+                .map(|asset| asset.vault)
+                .collect();
 
-        tokio::spawn(async move {
-            poller.run().await;
-        });
+            if vaults.is_empty() {
+                continue;
+            }
+
+            info!(
+                target: "redemption",
+                network = %network,
+                vault_count = vaults.len(),
+                "Spawning transfer poller for network"
+            );
+
+            let poller = TransferPoller::new(TransferPollerConfig {
+                network: network.clone(),
+                provider: runtime.http_provider.clone(),
+                bot_wallet,
+                vaults,
+                backfill_start_block: runtime.backfill_start_block,
+                store: redemption_store.clone(),
+                pool: pool.clone(),
+                redeem_call_manager: managers.redeem_call.clone(),
+                journal_manager: managers.journal.clone(),
+                burn_manager: managers.burn.clone(),
+            });
+
+            tokio::spawn(async move {
+                poller.run().await;
+            });
+        }
     }
 
     Ok(build_rocket(RocketState {
@@ -380,7 +395,9 @@ pub async fn initialize_rocket(
         alpaca_service,
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
-        vault_service: vault_service_for_rocket,
+        vault_services: admin::NetworkVaultServices::new(
+            chain_registry.clone_vault_services(),
+        ),
     }))
 }
 
@@ -394,7 +411,7 @@ struct RocketState {
     redemption_store: Arc<Store<Redemption>>,
     alpaca_service: Arc<dyn AlpacaService>,
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
-    vault_service: Arc<dyn vault::VaultService>,
+    vault_services: admin::NetworkVaultServices,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -419,7 +436,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.redemption_store)
         .manage(state.alpaca_service)
         .manage(state.burn_recovery)
-        .manage(state.vault_service)
+        .manage(state.vault_services)
         .manage(state.pool)
         .mount(
             "/",
@@ -514,10 +531,12 @@ where
     // `receipt_burns_view` (burns keyed by redemption aggregate_id, joined with
     // receipt_inventory_view at query time to compute available balance).
     prepare_event_sourced_startup::<Redemption>(pool).await?;
+    let redemption_services =
+        RedemptionServices::new(chain_registry.clone_vault_services());
     let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
         .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
         .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
-        .build(chain_registry.base()?.vault_service.clone())
+        .build(redemption_services)
         .await?;
 
     Ok(AggregateCqrsSetup { mint_store, redemption_store })
@@ -617,7 +636,7 @@ async fn clear_canonical_projection_for_aggregate(
 
 fn setup_redemption_managers(
     config: &Config,
-    blockchain_service: Arc<dyn vault::VaultService>,
+    vault_services: HashMap<Network, Arc<dyn vault::VaultService>>,
     redemption_store: &Arc<Store<Redemption>>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
@@ -639,7 +658,7 @@ fn setup_redemption_managers(
         Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
 
     let burn = Arc::new(BurnManager::new(
-        blockchain_service,
+        vault_services,
         pool.clone(),
         redemption_store.clone(),
         receipt_service,

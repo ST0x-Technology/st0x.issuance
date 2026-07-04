@@ -7,10 +7,10 @@ use sqlx::{Pool, Sqlite, SqlitePool};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::IssuerRedemptionRequestId;
+use super::{IssuerRedemptionRequestId, default_redemption_network};
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionEvent, TokensBurnedData};
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum RedemptionView {
@@ -20,6 +20,8 @@ pub(crate) enum RedemptionView {
         issuer_request_id: IssuerRedemptionRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         tx_hash: B256,
@@ -37,6 +39,8 @@ pub(crate) enum RedemptionView {
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         alpaca_quantity: Quantity,
@@ -51,6 +55,8 @@ pub(crate) enum RedemptionView {
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         alpaca_quantity: Quantity,
@@ -83,6 +89,8 @@ pub(crate) enum RedemptionView {
         tokenization_request_id: TokenizationRequestId,
         underlying: UnderlyingSymbol,
         token: TokenSymbol,
+        #[serde(default = "default_redemption_network")]
+        network: Network,
         wallet: Address,
         quantity: Quantity,
         alpaca_quantity: Quantity,
@@ -121,6 +129,7 @@ impl RedemptionView {
         let Self::Detected {
             underlying,
             token,
+            network,
             wallet,
             quantity,
             tx_hash,
@@ -137,6 +146,7 @@ impl RedemptionView {
             tokenization_request_id,
             underlying,
             token,
+            network,
             wallet,
             quantity,
             alpaca_quantity,
@@ -157,6 +167,7 @@ impl RedemptionView {
             tokenization_request_id,
             underlying,
             token,
+            network,
             wallet,
             quantity,
             alpaca_quantity,
@@ -176,6 +187,7 @@ impl RedemptionView {
             tokenization_request_id,
             underlying,
             token,
+            network,
             wallet,
             quantity,
             alpaca_quantity,
@@ -201,6 +213,7 @@ impl RedemptionView {
             tokenization_request_id,
             underlying,
             token,
+            network,
             wallet,
             quantity,
             alpaca_quantity,
@@ -221,6 +234,7 @@ impl RedemptionView {
             tokenization_request_id,
             underlying,
             token,
+            network,
             wallet,
             quantity,
             alpaca_quantity,
@@ -245,6 +259,7 @@ impl RedemptionView {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -254,6 +269,7 @@ impl RedemptionView {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: network.clone(),
                 wallet: *wallet,
                 quantity: quantity.clone(),
                 tx_hash: *tx_hash,
@@ -265,6 +281,7 @@ impl RedemptionView {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -276,6 +293,7 @@ impl RedemptionView {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: network.clone(),
                 wallet: *wallet,
                 quantity: quantity.clone(),
                 tx_hash: *tx_hash,
@@ -335,6 +353,7 @@ impl RedemptionView {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -352,6 +371,7 @@ impl RedemptionView {
                 tokenization_request_id: tokenization_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: network.clone(),
                 wallet: *wallet,
                 quantity: quantity.clone(),
                 alpaca_quantity: alpaca_quantity.clone(),
@@ -731,7 +751,7 @@ mod tests {
         BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionEvent,
         TokensBurnedData,
     };
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
     async fn migrated_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -843,6 +863,7 @@ mod tests {
                     issuer_request_id: id.clone(),
                     underlying: UnderlyingSymbol::new(underlying),
                     token: TokenSymbol::new(format!("t{underlying}")),
+                    network: Network::Base,
                     wallet,
                     quantity: Quantity::new(Decimal::from(quantity)),
                     tx_hash,
@@ -989,6 +1010,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -1009,6 +1031,7 @@ mod tests {
             block_number: view_block_number,
             detected_at: view_detected_at,
             detected_entered_at: view_detected_entered_at,
+            ..
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Detected view");
@@ -1053,6 +1076,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -1090,6 +1114,7 @@ mod tests {
             block_number: view_block_number,
             detected_at: view_detected_at,
             called_at: view_called_at,
+            ..
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected AlpacaCalled view");
@@ -1137,6 +1162,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -1187,6 +1213,7 @@ mod tests {
             called_at: view_called_at,
             alpaca_journal_completed_at: view_alpaca_journal_completed_at,
             burning_entered_at: view_burning_entered_at,
+            ..
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burning view");
@@ -1240,6 +1267,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -1302,6 +1330,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -1659,6 +1688,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -1820,6 +1850,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: quantity.clone(),
             tx_hash: b256!(
@@ -2062,6 +2093,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -2100,6 +2132,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -2163,6 +2196,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -2195,6 +2229,7 @@ mod tests {
             called_at: view_called_at,
             alpaca_journal_completed_at: view_journal_completed_at,
             burning_entered_at: view_burning_entered_at,
+            ..
         } = load_view(&pool, &issuer_request_id).await
         else {
             panic!("Expected Burning view after BurnResumed");

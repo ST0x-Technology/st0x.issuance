@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -148,9 +149,41 @@ impl std::fmt::Display for BurnExternalTxId {
         f.write_str(&self.0)
     }
 }
-use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::VaultError;
 use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
+
+pub(super) const fn default_redemption_network() -> Network {
+    Network::Base
+}
+
+/// Per-network vault services for redemption command handling ([RAI-1207]).
+pub(crate) struct RedemptionServices {
+    vaults: HashMap<Network, Arc<dyn VaultService>>,
+}
+
+impl RedemptionServices {
+    pub(crate) fn new(vaults: HashMap<Network, Arc<dyn VaultService>>) -> Self {
+        Self { vaults }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_single_vault(
+        network: Network,
+        vault: Arc<dyn VaultService>,
+    ) -> Self {
+        Self { vaults: HashMap::from([(network, vault)]) }
+    }
+
+    fn vault_for(
+        &self,
+        network: &Network,
+    ) -> Result<&Arc<dyn VaultService>, RedemptionError> {
+        self.vaults.get(network).ok_or_else(|| {
+            RedemptionError::NetworkNotConfigured { network: network.clone() }
+        })
+    }
+}
 
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent, TokensBurnedData};
@@ -164,6 +197,8 @@ pub(crate) struct RedemptionMetadata {
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     pub(crate) underlying: UnderlyingSymbol,
     pub(crate) token: TokenSymbol,
+    #[serde(default = "default_redemption_network")]
+    pub(crate) network: Network,
     pub(crate) wallet: Address,
     pub(crate) quantity: Quantity,
     pub(crate) detected_tx_hash: B256,
@@ -387,7 +422,7 @@ impl Redemption {
     /// Produces `BurnFireblocksSubmitted` on success; failure is propagated to caller.
     async fn handle_burn_tokens(
         &self,
-        services: &Arc<dyn VaultService>,
+        services: &RedemptionServices,
         issuer_request_id: IssuerRedemptionRequestId,
         input: BurnInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
@@ -399,6 +434,7 @@ impl Redemption {
         };
 
         let user_wallet = metadata.wallet;
+        let vault_service = services.vault_for(&metadata.network)?;
 
         let planned_burns: Vec<BurnRecord> = input
             .burns
@@ -409,7 +445,7 @@ impl Redemption {
             })
             .collect();
 
-        let submitted = services
+        let submitted = vault_service
             .submit_burn(MultiBurnParams {
                 vault: input.vault,
                 burns: input.burns,
@@ -441,12 +477,16 @@ impl Redemption {
     /// Confirms a previously submitted burn transaction.
     async fn handle_confirm_burn(
         &self,
-        services: &Arc<dyn VaultService>,
+        services: &RedemptionServices,
         issuer_request_id: IssuerRedemptionRequestId,
         fireblocks_tx_id: String,
         dust_shares: U256,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Self::BurnSubmitted { fireblocks_tx_id: stored_tx_id, .. } = self
+        let Self::BurnSubmitted {
+            metadata,
+            fireblocks_tx_id: stored_tx_id,
+            ..
+        } = self
         else {
             return Err(RedemptionError::InvalidState {
                 expected: "BurnSubmitted".to_string(),
@@ -461,7 +501,9 @@ impl Redemption {
             });
         }
 
-        let result = services
+        let vault_service = services.vault_for(&metadata.network)?;
+
+        let result = vault_service
             .confirm_burn(&fireblocks_tx_id, dust_shares)
             .await
             .map_err(|error: VaultError| RedemptionError::Vault {
@@ -538,6 +580,7 @@ impl Redemption {
             issuer_request_id,
             underlying: metadata.underlying,
             token: metadata.token,
+            network: metadata.network,
             wallet: metadata.wallet,
             quantity: metadata.quantity,
             tx_hash: metadata.detected_tx_hash,
@@ -573,6 +616,7 @@ impl Redemption {
             issuer_request_id: input.issuer_request_id,
             underlying: input.metadata.underlying,
             token: input.metadata.token,
+            network: input.metadata.network,
             wallet: input.metadata.wallet,
             quantity: input.metadata.quantity,
             tx_hash: input.metadata.detected_tx_hash,
@@ -815,6 +859,8 @@ pub(crate) enum RedemptionError {
         "Burn retry attempt counter overflowed for external tx id: {latest_external_tx_id}"
     )]
     RetryAttemptOverflow { latest_external_tx_id: BurnExternalTxId },
+    #[error("network {network} is not configured")]
+    NetworkNotConfigured { network: Network },
 }
 
 #[async_trait]
@@ -823,12 +869,12 @@ impl EventSourced for Redemption {
     type Event = RedemptionEvent;
     type Command = RedemptionCommand;
     type Error = RedemptionError;
-    type Services = Arc<dyn VaultService>;
+    type Services = RedemptionServices;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -836,6 +882,7 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -846,6 +893,7 @@ impl EventSourced for Redemption {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token: token.clone(),
+                    network: network.clone(),
                     wallet: *wallet,
                     quantity: quantity.clone(),
                     detected_tx_hash: *tx_hash,
@@ -875,6 +923,7 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -883,6 +932,7 @@ impl EventSourced for Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -1076,6 +1126,7 @@ impl Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -1086,6 +1137,7 @@ impl Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -1098,6 +1150,7 @@ impl Redemption {
                         issuer_request_id,
                         underlying,
                         token,
+                        network,
                         wallet,
                         quantity,
                         detected_tx_hash: tx_hash,
@@ -1188,6 +1241,7 @@ impl Redemption {
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -1206,6 +1260,7 @@ impl Redemption {
                         issuer_request_id,
                         underlying,
                         token,
+                        network,
                         wallet,
                         quantity,
                         detected_tx_hash: tx_hash,
@@ -1280,17 +1335,20 @@ mod tests {
     use super::{
         BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, Redemption,
         RedemptionCommand, RedemptionError, RedemptionEvent,
-        RedemptionMetadata, TokensBurnedData,
+        RedemptionMetadata, RedemptionServices, TokensBurnedData,
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+    use crate::vault::MultiBurnEntry;
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{MultiBurnEntry, VaultService};
 
-    fn mock_services() -> Arc<dyn VaultService> {
-        Arc::new(MockVaultService::new_success())
+    fn mock_services() -> RedemptionServices {
+        RedemptionServices::with_single_vault(
+            Network::Base,
+            Arc::new(MockVaultService::new_success()),
+        )
     }
 
     #[test]
@@ -1344,6 +1402,7 @@ mod tests {
                 ),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 quantity: Quantity::new(Decimal::from(1)),
                 tx_hash: detected_tx_hash,
@@ -1386,6 +1445,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -1405,6 +1465,7 @@ mod tests {
             tx_hash: event_tx_hash,
             block_number: event_block_number,
             detected_at,
+            ..
         } = &events[0]
         else {
             panic!("Expected Detected event, got {:?}", &events[0]);
@@ -1437,6 +1498,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -1447,6 +1509,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
+                network: Network::Base,
                 wallet,
                 quantity,
                 tx_hash,
@@ -1484,6 +1547,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -1500,6 +1564,7 @@ mod tests {
                     issuer_request_id,
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     detected_tx_hash: tx_hash,
@@ -1520,6 +1585,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL"),
                 token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
                 wallet: address!(
                     "0x1234567890abcdef1234567890abcdef12345678"
                 ),
@@ -1594,6 +1660,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("TSLA"),
                 token: TokenSymbol::new("tTSLA"),
+                network: Network::Base,
                 wallet: address!(
                     "0x9876543210fedcba9876543210fedcba98765432"
                 ),
@@ -1664,6 +1731,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -1754,6 +1822,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -1782,6 +1851,7 @@ mod tests {
                     issuer_request_id,
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     detected_tx_hash: tx_hash,
@@ -1810,6 +1880,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -1867,6 +1938,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("TSLA"),
                     token: TokenSymbol::new("tTSLA"),
+                    network: Network::Base,
                     wallet: user_wallet,
                     quantity: Quantity::new(Decimal::from(100)),
                     tx_hash: b256!(
@@ -1932,6 +2004,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("NVDA"),
                 token: TokenSymbol::new("tNVDA"),
+                network: Network::Base,
                 wallet: address!(
                     "0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"
                 ),
@@ -1970,6 +2043,102 @@ mod tests {
         );
     }
 
+    fn burning_given_events_on_network(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
+    ) -> Vec<RedemptionEvent> {
+        let mut events = burning_given_events(issuer_request_id);
+        let RedemptionEvent::Detected { network: event_network, .. } =
+            &mut events[0]
+        else {
+            panic!("burning_given_events must start with Detected");
+        };
+        *event_network = network;
+        events
+    }
+
+    fn burn_submitted_given_events_on_network(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        network: Network,
+    ) -> Vec<RedemptionEvent> {
+        let mut events =
+            burning_given_events_on_network(issuer_request_id, network);
+        events.push(RedemptionEvent::BurnFireblocksSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&b256!(
+                "0x4444444444444444444444444444444444444444444444444444444444444444"
+            )),
+            fireblocks_tx_id: "fb-799".to_string(),
+            planned_burns: vec![],
+            submitted_at: Utc::now(),
+        });
+        events
+    }
+
+    #[tokio::test]
+    async fn test_burn_tokens_network_not_configured() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(burning_given_events_on_network(
+                &issuer_request_id,
+                Network::Ethereum,
+            ))
+            .when(RedemptionCommand::BurnTokens {
+                issuer_request_id,
+                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                burns: vec![MultiBurnEntry {
+                    receipt_id: uint!(1_U256),
+                    burn_shares: uint!(17_000000000000000000_U256),
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                }],
+                dust_shares: U256::ZERO,
+                owner: address!("0x1111111111111111111111111111111111111111"),
+                external_tx_id: None,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::NetworkNotConfigured {
+                network: Network::Ethereum,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confirm_burn_network_not_configured() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let error = TestHarness::<Redemption>::with(mock_services())
+            .given(burn_submitted_given_events_on_network(
+                &issuer_request_id,
+                Network::Ethereum,
+            ))
+            .when(RedemptionCommand::ConfirmBurn {
+                issuer_request_id,
+                fireblocks_tx_id: "fb-799".to_string(),
+                dust_shares: U256::ZERO,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(error) = error else {
+            panic!("Expected Apply error, got {error:?}");
+        };
+        assert_eq!(
+            error,
+            RedemptionError::NetworkNotConfigured {
+                network: Network::Ethereum,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn test_record_burn_failure_from_burning_state() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
@@ -1981,6 +2150,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("GOOG"),
                     token: TokenSymbol::new("tGOOG"),
+                    network: Network::Base,
                     wallet: address!(
                         "0xabababababababababababababababababababab"
                     ),
@@ -2066,6 +2236,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("ARKK"),
                 token: TokenSymbol::new("tARKK"),
+                network: Network::Base,
                 wallet: address!("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
                 quantity: Quantity::new(Decimal::from(17)),
                 tx_hash: b256!(
@@ -2198,6 +2369,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("ARKK"),
                 token: TokenSymbol::new("tARKK"),
+                network: Network::Base,
                 wallet: address!(
                     "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
                 ),
@@ -2388,6 +2560,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
+                network: Network::Base,
                 wallet,
                 quantity,
                 tx_hash: detected_tx_hash,
@@ -2452,6 +2625,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying,
                 token,
+                network: Network::Base,
                 wallet,
                 quantity,
                 tx_hash,
@@ -2503,6 +2677,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -2685,6 +2860,7 @@ mod tests {
             issuer_request_id: IssuerRedemptionRequestId::random(),
             underlying: UnderlyingSymbol::new("RKLB"),
             token: TokenSymbol::new("tRKLB"),
+            network: Network::Base,
             wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
             quantity: Quantity::new(Decimal::from(100)),
             detected_tx_hash: b256!(
@@ -2707,6 +2883,7 @@ mod tests {
                     issuer_request_id: expected_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2753,6 +2930,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
+                network: metadata.network.clone(),
                 wallet: metadata.wallet,
                 quantity: metadata.quantity.clone(),
                 tx_hash: metadata.detected_tx_hash,
@@ -2786,6 +2964,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2833,6 +3012,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2916,6 +3096,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
+                network: metadata.network.clone(),
                 wallet: metadata.wallet,
                 quantity: metadata.quantity.clone(),
                 tx_hash: metadata.detected_tx_hash,
@@ -2937,6 +3118,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             tx_hash: metadata.detected_tx_hash,
@@ -2953,6 +3135,7 @@ mod tests {
                     issuer_request_id,
                     underlying: metadata.underlying,
                     token: metadata.token,
+                    network: metadata.network,
                     wallet: metadata.wallet,
                     quantity: metadata.quantity,
                     detected_tx_hash: metadata.detected_tx_hash,
@@ -2988,6 +3171,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -3042,6 +3226,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -3098,6 +3283,7 @@ mod tests {
                 issuer_request_id: metadata.issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
+                network: metadata.network.clone(),
                 wallet: metadata.wallet,
                 quantity: metadata.quantity.clone(),
                 tx_hash: metadata.detected_tx_hash,
@@ -3130,6 +3316,7 @@ mod tests {
                 issuer_request_id: metadata.issuer_request_id.clone(),
                 underlying: metadata.underlying.clone(),
                 token: metadata.token.clone(),
+                network: metadata.network.clone(),
                 wallet: metadata.wallet,
                 quantity: metadata.quantity.clone(),
                 tx_hash: metadata.detected_tx_hash,
@@ -3151,6 +3338,7 @@ mod tests {
             issuer_request_id: metadata.issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             tx_hash: metadata.detected_tx_hash,

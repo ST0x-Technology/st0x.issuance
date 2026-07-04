@@ -572,10 +572,11 @@ mod tests {
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
-        Redemption, RedemptionCommand, RedemptionView, UnderlyingSymbol,
+        Redemption, RedemptionCommand, RedemptionServices, RedemptionView,
+        UnderlyingSymbol,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::TokenSymbol;
+    use crate::tokenized_asset::{Network, TokenSymbol};
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
 
@@ -605,7 +606,10 @@ mod tests {
             Arc::new(MockVaultService::new_success());
         let store = StoreBuilder::<Redemption>::new(pool.clone())
             .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-            .build(vault_service)
+            .build(RedemptionServices::with_single_vault(
+                Network::Base,
+                vault_service,
+            ))
             .await
             .expect("Failed to build redemption store");
 
@@ -624,6 +628,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: UnderlyingSymbol::new("AAPL"),
                     token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
                     ),
@@ -1508,6 +1513,7 @@ mod tests {
             tokenization_request_id,
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: quantity.clone(),
             alpaca_quantity: quantity.clone(),

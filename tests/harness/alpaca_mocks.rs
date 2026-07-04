@@ -28,13 +28,23 @@ pub struct RedemptionState {
     pub underlying_symbol: String,
     pub token_symbol: String,
     pub wallet_address: String,
+    pub network: String,
 }
 
 pub fn setup_redemption_mocks(
     mock_alpaca: &MockServer,
 ) -> (Mock<'_>, Mock<'_>) {
+    setup_redemption_mocks_with_states(
+        mock_alpaca,
+        Arc::new(Mutex::new(Vec::<RedemptionState>::new())),
+    )
+}
+
+pub fn setup_redemption_mocks_with_states(
+    mock_alpaca: &MockServer,
+    shared_state: Arc<Mutex<Vec<RedemptionState>>>,
+) -> (Mock<'_>, Mock<'_>) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
-    let shared_state = Arc::new(Mutex::new(Vec::<RedemptionState>::new()));
 
     let shared_state_redeem = Arc::clone(&shared_state);
 
@@ -64,6 +74,8 @@ pub fn setup_redemption_mocks(
                     .as_str()
                     .unwrap()
                     .to_string();
+                let network =
+                    body["network"].as_str().unwrap().to_string();
 
                 shared_state_redeem.lock().unwrap().push(
                     RedemptionState {
@@ -73,6 +85,7 @@ pub fn setup_redemption_mocks(
                         underlying_symbol: underlying_symbol.clone(),
                         token_symbol: token_symbol.clone(),
                         wallet_address: wallet_address.clone(),
+                        network: network.clone(),
                     },
                 );
 
@@ -87,7 +100,7 @@ pub fn setup_redemption_mocks(
                     "token_symbol": token_symbol,
                     "qty": qty,
                     "issuer": "test-issuer",
-                    "network": "base",
+                    "network": network,
                     "wallet_address": wallet_address,
                     "tx_hash": tx_hash,
                     "fees": "0.5"
@@ -159,7 +172,7 @@ pub fn setup_redemption_mocks(
                     "token_symbol": state.token_symbol,
                     "qty": state.qty,
                     "issuer": "test-issuer",
-                    "network": "base",
+                    "network": state.network,
                     "wallet_address": state.wallet_address,
                     "tx_hash": state.tx_hash,
                     "fees": "0.5"

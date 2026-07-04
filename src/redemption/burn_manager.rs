@@ -2,6 +2,7 @@ use alloy::primitives::{Address, B256, U256};
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -54,8 +55,8 @@ pub(crate) enum RecoveryOutcome {
 ///
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
 pub(crate) struct BurnManager {
-    /// Used only for balance queries during recovery (not for burns - those go through aggregate)
-    vault_service: Arc<dyn VaultService>,
+    /// Per-network vault services for balance queries and Fireblocks recovery.
+    vault_services: HashMap<Network, Arc<dyn VaultService>>,
     view_pool: Pool<Sqlite>,
     store: Arc<Store<Redemption>>,
     receipt_service: Arc<dyn ReceiptService>,
@@ -67,20 +68,46 @@ impl BurnManager {
     ///
     /// # Arguments
     ///
-    /// * `vault_service` - Vault service for balance queries during recovery
+    /// * `vault_services` - Per-network vault services for recovery paths
     /// * `view_pool` - Database pool for querying views
     /// * `store` - Event-sorcery store for dispatching commands and loading
     ///   aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
     pub(crate) fn new(
+        vault_services: HashMap<Network, Arc<dyn VaultService>>,
+        view_pool: Pool<Sqlite>,
+        store: Arc<Store<Redemption>>,
+        receipt_service: Arc<dyn ReceiptService>,
+        bot_wallet: Address,
+    ) -> Self {
+        Self { vault_services, view_pool, store, receipt_service, bot_wallet }
+    }
+
+    fn vault_for(
+        &self,
+        network: &Network,
+    ) -> Result<&Arc<dyn VaultService>, RedemptionError> {
+        self.vault_services.get(network).ok_or_else(|| {
+            RedemptionError::NetworkNotConfigured { network: network.clone() }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
         vault_service: Arc<dyn VaultService>,
         view_pool: Pool<Sqlite>,
         store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
     ) -> Self {
-        Self { vault_service, view_pool, store, receipt_service, bot_wallet }
+        Self::new(
+            HashMap::from([(Network::Base, vault_service)]),
+            view_pool,
+            store,
+            receipt_service,
+            bot_wallet,
+        )
     }
 
     /// Recovers redemptions stuck in the `Burning` state at startup.
@@ -187,10 +214,10 @@ impl BurnManager {
                 }
             })?;
 
-        let underlying = match &redemption {
+        let (underlying, network) = match &redemption {
             Redemption::Burning { metadata, .. }
             | Redemption::BurnSubmitted { metadata, .. } => {
-                metadata.underlying.clone()
+                (metadata.underlying.clone(), metadata.network.clone())
             }
             other => {
                 return Err(BurnManagerError::InvalidAggregateState {
@@ -199,14 +226,14 @@ impl BurnManager {
             }
         };
 
-        let vault = find_vault(&self.view_pool, &underlying, &Network::Base)
+        let vault = find_vault(&self.view_pool, &underlying, &network)
             .await?
             .ok_or(BurnManagerError::AssetNotFound { underlying })?;
 
         // Verify the burn actually landed on-chain before recording a terminal
         // success — never trust the operator-supplied hash blindly.
         let verification = self
-            .vault_service
+            .vault_for(&network)?
             .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
             .await?;
 
@@ -339,6 +366,7 @@ impl BurnManager {
     ) -> Result<(), BurnManagerError> {
         let RedemptionView::BurnFailed {
             underlying,
+            network,
             token,
             wallet,
             quantity,
@@ -360,16 +388,18 @@ impl BurnManager {
             return Ok(());
         };
 
-        let vault = find_vault(&self.view_pool, underlying, &Network::Base)
+        let vault = find_vault(&self.view_pool, underlying, network)
             .await?
             .ok_or_else(|| BurnManagerError::AssetNotFound {
                 underlying: underlying.clone(),
             })?;
 
+        let vault_service = self.vault_for(network)?;
+
         // If a Fireblocks tx was already submitted before failure, inspect it
         // before deciding whether to confirm, wait, or submit a replacement.
         let retry_external_tx_id = if let Some(fb_tx_id) = fireblocks_tx_id {
-            match self.vault_service.check_fireblocks_tx(fb_tx_id).await? {
+            match vault_service.check_fireblocks_tx(fb_tx_id).await? {
                 // Completed: the tx landed on-chain. None: non-Fireblocks
                 // backend with no status to inspect. Both confirm/record the
                 // existing tx rather than resubmit.
@@ -377,6 +407,7 @@ impl BurnManager {
                     return self
                         .recover_burn_failed_with_existing_tx(
                             issuer_request_id,
+                            network,
                             vault,
                             fb_tx_id,
                             dust_quantity,
@@ -429,10 +460,8 @@ impl BurnManager {
         // shares, the burn likely already succeeded on-chain but we crashed before
         // recording it (e.g., RPC timeout via VaultError::PendingTransaction).
         // Skip this redemption to avoid double-burning. Manual intervention required.
-        let on_chain_balance = self
-            .vault_service
-            .get_share_balance(vault, self.bot_wallet)
-            .await?;
+        let on_chain_balance =
+            vault_service.get_share_balance(vault, self.bot_wallet).await?;
 
         if on_chain_balance < total_shares {
             let reason = format!(
@@ -473,6 +502,7 @@ impl BurnManager {
             issuer_request_id: issuer_request_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: network.clone(),
             wallet: *wallet,
             quantity: quantity.clone(),
             detected_tx_hash: *tx_hash,
@@ -518,6 +548,7 @@ impl BurnManager {
     async fn recover_burn_failed_with_existing_tx(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
+        network: &Network,
         vault: Address,
         fireblocks_tx_id: &str,
         dust_quantity: &crate::Quantity,
@@ -530,7 +561,7 @@ impl BurnManager {
         );
 
         match self
-            .vault_service
+            .vault_for(network)?
             .confirm_burn(fireblocks_tx_id, dust_shares)
             .await
         {
@@ -630,7 +661,7 @@ impl BurnManager {
                 let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
-                    &Network::Base,
+                    &metadata.network,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -725,7 +756,7 @@ impl BurnManager {
                 let vault = find_vault(
                     &self.view_pool,
                     &metadata.underlying,
-                    &Network::Base,
+                    &metadata.network,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -747,7 +778,7 @@ impl BurnManager {
                 // Resolve manually via the admin `force-complete` endpoint (records the
                 // verified burn tx) for landed burns, or `close` for ambiguous cases.
                 let on_chain_balance = self
-                    .vault_service
+                    .vault_for(&metadata.network)?
                     .get_share_balance(vault, self.bot_wallet)
                     .await?;
 
@@ -838,9 +869,12 @@ impl BurnManager {
             });
         };
 
-        let Some(vault) =
-            find_vault(&self.view_pool, &metadata.underlying, &Network::Base)
-                .await?
+        let Some(vault) = find_vault(
+            &self.view_pool,
+            &metadata.underlying,
+            &metadata.network,
+        )
+        .await?
         else {
             let error_msg = format!(
                 "No vault configured for underlying asset {}",
@@ -1415,17 +1449,19 @@ mod tests {
     };
     use crate::fireblocks::FireblocksVaultError;
     use crate::mint::IssuerMintRequestId;
-    use crate::mint::{Network, Quantity, TokenizationRequestId};
+    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptId, ReceiptInventory,
         ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
     use crate::redemption::BurnExternalTxId;
+    use crate::redemption::RedemptionServices;
     use crate::redemption::view::RedemptionViewReactor;
     use crate::redemption::{
         BurnRecord, IssuerRedemptionRequestId, RedemptionError,
     };
     use crate::test_utils::logs_contain_at;
+    use crate::tokenized_asset::Network;
     use crate::tokenized_asset::{
         AssetKey, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
@@ -1540,7 +1576,10 @@ mod tests {
             // `find_burning`/`find_burn_failed` populated during recovery.
             let store = StoreBuilder::<Redemption>::new(pool.clone())
                 .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
-                .build(vault_service)
+                .build(RedemptionServices::with_single_vault(
+                    Network::Base,
+                    vault_service,
+                ))
                 .await
                 .expect("Failed to build redemption store");
 
@@ -1637,6 +1676,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -1691,7 +1731,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -1756,7 +1796,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -1849,7 +1889,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -1898,7 +1938,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -1940,7 +1980,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -1982,7 +2022,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2090,7 +2130,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2175,7 +2215,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2252,7 +2292,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2330,7 +2370,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2391,7 +2431,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2452,7 +2492,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2509,7 +2549,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2550,7 +2590,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2575,6 +2615,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -2611,7 +2652,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2660,7 +2701,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2696,6 +2737,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity: quantity.clone(),
                     tx_hash,
@@ -2755,7 +2797,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2802,7 +2844,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2857,7 +2899,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2898,7 +2940,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2921,7 +2963,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -2970,7 +3012,7 @@ mod tests {
         );
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3010,7 +3052,7 @@ mod tests {
         let blockchain_service_mock = Arc::new(MockVaultService::new_success());
         let blockchain_service = blockchain_service_mock.clone()
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3036,6 +3078,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
+                    network: Network::Base,
                     wallet,
                     quantity,
                     tx_hash,
@@ -3072,7 +3115,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3154,7 +3197,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3251,7 +3294,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3355,7 +3398,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3433,7 +3476,7 @@ mod tests {
         harness.add_asset(&underlying, vault).await;
 
         let blockchain_service: Arc<dyn VaultService> = vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3505,7 +3548,7 @@ mod tests {
         );
         let blockchain_service =
             blockchain_service_mock.clone() as Arc<dyn VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3579,7 +3622,7 @@ mod tests {
         );
         let blockchain_service =
             blockchain_service_mock.clone() as Arc<dyn VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3646,7 +3689,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             pool.clone(),
             store.clone(),
@@ -3755,7 +3798,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),
@@ -3834,7 +3877,7 @@ mod tests {
 
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),
@@ -3896,7 +3939,7 @@ mod tests {
 
         let blockchain_service = Arc::new(MockVaultService::new_success())
             as Arc<dyn crate::vault::VaultService>;
-        let manager = BurnManager::new(
+        let manager = BurnManager::new_for_tests(
             blockchain_service,
             harness.pool.clone(),
             harness.store.clone(),

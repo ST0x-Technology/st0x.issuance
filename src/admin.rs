@@ -8,6 +8,7 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -31,7 +32,7 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
-use crate::tokenized_asset::UnderlyingSymbol;
+use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnVerification, FireblocksTxStatus, VaultError, VaultService,
 };
@@ -73,6 +74,40 @@ impl RedemptionBurnRecovery for BurnManager {
     }
 }
 
+/// Per-network vault services for admin Fireblocks lookups, held in Rocket
+/// managed state. Mirrors the map the live redemption path threads through
+/// `RedemptionServices`/`BurnManager`, so admin recovery and triage query the
+/// same signing backend as the flow that submitted the transaction.
+pub(crate) struct NetworkVaultServices(HashMap<Network, Arc<dyn VaultService>>);
+
+impl NetworkVaultServices {
+    pub(crate) fn new(
+        services: HashMap<Network, Arc<dyn VaultService>>,
+    ) -> Self {
+        Self(services)
+    }
+
+    fn get(
+        &self,
+        network: &Network,
+    ) -> Result<&Arc<dyn VaultService>, UnconfiguredNetworkError> {
+        self.0.get(network).ok_or_else(|| UnconfiguredNetworkError {
+            network: network.clone(),
+        })
+    }
+
+    /// True when more than one network has a configured vault service.
+    fn is_multichain(&self) -> bool {
+        self.0.len() > 1
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no vault service configured for network {network}")]
+struct UnconfiguredNetworkError {
+    network: Network,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregateKind {
@@ -104,6 +139,13 @@ pub(crate) struct StuckAggregate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = String)]
     quantity: Option<Quantity>,
+    /// Network the aggregate's on-chain activity lives on. Tells operators
+    /// which chain to inspect (and which signing backend the Fireblocks
+    /// enrichment queried). `None` when neither the view variant nor the
+    /// event history records a network (the redemption `Failed` view variant
+    /// carries none, so it falls back to the history's detection event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<Network>,
     /// Primary on-chain transaction hash for this aggregate, when known.
     /// For redemptions this is the detected transfer tx hash. For mints this
     /// is the successful mint tx hash, or a Fireblocks network hash when the
@@ -213,6 +255,7 @@ async fn load_reprocess_context(
                 issuer_request_id,
                 underlying,
                 token,
+                network,
                 wallet,
                 quantity,
                 tx_hash,
@@ -224,6 +267,7 @@ async fn load_reprocess_context(
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
                         token: token.clone(),
+                        network: network.clone(),
                         wallet: *wallet,
                         quantity: quantity.clone(),
                         detected_tx_hash: *tx_hash,
@@ -310,7 +354,8 @@ async fn load_reprocess_context(
         (status = 409, description = "Redemption already completed"),
         (status = 422,
             description = "Cannot recover: Alpaca journal pending/rejected, \
-                Fireblocks burn still pending, or invalid aggregate state"),
+                Fireblocks burn still pending, invalid aggregate state, or \
+                the redemption's network has no configured vault service"),
         (status = 502,
             description = "Alpaca poll, Fireblocks lookup, or burn execution failed"),
         (status = 500, description = "Event load/deserialize or internal failure")
@@ -322,7 +367,7 @@ async fn load_reprocess_context(
     store,
     pool,
     alpaca_service,
-    vault_service,
+    vault_services,
     burn_recovery
 ))]
 #[post("/admin/recover/redemption/<issuer_request_id>")]
@@ -331,7 +376,7 @@ pub(crate) async fn recover_redemption(
     store: &rocket::State<Arc<Store<Redemption>>>,
     pool: &rocket::State<Pool<Sqlite>>,
     alpaca_service: &rocket::State<Arc<dyn AlpacaService>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     burn_recovery: &rocket::State<Arc<dyn RedemptionBurnRecovery>>,
     issuer_request_id: IssuerRedemptionRequestId,
 ) -> Result<Json<ReprocessResponse>, Status> {
@@ -351,11 +396,23 @@ pub(crate) async fn recover_redemption(
         .await;
     };
 
+    // Prior Fireblocks burns must be inspected against the network that
+    // submitted them -- querying another chain's backend would misreport the
+    // burn as missing and risk a duplicate submission.
+    let vault_service =
+        vault_services.get(&context.metadata.network).map_err(|error| {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                error = %error,
+                "Cannot recover redemption on an unconfigured network"
+            );
+            Status::UnprocessableEntity
+        })?;
+
     // Post-Alpaca failure: verify with Alpaca before burning.
     recover_post_alpaca(
         store,
         alpaca_service,
-        vault_service.inner(),
+        vault_service,
         burn_recovery.inner(),
         PostAlpacaRecoveryInput {
             aggregate_id,
@@ -1203,12 +1260,12 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, vault_service))]
+#[tracing::instrument(skip(_auth, pool, vault_services))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
     let mut stuck = Vec::new();
@@ -1253,7 +1310,7 @@ pub(crate) async fn list_stuck(
             continue;
         }
 
-        let (underlying, quantity) = mint_view_asset(&view);
+        let (underlying, quantity, network) = mint_view_asset(&view);
         let mint_history =
             mint_history_summary(pool.inner(), &issuer_mint_request_id).await;
 
@@ -1266,14 +1323,14 @@ pub(crate) async fn list_stuck(
             timestamp: summary.timestamp,
             underlying,
             quantity,
+            network,
             tx_hash: mint_history.tx_hash,
             fireblocks_tx_id: mint_history.fireblocks_tx_id,
             fireblocks_status: None,
         });
     }
 
-    enrich_with_fireblocks_status(&mut stuck, vault_service.inner().as_ref())
-        .await;
+    enrich_with_fireblocks_status(&mut stuck, vault_services.inner()).await;
 
     Ok(Json(StuckResponse { stuck }))
 }
@@ -1334,17 +1391,41 @@ const fn redemption_stuck_info(
 }
 
 /// Best-effort enrichment: for every stuck entry with a `fireblocks_tx_id`,
-/// query the vault service for the live Fireblocks status (subStatus + network
-/// records) and attach it to the entry. Lookup failures and non-Fireblocks
-/// backends leave `fireblocks_status` as `None`; this is purely additive
-/// information for operators triaging stuck transactions.
+/// query the entry's network's vault service for the live Fireblocks status
+/// (subStatus + network records) and attach it to the entry. Entries without
+/// a resolvable network, lookup failures, and non-Fireblocks backends leave
+/// `fireblocks_status` as `None`; this is purely additive information for
+/// operators triaging stuck transactions.
 async fn enrich_with_fireblocks_status(
     stuck: &mut [StuckAggregate],
-    vault_service: &dyn VaultService,
+    vault_services: &NetworkVaultServices,
 ) {
     for entry in stuck.iter_mut() {
         let Some(tx_id) = entry.fireblocks_tx_id.as_deref() else {
             continue;
+        };
+
+        let Some(network) = entry.network.as_ref() else {
+            warn!(target: "admin",
+                aggregate_id = %entry.aggregate_id,
+                fireblocks_tx_id = %tx_id,
+                "Stuck entry carries a Fireblocks tx id but no network; \
+                 skipping Fireblocks enrichment"
+            );
+            continue;
+        };
+
+        let vault_service = match vault_services.get(network) {
+            Ok(service) => service,
+            Err(error) => {
+                warn!(target: "admin",
+                    aggregate_id = %entry.aggregate_id,
+                    fireblocks_tx_id = %tx_id,
+                    error = %error,
+                    "Failed to enrich stuck entry with Fireblocks status"
+                );
+                continue;
+            }
         };
 
         match vault_service.check_fireblocks_tx(tx_id).await {
@@ -1379,12 +1460,14 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        network,
         tx_hash,
         fireblocks_tx_id,
     ) = match view {
         RedemptionView::Detected {
             underlying,
             quantity,
+            network,
             tx_hash,
             detected_entered_at,
             ..
@@ -1395,6 +1478,7 @@ fn stuck_redemption_entry(
             detected_entered_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             history.fireblocks_tx_id,
         ),
@@ -1402,6 +1486,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             called_at,
             ..
@@ -1412,6 +1497,7 @@ fn stuck_redemption_entry(
             called_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             history.fireblocks_tx_id,
         ),
@@ -1419,6 +1505,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             burning_entered_at,
             ..
@@ -1439,6 +1526,7 @@ fn stuck_redemption_entry(
                 burning_entered_at,
                 Some(underlying),
                 Some(quantity),
+                Some(network),
                 Some(tx_hash),
                 history.fireblocks_tx_id,
             )
@@ -1450,6 +1538,7 @@ fn stuck_redemption_entry(
             failed_at,
             history.underlying,
             history.quantity,
+            history.network,
             history.tx_hash,
             history.fireblocks_tx_id,
         ),
@@ -1457,6 +1546,7 @@ fn stuck_redemption_entry(
             tokenization_request_id,
             underlying,
             quantity,
+            network,
             tx_hash,
             error,
             failed_at,
@@ -1469,6 +1559,7 @@ fn stuck_redemption_entry(
             failed_at,
             Some(underlying),
             Some(quantity),
+            Some(network),
             Some(tx_hash),
             fireblocks_tx_id.or(history.fireblocks_tx_id),
         ),
@@ -1488,6 +1579,7 @@ fn stuck_redemption_entry(
         timestamp,
         underlying,
         quantity,
+        network,
         tx_hash,
         fireblocks_tx_id,
         fireblocks_status: None,
@@ -1499,6 +1591,7 @@ struct RedemptionHistorySummary {
     tokenization_request_id: Option<TokenizationRequestId>,
     underlying: Option<UnderlyingSymbol>,
     quantity: Option<Quantity>,
+    network: Option<Network>,
     tx_hash: Option<B256>,
     fireblocks_tx_id: Option<String>,
 }
@@ -1568,26 +1661,34 @@ fn redemption_history_summary_from_events(
     for event in events {
         match event {
             RedemptionEvent::Detected {
-                underlying, quantity, tx_hash, ..
+                underlying,
+                quantity,
+                network,
+                tx_hash,
+                ..
             } => {
                 summary.underlying = Some(underlying);
                 summary.quantity = Some(quantity);
+                summary.network = Some(network);
                 summary.tx_hash = Some(tx_hash);
             }
             RedemptionEvent::Reprocessed {
                 underlying,
                 quantity,
+                network,
                 tx_hash,
                 ..
             }
             | RedemptionEvent::BurnResumed {
                 underlying,
                 quantity,
+                network,
                 tx_hash,
                 ..
             } => {
                 summary.underlying = Some(underlying);
                 summary.quantity = Some(quantity);
+                summary.network = Some(network);
                 summary.tx_hash = Some(tx_hash);
                 // Reprocess/Resume starts a fresh attempt — any prior
                 // Fireblocks submission belongs to the previous attempt
@@ -1721,20 +1822,26 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
 
 fn mint_view_asset(
     view: &MintView,
-) -> (Option<UnderlyingSymbol>, Option<Quantity>) {
+) -> (Option<UnderlyingSymbol>, Option<Quantity>, Option<Network>) {
     match view {
-        MintView::Initiated { underlying, quantity, .. }
-        | MintView::JournalConfirmed { underlying, quantity, .. }
-        | MintView::JournalRejected { underlying, quantity, .. }
-        | MintView::Minting { underlying, quantity, .. }
-        | MintView::FireblocksSubmitted { underlying, quantity, .. }
-        | MintView::MintingFailed { underlying, quantity, .. }
-        | MintView::CallbackPending { underlying, quantity, .. } => {
-            (Some(underlying.clone()), Some(quantity.clone()))
+        MintView::Initiated { underlying, quantity, network, .. }
+        | MintView::JournalConfirmed {
+            underlying, quantity, network, ..
         }
+        | MintView::JournalRejected { underlying, quantity, network, .. }
+        | MintView::Minting { underlying, quantity, network, .. }
+        | MintView::FireblocksSubmitted {
+            underlying, quantity, network, ..
+        }
+        | MintView::MintingFailed { underlying, quantity, network, .. }
+        | MintView::CallbackPending { underlying, quantity, network, .. } => (
+            Some(underlying.clone()),
+            Some(quantity.clone()),
+            Some(network.clone()),
+        ),
         MintView::NotFound
         | MintView::Completed { .. }
-        | MintView::Closed { .. } => (None, None),
+        | MintView::Closed { .. } => (None, None, None),
     }
 }
 
@@ -1853,31 +1960,76 @@ pub(crate) struct FireblocksTxResponse {
 /// Admin endpoint to look up a Fireblocks transaction status.
 ///
 /// Useful for checking orphaned transactions that were submitted but never
-/// recorded in the event store (e.g. due to recovery timeout).
+/// recorded in the event store (e.g. due to recovery timeout). The optional
+/// `network` query parameter selects which chain's signing backend to query;
+/// it defaults to Base when omitted.
 #[utoipa::path(
     get,
     path = "/admin/fireblocks/tx/{fireblocks_tx_id}",
     tag = "admin",
     params(
         ("fireblocks_tx_id" = String, Path,
-            description = "Fireblocks transaction id to look up")
+            description = "Fireblocks transaction id to look up"),
+        ("network" = Option<String>, Query,
+            description = "Network whose signing backend to query \
+                (defaults to `base`)")
     ),
     responses(
         (status = 200, description = "Live Fireblocks transaction status",
             body = FireblocksTxResponse),
+        (status = 400, description = "Unsupported network query parameter"),
         (status = 404,
             description = "Unknown tx, or backend is non-Fireblocks (Local signer)"),
+        (status = 422,
+            description = "Requested network has no configured vault service"),
         (status = 502, description = "Fireblocks lookup failed")
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, vault_service))]
-#[get("/admin/fireblocks/tx/<fireblocks_tx_id>")]
+#[tracing::instrument(skip(_auth, vault_services))]
+#[get("/admin/fireblocks/tx/<fireblocks_tx_id>?<network>")]
 pub(crate) async fn check_fireblocks_tx(
     _auth: InternalAuth,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    vault_services: &rocket::State<NetworkVaultServices>,
     fireblocks_tx_id: &str,
+    network: Option<&str>,
 ) -> Result<Json<FireblocksTxResponse>, Status> {
+    let network = match network {
+        None => {
+            // Defaulting to Base on a multichain deployment silently queries
+            // the wrong chain's backend for transactions submitted elsewhere;
+            // surface the ambiguity so a "not found" is not misread as
+            // "never submitted".
+            if vault_services.is_multichain() {
+                warn!(target: "admin",
+                    fireblocks_tx_id = %fireblocks_tx_id,
+                    "No ?network= given on a multichain deployment; \
+                     defaulting to base. A transaction submitted on another \
+                     chain will not be found by this lookup."
+                );
+            }
+            Network::Base
+        }
+        Some(value) => value.parse().map_err(|error| {
+            error!(target: "admin",
+                fireblocks_tx_id = %fireblocks_tx_id,
+                network = %value,
+                error = %error,
+                "Unsupported network query parameter"
+            );
+            Status::BadRequest
+        })?,
+    };
+
+    let vault_service = vault_services.get(&network).map_err(|error| {
+        error!(target: "admin",
+            fireblocks_tx_id = %fireblocks_tx_id,
+            error = %error,
+            "Requested network has no configured vault service"
+        );
+        Status::UnprocessableEntity
+    })?;
+
     let result = vault_service
         .check_fireblocks_tx(fireblocks_tx_id)
         .await
@@ -1912,6 +2064,7 @@ mod tests {
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
@@ -1929,10 +2082,10 @@ mod tests {
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionMetadata, RedemptionView,
+        RedemptionMetadata, RedemptionServices, RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{FireblocksTxStatus, MultiBurnEntry, VaultService};
 
@@ -1940,6 +2093,13 @@ mod tests {
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
+    }
+
+    fn mock_network_vault_services() -> super::NetworkVaultServices {
+        super::NetworkVaultServices::new(HashMap::from([(
+            Network::Base,
+            mock_vault_service(),
+        )]))
     }
 
     /// Configurable poll response for the test mock.
@@ -2115,6 +2275,7 @@ mod tests {
             issuer_request_id: IssuerRedemptionRequestId::random(),
             underlying: UnderlyingSymbol::new("AAPL"),
             token: TokenSymbol::new("tAAPL"),
+            network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: Quantity::new(Decimal::from(100)),
             detected_tx_hash: b256!(
@@ -2149,6 +2310,7 @@ mod tests {
             tokenization_request_id: Some(tokenization_request_id.clone()),
             underlying: Some(metadata.underlying.clone()),
             quantity: Some(metadata.quantity.clone()),
+            network: Some(metadata.network.clone()),
             tx_hash: Some(metadata.detected_tx_hash),
             fireblocks_tx_id: Some(fireblocks_tx_id.clone()),
         };
@@ -2168,6 +2330,7 @@ mod tests {
         );
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
+        assert_eq!(entry.network, Some(metadata.network));
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
         assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
         assert_eq!(entry.timestamp, failed_at);
@@ -2184,6 +2347,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -2214,6 +2378,7 @@ mod tests {
         assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
+        assert_eq!(entry.network, Some(metadata.network));
     }
 
     async fn setup_pool() -> sqlx::Pool<sqlx::Sqlite> {
@@ -2238,7 +2403,10 @@ mod tests {
     fn setup_store(pool: &sqlx::Pool<sqlx::Sqlite>) -> Arc<Store<Redemption>> {
         let vault_service: Arc<dyn VaultService> =
             Arc::new(MockVaultService::new_success());
-        Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
+        Arc::new(test_store::<Redemption>(
+            pool.clone(),
+            RedemptionServices::with_single_vault(Network::Base, vault_service),
+        ))
     }
 
     /// Sets up an in-memory redemption store with a redemption in Failed
@@ -2263,6 +2431,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2319,6 +2488,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2806,7 +2976,7 @@ mod tests {
             .manage(store.clone())
             .manage(pool.clone())
             .manage(alpaca)
-            .manage(mock_vault_service())
+            .manage(mock_network_vault_services())
             .manage(mock_burn_recovery())
             .mount("/", rocket::routes![super::recover_redemption]);
 
@@ -2827,6 +2997,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2864,6 +3035,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -2975,7 +3147,7 @@ mod tests {
             .manage(store)
             .manage(pool)
             .manage(alpaca)
-            .manage(mock_vault_service())
+            .manage(mock_network_vault_services())
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::recover_redemption])
     }
@@ -3218,6 +3390,7 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     underlying: metadata.underlying.clone(),
                     token: metadata.token.clone(),
+                    network: metadata.network.clone(),
                     wallet: metadata.wallet,
                     quantity: metadata.quantity.clone(),
                     tx_hash: metadata.detected_tx_hash,
@@ -3511,6 +3684,15 @@ mod tests {
         }
     }
 
+    fn stub_network_vault_services(
+        stub: StubFireblocksVault,
+    ) -> super::NetworkVaultServices {
+        super::NetworkVaultServices::new(HashMap::from([(
+            Network::Base,
+            Arc::new(stub) as Arc<dyn VaultService>,
+        )]))
+    }
+
     fn stuck_entry(id: &str, fireblocks_tx_id: Option<&str>) -> StuckAggregate {
         StuckAggregate {
             aggregate_type: AggregateKind::Mint,
@@ -3522,6 +3704,7 @@ mod tests {
             timestamp: Utc::now(),
             underlying: None,
             quantity: None,
+            network: Some(Network::Base),
             tx_hash: None,
             fireblocks_tx_id: fireblocks_tx_id.map(str::to_owned),
             fireblocks_status: None,
@@ -3544,7 +3727,8 @@ mod tests {
         };
 
         let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+        let services = stub_network_vault_services(stub);
+        super::enrich_with_fireblocks_status(&mut entries, &services).await;
 
         match entries[0].fireblocks_status.as_ref().expect(
             "matching tx id should produce a populated fireblocks_status",
@@ -3576,7 +3760,8 @@ mod tests {
         };
 
         let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+        let services = stub_network_vault_services(stub);
+        super::enrich_with_fireblocks_status(&mut entries, &services).await;
 
         // The unparseable hash must not be silently dropped: tx_hash stays
         // None and the bad value is surfaced in a warning.
@@ -3599,13 +3784,44 @@ mod tests {
             stuck_entry("redemption-unknown-tx", Some("unrelated-tx")),
         ];
 
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
+        let services = stub_network_vault_services(stub);
+        super::enrich_with_fireblocks_status(&mut entries, &services).await;
 
         // Entry without a tx id is skipped entirely.
         assert!(entries[0].fireblocks_status.is_none());
         // Entry with a tx id the stub doesn't recognise gets `Ok(None)` back
         // from the vault service, which maps to a left-as-None status.
         assert!(entries[1].fireblocks_status.is_none());
+    }
+
+    /// An entry whose network has no configured vault service must be left
+    /// un-enriched with a warning -- never silently routed to another chain's
+    /// signing backend.
+    #[traced_test]
+    #[tokio::test]
+    async fn enrich_skips_entry_on_unconfigured_network() {
+        let tx_id = "a29e5027-1e44-4a66-b78b-b579e55757db";
+        let stub = StubFireblocksVault {
+            tx_id: tx_id.to_string(),
+            response: FireblocksTxStatus::Pending,
+        };
+
+        let mut entry = stuck_entry("redemption-eth", Some(tx_id));
+        entry.network = Some(Network::Ethereum);
+        let mut entries = vec![entry];
+
+        // The map only carries a Base service.
+        let services = stub_network_vault_services(stub);
+        super::enrich_with_fireblocks_status(&mut entries, &services).await;
+
+        assert!(
+            entries[0].fireblocks_status.is_none(),
+            "unconfigured network must not be enriched via another backend"
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Failed to enrich stuck entry", "ethereum"]
+        ));
     }
 
     #[test]
@@ -3692,6 +3908,7 @@ mod tests {
             issuer_request_id: issuer.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             tx_hash,
@@ -3710,6 +3927,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             alpaca_quantity: quantity.clone(),
@@ -3733,6 +3951,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: underlying.clone(),
             token: token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             alpaca_quantity: quantity.clone(),
             quantity: quantity.clone(),
@@ -3768,6 +3987,7 @@ mod tests {
             tokenization_request_id: tok_id,
             underlying,
             token,
+            network: Network::Base,
             wallet: metadata.wallet,
             quantity: quantity.clone(),
             alpaca_quantity: quantity,
@@ -3820,6 +4040,7 @@ mod tests {
             issuer_request_id: metadata.issuer_request_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             tx_hash: metadata.detected_tx_hash,
@@ -3851,6 +4072,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -3881,6 +4103,7 @@ mod tests {
             tokenization_request_id: tok_id.clone(),
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -3914,6 +4137,7 @@ mod tests {
             tokenization_request_id: tok_id,
             underlying: metadata.underlying.clone(),
             token: metadata.token.clone(),
+            network: metadata.network.clone(),
             wallet: metadata.wallet,
             quantity: metadata.quantity.clone(),
             alpaca_quantity: metadata.quantity.clone(),
@@ -4152,6 +4376,7 @@ mod tests {
                 issuer_request_id: issuer.clone(),
                 underlying: underlying.clone(),
                 token: token.clone(),
+                network: Network::Base,
                 wallet,
                 quantity: quantity.clone(),
                 tx_hash,
@@ -4196,6 +4421,7 @@ mod tests {
                 issuer_request_id: issuer,
                 underlying,
                 token,
+                network: Network::Base,
                 wallet,
                 quantity,
                 tx_hash,
