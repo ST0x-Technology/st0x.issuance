@@ -295,8 +295,7 @@ async fn test_burn_tracking_computes_available_balance_correctly()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -443,8 +442,7 @@ async fn test_redemption_recovery_after_restart()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
 
     let rocket = initialize_rocket(config).await?;
     let client = rocket::local::asynchronous::Client::tracked(rocket).await?;
@@ -501,8 +499,7 @@ async fn test_redemption_recovery_after_restart()
     // Flip the flag so polls now return "completed"
     poll_should_succeed.store(true, Ordering::SeqCst);
 
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;

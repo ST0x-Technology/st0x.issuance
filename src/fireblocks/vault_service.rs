@@ -130,7 +130,8 @@ impl<P: Provider + Clone> FireblocksVaultService<P> {
     /// * `config` - Fireblocks configuration (with secret already loaded)
     /// * `read_provider` - Read-only RPC provider for view calls and receipt fetching
     /// * `chain_id` - The chain ID for transaction routing
-    /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
+    /// * `oa_schema_cache` - Cache for OA schema hashes read from on-chain
+    ///   vault information events
     ///
     /// # Errors
     ///

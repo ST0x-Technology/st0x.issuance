@@ -251,7 +251,6 @@ pub async fn initialize_rocket(
         target: "startup",
         network = %base.network,
         chain_id = base.chain_id,
-        subgraph_url = %base.subgraph_url,
         "Chain runtime configured"
     );
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
@@ -1157,7 +1156,6 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use tracing_test::traced_test;
-    use url::Url;
 
     use super::{
         Environment, Quantity, QuantityConversionError,
@@ -1445,7 +1443,6 @@ mod tests {
             chain_id: 8453,
             vault_service: Arc::new(MockVaultService::new_success()),
             http_provider: provider,
-            subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             backfill_start_block: 0,
         };
         let chain_registry = ChainRegistry::from_runtimes(HashMap::from([(

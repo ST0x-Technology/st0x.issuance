@@ -2315,9 +2315,8 @@ per-chain config fields carried forward from legacy startup). Alpaca calls a
 single issuer URL; payload `network` selects the runtime.
 
 **ChainRegistry ([RAI-1204](https://linear.app/makeitrain/issue/RAI-1204)):**
-Legacy env vars (`RPC_URL`, `CHAIN_ID`, `SUBGRAPH_URL`, `BACKFILL_START_BLOCK`)
-map to one `base` registry entry. Behaviour identical to single-chain
-production.
+Legacy env vars (`RPC_URL`, `CHAIN_ID`, `BACKFILL_START_BLOCK`) map to one
+`base` registry entry. Behaviour identical to single-chain production.
 
 **Asset identity ([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205) --
 breaking):** `TokenizedAsset` aggregate id becomes `{underlying}:{network}`

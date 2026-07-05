@@ -10,7 +10,7 @@ deployed stack against real Alpaca + chain B infrastructure.
 | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | [RAI-1099](https://linear.app/makeitrain/issue/RAI-1099)                                                            | Alpaca sandbox issuer enabled on target `network`                 |
 | [RAI-1095](https://linear.app/makeitrain/issue/RAI-1095) / [RAI-1096](https://linear.app/makeitrain/issue/RAI-1096) | Chain B vault deployed and permissioned                           |
-| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100)-[RAI-1104](https://linear.app/makeitrain/issue/RAI-1104)   | RPC, Fireblocks whitelist, gas, subgraph URL for chain B          |
+| [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100)-[RAI-1104](https://linear.app/makeitrain/issue/RAI-1104)   | RPC, Fireblocks whitelist, gas for chain B                        |
 | [RAI-1212](https://linear.app/makeitrain/issue/RAI-1212)                                                            | Liquidity freeze guard sends `?network=` (lockstep with RAI-1205) |
 
 Issuance multichain code (RAI-1204-1208) must be on the staging host. If
@@ -29,8 +29,8 @@ a blocking gate alongside the table above.
 
 On the staging host, confirm:
 
-- **Base (legacy block):** `RPC_URL`, `CHAIN_ID=8453`, `SUBGRAPH_URL`,
-  `BACKFILL_START_BLOCK` -- unchanged from pre-multichain.
+- **Base (legacy block):** `RPC_URL`, `CHAIN_ID=8453`, `BACKFILL_START_BLOCK` --
+  unchanged from pre-multichain.
 - **Ethereum registry entry:** second chain wired (via deploy secrets / planned
   `CHAIN_ETHEREUM_*` env -- see `.env.example`). Startup must not log
   `NetworkNotConfigured` for any live asset.

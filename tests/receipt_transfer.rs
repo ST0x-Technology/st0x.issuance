@@ -152,8 +152,7 @@ async fn test_inbound_receipt_transfer_discovered_by_monitor()
     .await?;
 
     // Start service — backfill runs, bot has no receipts yet
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let _client = Client::tracked(rocket).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -239,8 +238,7 @@ async fn test_outbound_receipt_transfer_reconciles_balance()
     .await?;
 
     // Start service — backfill discovers the receipt
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let _client = Client::tracked(rocket).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -358,8 +356,7 @@ async fn test_mint_transfer_not_double_counted()
     .await?;
 
     // Start service FIRST, then mint (so live monitor processes the events)
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let _client = Client::tracked(rocket).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -497,8 +494,7 @@ async fn test_inbound_transfer_discovered_by_backfill()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let _rocket = initialize_rocket(config).await?;
 
     // Give backfill time
@@ -562,8 +558,7 @@ async fn test_burn_transfer_not_double_reconciled()
     .await?;
 
     // Start service — backfill discovers the receipt
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let _client = Client::tracked(rocket).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -673,8 +668,7 @@ async fn test_unrelated_transfer_ignored()
     .await?;
 
     // Start service
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let _client = Client::tracked(rocket).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -840,8 +834,7 @@ async fn test_inbound_transfer_with_zero_balance_skipped()
     )
     .await?;
 
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let _rocket = initialize_rocket(config).await?;
 
     // Give backfill time

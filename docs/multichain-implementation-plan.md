@@ -9,7 +9,7 @@ every chain Alpaca enables -- not mint-only routing. Issuance code covers:
 | Token listing + asset registration                    | RAI-1205               | RAI-1095 vault deployed on second chain (RAI-1094) |
 | Mint ITN (initiate -> confirm -> callback)            | RAI-1206               | RAI-1099, RAI-1094                                 |
 | Redemption + burn (detect -> Alpaca -> on-chain burn) | RAI-1207               | RAI-1095, RAI-1096                                 |
-| Receipt inventory backfill/reconcile                  | RAI-1208               | RAI-1104                                           |
+| Receipt inventory backfill/reconcile                  | RAI-1208               | None (RAI-1104 no longer required)                 |
 | Config templates + staging E2E                        | RAI-1209, RAI-1210     | RAI-1099                                           |
 
 **Contract deployment**
@@ -60,13 +60,13 @@ satisfied.
 | [RAI-1100](https://linear.app/makeitrain/issue/RAI-1100) | Per-chain RPC creds                                                                                                                                                                                                                                                                          |
 | [RAI-1102](https://linear.app/makeitrain/issue/RAI-1102) | Fireblocks whitelist                                                                                                                                                                                                                                                                         |
 | [RAI-1103](https://linear.app/makeitrain/issue/RAI-1103) | Gas funding                                                                                                                                                                                                                                                                                  |
-| [RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) | Subgraph indexer deployment (ops supplies URL for chain config)                                                                                                                                                                                                                              |
+| [RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) | No longer required -- OA schema hash is read from on-chain `ReceiptVaultInformation` events, so no subgraph indexer or URL is needed                                                                                                                                                         |
 | [RAI-1211](https://linear.app/makeitrain/issue/RAI-1211) | Zoltu factory on candidate chain (feeds RAI-1094 chain choice)                                                                                                                                                                                                                               |
 
-Deploy, contract rollout (`st0x.deploy`), Fireblocks, gas, and subgraph indexer
-work are **external**. Issuance reads vault addresses at asset-registration time
-and `subgraph_url` from per-chain config -- same fields as legacy single-chain
-startup.
+Deploy, contract rollout (`st0x.deploy`), Fireblocks, and gas work are
+**external**. Issuance reads vault addresses at asset-registration time; the OA
+schema hash comes from on-chain `ReceiptVaultInformation` events via the chain's
+own RPC, so no per-chain indexer config is needed.
 
 **Cross-repo ([RAI-1205](https://linear.app/makeitrain/issue/RAI-1205) +
 [RAI-1212](https://linear.app/makeitrain/issue/RAI-1212)):** when internal
@@ -188,8 +188,9 @@ just a SQL migration/view rebuild.
 
 - Startup + periodic backfill partitioned by asset `network`.
 - Per-chain provider from `ChainRegistry` (not a single global provider).
-- **Deploy:** enables Chain B receipt inventory (requires
-  [RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) for prod URL).
+- **Deploy:** enables Chain B receipt inventory
+  ([RAI-1104](https://linear.app/makeitrain/issue/RAI-1104) no longer required
+  -- OA schema hash is read from on-chain `ReceiptVaultInformation` events).
 
 ### RAI-1209 -- Config templates
 
@@ -221,7 +222,7 @@ just a SQL migration/view rebuild.
 | Register asset + ITN token list | RAI-1205        | RAI-1095 vault on chain B |
 | Mint ITN                        | RAI-1206        | RAI-1099, RAI-1094        |
 | Redemption + on-chain burn      | RAI-1207        | RAI-1095, RAI-1096        |
-| Receipt inventory               | RAI-1208        | RAI-1104                  |
+| Receipt inventory               | RAI-1208        | None (RAI-1104 dropped)   |
 | Alpaca prod/staging new wire    | RAI-1210        | RAI-1099 + ops gates      |
 
 Base-only config must stay behaviour-identical after each merge. Do not expose
@@ -249,12 +250,12 @@ Chain B vaults to user redemption traffic before
 
 ## Post-cutover cleanup: sunset the legacy Base-only config path
 
-The legacy flat env vars (`RPC_URL`, `CHAIN_ID`, `SUBGRAPH_URL`,
-`BACKFILL_START_BLOCK` -> one `base` registry entry) and the legacy checkpoint
-fallback (`transfer_poll` -> `transfer_poll:base`) exist only so current
-Base-only production upgrades in place while the external gates clear. They are
-transitional compatibility, not a supported long-term configuration -- keeping
-two config paths invites silent drift between them.
+The legacy flat env vars (`RPC_URL`, `CHAIN_ID`, `BACKFILL_START_BLOCK` -> one
+`base` registry entry) and the legacy checkpoint fallback (`transfer_poll` ->
+`transfer_poll:base`) exist only so current Base-only production upgrades in
+place while the external gates clear. They are transitional compatibility, not a
+supported long-term configuration -- keeping two config paths invites silent
+drift between them.
 
 One deploy cycle after staging and production have moved to the multichain
 config format:

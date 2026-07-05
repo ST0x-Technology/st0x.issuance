@@ -49,7 +49,7 @@ async fn test_multichain_mint_routes_by_network()
     .await?;
     pool.close().await;
 
-    let (config, _mock_subgraph) = harness::create_multichain_config_with_db(
+    let config = harness::create_multichain_config_with_db(
         &db_url,
         &mock_alpaca,
         &base_evm,

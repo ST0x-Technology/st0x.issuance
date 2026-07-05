@@ -11,8 +11,12 @@
 /// The OffchainAsset magic numbers are used by the gildlab/SFT and h20.market
 /// tokenization frontends for encoding receipt information in
 /// `OffchainAssetReceiptVault` deposits and withdrawals.
-use alloy::hex;
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
+use alloy::providers::{DynProvider, Provider};
+use alloy::rpc::types::Filter;
+use alloy::sol_types::SolEvent;
+use alloy::transports::{RpcError, TransportErrorKind};
 use ciborium::value::Value;
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -22,7 +26,8 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
-use url::Url;
+
+use crate::bindings::OffchainAssetReceiptVault::ReceiptVaultInformation;
 
 /// 8-byte prefix for every Rain metadata v1 document.
 const RAIN_META_DOCUMENT_V1: [u8; 8] =
@@ -262,10 +267,11 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>, RainMetaError> {
     Ok(result)
 }
 
-/// Resolves the OA schema hash (IPFS CID) for receipt metadata encoding by
-/// querying the Goldsky subgraph. The schema hash rarely changes for a vault,
-/// so successful results are cached for the lifetime of the process.
-/// Transient failures are NOT cached, allowing retries on subsequent calls.
+/// Resolves the OA schema hash (IPFS CID) for receipt metadata encoding from
+/// the vault's own on-chain `ReceiptVaultInformation` events. The schema hash
+/// rarely changes for a vault, so successful results are cached for the
+/// lifetime of the process. Transient failures are NOT cached, allowing
+/// retries on subsequent calls.
 pub(crate) struct OaSchemaCache {
     mode: OaSchemaCacheMode,
     /// Only positive results (`Some(hash)`) are cached. Absent key means not
@@ -274,34 +280,22 @@ pub(crate) struct OaSchemaCache {
 }
 
 enum OaSchemaCacheMode {
-    /// Fetches schema hashes from the Goldsky subgraph on cache miss.
-    Live { client: reqwest::Client, subgraph_url: Url },
+    /// Reads the vault's latest `ReceiptVaultInformation` event through the
+    /// chain's own RPC on cache miss.
+    Live { provider: DynProvider },
 
     /// Returns a fixed schema hash for any vault. Used in tests to exercise
-    /// the full CBOR encoding path without requiring a live subgraph.
+    /// the full CBOR encoding path without requiring a chain.
     #[cfg(test)]
     Fixed(String),
 }
 
-/// Connect timeout for subgraph HTTP requests.
-const SUBGRAPH_CONNECT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
-
-/// Total request timeout for subgraph HTTP requests.
-const SUBGRAPH_REQUEST_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
 impl OaSchemaCache {
-    pub(crate) fn new(subgraph_url: Url) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(SUBGRAPH_CONNECT_TIMEOUT)
-            .timeout(SUBGRAPH_REQUEST_TIMEOUT)
-            .build()?;
-
-        Ok(Self {
-            mode: OaSchemaCacheMode::Live { client, subgraph_url },
+    pub(crate) fn new(provider: DynProvider) -> Self {
+        Self {
+            mode: OaSchemaCacheMode::Live { provider },
             cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+        }
     }
 
     /// Creates a cache that returns a fixed schema hash for any vault address.
@@ -315,9 +309,9 @@ impl OaSchemaCache {
 
     /// Returns the OA schema hash for the given vault, or `None` if unavailable.
     ///
-    /// Fetches from the subgraph on first call per vault, then caches the result.
-    /// Returns `None` (and logs a warning) if the subgraph query fails or the
-    /// vault has no registered schema.
+    /// Fetches from the chain on first call per vault, then caches the result.
+    /// Returns `None` (and logs a warning) if the log query fails or the vault
+    /// has no registered schema.
     ///
     /// Only successful responses are cached. Transient failures (network errors,
     /// timeouts) are NOT cached so subsequent calls will retry.
@@ -348,113 +342,85 @@ impl OaSchemaCache {
             }
 
             Ok(None) => {
-                // Don't cache negative results — the subgraph may not have
-                // indexed this vault's schema yet. Retry on next call.
+                // Don't cache negative results -- the vault's information may
+                // not have been registered yet. Retry on next call.
                 None
             }
 
             Err(error) => {
-                // Don't cache transient failures — allow retry on next call
+                // Don't cache transient failures -- allow retry on next call
                 warn!(
                     target: "vault",
                     %vault,
                     %error,
-                    "failed to fetch OA schema hash from subgraph, \
-                     receipt metadata will omit OA_SCHEMA"
+                    "failed to fetch OA schema hash from vault information \
+                     events, receipt metadata will omit OA_SCHEMA"
                 );
                 None
             }
         }
     }
 
-    /// Queries the subgraph for `receiptVaultInformations` and extracts the
-    /// schema IPFS CID from the first matching document.
+    /// Reads the vault's `ReceiptVaultInformation` events and extracts the
+    /// schema IPFS CID from the most recent document.
     ///
-    /// The `information` field is a hex-encoded Rain meta v1 document containing
-    /// a CBOR sequence. We look for an item with `OA_HASH_LIST` magic and
-    /// extract key 0 (the IPFS CID string).
+    /// The event payload is a Rain meta v1 document containing a CBOR
+    /// sequence. We look for an item with `OA_HASH_LIST` magic and extract
+    /// key 0 (the IPFS CID string).
     async fn fetch_schema_hash(
         &self,
         vault: Address,
     ) -> Result<Option<String>, OaSchemaFetchError> {
-        let vault_hex = format!("{vault:#x}");
-
-        let query = serde_json::json!({
-            "query": format!(
-                r#"{{
-                    receiptVaultInformations(
-                        first: 1,
-                        orderBy: timestamp,
-                        orderDirection: desc,
-                        where: {{ offchainAssetReceiptVault_in: ["{vault_hex}"] }}
-                    ) {{
-                        information
-                    }}
-                }}"#
-            )
-        });
-
-        let (client, subgraph_url) = match &self.mode {
-            OaSchemaCacheMode::Live { client, subgraph_url } => {
-                (client, subgraph_url)
-            }
-
+        let provider = match &self.mode {
+            OaSchemaCacheMode::Live { provider } => provider,
+            // Fixed mode is handled in get() before reaching here
             #[cfg(test)]
-            OaSchemaCacheMode::Fixed(_) => {
-                // Fixed mode is handled in get() before reaching here
-                return Ok(None);
-            }
+            OaSchemaCacheMode::Fixed(_) => return Ok(None),
         };
 
-        let response = client
-            .post(subgraph_url.as_str())
-            .json(&query)
-            .send()
-            .await?
-            .error_for_status()?;
+        // Vault-scoped, single-topic query: a vault emits this event only
+        // when its metadata is (re-)registered, so the full block range stays
+        // a handful of logs.
+        let filter = Filter::new()
+            .address(vault)
+            .event_signature(ReceiptVaultInformation::SIGNATURE_HASH)
+            .from_block(0)
+            .to_block(BlockNumberOrTag::Latest);
 
-        let body: serde_json::Value = response.json().await?;
+        let logs = provider.get_logs(&filter).await?;
 
-        let informations = &body["data"]["receiptVaultInformations"];
-
-        let Some(first) = informations.get(0) else {
+        // Logs arrive in ascending block order; the last one is the current
+        // registration, mirroring the latest-first ordering the old subgraph
+        // query used.
+        let Some(latest) = logs.last() else {
             return Ok(None);
         };
 
-        let Some(info_hex) = first["information"].as_str() else {
-            return Ok(None);
-        };
+        let event = ReceiptVaultInformation::decode_log(&latest.inner)?;
 
-        parse_schema_hash_from_information(info_hex)
+        Ok(parse_schema_hash_from_information(&event.vaultInformation))
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 enum OaSchemaFetchError {
-    #[error("subgraph HTTP request failed: {0}")]
-    Reqwest(#[from] reqwest::Error),
+    #[error("vault information log query failed: {0}")]
+    Rpc(#[from] RpcError<TransportErrorKind>),
 
-    #[error("failed to decode information hex: {0}")]
-    Hex(#[from] hex::FromHexError),
-
-    #[error("CBOR deserialization error: {0}")]
-    CborDeserialize(#[from] ciborium::de::Error<std::io::Error>),
+    #[error("failed to decode ReceiptVaultInformation event: {0}")]
+    SolTypes(#[from] alloy::sol_types::Error),
 }
 
-/// Parses the schema IPFS CID from a hex-encoded `receiptVaultInformation`
-/// document.
+/// Parses the schema IPFS CID from a `receiptVaultInformation` document.
 ///
 /// The document is a Rain meta v1 CBOR sequence. We iterate the items looking
 /// for one whose magic (key 1) equals `OA_HASH_LIST`, then extract key 0 as
-/// the schema hash string.
-fn parse_schema_hash_from_information(
-    info_hex: &str,
-) -> Result<Option<String>, OaSchemaFetchError> {
-    let hex_str = info_hex.strip_prefix("0x").unwrap_or(info_hex);
-    let raw_bytes = hex::decode(hex_str)?;
-
+/// the schema hash string. Malformed documents yield `None` rather than an
+/// error: the payload is untrusted on-chain data, and an unparseable
+/// registration is equivalent to no registration.
+fn parse_schema_hash_from_information(raw_bytes: &[u8]) -> Option<String> {
     if raw_bytes.len() <= 8 || raw_bytes[..8] != RAIN_META_DOCUMENT_V1 {
-        return Ok(None);
+        return None;
     }
 
     let cbor_data = &raw_bytes[8..];
@@ -486,17 +452,24 @@ fn parse_schema_hash_from_information(
                 && !hash.is_empty()
                 && !hash.contains(',')
             {
-                return Ok(Some(hash));
+                return Some(hash);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::hex;
+    use alloy::network::EthereumWallet;
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+
     use super::*;
+    use crate::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
+    use crate::test_utils::LocalEvm;
 
     /// A realistic serialized `ReceiptInformation` with fixed values for
     /// deterministic cross-encoding tests against the h20 TypeScript frontend.
@@ -676,14 +649,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_schema_hash_from_real_subgraph_data() {
-        // Real `information` hex from the Goldsky subgraph for the TESTSTOX
-        // vault (0x9b117137aa839b53fd1aaf2f92fc4d78087326a7) on Base.
-        // Contains two CBOR items: OA_SCHEMA definition + OA_HASH_LIST with CID.
-        let info_hex = "0xff0a89c674ee7874a40058d3789c858eb14ec33010865fc53a3aa6a462a9e407600321d10d315ce34b73ad639bf37788a2be7beda620c482179f3ffffefccfe038278fd32b8e04167694d5bc77038d689ea0817c1bc1ceb0fa1e61504db66d8f3986f5021fa31c5a27d8eb7ab36d17f6505e2babbf59e389c20b293a54ac7c4a15c7fd913a2d67748e956340ff263191285306dba3cfd480d0d799851cd80f08b56569358dfbe8e1b381f42b3f2fd765bffbb30a8743c93bca9d70aa5f14fc7cf6ded4a889bdd1818cd67a70f9f1fe6bd8717722314bfc8fa5ac2bb25f75f0011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465a200783b6261666b7265696365636e783267766e746d3666626372766e63333336717a6536737435753771713734353769676567616d6433627a6b78377269011bff9fae3cc645f463";
+    /// Real `receiptVaultInformation` payload emitted for the TESTSTOX vault
+    /// (0x9b117137aa839b53fd1aaf2f92fc4d78087326a7) on Base. Contains two
+    /// CBOR items: OA_SCHEMA definition + OA_HASH_LIST with the CID.
+    const REAL_VAULT_INFORMATION_HEX: &str = "ff0a89c674ee7874a40058d3789c858eb14ec33010865fc53a3aa6a462a9e407600321d10d315ce34b73ad639bf37788a2be7beda620c482179f3ffffefccfe038278fd32b8e04167694d5bc77038d689ea0817c1bc1ceb0fa1e61504db66d8f3986f5021fa31c5a27d8eb7ab36d17f6505e2babbf59e389c20b293a54ac7c4a15c7fd913a2d67748e956340ff263191285306dba3cfd480d0d799851cd80f08b56569358dfbe8e1b381f42b3f2fd765bffbb30a8743c93bca9d70aa5f14fc7cf6ded4a889bdd1818cd67a70f9f1fe6bd8717722314bfc8fa5ac2bb25f75f0011bffa8e8a9b9cf4a3102706170706c69636174696f6e2f6a736f6e03676465666c617465a200783b6261666b7265696365636e783267766e746d3666626372766e63333336717a6536737435753771713734353769676567616d6433627a6b78377269011bff9fae3cc645f463";
 
-        let result = parse_schema_hash_from_information(info_hex).unwrap();
+    #[test]
+    fn parse_schema_hash_from_real_vault_information() {
+        let info_bytes = hex::decode(REAL_VAULT_INFORMATION_HEX).unwrap();
+
+        let result = parse_schema_hash_from_information(&info_bytes);
 
         assert_eq!(
             result.as_deref(),
@@ -694,13 +669,14 @@ mod tests {
 
     #[test]
     fn parse_schema_hash_returns_none_for_non_rain_meta() {
-        let result = parse_schema_hash_from_information("0xdeadbeef").unwrap();
+        let result =
+            parse_schema_hash_from_information(&[0xde, 0xad, 0xbe, 0xef]);
         assert!(result.is_none());
     }
 
     #[test]
-    fn parse_schema_hash_returns_none_for_empty_hex() {
-        let result = parse_schema_hash_from_information("0x").unwrap();
+    fn parse_schema_hash_returns_none_for_empty_input() {
+        let result = parse_schema_hash_from_information(&[]);
         assert!(result.is_none());
     }
 
@@ -797,41 +773,49 @@ mod tests {
     }
 
     /// End-to-end test of the full OA schema resolution + encoding pipeline
-    /// against the live Goldsky subgraph on Base.
+    /// against a local Anvil chain.
     ///
-    /// 1. Creates a real `OaSchemaCache` pointed at the live Base subgraph
-    /// 2. Calls `get()` for the TESTSTOX vault — verifies a schema hash is returned
+    /// 1. Deploys a vault and registers real vault information on-chain
+    /// 2. Calls `get()` -- verifies the schema hash is read from the
+    ///    `ReceiptVaultInformation` event via the chain provider
     /// 3. Encodes a receipt with that schema hash
     /// 4. Decodes the result and verifies roundtrip correctness
-    ///
-    /// Run with: `cargo test fetch_schema_and_encode -- --ignored`
     #[tokio::test]
-    #[ignore = "requires live Base subgraph"]
-    async fn fetch_schema_and_encode_receipt_via_live_subgraph() {
-        let subgraph_url = Url::parse(
-            "https://api.goldsky.com/api/public/\
-             project_cm153vmqi5gke01vy66p4ftzf/subgraphs/\
-             sft-offchainassetvaulttest-base/1.0.5/gn",
-        )
-        .unwrap();
+    async fn fetch_schema_and_encode_receipt_via_onchain_event() {
+        let evm = LocalEvm::new().await.unwrap();
 
-        // TESTSTOX vault on Base
-        let vault: Address =
-            "0x9b117137aa839b53fd1aaf2f92fc4d78087326a7".parse().unwrap();
-
-        let cache =
-            OaSchemaCache::new(subgraph_url).expect("failed to create cache");
-
-        // Step 1: Fetch the schema hash from the live subgraph
-        let schema_hash = cache.get(vault).await;
-        assert!(
-            schema_hash.is_some(),
-            "subgraph returned no schema hash for TESTSTOX3 vault {vault}"
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .unwrap();
+        let vault_instance = OffchainAssetReceiptVaultInstance::new(
+            evm.vault_address,
+            provider.clone(),
         );
-        let schema_hash = schema_hash.unwrap();
-        assert!(
-            schema_hash.starts_with("bafkrei"),
-            "schema hash should be an IPFS CID, got: {schema_hash}"
+
+        let info_bytes = hex::decode(REAL_VAULT_INFORMATION_HEX).unwrap();
+        vault_instance
+            .receiptVaultInformation(info_bytes.into())
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let cache = OaSchemaCache::new(provider.erased());
+
+        // Step 1: Read the schema hash from the on-chain event
+        let schema_hash = cache.get(evm.vault_address).await.expect(
+            "schema hash should be read from the ReceiptVaultInformation \
+             event",
+        );
+        assert_eq!(
+            schema_hash,
+            "bafkreicecnx2gvntm6fbcrvnc336qze6st5u7qq7457igegamd3bzkx7ri",
+            "should extract the CID registered on-chain"
         );
 
         // Step 2: Encode a receipt using the fetched schema hash
@@ -850,7 +834,7 @@ mod tests {
         assert_eq!(
             extract_optional_text(map, OA_SCHEMA).as_deref(),
             Some(schema_hash.as_str()),
-            "encoded OA_SCHEMA should match the hash from the subgraph"
+            "encoded OA_SCHEMA should match the hash from the chain"
         );
 
         // Step 4: Decode and verify roundtrip

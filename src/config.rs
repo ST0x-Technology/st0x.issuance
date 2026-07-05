@@ -43,7 +43,6 @@ pub struct Config {
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
-    pub subgraph_url: Url,
     /// All chain runtimes the registry is built from, Base first. The legacy
     /// flat env vars populate the single Base entry today; the multichain
     /// config format extends this list (see
@@ -142,13 +141,6 @@ struct Env {
 
     #[clap(flatten)]
     pub(crate) alpaca: AlpacaConfig,
-
-    #[arg(
-        long,
-        env = "SUBGRAPH_URL",
-        help = "Goldsky subgraph URL for querying OA schema hashes"
-    )]
-    subgraph_url: Url,
 }
 
 impl Env {
@@ -157,20 +149,10 @@ impl Env {
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
         let signer = self.signer.into_config()?;
 
-        match self.subgraph_url.scheme() {
-            "http" | "https" => {}
-            scheme => {
-                return Err(ConfigError::InvalidSubgraphScheme(
-                    scheme.to_string(),
-                ));
-            }
-        }
-
         let chains = vec![ChainConfig {
             network: Network::Base,
             chain_id: self.chain_id,
             rpc_url: self.rpc_url.clone(),
-            subgraph_url: self.subgraph_url.clone(),
             backfill_start_block: self.backfill_start_block,
         }];
 
@@ -187,7 +169,6 @@ impl Env {
             environment: self.environment,
             hyperdx,
             alpaca: self.alpaca,
-            subgraph_url: self.subgraph_url,
             chains,
         })
     }
@@ -278,10 +259,6 @@ pub enum ConfigError {
     ParseError(#[from] clap::Error),
     #[error("Fireblocks vault service initialization failed: {0}")]
     FireblocksVault(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
-    #[error("SUBGRAPH_URL must use http or https scheme, got: {0}")]
-    InvalidSubgraphScheme(String),
     #[error("chain registry initialization failed")]
     ChainRegistry(#[source] Box<ChainRegistryError>),
     #[error(
@@ -374,8 +351,6 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ]
     }
 
@@ -497,41 +472,11 @@ mod tests {
             "alpaca-test-key",
             "--alpaca-api-secret",
             "alpaca-test-secret",
-            "--subgraph-url",
-            "http://localhost:0/subgraph",
         ];
 
         let result = Env::try_parse_from(args);
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_wss_subgraph_url_rejected() {
-        let args = vec![
-            "test-binary",
-            "--rpc-url",
-            "wss://localhost:8545",
-            "--evm-private-key",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "--backfill-start-block",
-            "12345678",
-            "--issuer-api-key",
-            "test-key-that-is-at-least-32-chars-long",
-            "--alpaca-account-id",
-            "test-alpaca-account-id",
-            "--alpaca-api-key",
-            "alpaca-test-key",
-            "--alpaca-api-secret",
-            "alpaca-test-secret",
-            "--subgraph-url",
-            "wss://api.goldsky.com/api/public/project_xxx/subgraphs/test/1.0.0/gn",
-        ];
-
-        let env = Env::try_parse_from(args).unwrap();
-        let result = env.into_config();
-
-        assert!(matches!(result, Err(ConfigError::InvalidSubgraphScheme(_))));
     }
 
     #[tokio::test]

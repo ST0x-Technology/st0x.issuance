@@ -10,7 +10,6 @@ use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
-use std::collections::HashMap;
 use std::time::Duration;
 use url::Url;
 
@@ -129,8 +128,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     pool.close().await;
 
     // Step 2: Start service - backfill should discover the historic receipt
-    let (config1, _mock_subgraph1) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config1 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket1 = initialize_rocket(config1).await?;
     let client1 = Client::tracked(rocket1).await?;
 
@@ -149,8 +147,7 @@ async fn test_backfill_checkpoint_independent_from_monitor_discoveries()
     drop(client1);
 
     // Step 5: Restart service - backfill should use checkpoint, not monitor's block
-    let (config2, _mock_subgraph2) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config2 = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 = Client::tracked(rocket2).await?;
 
@@ -279,13 +276,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
     // Close the pool so rocket can open it
     pool.close().await;
 
-    let vault_schemas =
-        HashMap::from([(evm.vault_address, harness::TEST_OA_SCHEMA_HASH)]);
-    let mock_subgraph = harness::setup_mock_subgraph(&vault_schemas);
-
     let rpc_url = Url::parse(&evm.endpoint)?;
-    let subgraph_url =
-        Url::parse(&mock_subgraph.base_url()).expect("valid mock subgraph URL");
 
     let config = Config {
         database_url,
@@ -317,12 +308,10 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
-        subgraph_url: subgraph_url.clone(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: ANVIL_CHAIN_ID,
             rpc_url,
-            subgraph_url,
             backfill_start_block: 0,
         }],
     };
@@ -452,8 +441,7 @@ async fn test_startup_reconciliation_detects_stale_receipts()
         harness::alpaca_mocks::setup_redemption_mocks(&mock_alpaca);
 
     // Start service — reconciliation should detect stale receipt A (on-chain balance 0)
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = Client::tracked(rocket).await?;
 
@@ -558,8 +546,7 @@ async fn test_external_burn_detected_by_withdraw_monitor()
     .await?;
 
     // Step 2: Start service — backfill discovers receipt A
-    let (config, _mock_subgraph) =
-        harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
+    let config = harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket = initialize_rocket(config).await?;
     let client = Client::tracked(rocket).await?;
 
