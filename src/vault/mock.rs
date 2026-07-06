@@ -1,16 +1,17 @@
 use alloy::primitives::{Address, B256, Bytes, U256, b256};
+use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
-    MultiBurnResult, MultiBurnResultEntry, ReceiptInformation, SubmittedTx,
-    TxId, VaultError, VaultService,
+    BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
+    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
+    VaultService,
 };
 use crate::redemption::BurnExternalTxId;
-use crate::vault::SendableTxWithHash;
+use crate::vault::{SendableTxWithHash, TxId};
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -96,16 +97,11 @@ pub(crate) struct MockVaultService {
     share_balance: Arc<Mutex<U256>>,
     #[cfg(test)]
     last_multi_burn_params: Arc<Mutex<Option<MultiBurnParams>>>,
-    /// Status returned by `check_fireblocks_tx`. `None` mirrors the trait
-    /// default (no Fireblocks state), exercising the non-Fireblocks path.
-    #[cfg(test)]
-    fireblocks_tx_status: Arc<Mutex<Option<FireblocksTxStatus>>>,
     /// Outcome returned by `verify_burn_tx`. Defaults to a successful
     /// verification, exercising the admin force-complete happy path.
     #[cfg(test)]
     verify_burn: Arc<Mutex<MockVerifyBurn>>,
     /// Signed tx returned by `prepare_tx` when local signing is configured.
-    /// `None` simulates the Fireblocks backend (prepare_tx returns nothing).
     #[cfg(test)]
     prepared_tx: Arc<Mutex<Option<SendableTxWithHash>>>,
 }
@@ -127,8 +123,6 @@ impl MockVaultService {
             #[cfg(test)]
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             #[cfg(test)]
             prepared_tx: Arc::new(Mutex::new(None)),
@@ -147,7 +141,6 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
         }
@@ -165,7 +158,6 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
         }
@@ -183,7 +175,6 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
         }
@@ -208,7 +199,6 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
         }
@@ -226,7 +216,6 @@ impl MockVaultService {
             last_call: Arc::new(Mutex::new(None)),
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
-            fireblocks_tx_status: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
         }
@@ -303,17 +292,9 @@ impl MockVaultService {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_fireblocks_tx_status(
-        self,
-        status: FireblocksTxStatus,
-    ) -> Self {
-        *self.fireblocks_tx_status.lock().unwrap() = Some(status);
-        self
-    }
-
-    /// Configures `prepare_tx` to return the given [`SendableTxWithHash`],
-    /// simulating the local signing backend pre-signing the burn transaction.
+    /// Configures `find_existing_burn` to return the given [`SubmittedTx`],
+    /// simulating a burn that was already submitted on-chain before the current
+    /// process started (crash-safe idempotency recovery path).
     #[cfg(test)]
     pub(crate) fn with_prepared_tx(
         self,
@@ -404,13 +385,13 @@ impl VaultService for MockVaultService {
         Ok(SubmittedTx {
             external_tx_id: external_tx_id
                 .unwrap_or_else(|| "mock-mint".to_string()),
-            fireblocks_tx_id: "mock-fb-mint".to_string(),
+            tx_id: MOCK_MINT_TX_HASH.into(),
         })
     }
 
     async fn confirm_mint(
         &self,
-        _fireblocks_tx_id: &str,
+        _tx_id: &TxId,
     ) -> Result<MintResult, VaultError> {
         match &self.behavior {
             MockBehavior::Success => {
@@ -474,25 +455,11 @@ impl VaultService for MockVaultService {
         }
     }
 
-    async fn check_fireblocks_tx(
-        &self,
-        _fireblocks_tx_id: &str,
-    ) -> Result<Option<FireblocksTxStatus>, VaultError> {
-        #[cfg(test)]
-        {
-            Ok(self.fireblocks_tx_status.lock().unwrap().clone())
-        }
-        #[cfg(not(test))]
-        {
-            Ok(None)
-        }
-    }
-
     async fn submit_burn(
         &self,
         params: MultiBurnParams,
-        prepared_tx: Option<SendableTxWithHash>,
-    ) -> Result<SubmittedTx<BurnExternalTxId, TxId>, VaultError> {
+        prepared_tx: SendableTxWithHash,
+    ) -> Result<SubmittedTx, VaultError> {
         #[cfg(test)]
         if matches!(self.behavior, MockBehavior::SubmitFailure) {
             return Err(VaultError::InvalidReceipt);
@@ -533,19 +500,17 @@ impl VaultService for MockVaultService {
             });
 
         Ok(SubmittedTx {
-            external_tx_id: params.external_tx_id.unwrap_or_else(|| {
-                BurnExternalTxId::from_string("mock-burn".to_string())
-            }),
-            fireblocks_tx_id: prepared_tx.map_or_else(
-                || TxId::Legacy("mock-fb-burn".to_string()),
-                |sendable_tx| TxId::Hash(sendable_tx.hash),
+            external_tx_id: params.external_tx_id.map_or_else(
+                || "mock-burn".to_string(),
+                BurnExternalTxId::into_string,
             ),
+            tx_id: prepared_tx.hash.into(),
         })
     }
 
     async fn confirm_burn(
         &self,
-        _fireblocks_tx_id: &TxId,
+        _tx_id: &TxId,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError> {
         match &self.behavior {
@@ -578,7 +543,7 @@ impl VaultService for MockVaultService {
             #[cfg(test)]
             MockBehavior::ConfirmPending => {
                 Err(VaultError::ConfirmationPending {
-                    tx_id: _fireblocks_tx_id.clone(),
+                    tx_id: _tx_id.clone(),
                     message: "receipt polling timed out".to_string(),
                 })
             }
@@ -631,18 +596,31 @@ impl VaultService for MockVaultService {
     async fn prepare_burn_tx(
         &self,
         _params: &MultiBurnParams,
-    ) -> Result<Option<SendableTxWithHash>, VaultError> {
+    ) -> Result<SendableTxWithHash, VaultError> {
         #[cfg(test)]
         {
             if matches!(self.behavior, MockBehavior::PrepareTxFails) {
                 return Err(VaultError::InvalidReceipt);
             }
-            let prepared = self.prepared_tx.lock().unwrap().take();
-            if prepared.is_some() {
-                return Ok(prepared);
-            }
+            // Use configured tx if present, otherwise fall back to default.
+            // Cloned (not taken) so retries can re-use the same configured tx.
+            let prepared = self.prepared_tx.lock().unwrap().clone();
+            return Ok(prepared.unwrap_or_default());
         }
-        Ok(None)
+        #[cfg(not(test))]
+        Ok(SendableTxWithHash::default())
+    }
+
+    async fn check_tx(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<TransactionReceipt, VaultError> {
+        #[cfg(test)]
+        if matches!(*self.verify_burn.lock().unwrap(), MockVerifyBurn::Reverted)
+        {
+            return Err(VaultError::Reverted { tx_hash: B256::ZERO });
+        }
+        Err(VaultError::InvalidReceipt)
     }
 }
 
@@ -656,11 +634,15 @@ mod tests {
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
-    use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
+    use crate::redemption::IssuerRedemptionRequestId;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
-        VaultService,
+        MultiBurnEntry, MultiBurnParams, ReceiptInformation,
+        SendableTxWithHash, VaultError, VaultService,
     };
+
+    fn test_sendable_tx() -> SendableTxWithHash {
+        SendableTxWithHash::default()
+    }
 
     fn test_receipt_info() -> ReceiptInformation {
         ReceiptInformation::new(
@@ -705,8 +687,7 @@ mod tests {
 
         assert_eq!(submitted.external_tx_id, "mock-mint");
 
-        let result =
-            mock.confirm_mint(&submitted.fireblocks_tx_id).await.unwrap();
+        let result = mock.confirm_mint(&submitted.tx_id).await.unwrap();
 
         assert_eq!(result.receipt_id, U256::from(1));
         assert_eq!(result.shares_minted, assets);
@@ -738,7 +719,7 @@ mod tests {
             .unwrap();
 
         // Confirm returns the failure
-        let result = mock.confirm_mint(&submitted.fireblocks_tx_id).await;
+        let result = mock.confirm_mint(&submitted.tx_id).await;
         assert!(matches!(result, Err(VaultError::InvalidReceipt)));
     }
 
@@ -886,14 +867,11 @@ mod tests {
         let params = test_multi_burn_params();
         let dust = params.dust_shares;
 
-        let submitted = mock.submit_burn(params, None).await.unwrap();
-        assert_eq!(
-            submitted.external_tx_id,
-            BurnExternalTxId::from_string("mock-burn".to_string())
-        );
+        let submitted =
+            mock.submit_burn(params, test_sendable_tx()).await.unwrap();
+        assert_eq!(submitted.external_tx_id, "mock-burn");
 
-        let result =
-            mock.confirm_burn(&submitted.fireblocks_tx_id, dust).await.unwrap();
+        let result = mock.confirm_burn(&submitted.tx_id, dust).await.unwrap();
 
         assert_eq!(result.burns.len(), 1);
         assert_eq!(result.dust_returned, dust);
@@ -905,10 +883,14 @@ mod tests {
 
         assert_eq!(mock.get_multi_burn_call_count(), 0);
 
-        mock.submit_burn(test_multi_burn_params(), None).await.unwrap();
+        mock.submit_burn(test_multi_burn_params(), test_sendable_tx())
+            .await
+            .unwrap();
         assert_eq!(mock.get_multi_burn_call_count(), 1);
 
-        mock.submit_burn(test_multi_burn_params(), None).await.unwrap();
+        mock.submit_burn(test_multi_burn_params(), test_sendable_tx())
+            .await
+            .unwrap();
         assert_eq!(mock.get_multi_burn_call_count(), 2);
     }
 
@@ -916,8 +898,12 @@ mod tests {
     async fn test_reset_clears_multi_burn_state() {
         let mock = MockVaultService::new_success();
 
-        mock.submit_burn(test_multi_burn_params(), None).await.unwrap();
-        mock.submit_burn(test_multi_burn_params(), None).await.unwrap();
+        mock.submit_burn(test_multi_burn_params(), test_sendable_tx())
+            .await
+            .unwrap();
+        mock.submit_burn(test_multi_burn_params(), test_sendable_tx())
+            .await
+            .unwrap();
 
         assert_eq!(mock.get_multi_burn_call_count(), 2);
 
@@ -949,7 +935,9 @@ mod tests {
     #[tokio::test]
     async fn test_submit_burn_failure() {
         let mock = MockVaultService::new_submit_failure();
-        let result = mock.submit_burn(test_multi_burn_params(), None).await;
+        let result = mock
+            .submit_burn(test_multi_burn_params(), test_sendable_tx())
+            .await;
 
         assert!(
             matches!(result, Err(VaultError::InvalidReceipt)),

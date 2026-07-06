@@ -147,7 +147,7 @@ async fn process_journal_completion(
         return;
     }
 
-    // Step 2: Submit mint transaction (SubmitMint → FireblocksSubmitted).
+    // Step 2: Submit mint transaction (SubmitMint → TxSubmitted).
     if let Err(err) = mint_store
         .send(
             &issuer_request_id,
@@ -164,7 +164,7 @@ async fn process_journal_completion(
         return;
     }
 
-    // Step 3: Load the fireblocks_tx_id from the aggregate and confirm
+    // Step 3: Load the tx_id from the aggregate and confirm
     let mint = match mint_store.load(&issuer_request_id).await {
         Ok(Some(mint)) => mint,
         Ok(None) => {
@@ -182,13 +182,13 @@ async fn process_journal_completion(
         }
     };
 
-    if let Mint::FireblocksSubmitted { fireblocks_tx_id, .. } = &mint {
+    if let Mint::TxSubmitted { tx_id, .. } = &mint {
         if let Err(err) = mint_store
             .send(
                 &issuer_request_id,
                 MintCommand::ConfirmMint {
                     issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: fireblocks_tx_id.clone(),
+                    tx_id: tx_id.clone(),
                 },
             )
             .await

@@ -1,3 +1,4 @@
+use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,9 +33,7 @@ use crate::redemption::{
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::UnderlyingSymbol;
-use crate::vault::{
-    BurnVerification, FireblocksTxStatus, VaultError, VaultService,
-};
+use crate::vault::{BurnVerification, TxId, VaultError, VaultService};
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -106,22 +105,16 @@ pub(crate) struct StuckAggregate {
     quantity: Option<Quantity>,
     /// Primary on-chain transaction hash for this aggregate, when known.
     /// For redemptions this is the detected transfer tx hash. For mints this
-    /// is the successful mint tx hash, or a Fireblocks network hash when the
-    /// signing backend exposes one.
+    /// is the successful mint tx hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = String)]
     tx_hash: Option<B256>,
-    /// Fireblocks transaction ID associated with this aggregate's current
+    /// Transaction ID associated with this aggregate's current
     /// stuck step. For mints, sourced from the most recent
-    /// `FireblocksSubmitted` event. For redemptions, populated only on
+    /// `MintTxSubmitted` event. For redemptions, populated only on
     /// `BurnFailed` (the view carries it for that variant).
     #[serde(skip_serializing_if = "Option::is_none")]
-    fireblocks_tx_id: Option<String>,
-    /// Live status of the Fireblocks transaction (subStatus, network tx
-    /// hashes). Best-effort: omitted when `fireblocks_tx_id` is missing,
-    /// the backend is non-Fireblocks, or the lookup itself fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fireblocks_status: Option<FireblocksTxStatus>,
+    tx_id: Option<TxId>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -139,7 +132,7 @@ struct AlpacaCalledData {
 
 /// Data extracted from a BurningFailed event in the event history.
 struct BurningFailedData {
-    fireblocks_tx_id: Option<String>,
+    tx_id: Option<TxId>,
     planned_burns: Vec<BurnRecord>,
 }
 
@@ -151,7 +144,7 @@ struct ReprocessContext {
     alpaca_called: Option<AlpacaCalledData>,
     /// Data from the most recent BurningFailed event, if one exists.
     burning_failed: Option<BurningFailedData>,
-    /// Replacement Fireblocks externalTxId for a retry burn, when event
+    /// Replacement externalTxId for a retry burn, when event
     /// history shows a prior accepted burn or an unaccepted retry attempt.
     burn_retry_external_tx_id: Option<BurnExternalTxId>,
 }
@@ -246,15 +239,9 @@ async fn load_reprocess_context(
                     called_at: *called_at,
                 });
             }
-            RedemptionEvent::BurningFailed {
-                fireblocks_tx_id,
-                planned_burns,
-                ..
-            } => {
+            RedemptionEvent::BurningFailed { tx_id, planned_burns, .. } => {
                 burning_failed = Some(BurningFailedData {
-                    fireblocks_tx_id: fireblocks_tx_id
-                        .as_ref()
-                        .map(ToString::to_string),
+                    tx_id: tx_id.clone(),
                     planned_burns: planned_burns.clone(),
                 });
             }
@@ -312,9 +299,9 @@ async fn load_reprocess_context(
         (status = 409, description = "Redemption already completed"),
         (status = 422,
             description = "Cannot recover: Alpaca journal pending/rejected, \
-                Fireblocks burn still pending, or invalid aggregate state"),
+                Transaction burn still pending, or invalid aggregate state"),
         (status = 502,
-            description = "Alpaca poll, Fireblocks lookup, or burn execution failed"),
+            description = "Alpaca poll, Transaction lookup, or burn execution failed"),
         (status = 500, description = "Event load/deserialize or internal failure")
     ),
     security(("internal_api_key" = []))
@@ -432,6 +419,7 @@ async fn recover_post_alpaca(
         alpaca_data,
         burning_failed,
         burn_retry_external_tx_id,
+        ..
     } = input;
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
@@ -518,9 +506,9 @@ async fn recover_post_alpaca(
         }
     }
 
-    // If a Fireblocks tx ID was recorded on a previous BurningFailed event,
+    // If a transaction ID was recorded on a previous BurningFailed event,
     // inspect it before deciding whether to record the existing burn or resume.
-    let burn_retry_external_tx_id = match inspect_prior_fireblocks_burn(
+    let burn_retry_external_tx_id = match inspect_prior_burn(
         store,
         vault_service,
         &aggregate_id,
@@ -593,7 +581,7 @@ async fn recover_post_alpaca(
     }))
 }
 
-/// Outcome of inspecting a prior Fireblocks burn on a failed redemption.
+/// Outcome of inspecting a prior burn on a failed redemption.
 enum PriorBurnDisposition {
     /// The prior burn already completed on-chain and was recorded; the caller
     /// should return this response directly.
@@ -603,11 +591,11 @@ enum PriorBurnDisposition {
     ResumeWith(Option<BurnExternalTxId>),
 }
 
-/// Inspects the Fireblocks tx (if any) from a previous `BurningFailed` event to
+/// Inspects the prior tx (if any) from a previous `BurningFailed` event to
 /// decide whether the on-chain burn already succeeded (record it), is still
 /// pending (cannot recover yet), or terminally failed (resume with a fresh
 /// replacement `externalTxId`).
-async fn inspect_prior_fireblocks_burn(
+async fn inspect_prior_burn(
     store: &Store<Redemption>,
     vault_service: &Arc<dyn VaultService>,
     aggregate_id: &str,
@@ -619,26 +607,24 @@ async fn inspect_prior_fireblocks_burn(
     let Some(bf_data) = burning_failed else {
         return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
     };
-    let Some(fb_tx_id) = bf_data.fireblocks_tx_id.as_ref() else {
+    let Some(tx_id) = bf_data.tx_id.as_ref() else {
         return Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id));
     };
 
-    match vault_service.check_fireblocks_tx(fb_tx_id).await {
-        Ok(Some(FireblocksTxStatus::Completed { tx_hash, block_number })) => {
+    match vault_service.check_tx(tx_id).await {
+        Ok(receipt) => {
             if bf_data.planned_burns.is_empty() {
                 warn!(target: "admin", aggregate_id = %aggregate_id,
-                    fireblocks_tx_id = %fb_tx_id,
-                    tx_hash = ?tx_hash,
-                    "Pre-enrichment BurningFailed event has no planned_burns — \
+                    tx_hash = ?tx_id,
+                    "BurningFailed event has no planned_burns — \
                      burn records will be empty. Manual receipt inventory \
                      reconciliation may be needed after recovery."
                 );
             }
 
             info!(target: "admin", aggregate_id = %aggregate_id,
-                fireblocks_tx_id = %fb_tx_id,
-                tx_hash = ?tx_hash,
-                "Fireblocks tx already completed on-chain, recording existing burn"
+                tx_hash = ?tx_id,
+                "Transaction already completed on-chain, recording existing burn"
             );
 
             store
@@ -646,12 +632,12 @@ async fn inspect_prior_fireblocks_burn(
                     issuer_request_id,
                     RedemptionCommand::RecordExistingBurn {
                         issuer_request_id: issuer_request_id.clone(),
-                        fireblocks_tx_id: crate::vault::TxId::Legacy(
-                            fb_tx_id.clone(),
-                        ),
-                        tx_hash,
+                        tx_id: tx_id.clone(),
+                        tx_hash: receipt.transaction_hash(),
                         planned_burns: bf_data.planned_burns.clone(),
-                        block_number,
+                        block_number: receipt
+                            .block_number()
+                            .unwrap_or_default(),
                     },
                 )
                 .await
@@ -667,57 +653,41 @@ async fn inspect_prior_fireblocks_burn(
                 aggregate_type: AggregateKind::Redemption,
                 aggregate_id: aggregate_id.to_string(),
                 previous_state: "Failed".to_string(),
-                message:
-                    "Existing on-chain burn recorded via Fireblocks tx lookup"
-                        .to_string(),
+                message: "Existing on-chain burn recorded via tx lookup"
+                    .to_string(),
             }))
         }
-        Ok(Some(FireblocksTxStatus::Pending)) => {
-            info!(target: "admin", aggregate_id = %aggregate_id,
-                fireblocks_tx_id = %fb_tx_id,
-                "Fireblocks tx still pending, cannot recover yet"
-            );
-            Err(Status::UnprocessableEntity)
-        }
-        Ok(Some(FireblocksTxStatus::Failed {
-            detail: fb_detail,
-            sub_status: fb_sub_status,
-            network_tx_hashes: _,
-        })) => {
-            // The terminally failed Fireblocks tx permanently reserves its
-            // externalTxId, so the replacement burn must never reuse the base
-            // id. When event history has no recorded retry id (e.g.
-            // pre-enrichment BurningFailed events without a
-            // BurnFireblocksSubmitted event), fall back to retry-1 — mirror of
-            // the startup recovery path in BurnManager.
-            let retry_external_tx_id =
-                burn_retry_external_tx_id.or_else(|| {
-                    Some(Redemption::retry_burn_external_tx_id_typed(
-                        detected_tx_hash,
-                        1,
-                    ))
-                });
+        Err(e) => {
+            if matches!(e, VaultError::Reverted { .. }) {
+                // The terminally failed tx permanently reserves its
+                // externalTxId, so the replacement burn must never reuse the base
+                // id. When event history has no recorded retry id, fall back to
+                // retry-1 — mirror of the startup recovery path in BurnManager.
+                let retry_external_tx_id =
+                    burn_retry_external_tx_id.or_else(|| {
+                        Some(Redemption::retry_burn_external_tx_id_typed(
+                            detected_tx_hash,
+                            1,
+                        ))
+                    });
 
-            info!(target: "admin", aggregate_id = %aggregate_id,
-                fireblocks_tx_id = %fb_tx_id,
-                fireblocks_status = %fb_detail,
-                fireblocks_sub_status = ?fb_sub_status,
-                retry_external_tx_id = ?retry_external_tx_id,
-                "Fireblocks tx failed, proceeding with ResumeBurn"
-            );
+                info!(target: "admin", aggregate_id = %aggregate_id,
+                    tx_hash = %tx_id,
+                    retry_external_tx_id = ?retry_external_tx_id,
+                    "Transaction reverted onchain, proceeding with ResumeBurn"
+                );
 
-            Ok(PriorBurnDisposition::ResumeWith(retry_external_tx_id))
-        }
-        Ok(None) => {
+                return Ok(PriorBurnDisposition::ResumeWith(
+                    retry_external_tx_id,
+                ));
+            }
+
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                %tx_id,
+                error = %e,
+                "Failed to confirm previously submitted burn"
+            );
             Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id))
-        }
-        Err(err) => {
-            error!(target: "admin", aggregate_id = %aggregate_id,
-                fireblocks_tx_id = %fb_tx_id,
-                error = %err,
-                "Failed to check Fireblocks tx status"
-            );
-            Err(Status::BadGateway)
         }
     }
 }
@@ -1069,7 +1039,7 @@ pub(crate) async fn reprocess_mint(
                 MintView::JournalConfirmed { .. } => "JournalConfirmed",
                 MintView::JournalRejected { .. } => "JournalRejected",
                 MintView::Minting { .. } => "Minting",
-                MintView::FireblocksSubmitted { .. } => "FireblocksSubmitted",
+                MintView::MintTxSubmitted { .. } => "MintTxSubmitted",
                 MintView::CallbackPending { .. } => "CallbackPending",
                 MintView::MintingFailed { .. } => "MintingFailed",
             };
@@ -1108,7 +1078,7 @@ pub(crate) async fn reprocess_mint(
     );
 
     // A single manual Recover advances the mint by one step (e.g. submits the
-    // next retry, leaving it in FireblocksSubmitted). Hand it to a background
+    // next retry, leaving it in TxSubmitted). Hand it to a background
     // scheduled-recovery task so it is driven to completion instead of
     // stalling until the next restart or another manual reprocess.
     spawn_scheduled_mint_recovery(store.inner().clone(), issuer_request_id);
@@ -1190,10 +1160,10 @@ pub(crate) async fn close_mint(
 }
 
 /// In-progress states that haven't transitioned in this long are reported as
-/// stuck. Most state transitions take seconds (a few minutes at most for a
-/// Fireblocks confirmation), so anything older than this either deadlocked or
-/// was silently skipped by recovery (e.g. `RecoveryOutcome::SkippedManualIntervention`
-/// leaves a redemption in `Burning` indefinitely with no terminal event).
+/// stuck. Most state transitions take seconds, so anything older than this
+/// either deadlocked or was silently skipped by recovery (e.g.
+/// `RecoveryOutcome::SkippedManualIntervention` leaves a redemption in
+/// `Burning` indefinitely with no terminal event).
 const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 
 #[utoipa::path(
@@ -1201,18 +1171,17 @@ const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
     path = "/admin/stuck",
     tag = "admin",
     responses(
-        (status = 200, description = "Stuck mints and redemptions, enriched with \
-            best-effort Fireblocks status", body = StuckResponse),
+        (status = 200, description = "Stuck mints and redemptions", body = StuckResponse),
         (status = 500, description = "Failed to query stuck aggregates")
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, pool, vault_service))]
+#[tracing::instrument(skip(_auth, pool, _vault_service))]
 #[get("/admin/stuck")]
 pub(crate) async fn list_stuck(
     _auth: InternalAuth,
     pool: &rocket::State<Pool<Sqlite>>,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
+    _vault_service: &rocket::State<Arc<dyn VaultService>>,
 ) -> Result<Json<StuckResponse>, Status> {
     let now = Utc::now();
     let mut stuck = Vec::new();
@@ -1271,13 +1240,9 @@ pub(crate) async fn list_stuck(
             underlying,
             quantity,
             tx_hash: mint_history.tx_hash,
-            fireblocks_tx_id: mint_history.fireblocks_tx_id,
-            fireblocks_status: None,
+            tx_id: mint_history.tx_id,
         });
     }
-
-    enrich_with_fireblocks_status(&mut stuck, vault_service.inner().as_ref())
-        .await;
 
     Ok(Json(StuckResponse { stuck }))
 }
@@ -1337,40 +1302,6 @@ const fn redemption_stuck_info(
     }
 }
 
-/// Best-effort enrichment: for every stuck entry with a `fireblocks_tx_id`,
-/// query the vault service for the live Fireblocks status (subStatus + network
-/// records) and attach it to the entry. Lookup failures and non-Fireblocks
-/// backends leave `fireblocks_status` as `None`; this is purely additive
-/// information for operators triaging stuck transactions.
-async fn enrich_with_fireblocks_status(
-    stuck: &mut [StuckAggregate],
-    vault_service: &dyn VaultService,
-) {
-    for entry in stuck.iter_mut() {
-        let Some(tx_id) = entry.fireblocks_tx_id.as_deref() else {
-            continue;
-        };
-
-        match vault_service.check_fireblocks_tx(tx_id).await {
-            Ok(Some(status)) => {
-                if entry.tx_hash.is_none() {
-                    entry.tx_hash = tx_hash_from_fireblocks_status(&status);
-                }
-                entry.fireblocks_status = Some(status);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(target: "admin",
-                    aggregate_id = %entry.aggregate_id,
-                    fireblocks_tx_id = %tx_id,
-                    error = %err,
-                    "Failed to enrich stuck entry with Fireblocks status"
-                );
-            }
-        }
-    }
-}
-
 fn stuck_redemption_entry(
     issuer_redemption_request_id: &IssuerRedemptionRequestId,
     view: RedemptionView,
@@ -1384,7 +1315,7 @@ fn stuck_redemption_entry(
         underlying,
         quantity,
         tx_hash,
-        fireblocks_tx_id,
+        tx_id,
     ) = match view {
         RedemptionView::Detected {
             underlying,
@@ -1400,7 +1331,7 @@ fn stuck_redemption_entry(
             Some(underlying),
             Some(quantity),
             Some(tx_hash),
-            history.fireblocks_tx_id,
+            history.tx_id,
         ),
         RedemptionView::AlpacaCalled {
             tokenization_request_id,
@@ -1417,7 +1348,7 @@ fn stuck_redemption_entry(
             Some(underlying),
             Some(quantity),
             Some(tx_hash),
-            history.fireblocks_tx_id,
+            history.tx_id,
         ),
         RedemptionView::Burning {
             tokenization_request_id,
@@ -1427,11 +1358,11 @@ fn stuck_redemption_entry(
             burning_entered_at,
             ..
         } => {
-            // BurnFireblocksSubmitted intentionally leaves the view in
+            // BurnTxSubmitted intentionally leaves the view in
             // Burning. The detail string is what operators read first, so
-            // distinguish pre- vs post-submission by whether a Fireblocks
-            // tx id has been recorded in event history.
-            let detail = if history.fireblocks_tx_id.is_some() {
+            // distinguish pre- vs post-submission by whether a tx id has
+            // been recorded in event history.
+            let detail = if history.tx_id.is_some() {
                 "Waiting for burn confirmation".to_string()
             } else {
                 "Waiting for burn submission".to_string()
@@ -1444,7 +1375,7 @@ fn stuck_redemption_entry(
                 Some(underlying),
                 Some(quantity),
                 Some(tx_hash),
-                history.fireblocks_tx_id,
+                history.tx_id,
             )
         }
         RedemptionView::Failed { reason, failed_at, .. } => (
@@ -1455,7 +1386,7 @@ fn stuck_redemption_entry(
             history.underlying,
             history.quantity,
             history.tx_hash,
-            history.fireblocks_tx_id,
+            history.tx_id,
         ),
         RedemptionView::BurnFailed {
             tokenization_request_id,
@@ -1464,7 +1395,7 @@ fn stuck_redemption_entry(
             tx_hash,
             error,
             failed_at,
-            fireblocks_tx_id,
+            tx_id,
             ..
         } => (
             Some(tokenization_request_id),
@@ -1474,7 +1405,7 @@ fn stuck_redemption_entry(
             Some(underlying),
             Some(quantity),
             Some(tx_hash),
-            fireblocks_tx_id.or(history.fireblocks_tx_id),
+            tx_id.or(history.tx_id),
         ),
         // Terminal/Unavailable variants never reach here — list_stuck gates
         // on redemption_stuck_info which returns None for them.
@@ -1493,8 +1424,7 @@ fn stuck_redemption_entry(
         underlying,
         quantity,
         tx_hash,
-        fireblocks_tx_id,
-        fireblocks_status: None,
+        tx_id,
     })
 }
 
@@ -1504,7 +1434,7 @@ struct RedemptionHistorySummary {
     underlying: Option<UnderlyingSymbol>,
     quantity: Option<Quantity>,
     tx_hash: Option<B256>,
-    fireblocks_tx_id: Option<String>,
+    tx_id: Option<TxId>,
 }
 
 /// Summarizes a redemption's history for the `/admin/stuck` metadata lookup.
@@ -1563,8 +1493,8 @@ async fn redemption_history_summary(
 
 /// Pure reduce: builds a `RedemptionHistorySummary` from an ordered sequence
 /// of `RedemptionEvent`s. Split out from `redemption_history_summary` so the
-/// branching (especially the Reprocess/Resume fireblocks-id reset) is
-/// unit-testable without an event store.
+/// branching (especially the Reprocess/Resume tx-id reset) is unit-testable
+/// without an event store.
 fn redemption_history_summary_from_events(
     events: impl IntoIterator<Item = RedemptionEvent>,
 ) -> RedemptionHistorySummary {
@@ -1594,29 +1524,21 @@ fn redemption_history_summary_from_events(
                 summary.quantity = Some(quantity);
                 summary.tx_hash = Some(tx_hash);
                 // Reprocess/Resume starts a fresh attempt — any prior
-                // Fireblocks submission belongs to the previous attempt
+                // tx submission belongs to the previous attempt
                 // and must not bleed into the current Burning row's
                 // operator-facing detail. A subsequent
-                // `BurnFireblocksSubmitted` re-sets the field.
-                summary.fireblocks_tx_id = None;
+                // `BurnTxSubmitted` re-sets the field.
+                summary.tx_id = None;
             }
             RedemptionEvent::AlpacaCalled {
                 tokenization_request_id, ..
             } => {
                 summary.tokenization_request_id = Some(tokenization_request_id);
             }
-            RedemptionEvent::BurnFireblocksSubmitted {
-                fireblocks_tx_id,
-                ..
-            }
-            | RedemptionEvent::ExistingBurnRecovered {
-                fireblocks_tx_id, ..
-            }
-            | RedemptionEvent::BurningFailed {
-                fireblocks_tx_id: Some(fireblocks_tx_id),
-                ..
-            } => {
-                summary.fireblocks_tx_id = Some(fireblocks_tx_id.to_string());
+            RedemptionEvent::BurnTxSubmitted { tx_id, .. }
+            | RedemptionEvent::ExistingBurnRecovered { tx_id, .. }
+            | RedemptionEvent::BurningFailed { tx_id: Some(tx_id), .. } => {
+                summary.tx_id = Some(tx_id);
             }
             _ => {}
         }
@@ -1683,14 +1605,14 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
             detail: "Deposit in progress".to_string(),
             timestamp: *minting_started_at,
         }),
-        MintView::FireblocksSubmitted {
+        MintView::MintTxSubmitted {
             tokenization_request_id,
             minting_started_at,
             ..
         } => Some(MintStuckSummary {
             class: InProgress,
             tokenization_request_id: Some(tokenization_request_id.clone()),
-            state: "FireblocksSubmitted".to_string(),
+            state: "MintTxSubmitted".to_string(),
             detail: "Awaiting on-chain confirmation".to_string(),
             timestamp: *minting_started_at,
         }),
@@ -1731,7 +1653,7 @@ fn mint_view_asset(
         | MintView::JournalConfirmed { underlying, quantity, .. }
         | MintView::JournalRejected { underlying, quantity, .. }
         | MintView::Minting { underlying, quantity, .. }
-        | MintView::FireblocksSubmitted { underlying, quantity, .. }
+        | MintView::MintTxSubmitted { underlying, quantity, .. }
         | MintView::MintingFailed { underlying, quantity, .. }
         | MintView::CallbackPending { underlying, quantity, .. } => {
             (Some(underlying.clone()), Some(quantity.clone()))
@@ -1745,7 +1667,7 @@ fn mint_view_asset(
 #[derive(Debug, Default)]
 struct MintHistorySummary {
     tx_hash: Option<B256>,
-    fireblocks_tx_id: Option<String>,
+    tx_id: Option<TxId>,
 }
 
 /// Returns the latest useful transaction hints from this mint's history.
@@ -1776,7 +1698,7 @@ async fn mint_history_summary(
                 target: "admin",
                 aggregate_id = %aggregate_id,
                 error = %err,
-                "Failed to load mint events for fireblocks_tx_id lookup"
+                "Failed to load mint events for tx_id lookup"
             );
             return MintHistorySummary::default();
         }
@@ -1793,7 +1715,7 @@ async fn mint_history_summary(
                 target: "admin",
                 aggregate_id = %aggregate_id,
                 error = %err,
-                "Failed to deserialize mint events for fireblocks_tx_id lookup"
+                "Failed to deserialize mint events for tx_id lookup"
             );
             return MintHistorySummary::default();
         }
@@ -1816,95 +1738,14 @@ fn mint_history_summary_from_events(
             | MintEvent::MintRetryStarted { tx_hash: Some(tx_hash), .. } => {
                 summary.tx_hash = Some(tx_hash);
             }
-            MintEvent::FireblocksSubmitted { fireblocks_tx_id, .. } => {
-                summary.fireblocks_tx_id = Some(fireblocks_tx_id);
+            MintEvent::MintTxSubmitted { tx_id, .. } => {
+                summary.tx_id = Some(tx_id);
             }
             _ => {}
         }
     }
 
     summary
-}
-
-fn tx_hash_from_fireblocks_status(status: &FireblocksTxStatus) -> Option<B256> {
-    match status {
-        FireblocksTxStatus::Completed { tx_hash, .. } => Some(*tx_hash),
-        FireblocksTxStatus::Failed { network_tx_hashes, .. } => {
-            network_tx_hashes.iter().find_map(|tx_hash| match tx_hash.parse() {
-                Ok(parsed) => Some(parsed),
-                Err(err) => {
-                    warn!(target: "admin",
-                        network_tx_hash = %tx_hash,
-                        error = %err,
-                        "Skipping malformed Fireblocks network_tx_hash"
-                    );
-                    None
-                }
-            })
-        }
-        FireblocksTxStatus::Pending => None,
-    }
-}
-
-/// Response for the Fireblocks transaction status lookup endpoint.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct FireblocksTxResponse {
-    fireblocks_tx_id: String,
-    #[serde(flatten)]
-    status: FireblocksTxStatus,
-}
-
-/// Admin endpoint to look up a Fireblocks transaction status.
-///
-/// Useful for checking orphaned transactions that were submitted but never
-/// recorded in the event store (e.g. due to recovery timeout).
-#[utoipa::path(
-    get,
-    path = "/admin/fireblocks/tx/{fireblocks_tx_id}",
-    tag = "admin",
-    params(
-        ("fireblocks_tx_id" = String, Path,
-            description = "Fireblocks transaction id to look up")
-    ),
-    responses(
-        (status = 200, description = "Live Fireblocks transaction status",
-            body = FireblocksTxResponse),
-        (status = 404,
-            description = "Unknown tx, or backend is non-Fireblocks (Local signer)"),
-        (status = 502, description = "Fireblocks lookup failed")
-    ),
-    security(("internal_api_key" = []))
-)]
-#[tracing::instrument(skip(_auth, vault_service))]
-#[get("/admin/fireblocks/tx/<fireblocks_tx_id>")]
-pub(crate) async fn check_fireblocks_tx(
-    _auth: InternalAuth,
-    vault_service: &rocket::State<Arc<dyn VaultService>>,
-    fireblocks_tx_id: &str,
-) -> Result<Json<FireblocksTxResponse>, Status> {
-    let result = vault_service
-        .check_fireblocks_tx(fireblocks_tx_id)
-        .await
-        .map_err(|err| {
-            error!(target: "admin",
-                fireblocks_tx_id = %fireblocks_tx_id,
-                error = %err,
-                "Failed to check Fireblocks transaction"
-            );
-            Status::BadGateway
-        })?;
-
-    let Some(fb_status) = result else {
-        // Non-Fireblocks backend — check_fireblocks_tx returns None.
-        return Err(Status::NotFound);
-    };
-
-    let response = FireblocksTxResponse {
-        fireblocks_tx_id: fireblocks_tx_id.to_string(),
-        status: fb_status,
-    };
-
-    Ok(Json(response))
 }
 
 #[cfg(test)]
@@ -1921,10 +1762,12 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
+    use super::AggregateKind;
     use super::{
-        AlpacaCalledData, BurningFailedData, PostAlpacaRecoveryInput,
-        load_reprocess_context, recover_post_alpaca,
+        AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
+        recover_post_alpaca,
     };
+    use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
@@ -1938,11 +1781,7 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{
-        FireblocksTxStatus, MultiBurnEntry, SendableTxWithHash, VaultService,
-    };
-
-    use super::{AggregateKind, StuckAggregate};
+    use crate::vault::{MultiBurnEntry, TxId, VaultService};
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -2144,11 +1983,11 @@ mod tests {
     fn failed_redemption_stuck_entry_uses_history_metadata() {
         let metadata = test_metadata();
         let tokenization_request_id = TokenizationRequestId::new("tok-red-1");
-        let fireblocks_tx_id = "fb-redemption-1".to_string();
+        let tx_id = TxId::random();
         let failed_at = Utc::now();
         let view = RedemptionView::Failed {
             issuer_request_id: metadata.issuer_request_id.clone(),
-            reason: "Fireblocks burn confirmation failed".to_string(),
+            reason: "Transaction burn confirmation failed".to_string(),
             failed_at,
         };
         let history = super::RedemptionHistorySummary {
@@ -2156,7 +1995,7 @@ mod tests {
             underlying: Some(metadata.underlying.clone()),
             quantity: Some(metadata.quantity.clone()),
             tx_hash: Some(metadata.detected_tx_hash),
-            fireblocks_tx_id: Some(fireblocks_tx_id.clone()),
+            tx_id: Some(tx_id.clone()),
         };
 
         let entry = super::stuck_redemption_entry(
@@ -2175,7 +2014,7 @@ mod tests {
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
-        assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
+        assert_eq!(entry.tx_id, Some(tx_id));
         assert_eq!(entry.timestamp, failed_at);
     }
 
@@ -2183,7 +2022,7 @@ mod tests {
     fn burn_failed_stuck_entry_prefers_view_metadata() {
         let metadata = test_metadata();
         let tokenization_request_id = TokenizationRequestId::new("tok-red-2");
-        let fireblocks_tx_id = "fb-burn-failed".to_string();
+        let tx_id = TxId::random();
         let failed_at = Utc::now();
         let view = RedemptionView::BurnFailed {
             issuer_request_id: metadata.issuer_request_id.clone(),
@@ -2201,7 +2040,7 @@ mod tests {
             alpaca_journal_completed_at: Utc::now(),
             error: "burn failed".to_string(),
             failed_at,
-            fireblocks_tx_id: Some(fireblocks_tx_id.clone()),
+            tx_id: Some(tx_id.clone()),
             planned_burns: vec![],
         };
 
@@ -2217,7 +2056,7 @@ mod tests {
             Some(tokenization_request_id)
         );
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
-        assert_eq!(entry.fireblocks_tx_id, Some(fireblocks_tx_id));
+        assert_eq!(entry.tx_id, Some(tx_id));
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
     }
@@ -2314,9 +2153,10 @@ mod tests {
 
         let metadata = test_metadata();
         let alpaca_data = test_alpaca_data();
+        let tx_id = TxId::random();
 
         // Drive the redemption through a real burn submission that then fails,
-        // so event history carries a BurnFireblocksSubmitted event the
+        // so event history carries a BurnTxSubmitted event the
         // derivation must scan — rather than injecting the retry id directly.
         store
             .send(
@@ -2413,9 +2253,7 @@ mod tests {
                 RedemptionCommand::RecordBurnFailure {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     error: "burn terminally failed".to_string(),
-                    fireblocks_tx_id: Some(crate::vault::TxId::Legacy(
-                        "mock-fb-burn".to_string(),
-                    )),
+                    tx_id: Some(tx_id.clone()),
                     planned_burns: vec![],
                 },
             )
@@ -2427,7 +2265,7 @@ mod tests {
                 .await
                 .expect("load_reprocess_context failed");
 
-        // The base BurnFireblocksSubmitted in history must advance the derived
+        // The base BurnTxSubmitted in history must advance the derived
         // id to retry-1, proving the derivation is wired into
         // load_reprocess_context rather than the retry id being injected.
         assert_eq!(
@@ -2441,10 +2279,7 @@ mod tests {
         let burning_failed = context
             .burning_failed
             .expect("expected BurningFailed data in context");
-        assert_eq!(
-            burning_failed.fireblocks_tx_id,
-            Some("mock-fb-burn".to_string())
-        );
+        assert_eq!(burning_failed.tx_id, Some(tx_id));
     }
 
     #[traced_test]
@@ -2550,15 +2385,8 @@ mod tests {
                 &alpaca_data,
             )),
         });
-        let vault: Arc<dyn VaultService> = Arc::new(
-            MockVaultService::new_success().with_fireblocks_tx_status(
-                FireblocksTxStatus::Failed {
-                    detail: "FAILED".to_string(),
-                    sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
-                    network_tx_hashes: vec![],
-                },
-            ),
-        );
+        let vault: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_reverted_burn());
 
         let result = recover_post_alpaca(
             &store,
@@ -2570,10 +2398,8 @@ mod tests {
                 issuer_request_id: metadata.issuer_request_id.clone(),
                 metadata: metadata.clone(),
                 alpaca_data,
-                // Pre-enrichment failure: a Fireblocks tx exists but history
-                // carries no recorded retry id.
                 burning_failed: Some(BurningFailedData {
-                    fireblocks_tx_id: Some("fb-terminal-1".to_string()),
+                    tx_id: Some(TxId::random()),
                     planned_burns: vec![],
                 }),
                 burn_retry_external_tx_id: None,
@@ -2593,7 +2419,7 @@ mod tests {
             panic!("Expected Burning state, got {redemption:?}");
         };
 
-        // The terminally failed Fireblocks tx permanently blocks the base
+        // The terminally failed transaction permanently blocks the base
         // externalTxId, so recovery must fall back to retry-1 rather than
         // reuse it.
         assert_eq!(
@@ -2606,7 +2432,7 @@ mod tests {
 
         assert!(logs_contain_at!(
             Level::INFO,
-            &["Fireblocks tx failed", "ResumeBurn"]
+            &["Transaction reverted onchain", "ResumeBurn"]
         ));
     }
 
@@ -2808,7 +2634,7 @@ mod tests {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
         use crate::config::{Config, Environment, LogLevel};
-        use crate::fireblocks::SignerConfig;
+        use crate::wallet::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
 
@@ -2979,7 +2805,7 @@ mod tests {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
         use crate::config::{Config, Environment, LogLevel};
-        use crate::fireblocks::SignerConfig;
+        use crate::wallet::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
 
@@ -3292,7 +3118,7 @@ mod tests {
         use crate::alpaca::service::AlpacaConfig;
         use crate::auth::{FailedAuthRateLimiter, test_auth_config};
         use crate::config::{Config, Environment, LogLevel};
-        use crate::fireblocks::SignerConfig;
+        use crate::wallet::SignerConfig;
         use alloy::primitives::B256;
         use url::Url;
 
@@ -3461,203 +3287,6 @@ mod tests {
         );
     }
 
-    /// Stub VaultService that returns a pre-canned `FireblocksTxStatus` for a
-    /// specific tx id and `None` for everything else. Lets us drive
-    /// `enrich_with_fireblocks_status` without spinning up Fireblocks.
-    struct StubFireblocksVault {
-        tx_id: String,
-        response: FireblocksTxStatus,
-    }
-
-    #[async_trait]
-    impl VaultService for StubFireblocksVault {
-        async fn submit_mint(
-            &self,
-            _vault: alloy::primitives::Address,
-            _assets: alloy::primitives::U256,
-            _bot: alloy::primitives::Address,
-            _user: alloy::primitives::Address,
-            _receipt_info: crate::vault::ReceiptInformation,
-            _external_tx_id: Option<String>,
-        ) -> Result<crate::vault::SubmittedTx, crate::vault::VaultError>
-        {
-            unimplemented!("not used in enrichment tests")
-        }
-
-        async fn confirm_mint(
-            &self,
-            _fireblocks_tx_id: &str,
-        ) -> Result<crate::vault::MintResult, crate::vault::VaultError>
-        {
-            unimplemented!("not used in enrichment tests")
-        }
-
-        async fn get_share_balance(
-            &self,
-            _vault: alloy::primitives::Address,
-            _owner: alloy::primitives::Address,
-        ) -> Result<alloy::primitives::U256, crate::vault::VaultError> {
-            unimplemented!("not used in enrichment tests")
-        }
-
-        async fn check_fireblocks_tx(
-            &self,
-            fireblocks_tx_id: &str,
-        ) -> Result<Option<FireblocksTxStatus>, crate::vault::VaultError>
-        {
-            if fireblocks_tx_id == self.tx_id {
-                Ok(Some(self.response.clone()))
-            } else {
-                Ok(None)
-            }
-        }
-
-        async fn submit_burn(
-            &self,
-            _params: crate::vault::MultiBurnParams,
-            _prepared_tx: Option<SendableTxWithHash>,
-        ) -> Result<
-            crate::vault::SubmittedTx<
-                crate::redemption::BurnExternalTxId,
-                crate::vault::TxId,
-            >,
-            crate::vault::VaultError,
-        > {
-            unimplemented!("not used in enrichment tests")
-        }
-
-        async fn confirm_burn(
-            &self,
-            _fireblocks_tx_id: &crate::vault::TxId,
-            _dust_shares: alloy::primitives::U256,
-        ) -> Result<crate::vault::MultiBurnResult, crate::vault::VaultError>
-        {
-            unimplemented!("not used in enrichment tests")
-        }
-
-        async fn verify_burn_tx(
-            &self,
-            _vault: alloy::primitives::Address,
-            _owner: alloy::primitives::Address,
-            _tx_hash: alloy::primitives::B256,
-        ) -> Result<crate::vault::BurnVerification, crate::vault::VaultError>
-        {
-            unimplemented!("not used in enrichment tests")
-        }
-    }
-
-    fn stuck_entry(id: &str, fireblocks_tx_id: Option<&str>) -> StuckAggregate {
-        StuckAggregate {
-            aggregate_type: AggregateKind::Mint,
-            aggregate_id: id.to_string(),
-            tokenization_request_id: None,
-            state: "MintingFailed".to_string(),
-            detail: "Fireblocks transaction X reached terminal status: Failed"
-                .to_string(),
-            timestamp: Utc::now(),
-            underlying: None,
-            quantity: None,
-            tx_hash: None,
-            fireblocks_tx_id: fireblocks_tx_id.map(str::to_owned),
-            fireblocks_status: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn enrich_populates_status_for_matching_tx_id() {
-        let tx_id = "a29e5027-1e44-4a66-b78b-b579e55757db";
-        let stub = StubFireblocksVault {
-            tx_id: tx_id.to_string(),
-            response: FireblocksTxStatus::Failed {
-                detail: "Failed".to_string(),
-                sub_status: Some("INSUFFICIENT_FUNDS".to_string()),
-                network_tx_hashes: vec![
-                    "0xabc0000000000000000000000000000000000000000000000000000000000001"
-                        .to_string(),
-                ],
-            },
-        };
-
-        let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
-
-        match entries[0].fireblocks_status.as_ref().expect(
-            "matching tx id should produce a populated fireblocks_status",
-        ) {
-            FireblocksTxStatus::Failed {
-                detail,
-                sub_status,
-                network_tx_hashes,
-            } => {
-                assert_eq!(detail, "Failed");
-                assert_eq!(sub_status.as_deref(), Some("INSUFFICIENT_FUNDS"),);
-                assert_eq!(network_tx_hashes.len(), 1);
-            }
-            other => panic!("unexpected status: {other:?}"),
-        }
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn enrich_warns_on_malformed_network_tx_hash() {
-        let tx_id = "a29e5027-1e44-4a66-b78b-b579e55757db";
-        let stub = StubFireblocksVault {
-            tx_id: tx_id.to_string(),
-            response: FireblocksTxStatus::Failed {
-                detail: "Failed".to_string(),
-                sub_status: Some("REJECTED_BY_BLOCKCHAIN".to_string()),
-                network_tx_hashes: vec!["not-a-hash".to_string()],
-            },
-        };
-
-        let mut entries = vec![stuck_entry("mint-1", Some(tx_id))];
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
-
-        // The unparseable hash must not be silently dropped: tx_hash stays
-        // None and the bad value is surfaced in a warning.
-        assert!(entries[0].tx_hash.is_none());
-        assert!(logs_contain_at!(
-            Level::WARN,
-            &["malformed Fireblocks network_tx_hash", "not-a-hash"]
-        ));
-    }
-
-    #[tokio::test]
-    async fn enrich_leaves_entries_without_tx_id_untouched() {
-        let stub = StubFireblocksVault {
-            tx_id: "any".to_string(),
-            response: FireblocksTxStatus::Pending,
-        };
-
-        let mut entries = vec![
-            stuck_entry("redemption-no-tx", None),
-            stuck_entry("redemption-unknown-tx", Some("unrelated-tx")),
-        ];
-
-        super::enrich_with_fireblocks_status(&mut entries, &stub).await;
-
-        // Entry without a tx id is skipped entirely.
-        assert!(entries[0].fireblocks_status.is_none());
-        // Entry with a tx id the stub doesn't recognise gets `Ok(None)` back
-        // from the vault service, which maps to a left-as-None status.
-        assert!(entries[1].fireblocks_status.is_none());
-    }
-
-    #[test]
-    fn failed_status_serializes_with_sub_status_and_network_hashes() {
-        let status = FireblocksTxStatus::Failed {
-            detail: "Failed".to_string(),
-            sub_status: Some("BLOCKED_BY_POLICY".to_string()),
-            network_tx_hashes: vec!["0xdeadbeef".to_string()],
-        };
-
-        let json = serde_json::to_value(&status).unwrap();
-        assert_eq!(json["status"], "failed");
-        assert_eq!(json["detail"], "Failed");
-        assert_eq!(json["sub_status"], "BLOCKED_BY_POLICY");
-        assert_eq!(json["network_tx_hashes"][0], "0xdeadbeef");
-    }
-
     #[test]
     fn is_stuck_terminal_fail_always_true_regardless_of_age() {
         let now = Utc::now();
@@ -3814,7 +3443,7 @@ mod tests {
             alpaca_journal_completed_at: detected_at,
             error: "burn failed".to_string(),
             failed_at: burn_failed_at,
-            fireblocks_tx_id: None,
+            tx_id: None,
             planned_burns: vec![],
         };
         assert_eq!(
@@ -3939,10 +3568,10 @@ mod tests {
         assert_eq!(entry.timestamp, burning_entered_at);
         assert_eq!(entry.tokenization_request_id, Some(tok_id.clone()));
 
-        // Same Burning view, but history shows a prior Fireblocks
+        // Same Burning view, but history shows a prior transaction
         // submission — the detail should flip to "Waiting for burn
         // confirmation" so operators don't see misleading "submission"
-        // text on a post-submission row. BurnFireblocksSubmitted leaves
+        // text on a post-submission row. BurnTxSubmitted leaves
         // the view in Burning, so this branch is the only signal.
         let burning_view_with_history = RedemptionView::Burning {
             issuer_request_id: metadata.issuer_request_id.clone(),
@@ -3960,8 +3589,10 @@ mod tests {
             alpaca_journal_completed_at: journal_completed_at,
             burning_entered_at,
         };
+
+        let tx_id = TxId::random();
         let history_with_fb = super::RedemptionHistorySummary {
-            fireblocks_tx_id: Some("fb-tx-burn-1".to_string()),
+            tx_id: Some(tx_id.clone()),
             ..super::RedemptionHistorySummary::default()
         };
         let entry = super::stuck_redemption_entry(
@@ -3972,7 +3603,7 @@ mod tests {
         .expect("Burning view should produce a stuck entry");
         assert_eq!(entry.state, "Burning");
         assert_eq!(entry.detail, "Waiting for burn confirmation");
-        assert_eq!(entry.fireblocks_tx_id, Some("fb-tx-burn-1".to_string()));
+        assert_eq!(entry.tx_id, Some(tx_id));
     }
 
     #[test]
@@ -4159,13 +3790,13 @@ mod tests {
     }
 
     /// Regression: an iter-3 fix branches the Burning detail string on
-    /// `history.fireblocks_tx_id.is_some()`. Without the iter-4 fix to
-    /// `redemption_history_summary`, a previously-failed Fireblocks tx
+    /// `history.tx_id.is_some()`. Without the iter-4 fix to
+    /// `redemption_history_summary`, a previously-failed transaction
     /// would survive across a `BurnResumed` and mislabel the freshly
     /// resumed (but not-yet-submitted) Burning row as "Waiting for burn
     /// confirmation".
     #[test]
-    fn redemption_history_summary_clears_fireblocks_tx_id_on_burn_resumed() {
+    fn redemption_history_summary_clears_tx_id_on_burn_resumed() {
         use crate::redemption::{BurnExternalTxId, RedemptionEvent};
 
         let issuer = IssuerRedemptionRequestId::random();
@@ -4178,8 +3809,9 @@ mod tests {
         );
         let now = Utc::now();
         let tok_id = TokenizationRequestId::new("tok-resume-1");
+        let tx_id = TxId::random();
 
-        // Sequence: a full Burning attempt that failed during Fireblocks
+        // Sequence: a full Burning attempt that failed during transaction
         // confirmation, then operator-initiated BurnResumed putting us
         // back into Burning with NO new submission yet.
         let events = vec![
@@ -4204,24 +3836,20 @@ mod tests {
                 issuer_request_id: issuer.clone(),
                 alpaca_journal_completed_at: now,
             },
-            RedemptionEvent::BurnFireblocksSubmitted {
+            RedemptionEvent::BurnTxSubmitted {
                 issuer_request_id: issuer.clone(),
                 external_tx_id: BurnExternalTxId::from_string(format!(
                     "burn-{tx_hash}"
                 )),
-                fireblocks_tx_id: crate::vault::TxId::Legacy(
-                    "fb-old-attempt".to_string(),
-                ),
+                tx_id: tx_id.clone(),
                 planned_burns: vec![],
                 submitted_at: now,
             },
             RedemptionEvent::BurningFailed {
                 issuer_request_id: issuer.clone(),
-                error: "fireblocks failed".to_string(),
+                error: "tx failed".to_string(),
                 failed_at: now,
-                fireblocks_tx_id: Some(crate::vault::TxId::Legacy(
-                    "fb-old-attempt".to_string(),
-                )),
+                tx_id: Some(tx_id),
                 planned_burns: vec![],
             },
             RedemptionEvent::RedemptionFailed {
@@ -4229,7 +3857,7 @@ mod tests {
                 reason: "burn failed".to_string(),
                 failed_at: now,
             },
-            // Operator resumes the burn — no new BurnFireblocksSubmitted
+            // Operator resumes the burn — no new BurnTxSubmitted
             // has happened yet.
             RedemptionEvent::BurnResumed {
                 issuer_request_id: issuer,
@@ -4252,12 +3880,12 @@ mod tests {
 
         let summary = super::redemption_history_summary_from_events(events);
 
-        // BurnResumed must clear the prior failed Fireblocks tx id so the
+        // BurnResumed must clear the prior failed transaction id so the
         // stuck-row detail string reflects "Waiting for burn submission"
         // (not "Waiting for burn confirmation") for the new attempt.
         assert_eq!(
-            summary.fireblocks_tx_id, None,
-            "BurnResumed must clear prior fireblocks_tx_id from summary"
+            summary.tx_id, None,
+            "BurnResumed must clear prior tx_id from summary"
         );
         // tokenization_request_id is preserved (it doesn't reset).
         assert_eq!(summary.tokenization_request_id, Some(tok_id));

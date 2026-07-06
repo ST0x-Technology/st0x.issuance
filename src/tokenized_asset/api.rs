@@ -210,11 +210,11 @@ mod tests {
     use crate::alpaca::service::AlpacaConfig;
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, Environment, LogLevel};
-    use crate::fireblocks::SignerConfig;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
+    use crate::wallet::SignerConfig;
 
     fn test_config() -> Config {
         Config {

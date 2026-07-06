@@ -95,10 +95,10 @@ pub(crate) enum RedemptionView {
         alpaca_journal_completed_at: DateTime<Utc>,
         error: String,
         failed_at: DateTime<Utc>,
-        /// Fireblocks transaction ID, if a burn was already submitted before failure.
+        /// Transaction ID, if a burn was already submitted before failure.
         /// Present when the failure occurred during confirmation (after submission).
         #[serde(default)]
-        fireblocks_tx_id: Option<String>,
+        tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         #[serde(default)]
         planned_burns: Vec<super::BurnRecord>,
@@ -194,7 +194,7 @@ impl RedemptionView {
         self,
         error: &str,
         failed_at: DateTime<Utc>,
-        fireblocks_tx_id: Option<&TxId>,
+        tx_id: Option<&TxId>,
         planned_burns: &[super::BurnRecord],
     ) -> Self {
         let Self::Burning {
@@ -233,7 +233,7 @@ impl RedemptionView {
             alpaca_journal_completed_at,
             error: error.to_string(),
             failed_at,
-            fireblocks_tx_id: fireblocks_tx_id.map(ToString::to_string),
+            tx_id: tx_id.cloned(),
             planned_burns: planned_burns.to_vec(),
         }
     }
@@ -315,13 +315,13 @@ impl RedemptionView {
             RedemptionEvent::BurningFailed {
                 error,
                 failed_at,
-                fireblocks_tx_id,
+                tx_id,
                 planned_burns,
                 ..
             } => self.update_burning_failed(
                 error,
                 *failed_at,
-                fireblocks_tx_id.as_ref(),
+                tx_id.as_ref(),
                 planned_burns,
             ),
 
@@ -388,10 +388,10 @@ impl RedemptionView {
                 block_number: *block_number,
                 completed_at: *recovered_at,
             },
-            // View stays in Burning — BurnFireblocksSubmitted and BurnIntended is an internal
+            // View stays in Burning — BurnTxSubmitted and BurnIntended is an internal
             // detail that doesn't change the query-facing state.
             RedemptionEvent::BurnIntended { .. }
-            | RedemptionEvent::BurnFireblocksSubmitted { .. } => self,
+            | RedemptionEvent::BurnTxSubmitted { .. } => self,
             RedemptionEvent::RedemptionClosed {
                 issuer_request_id,
                 reason,
@@ -938,7 +938,7 @@ mod tests {
                     issuer_request_id: id.clone(),
                     error: error.to_string(),
                     failed_at: Utc::now(),
-                    fireblocks_tx_id: None,
+                    tx_id: None,
                     planned_burns: vec![],
                 },
             )
@@ -1709,7 +1709,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     error: error.clone(),
                     failed_at,
-                    fireblocks_tx_id: None,
+                    tx_id: None,
                     planned_burns: vec![],
                 },
             )
@@ -2239,9 +2239,7 @@ mod tests {
                 issuer_request_id.clone(),
                 RedemptionEvent::ExistingBurnRecovered {
                     issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: TxId::Legacy(
-                        "fb-recovered-123".to_string(),
-                    ),
+                    tx_id: TxId::random(),
                     tx_hash,
                     burns: vec![],
                     block_number,

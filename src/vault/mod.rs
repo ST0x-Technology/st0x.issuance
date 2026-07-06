@@ -25,14 +25,12 @@ pub(crate) mod service;
 pub(crate) trait VaultService: Send + Sync {
     /// Submits a mint transaction (deposit + share transfer) to the signing backend.
     ///
-    /// Encodes the multicall calldata and submits it via the backend (Fireblocks
-    /// CONTRACT_CALL or direct send). Returns a [`SubmittedTx`] whose
-    /// `fireblocks_tx_id` is persisted in a CQRS event so that `confirm_mint`
+    /// Encodes the multicall calldata and submits it via the backend. Returns a
+    /// [`SubmittedTx`] whose `tx_id` is persisted in a CQRS event so that `confirm_mint`
     /// can resume polling after a restart.
     ///
     /// Uses a deterministic `external_tx_id` so that resubmitting the same mint
-    /// after a crash triggers Fireblocks' duplicate rejection instead of a
-    /// double-mint.
+    /// after a crash triggers transaction duplicate rejection instead of a double-mint.
     async fn submit_mint(
         &self,
         vault: Address,
@@ -50,10 +48,10 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `fireblocks_tx_id` - Backend transaction ID from [`SubmittedTx`]
+    /// * `tx_id` - Backend transaction ID from [`SubmittedTx`]
     async fn confirm_mint(
         &self,
-        fireblocks_tx_id: &str,
+        tx_id: &TxId,
     ) -> Result<MintResult, VaultError>;
 
     /// Gets the ERC-20 share balance for an address.
@@ -75,20 +73,6 @@ pub(crate) trait VaultService: Send + Sync {
         owner: Address,
     ) -> Result<U256, VaultError>;
 
-    /// Checks the status of a Fireblocks transaction by its ID.
-    ///
-    /// Returns `Ok(None)` for non-Fireblocks backends (no Fireblocks state to check).
-    /// Returns `Ok(Some(status))` if the transaction was found on Fireblocks.
-    ///
-    /// This is a single-shot check, not a polling loop. Used by the admin recovery
-    /// endpoint to detect burns that succeeded on-chain but weren't recorded.
-    async fn check_fireblocks_tx(
-        &self,
-        _fireblocks_tx_id: &str,
-    ) -> Result<Option<FireblocksTxStatus>, VaultError> {
-        Ok(None)
-    }
-
     /// Submits a multi-receipt burn transaction to the signing backend.
     ///
     /// Encodes the multicall calldata (N redeems + optional dust transfer)
@@ -96,8 +80,8 @@ pub(crate) trait VaultService: Send + Sync {
     async fn submit_burn(
         &self,
         params: MultiBurnParams,
-        prepared_tx: Option<SendableTxWithHash>,
-    ) -> Result<SubmittedTx<BurnExternalTxId, TxId>, VaultError>;
+        sendable_tx: SendableTxWithHash,
+    ) -> Result<SubmittedTx, VaultError>;
 
     /// Confirms a previously submitted burn transaction.
     ///
@@ -105,12 +89,12 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `fireblocks_tx_id` - Backend transaction ID from [`SubmittedTx`]
+    /// * `tx_id` - Backend transaction ID from [`SubmittedTx`]
     /// * `dust_shares` - Amount of dust to report as returned (passed through
     ///   from the original request since it cannot be derived from on-chain events)
     async fn confirm_burn(
         &self,
-        fireblocks_tx_id: &TxId,
+        tx_id: &TxId,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError>;
 
@@ -129,15 +113,17 @@ pub(crate) trait VaultService: Send + Sync {
     ) -> Result<BurnVerification, VaultError>;
 
     /// Prepares asigned raw tx that is sendable via eth_sendRawTransaction
-    ///
-    /// Currently returns Option<>, since fireblocks path doesnt use this,
-    /// but options return will be removed once fireblocks is completely removed
     async fn prepare_burn_tx(
         &self,
         _params: &MultiBurnParams,
-    ) -> Result<Option<SendableTxWithHash>, VaultError> {
-        Ok(None)
-    }
+    ) -> Result<SendableTxWithHash, VaultError>;
+
+    /// Fetches the on-chain receipt for `tx_hash`, returning an error if the
+    /// transaction reverted.
+    async fn check_tx(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<TransactionReceipt, VaultError>;
 
     /// Serializes the local wallet's nonce assignment through broadcast.
     async fn lock_wallet(&self) -> WalletNonceGuard {
@@ -147,7 +133,7 @@ pub(crate) trait VaultService: Send + Sync {
 
 pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct SendableTxWithHash {
     pub(crate) tx: Vec<u8>,
     pub(crate) hash: B256,
@@ -219,33 +205,6 @@ pub(crate) fn verify_burn_in_receipt(
     Ok(BurnVerification { block_number, shares_burned })
 }
 
-/// Status of a Fireblocks transaction, as returned by `check_fireblocks_tx`.
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum FireblocksTxStatus {
-    /// Transaction completed on-chain.
-    Completed {
-        #[schema(value_type = String)]
-        tx_hash: B256,
-        block_number: u64,
-    },
-    /// Transaction is still pending (submitted, confirming, etc.).
-    Pending,
-    /// Transaction reached a terminal failure status.
-    Failed {
-        /// Top-level Fireblocks `TransactionStatus` variant (debug-formatted).
-        detail: String,
-        /// Fireblocks `subStatus` (e.g. `INSUFFICIENT_FUNDS`,
-        /// `BLOCKED_BY_POLICY`, `REJECTED_BY_BLOCKCHAIN`). This is what tells
-        /// you *why* a transaction failed; `detail` alone just says it did.
-        sub_status: Option<String>,
-        /// Per-network transaction hashes Fireblocks recorded. Useful when a
-        /// blockchain-level failure (revert, dropped tx) needs to be inspected
-        /// against an explorer.
-        network_tx_hashes: Vec<String>,
-    },
-}
-
 /// Result of a successful on-chain minting operation.
 ///
 /// Contains all transaction details needed to track the mint in the Mint aggregate
@@ -301,13 +260,13 @@ pub(crate) struct MultiBurnParams {
     pub(crate) owner: Address,
     /// User's address that will receive the dust
     pub(crate) user: Address,
-    /// Redemption's issuer request ID (for Fireblocks notes/externalTxId)
+    /// Redemption's issuer request ID
     pub(crate) issuer_request_id: IssuerRedemptionRequestId,
     /// Full transaction hash that triggered this redemption, used for
-    /// constructing a collision-resistant Fireblocks `externalTxId`.
+    /// constructing a collision-resistant `externalTxId`.
     pub(crate) detected_tx_hash: B256,
     /// Optional deterministic `externalTxId` override for replacement burn
-    /// retries after a previously accepted Fireblocks transaction failed.
+    /// retries after a previously accepted transaction failed.
     #[serde(default)]
     pub(crate) external_tx_id: Option<BurnExternalTxId>,
 }
@@ -393,72 +352,17 @@ impl ReceiptInformation {
 
 /// Result of submitting a transaction to the signing backend.
 ///
-/// Returned by `submit_mint` and `submit_burn`. The `fireblocks_tx_id` is
+/// Returned by `submit_mint` and `submit_burn`. The `tx_id` is
 /// persisted in an intermediate CQRS event so that `confirm_mint`/`confirm_burn`
 /// can resume polling after a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SubmittedTx<ExternalTxId = String, TransactionId = String> {
-    /// Deterministic ID used for Fireblocks idempotency (`externalTxId`).
+pub(crate) struct SubmittedTx {
+    /// Deterministic ID used for idempotency (`externalTxId`).
     /// Format: `{operation}-{issuer_request_id}`.
-    pub(crate) external_tx_id: ExternalTxId,
+    pub(crate) external_tx_id: String,
     /// Backend-specific transaction identifier.
-    /// For Fireblocks: the Fireblocks transaction ID.
-    /// For local backends: the on-chain transaction hash.
-    pub(crate) fireblocks_tx_id: TransactionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TxId {
-    Hash(B256),
-    Legacy(String),
-}
-
-impl From<B256> for TxId {
-    fn from(value: B256) -> Self {
-        Self::Hash(value)
-    }
-}
-
-impl std::fmt::Display for TxId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Hash(tx_hash) => write!(f, "{tx_hash:#x}"),
-            Self::Legacy(id) => f.write_str(id),
-        }
-    }
-}
-
-impl std::str::FromStr for TxId {
-    type Err = std::convert::Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Ok(bytes) = decode(value)
-            && bytes.len() == B256::len_bytes()
-        {
-            return Ok(Self::Hash(B256::from_slice(&bytes)));
-        }
-
-        Ok(Self::Legacy(value.to_string()))
-    }
-}
-
-impl Serialize for TxId {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for TxId {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
+    /// For local and Turnkey backends: the on-chain transaction hash.
+    pub(crate) tx_id: TxId,
 }
 
 /// Errors that can occur when encoding receipt information.
@@ -510,13 +414,91 @@ pub(crate) enum VaultError {
         #[from]
         alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
     ),
-    /// Fireblocks vault service error
-    #[error(transparent)]
-    Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
     #[error(transparent)]
     SendableTxErr(#[from] Box<SendableTxErr<TransactionRequest>>),
-    #[error("Expected a prepared signed tx but got none")]
-    ExpectedPreparedTx,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxId {
+    Hash(B256),
+    Legacy(String),
+}
+
+impl TxId {
+    pub(crate) const fn to_hash(&self) -> Option<B256> {
+        if let Self::Hash(hash) = self {
+            return Some(*hash);
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn random() -> Self {
+        Self::Hash(B256::random())
+    }
+}
+
+impl From<B256> for TxId {
+    fn from(value: B256) -> Self {
+        Self::Hash(value)
+    }
+}
+
+impl std::fmt::Display for TxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hash(tx_hash) => write!(f, "{tx_hash:#x}"),
+            Self::Legacy(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+impl std::str::FromStr for TxId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(bytes) = decode(s)
+            && bytes.len() == 32
+        {
+            return Ok(Self::Hash(B256::from_slice(&bytes)));
+        }
+        Ok(Self::Legacy(s.to_string()))
+    }
+}
+
+impl utoipa::ToSchema for TxId {
+    fn name() -> std::borrow::Cow<'static, str> {
+        "TxId".into()
+    }
+}
+impl utoipa::PartialSchema for TxId {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .description(Some(
+                "On-chain transaction hash (0x-prefixed 32-byte hex) \
+                    or legacy backend transaction ID",
+            ))
+            .into()
+    }
+}
+
+impl Serialize for TxId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TxId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]
@@ -742,25 +724,139 @@ mod tests {
         assert!(matches!(err, VaultError::NotABurn { .. }));
     }
 
-    #[test]
-    fn tx_id_deserializes_hashes_without_changing_wire_format() {
-        let hash = B256::repeat_byte(0x42);
-        let json = serde_json::to_string(&TxId::Hash(hash)).unwrap();
+    const HASH_HEX: &str =
+        "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf";
 
-        assert_eq!(json, format!("\"{hash:#x}\""));
-        assert_eq!(
-            serde_json::from_str::<TxId>(&json).unwrap(),
-            TxId::Hash(hash)
-        );
+    fn known_hash() -> B256 {
+        BURN_TX
     }
 
     #[test]
-    fn tx_id_preserves_legacy_backend_identifiers() {
-        let json = r#""fireblocks-transaction-id""#;
+    fn tx_id_from_b256_is_hash_variant() {
+        let tx_id = TxId::from(known_hash());
+        assert_eq!(tx_id, TxId::Hash(known_hash()));
+    }
 
-        assert_eq!(
-            serde_json::from_str::<TxId>(json).unwrap(),
-            TxId::Legacy("fireblocks-transaction-id".to_string())
+    #[test]
+    fn tx_id_to_hash_returns_inner_for_hash_variant() {
+        let tx_id = TxId::Hash(known_hash());
+        assert_eq!(tx_id.to_hash(), Some(known_hash()));
+    }
+
+    #[test]
+    fn tx_id_to_hash_returns_none_for_legacy_variant() {
+        let tx_id = TxId::Legacy("fb-tx-uuid-123".to_string());
+        assert_eq!(tx_id.to_hash(), None);
+    }
+
+    #[test]
+    fn tx_id_random_produces_hash_variant() {
+        let tx_id = TxId::random();
+        assert!(matches!(tx_id, TxId::Hash(_)));
+    }
+
+    #[test]
+    fn tx_id_display_hash_emits_0x_hex() {
+        let tx_id = TxId::Hash(known_hash());
+        assert_eq!(tx_id.to_string(), HASH_HEX);
+    }
+
+    #[test]
+    fn tx_id_display_legacy_emits_raw_string() {
+        let raw = "fb-tx-uuid-123".to_string();
+        let tx_id = TxId::Legacy(raw.clone());
+        assert_eq!(tx_id.to_string(), raw);
+    }
+
+    #[test]
+    fn tx_id_from_str_0x_hex_parses_as_hash() {
+        let tx_id: TxId = HASH_HEX.parse().unwrap();
+        assert_eq!(tx_id, TxId::Hash(known_hash()));
+    }
+
+    #[test]
+    fn tx_id_from_str_non_hex_parses_as_legacy() {
+        let raw = "fb-tx-uuid-123";
+        let tx_id: TxId = raw.parse().unwrap();
+        assert_eq!(tx_id, TxId::Legacy(raw.to_string()));
+    }
+
+    #[test]
+    fn tx_id_from_str_short_hex_parses_as_legacy() {
+        // Fewer than 32 bytes — not a full tx hash.
+        let raw = "0xdeadbeef";
+        let tx_id: TxId = raw.parse().unwrap();
+        assert_eq!(tx_id, TxId::Legacy(raw.to_string()));
+    }
+
+    #[test]
+    fn tx_id_from_str_roundtrips_hash_via_display() {
+        let original = TxId::Hash(known_hash());
+        let roundtripped: TxId = original.to_string().parse().unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn tx_id_from_str_roundtrips_legacy_via_display() {
+        let original = TxId::Legacy("fb-tx-uuid-123".to_string());
+        let roundtripped: TxId = original.to_string().parse().unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn tx_id_serialize_hash_as_0x_hex_string() {
+        let tx_id = TxId::Hash(known_hash());
+        let json = serde_json::to_string(&tx_id).unwrap();
+        assert_eq!(json, format!("\"{HASH_HEX}\""));
+    }
+
+    #[test]
+    fn tx_id_serialize_legacy_as_raw_string() {
+        let raw = "fb-tx-uuid-123";
+        let tx_id = TxId::Legacy(raw.to_string());
+        let json = serde_json::to_string(&tx_id).unwrap();
+        assert_eq!(json, format!("\"{raw}\""));
+    }
+
+    #[test]
+    fn tx_id_deserialize_0x_hex_string_as_hash() {
+        let json = format!("\"{HASH_HEX}\"");
+        let tx_id: TxId = serde_json::from_str(&json).unwrap();
+        assert_eq!(tx_id, TxId::Hash(known_hash()));
+    }
+
+    #[test]
+    fn tx_id_deserialize_legacy_string_as_legacy() {
+        let raw = "fb-tx-uuid-123";
+        let tx_id: TxId = serde_json::from_str(&format!("\"{raw}\"")).unwrap();
+        assert_eq!(tx_id, TxId::Legacy(raw.to_string()));
+    }
+
+    #[test]
+    fn tx_id_serde_hash_roundtrips() {
+        let original = TxId::Hash(known_hash());
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: TxId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn tx_id_serde_legacy_roundtrips() {
+        let original = TxId::Legacy("fb-tx-uuid-123".to_string());
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: TxId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn tx_id_openapi_schema_is_string_type() {
+        use utoipa::PartialSchema;
+        let schema_ref = TxId::schema();
+        let json = serde_json::to_value(&schema_ref).unwrap();
+        assert_eq!(json["type"], "string", "TxId schema must be type: string");
+        assert!(
+            json["description"].as_str().is_some(),
+            "TxId schema must have a description"
         );
     }
 }

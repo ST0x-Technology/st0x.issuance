@@ -54,7 +54,9 @@ base64 = "0.22.1"
 ipnetwork = "0.21.1"
 subtle = "2.6.1"
 governor = "0.10.2"
-fireblocks-sdk = { git = "https://github.com/0xgleb/fireblocks-sdk-rs.git", branch = "fix/confirming-not-terminal" }
+turnkey_api_key_stamper = "0.7.0"
+turnkey_client = "0.7.0"
+mime = { version = "0.3.17" }
 ciborium = "0.2.2"
 flate2 = "1.1.9"
 utoipa = { version = "5.5.0", features = ["rocket_extras"] }

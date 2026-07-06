@@ -52,22 +52,22 @@ pub(crate) mod alpaca;
 pub(crate) mod auth;
 pub(crate) mod catchers;
 pub(crate) mod config;
-pub(crate) mod fireblocks;
 mod openapi;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
 pub(crate) mod telemetry;
 pub(crate) mod vault;
+pub(crate) mod wallet;
 
 pub mod bindings;
 
 pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use config::{Config, Environment, LogLevel, setup_tracing};
-pub use fireblocks::SignerConfig;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::ANVIL_CHAIN_ID;
 pub use tokenized_asset::cli::run_issuer_cli;
+pub use wallet::SignerConfig;
 
 struct AggregateCqrsSetup {
     mint_store: Arc<Store<Mint>>,
@@ -240,7 +240,7 @@ pub async fn initialize_rocket(
 
     let blockchain_setup = config.create_blockchain_setup().await?;
     let alpaca_service = config.alpaca.service()?;
-    let bot_wallet = config.signer.address().await?;
+    let bot_wallet = config.signer.address()?;
     info!(target: "startup", "Bot wallet address: {bot_wallet}");
 
     let vault_service_for_rocket = blockchain_setup.vault_service.clone();
@@ -310,7 +310,7 @@ pub async fn initialize_rocket(
     // starts. Mints that need deferred or pending follow-up are handed to
     // detached background scheduled-recovery tasks that intentionally outlive
     // this timeout and run concurrently with request handling; their safety
-    // rests on cqrs-es optimistic concurrency and Fireblocks externalTxId
+    // rests on cqrs-es optimistic concurrency and externalTxId
     // idempotency, not on completing before the server is up. If the
     // synchronous pass hangs it is cancelled and any remaining stuck aggregates
     // are left for manual admin intervention.
@@ -425,7 +425,6 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::reprocess_mint,
                 admin::close_mint,
                 admin::list_stuck,
-                admin::check_fireblocks_tx,
             ],
         )
         .register("/", catchers::json_catchers());
@@ -654,14 +653,11 @@ async fn run_mint_recovery(pool: &Pool<Sqlite>, mint_store: &Arc<Store<Mint>>) {
         // Drive one synchronous pass so mints that can finish immediately
         // (e.g. an on-chain receipt already exists) complete before the HTTP
         // server starts. If the pass does not reach a terminal/exhausted state
-        // — waiting on a retry window, a pending Fireblocks tx, or a transient
-        // failure — hand the mint to a background scheduled-recovery task so it
-        // keeps progressing while the service runs instead of waiting for the
-        // next restart.
+        // — waiting on a retry window, or a transient failure — hand the mint
+        // to a background scheduled-recovery task so it keeps progressing while
+        // the service runs instead of waiting for the next restart.
         match recover_mint(mint_store, issuer_request_id.clone()).await {
-            DriveOutcome::RetryNotDue
-            | DriveOutcome::Pending
-            | DriveOutcome::Failed => {
+            DriveOutcome::RetryNotDue | DriveOutcome::Failed => {
                 spawn_scheduled_mint_recovery(
                     mint_store.clone(),
                     issuer_request_id,
@@ -698,7 +694,7 @@ async fn run_redemption_recovery(
 ///
 /// Recovery runs as a background task with a timeout. If it completes within
 /// this window, no race condition is possible (recovery is done before any
-/// HTTP request arrives). If it hangs (e.g., Fireblocks call), the task is
+/// HTTP request arrives). If it hangs (e.g. RPC call), the task is
 /// **cancelled** — not left running — so no concurrent side effects can
 /// race with incoming HTTP requests. Stuck aggregates that weren't recovered
 /// in time require manual intervention via `/admin/recover` or `/admin/close`.

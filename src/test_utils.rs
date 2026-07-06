@@ -26,7 +26,6 @@ use crate::bindings::{
     OffchainAssetReceiptVaultAuthorizerV1, Receipt,
 };
 use crate::config::{Config, Environment, LogLevel};
-use crate::fireblocks::SignerConfig;
 use crate::mint::{Mint, MintServices};
 use crate::receipt_inventory::{
     CqrsReceiptService, ReceiptInventory, view::ReceiptInventoryViewReactor,
@@ -36,6 +35,7 @@ use crate::tokenized_asset::{
     UnderlyingSymbol,
 };
 use crate::vault::mock::MockVaultService;
+use crate::wallet::SignerConfig;
 
 /// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
@@ -795,8 +795,8 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
         "alpaca"
     } else if module.contains("::auth") {
         "auth"
-    } else if module.contains("::fireblocks") {
-        "fireblocks"
+    } else if module.contains("::wallet") {
+        "wallet"
     } else if module.contains("::admin") {
         "admin"
     } else if module.contains("::vault") {

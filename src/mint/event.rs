@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
+use crate::vault::TxId;
+
 use super::{
     ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
     TokenizationRequestId, UnderlyingSymbol,
@@ -69,13 +71,15 @@ pub(crate) enum MintEvent {
         closed_at: DateTime<Utc>,
     },
 
-    /// Transaction submitted to the signing backend (Fireblocks or local).
+    /// Mint transaction submitted to the signing backend (Turnkey or local).
     /// Persists the backend transaction ID so that polling can resume after
     /// a restart without resubmitting (which would double-mint).
-    FireblocksSubmitted {
+    #[serde(alias = "FireblocksSubmitted")]
+    MintTxSubmitted {
         issuer_request_id: IssuerMintRequestId,
         external_tx_id: String,
-        fireblocks_tx_id: String,
+        #[serde(alias = "fireblocks_tx_id")]
+        tx_id: TxId,
         submitted_at: DateTime<Utc>,
     },
 
@@ -115,8 +119,8 @@ impl DomainEvent for MintEvent {
                 "MintEvent::ExistingMintRecovered".to_string()
             }
             Self::MintClosed { .. } => "MintEvent::MintClosed".to_string(),
-            Self::FireblocksSubmitted { .. } => {
-                "MintEvent::FireblocksSubmitted".to_string()
+            Self::MintTxSubmitted { .. } => {
+                "MintEvent::MintTxSubmitted".to_string()
             }
             Self::MintRetryStarted { .. } => {
                 "MintEvent::MintRetryStarted".to_string()

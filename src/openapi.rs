@@ -32,7 +32,6 @@ expressed as an OpenAPI scheme."
         crate::admin::reprocess_mint,
         crate::admin::close_mint,
         crate::admin::list_stuck,
-        crate::admin::check_fireblocks_tx,
     ),
     components(schemas(
         st0x_issuance_dto::TokenizedAssetDetailResponse,
@@ -54,8 +53,6 @@ expressed as an OpenAPI scheme."
         crate::admin::CloseRedemptionRequest,
         crate::admin::ForceCompleteRedemptionRequest,
         crate::admin::CloseMintRequest,
-        crate::admin::FireblocksTxResponse,
-        crate::vault::FireblocksTxStatus,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -105,7 +102,6 @@ mod tests {
             "/accounts/{client_id}/wallets",
             "/accounts/{client_id}/wallets/{wallet}",
             "/admin/stuck",
-            "/admin/fireblocks/tx/{fireblocks_tx_id}",
             "/admin/recover/redemption/{issuer_request_id}",
             "/admin/close/redemption/{issuer_request_id}",
             "/admin/force-complete/redemption/{issuer_request_id}",

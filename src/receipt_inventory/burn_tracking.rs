@@ -370,6 +370,7 @@ mod tests {
         TokensBurnedData,
     };
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::vault::TxId;
 
     async fn setup_test_db() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -477,9 +478,7 @@ mod tests {
                 issuer_request_id.clone(),
                 RedemptionEvent::ExistingBurnRecovered {
                     issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: crate::vault::TxId::Legacy(
-                        "fb-tx-123".to_string(),
-                    ),
+                    tx_id: TxId::random(),
                     tx_hash: b256!(
                         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     ),
@@ -540,7 +539,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: "test error".to_string(),
                 failed_at: Utc::now(),
-                fireblocks_tx_id: None,
+                tx_id: None,
                 planned_burns: vec![],
             },
         ];
@@ -939,7 +938,7 @@ mod tests {
         let dust_amount = Shares::new(U256::ZERO);
 
         let err = plan_burn(receipts, burn_amount, dust_amount)
-            .expect_err("Plan should fail before Fireblocks submission");
+            .expect_err("Plan should fail before tx submission");
 
         assert!(
             matches!(err, BurnTrackingError::InsufficientBalance { required, available }

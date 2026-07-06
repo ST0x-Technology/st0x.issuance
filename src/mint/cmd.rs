@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, TxHash};
 use serde::{Deserialize, Serialize};
 
+use crate::vault::TxId;
+
 use super::{
     ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
     TokenizationRequestId, UnderlyingSymbol,
@@ -45,7 +47,7 @@ pub(crate) enum MintCommand {
     ///
     /// Requires `Minting` state (set by prior `Deposit` command). Performs vault
     /// lookup, builds receipt info, and calls `submit_mint()`. Produces
-    /// `FireblocksSubmitted` on success or `MintingFailed` on failure.
+    /// `TxSubmitted` on success or `MintingFailed` on failure.
     SubmitMint {
         issuer_request_id: IssuerMintRequestId,
     },
@@ -53,10 +55,10 @@ pub(crate) enum MintCommand {
     /// Confirms a previously submitted mint transaction.
     ///
     /// Polls the signing backend for the transaction identified by
-    /// `fireblocks_tx_id`, then produces `TokensMinted` or `MintingFailed`.
+    /// `tx_id`, then produces `TokensMinted` or `MintingFailed`.
     ConfirmMint {
         issuer_request_id: IssuerMintRequestId,
-        fireblocks_tx_id: String,
+        tx_id: TxId,
     },
 
     /// Sends the callback to Alpaca to confirm mint completion.

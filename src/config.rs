@@ -4,18 +4,18 @@ use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::Level;
+use tracing::{Level, info};
 use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
-use crate::fireblocks::{
-    FireblocksVaultService, SignerConfig, SignerConfigError, SignerEnv,
-    resolve_local_signer,
-};
 use crate::telemetry::HyperDxConfig;
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{VaultService, service::RealBlockchainService};
+use crate::wallet::{
+    SignerConfig, SignerConfigError, SignerEnv, SignerResolveError,
+    local::resolve_local_signer, turnkey::resolve_turnkey_signer,
+};
 
 pub(crate) struct BlockchainSetup<HttpP> {
     pub(crate) vault_service: Arc<dyn VaultService>,
@@ -72,7 +72,7 @@ impl Config {
     ///
     /// Initializes an HTTP provider for non-subscription RPC calls (backfill,
     /// reconciliation, vault service) and builds the appropriate VaultService
-    /// (local signer or Fireblocks). Receipt monitors and redemption detectors
+    /// (local signer or Turnkey). Receipt monitors and redemption detectors
     /// create their own WSS connections independently.
     pub(crate) async fn create_blockchain_setup(
         &self,
@@ -92,37 +92,29 @@ impl Config {
         let oa_schema_cache =
             Arc::new(OaSchemaCache::new(self.subgraph_url.clone())?);
 
-        let vault_service: Arc<dyn VaultService> = match &self.signer {
-            SignerConfig::Local(key) => {
-                let resolved = resolve_local_signer(key, self.chain_id)
-                    .map_err(|err| ConfigError::SignerResolve(Box::new(err)))?;
+        let vault_service: Arc<dyn VaultService> = {
+            let resolved = match &self.signer {
+                SignerConfig::Local(key) => {
+                    resolve_local_signer(key, self.chain_id)?
+                }
+                SignerConfig::Turnkey(env) => {
+                    resolve_turnkey_signer(env, self.chain_id)?
+                }
+            };
+            info!(signer_kind = ?resolved.kind, "Signer backend resolved");
+            let signing_provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .with_gas_estimation()
+                .filler(BlobGasFiller)
+                .with_simple_nonce_management()
+                .with_chain_id(self.chain_id)
+                .wallet(resolved.wallet)
+                .connect_http(wss_to_http(&self.rpc_url)?);
 
-                let signing_provider = ProviderBuilder::new()
-                    .disable_recommended_fillers()
-                    .with_gas_estimation()
-                    .filler(BlobGasFiller)
-                    .with_simple_nonce_management()
-                    .with_chain_id(self.chain_id)
-                    .wallet(resolved.wallet)
-                    .connect_http(wss_to_http(&self.rpc_url)?);
-
-                Arc::new(RealBlockchainService::new(
-                    signing_provider,
-                    oa_schema_cache,
-                ))
-            }
-
-            SignerConfig::Fireblocks(env) => {
-                let service = FireblocksVaultService::new(
-                    env,
-                    http_provider.clone(),
-                    self.chain_id,
-                    oa_schema_cache,
-                )
-                .map_err(|err| ConfigError::FireblocksVault(Box::new(err)))?;
-
-                Arc::new(service)
-            }
+            Arc::new(RealBlockchainService::new(
+                signing_provider,
+                oa_schema_cache,
+            ))
         };
 
         Ok(BlockchainSetup { vault_service, http_provider })
@@ -315,13 +307,11 @@ pub enum ConfigError {
     #[error("Signer configuration error")]
     SignerConfig(#[from] SignerConfigError),
     #[error("Failed to resolve signer: {0}")]
-    SignerResolve(#[source] Box<dyn std::error::Error + Send + Sync>),
+    SignerResolve(#[from] SignerResolveError),
     #[error("RPC error")]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("Failed to parse configuration: {0}")]
     ParseError(#[from] clap::Error),
-    #[error("Fireblocks vault service initialization failed: {0}")]
-    FireblocksVault(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error("SUBGRAPH_URL must use http or https scheme, got: {0}")]
@@ -364,7 +354,7 @@ const DOMAIN_TARGETS: &[&str] = &[
     "asset",
     "alpaca",
     "auth",
-    "fireblocks",
+    "wallet",
     "admin",
     "vault",
 ];
@@ -587,6 +577,6 @@ mod tests {
         // Private key 0x...01 derives to this well-known address
         let expected = address!("7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
 
-        assert_eq!(config.signer.address().await.unwrap(), expected);
+        assert_eq!(config.signer.address().unwrap(), expected);
     }
 }
