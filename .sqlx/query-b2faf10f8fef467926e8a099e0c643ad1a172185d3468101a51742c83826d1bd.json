@@ -1,0 +1,19 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM account_view\n        WHERE view_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "live: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [null]
+  },
+  "hash": "b2faf10f8fef467926e8a099e0c643ad1a172185d3468101a51742c83826d1bd"
+}

@@ -24,11 +24,13 @@ pub(crate) enum AccountViewError {
 pub(crate) enum AccountView {
     Registered {
         client_id: ClientId,
+        #[serde(deserialize_with = "Email::deserialize_stored")]
         email: Email,
         registered_at: DateTime<Utc>,
     },
     LinkedToAlpaca {
         client_id: ClientId,
+        #[serde(deserialize_with = "Email::deserialize_stored")]
         email: Email,
         alpaca_account: AlpacaAccountNumber,
         whitelisted_wallets: Vec<Address>,
@@ -42,14 +44,16 @@ pub(crate) async fn find_by_client_id(
     client_id: &ClientId,
 ) -> Result<Option<AccountView>, AccountViewError> {
     let client_id_str = client_id.to_string();
+    // The account aggregate is keyed by `ClientId`, so `view_id` is the client
+    // id — an O(1) primary-key lookup, not a full-table JSON scan. The `$.Live`
+    // extraction and the `row.live` None-check below still handle the
+    // Uninitialized/Failed lifecycle cases regardless of how the row is found.
     let row = sqlx::query!(
         r#"
         SELECT json_extract(payload, '$.Live') as "live: String"
         FROM account_view
-        WHERE json_extract(payload, '$.Live.Registered.client_id') = ?
-           OR json_extract(payload, '$.Live.LinkedToAlpaca.client_id') = ?
+        WHERE view_id = ?
         "#,
-        client_id_str,
         client_id_str
     )
     .fetch_optional(pool)
@@ -235,6 +239,34 @@ mod tests {
         assert_eq!(found_client_id, client_id);
         assert_eq!(found_email, email);
         assert_eq!(found_alpaca, alpaca_account);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_client_id_returns_registered_only_account() {
+        let harness = TestHarness::new().await;
+        let TestHarness { pool, .. } = &harness;
+
+        let client_id = ClientId::new();
+        let email = Email("registered-only@example.com".to_string());
+
+        harness.register_account(client_id, email.clone()).await;
+
+        let view = find_by_client_id(pool, &client_id)
+            .await
+            .expect("Query should succeed")
+            .expect("View should exist");
+
+        let AccountView::Registered {
+            client_id: found_client_id,
+            email: found_email,
+            ..
+        } = view
+        else {
+            panic!("Expected Registered, got {view:?}")
+        };
+
+        assert_eq!(found_client_id, client_id);
+        assert_eq!(found_email, email);
     }
 
     #[tokio::test]

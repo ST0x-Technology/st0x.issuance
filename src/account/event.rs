@@ -9,6 +9,7 @@ use super::{AlpacaAccountNumber, ClientId, Email};
 pub(crate) enum AccountEvent {
     Registered {
         client_id: ClientId,
+        #[serde(deserialize_with = "Email::deserialize_stored")]
         email: Email,
         registered_at: DateTime<Utc>,
     },

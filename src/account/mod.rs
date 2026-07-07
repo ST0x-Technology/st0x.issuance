@@ -29,21 +29,64 @@ pub(crate) struct Email(String);
 
 impl Email {
     pub(crate) fn new(email: &str) -> Result<Self, AccountError> {
-        let normalized = email.trim().to_lowercase();
-        let parts: Vec<&str> = normalized.split('@').collect();
+        let normalized = Self::checked_structure(email)?;
 
-        if parts.len() != 2 {
-            return Err(AccountError::InvalidEmail { email: normalized });
-        }
-
-        let local = parts[0];
-        let domain = parts[1];
-
-        if local.is_empty() || domain.is_empty() {
+        // Reject embedded whitespace/control characters — `trim()` only strips
+        // the ends, so "user @domain.com" or "user@do main.com" would otherwise
+        // pass. No valid address contains them. New input only: values already
+        // committed to the event log were accepted by the older, laxer
+        // validator and must keep deserializing (see `deserialize_stored`).
+        if normalized.contains(|character: char| {
+            character.is_whitespace() || character.is_control()
+        }) {
             return Err(AccountError::InvalidEmail { email: normalized });
         }
 
         Ok(Self(normalized))
+    }
+
+    /// Deserializer for `Email` values already committed to the event log or
+    /// projected view rows, used via
+    /// `#[serde(deserialize_with = "Email::deserialize_stored")]`.
+    ///
+    /// Stored values were validated by the rules in force when they were
+    /// written, so only the structural checks the validator has always
+    /// enforced apply here. Checks added later — the embedded
+    /// whitespace/control rejection in [`Email::new`] — must not apply
+    /// retroactively: a historical event the old validator accepted would
+    /// otherwise fail deserialization and brick event replay, view reads, and
+    /// service startup. New input still validates strictly via [`Email::new`]
+    /// (the default `Deserialize` impl, which API request bodies use).
+    pub(crate) fn deserialize_stored<'de, D>(
+        deserializer: D,
+    ) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::checked_structure(&value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+
+    /// Normalization plus the structural checks the validator has enforced
+    /// since account registration shipped: exactly one `@` separating a
+    /// non-empty local part from a non-empty domain.
+    fn checked_structure(email: &str) -> Result<String, AccountError> {
+        let normalized = email.trim().to_lowercase();
+
+        let structure_valid = match normalized.split_once('@') {
+            Some((local, domain)) => {
+                !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+            }
+            None => false,
+        };
+
+        if !structure_valid {
+            return Err(AccountError::InvalidEmail { email: normalized });
+        }
+
+        Ok(normalized)
     }
 }
 
@@ -108,11 +151,13 @@ impl Encode<'_, Sqlite> for ClientId {
 pub(crate) enum Account {
     Registered {
         client_id: ClientId,
+        #[serde(deserialize_with = "Email::deserialize_stored")]
         email: Email,
         registered_at: DateTime<Utc>,
     },
     LinkedToAlpaca {
         client_id: ClientId,
+        #[serde(deserialize_with = "Email::deserialize_stored")]
         email: Email,
         alpaca_account: AlpacaAccountNumber,
         whitelisted_wallets: Vec<Address>,
@@ -542,7 +587,55 @@ mod tests {
             Err(AccountError::InvalidEmail { email }) if email == "user@domain@com"
         ));
 
+        // Embedded whitespace/control chars in either part are rejected — only
+        // leading/trailing whitespace is trimmed.
+        assert!(matches!(
+            Email::new("user @domain.com"),
+            Err(AccountError::InvalidEmail { email }) if email == "user @domain.com"
+        ));
+        assert!(matches!(
+            Email::new("user@do main.com"),
+            Err(AccountError::InvalidEmail { email }) if email == "user@do main.com"
+        ));
+        assert!(matches!(
+            Email::new("user\t@domain.com"),
+            Err(AccountError::InvalidEmail { email }) if email == "user\t@domain.com"
+        ));
+
         assert!(Email::new("user@example.com").is_ok());
+    }
+
+    #[test]
+    fn stored_event_with_embedded_whitespace_email_still_deserializes() {
+        // The embedded-whitespace rejection in `Email::new` applies to new
+        // input only. This payload shape was accepted by the validator before
+        // that check existed, so replaying it from the event log must keep
+        // working instead of bricking startup.
+        let payload = format!(
+            r#"{{"Registered":{{"client_id":"{}","email":"user @domain.com","registered_at":"2025-01-01T00:00:00Z"}}}}"#,
+            Uuid::new_v4()
+        );
+
+        let event: AccountEvent = serde_json::from_str(&payload).unwrap();
+
+        let AccountEvent::Registered { email, .. } = event else {
+            panic!("Expected Registered event");
+        };
+        assert_eq!(email.0, "user @domain.com");
+    }
+
+    #[test]
+    fn email_deserialize_stays_strict_for_new_input() {
+        // API request bodies deserialize `Email` through the default
+        // `Deserialize` impl, which must keep enforcing the full `Email::new`
+        // rules — the stored-value tolerance is opt-in per field.
+        let result: Result<Email, _> =
+            serde_json::from_str(r#""user @domain.com""#);
+
+        assert!(
+            result.is_err(),
+            "ingress deserialization must reject embedded whitespace"
+        );
     }
 
     #[test]
