@@ -33,10 +33,16 @@ entry shows:
 
 ## How automatic recovery works
 
-On every startup, the bot automatically attempts to recover stuck transactions
-(mints in `MintingFailed` state, redemptions in `Burning` or `BurnFailed`
-state). This runs with a **30-second timeout** before the HTTP server starts
-accepting requests.
+On every startup, the bot automatically attempts to recover stuck transactions.
+Mint recovery (`run_mint_recovery`) covers mints in `JournalConfirmed`,
+`Minting`, `FireblocksSubmitted`, `MintingFailed`, and `CallbackPending`.
+Redemption recovery covers redemptions in `Detected`
+(`recover_detected_redemptions`), `AlpacaCalled`
+(`recover_alpaca_called_redemptions`), `Burning`
+(`recover_burning_redemptions`), and `BurnFailed`
+(`recover_burn_failed_redemptions`), plus stuck-reservation cleanup
+(`recover_stuck_reservations`). This runs with a **30-second timeout** before
+the HTTP server starts accepting requests.
 
 - If recovery completes within 30 seconds, everything is handled automatically.
 - If recovery times out (e.g., the RPC is slow or unavailable), the remaining
