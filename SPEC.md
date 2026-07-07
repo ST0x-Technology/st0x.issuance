@@ -192,11 +192,11 @@ initial request through journal confirmation to on-chain minting and callback.
   during submission leaves the aggregate in a recoverable `Minting` state rather
   than `JournalConfirmed` (which would lose track of the submission)
 - `SubmitMint { issuer_request_id }` - Submit the on-chain deposit to the
-  signing backend. Requires `Minting` state. Produces `FireblocksSubmitted` on
+  signing backend. Requires `Minting` state. Produces `MintTxSubmitted` on
   success or `MintingFailed` on failure
-- `ConfirmMint { issuer_request_id, fireblocks_tx_id }` - Confirm a previously
-  submitted mint transaction. Polls the signing backend and produces
-  `TokensMinted` or `MintingFailed`
+- `ConfirmMint { issuer_request_id, tx_id }` - Confirm a previously submitted
+  mint transaction. Re-fetches the on-chain receipt for the stored `tx_id` and
+  produces `TokensMinted` or `MintingFailed`
 - `SendCallback { issuer_request_id }` - Send the callback to Alpaca confirming
   mint completion
 - `Recover { issuer_request_id, mode }` - Recover a mint stuck in an incomplete
@@ -204,17 +204,17 @@ initial request through journal confirmation to on-chain minting and callback.
   `MintingFailed`, or `CallbackPending` state; at runtime, live retry scheduling
   is triggered specifically when a mint lands in `MintingFailed` during the
   journal-confirmation flow. Both paths hand a mint that is waiting on a retry
-  window or a pending Fireblocks transaction to a background scheduled-recovery
-  task, so retries fire on schedule without waiting for a restart. Queries the
-  receipt inventory for a receipt matching the `issuer_request_id`. If a
-  matching receipt is found, the mint already succeeded on-chain, so recovery
-  records the existing mint (`ExistingMintRecovered`) and proceeds to callback.
-  If no receipt is found and the previous Fireblocks transaction is terminally
-  failed, automatic recovery submits up to four retry transactions after 1m,
-  10m, 30m, and 1h delays. Manual admin reprocess uses the same recovery path
-  but bypasses the automatic retry cap so an operator can retry after fixing the
-  underlying cause. This prevents double-minting after crashes while ensuring
-  terminal Fireblocks failures can be retried with new `externalTxId`s
+  window to a background scheduled-recovery task, so retries fire on schedule
+  without waiting for a restart. Queries the receipt inventory for a receipt
+  matching the `issuer_request_id`. If a matching receipt is found, the mint
+  already succeeded on-chain, so recovery records the existing mint
+  (`ExistingMintRecovered`) and proceeds to callback. If no receipt is found and
+  the previous transaction is terminally failed, automatic recovery submits up
+  to four retry transactions after 1m, 10m, 30m, and 1h delays. Manual admin
+  reprocess uses the same recovery path but bypasses the automatic retry cap so
+  an operator can retry after fixing the underlying cause. This prevents
+  double-minting after crashes while ensuring terminal failures can be retried
+  with new `externalTxId`s
 - `RecoverFromReceipt { issuer_request_id, tx_hash }` - Recover a mint that
   failed during the minting step when an ITN receipt is discovered on-chain.
   Triggered by the receipt monitor when it finds a Deposit event with a matching
@@ -231,8 +231,8 @@ initial request through journal confirmation to on-chain minting and callback.
 - `JournalConfirmed` - Alpaca journal transfer confirmed
 - `JournalRejected` - Alpaca journal transfer rejected (terminal)
 - `MintingStarted` - Mint intent recorded (aggregate moves to `Minting`)
-- `FireblocksSubmitted` - Mint transaction submitted to signing backend (carries
-  `external_tx_id` and `fireblocks_tx_id` for crash recovery)
+- `MintTxSubmitted` - Mint transaction submitted to signing backend (carries
+  `external_tx_id` and `tx_id` — the on-chain tx hash — for crash recovery)
 - `TokensMinted` - On-chain mint succeeded (carries tx details)
 - `MintingFailed` - On-chain mint failed
 - `MintCompleted` - Alpaca callback sent, mint fully completed (terminal)
@@ -255,33 +255,36 @@ initial request through journal confirmation to on-chain minting and callback.
 | `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt-triggered recovery from `MintingFailed` |
 
 `Deposit` emits only `MintingStarted` (intent). The actual submission is handled
-by `SubmitMint`, which emits either `FireblocksSubmitted` (success) or
+by `SubmitMint`, which emits either `MintTxSubmitted` (success) or
 `MintingFailed` (failure). This two-step design persists intent before the
 network call, so a crash during submission leaves the aggregate in `Minting`
 state (recoverable) rather than `JournalConfirmed`.
 
-`ConfirmMint` polls the signing backend for the submitted transaction and emits
-either `TokensMinted` (success) or `MintingFailed` (failure).
+`ConfirmMint` re-fetches the on-chain receipt for the submitted `tx_id` and
+emits either `TokensMinted` (success) or `MintingFailed` (failure).
 
 `Recover` checks the receipt inventory for a receipt matching the
 `issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found and
-in `Minting` state, submits and emits `FireblocksSubmitted`. If in
-`FireblocksSubmitted` (or `MintingFailed` with a known prior transaction), it
-first checks the Fireblocks transaction status without blocking: a `Pending`
-status pauses recovery (so the scheduled loop backs off rather than blocking in
-a long confirmation poll), `Completed` proceeds to confirmation, and `Failed`
-submits the next retry. Retry transactions use
+in `Minting` state, submits and emits `MintTxSubmitted` (or `MintingFailed` on
+failure). If in `TxSubmitted` (or `MintingFailed` with a known prior
+transaction), calls `ConfirmMint` with the stored `tx_id` to re-fetch the
+on-chain receipt. `TxSubmitted` means the signing backend accepted the
+submission and returned a transaction identifier; it does not mean the
+transaction succeeded on-chain. `ConfirmMint` waits for the receipt and emits
+`TokensMinted` for a successful transaction or `MintingFailed` for a reverted or
+otherwise failed transaction. Retry transactions use
 `mint-{issuer_request_id}-retry-{n}` where automatic retries use n = 1..4 and
 the delay schedule is 1m, 10m, 30m, then 1h.
 
 The retry-delay/exhaustion schedule is driven by a `MintingFailed` attempt
 counter that advances on every failure — including a submission that fails
-before Fireblocks accepts it (no `FireblocksSubmitted` predecessor). In that
-case the `external_tx_id` is reused unchanged (Fireblocks deduplicates) so
-resubmission stays idempotent, while the schedule still escalates and eventually
-exhausts. A running service keeps driving deferred and pending retries via a
-background scheduled-recovery task (also spawned at startup and after a manual
-reprocess), rather than waiting for the next restart.
+before the transaction lands (no `MintTxSubmitted` predecessor). In that case
+the `external_tx_id` is reused unchanged; the receipt backfiller's on-chain scan
+for existing deposits guards against double-minting, so resubmission stays
+idempotent, while the schedule still escalates and eventually exhausts. A
+running service keeps driving deferred retries via a background
+scheduled-recovery task (also spawned at startup and after a manual reprocess),
+rather than waiting for the next restart.
 
 `RecoverFromReceipt` is triggered when the receipt monitor discovers an on-chain
 receipt for a mint in `MintingFailed` state (where the predecessor was
@@ -312,14 +315,14 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RecordAlpacaFailure` - Alpaca redeem API call failed
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `BurnTokens` - Submit burn transaction to signing backend. Produces
-  `BurnFireblocksSubmitted` on success
-- `ConfirmBurn { fireblocks_tx_id, dust_shares }` - Confirm a previously
-  submitted burn transaction. Produces `TokensBurned` on success
+  `BurnTxSubmitted` on success
+- `ConfirmBurn { tx_id, dust_shares }` - Confirm a previously submitted burn
+  transaction. Produces `TokensBurned` on success
 - `RecordBurnFailure` - Record on-chain burn failure (from `Burning` or
-  `BurnSubmitted` state). Carries optional `fireblocks_tx_id` and
-  `planned_burns` for recovery
+  `BurnSubmitted` state). Carries optional `tx_id` and `planned_burns` for
+  recovery
 - `RecordExistingBurn` - Record an existing on-chain burn discovered during
-  recovery via Fireblocks transaction lookup
+  recovery via on-chain transaction lookup
 - `MarkFailed` - Mark redemption as failed
 - `Reprocess { issuer_request_id, metadata }` - Reset a failed redemption back
   to `Detected` state for reprocessing. Only valid from `Failed` state when no
@@ -337,10 +340,10 @@ on-chain transfer through calling Alpaca to burning tokens.
   call step. Only valid from `Failed` state. Used for post-Alpaca failures where
   Alpaca has already completed the journal. The API layer polls Alpaca to verify
   journal completion before issuing this command — refuses if Pending or
-  Rejected. If the failed redemption already has a terminal failed Fireblocks
-  burn, `external_tx_id` is set to the next deterministic retry id:
-  `burn-{detected_tx_hash}-retry-{n}`. If a retry submission fails before
-  Fireblocks accepts it, recovery reuses the same retry id. Emits `BurnResumed`
+  Rejected. If the failed redemption already has a terminal failed burn,
+  `external_tx_id` is set to the next deterministic retry id:
+  `burn-{detected_tx_hash}-retry-{n}`. If a retry submission fails before the
+  transaction lands, recovery reuses the same retry id. Emits `BurnResumed`
   event. The admin recovery path immediately invokes burn recovery in-process so
   the on-chain burn does not wait for a service restart.
 - `CloseRedemption { issuer_request_id, reason }` - Admin-close a redemption
@@ -370,26 +373,26 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
-- `BurnFireblocksSubmitted` - Burn transaction submitted to signing backend
-  (carries `external_tx_id`, `fireblocks_tx_id`, and `planned_burns`). The burn
-  manager reserves the `planned_burns` in the receipt inventory **before** this
-  submission, so a concurrent redemption that already committed the same receipt
-  balance fails to reserve and never submits an unbacked burn. On confirmation
-  the reservation is settled (mirror balance reduced); on a definitive
-  terminal/reverted failure it is released.
-- `BurnIntended` - For a locally signed burn, persists the exact signed raw
-  transaction and its hash before any broadcast attempt. A prepared
-  transaction is immutable: live execution and recovery may only broadcast
-  those persisted bytes, never sign a replacement while its outcome is
-  unknown. Recovery re-broadcasts the same bytes before confirming the stored
-  hash. If the broadcast outcome remains ambiguous, the redemption stays in
-  `BurnIntended` with its receipt reservation held for operator resolution.
+- `BurnTxSubmitted` - Burn transaction submitted to signing backend (carries
+  `external_tx_id`, `tx_id` — the pending tx identifier — and `planned_burns`).
+  The burn manager reserves the `planned_burns` in the receipt inventory
+  **before** this submission, so a concurrent redemption that already committed
+  the same receipt balance fails to reserve and never submits an unbacked burn.
+  On confirmation the reservation is settled (mirror balance reduced); on a
+  definitive terminal/reverted failure it is released.
+- `BurnIntended` - Persists the exact signed raw transaction and its hash before
+  any broadcast attempt. A prepared transaction is immutable: live execution and
+  recovery may only broadcast those persisted bytes, never sign a replacement
+  while its outcome is unknown. Recovery re-broadcasts the same bytes before
+  confirming the stored hash. If the broadcast outcome remains ambiguous, the
+  redemption stays in `BurnIntended` with its receipt reservation held for
+  operator resolution.
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
   success). Payload contains `burns: Vec<BurnRecord>` where each `BurnRecord`
   has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
   single redemption spans multiple ERC-1155 receipts
-- `BurningFailed` - On-chain burn failed. Carries optional `fireblocks_tx_id`
-  and `planned_burns` for recovery of previously submitted transactions
+- `BurningFailed` - On-chain burn failed. Carries optional `tx_id` and
+  `planned_burns` for recovery of previously submitted transactions
 - `ExistingBurnRecovered` - Existing on-chain burn discovered during recovery
 - `RedemptionClosed` - Admin-closed redemption (terminal). Carries the operator
   `reason` and `closed_at`. Closed redemptions do not appear in stuck queries.
@@ -410,21 +413,21 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command -> Event Mappings:**
 
-| Command                 | Events                    | Notes                                         |
-| ----------------------- | ------------------------- | --------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`      | Transfer detected                             |
-| `RecordAlpacaCall`      | `AlpacaCalled`            | Alpaca API called                             |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`        | Terminal failure                              |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`  | Journal complete                              |
-| `IntendBurn`            | `BurnIntended`            | Persist exact signed tx before broadcasting   |
-| `BurnTokens`            | `BurnFireblocksSubmitted` | Submits to signing backend                    |
-| `ConfirmBurn`           | `TokensBurned`            | Confirms burn, terminal success               |
-| `RecordBurnFailure`     | `BurningFailed`           | Records failure with optional tx metadata     |
-| `RecordExistingBurn`    | `ExistingBurnRecovered`   | Recovery from Failed with known tx            |
-| `Reprocess`             | `Reprocessed`             | Reset to Detected for reprocessing            |
-| `ResumeBurn`            | `BurnResumed`             | Resume to Burning for post-Alpaca recovery    |
-| `CloseRedemption`       | `RedemptionClosed`        | Admin close from Failed/Burning/BurnSubmitted |
-| `ForceCompleteBurn`     | `BurnForceCompleted`      | Admin terminalize a verified-on-chain burn    |
+| Command                 | Events                   | Notes                                         |
+| ----------------------- | ------------------------ | --------------------------------------------- |
+| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                             |
+| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                             |
+| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                              |
+| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                              |
+| `IntendBurn`            | `BurnIntended`           | Persist exact signed tx before broadcasting   |
+| `BurnTokens`            | `BurnTxSubmitted`        | Submits to signing backend                    |
+| `ConfirmBurn`           | `TokensBurned`           | Confirms burn, terminal success               |
+| `RecordBurnFailure`     | `BurningFailed`          | Records failure with optional tx metadata     |
+| `RecordExistingBurn`    | `ExistingBurnRecovered`  | Recovery from Failed with known tx            |
+| `Reprocess`             | `Reprocessed`            | Reset to Detected for reprocessing            |
+| `ResumeBurn`            | `BurnResumed`            | Resume to Burning for post-Alpaca recovery    |
+| `CloseRedemption`       | `RedemptionClosed`       | Admin close from Failed/Burning/BurnSubmitted |
+| `ForceCompleteBurn`     | `BurnForceCompleted`     | Admin terminalize a verified-on-chain burn    |
 
 ### Account Aggregate
 
@@ -585,7 +588,8 @@ handlers, making aggregates testable with mock services.
 
 - RPC client for on-chain vault interaction
 - Methods: `deposit()`, `withdraw()`
-- Two implementations: local key signing and Fireblocks
+- Two implementations: local key signing — `EVM_PRIVATE_KEY` or Turnkey —
+  `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS` (prod)
 
 ### ReceiptService
 
@@ -674,8 +678,8 @@ Commands:
   reservation (wherever held), restoring availability without changing the
   mirror balance (the burn consumed nothing on-chain). No-op when the redemption
   holds no reservation. Issued **only** on a definitive terminal/reverted
-  failure; pending or ambiguous Fireblocks statuses are not released because the
-  burn may still land
+  failure; pending or ambiguous statuses are not released because the burn may
+  still land
 - `SettleBurn { redemption_issuer_request_id }` - Consume the redemption's
   reservation after its burn confirmed on-chain: clear the reservation and
   reduce the mirror balance by the reserved amount. Idempotent; emits `Depleted`
@@ -1346,11 +1350,11 @@ stateDiagram-v2
     PendingJournal --> JournalConfirmed: ConfirmJournal
     PendingJournal --> JournalRejected: RejectJournal
     JournalConfirmed --> Minting: Deposit (MintingStarted)
-    Minting --> FireblocksSubmitted: SubmitMint (FireblocksSubmitted)
+    Minting --> TxSubmitted: SubmitMint (MintTxSubmitted)
     Minting --> MintingFailed: SubmitMint (MintingFailed)
-    FireblocksSubmitted --> CallbackPending: ConfirmMint (TokensMinted)
-    FireblocksSubmitted --> MintingFailed: ConfirmMint (MintingFailed)
-    MintingFailed --> FireblocksSubmitted: Recover after automatic retry delay, or manual reprocess (MintRetryStarted + FireblocksSubmitted)
+    TxSubmitted --> CallbackPending: ConfirmMint (TokensMinted)
+    TxSubmitted --> MintingFailed: ConfirmMint (MintingFailed)
+    MintingFailed --> TxSubmitted: Recover after automatic retry delay, or manual reprocess (MintRetryStarted + MintTxSubmitted)
     MintingFailed --> CallbackPending: Recover (ExistingMintRecovered)
     MintingFailed --> CallbackPending: RecoverFromReceipt (ExistingMintRecovered)
     CallbackPending --> Completed: SendCallback
@@ -1704,7 +1708,7 @@ stateDiagram-v2
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> Completed: RecordBurnSuccess
-    Burning --> BurnSubmitted: BurnTokens (BurnFireblocksSubmitted)
+    Burning --> BurnSubmitted: BurnTokens (BurnTxSubmitted)
     Burning --> Failed: RecordBurnFailure / MarkFailed
     Burning --> Completed: ForceCompleteBurn (admin, verified on-chain)
     Burning --> Closed: CloseRedemption (admin)
@@ -2159,14 +2163,13 @@ Auto-detects the right recovery path from the event history:
 
 Dispatches the manual `Recover` command which handles `JournalConfirmed`,
 `Minting`, `MintingFailed`, and `CallbackPending` states. Manual reprocess can
-submit the next deterministic Fireblocks retry even after automatic retries have
-exhausted.
+submit the next deterministic retry even after automatic retries have exhausted.
 
 **Post-Alpaca with existing on-chain burn:** If a `BurningFailed` event carries
-a Fireblocks tx ID (enrichment added in PR #143), the endpoint queries
-Fireblocks. If the tx completed on-chain, dispatches `RecordExistingBurn` →
-`ExistingBurnRecovered` event → `Completed` state. This handles the Fireblocks
-polling timeout scenario where burns landed on-chain but weren't recorded.
+a tx ID, the endpoint scans on-chain for the transaction. If the tx completed
+on-chain, dispatches `RecordExistingBurn` → `ExistingBurnRecovered` event →
+`Completed` state. This handles the scenario where burns landed on-chain but
+weren't recorded (e.g. a crash between submit and confirmation).
 
 **Examples:**
 
