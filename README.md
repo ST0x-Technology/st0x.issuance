@@ -169,7 +169,7 @@ st0x.issuance/
 │   ├── receipt_inventory/   # Receipt tracking aggregate
 │   ├── alpaca/              # Alpaca API service
 │   ├── vault/               # On-chain vault service
-│   ├── fireblocks/          # Fireblocks signing backend
+│   ├── wallet/              # Signing backend (Turnkey / local)
 │   └── auth/                # API key auth and IP whitelisting
 ├── tests/                   # End-to-end tests (Anvil + mocks)
 ├── crates/

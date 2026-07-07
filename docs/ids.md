@@ -22,20 +22,18 @@ typing-bug issues filed against `main`.
 
 ## Catalog
 
-| Entity                         | ID type today                      | Status | Note                                                                                                                             |
-| ------------------------------ | ---------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| Mint operation                 | `IssuerMintRequestId(Uuid)`        | ✅     | newtype                                                                                                                          |
-| Redemption operation           | `IssuerRedemptionRequestId`        | ✅     | enum `Full(TxHash) \| Legacy(FixedBytes<4>)`                                                                                     |
-| Fireblocks mint tx (we author) | bare `String` (`external_tx_id`)   | 🐛     | proposed `ExternalTxId` ADT, mint side (see below)                                                                               |
-| Fireblocks burn tx (we author) | `BurnExternalTxId(String)`         | ✅     | newtype with `base`/`retry` constructors + `retry_attempt` parser; the proposed `ExternalTxId` ADT unifies it with the mint side |
-| Fireblocks tx (they author)    | bare `String` (`fireblocks_tx_id`) | 🐛     | proposed opaque newtype `FireblocksTxId`                                                                                         |
-| Alpaca tokenization request    | `TokenizationRequestId(String)`    | ✅     | opaque newtype                                                                                                                   |
-| Alpaca account                 | bare `String` (`account_id`)       | 🐛     | proposed opaque newtype `AlpacaAccountId`                                                                                        |
-| Fireblocks vault account       | `FireblocksVaultAccountId`         | ✅     | opaque newtype                                                                                                                   |
-| On-chain transaction           | `B256` / `TxHash`                  | ⚠️     | alias collapse — both alias `FixedBytes<32>`, indistinguishable to the compiler                                                  |
-| AP wallet                      | `Address`                          | ✅     | alloy newtype on `FixedBytes<20>`, distinct from `B256`                                                                          |
-| Tokenized asset (token)        | `TokenSymbol(String)`              | ✅     | newtype                                                                                                                          |
-| Tokenized asset (underlying)   | `UnderlyingSymbol(String)`         | ✅     | newtype                                                                                                                          |
+| Entity                          | ID type today                    | Status | Note                                                                                                                             |
+| ------------------------------- | -------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| Mint operation                  | `IssuerMintRequestId(Uuid)`      | ✅     | newtype                                                                                                                          |
+| Redemption operation            | `IssuerRedemptionRequestId`      | ✅     | enum `Full(TxHash) \| Legacy(FixedBytes<4>)`                                                                                     |
+| Mint external tx ID (we author) | bare `String` (`external_tx_id`) | 🐛     | proposed `ExternalTxId` ADT, mint side (see below)                                                                               |
+| Burn external tx ID (we author) | `BurnExternalTxId(String)`       | ✅     | newtype with `base`/`retry` constructors + `retry_attempt` parser; the proposed `ExternalTxId` ADT unifies it with the mint side |
+| Alpaca tokenization request     | `TokenizationRequestId(String)`  | ✅     | opaque newtype                                                                                                                   |
+| Alpaca account                  | bare `String` (`account_id`)     | 🐛     | proposed opaque newtype `AlpacaAccountId`                                                                                        |
+| On-chain transaction            | `B256` / `TxHash`                | ⚠️     | alias collapse — both alias `FixedBytes<32>`, indistinguishable to the compiler                                                  |
+| AP wallet                       | `Address`                        | ✅     | alloy newtype on `FixedBytes<20>`, distinct from `B256`                                                                          |
+| Tokenized asset (token)         | `TokenSymbol(String)`            | ✅     | newtype                                                                                                                          |
+| Tokenized asset (underlying)    | `UnderlyingSymbol(String)`       | ✅     | newtype                                                                                                                          |
 
 ## Current-state graph
 
@@ -52,10 +50,8 @@ graph LR
 
   Mint([Mint operation]):::entity
   Red([Redemption operation]):::entity
-  FbTx([Fireblocks transaction]):::entity
   AlpReq([Alpaca tokenization request]):::entity
   AlpAcc([Alpaca account]):::entity
-  FbVault([Fireblocks vault account]):::entity
   OnchainTx([On-chain transaction]):::entity
   Wallet([AP wallet]):::entity
   Asset([Tokenized asset]):::entity
@@ -63,13 +59,14 @@ graph LR
   IMR["✅ IssuerMintRequestId"]:::ok --> Mint
   IRR["✅ IssuerRedemptionRequestId"]:::ok --> Red
 
-  ETIMintBug["🐛 mint external_tx_id: String"]:::bug --> FbTx
-  ETIBurn["✅ BurnExternalTxId"]:::ok --> FbTx
-  FTIBug["🐛 fireblocks_tx_id: String"]:::bug --> FbTx
+  SubAttempt([Submission attempt]):::entity
+
+  ETIMintBug["🐛 mint external_tx_id: String"]:::bug --> SubAttempt
+  ETIBurn["✅ BurnExternalTxId"]:::ok --> SubAttempt
+  SubAttempt -. "when tx hash exists" .-> OnchainTx
 
   TRR["✅ TokenizationRequestId"]:::ok --> AlpReq
   AAIBug["🐛 account_id: String"]:::bug --> AlpAcc
-  FVA["✅ FireblocksVaultAccountId"]:::ok --> FbVault
 
   TxH["⚠️ B256 ≡ TxHash"]:::alias --> OnchainTx
   Addr["✅ Address"]:::ok --> Wallet
@@ -85,16 +82,20 @@ specific name (received IDs).
 
 ### `ExternalTxId` (constructed)
 
-We author this string and send it to Fireblocks for idempotency. The burn side
-is already half-typed: `BurnExternalTxId(String)` (`redemption/mod.rs`) is a
-newtype with `base`/`retry` constructors, a `retry_attempt` parser, and a
-`Display` impl. The mint side is still a bare `String`, built ad-hoc via
-`format!("mint-{…}")` in `mint/mod.rs` with parsing helpers like
-`retry_attempt_from_external_tx_id(&str)` that re-derive structure that was
-present at construction. The proposed `ExternalTxId` consolidates both into one
-enum — folding the existing `BurnExternalTxId` (the `BurnBase`/`BurnRetry`
-variants) together with the still-stringly mint side (`MintBase`/`MintRetry`) —
-so the string ↔ ADT mapping lives in exactly one place.
+We author this string as an internal tracking key for submission attempts — it
+is stored on `SubmittedTx` and persisted in CQRS events so recovery can
+correlate a retry with its predecessor. Idempotency for mints is provided by the
+receipt backfiller, which scans for existing `Deposit` events before a new
+submission. The burn side is already half-typed: `BurnExternalTxId(String)`
+(`redemption/mod.rs`) is a newtype with `base`/`retry` constructors, a
+`retry_attempt` parser, and a `Display` impl. The mint side is still a bare
+`String`, built ad-hoc via `format!("mint-{…}")` in `mint/mod.rs` with parsing
+helpers like `retry_attempt_from_external_tx_id(&str)` that re-derive structure
+that was present at construction. The proposed `ExternalTxId` consolidates both
+into one enum — folding the existing `BurnExternalTxId` (the
+`BurnBase`/`BurnRetry` variants) together with the still-stringly mint side
+(`MintBase`/`MintRetry`) — so the string ↔ ADT mapping lives in exactly one
+place.
 
 ```mermaid
 graph LR
@@ -120,18 +121,7 @@ graph LR
 ```
 
 Constructors live on the type; `Display` produces the wire string; `FromStr`
-parses it. The format helpers and the `VaultOperation` enum in
-`fireblocks/vault_service.rs` become dead and get deleted.
-
-### `FireblocksTxId` (received opaque)
-
-```rust
-pub(crate) struct FireblocksTxId(String);
-```
-
-No internal ADT — Fireblocks authors the value. The type exists so callers can't
-pass an `external_tx_id` (which we author) where a `fireblocks_tx_id` (which
-Fireblocks authors) is expected.
+parses it.
 
 ### `AlpacaAccountId` (received opaque)
 

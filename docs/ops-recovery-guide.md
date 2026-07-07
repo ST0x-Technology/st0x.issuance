@@ -39,8 +39,9 @@ state). This runs with a **30-second timeout** before the HTTP server starts
 accepting requests.
 
 - If recovery completes within 30 seconds, everything is handled automatically.
-- If recovery times out (e.g., Fireblocks is slow), the remaining stuck
-  transactions are left for manual intervention via the admin endpoints below.
+- If recovery times out (e.g., the RPC is slow or unavailable), the remaining
+  stuck transactions are left for manual intervention via the admin endpoints
+  below.
 - If a burn recovery finds that the **on-chain balance is insufficient**, it
   skips the burn and logs `MANUAL INTERVENTION REQUIRED`. This usually means the
   burn already succeeded on-chain but wasn't recorded — verify on Basescan and
@@ -50,35 +51,17 @@ accepting requests.
 
 ### Common failure patterns
 
-| Detail message contains                  | Cause                                | Action                                                                          |
-| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
-| `error sending request for url`          | Transient network/API                | Reprocess/recover — will likely work on retry                                   |
-| `reached terminal status: Failed`        | Fireblocks tx failed                 | Check Fireblocks console (see below), then reprocess/recover                    |
-| `sub_status: INSUFFICIENT_FUNDS_FOR_FEE` | Bot wallet out of gas                | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover       |
-| `is not whitelisted in Fireblocks`       | Missing contract                     | Whitelist the contract in Fireblocks, then reprocess                            |
-| `Tokenization request not found`         | Request genuinely absent from Alpaca | 404 returned by per-request GET endpoint — see "Alpaca request not found" below |
-| `aggregate conflict` (409 response)      | Already recovered                    | No action needed — it already completed                                         |
+| Detail message contains                      | Cause                                | Action                                                                                  |
+| -------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `error sending request for url`              | Transient network/API                | Reprocess/recover — will likely work on retry                                           |
+| `Transaction reverted on-chain: 0x...`       | On-chain tx reverted                 | Check Basescan for the tx hash in `detail`, then reprocess/recover                      |
+| `Event not found in transaction: 0x...`      | Tx succeeded but emitted no event    | Inspect the tx on Basescan; if it looks correct use `/admin/close`, otherwise reprocess |
+| `insufficient funds for gas * price + value` | Bot wallet out of gas                | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover               |
+| `Tokenization request not found`             | Request genuinely absent from Alpaca | 404 returned by per-request GET endpoint — see "Alpaca request not found" below         |
+| `aggregate conflict` (409 response)          | Already recovered                    | No action needed — it already completed                                                 |
 
-The `INSUFFICIENT_FUNDS_FOR_FEE` sub-status appears in the `fireblocks_status`
-object of the `/admin/stuck` entry (the top-level `detail` just says
-`reached terminal status: Failed`). When many transactions share this cause, the
-bot wallet has run dry — fund it once, then recover them all.
-
-### Checking Fireblocks
-
-When the detail says a Fireblocks transaction failed, look up the Fireblocks TX
-ID (the UUID in the `detail` field) in the Fireblocks console. The console shows
-the transaction status, sub-status, and any error from the smart contract.
-
-If there's an `Error from contract` starting with `execution reverted:`, you can
-decode the error using Foundry:
-
-```bash
-# Get the error signature
-cast 4byte <first-4-bytes-of-error>
-
-# Example: 0x03dee4c5 = ERC1155InsufficientBalance
-```
+When many transactions share `insufficient funds for gas * price + value` as the
+cause, the bot wallet has run dry — fund it once, then recover them all.
 
 ### Checking on-chain (Basescan)
 
@@ -90,7 +73,7 @@ docker logs $(docker ps -q) 2>&1 | grep "Bot wallet address"
 
 Look up the bot wallet on [Basescan](https://basescan.org) to see recent
 transactions. This tells you whether a transaction actually made it on-chain and
-whether it succeeded or reverted — regardless of what Fireblocks reports.
+whether it succeeded or reverted.
 
 ## Step 3: Recover
 
@@ -103,14 +86,14 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" \
   http://localhost:8000/admin/reprocess/mint/<aggregate_id> | python3 -m json.tool
 ```
 
-This retries recovery inline (no restart needed). If the previous Fireblocks
-mint transaction terminally failed, manual reprocess submits the next
-deterministic retry transaction even after automatic retries are exhausted, and
-hands the mint to a background task that drives that submitted transaction
-through confirmation. A single reprocess is usually enough. The exception is a
-retry submitted past the automatic cap (e.g. `retry-5`): if that transaction
-also fails, the background task is exhausted and gives up, so you must reprocess
-again. A 409 Conflict response means it already completed — no action needed.
+This retries recovery inline (no restart needed). If the previous on-chain mint
+transaction failed, manual reprocess submits the next deterministic retry
+transaction even after automatic retries are exhausted, and hands the mint to a
+background task that drives that submitted transaction through confirmation. A
+single reprocess is usually enough. The exception is a retry submitted past the
+automatic cap (e.g. `retry-5`): if that transaction also fails, the background
+task is exhausted and gives up, so you must reprocess again. A 409 Conflict
+response means it already completed — no action needed.
 
 ### Recovering redemptions
 
@@ -139,13 +122,6 @@ Possible responses:
 | `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited or network error). See below.     |
 
 Then check `/admin/stuck` again to confirm it cleared.
-
-> **Bulk recovery — pace your requests.** The recover endpoint makes a
-> Fireblocks API call per request (status check on the prior burn tx). Firing
-> many back-to-back trips Fireblocks' rate limit (`429 Too Many Requests`),
-> which surfaces as `502 Bad Gateway` from this endpoint. When recovering a
-> batch, space requests **~10s apart**. A `502` from rate-limiting is harmless —
-> the redemption stays in its prior state, so just retry it (paced).
 
 ### Closing (manually marking as done)
 
@@ -194,7 +170,7 @@ Always include a descriptive reason with the on-chain tx hash when closing.
 
 ## Insufficient receipt balance (ERC1155InsufficientBalance)
 
-A burn skipped with `on-chain balance insufficient` (or a Fireblocks error
+A burn skipped with `on-chain balance insufficient` (or a revert error
 containing `execution reverted: 0x03dee4c5`) means the bot tried to withdraw
 more receipt tokens than it holds for a specific receipt ID. This happens when
 deposit events were missed (e.g., a gap in the receipt-backfill poller), so the
@@ -243,17 +219,13 @@ check.
 
 ## Quick reference
 
-| Action              | Endpoint                         | Method           | Needs restart? |
-| ------------------- | -------------------------------- | ---------------- | -------------- |
-| List stuck          | `/admin/stuck`                   | GET              | No             |
-| Retry mint          | `/admin/reprocess/mint/<id>`     | POST             | No             |
-| Recover redemption  | `/admin/recover/redemption/<id>` | POST             | No             |
-| Close redemption    | `/admin/close/redemption/<id>`   | POST (JSON body) | No             |
-| Close mint          | `/admin/close/mint/<id>`         | POST (JSON body) | No             |
-| Check Fireblocks tx | `/admin/fireblocks/tx/<id>`      | GET              | No             |
-
-**Note:** The Fireblocks tx lookup endpoint (`/admin/fireblocks/tx/<id>`) may
-not be deployed yet. Until it is, use the Fireblocks console directly.
+| Action             | Endpoint                         | Method           | Needs restart? |
+| ------------------ | -------------------------------- | ---------------- | -------------- |
+| List stuck         | `/admin/stuck`                   | GET              | No             |
+| Retry mint         | `/admin/reprocess/mint/<id>`     | POST             | No             |
+| Recover redemption | `/admin/recover/redemption/<id>` | POST             | No             |
+| Close redemption   | `/admin/close/redemption/<id>`   | POST (JSON body) | No             |
+| Close mint         | `/admin/close/mint/<id>`         | POST (JSON body) | No             |
 
 ## Checking container logs
 
