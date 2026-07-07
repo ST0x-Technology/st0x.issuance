@@ -19,6 +19,7 @@ const MAX_CONCURRENT_BALANCE_CHECKS: usize = 4;
 pub(crate) struct ReconcileResult {
     pub(crate) checked: usize,
     pub(crate) mismatches: usize,
+    pub(crate) errors: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +61,8 @@ where
     ///
     /// Loads the aggregate to find receipts with positive balance, queries the
     /// actual on-chain balance for each, and executes ReconcileBalance commands
-    /// for any mismatches (emitting ExternalBurnDetected events).
+    /// for any mismatches (emitting BalanceReconciled, and Depleted when the
+    /// on-chain balance is zero).
     pub(crate) async fn reconcile(
         &self,
     ) -> Result<ReconcileResult, ReconcileError> {
@@ -73,7 +75,11 @@ where
             .collect();
 
         if receipts.is_empty() {
-            return Ok(ReconcileResult { checked: 0, mismatches: 0 });
+            return Ok(ReconcileResult {
+                checked: 0,
+                mismatches: 0,
+                errors: 0,
+            });
         }
 
         info!(target: "receipt", receipt_count = receipts.len(),
@@ -119,7 +125,7 @@ where
             "Receipt reconciliation complete"
         );
 
-        Ok(ReconcileResult { checked, mismatches })
+        Ok(ReconcileResult { checked, mismatches, errors })
     }
 
     /// Returns true if a mismatch was detected and corrected.
@@ -195,6 +201,7 @@ pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
 
     let mut total_checked = 0usize;
     let mut total_mismatches = 0usize;
+    let mut total_errors = 0usize;
     let mut failed_vaults = 0usize;
     let mut first_error = None;
 
@@ -203,6 +210,7 @@ pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
             Ok(result) => {
                 total_checked += result.checked;
                 total_mismatches += result.mismatches;
+                total_errors += result.errors;
 
                 if result.mismatches > 0 {
                     debug!(target: "receipt", vault = %vault,
@@ -224,9 +232,10 @@ pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
         }
     }
 
-    if total_mismatches > 0 || failed_vaults > 0 {
+    if total_mismatches > 0 || total_errors > 0 || failed_vaults > 0 {
         info!(target: "receipt", total_checked,
-            total_mismatches, failed_vaults, "Receipt reconciliation complete"
+            total_mismatches, total_errors, failed_vaults,
+            "Receipt reconciliation complete"
         );
     }
 
@@ -241,13 +250,14 @@ mod tests {
     use event_sorcery::test_store;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
         Shares,
     };
-    use crate::test_utils::LocalEvm;
+    use crate::test_utils::{LocalEvm, logs_contain_at};
 
     async fn setup_store() -> Arc<Store<ReceiptInventory>> {
         let pool = SqlitePoolOptions::new()
@@ -313,6 +323,116 @@ mod tests {
 
         assert_eq!(result.checked, 0);
         assert_eq!(result.mismatches, 0);
+        assert_eq!(result.errors, 0);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_reconcile_counts_errors_for_failing_balance_check() {
+        let evm = LocalEvm::new().await.unwrap();
+        let store = setup_store().await;
+
+        let provider =
+            ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+
+        seed_receipt(
+            &store,
+            evm.vault_address,
+            uint!(0xff_U256),
+            U256::from(100) * U256::from(10).pow(U256::from(18)),
+        )
+        .await;
+
+        // An address with no contract deployed: `balanceOf` returns no data,
+        // so the call errors instead of reporting a balance. The receipt must
+        // be counted as an error — not silently checked or mismatched.
+        let missing_receipt_contract = Address::random();
+
+        let reconciler = ReceiptReconciler::new(
+            provider,
+            missing_receipt_contract,
+            evm.wallet_address,
+            evm.vault_address,
+            store,
+        );
+
+        let result = reconciler.reconcile().await.unwrap();
+
+        assert_eq!(result.errors, 1, "balance-check failure must be counted");
+        assert_eq!(result.checked, 0, "an errored receipt is not checked");
+        assert_eq!(result.mismatches, 0);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Failed to reconcile receipt"]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Receipt reconciliation complete", "errors=1"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_startup_reconciliation_accumulates_totals_across_vaults() {
+        let evm = LocalEvm::new().await.unwrap();
+        let store = setup_store().await;
+
+        let provider =
+            ProviderBuilder::new().connect(&evm.endpoint).await.unwrap();
+        let vault_contract = crate::bindings::OffchainAssetReceiptVault::new(
+            evm.vault_address,
+            &provider,
+        );
+        let receipt_contract =
+            Address::from(vault_contract.receipt().call().await.unwrap().0);
+
+        // First vault: a stale receipt that was never minted on Anvil, so its
+        // on-chain balance is zero -> one checked receipt with one mismatch.
+        seed_receipt(
+            &store,
+            evm.vault_address,
+            uint!(0xff_U256),
+            U256::from(100) * U256::from(10).pow(U256::from(18)),
+        )
+        .await;
+
+        // Second vault: its receipt contract address has no contract deployed,
+        // so the balance check errors -> one per-receipt error, which must be
+        // accumulated and must not fail the overall startup reconciliation.
+        let vault_without_contract = Address::random();
+        seed_receipt(
+            &store,
+            vault_without_contract,
+            uint!(0x2_U256),
+            U256::from(10) * U256::from(10).pow(U256::from(18)),
+        )
+        .await;
+
+        let result = run_startup_reconciliation(
+            provider,
+            &[
+                (evm.vault_address, receipt_contract),
+                (vault_without_contract, Address::random()),
+            ],
+            &store,
+            evm.wallet_address,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "per-receipt errors must not fail startup reconciliation: {result:?}"
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Receipt reconciliation complete",
+                "total_checked=1",
+                "total_mismatches=1",
+                "total_errors=1",
+                "failed_vaults=0"
+            ]
+        ));
     }
 
     #[tokio::test]
