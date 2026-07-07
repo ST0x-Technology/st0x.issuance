@@ -508,20 +508,24 @@ impl ReceiptService for CqrsReceiptService {
             return Ok(None);
         };
 
-        let receipt = receipt_inventory
-            .receipts_with_balance()
-            .into_iter()
-            .find(|r| r.receipt_id == receipt_id)
-            .ok_or(ReceiptLookupError::Inconsistent {
+        // Recovery records how many shares the deposit actually created, which
+        // is the receipt's mirror balance. `available_balance` (mirror minus
+        // outstanding reservations) is the wrong source here: it is zero for a
+        // fully-reserved receipt, so recovering a mint whose receipt is reserved
+        // by a pending redemption would record `shares_minted = 0` for a real
+        // on-chain deposit.
+        let metadata = receipt_inventory.receipts.get(&receipt_id).ok_or(
+            ReceiptLookupError::Inconsistent {
                 issuer_request_id: issuer_request_id.clone(),
                 receipt_id,
-            })?;
+            },
+        )?;
 
         Ok(Some(RecoveredReceipt {
             receipt_id: receipt_id.inner(),
-            tx_hash: receipt.tx_hash,
-            shares: receipt.available_balance.inner(),
-            block_number: receipt.block_number,
+            tx_hash: metadata.tx_hash,
+            shares: metadata.balance.inner(),
+            block_number: metadata.block_number,
         }))
     }
 }
@@ -576,8 +580,6 @@ impl ReceiptInventory {
         ReceiptWithBalance {
             receipt_id,
             available_balance,
-            tx_hash: metadata.tx_hash,
-            block_number: metadata.block_number,
             receipt_info: metadata.receipt_info.clone(),
             receipt_info_bytes: metadata.receipt_info_bytes.clone(),
         }
@@ -1402,6 +1404,61 @@ mod tests {
         let inventory = load_inventory(&store, &vault).await.unwrap();
         let found = inventory.find_by_issuer_request_id(&issuer_request_id);
         assert_eq!(found, Some(make_receipt_id(42)));
+    }
+
+    #[tokio::test]
+    async fn test_recovery_reports_mirror_balance_for_fully_reserved_receipt() {
+        // Regression: a fully-reserved receipt has available_balance == 0, but
+        // its mirror balance (the real on-chain amount the deposit created) is
+        // intact. Recovery must report the mirror balance as `shares`, not the
+        // reserved-away available balance, or `ExistingMintRecovered` records
+        // `shares_minted == 0` for a real on-chain deposit.
+        let store = setup_store().await;
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let issuer_request_id = IssuerMintRequestId::random();
+
+        store
+            .send(
+                &vault,
+                discover_itn_receipt_cmd(
+                    make_receipt_id(42),
+                    make_shares(100),
+                    1000,
+                    tx_hash,
+                    issuer_request_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let service = CqrsReceiptService::new(store.clone());
+
+        service
+            .reserve_burn(
+                vault,
+                "red-00000001".parse().unwrap(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(42),
+                    shares_burned: U256::from(100),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let recovered = service
+            .find_by_issuer_request_id(&vault, &issuer_request_id)
+            .await
+            .unwrap()
+            .expect("ITN receipt must be found by issuer_request_id");
+
+        assert_eq!(
+            recovered.shares,
+            U256::from(100),
+            "recovery must report the mirror balance, not the zero available balance of a fully-reserved receipt"
+        );
     }
 
     #[tokio::test]

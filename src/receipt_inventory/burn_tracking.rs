@@ -1,4 +1,4 @@
-use alloy::primitives::{Bytes, TxHash, U256};
+use alloy::primitives::{Bytes, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
@@ -209,8 +209,6 @@ pub(crate) enum BurnTrackingError {
 pub(crate) struct ReceiptWithBalance {
     pub(crate) receipt_id: ReceiptId,
     pub(crate) available_balance: Shares,
-    pub(crate) tx_hash: TxHash,
-    pub(crate) block_number: u64,
     pub(crate) receipt_info: Option<ReceiptInformation>,
     /// Original on-chain encoded bytes. Used to pass exact deposit bytes back
     /// to redeem(), avoiding re-encoding legacy JSON receipts as CBOR.
@@ -759,8 +757,6 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
-            tx_hash: TxHash::ZERO,
-            block_number: 0,
             receipt_info: None,
             receipt_info_bytes: None,
         }];
@@ -794,8 +790,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -804,8 +798,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -814,8 +806,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -855,8 +845,6 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(50_000000000000000000_U256)),
-            tx_hash: TxHash::ZERO,
-            block_number: 0,
             receipt_info: None,
             receipt_info_bytes: None,
         }];
@@ -883,16 +871,12 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     10079999999000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(124_U256)),
                 available_balance: Shares::new(uint!(1000000000_U256)),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -928,8 +912,6 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(131_U256)),
             available_balance: Shares::new(uint!(10079999999000000000_U256)),
-            tx_hash: TxHash::ZERO,
-            block_number: 0,
             receipt_info: None,
             receipt_info_bytes: None,
         }];
@@ -958,8 +940,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     10_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -968,8 +948,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     30_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -978,8 +956,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     60_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1027,8 +1003,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1037,8 +1011,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1091,8 +1063,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     40_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1101,8 +1071,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     50_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1163,8 +1131,6 @@ mod tests {
         let receipts = vec![ReceiptWithBalance {
             receipt_id: ReceiptId::from(uint!(1_U256)),
             available_balance: Shares::new(uint!(100_000000000000000000_U256)),
-            tx_hash: TxHash::ZERO,
-            block_number: 0,
             receipt_info: None,
             receipt_info_bytes: None,
         }];
@@ -1186,8 +1152,6 @@ mod tests {
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(uint!(1_U256)),
                 available_balance: Shares::new(U256::ZERO),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1196,8 +1160,6 @@ mod tests {
                 available_balance: Shares::new(uint!(
                     100_000000000000000000_U256
                 )),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             },
@@ -1228,8 +1190,6 @@ mod tests {
             ReceiptWithBalance {
                 receipt_id: ReceiptId::from(U256::from(id)),
                 available_balance: Shares::new(U256::from(balance)),
-                tx_hash: TxHash::ZERO,
-                block_number: 0,
                 receipt_info: None,
                 receipt_info_bytes: None,
             }
