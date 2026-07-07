@@ -241,58 +241,61 @@ pub(crate) async fn drive_redemption_flow(
 
     let tokenization_request_id = tokenization_request_id.clone();
 
-    tokio::spawn(async move {
+    // Awaited inline rather than spawned: this function already runs inside
+    // the spawned task that `watch_redemption_flow` observes, and a detached
+    // inner task would put the journal-polling/burn continuation outside that
+    // watcher — a panic there would vanish silently, exactly what the watcher
+    // exists to prevent.
+    if let Err(err) = deps
+        .journal_manager
+        .handle_alpaca_called(
+            &alpaca_account,
+            issuer_request_id.clone(),
+            tokenization_request_id,
+        )
+        .await
+    {
+        warn!(target: "redemption", %issuer_request_id,
+            error = ?err,
+            "handle_alpaca_called (journal polling) failed"
+        );
+        return;
+    }
+
+    let redemption = match deps.store.load(&issuer_request_id).await {
+        Ok(Some(redemption)) => redemption,
+        Ok(None) => {
+            warn!(target: "redemption", %issuer_request_id,
+                "Redemption not found after journal completion"
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(target: "redemption", %issuer_request_id,
+                error = ?err,
+                "Failed to load aggregate after journal completion"
+            );
+            return;
+        }
+    };
+
+    if matches!(redemption, Redemption::Burning { .. }) {
         if let Err(err) = deps
-            .journal_manager
-            .handle_alpaca_called(
-                &alpaca_account,
-                issuer_request_id.clone(),
-                tokenization_request_id,
-            )
+            .burn_manager
+            .handle_burning_started(&issuer_request_id, &redemption)
             .await
         {
             warn!(target: "redemption", %issuer_request_id,
                 error = ?err,
-                "handle_alpaca_called (journal polling) failed"
-            );
-            return;
-        }
-
-        let redemption = match deps.store.load(&issuer_request_id).await {
-            Ok(Some(redemption)) => redemption,
-            Ok(None) => {
-                warn!(target: "redemption", %issuer_request_id,
-                    "Redemption not found after journal completion"
-                );
-                return;
-            }
-            Err(err) => {
-                warn!(target: "redemption", %issuer_request_id,
-                    error = ?err,
-                    "Failed to load aggregate after journal completion"
-                );
-                return;
-            }
-        };
-
-        if matches!(redemption, Redemption::Burning { .. }) {
-            if let Err(err) = deps
-                .burn_manager
-                .handle_burning_started(&issuer_request_id, &redemption)
-                .await
-            {
-                warn!(target: "redemption", %issuer_request_id,
-                    error = ?err,
-                    "handle_burning_started failed"
-                );
-            }
-        } else {
-            debug!(target: "redemption", %issuer_request_id,
-                aggregate_state = ?redemption,
-                "Aggregate not in Burning state after journal completion"
+                "handle_burning_started failed"
             );
         }
-    });
+    } else {
+        debug!(target: "redemption", %issuer_request_id,
+            aggregate_state = ?redemption,
+            "Aggregate not in Burning state after journal completion"
+        );
+    }
 }
 
 /// Attributes a vault to its enabled asset from the caller's per-pass asset
