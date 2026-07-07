@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::AuthConfig;
-use crate::telemetry::HyperDxConfig;
+use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
 use crate::vault::rain_meta::OaSchemaCache;
 use crate::vault::{VaultService, service::RealBlockchainService};
 use crate::wallet::{
@@ -295,7 +295,7 @@ struct HyperDxEnv {
 impl HyperDxEnv {
     fn into_config(self, log_level: Level) -> Option<HyperDxConfig> {
         self.hyperdx_api_key.map(|api_key| HyperDxConfig {
-            api_key,
+            api_key: HyperDxApiKey::new(api_key),
             service_name: self.hyperdx_service_name,
             log_level,
         })
