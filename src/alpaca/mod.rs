@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -157,31 +157,39 @@ pub(crate) enum TokenizationRequest {
         wallet: Address,
         #[serde(
             rename = "tx_hash",
+            default,
             deserialize_with = "deserialize_optional_b256"
         )]
-        tx_hash: Option<B256>,
+        tx_hash: Option<TxHash>,
         updated_at: Option<DateTime<Utc>>,
     },
 }
 
 fn deserialize_optional_b256<'de, D>(
     deserializer: D,
-) -> Result<Option<B256>, D::Error>
+) -> Result<Option<TxHash>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s: String = serde::Deserialize::deserialize(deserializer)?;
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        s.parse().map(Some).map_err(serde::de::Error::custom)
+    // Alpaca returns an empty string for a still-Pending redeem's tx_hash
+    // (observed in production polling); JSON `null` and an omitted field
+    // (handled by `#[serde(default)]` on the field) are tolerated defensively,
+    // not observed behavior. Treat all three as `None`; only a non-empty
+    // string is parsed as a hash. A type error here would surface as a
+    // non-retryable `Parse` error and stall an otherwise-healthy redemption.
+    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    match opt.as_deref() {
+        None | Some("") => Ok(None),
+        Some(value) => {
+            value.parse().map(Some).map_err(serde::de::Error::custom)
+        }
     }
 }
 
 /// Errors that can occur during Alpaca API operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AlpacaError {
-    #[error("Reqwest error")]
+    #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
     /// Failed to parse response after 200 OK - NOT retryable
     #[error("Failed to parse response: {source}")]
@@ -420,5 +428,34 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(matches!(requests[0], TokenizationRequest::Mint { .. }));
         assert!(matches!(requests[1], TokenizationRequest::Redeem { .. }));
+    }
+
+    #[test]
+    fn test_redeem_deserializes_absent_null_and_empty_tx_hash_as_none() {
+        // A still-Pending redeem's tx_hash arrives as an empty string
+        // (observed); JSON null and an omitted field are tolerated
+        // defensively. All three must deserialize to None rather than a
+        // non-retryable Parse error that would stall the redemption.
+        let base = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"pending","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.1","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-06-11T04:02:33.530523Z""#;
+
+        for tx_hash_field in ["", r#","tx_hash":null"#, r#","tx_hash":"""#] {
+            let json = format!("{base}{tx_hash_field}}}");
+            let parsed: TokenizationRequest = serde_json::from_str(&json)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to parse with tx_hash `{tx_hash_field}`: {err}"
+                    )
+                });
+
+            match parsed {
+                TokenizationRequest::Redeem { tx_hash, .. } => assert_eq!(
+                    tx_hash, None,
+                    "tx_hash `{tx_hash_field}` should deserialize to None"
+                ),
+                other @ TokenizationRequest::Mint { .. } => {
+                    panic!("expected Redeem, got {other:?}")
+                }
+            }
+        }
     }
 }
