@@ -40,10 +40,9 @@ let
   #   1. Stop the unit and clear the marker so systemd won't see a stale-ready
   #      service during system activation.
   #   2. Decrypt and install the env-file secrets (chmod 0640 group st0x).
-  #   3. Decrypt and install the Fireblocks RSA key (chmod 0440 group st0x).
-  #   4. Chown any existing data files so the st0x user can access them.
-  #   5. Record the deployed git revision for ops tooling.
-  #   6. Touch the marker (ConditionPathExists in the unit) and restart.
+  #   3. Chown any existing data files so the st0x user can access them.
+  #   4. Record the deployed git revision for ops tooling.
+  #   5. Touch the marker (ConditionPathExists in the unit) and restart.
   #
   # If any step fails, deploy-rs exits non-zero and rolls back automatically.
   mkIssuanceProfile =
@@ -52,7 +51,6 @@ let
       cfg = enabled.${name};
       pkg = self.packages.${system}.${cfg.package};
       envSecretsFile = ./secret + "/${name}-${env}.env.age";
-      fireblocksKeyFile = ./secret + "/fireblocks-secret-issuance-${env}.key.age";
       deploymentEnvironment =
         if env == "prod" then
           "production"
@@ -74,12 +72,9 @@ let
         # Decrypt env file — contains all secret env vars
         "${rage} -d -i ${hostKey} ${envSecretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedEnvPath}"
 
-        # Decrypt Fireblocks RSA private key
-        "${rage} -d -i ${hostKey} ${fireblocksKeyFile} | install -D -m 0440 -o root -g st0x /dev/stdin ${cfg.decryptedFireblocksKeyPath}"
-
         # Validate config + secrets before restarting. If validation fails,
         # deploy-rs exits non-zero and rolls back instead of starting bad config.
-        "set -a; . ${cfg.decryptedEnvPath}; set +a; DATABASE_URL=sqlite:///mnt/data/issuance.db FIREBLOCKS_SECRET_PATH=${cfg.decryptedFireblocksKeyPath} ENVIRONMENT=${deploymentEnvironment} ${cfg.profilePath}/bin/validate-config"
+        "set -a; . ${cfg.decryptedEnvPath}; set +a; DATABASE_URL=sqlite:///mnt/data/issuance.db ENVIRONMENT=${deploymentEnvironment} ${cfg.profilePath}/bin/validate-config"
 
         # Chown existing data files so st0x user can open them after a fresh deploy
         "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"

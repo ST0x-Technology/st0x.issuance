@@ -184,7 +184,7 @@ let
         # shellcheck disable=SC2029
         ssh ''${identity:+-i "$identity"} "root@$host_ip" '
           activate=/nix/var/nix/profiles/per-service/st0x-issuance/deploy-rs-activate
-          if [ ! -f /run/agenix/st0x-issuance.env ] || [ ! -f /run/agenix/fireblocks-secret-issuance.key ]; then
+          if [ ! -f /run/agenix/st0x-issuance.env ]; then
             echo "Decrypted secrets missing (tmpfs cleared after reboot); trying to re-run service activation to restore them..." >&2
             if [ ! -x "$activate" ]; then
               echo "ERROR: $activate not found!" >&2
