@@ -15,6 +15,7 @@ in
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
     ./disko.nix
+    ./nix/cloud-init.nix
   ];
 
   boot.loader.grub = {
@@ -24,26 +25,11 @@ in
 
   networking.useDHCP = lib.mkForce false;
 
-  services = {
-    cloud-init = {
-      enable = true;
-      network.enable = true;
-      settings = {
-        datasource_list = [
-          "ConfigDrive"
-          "Digitalocean"
-        ];
-        datasource.ConfigDrive = { };
-        datasource.Digitalocean = { };
-      };
-    };
-
-    openssh = {
-      enable = true;
-      settings = {
-        PasswordAuthentication = false;
-        PermitRootLogin = "prohibit-password";
-      };
+  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      PermitRootLogin = "prohibit-password";
     };
   };
 

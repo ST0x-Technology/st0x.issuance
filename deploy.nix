@@ -131,15 +131,16 @@ let
   };
 
   # `hostname` here is an eval-time placeholder that keeps the flake pure.
-  # The real SSH target is the Tailscale MagicDNS name resolved at deploy time.
+  # The real SSH target is the droplet IP resolved at deploy time and always
+  # passed via `--hostname` by the deploy scripts below.
   mkNode =
     {
       env,
       nixosConfig,
-      tailscaleMagicDnsName,
+      nodeName,
     }:
     {
-      hostname = tailscaleMagicDnsName;
+      hostname = nodeName;
       sshUser = "root";
       user = "root";
 
@@ -169,7 +170,7 @@ in
           name = cfg.nodeName;
           value = mkNode {
             inherit env;
-            inherit (cfg) tailscaleMagicDnsName;
+            inherit (cfg) nodeName;
             nixosConfig = self.nixosConfigurations.${cfg.nodeName};
           };
         }
@@ -189,11 +190,16 @@ in
         pkgs.openssh
       ];
 
+      # --rollback-succeeded false: when a later profile fails (e.g. the
+      # service's validate-config gate), do NOT revoke already-confirmed
+      # profiles. Reverting the system profile would roll authorized_keys and
+      # the firewall back to the previous generation, locking CI out until a
+      # manual local redeploy.
       deployFlags =
         if localSystem == "x86_64-linux" then
-          "--debug-logs --skip-checks"
+          "--debug-logs --skip-checks --rollback-succeeded false"
         else
-          "--debug-logs --skip-checks --remote-build";
+          "--debug-logs --skip-checks --remote-build --rollback-succeeded false";
 
       nixFlags = "--accept-flake-config --extra-experimental-features 'nix-command flakes'";
 
@@ -205,11 +211,19 @@ in
           envInfraPkgs = infraPkgs.perEnv.${env};
 
           deployPreamble = ''
+            # parseIdentity (inside resolveHost) redefines this. The no-op keeps
+            # the EXIT trap from failing with exit 127 -- masking the real exit
+            # code -- when DEPLOY_HOST is pre-set and resolveHost never runs.
+            _cleanup_identity() { :; }
+
             if [ -n "''${DEPLOY_HOST:-}" ]; then
               host_ip="$DEPLOY_HOST"
               echo "Using pre-set DEPLOY_HOST=$host_ip"
             else
-              ${envInfraPkgs.resolveIp}
+              # Resolves the droplet IP from the encrypted per-env cache
+              # (infra/.remote-${env}.age), decryptable by every key in
+              # roles.${env}.ssh -- including the CI deploy key.
+              ${envInfraPkgs.resolveHost}
             fi
 
             # Pin the host key from keys.nix so SSH verifies it during

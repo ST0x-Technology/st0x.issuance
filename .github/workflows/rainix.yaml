@@ -1,6 +1,9 @@
 name: Rainix CI
 
-on: [push]
+on:
+  push:
+    branches-ignore:
+      - 'graphite-base/**'
 
 concurrency:
   group: ${{ github.ref }}-rainix
@@ -11,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: "sqlite:issuance.db"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
@@ -42,12 +46,31 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
+      # Shared rainlanguage Cachix that raindex CI populates; read works
+      # anonymously (the cache is public), pushes need CACHIX_AUTH_TOKEN.
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
+        continue-on-error: true
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      # github.job in the key keeps test and static from racing for the same
+      # immutable save key (first saver would win and the other job's store
+      # diff would never be cached); the bare OS prefix stays as a cross-job
+      # fallback restore.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ github.job }}-
+            nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          prefix-key: rust-${{ github.workflow }}
 
       - run: nix flake check
 
@@ -61,6 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: "sqlite:issuance.db"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
@@ -92,12 +116,31 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
+      # Shared rainlanguage Cachix that raindex CI populates; read works
+      # anonymously (the cache is public), pushes need CACHIX_AUTH_TOKEN.
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
+        continue-on-error: true
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      # github.job in the key keeps test and static from racing for the same
+      # immutable save key (first saver would win and the other job's store
+      # diff would never be cached); the bare OS prefix stays as a cross-job
+      # fallback restore.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ github.job }}-
+            nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          prefix-key: rust-${{ github.workflow }}
 
       - run: nix run .#prepSolArtifacts
       - run: nix flake check

@@ -54,12 +54,12 @@ resource "digitalocean_firewall" "st0x_issuance" {
   name        = "st0x-issuance-${var.environment}"
   droplet_ids = [digitalocean_droplet.nixos.id]
 
-  # Tailscale WireGuard -- must be publicly reachable for NAT traversal.
-  # Authentication is handled by WireGuard's Noise protocol, not by IP filtering.
-  # Operator access (SSH/admin) goes through the tailnet.
+  # Public SSH for bootstrap (Ubuntu image + nixos-anywhere), operators, and
+  # CI deploys. Key-only auth (PasswordAuthentication=false) plus fail2ban are
+  # enforced by os.nix on the host.
   inbound_rule {
-    protocol         = "udp"
-    port_range       = "41641"
+    protocol         = "tcp"
+    port_range       = "22"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 

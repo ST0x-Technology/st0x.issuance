@@ -43,9 +43,4 @@ let
   );
 
 in
-envSecretRules
-// fireblocksKeyRules
-// {
-  "tailscale-authkey-prod.age".publicKeys = roles.prod.service;
-  "tailscale-authkey-staging.age".publicKeys = roles.staging.service;
-}
+envSecretRules // fireblocksKeyRules

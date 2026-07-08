@@ -7,13 +7,16 @@
 let
   # Full source tree including the ethgild `out/` directory produced above.
   # crane's cleanCargoSource strips non-Rust files, so we supply an explicit
-  # filter that also keeps migrations
+  # filter that also keeps migrations and the .sqlx offline query cache —
+  # without the latter, SQLX_OFFLINE=true compiles with no cached query
+  # metadata and every sqlx::query! macro fails.
   baseSrc = pkgs.lib.cleanSourceWith {
     src = pkgs.lib.cleanSource ./.;
     filter =
       path: type:
-      # Keep everything crane would normally keep PLUS the migrations.
-      (craneLib.filterCargoSources path type) || (pkgs.lib.hasInfix "/migrations" path);
+      (craneLib.filterCargoSources path type)
+      || (pkgs.lib.hasInfix "/migrations" path)
+      || (pkgs.lib.hasInfix "/.sqlx" path);
   };
 
   fullSrc = baseSrc;
