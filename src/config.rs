@@ -369,6 +369,20 @@ mod tests {
     }
 
     #[test]
+    fn into_config_populates_base_chain_entry_from_legacy_env_vars() {
+        let env = Env::try_parse_from(minimal_args()).unwrap();
+        let config = env.into_config().unwrap();
+
+        assert_eq!(config.chains.len(), 1);
+        let chain = &config.chains[0];
+        assert_eq!(chain.network, Network::Base);
+        assert_eq!(chain.chain_id, DEFAULT_CHAIN_ID);
+        assert_eq!(chain.rpc_url, config.rpc_url);
+        assert_eq!(chain.subgraph_url, config.subgraph_url);
+        assert_eq!(chain.backfill_start_block, config.backfill_start_block);
+    }
+
+    #[test]
     fn test_empty_ip_ranges_default() {
         let args = minimal_args();
         let env = Env::try_parse_from(args).unwrap();

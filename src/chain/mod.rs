@@ -163,6 +163,12 @@ impl<P> ChainRegistry<P> {
             .map(|(network, runtime)| (*network, runtime.vault_service.clone()))
             .collect()
     }
+
+    pub(crate) fn runtimes(
+        &self,
+    ) -> impl Iterator<Item = (&Network, &ChainRuntime<P>)> {
+        self.runtimes.iter()
+    }
 }
 
 pub(crate) fn validate_chain_configs(

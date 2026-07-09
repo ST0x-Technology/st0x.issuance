@@ -19,6 +19,7 @@ use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
     IpWhitelist, LogLevel, Network, SignerConfig, initialize_rocket,
+    receipt_inventory_aggregate_id,
 };
 
 use crate::harness::create_provider;
@@ -45,7 +46,7 @@ async fn wait_for_receipt_depleted(
               AND event_type = 'ReceiptInventoryEvent::Depleted'
             ",
         )
-        .bind(vault.to_string())
+        .bind(receipt_inventory_aggregate_id(ANVIL_CHAIN_ID, vault))
         .fetch_all(&pool)
         .await?;
 
@@ -342,7 +343,8 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
 
     // Query events table to verify the TSLA receipt was discovered by backfill.
     // Backfill stores ReceiptInventoryEvent::Discovered events in the events table.
-    let tsla_vault_str = tsla_vault.to_string();
+    let tsla_vault_aggregate_id =
+        receipt_inventory_aggregate_id(ANVIL_CHAIN_ID, tsla_vault);
     let receipt_count = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) as "count: i64"
@@ -351,7 +353,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
           AND aggregate_id = ?
           AND event_type = 'ReceiptInventoryEvent::Discovered'
         "#,
-        tsla_vault_str
+        tsla_vault_aggregate_id
     )
     .fetch_one(&pool)
     .await?;

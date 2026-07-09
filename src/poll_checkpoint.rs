@@ -8,6 +8,7 @@
 //! Checkpoints are not domain entities — there is no audit history to keep
 //! and no state machine to enforce — so they live in a plain SQL table.
 
+use crate::tokenized_asset::Network;
 use alloy::primitives::Address;
 use sqlx::{Pool, Sqlite};
 
@@ -27,14 +28,59 @@ pub(crate) fn transfer_poll_name(vault: Address) -> String {
     format!("transfer_poll:{vault:#x}")
 }
 
-/// Checkpoint name for the receipt backfiller for a given vault.
-pub(crate) fn receipt_backfill_name(vault: Address) -> String {
+/// Per-network receipt backfill checkpoint name.
+pub(crate) fn receipt_backfill_name(
+    network: Network,
+    vault: Address,
+) -> String {
+    format!("receipt_backfill:{network}:{vault:#x}")
+}
+
+/// Legacy single-chain (Base only) checkpoint name, seeded by the migration
+/// from event-sourced BackfillCheckpoint events.
+fn legacy_receipt_backfill_name(vault: Address) -> String {
     format!("receipt_backfill:{vault:#x}")
+}
+
+/// Loads the receipt backfill checkpoint for `network`/`vault`, falling back
+/// to the legacy vault-only name when polling Base.
+pub(crate) async fn load_receipt_backfill(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+) -> Result<Option<u64>, CheckpointError> {
+    if let Some(block) =
+        load_checkpoint_block(pool, &receipt_backfill_name(network, vault))
+            .await?
+    {
+        return Ok(Some(block));
+    }
+
+    if network == Network::Base {
+        load_checkpoint_block(pool, &legacy_receipt_backfill_name(vault)).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Advances the receipt backfill checkpoint for `network`/`vault`.
+pub(crate) async fn advance_receipt_backfill(
+    pool: &Pool<Sqlite>,
+    network: Network,
+    vault: Address,
+    block_number: u64,
+) -> Result<(), CheckpointError> {
+    advance_checkpoint_block(
+        pool,
+        &receipt_backfill_name(network, vault),
+        block_number,
+    )
+    .await
 }
 
 /// Returns the highest block number recorded for `name`, or `None` if no
 /// checkpoint has been written yet.
-pub(crate) async fn load(
+pub(crate) async fn load_checkpoint_block(
     pool: &Pool<Sqlite>,
     name: &str,
 ) -> Result<Option<u64>, CheckpointError> {
@@ -51,7 +97,7 @@ pub(crate) async fn load(
 /// Advances `name` to `block_number`, but only if the new value is strictly
 /// greater than the existing one. Older or equal values are ignored, matching
 /// the monotonic semantics of the aggregates this replaces.
-pub(crate) async fn advance(
+pub(crate) async fn advance_checkpoint_block(
     pool: &Pool<Sqlite>,
     name: &str,
     block_number: u64,
@@ -107,6 +153,8 @@ mod tests {
     use alloy::primitives::address;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    use crate::tokenized_asset::Network;
+
     use super::*;
 
     async fn setup_pool() -> Pool<Sqlite> {
@@ -122,39 +170,54 @@ mod tests {
     #[tokio::test]
     async fn load_returns_none_when_unset() {
         let pool = setup_pool().await;
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), None);
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn advance_sets_the_value() {
         let pool = setup_pool().await;
-        advance(&pool, TRANSFER_POLL, 100).await.unwrap();
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(100));
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 100).await.unwrap();
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            Some(100)
+        );
     }
 
     #[tokio::test]
     async fn advance_is_monotonic() {
         let pool = setup_pool().await;
-        advance(&pool, TRANSFER_POLL, 100).await.unwrap();
-        advance(&pool, TRANSFER_POLL, 80).await.unwrap();
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(100));
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 100).await.unwrap();
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 80).await.unwrap();
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            Some(100)
+        );
     }
 
     #[tokio::test]
     async fn advance_to_same_block_is_noop() {
         let pool = setup_pool().await;
-        advance(&pool, TRANSFER_POLL, 100).await.unwrap();
-        advance(&pool, TRANSFER_POLL, 100).await.unwrap();
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(100));
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 100).await.unwrap();
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 100).await.unwrap();
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            Some(100)
+        );
     }
 
     #[tokio::test]
     async fn sequential_advances_grow_monotonically() {
         let pool = setup_pool().await;
-        advance(&pool, TRANSFER_POLL, 100).await.unwrap();
-        advance(&pool, TRANSFER_POLL, 200).await.unwrap();
-        advance(&pool, TRANSFER_POLL, 350).await.unwrap();
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(350));
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 100).await.unwrap();
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 200).await.unwrap();
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 350).await.unwrap();
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            Some(350)
+        );
     }
 
     #[tokio::test]
@@ -162,27 +225,70 @@ mod tests {
         let pool = setup_pool().await;
         let vault_a = address!("00000000000000000000000000000000000000aa");
         let vault_b = address!("00000000000000000000000000000000000000bb");
-        advance(&pool, &receipt_backfill_name(vault_a), 100).await.unwrap();
-        advance(&pool, &receipt_backfill_name(vault_b), 500).await.unwrap();
-        advance(&pool, TRANSFER_POLL, 999).await.unwrap();
+        advance_checkpoint_block(
+            &pool,
+            &receipt_backfill_name(Network::Base, vault_a),
+            100,
+        )
+        .await
+        .unwrap();
+        advance_checkpoint_block(
+            &pool,
+            &receipt_backfill_name(Network::Base, vault_b),
+            500,
+        )
+        .await
+        .unwrap();
+        advance_checkpoint_block(&pool, TRANSFER_POLL, 999).await.unwrap();
 
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault_a)).await.unwrap(),
+            load_checkpoint_block(
+                &pool,
+                &receipt_backfill_name(Network::Base, vault_a),
+            )
+            .await
+            .unwrap(),
             Some(100)
         );
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault_b)).await.unwrap(),
+            load_checkpoint_block(
+                &pool,
+                &receipt_backfill_name(Network::Base, vault_b),
+            )
+            .await
+            .unwrap(),
             Some(500)
         );
-        assert_eq!(load(&pool, TRANSFER_POLL).await.unwrap(), Some(999));
+        assert_eq!(
+            load_checkpoint_block(&pool, TRANSFER_POLL).await.unwrap(),
+            Some(999)
+        );
     }
 
     #[tokio::test]
     async fn receipt_backfill_name_uses_lowercase_hex() {
         let vault = address!("AaBbCcDdEeFf00112233445566778899aAbBcCdD");
         assert_eq!(
-            receipt_backfill_name(vault),
-            "receipt_backfill:0xaabbccddeeff00112233445566778899aabbccdd"
+            receipt_backfill_name(Network::Base, vault),
+            "receipt_backfill:base:0xaabbccddeeff00112233445566778899aabbccdd"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_receipt_backfill_falls_back_to_legacy_base_checkpoint() {
+        let pool = setup_pool().await;
+        let vault = address!("00000000000000000000000000000000000000aa");
+        advance_checkpoint_block(
+            &pool,
+            &legacy_receipt_backfill_name(vault),
+            42,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_receipt_backfill(&pool, Network::Base, vault).await.unwrap(),
+            Some(42)
         );
     }
 
@@ -259,7 +365,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            load(&pool, &receipt_backfill_name(vault)).await.unwrap(),
+            load_receipt_backfill(&pool, Network::Base, vault).await.unwrap(),
             Some(12345),
             "seeded checkpoint must be readable via the runtime key"
         );

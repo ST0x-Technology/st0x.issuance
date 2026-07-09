@@ -1496,6 +1496,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_poll_request_status_parses_ethereum_network_wire_string() {
+        let target_id = "00000000-0000-0000-0000-000000000002";
+        let ethereum_json = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000002","issuer_request_id":"0x2222222222222222222222222222222222222222222222222222222222222222","type":"mint","status":"completed","underlying_symbol":"AAPL","token_symbol":"tAAPL","qty":"1","client_external_account_id":"00000000-0000-0000-0000-000000000003","created_at":"2026-06-11T00:02:27.467568Z","updated_at":"2026-06-11T04:02:33.530523Z","wallet_address":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","network":"ethereum","issuer":"st0x","fees":"0","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}"#;
+
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/test-account/tokenization/requests/{target_id}"
+            ));
+            then.status(200).body(ethereum_json);
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap();
+
+        let result = service
+            .poll_request_status(&TokenizationRequestId::new(target_id))
+            .await;
+
+        let request = result.unwrap();
+        assert!(
+            matches!(request, TokenizationRequest::Mint {}),
+            "ethereum mint payload must parse through the real poll path, \
+             got {request:?}"
+        );
+        mock.assert();
+    }
+
+    #[tokio::test]
     async fn test_200_with_invalid_json_returns_non_retryable_error() {
         let server = MockServer::start();
 

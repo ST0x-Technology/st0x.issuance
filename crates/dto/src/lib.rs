@@ -634,7 +634,7 @@ mod tests {
         assert_eq!("SGOV:base".parse::<AssetKey>().unwrap(), key);
 
         let eth_key = AssetKey::new(
-            valid_underlying_symbol("TSLA"),
+            UnderlyingSymbol::new("TSLA").unwrap(),
             Network::Ethereum,
         );
         assert_eq!(eth_key.to_string(), "TSLA:ethereum");

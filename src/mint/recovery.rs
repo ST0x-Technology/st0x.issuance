@@ -1010,9 +1010,9 @@ mod tests {
     };
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptId, ReceiptInventory,
-        ReceiptInventoryCommand, ReceiptSource, Shares,
+        ReceiptInventoryCommand, ReceiptSource, ReceiptVaultKey, Shares,
     };
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, TokenizedAsset, TokenizedAssetCommand,
     };
@@ -1086,6 +1086,7 @@ mod tests {
 
             let services = MintServices::with_single_vault(
                 Network::Base,
+                ANVIL_CHAIN_ID,
                 vault.clone(),
                 alpaca,
                 Arc::new(CqrsReceiptService::new(receipt_store.clone())),
@@ -1314,7 +1315,7 @@ mod tests {
         fixture
             .receipt_store
             .send(
-                &VAULT,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, VAULT),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(uint!(42_U256)),
                     balance: Shares::from(
@@ -2252,13 +2253,15 @@ mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
         let vault: Arc<dyn VaultService> =
             Arc::new(MockVaultService::new_success());
-        let services = MintServices {
-            vault: vault.clone(),
-            alpaca: Arc::new(MockAlpacaService::new_success()),
-            receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
-            pool: pool.clone(),
-            bot: BOT,
-        };
+        let services = MintServices::with_single_vault(
+            Network::Base,
+            ANVIL_CHAIN_ID,
+            vault.clone(),
+            Arc::new(MockAlpacaService::new_success()),
+            Arc::new(CqrsReceiptService::new(receipt_store)),
+            pool.clone(),
+            BOT,
+        );
         let mint_store = Arc::new(test_store::<Mint>(pool.clone(), services));
 
         let issuer_request_id = test_issuer_request_id();

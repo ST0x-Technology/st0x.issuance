@@ -9,8 +9,8 @@ use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+use st0x_issuance::{Network, initialize_rocket};
 
 /// Tests that adding a new tokenized asset at runtime is picked up by the
 /// receipt backfill loop and the transfer poller on their next polling pass,
@@ -92,11 +92,14 @@ async fn test_new_asset_triggers_backfills_and_monitors()
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-mint-msft",
-        "25.0",
-        "MSFT",
-        "tMSFT",
+        harness::MintFlowRequest {
+            client_id: &link_body.client_id.to_string(),
+            tokenization_request_id: "alp-mint-msft",
+            quantity: "25.0",
+            underlying: "MSFT",
+            token: "tMSFT",
+            network: Network::Base,
+        },
     )
     .await?;
 
@@ -213,11 +216,14 @@ async fn test_address_change_picked_up_on_next_pass()
     harness::perform_mint_and_confirm_with(
         &client,
         user_wallet,
-        &link_body.client_id.to_string(),
-        "alp-mint-aapl-new",
-        "25.0",
-        "AAPL",
-        "tAAPL",
+        harness::MintFlowRequest {
+            client_id: &link_body.client_id.to_string(),
+            tokenization_request_id: "alp-mint-aapl-new",
+            quantity: "25.0",
+            underlying: "AAPL",
+            token: "tAAPL",
+            network: Network::Base,
+        },
     )
     .await?;
 

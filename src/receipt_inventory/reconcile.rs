@@ -38,6 +38,7 @@ pub(crate) struct ReceiptReconciler<Node> {
     provider: Node,
     receipt_contract: Address,
     bot_wallet: Address,
+    chain_id: u64,
     vault: Address,
     store: Arc<Store<ReceiptInventory>>,
 }
@@ -47,10 +48,11 @@ impl<Node> ReceiptReconciler<Node> {
         provider: Node,
         receipt_contract: Address,
         bot_wallet: Address,
+        chain_id: u64,
         vault: Address,
         store: Arc<Store<ReceiptInventory>>,
     ) -> Self {
-        Self { provider, receipt_contract, bot_wallet, vault, store }
+        Self { provider, receipt_contract, bot_wallet, chain_id, vault, store }
     }
 }
 
@@ -67,7 +69,8 @@ where
     pub(crate) async fn reconcile(
         &self,
     ) -> Result<ReconcileResult, ReconcileError> {
-        let inventory = load_inventory(&self.store, &self.vault).await?;
+        let inventory =
+            load_inventory(&self.store, self.chain_id, &self.vault).await?;
 
         let receipts: Vec<_> = inventory
             .receipts_with_balance()
@@ -164,6 +167,7 @@ where
 
         send_receipt_inventory_command(
             &self.store,
+            self.chain_id,
             &self.vault,
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id,
@@ -178,12 +182,12 @@ where
 
 pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
     provider: P,
-    vault_receipt_contracts: &[(Address, Address)],
+    entries: &[(u64, Address, Address)],
     store: &Arc<Store<ReceiptInventory>>,
     bot_wallet: Address,
 ) -> Result<(), ReconcileError> {
-    let results = stream::iter(vault_receipt_contracts.iter().copied())
-        .then(|(vault, receipt_contract)| {
+    let results = stream::iter(entries.iter().copied())
+        .then(|(chain_id, vault, receipt_contract)| {
             let provider = provider.clone();
             let store = store.clone();
             async move {
@@ -191,13 +195,14 @@ pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
                     provider,
                     receipt_contract,
                     bot_wallet,
+                    chain_id,
                     vault,
                     store,
                 )
                 .reconcile()
                 .await;
 
-                (vault, receipt_contract, result)
+                (chain_id, vault, receipt_contract, result)
             }
         })
         .collect::<Vec<_>>()
@@ -209,7 +214,7 @@ pub(crate) async fn run_startup_reconciliation<P: Provider + Clone>(
     let mut failed_vaults = 0usize;
     let mut first_error = None;
 
-    for (vault, receipt_contract, result) in results {
+    for (_chain_id, vault, receipt_contract, result) in results {
         match result {
             Ok(result) => {
                 total_checked += result.checked;
@@ -259,9 +264,9 @@ mod tests {
     use super::*;
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
-        Shares,
+        ReceiptVaultKey, Shares,
     };
-    use crate::test_utils::{LocalEvm, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm, logs_contain_at};
 
     async fn setup_store() -> Arc<Store<ReceiptInventory>> {
         let pool = SqlitePoolOptions::new()
@@ -284,7 +289,7 @@ mod tests {
     ) {
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(receipt_id),
                     balance: Shares::from(balance),
@@ -319,6 +324,7 @@ mod tests {
             provider,
             receipt_contract,
             evm.wallet_address,
+            ANVIL_CHAIN_ID,
             evm.vault_address,
             store,
         );
@@ -356,6 +362,7 @@ mod tests {
             provider,
             missing_receipt_contract,
             evm.wallet_address,
+            crate::test_utils::ANVIL_CHAIN_ID,
             evm.vault_address,
             store,
         );
@@ -415,8 +422,16 @@ mod tests {
         let result = run_startup_reconciliation(
             provider,
             &[
-                (evm.vault_address, receipt_contract),
-                (vault_without_contract, Address::random()),
+                (
+                    crate::test_utils::ANVIL_CHAIN_ID,
+                    evm.vault_address,
+                    receipt_contract,
+                ),
+                (
+                    crate::test_utils::ANVIL_CHAIN_ID,
+                    vault_without_contract,
+                    Address::random(),
+                ),
             ],
             &store,
             evm.wallet_address,
@@ -469,6 +484,7 @@ mod tests {
             provider,
             receipt_contract,
             evm.wallet_address,
+            ANVIL_CHAIN_ID,
             evm.vault_address,
             store.clone(),
         );
@@ -480,7 +496,9 @@ mod tests {
 
         // Verify the aggregate was updated — receipt should be depleted
         let inventory =
-            load_inventory(&store, &evm.vault_address).await.unwrap();
+            load_inventory(&store, ANVIL_CHAIN_ID, &evm.vault_address)
+                .await
+                .unwrap();
         let receipts = inventory.receipts_with_balance();
         assert!(
             receipts.is_empty(),
@@ -563,6 +581,7 @@ mod tests {
             bot_provider,
             receipt_contract,
             evm.wallet_address,
+            ANVIL_CHAIN_ID,
             evm.vault_address,
             store,
         );

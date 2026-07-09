@@ -54,6 +54,12 @@ pub fn test_alpaca_legacy_auth() -> (String, String, String) {
 /// Anvil local chain ID (Base test runtime).
 pub const ANVIL_CHAIN_ID: u64 = 31337;
 
+/// ReceiptInventory aggregate id for integration tests (`{chain_id}:{vault:#x}`).
+#[must_use]
+pub fn receipt_inventory_aggregate_id(chain_id: u64, vault: Address) -> String {
+    format!("{chain_id}:{vault:#x}")
+}
+
 /// Chain ID for the Ethereum test runtime in multichain integration tests.
 pub const ETHEREUM_TEST_CHAIN_ID: u64 = 1;
 
@@ -115,6 +121,7 @@ pub async fn setup_test_rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>
     let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let mint_services = MintServices::with_single_vault(
         Network::Base,
+        ANVIL_CHAIN_ID,
         Arc::new(MockVaultService::new_success()),
         Arc::new(MockAlpacaService::new_success()),
         Arc::new(CqrsReceiptService::new(receipt_inventory_store)),

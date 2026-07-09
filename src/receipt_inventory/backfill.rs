@@ -18,7 +18,8 @@ use super::{
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::IssuerMintRequestId;
-use crate::poll_checkpoint::{self, CheckpointError, receipt_backfill_name};
+use crate::poll_checkpoint::{CheckpointError, advance_receipt_backfill};
+use crate::tokenized_asset::Network;
 
 /// Maximum number of blocks to query in a single get_logs call.
 /// RPCs typically limit response sizes, so we chunk large ranges.
@@ -53,10 +54,26 @@ where
     provider: ProviderType,
     receipt_contract: Address,
     bot_wallet: Address,
+    chain_id: u64,
+    network: Network,
     vault: Address,
     store: Arc<Store<ReceiptInventory>>,
     pool: Pool<Sqlite>,
     handler: Handler,
+}
+
+/// Bundles [`ReceiptBackfiller`] construction inputs to stay within clippy's
+/// argument limit.
+pub(crate) struct ReceiptBackfillDeps<ProviderType, Handler> {
+    pub(crate) provider: ProviderType,
+    pub(crate) receipt_contract: Address,
+    pub(crate) bot_wallet: Address,
+    pub(crate) chain_id: u64,
+    pub(crate) network: Network,
+    pub(crate) vault: Address,
+    pub(crate) store: Arc<Store<ReceiptInventory>>,
+    pub(crate) pool: Pool<Sqlite>,
+    pub(crate) handler: Handler,
 }
 
 #[derive(Debug)]
@@ -90,19 +107,27 @@ impl<ProviderType, Handler> ReceiptBackfiller<ProviderType, Handler>
 where
     Handler: ItnReceiptHandler,
 {
-    pub(crate) const fn new(
-        provider: ProviderType,
-        receipt_contract: Address,
-        bot_wallet: Address,
-        vault: Address,
-        store: Arc<Store<ReceiptInventory>>,
-        pool: Pool<Sqlite>,
-        handler: Handler,
+    pub(crate) fn new(
+        deps: ReceiptBackfillDeps<ProviderType, Handler>,
     ) -> Self {
+        let ReceiptBackfillDeps {
+            provider,
+            receipt_contract,
+            bot_wallet,
+            chain_id,
+            network,
+            vault,
+            store,
+            pool,
+            handler,
+        } = deps;
+
         Self {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id,
+            network,
             vault,
             store,
             pool,
@@ -127,7 +152,7 @@ where
     /// `from_block` is the block to start scanning from. On first run, pass
     /// the configured backfill start block. On subsequent runs, read the
     /// previous checkpoint via
-    /// `poll_checkpoint::load(pool, &receipt_backfill_name(vault))`.
+    /// `load_receipt_backfill(pool, network, vault)`.
     ///
     /// `head_block` is the chain head to scan up to. The caller fetches it so
     /// a single `eth_blockNumber` can be shared across every vault in one
@@ -217,9 +242,10 @@ where
             self.reconcile_receipt(receipt_id).await?;
         }
 
-        poll_checkpoint::advance(
+        advance_receipt_backfill(
             &self.pool,
-            &receipt_backfill_name(self.vault),
+            self.network,
+            self.vault,
             current_block,
         )
         .await?;
@@ -459,6 +485,7 @@ where
 
         send_receipt_inventory_command(
             &self.store,
+            self.chain_id,
             &self.vault,
             ReceiptInventoryCommand::DiscoverReceipt {
                 receipt_id: discovery.receipt_id,
@@ -477,6 +504,7 @@ where
         // after an inbound transfer increases the balance).
         send_receipt_inventory_command(
             &self.store,
+            self.chain_id,
             &self.vault,
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id: discovery.receipt_id,
@@ -514,6 +542,7 @@ where
 
         send_receipt_inventory_command(
             &self.store,
+            self.chain_id,
             &self.vault,
             ReceiptInventoryCommand::ReconcileBalance {
                 receipt_id,
@@ -651,14 +680,17 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::{NoOpItnHandler, ReceiptBackfiller};
+    use super::{NoOpItnHandler, ReceiptBackfillDeps, ReceiptBackfiller};
     use crate::bindings::OffchainAssetReceiptVault;
-    use crate::poll_checkpoint;
+    use crate::poll_checkpoint::{
+        load_checkpoint_block, receipt_backfill_name,
+    };
     use crate::receipt_inventory::{
         ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
-        Shares, load_inventory,
+        ReceiptVaultKey, Shares, load_inventory,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
+    use crate::tokenized_asset::Network;
 
     async fn setup_test_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -779,15 +811,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -847,15 +881,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter1);
 
-        let backfiller1 = ReceiptBackfiller::new(
-            provider1,
+        let backfiller1 = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider: provider1,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result1 =
             backfiller1.backfill_receipts(0, current_block).await.unwrap();
@@ -864,16 +900,16 @@ mod tests {
         // After the first run the aggregate has exactly one Discovered event
         // and the SQL checkpoint matches the chain head.
         let inventory_after_first =
-            load_inventory(&store, &vault).await.unwrap();
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         assert_eq!(
             inventory_after_first.receipts_with_balance().len(),
             1,
             "first run should produce exactly one receipt"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            load_checkpoint_block(
                 &pool,
-                &poll_checkpoint::receipt_backfill_name(vault),
+                &receipt_backfill_name(Network::Base, vault),
             )
             .await
             .unwrap(),
@@ -891,15 +927,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter2);
 
-        let backfiller2 = ReceiptBackfiller::new(
-            provider2,
+        let backfiller2 = ReceiptBackfiller::new(ReceiptBackfillDeps {
+            provider: provider2,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result2 =
             backfiller2.backfill_receipts(0, current_block).await.unwrap();
@@ -909,16 +947,16 @@ mod tests {
         // (no duplicate Discovered event applied) and the checkpoint is
         // unchanged.
         let inventory_after_second =
-            load_inventory(&store, &vault).await.unwrap();
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         assert_eq!(
             inventory_after_second.receipts_with_balance().len(),
             1,
             "second run must not produce a duplicate receipt"
         );
         assert_eq!(
-            poll_checkpoint::load(
+            load_checkpoint_block(
                 &pool,
-                &poll_checkpoint::receipt_backfill_name(vault),
+                &receipt_backfill_name(Network::Base, vault),
             )
             .await
             .unwrap(),
@@ -964,15 +1002,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1034,22 +1074,25 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
 
         assert_eq!(result.processed_count, 1);
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
 
         assert_eq!(receipts.len(), 1);
@@ -1108,15 +1151,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1161,21 +1206,23 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
             store,
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         backfiller.backfill_receipts(0, current_block).await.unwrap();
 
-        let recorded = poll_checkpoint::load(
+        let recorded = load_checkpoint_block(
             &pool,
-            &poll_checkpoint::receipt_backfill_name(vault),
+            &receipt_backfill_name(Network::Base, vault),
         )
         .await
         .unwrap();
@@ -1406,15 +1453,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1423,7 +1472,8 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify the receipt was actually discovered with correct ID and balance
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1, "Should discover exactly one receipt");
         assert_eq!(
@@ -1490,15 +1540,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1510,7 +1562,8 @@ mod tests {
         assert_eq!(result.skipped_zero_balance, 0);
 
         // Verify: aggregate has no receipts at all
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         assert!(
             inventory.receipts_with_balance().is_empty(),
             "No receipts should be discovered from outbound/mint transfers"
@@ -1574,15 +1627,17 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
@@ -1590,7 +1645,8 @@ mod tests {
         // Should only process once despite appearing in both Deposit and Transfer
         assert_eq!(result.processed_count, 1);
 
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
         assert_eq!(
             receipts.len(),
@@ -1625,7 +1681,7 @@ mod tests {
         // Seed aggregate with a receipt at a stale lower balance
         store
             .send(
-                &vault,
+                &ReceiptVaultKey::new(ANVIL_CHAIN_ID, vault),
                 ReceiptInventoryCommand::DiscoverReceipt {
                     receipt_id: ReceiptId::from(receipt_id_raw),
                     balance: Shares::from(stale_balance),
@@ -1674,22 +1730,25 @@ mod tests {
             .wallet(EthereumWallet::from(PrivateKeySigner::random()))
             .connect_mocked_client(asserter);
 
-        let backfiller = ReceiptBackfiller::new(
+        let backfiller = ReceiptBackfiller::new(ReceiptBackfillDeps {
             provider,
             receipt_contract,
             bot_wallet,
+            chain_id: ANVIL_CHAIN_ID,
+            network: Network::Base,
             vault,
-            store.clone(),
-            pool.clone(),
-            NoOpItnHandler,
-        );
+            store: store.clone(),
+            pool: pool.clone(),
+            handler: NoOpItnHandler,
+        });
 
         let result =
             backfiller.backfill_receipts(0, current_block).await.unwrap();
         assert_eq!(result.processed_count, 1);
 
         // Verify balance was reconciled upward from 500 to 750
-        let inventory = load_inventory(&store, &vault).await.unwrap();
+        let inventory =
+            load_inventory(&store, ANVIL_CHAIN_ID, &vault).await.unwrap();
         let receipts = inventory.receipts_with_balance();
         assert_eq!(receipts.len(), 1);
         assert_eq!(

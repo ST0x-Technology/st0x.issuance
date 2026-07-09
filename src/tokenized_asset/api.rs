@@ -221,6 +221,8 @@ pub(crate) async fn add_tokenized_asset(
     // An asset on a network with no chain config would make the next boot
     // abort in `validate_configured_asset_networks`, bricking the service
     // until the chain is configured or the asset removed. Reject upfront.
+    // Non-Base networks are not fully wired for redemption/backfill until the
+    // multichain redemption PR lands — do not register them in staging early.
     if !configured_networks.contains(request.network) {
         warn!(
             target: "asset",
@@ -715,6 +717,7 @@ mod tests {
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(store)
             .manage(pool)
+            .manage(ConfiguredNetworks::from_iter([Network::Base]))
             .mount("/", routes![add_tokenized_asset]);
 
         let client = rocket::local::asynchronous::Client::tracked(rocket)
@@ -830,8 +833,10 @@ mod tests {
 
         // The rejected registration must not have written the aggregate — a
         // written-but-rejected asset would still brick the next boot.
-        let key =
-            AssetKey::new(UnderlyingSymbol::new("AAPL"), Network::Ethereum);
+        let key = AssetKey::new(
+            UnderlyingSymbol::new("AAPL").unwrap(),
+            Network::Ethereum,
+        );
         let asset = store.load(&key).await.expect("load must succeed");
         assert!(asset.is_none(), "aggregate must not exist: {asset:?}");
     }

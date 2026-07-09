@@ -43,6 +43,7 @@ pub(crate) use view::{
 /// [`Self::vault_for`] ([RAI-1206]).
 pub(crate) struct MintServices {
     vaults: HashMap<Network, Arc<dyn VaultService>>,
+    chain_ids: HashMap<Network, u64>,
     pub(crate) alpaca: Arc<dyn AlpacaService>,
     pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) pool: Pool<Sqlite>,
@@ -52,16 +53,18 @@ pub(crate) struct MintServices {
 impl MintServices {
     pub(crate) fn new(
         vaults: HashMap<Network, Arc<dyn VaultService>>,
+        chain_ids: HashMap<Network, u64>,
         alpaca: Arc<dyn AlpacaService>,
         receipts: Arc<dyn ReceiptService>,
         pool: Pool<Sqlite>,
         bot: Address,
     ) -> Self {
-        Self { vaults, alpaca, receipts, pool, bot }
+        Self { vaults, chain_ids, alpaca, receipts, pool, bot }
     }
 
     pub(crate) fn with_single_vault(
         network: Network,
+        chain_id: u64,
         vault: Arc<dyn VaultService>,
         alpaca: Arc<dyn AlpacaService>,
         receipts: Arc<dyn ReceiptService>,
@@ -70,11 +73,22 @@ impl MintServices {
     ) -> Self {
         Self::new(
             HashMap::from([(network, vault)]),
+            HashMap::from([(network, chain_id)]),
             alpaca,
             receipts,
             pool,
             bot,
         )
+    }
+
+    pub(crate) fn chain_id_for(
+        &self,
+        network: Network,
+    ) -> Result<u64, MintError> {
+        self.chain_ids
+            .get(&network)
+            .copied()
+            .ok_or(MintError::NetworkNotConfigured { network })
     }
 
     fn vault_for(
@@ -651,18 +665,11 @@ impl Mint {
             Some(&issuer_request_id),
         )
         .await
-        .map_err(|error| {
-            MintError::AssetView(TokenizedAssetViewFailure::Database {
-                message: error.to_string(),
-            })
-        })?;
-        let unresolved_burn = has_unresolved_burn_intent(&services.pool, None)
-            .await
-            .map_err(|error| {
-                MintError::AssetView(TokenizedAssetViewFailure::Database {
-                    message: error.to_string(),
-                })
-            })?;
+        .map_err(|error| MintError::Database { message: error.to_string() })?;
+        let unresolved_burn =
+            has_unresolved_burn_intent(&services.pool, None).await.map_err(
+                |error| MintError::Database { message: error.to_string() },
+            )?;
         if unresolved_mint || unresolved_burn {
             return Err(MintError::PendingWalletIntent);
         }
@@ -844,6 +851,10 @@ impl Mint {
         let now = Utc::now();
 
         let vault_service = services.vault_for(*network)?;
+        // Resolved before the irreversible on-chain call: a failing lookup
+        // after `confirm_mint` would error the command and leave tokens
+        // minted with no TokensMinted event.
+        let chain_id = services.chain_id_for(*network)?;
 
         match vault_service.confirm_mint(&tx_id).await {
             Ok(result) => {
@@ -872,6 +883,7 @@ impl Mint {
                         if let Err(err) = services
                             .receipts
                             .register_minted_receipt(MintedReceiptParams {
+                                chain_id,
                                 vault,
                                 receipt_id: ReceiptId::from(result.receipt_id),
                                 shares: Shares::from(result.shares_minted),
@@ -1016,6 +1028,7 @@ impl Mint {
                 if let Some(deposit_events) =
                     Self::recover_from_existing_receipt(
                         services,
+                        *network,
                         &vault,
                         &issuer_request_id,
                     )
@@ -1115,6 +1128,7 @@ impl Mint {
                     })?;
                 let deposit_events = Self::recover_from_existing_receipt(
                     services,
+                    *network,
                     &vault,
                     &issuer_request_id,
                 )
@@ -1196,6 +1210,7 @@ impl Mint {
 
         if let Some(events) = Self::recover_from_existing_receipt(
             services,
+            *network,
             &vault,
             &issuer_request_id,
         )
@@ -1214,6 +1229,10 @@ impl Mint {
         );
 
         let now = Utc::now();
+        // Resolved before the irreversible on-chain call: a failing lookup
+        // after `confirm_mint` would error the command and leave tokens
+        // minted with no TokensMinted event.
+        let chain_id = services.chain_id_for(*network)?;
 
         if let Some(known_tx) = known_mint_tx {
             // Known tx_id from a prior submission: go straight to confirm.
@@ -1237,6 +1256,7 @@ impl Mint {
                     if let Err(err) = services
                         .receipts
                         .register_minted_receipt(MintedReceiptParams {
+                            chain_id,
                             vault,
                             receipt_id: ReceiptId::from(result.receipt_id),
                             shares: Shares::from(result.shares_minted),
@@ -1432,12 +1452,14 @@ impl Mint {
 
     async fn recover_from_existing_receipt(
         services: &MintServices,
+        network: Network,
         vault: &Address,
         issuer_request_id: &IssuerMintRequestId,
     ) -> Result<Option<Vec<MintEvent>>, MintError> {
+        let chain_id = services.chain_id_for(network)?;
         let Some(receipt) = services
             .receipts
-            .find_by_issuer_request_id(vault, issuer_request_id)
+            .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
             .await
             .map_err(|e| MintError::ReceiptLookup { message: e.to_string() })?
         else {
@@ -2356,6 +2378,8 @@ pub(crate) enum MintError {
     QuantityConversion { message: String },
     #[error(transparent)]
     AssetView(#[from] TokenizedAssetViewFailure),
+    #[error("database query failed: {message}")]
+    Database { message: String },
     #[error("Alpaca: {message}")]
     Alpaca { message: String },
     #[error("Receipt lookup: {message}")]
@@ -2406,7 +2430,7 @@ pub(crate) mod tests {
     use crate::alpaca::mock::MockAlpacaService;
     use crate::prepare_event_sourced_startup;
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         AssetKey, TokenizedAsset, TokenizedAssetCommand,
     };
@@ -2644,6 +2668,7 @@ pub(crate) mod tests {
 
             let services = MintServices::with_single_vault(
                 Network::Base,
+                ANVIL_CHAIN_ID,
                 vault,
                 Arc::new(MockAlpacaService::new_success()),
                 Arc::new(CqrsReceiptService::new(receipt_store)),
@@ -2782,6 +2807,7 @@ pub(crate) mod tests {
 
         MintServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             Arc::new(MockVaultService::new_success()),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
@@ -2802,6 +2828,7 @@ pub(crate) mod tests {
 
         MintServices::new(
             HashMap::new(),
+            HashMap::new(),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
@@ -2812,11 +2839,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_mint_errors_when_network_not_configured() {
         let issuer_request_id = IssuerMintRequestId::random();
-        let now = Utc::now();
-
-        let mut events =
-            minting_events_for_retry(&issuer_request_id, String::new(), now);
-        events.truncate(3);
+        let prepared_tx = test_prepared_mint_tx(&issuer_request_id);
+        let events =
+            persisted_mint_intent_events(&issuer_request_id, prepared_tx);
 
         let error = TestHarness::<Mint>::with(empty_vault_services())
             .given(events)
@@ -3790,6 +3815,7 @@ pub(crate) mod tests {
 
         let services = MintServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             vault,
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
@@ -4128,6 +4154,7 @@ pub(crate) mod tests {
 
         let services = MintServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             Arc::new(MockVaultService::new_success()),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
@@ -4331,6 +4358,7 @@ pub(crate) mod tests {
 
         let services = MintServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             Arc::new(MockVaultService::new_success()),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
@@ -5229,6 +5257,7 @@ pub(crate) mod tests {
 
         let services = MintServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             Arc::new(MockVaultService::new_success()),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
