@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 
 use super::{
     IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-    burn_manager::BurnManager, journal_manager::JournalManager,
-    redeem_call_manager::RedeemCallManager,
+    burn_manager::BurnManager,
+    journal_manager::JournalManager,
+    redeem_call_manager::{DetectedRecoveryOutcome, RedeemCallManager},
 };
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
@@ -242,7 +243,7 @@ pub(crate) async fn drive_redemption_flow(
         }
     };
 
-    if let Err(err) = deps
+    let recovery_outcome = match deps
         .redeem_call_manager
         .handle_redemption_detected(
             &alpaca_account,
@@ -252,10 +253,16 @@ pub(crate) async fn drive_redemption_flow(
         )
         .await
     {
-        warn!(target: "redemption", %issuer_request_id,
-            error = ?err,
-            "handle_redemption_detected failed"
-        );
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(target: "redemption", %issuer_request_id,
+                error = ?err,
+                "handle_redemption_detected failed"
+            );
+            return;
+        }
+    };
+    if recovery_outcome != DetectedRecoveryOutcome::Recovered {
         return;
     }
 

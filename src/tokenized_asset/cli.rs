@@ -38,7 +38,7 @@ use crate::redemption::force_complete::{
 };
 use crate::underlying::{
     AssetStatus, Underlying, UnderlyingCommand, UnderlyingViewError,
-    load_freeze_status,
+    load_freeze_status, with_freeze_admission,
 };
 use crate::vault::onboarding::{
     ApprovalOutcome, check_orchestrator_readiness, ensure_unlimited_approval,
@@ -1488,12 +1488,17 @@ impl AssetAdmin {
             Some(AssetStatus::Frozen)
         );
 
-        self.store
-            .send(
-                underlying,
-                UnderlyingCommand::Freeze { underlying: underlying.clone() },
-            )
-            .await?;
+        with_freeze_admission(|| async {
+            self.store
+                .send(
+                    underlying,
+                    UnderlyingCommand::Freeze {
+                        underlying: underlying.clone(),
+                    },
+                )
+                .await
+        })
+        .await?;
 
         Ok(if already_frozen {
             FreezeOutcome::OperatorHoldEnsured

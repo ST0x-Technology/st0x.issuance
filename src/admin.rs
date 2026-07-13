@@ -3607,6 +3607,21 @@ mod tests {
         ))
     }
 
+    async fn claim_alpaca_call(
+        store: &Store<Redemption>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) {
+        store
+            .send(
+                issuer_request_id,
+                RedemptionCommand::ClaimAlpacaCall {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .expect("ClaimAlpacaCall failed");
+    }
+
     /// Sets up an in-memory redemption store with a redemption in Failed
     /// state (post-Alpaca, i.e. with AlpacaCalled event in history).
     async fn setup_failed_redemption() -> (
@@ -3640,6 +3655,7 @@ mod tests {
             .await
             .expect("Detect failed");
 
+        claim_alpaca_call(&store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -3699,6 +3715,7 @@ mod tests {
             .await
             .expect("Detect failed");
 
+        claim_alpaca_call(&store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -4338,6 +4355,7 @@ mod tests {
             .await
             .expect("Detect failed");
 
+        claim_alpaca_call(store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -4777,6 +4795,7 @@ mod tests {
             )
             .await
             .expect("Detect failed");
+        claim_alpaca_call(store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -5549,6 +5568,7 @@ mod tests {
             .await
             .expect("Detect failed");
 
+        claim_alpaca_call(&store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
@@ -5688,6 +5708,7 @@ mod tests {
             .await
             .expect("Detect failed");
 
+        claim_alpaca_call(store, &metadata.issuer_request_id).await;
         store
             .send(
                 &metadata.issuer_request_id,
