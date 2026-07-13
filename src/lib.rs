@@ -431,6 +431,13 @@ pub async fn initialize_rocket_with_notifications(
     spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
     spawn_burn_recovery_reconciler(managers.burn.clone());
 
+    // After recovery so a drain pass cannot race the startup sweep over the
+    // same aggregates. Resumes redemptions held during a dividend freeze once
+    // their asset unfreezes.
+    redemption::redeem_call_manager::spawn_held_redemption_reconciler(
+        managers.redeem_call.clone(),
+    );
+
     // Flipped by the rocket shutdown fairing so the spawned chain-scanning
     // loops stop with the server instead of outliving it. In production the
     // whole process exits and takes them along; this matters when a server is
