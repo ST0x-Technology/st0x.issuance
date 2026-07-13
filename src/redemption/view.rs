@@ -764,6 +764,34 @@ pub(crate) async fn find_detected(
         .collect()
 }
 
+/// Finds all redemptions in the `Held` state.
+///
+/// These are redemptions parked before the Alpaca redeem call because their
+/// asset was frozen at detection handling time. The resume driver drains them
+/// once the asset unfreezes.
+pub(crate) async fn find_held(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<(IssuerRedemptionRequestId, RedemptionView)>, RedemptionViewError>
+{
+    let rows = sqlx::query!(
+        r#"
+        SELECT view_id as "view_id!: String", payload as "payload!: String"
+        FROM redemption_view
+        WHERE json_extract(payload, '$.Held') IS NOT NULL
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let view: RedemptionView = serde_json::from_str(&row.payload)?;
+            let id: IssuerRedemptionRequestId = row.view_id.parse()?;
+            Ok((id, view))
+        })
+        .collect()
+}
+
 /// Finds all redemptions in the `AlpacaCalled` state.
 ///
 /// These are redemptions where Alpaca's redeem API was called but the
