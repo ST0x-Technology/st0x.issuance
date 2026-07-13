@@ -650,14 +650,15 @@ on-chain transfer through calling Alpaca to burning tokens.
   happens strictly **before** the Alpaca call: past that boundary Alpaca has
   decremented its side, and holding the burn would leave on-chain supply above
   the Alpaca count — the exact divergence the freeze prevents. A held redemption
-  is deferred, never dropped (its tokens are already committed on-chain); resume
-  reuses `RecordAlpacaCall`, giving the audit trail
-  `Detected -> RedemptionHeld -> AlpacaCalled` with no separate resume event.
-- `RecordAlpacaCall` - Alpaca redeem API called successfully. Valid from
-  `Detected` or `Held` (a held redemption resumes through this command once the
-  asset unfreezes)
-- `RecordAlpacaFailure` - Alpaca redeem API call failed (valid from `Detected`
-  or `Held`)
+  is deferred, never dropped (its tokens are already committed on-chain).
+- `ClaimAlpacaCall` - Persist the right to make the external Alpaca call. Valid
+  from `Detected` or `Held`; emits `AlpacaCallClaimed` while holding the same
+  admission guard used by every operator and corporate-action freeze
+  acquisition.
+- `RecordAlpacaCall` - Alpaca redeem API called successfully. Valid only from
+  `AlpacaCallClaimed`.
+- `RecordAlpacaFailure` - Alpaca redeem API call failed (valid only from
+  `AlpacaCallClaimed`).
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
@@ -772,6 +773,24 @@ on-chain transfer through calling Alpaca to burning tokens.
   force-completed; ops use `CloseRedemption` after off-chain reconciliation
   instead.
 
+**Pre-call threat and recovery boundary.** The protected asset is the equality
+between on-chain supply and Alpaca's share count during a freeze. The credible
+abuse cases are temporal tampering (a freeze racing the last status read),
+repudiation after a crash (no durable proof that the Alpaca call was admitted),
+and duplicate execution by concurrent recovery workers. Every production freeze
+acquisition and `ClaimAlpacaCall` uses one issuer-process admission guard. A
+freeze that commits first forces `RedemptionHeld`; a claim that commits first is
+durable and recovery resumes the external call without re-entering the freeze
+gate. A worker that observes another committed claim does not call Alpaca. This
+adds no identity, authorization, disclosure, or privilege surface.
+
+The on-call question is "did the freeze or redemption claim win, and did the
+winner make progress?" The signals are the structured hold/claim/call lifecycle
+logs plus the persisted events. The indexer question is "can the pre-call order
+be reconstructed after restart?" It consumes `RedemptionHeld`,
+`AlpacaCallClaimed`, `AlpacaCalled`, and the Underlying freeze-hold events; no
+raw redemption amounts are emitted in the admission log.
+
 **Events:**
 
 - `RedemptionDetected` - Transfer to redemption wallet detected. Gains one
@@ -785,6 +804,8 @@ on-chain transfer through calling Alpaca to burning tokens.
   redeem call. Carries only `held_at`; detection metadata stays in the aggregate
   from `RedemptionDetected`. The resume driver drains held redemptions in
   detection order once the asset unfreezes.
+- `AlpacaCallClaimed` - Durable pre-call admission. Carries `claimed_at`; the
+  aggregate retains detection metadata and recovery resumes this state directly.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
@@ -899,7 +920,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 | ---------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Detect`                                 | `RedemptionDetected`               | Transfer detected; captures `burn_mode` for later mode derivation                                                                                                                                                                                  |
 | `Hold`                                   | `RedemptionHeld`                   | Asset frozen; park pre-Alpaca (idempotent)                                                                                                                                                                                                         |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called (from Detected or Held)                                                                                                                                                                                                          |
+| `ClaimAlpacaCall`                        | `AlpacaCallClaimed`                | Durable pre-call admission, serialized with every freeze acquisition                                                                                                                                                                               |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called after durable admission                                                                                                                                                                                                          |
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                                                                                                                                                                                                                   |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                                                                                                                                                                                                                   |
 | `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting                                                                                                                                                                                                        |
@@ -1097,6 +1119,14 @@ pre-multichain store keyed by bare `UnderlyingSymbol`.
 - `underlying`, `token`: Symbol identifiers
 - `network`: Blockchain network
 - `vault`: On-chain vault contract address
+- `status`: `AssetStatus` — `Enabled` (mints accepted) or `Frozen` (mints
+  rejected; the asset stays supported, newly detected redemptions are held
+  before the Alpaca call, and redemptions already past it still complete). This
+  value is not aggregate-owned freeze state: the `Underlying` aggregate's freeze
+  holds are the single cross-network authority, and every freeze gate (mint
+  admission, the pre-Alpaca redemption hold) reads the `Underlying` view, never
+  a per-listing copy. `status` exists on the wire contract as the projection of
+  that underlying state onto each listing.
 - `added_at`: Timestamp
 
 **Commands:**
@@ -1175,17 +1205,25 @@ Frozen  -> Frozen: additional hold acquired or one of several holds released
 Frozen  -> Enabled: final hold released
 ```
 
-**Freeze invariant — frozen is not de-listed.** Freezing only gates _new_ mints:
-`POST /inkind/issuance` rejects a frozen asset with a distinct `AssetFrozen`
-error (separate from `AssetNotAvailable`), so the rejection is observable and
-not conflated with de-listing. A frozen asset stays in `list_enabled_assets()`,
-so in-flight redemption detection (`src/redemption/`) keeps working — issuance
-reacts to on-chain transfers and has no "reject redemption" point. Preventing
-_new_ redemptions of a frozen asset is the liquidity rebalance guard's job,
-which reads the per-asset status endpoint (see "Tokenized Assets Data
-Endpoint"). This issuance-side freeze plus the liquidity guard form the single
-dividend freeze/unfreeze mechanism; no on-chain wrapper-contract freeze is
-involved here (that is separate, heavier supply-control work and out of scope).
+**Freeze invariant — frozen is not de-listed.** Freezing gates _new_ mints and
+holds _new_ redemptions at the supply boundary: `POST /inkind/issuance` rejects
+a frozen asset with a distinct `AssetFrozen` error (separate from
+`AssetNotAvailable`), so the rejection is observable and not conflated with
+de-listing. A frozen asset stays in `list_enabled_assets()`, so in-flight
+redemption detection (`src/redemption/`) keeps working — issuance reacts to
+on-chain transfers and has no "reject redemption" point. A redemption detected
+during a freeze window is **held, never dropped**: the `RedeemCallManager` reads
+the asset's freeze status in-process before the Alpaca redeem call and
+dispatches `Hold` instead of calling Alpaca, so on-chain supply stays equal to
+Alpaca's snapshot; held redemptions resume in order on unfreeze. A redemption
+already past the Alpaca call completes — holding the burn after Alpaca has
+decremented would leave on-chain supply above the Alpaca count, the exact
+divergence the freeze prevents. Issuance is the supply authority and this hold
+is the authoritative lock; the liquidity bot's guards (the rebalance trigger's
+RAI-1038 gate and its redemption send-guard) are the agent declining to send —
+defense-in-depth that keeps the bot's own funds out of the wallet mid-freeze,
+not the lock itself. No on-chain wrapper-contract freeze is involved here (that
+is separate, heavier supply-control work and out of scope).
 
 The issuer-host CLI acquires and releases the operator hold. The dividend
 scheduler independently acquires and releases a hold identified by the complete
@@ -2383,6 +2421,7 @@ sequenceDiagram
     Blockchain->>Us: Transfer event detected
     Note right of Us: Detect command<br/>Event: RedemptionDetected
 
+    Note right of Us: ClaimAlpacaCall command<br/>Event: AlpacaCallClaimed
     Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled
@@ -3705,6 +3744,7 @@ sequenceDiagram
     Blockchain->>Us: Transfer event detected
     Note right of Us: Detect command<br/>Event: RedemptionDetected<br/>Status: detected
 
+    Note right of Us: ClaimAlpacaCall command<br/>Event: AlpacaCallClaimed<br/>Status: detected
     Us->>Alpaca: POST /tokenization/callback/redeem<br/>{issuer_request_id, qty, tx_hash}
     Alpaca->>Us: {tokenization_request_id, status: "pending"}
     Note right of Us: RecordAlpacaCall command<br/>Event: AlpacaCalled<br/>Status: alpaca_called
@@ -4019,11 +4059,13 @@ struct BurnResult {
 ```mermaid
 stateDiagram-v2
     [*] --> Detected: Detect
-    Detected --> AlpacaCalled: RecordAlpacaCall
+    Detected --> AlpacaCallClaimed: ClaimAlpacaCall
     Detected --> Held: Hold (asset frozen)
-    Detected --> Failed: RecordAlpacaFailure / MarkFailed
-    Held --> AlpacaCalled: RecordAlpacaCall (asset unfrozen)
-    Held --> Failed: RecordAlpacaFailure / MarkFailed
+    Detected --> Failed: MarkFailed
+    Held --> AlpacaCallClaimed: ClaimAlpacaCall (asset unfrozen)
+    Held --> Failed: MarkFailed
+    AlpacaCallClaimed --> AlpacaCalled: RecordAlpacaCall
+    AlpacaCallClaimed --> Failed: RecordAlpacaFailure
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn
@@ -4066,6 +4108,7 @@ struct StoredRedemption {
     status: RedemptionStatus,
     detected_at: DateTime<Utc>,
     held_at: Option<DateTime<Utc>>,
+    alpaca_call_claimed_at: Option<DateTime<Utc>>,
     alpaca_called_at: Option<DateTime<Utc>>,
     alpaca_completed_at: Option<DateTime<Utc>>,
     burned_at: Option<DateTime<Utc>>,
@@ -4074,6 +4117,7 @@ struct StoredRedemption {
 enum RedemptionStatus {
     Detected,
     Held,
+    AlpacaCallClaimed,
     AlpacaCalled,
     Burning,
     Completed,
