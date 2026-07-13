@@ -134,17 +134,12 @@ pub async fn wait_for_mock_hit(
     wait_for_mock_hits(mock, 1).await
 }
 
-/// Polls the event store until the mint's terminal `MintCompleted` event is
-/// COMMITTED. A callback-mock hit alone is not terminality: the mock counts
-/// the request on arrival, while the service still has to process the
-/// response and persist `RecordCallbackSent -> MintCompleted` — a window a
-/// fast test can win locally and lose on a loaded CI runner. Anything that
-/// gates on the mint being terminal (service shutdown before a custody
-/// migration's quiescence check, restarts asserting no recovery work) must
-/// wait on this, not on the mock.
-pub async fn wait_for_mint_completed(
+/// Polls until the named aggregate event is committed.
+pub async fn wait_for_event(
     db_url: &str,
-    issuer_request_id: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -159,12 +154,14 @@ pub async fn wait_for_mint_completed(
             "
             SELECT COUNT(*)
             FROM events
-            WHERE aggregate_type = 'Mint'
+            WHERE aggregate_type = ?
               AND aggregate_id = ?
-              AND event_type = 'MintEvent::MintCompleted'
+              AND event_type = ?
             ",
         )
-        .bind(issuer_request_id)
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(event_type)
         .fetch_one(&pool)
         .await?;
 
@@ -176,8 +173,8 @@ pub async fn wait_for_mint_completed(
         if start.elapsed() >= timeout {
             pool.close().await;
             return Err(format!(
-                "Timeout waiting for MintCompleted on {issuer_request_id} \
-                 after {}s",
+                "Timeout waiting for {event_type} on \
+                 {aggregate_type}/{aggregate_id} after {}s",
                 timeout.as_secs()
             )
             .into());
@@ -185,6 +182,27 @@ pub async fn wait_for_mint_completed(
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Polls the event store until the mint's terminal `MintCompleted` event is
+/// COMMITTED. A callback-mock hit alone is not terminality: the mock counts
+/// the request on arrival, while the service still has to process the
+/// response and persist `RecordCallbackSent -> MintCompleted` — a window a
+/// fast test can win locally and lose on a loaded CI runner. Anything that
+/// gates on the mint being terminal (service shutdown before a custody
+/// migration's quiescence check, restarts asserting no recovery work) must
+/// wait on this, not on the mock.
+pub async fn wait_for_mint_completed(
+    db_url: &str,
+    issuer_request_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_event(
+        db_url,
+        "Mint",
+        issuer_request_id,
+        "MintEvent::MintCompleted",
+    )
+    .await
 }
 
 pub async fn wait_for_mock_hits(
