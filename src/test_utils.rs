@@ -814,7 +814,9 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
         "receipt"
     } else if module.contains("::account") {
         "account"
-    } else if module.contains("::tokenized_asset") {
+    } else if module.contains("::tokenized_asset")
+        || module.contains("::underlying")
+    {
         "asset"
     } else if module.contains("::alpaca") {
         "alpaca"

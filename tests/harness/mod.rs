@@ -366,10 +366,11 @@ pub async fn preseed_tokenized_asset_into_pool_with_network(
     Ok(())
 }
 
-/// Seeds an asset that is currently frozen by appending a `Frozen` event
-/// (sequence 2) after the `Added` event. Per the AGENTS.md setup-phase
-/// exception, only the event store is seeded; the view is rebuilt from these
-/// events by `initialize_rocket` at startup.
+/// Seeds an asset that is currently frozen: an `Added` listing event plus a
+/// `Frozen` event on the underlying-keyed `Underlying` aggregate (corporate
+/// action freezes are underlying-scoped). Per the AGENTS.md setup-phase
+/// exception, only the event store is seeded; the views are rebuilt from
+/// these events by `initialize_rocket` at startup.
 pub async fn preseed_frozen_tokenized_asset(
     db_url: &str,
     vault: Address,
@@ -400,14 +401,14 @@ pub async fn preseed_frozen_tokenized_asset(
             metadata
         )
         VALUES (
-            'TokenizedAsset',
+            'Underlying',
             ?,
-            2,
-            'TokenizedAssetEvent::Frozen', '1.0', ?, '{}'
+            1,
+            'UnderlyingEvent::Frozen', '1.0', ?, '{}'
         )
         ",
     )
-    .bind(format!("{underlying}:base"))
+    .bind(underlying)
     .bind(&frozen_payload)
     .execute(&pool)
     .await?;

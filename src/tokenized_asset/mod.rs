@@ -26,37 +26,6 @@ pub(crate) use st0x_issuance_dto::AssetKey;
 pub(crate) use st0x_issuance_dto::{Network, TokenSymbol};
 pub use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
-/// Whether an asset accepts new mints.
-///
-/// `Frozen` gates *only* new minting — a frozen asset stays supported and in the
-/// `list_enabled_assets()` set so in-flight redemptions still detect and
-/// complete. This is orthogonal to listing; see the freeze invariant in
-/// SPEC.md. Serializes to the bare strings `"Enabled"` / `"Frozen"`, which the
-/// view queries match against `$.Live.status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum AssetStatus {
-    Enabled,
-    Frozen,
-}
-
-impl AssetStatus {
-    /// Whether new mints are currently rejected for this asset.
-    pub(crate) const fn is_frozen(self) -> bool {
-        matches!(self, Self::Frozen)
-    }
-}
-
-/// Maps the domain freeze state onto its wire representation. The two enums are
-/// kept distinct (domain vs API contract) but always move in lock-step.
-impl From<AssetStatus> for TokenizedAssetStatus {
-    fn from(status: AssetStatus) -> Self {
-        match status {
-            AssetStatus::Enabled => Self::Enabled,
-            AssetStatus::Frozen => Self::Frozen,
-        }
-    }
-}
-
 /// Two enabled assets on different networks share one vault address.
 ///
 /// Receipt inventory is keyed by `(chain_id, vault)`, so the streams no longer
@@ -95,13 +64,16 @@ pub(crate) fn validate_no_cross_network_vault_collisions(
     })
 }
 
+/// One per-network listing of an underlying: token symbol, vault address,
+/// network. Corporate-action freeze status is a property of the underlying
+/// equity, not of a listing, and lives on the underlying-keyed `Underlying`
+/// aggregate (`crate::underlying`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TokenizedAsset {
     underlying: UnderlyingSymbol,
     token: TokenSymbol,
     network: Network,
     vault: Address,
-    status: AssetStatus,
     added_at: DateTime<Utc>,
 }
 
@@ -116,7 +88,7 @@ impl EventSourced for TokenizedAsset {
 
     const AGGREGATE_TYPE: &'static str = "TokenizedAsset";
     const PROJECTION: Table = Table("tokenized_asset_view");
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -138,14 +110,11 @@ impl EventSourced for TokenizedAsset {
                 token: token.clone(),
                 network: *network,
                 vault: *vault,
-                status: AssetStatus::Enabled,
                 added_at: *added_at,
             }),
-            // Vault updates and freeze/unfreeze are only reachable after an
-            // `Added` genesis — they never start a stream.
-            TokenizedAssetEvent::VaultAddressUpdated { .. }
-            | TokenizedAssetEvent::Frozen { .. }
-            | TokenizedAssetEvent::Unfrozen { .. } => None,
+            // Vault updates are only reachable after an `Added` genesis —
+            // they never start a stream.
+            TokenizedAssetEvent::VaultAddressUpdated { .. } => None,
         }
     }
 
@@ -158,19 +127,8 @@ impl EventSourced for TokenizedAsset {
                 Ok(Some(Self { vault: *vault, ..entity.clone() }))
             }
 
-            TokenizedAssetEvent::Frozen { .. } => {
-                Ok(Some(Self { status: AssetStatus::Frozen, ..entity.clone() }))
-            }
-
-            TokenizedAssetEvent::Unfrozen { .. } => Ok(Some(Self {
-                status: AssetStatus::Enabled,
-                ..entity.clone()
-            })),
-
-            // A second `Added` re-adds the asset, overwriting identity and vault
-            // in place but preserving the current freeze `status` — re-adding
-            // must not silently clear a freeze, since there would be no
-            // `Unfrozen` event to explain the transition. event-sorcery turns an
+            // A second `Added` re-adds the asset, overwriting the full listing
+            // state from the authoritative event. event-sorcery turns an
             // unhandled event (`Ok(None)`) into a permanent `Failed` lifecycle,
             // which startup `catch_up` would hit for any stream carrying a
             // duplicate `Added` (only reachable via direct event-store seeding),
@@ -187,11 +145,6 @@ impl EventSourced for TokenizedAsset {
                 network: *network,
                 vault: *vault,
                 added_at: *added_at,
-                // Preserve only the freeze `status`; everything else comes from
-                // the authoritative `Added` event. Naming the single carried-over
-                // field keeps the no-silent-unfreeze invariant local, and stops a
-                // future field from being silently carried from stale state.
-                status: entity.status,
             })),
         }
     }
@@ -219,16 +172,6 @@ impl EventSourced for TokenizedAsset {
                     vault,
                     added_at: Utc::now(),
                 }])
-            }
-
-            // Freezing or unfreezing an asset that was never added is a no-op:
-            // there is nothing to gate. Callers (the issuer CLI) check existence
-            // first and report "not found" rather than silently dispatching.
-            TokenizedAssetCommand::Freeze | TokenizedAssetCommand::Unfreeze => {
-                tracing::warn!(target: "asset",
-                    "Ignoring freeze/unfreeze for an asset that does not exist"
-                );
-                Ok(vec![])
             }
         }
     }
@@ -258,56 +201,22 @@ impl EventSourced for TokenizedAsset {
                     updated_at: Utc::now(),
                 }])
             }
-
-            TokenizedAssetCommand::Freeze => {
-                if self.status == AssetStatus::Frozen {
-                    tracing::debug!(target: "asset",
-                        underlying = %self.underlying,
-                        "Asset already frozen, skipping"
-                    );
-                    return Ok(vec![]);
-                }
-
-                tracing::info!(target: "asset",
-                    underlying = %self.underlying,
-                    "Freezing tokenized asset"
-                );
-                Ok(vec![TokenizedAssetEvent::Frozen { frozen_at: Utc::now() }])
-            }
-
-            TokenizedAssetCommand::Unfreeze => {
-                if self.status == AssetStatus::Enabled {
-                    tracing::debug!(target: "asset",
-                        underlying = %self.underlying,
-                        "Asset already enabled, skipping"
-                    );
-                    return Ok(vec![]);
-                }
-
-                tracing::info!(target: "asset",
-                    underlying = %self.underlying,
-                    "Unfreezing tokenized asset"
-                );
-                Ok(vec![TokenizedAssetEvent::Unfrozen {
-                    unfrozen_at: Utc::now(),
-                }])
-            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::address;
     use chrono::Utc;
     use event_sorcery::{StoreBuilder, TestHarness, replay};
     use sqlx::sqlite::SqlitePoolOptions;
     use tracing_test::traced_test;
 
     use super::{
-        AssetStatus, Network, TokenSymbol, TokenizedAsset,
-        TokenizedAssetCommand, TokenizedAssetEvent, TokenizedAssetView,
-        UnderlyingSymbol, validate_no_cross_network_vault_collisions,
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        TokenizedAssetEvent, TokenizedAssetView, UnderlyingSymbol,
+        validate_no_cross_network_vault_collisions,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -322,7 +231,6 @@ mod tests {
             token: TokenSymbol::new(format!("t{underlying}")),
             network,
             vault,
-            status: AssetStatus::Enabled,
             added_at: Utc::now(),
         }
     }
@@ -460,181 +368,21 @@ mod tests {
 
         assert_eq!(events.len(), 1, "Expected exactly one event");
 
-        match &events[0] {
-            TokenizedAssetEvent::VaultAddressUpdated {
-                vault,
-                previous_vault,
-                ..
-            } => {
-                assert_eq!(*vault, vault_b);
-                assert_eq!(*previous_vault, vault_a);
-            }
-            other => {
-                panic!("Expected VaultAddressUpdated, got: {other:?}")
-            }
-        }
+        let TokenizedAssetEvent::VaultAddressUpdated {
+            vault,
+            previous_vault,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected VaultAddressUpdated, got: {:?}", events[0])
+        };
+        assert_eq!(*vault, vault_b);
+        assert_eq!(*previous_vault, vault_a);
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Updating vault address for asset", "AAPL"]
         ));
-    }
-
-    fn added_event(vault: Address) -> TokenizedAssetEvent {
-        TokenizedAssetEvent::Added {
-            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
-            token: TokenSymbol::new("tAAPL"),
-            network: Network::Base,
-            vault,
-            added_at: chrono::Utc::now(),
-        }
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_freeze_enabled_asset_emits_frozen() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let events = TestHarness::<TokenizedAsset>::with(())
-            .given(vec![added_event(vault)])
-            .when(TokenizedAssetCommand::Freeze)
-            .await
-            .events();
-
-        assert_eq!(events.len(), 1, "Expected exactly one event");
-
-        let TokenizedAssetEvent::Frozen { frozen_at } = &events[0] else {
-            panic!("Expected Frozen event, got: {:?}", events[0])
-        };
-        assert!(frozen_at.timestamp() > 0);
-
-        assert!(logs_contain_at!(
-            tracing::Level::INFO,
-            &["Freezing tokenized asset", "AAPL"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_freeze_already_frozen_is_idempotent() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        TestHarness::<TokenizedAsset>::with(())
-            .given(vec![
-                added_event(vault),
-                TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
-            ])
-            .when(TokenizedAssetCommand::Freeze)
-            .await
-            .then_expect_events(&[]);
-
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["Asset already frozen, skipping", "AAPL"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_unfreeze_frozen_asset_emits_unfrozen() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let events = TestHarness::<TokenizedAsset>::with(())
-            .given(vec![
-                added_event(vault),
-                TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
-            ])
-            .when(TokenizedAssetCommand::Unfreeze)
-            .await
-            .events();
-
-        assert_eq!(events.len(), 1, "Expected exactly one event");
-
-        let TokenizedAssetEvent::Unfrozen { unfrozen_at } = &events[0] else {
-            panic!("Expected Unfrozen event, got: {:?}", events[0])
-        };
-        assert!(unfrozen_at.timestamp() > 0);
-
-        assert!(logs_contain_at!(
-            tracing::Level::INFO,
-            &["Unfreezing tokenized asset", "AAPL"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_unfreeze_enabled_asset_is_idempotent() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        TestHarness::<TokenizedAsset>::with(())
-            .given(vec![added_event(vault)])
-            .when(TokenizedAssetCommand::Unfreeze)
-            .await
-            .then_expect_events(&[]);
-
-        assert!(logs_contain_at!(
-            tracing::Level::DEBUG,
-            &["Asset already enabled, skipping", "AAPL"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_freeze_nonexistent_asset_is_noop() {
-        TestHarness::<TokenizedAsset>::with(())
-            .given_no_previous_events()
-            .when(TokenizedAssetCommand::Freeze)
-            .await
-            .then_expect_events(&[]);
-
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &["Ignoring freeze/unfreeze for an asset that does not exist"]
-        ));
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_unfreeze_nonexistent_asset_is_noop() {
-        TestHarness::<TokenizedAsset>::with(())
-            .given_no_previous_events()
-            .when(TokenizedAssetCommand::Unfreeze)
-            .await
-            .then_expect_events(&[]);
-
-        assert!(logs_contain_at!(
-            tracing::Level::WARN,
-            &["Ignoring freeze/unfreeze for an asset that does not exist"]
-        ));
-    }
-
-    #[test]
-    fn test_apply_frozen_sets_status_frozen() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let asset = replay::<TokenizedAsset>(vec![
-            added_event(vault),
-            TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
-        ])
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(asset.status, AssetStatus::Frozen);
-    }
-
-    #[test]
-    fn test_apply_unfrozen_sets_status_enabled() {
-        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let asset = replay::<TokenizedAsset>(vec![
-            added_event(vault),
-            TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
-            TokenizedAssetEvent::Unfrozen { unfrozen_at: chrono::Utc::now() },
-        ])
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(asset.status, AssetStatus::Enabled);
     }
 
     #[test]
@@ -661,7 +409,6 @@ mod tests {
             token: added_token,
             network: added_network,
             vault: added_vault,
-            status,
             added_at: added_at_timestamp,
         } = asset;
 
@@ -669,7 +416,6 @@ mod tests {
         assert_eq!(added_token, token);
         assert_eq!(added_network, network);
         assert_eq!(added_vault, vault);
-        assert_eq!(status, AssetStatus::Enabled);
         assert_eq!(added_at_timestamp, added_at);
     }
 
@@ -731,39 +477,6 @@ mod tests {
         assert_eq!(asset.token, TokenSymbol::new("tAAPL2"));
     }
 
-    // A re-`Added` on a frozen asset must overwrite identity/vault but keep the
-    // freeze `status` — there is no `Unfrozen` event to explain a transition back
-    // to `Enabled`, so silently clearing the freeze would resume minting with no
-    // audit trail.
-    #[test]
-    fn test_apply_duplicate_added_preserves_freeze_status() {
-        let vault_a = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let vault_b = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-
-        let asset = replay::<TokenizedAsset>(vec![
-            TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
-                token: TokenSymbol::new("tAAPL"),
-                network: Network::Base,
-                vault: vault_a,
-                added_at: chrono::Utc::now(),
-            },
-            TokenizedAssetEvent::Frozen { frozen_at: chrono::Utc::now() },
-            TokenizedAssetEvent::Added {
-                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
-                token: TokenSymbol::new("tAAPL2"),
-                network: Network::Base,
-                vault: vault_b,
-                added_at: chrono::Utc::now(),
-            },
-        ])
-        .expect("duplicate Added must not fail the lifecycle")
-        .expect("aggregate must stay live after a duplicate Added");
-
-        assert_eq!(asset.vault, vault_b);
-        assert_eq!(asset.status, AssetStatus::Frozen);
-    }
-
     #[test]
     fn test_underlying_symbol_display() {
         let symbol = UnderlyingSymbol::new("AAPL").unwrap();
@@ -785,7 +498,9 @@ mod tests {
     /// Executes the real migration file (via `include_str!`) so the test
     /// cannot drift from what production runs. Running the sequence twice
     /// proves both the rekey and its idempotency: legacy bare-ticker ids gain
-    /// `:base` exactly once, already-rekeyed ids are untouched, and the view
+    /// `:base` exactly once, already-rekeyed ids are untouched, shipped
+    /// `Frozen`/`Unfrozen` events move to the underlying-keyed `Underlying`
+    /// aggregate with contiguous resequencing on both streams, and the view
     /// is cleared for projection catch-up.
     #[tokio::test]
     async fn rekey_migration_rekeys_legacy_ids_and_is_idempotent() {
@@ -797,31 +512,45 @@ mod tests {
 
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        sqlx::query(
-            "
-            INSERT INTO events (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
+        // A legacy stream shaped like production history: Added, then a
+        // dividend freeze/unfreeze cycle, then a vault update. The freeze
+        // events must split off to `Underlying` (resequenced 1..N) while the
+        // listing events close ranks under the rekeyed AssetKey id.
+        for (sequence, event_type, payload) in [
+            (1, "TokenizedAssetEvent::Added", "{}"),
+            (
+                2,
+                "TokenizedAssetEvent::Frozen",
+                r#"{"Frozen":{"frozen_at":"2026-06-15T12:00:00Z"}}"#,
+            ),
+            (
+                3,
+                "TokenizedAssetEvent::Unfrozen",
+                r#"{"Unfrozen":{"unfrozen_at":"2026-06-16T12:00:00Z"}}"#,
+            ),
+            (4, "TokenizedAssetEvent::VaultAddressUpdated", "{}"),
+        ] {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('TokenizedAsset', 'AAPL', ?, ?, '1.0', ?, '{}')
+                ",
             )
-            VALUES (
-                'TokenizedAsset',
-                'AAPL',
-                1,
-                'TokenizedAssetEvent::Added',
-                '1.0',
-                '{}',
-                '{}'
-            )
-            ",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+            .bind(sequence)
+            .bind(event_type)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         sqlx::query(
             "
@@ -856,20 +585,65 @@ mod tests {
         for pass in 1..=2 {
             sqlx::raw_sql(REKEY_MIGRATION).execute(&pool).await.unwrap();
 
-            let event_ids: Vec<(String,)> = sqlx::query_as(
+            let listing_events: Vec<(String, i64, String)> = sqlx::query_as(
                 "
-                SELECT aggregate_id
+                SELECT aggregate_id, sequence, event_type
                 FROM events
                 WHERE aggregate_type = 'TokenizedAsset'
+                ORDER BY sequence
                 ",
             )
             .fetch_all(&pool)
             .await
             .unwrap();
             assert_eq!(
-                event_ids,
-                vec![("AAPL:base".to_string(),)],
-                "event aggregate_id wrong after pass {pass}"
+                listing_events,
+                vec![
+                    (
+                        "AAPL:base".to_string(),
+                        1,
+                        "TokenizedAssetEvent::Added".to_string()
+                    ),
+                    (
+                        "AAPL:base".to_string(),
+                        2,
+                        "TokenizedAssetEvent::VaultAddressUpdated".to_string()
+                    ),
+                ],
+                "listing events wrong after pass {pass}"
+            );
+
+            let freeze_events: Vec<(String, i64, String, String)> =
+                sqlx::query_as(
+                    "
+                    SELECT aggregate_id, sequence, event_type, payload
+                    FROM events
+                    WHERE aggregate_type = 'Underlying'
+                    ORDER BY sequence
+                    ",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                freeze_events,
+                vec![
+                    (
+                        "AAPL".to_string(),
+                        1,
+                        "UnderlyingEvent::Frozen".to_string(),
+                        r#"{"Frozen":{"frozen_at":"2026-06-15T12:00:00Z"}}"#
+                            .to_string(),
+                    ),
+                    (
+                        "AAPL".to_string(),
+                        2,
+                        "UnderlyingEvent::Unfrozen".to_string(),
+                        r#"{"Unfrozen":{"unfrozen_at":"2026-06-16T12:00:00Z"}}"#
+                            .to_string(),
+                    ),
+                ],
+                "freeze events wrong after pass {pass}"
             );
 
             let snapshot_ids: Vec<(String,)> = sqlx::query_as(
@@ -882,10 +656,9 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            assert_eq!(
-                snapshot_ids,
-                vec![("AAPL:base".to_string(),)],
-                "snapshot aggregate_id wrong after pass {pass}"
+            assert!(
+                snapshot_ids.is_empty(),
+                "stale TokenizedAsset snapshots must be dropped after pass {pass}"
             );
 
             let view_rows: Vec<(String,)> =

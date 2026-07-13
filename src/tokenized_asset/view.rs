@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 
-use super::{AssetKey, AssetStatus, Network, TokenSymbol, UnderlyingSymbol};
+use super::{AssetKey, Network, TokenSymbol, UnderlyingSymbol};
 
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error,
@@ -62,17 +62,16 @@ pub(crate) struct TokenizedAssetView {
     pub(crate) token: TokenSymbol,
     pub(crate) network: Network,
     pub(crate) vault: Address,
-    pub(crate) status: AssetStatus,
     pub(crate) added_at: DateTime<Utc>,
 }
 
-/// Lists all supported assets, including frozen ones.
+/// Lists all supported assets, including listings of frozen underlyings.
 ///
-/// Freezing gates new minting only — a frozen asset stays in this set so
-/// in-flight redemption detection (`src/redemption/`) and receipt backfilling
-/// keep working. The filter matches `$.Live.status` against the supported
-/// states rather than excluding `Frozen`, preserving the freeze invariant (see
-/// SPEC.md).
+/// Freezing gates new minting only and lives on the underlying-keyed
+/// `Underlying` aggregate — a listing of a frozen underlying stays in this set
+/// so in-flight redemption detection (`src/redemption/`) and receipt
+/// backfilling keep working (the freeze invariant, see SPEC.md). The filter
+/// selects live projection rows.
 pub(crate) async fn list_enabled_assets(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<TokenizedAssetView>, TokenizedAssetViewError> {
@@ -80,7 +79,7 @@ pub(crate) async fn list_enabled_assets(
         r#"
         SELECT json_extract(payload, '$.Live') as "live: String"
         FROM tokenized_asset_view
-        WHERE json_extract(payload, '$.Live.status') IN ('Enabled', 'Frozen')
+        WHERE json_extract(payload, '$.Live') IS NOT NULL
         "#
     )
     .fetch_all(pool)
@@ -136,6 +135,39 @@ pub(crate) async fn load_asset_by_network(
     load_asset(pool, &AssetKey::new(underlying.clone(), *network)).await
 }
 
+/// Whether the underlying has at least one listing row on any network.
+///
+/// The freeze-status endpoint gates on this so an underlying that was never
+/// listed anywhere reports 404 (unknown asset) rather than a default
+/// `Enabled` — preserving the liquidity guard's fail-closed handling.
+///
+/// Matches on the `view_id` prefix (`{underlying}:`) rather than the `$.Live`
+/// payload so a non-live (corrupt) projection row still counts as "known":
+/// the freeze answer comes from the separate `underlying_view` and stays
+/// valid regardless of the listing row's payload state. Exact-prefix
+/// comparison via `substr` avoids GLOB/LIKE pattern semantics on the symbol.
+pub(crate) async fn underlying_has_listing(
+    pool: &Pool<Sqlite>,
+    underlying: &UnderlyingSymbol,
+) -> Result<bool, TokenizedAssetViewError> {
+    let prefix = format!("{}:", underlying.as_str());
+
+    let row = sqlx::query!(
+        r#"
+        SELECT view_id
+        FROM tokenized_asset_view
+        WHERE substr(view_id, 1, length(?)) = ?
+        LIMIT 1
+        "#,
+        prefix,
+        prefix
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
 /// Finds the vault address for a given underlying symbol on a specific network.
 ///
 /// Delegates to [`load_asset_by_network`] and so inherits its contract:
@@ -165,8 +197,10 @@ mod tests {
     use super::*;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        AssetKey, AssetStatus, TokenizedAsset, TokenizedAssetCommand,
-        TokenizedAssetEvent,
+        AssetKey, TokenizedAsset, TokenizedAssetCommand, TokenizedAssetEvent,
+    };
+    use crate::underlying::{
+        AssetStatus, Underlying, UnderlyingCommand, load_freeze_status,
     };
 
     struct TestHarness {
@@ -399,9 +433,9 @@ mod tests {
 
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-        // A genesis `Added` at a non-1 sequence followed by a `Frozen` after a
-        // large gap reproduces the sparse, shared-counter sequencing that aborted
-        // catch-up in production.
+        // A genesis `Added` at a non-1 sequence followed by a
+        // `VaultAddressUpdated` after a large gap reproduces the sparse,
+        // shared-counter sequencing that aborted catch-up in production.
         let added = serde_json::to_string(&TokenizedAssetEvent::Added {
             underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
@@ -410,14 +444,23 @@ mod tests {
             added_at: chrono::Utc::now(),
         })
         .unwrap();
-        let frozen = serde_json::to_string(&TokenizedAssetEvent::Frozen {
-            frozen_at: chrono::Utc::now(),
-        })
-        .unwrap();
+        let updated_vault =
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let vault_updated =
+            serde_json::to_string(&TokenizedAssetEvent::VaultAddressUpdated {
+                vault: updated_vault,
+                previous_vault: vault,
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
 
         for (sequence, event_type, payload) in [
             (24_i64, "TokenizedAssetEvent::Added", added.as_str()),
-            (4559_i64, "TokenizedAssetEvent::Frozen", frozen.as_str()),
+            (
+                4559_i64,
+                "TokenizedAssetEvent::VaultAddressUpdated",
+                vault_updated.as_str(),
+            ),
         ] {
             sqlx::query(
                 "
@@ -448,8 +491,9 @@ mod tests {
             .await
             .expect("startup must tolerate non-contiguous event sequences");
 
-        // `Frozen` applied on top of `Added` proves in-order replay across the
-        // gap -- an out-of-order or dropped event could not yield `Frozen`.
+        // `VaultAddressUpdated` applied on top of `Added` proves in-order
+        // replay across the gap -- an out-of-order or dropped event could not
+        // yield the updated vault.
         let asset = load_asset_by_network(
             &pool,
             &UnderlyingSymbol::new("AAPL").unwrap(),
@@ -458,8 +502,7 @@ mod tests {
         .await
         .unwrap()
         .expect("asset rebuilt despite the sequence gap");
-        assert_eq!(asset.status, AssetStatus::Frozen);
-        assert_eq!(asset.vault, vault);
+        assert_eq!(asset.vault, updated_vault);
 
         // The view advances to the max event sequence, not the event count.
         let (version,): (i64,) = sqlx::query_as(
@@ -600,40 +643,40 @@ mod tests {
         );
     }
 
-    // Freezing must project `status: Frozen` into the view AND keep the asset in
-    // `list_enabled_assets` — the freeze invariant that lets in-flight
-    // redemptions of a frozen asset keep detecting (see SPEC.md).
+    // Freezing the underlying must not touch the listing view: the asset stays
+    // in `list_enabled_assets` and keeps resolving its vault — the freeze
+    // invariant that lets in-flight redemptions of a frozen asset keep
+    // detecting (see SPEC.md).
     #[tokio::test]
-    async fn test_freeze_projects_status_and_keeps_asset_listed() {
+    async fn test_frozen_underlying_keeps_asset_listed() {
         let harness = TestHarness::new().await;
-        let TestHarness { pool, store } = &harness;
+        let TestHarness { pool, .. } = &harness;
 
         let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         harness.add_asset("AAPL", vault).await;
 
-        let key = AssetKey::new(underlying.clone(), Network::Base);
-        let before = load_asset(pool, &key)
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .expect("Failed to build underlying store");
+        underlying_store
+            .send(
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
+            )
             .await
-            .unwrap()
-            .expect("asset exists before freeze");
-        assert_eq!(before.status, AssetStatus::Enabled);
+            .expect("Failed to freeze underlying");
 
-        store
-            .send(&key, TokenizedAssetCommand::Freeze)
-            .await
-            .expect("Failed to freeze asset");
-
-        let after = load_asset(pool, &key)
-            .await
-            .unwrap()
-            .expect("asset exists after freeze");
-        assert_eq!(after.status, AssetStatus::Frozen);
+        assert_eq!(
+            load_freeze_status(pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen
+        );
 
         let listed =
             list_enabled_assets(pool).await.expect("Query should succeed");
         assert_eq!(listed.len(), 1, "frozen asset must stay listed");
-        assert_eq!(listed[0].status, AssetStatus::Frozen);
 
         // A frozen asset must still resolve its vault so in-flight redemptions
         // and mints can complete.

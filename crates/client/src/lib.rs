@@ -19,9 +19,7 @@
 
 use reqwest::StatusCode;
 use reqwest::redirect::Policy;
-use st0x_issuance_dto::{
-    Network, TokenizedAssetStatusResponse, UnderlyingSymbol,
-};
+use st0x_issuance_dto::{TokenizedAssetStatusResponse, UnderlyingSymbol};
 use std::time::Duration;
 use url::Url;
 
@@ -82,6 +80,10 @@ impl IssuanceClient {
     /// `GET /tokenized-assets/<underlying>/status`, returning `Ok(None)` when
     /// the asset is unknown (404).
     ///
+    /// Freeze status is a property of the underlying equity (one
+    /// corporate-action freeze covers every network's listing), so the route
+    /// takes no network parameter.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] on URL/transport failures or an unexpected
@@ -89,7 +91,6 @@ impl IssuanceClient {
     pub async fn tokenized_asset_status(
         &self,
         underlying: &UnderlyingSymbol,
-        network: &Network,
     ) -> Result<Option<TokenizedAssetStatusResponse>, ClientError> {
         // Build the URL by appending percent-encoded path segments to the base
         // rather than `Url::join`ing a relative string: join drops a base path
@@ -110,8 +111,6 @@ impl IssuanceClient {
                 underlying_segment.as_str(),
                 "status",
             ]);
-
-        url.query_pairs_mut().append_pair("network", network.as_str());
 
         let response = self
             .http
@@ -155,7 +154,6 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/tokenized-assets/SGOV/status")
-                .query_param("network", "base")
                 .header(API_KEY_HEADER, "test-key");
             then.status(200).json_body(json!({
                 "underlying": "SGOV",
@@ -164,10 +162,7 @@ mod tests {
         });
 
         let status = client_for(&server)
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("SGOV").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
             .await
             .expect("request succeeds")
             .expect("asset exists");
@@ -183,16 +178,12 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/tokenized-assets/UNKNOWN/status")
-                .query_param("network", "base")
                 .header(API_KEY_HEADER, "test-key");
             then.status(404);
         });
 
         let status = client_for(&server)
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("UNKNOWN").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("UNKNOWN").unwrap())
             .await
             .expect("request succeeds");
 
@@ -204,17 +195,12 @@ mod tests {
     async fn tokenized_asset_status_errors_on_unexpected_status() {
         let server = MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/tokenized-assets/SGOV/status")
-                .query_param("network", "base");
+            when.method(GET).path("/tokenized-assets/SGOV/status");
             then.status(500);
         });
 
         let err = client_for(&server)
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("SGOV").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
             .await
             .expect_err("a 500 must surface as an error, not None");
 
@@ -229,17 +215,12 @@ mod tests {
     async fn tokenized_asset_status_errors_on_malformed_body() {
         let server = MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/tokenized-assets/SGOV/status")
-                .query_param("network", "base");
+            when.method(GET).path("/tokenized-assets/SGOV/status");
             then.status(200).body("not json");
         });
 
         let err = client_for(&server)
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("SGOV").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
             .await
             .expect_err("a malformed 200 body must surface as a parse error");
 
@@ -254,9 +235,7 @@ mod tests {
     async fn tokenized_asset_status_preserves_base_path_prefix() {
         let server = MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/api/tokenized-assets/SGOV/status")
-                .query_param("network", "base");
+            when.method(GET).path("/api/tokenized-assets/SGOV/status");
             then.status(200).json_body(json!({
                 "underlying": "SGOV",
                 "status": "enabled"
@@ -271,10 +250,7 @@ mod tests {
             IssuanceClient::new(base, "test-key").expect("client builds");
 
         let status = client
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("SGOV").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
             .await
             .expect("request succeeds")
             .expect("asset exists");
@@ -294,10 +270,7 @@ mod tests {
         .expect("client builds");
 
         let err = client
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("SGOV").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
             .await
             .expect_err("a cannot-be-a-base URL must error");
 
@@ -317,9 +290,7 @@ mod tests {
     async fn tokenized_asset_status_percent_encodes_path_unsafe_symbols() {
         let server = MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/tokenized-assets/FUND%2FA/status")
-                .query_param("network", "base");
+            when.method(GET).path("/tokenized-assets/FUND%2FA/status");
             then.status(200).json_body(json!({
                 "underlying": "FUND/A",
                 "status": "enabled"
@@ -327,10 +298,7 @@ mod tests {
         });
 
         let status = client_for(&server)
-            .tokenized_asset_status(
-                &UnderlyingSymbol::new("FUND/A").unwrap(),
-                &Network::Base,
-            )
+            .tokenized_asset_status(&UnderlyingSymbol::new("FUND/A").unwrap())
             .await
             .expect("request succeeds")
             .expect("asset exists");
@@ -349,17 +317,12 @@ mod tests {
         for code in [401u16, 403, 429] {
             let server = MockServer::start_async().await;
             let mock = server.mock(|when, then| {
-                when.method(GET)
-                    .path("/tokenized-assets/SGOV/status")
-                    .query_param("network", "base");
+                when.method(GET).path("/tokenized-assets/SGOV/status");
                 then.status(code);
             });
 
             let err = client_for(&server)
-                .tokenized_asset_status(
-                    &UnderlyingSymbol::new("SGOV").unwrap(),
-                    &Network::Base,
-                )
+                .tokenized_asset_status(&UnderlyingSymbol::new("SGOV").unwrap())
                 .await
                 .expect_err("a non-404 error status must surface as an error");
 

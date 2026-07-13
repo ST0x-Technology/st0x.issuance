@@ -1,14 +1,19 @@
 # TokenizedAsset aggregate rekey runbook (RAI-1205)
 
 Rekeys live `TokenizedAsset` aggregate ids from `{underlying}` to
-`{underlying}:{network}` (e.g. `AAPL` -> `AAPL:base`).
+`{underlying}:{network}` (e.g. `AAPL` -> `AAPL:base`), and moves the
+corporate-action `Frozen`/`Unfrozen` events onto the underlying-keyed
+`Underlying` aggregate (freeze is underlying-scoped: one freeze covers every
+network's listing).
 
 ## Preconditions
 
 - Issuance binary includes migration
   `20260703235904_rekey_tokenized_asset_aggregate_id`.
-- Coordinate lockstep deploy with `st0x-issuance-client` and liquidity
-  (RAI-1212): internal detail/status callers must send `?network=`.
+- Internal detail callers (`GET /tokenized-assets/{underlying}`) must send
+  `?network=`. The freeze-status route stays underlying-keyed with an unchanged
+  contract, so the deployed liquidity freeze guard keeps working across the
+  cutover — no lockstep deploy is required for it.
 - Maintenance window long enough for backup + single deploy + smoke check.
 
 ## 1. Backup
@@ -60,7 +65,7 @@ Then apply the migration:
 DATABASE_URL=sqlite:/tmp/issuance-dry-run.db sqlx migrate run
 ```
 
-Validate rekey idempotency and view rebuild:
+Validate rekey idempotency, the freeze-event split, and view rebuild:
 
 ```sql
 -- No underlying-only ids remain
@@ -71,14 +76,29 @@ WHERE aggregate_type = 'TokenizedAsset' AND aggregate_id NOT GLOB '*:*';
 SELECT aggregate_id FROM events
 WHERE aggregate_type = 'TokenizedAsset'
 LIMIT 5;
+
+-- No freeze events remain on TokenizedAsset streams...
+SELECT COUNT(*) FROM events
+WHERE aggregate_type = 'TokenizedAsset'
+  AND event_type IN (
+    'TokenizedAssetEvent::Frozen', 'TokenizedAssetEvent::Unfrozen'
+  );
+
+-- ...they moved to the Underlying aggregate, keyed by bare underlying,
+-- resequenced 1..N
+SELECT aggregate_id, sequence, event_type FROM events
+WHERE aggregate_type = 'Underlying'
+ORDER BY aggregate_id, sequence;
 ```
 
 Start issuance against the copy
 (`DATABASE_URL=sqlite:/tmp/issuance-dry-run.db`). Confirm:
 
 - `GET /tokenized-assets` lists seeded assets.
-- `GET /tokenized-assets/AAPL/status?network=base` returns 200 (not 422).
-- `GET /tokenized-assets/AAPL/status` without `?network=` returns 422.
+- `GET /tokenized-assets/AAPL/status` (no network parameter) returns 200 and,
+  for an underlying frozen pre-migration, still reports `"frozen"`.
+- `GET /tokenized-assets/AAPL?network=base` returns 200 (not 422).
+- `GET /tokenized-assets/AAPL` without `?network=` returns 422.
 
 Re-run `sqlx migrate run` on the same copy -- row counts and aggregate ids must
 be unchanged (migration is idempotent).
@@ -90,9 +110,9 @@ be unchanged (migration is idempotent).
 3. Run the duplicate-aggregate check from step 2 against the stopped production
    database — it must return no rows before you deploy.
 4. Deploy the RAI-1205 binary; startup runs migrations automatically.
-5. Deploy matching `st0x-issuance-client` + liquidity freeze guard (RAI-1212).
-6. Smoke: token list, `?network=base` status for a known asset, one mint on
-   Base.
+5. Smoke: token list, network-less `/status` for a known asset (and that a
+   pre-migration freeze still reports `"frozen"`), `?network=base` detail
+   lookup, one mint on Base.
 
 ## 4. Rollback
 
@@ -104,22 +124,27 @@ be unchanged (migration is idempotent).
    ```
 
    The database restore is mandatory, not optional: reverted code looks assets
-   up by the old `{underlying}` keys, so running it against a rekeyed store
-   silently finds no assets at all.
+   up by the old `{underlying}` keys, and the migration moved `Frozen`/
+   `Unfrozen` events off the `TokenizedAsset` streams entirely — a code-only
+   rollback silently finds no assets and no freeze state at all.
 
-3. Redeploy the previous issuance, `st0x-issuance-client`, and liquidity builds
-   together.
+3. Redeploy the previous issuance build.
 
-Do not leave a mixed-version window: if liquidity still sends `?network=`
-against rolled-back issuance, freeze/status calls succeed harmlessly, but if
-liquidity is rolled back alone while issuance still requires `?network=`, the
-freeze guard receives 422 and rebalancing fail-closes until the versions match
-again.
+The liquidity freeze guard is unaffected in either direction: the status route's
+contract (underlying-keyed, `{underlying, status}` body) is identical before and
+after the cutover.
 
 ## 5. Idempotency notes
 
-- SQL migration only appends `:base` when `aggregate_id` has no `:` suffix.
+- SQL migration only appends `:base` when `aggregate_id` has no `:` suffix, and
+  the freeze-event move matches on the pre-move
+  `TokenizedAssetEvent::Frozen`/`Unfrozen` event types, so re-running finds
+  nothing left to move.
+- The resequencing pass re-ranks each stream by its current order; on an
+  already-contiguous store it rewrites every sequence to its existing value (a
+  no-op by value).
 - `TokenizedAsset` schema version bump clears stale projections; catch-up
-  rebuilds `tokenized_asset_view` from rekeyed events.
+  rebuilds `tokenized_asset_view` (and `underlying_view`) from the migrated
+  events.
 - Safe to re-run migration on a partially migrated copy during dry-run
   validation.

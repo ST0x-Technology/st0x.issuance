@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Network, TokenSymbol, UnderlyingSymbol};
 
+/// Listing lifecycle commands. Corporate-action freeze/unfreeze address the
+/// underlying-keyed `Underlying` aggregate (`crate::underlying`), not a
+/// per-network listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum TokenizedAssetCommand {
     Add {
@@ -11,6 +14,4 @@ pub(crate) enum TokenizedAssetCommand {
         network: Network,
         vault: Address,
     },
-    Freeze,
-    Unfreeze,
 }

@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{Network, TokenSymbol, UnderlyingSymbol};
 
+/// Listing lifecycle events. The pre-multichain `Frozen`/`Unfrozen` variants
+/// live on the underlying-keyed `Underlying` aggregate now — the
+/// aggregate-rekey migration re-types shipped rows onto it, so no
+/// `TokenizedAsset` stream carries them after migration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedAssetEvent {
     Added {
@@ -19,12 +23,6 @@ pub(crate) enum TokenizedAssetEvent {
         previous_vault: Address,
         updated_at: DateTime<Utc>,
     },
-    Frozen {
-        frozen_at: DateTime<Utc>,
-    },
-    Unfrozen {
-        unfrozen_at: DateTime<Utc>,
-    },
 }
 
 impl DomainEvent for TokenizedAssetEvent {
@@ -33,10 +31,6 @@ impl DomainEvent for TokenizedAssetEvent {
             Self::Added { .. } => "TokenizedAssetEvent::Added".to_string(),
             Self::VaultAddressUpdated { .. } => {
                 "TokenizedAssetEvent::VaultAddressUpdated".to_string()
-            }
-            Self::Frozen { .. } => "TokenizedAssetEvent::Frozen".to_string(),
-            Self::Unfrozen { .. } => {
-                "TokenizedAssetEvent::Unfrozen".to_string()
             }
         }
     }

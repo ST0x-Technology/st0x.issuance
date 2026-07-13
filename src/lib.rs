@@ -56,6 +56,7 @@ use crate::tokenized_asset::{
     TokenizedAsset, TokenizedAssetView, UnderlyingSymbol,
     validate_no_cross_network_vault_collisions, view::list_enabled_assets,
 };
+use crate::underlying::Underlying;
 use poll_checkpoint::load_receipt_backfill;
 
 pub mod account;
@@ -63,6 +64,7 @@ pub mod mint;
 pub mod redemption;
 pub mod test_utils;
 pub mod tokenized_asset;
+pub mod underlying;
 
 pub(crate) mod admin;
 pub(crate) mod alpaca;
@@ -259,6 +261,13 @@ pub async fn initialize_rocket(
     prepare_event_sourced_startup::<TokenizedAsset>(&pool).await?;
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
+
+    // The server never dispatches Underlying commands (freeze/unfreeze are
+    // issuer-CLI actions), but startup must still reconcile the schema version
+    // and catch the `underlying_view` projection up with the event log.
+    prepare_event_sourced_startup::<Underlying>(&pool).await?;
+    let (_underlying_store, _underlying_projection) =
+        StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
     prepare_event_sourced_startup::<Account>(&pool).await?;
     let (account_store, _account_projection) =
@@ -662,6 +671,7 @@ async fn clear_canonical_projection_for_aggregate(
         "Account" => "account_view",
         "Mint" => "mint_view",
         "TokenizedAsset" => "tokenized_asset_view",
+        "Underlying" => "underlying_view",
         _ => return Ok(()),
     };
 
@@ -683,6 +693,9 @@ async fn clear_canonical_projection_for_aggregate(
             sqlx::query!("DELETE FROM tokenized_asset_view")
                 .execute(pool)
                 .await?
+        }
+        "underlying_view" => {
+            sqlx::query!("DELETE FROM underlying_view").execute(pool).await?
         }
         _ => unreachable!("table derived from supported aggregate types"),
     };
