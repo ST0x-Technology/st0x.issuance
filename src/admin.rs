@@ -1389,6 +1389,10 @@ const fn redemption_stuck_info(
         RedemptionView::Detected { detected_entered_at, .. } => {
             Some((InProgress, *detected_entered_at))
         }
+        // Held is deliberate during a freeze window, but it parks operator
+        // funds in the redemption wallet — surface it so a hold outliving
+        // its freeze window is visible.
+        RedemptionView::Held { held_at, .. } => Some((InProgress, *held_at)),
         RedemptionView::AlpacaCalled { called_at, .. } => {
             Some((InProgress, *called_at))
         }
@@ -1436,6 +1440,18 @@ fn stuck_redemption_entry(
             Some(underlying),
             Some(quantity),
             Some(network),
+            Some(tx_hash),
+            history.tx_id,
+        ),
+        RedemptionView::Held {
+            underlying, quantity, tx_hash, held_at, ..
+        } => (
+            None,
+            "Held".to_string(),
+            "Held during asset freeze — resumes on unfreeze".to_string(),
+            held_at,
+            Some(underlying),
+            Some(quantity),
             Some(tx_hash),
             history.tx_id,
         ),

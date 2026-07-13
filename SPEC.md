@@ -361,8 +361,20 @@ on-chain transfer through calling Alpaca to burning tokens.
 **Commands:**
 
 - `DetectRedemption` - Transfer to redemption wallet detected
-- `RecordAlpacaCall` - Alpaca redeem API called successfully
-- `RecordAlpacaFailure` - Alpaca redeem API call failed
+- `Hold` - Park a detected redemption of a frozen asset before the Alpaca redeem
+  call. Valid from `Detected` (emits `RedemptionHeld`) and idempotent from
+  `Held` (no event), so concurrent guard paths cannot race each other. Holding
+  happens strictly **before** the Alpaca call: past that boundary Alpaca has
+  decremented its side, and holding the burn would leave on-chain supply above
+  the Alpaca count — the exact divergence the freeze prevents. A held redemption
+  is deferred, never dropped (its tokens are already committed on-chain); resume
+  reuses `RecordAlpacaCall`, giving the audit trail
+  `Detected -> RedemptionHeld -> AlpacaCalled` with no separate resume event.
+- `RecordAlpacaCall` - Alpaca redeem API called successfully. Valid from
+  `Detected` or `Held` (a held redemption resumes through this command once the
+  asset unfreezes)
+- `RecordAlpacaFailure` - Alpaca redeem API call failed (valid from `Detected`
+  or `Held`)
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
 - `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
   raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
@@ -464,6 +476,10 @@ on-chain transfer through calling Alpaca to burning tokens.
 **Events:**
 
 - `RedemptionDetected` - Transfer to redemption wallet detected
+- `RedemptionHeld` - Redemption of a frozen asset parked before the Alpaca
+  redeem call. Carries only `held_at`; detection metadata stays in the aggregate
+  from `RedemptionDetected`. The resume driver drains held redemptions in
+  detection order once the asset unfreezes.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
@@ -531,7 +547,8 @@ on-chain transfer through calling Alpaca to burning tokens.
 | Command                                  | Events                             | Notes                                             |
 | ---------------------------------------- | ---------------------------------- | ------------------------------------------------- |
 | `DetectRedemption`                       | `RedemptionDetected`               | Transfer detected                                 |
-| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                 |
+| `Hold`                                   | `RedemptionHeld`                   | Asset frozen; park pre-Alpaca (idempotent)        |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called (from Detected or Held)         |
 | `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                  |
 | `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                  |
 | `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting       |
@@ -2114,7 +2131,10 @@ struct BurnResult {
 stateDiagram-v2
     [*] --> Detected: DetectRedemption
     Detected --> AlpacaCalled: RecordAlpacaCall
+    Detected --> Held: Hold (asset frozen)
     Detected --> Failed: MarkFailed
+    Held --> AlpacaCalled: RecordAlpacaCall (asset unfrozen)
+    Held --> Failed: RecordAlpacaFailure / MarkFailed
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
     Burning --> BurnIntended: IntendBurn

@@ -2149,6 +2149,7 @@ impl BurnExecutionPlan {
 const fn aggregate_state_name(aggregate: &Redemption) -> &'static str {
     match aggregate {
         Redemption::Detected { .. } => "Detected",
+        Redemption::Held { .. } => "Held",
         Redemption::AlpacaCalled { .. } => "AlpacaCalled",
         Redemption::Burning { .. } => "Burning",
         Redemption::BurnSubmitted { .. } => "BurnSubmitted",
