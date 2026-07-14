@@ -1610,9 +1610,22 @@ scheduler itself so every schedule source inherits it); an inverted or
 sub-second window is rejected with 422 (apalis schedules at second granularity,
 so a sub-second window has no defined execution order); a fully elapsed window
 is rejected rather than flapping the asset; a `freeze_at` already in the past
-with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
-the schedule mechanism the automated corporate-actions sourcing feeds; until
-then an operator arms windows manually.
+with `unfreeze_at` still ahead (window in progress) freezes immediately. This
+is the schedule mechanism both the manual admin endpoint and the automated
+corporate-actions sourcing feed.
+
+**Corporate-actions sourcing.** A periodic sync (every 6 hours) lists upcoming
+dividend announcements from Alpaca's Corporate Actions Announcements API
+(`GET /v1/corporate_actions/announcements`, filtered to `ca_types=dividend` /
+`date_type=ex_date`, 89-day horizon) and arms one freeze window per supported
+asset per ex-date through the same scheduler. The window is the full UTC ex-date
+day — freeze at ex-date 00:00 UTC, unfreeze at 00:00 UTC the next day — which
+brackets the US/Eastern trading session on both sides. Announcements for symbols
+we do not tokenize, announcements whose ex-date is not yet set, and windows that
+already elapsed are skipped; a failed pass is retried at the next interval, and
+because re-arming the same window is an idempotent no-op the sync needs no state
+of its own. The issuer CLI owns an independent operator hold and cannot release
+a corporate-action window's hold.
 
 ## Orchestrator Migration (ST0xOrchestrator)
 
