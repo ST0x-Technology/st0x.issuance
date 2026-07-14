@@ -291,7 +291,10 @@ impl DomainEvent for RedemptionEvent {
 
     fn event_version(&self) -> String {
         match self {
-            Self::TokensBurned(_) => "2.0".to_string(),
+            Self::TokensBurned(_)
+            | Self::BurningFailed { .. }
+            | Self::BurnTxSubmitted { .. }
+            | Self::ExistingBurnRecovered { .. } => "2.0".to_string(),
             _ => "1.0".to_string(),
         }
     }
@@ -395,7 +398,34 @@ mod tests {
         };
 
         assert_eq!(event.event_type(), "RedemptionEvent::BurningFailed");
-        assert_eq!(event.event_version(), "1.0");
+        assert_eq!(event.event_version(), "2.0");
+    }
+
+    #[test]
+    fn submitted_and_recovered_burns_use_tagged_tx_id_event_version() {
+        let submitted = RedemptionEvent::BurnTxSubmitted {
+            issuer_request_id: test_redemption_id(),
+            external_tx_id: BurnExternalTxId::from_string(
+                "burn-abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    .to_string(),
+            ),
+            tx_id: TxId::random(),
+            planned_burns: vec![],
+            submitted_at: Utc::now(),
+        };
+        let recovered = RedemptionEvent::ExistingBurnRecovered {
+            issuer_request_id: test_redemption_id(),
+            tx_id: TxId::random(),
+            tx_hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            burns: vec![],
+            block_number: 1000,
+            recovered_at: Utc::now(),
+        };
+
+        assert_eq!(submitted.event_version(), "2.0");
+        assert_eq!(recovered.event_version(), "2.0");
     }
 
     #[test]

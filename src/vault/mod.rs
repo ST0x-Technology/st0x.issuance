@@ -424,6 +424,27 @@ pub(crate) enum TxId {
     Legacy(String),
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaggedTxIdRef<'value> {
+    Hash(&'value B256),
+    Legacy(&'value str),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaggedTxId {
+    Hash(B256),
+    Legacy(String),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedTxId {
+    Tagged(TaggedTxId),
+    Flat(String),
+}
+
 impl TxId {
     pub(crate) const fn to_hash(&self) -> Option<B256> {
         if let Self::Hash(hash) = self {
@@ -471,6 +492,7 @@ impl utoipa::ToSchema for TxId {
         "TxId".into()
     }
 }
+
 impl utoipa::PartialSchema for TxId {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         utoipa::openapi::ObjectBuilder::new()
@@ -488,7 +510,12 @@ impl Serialize for TxId {
         &self,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        match self {
+            Self::Hash(hash) => TaggedTxIdRef::Hash(hash).serialize(serializer),
+            Self::Legacy(value) => {
+                TaggedTxIdRef::Legacy(value).serialize(serializer)
+            }
+        }
     }
 }
 
@@ -496,19 +523,75 @@ impl<'de> Deserialize<'de> for TxId {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
+        match PersistedTxId::deserialize(deserializer)? {
+            PersistedTxId::Tagged(TaggedTxId::Hash(hash)) => {
+                Ok(Self::Hash(hash))
+            }
+            PersistedTxId::Tagged(TaggedTxId::Legacy(value)) => {
+                Ok(Self::Legacy(value))
+            }
+            PersistedTxId::Flat(value) => {
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{address, b256};
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
     use super::*;
     use crate::mint::{IssuerMintRequestId, Quantity, TokenizationRequestId};
+
+    #[test]
+    fn tx_id_tagged_persistence_roundtrips_variants() {
+        let legacy_uuid =
+            TxId::Legacy("07bdef3c-5314-4d1d-94f7-f3f346cd4c2f".to_string());
+        let legacy_hex = TxId::Legacy(
+            "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        );
+        let hash = TxId::Hash(b256!(
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        ));
+
+        let cases =
+            [(legacy_uuid, "legacy"), (legacy_hex, "legacy"), (hash, "hash")];
+
+        for (tx_id, expected_tag) in cases {
+            let serialized = serde_json::to_value(&tx_id).unwrap();
+            let roundtripped: TxId =
+                serde_json::from_value(serialized.clone()).unwrap();
+
+            assert_eq!(roundtripped, tx_id);
+            assert!(serialized.get(expected_tag).is_some());
+        }
+    }
+
+    #[test]
+    fn tx_id_deserializes_historical_flat_strings() {
+        let legacy: TxId =
+            serde_json::from_str(r#""07bdef3c-5314-4d1d-94f7-f3f346cd4c2f""#)
+                .unwrap();
+        let hash: TxId = serde_json::from_str(
+            r#""0x2222222222222222222222222222222222222222222222222222222222222222""#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy,
+            TxId::Legacy("07bdef3c-5314-4d1d-94f7-f3f346cd4c2f".to_string())
+        );
+        assert_eq!(
+            hash,
+            TxId::Hash(b256!(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            ))
+        );
+    }
 
     const TEST_OA_SCHEMA: &str =
         "bafkreiahuttak2jvjzsd4r62xhf2fwvy7hbpbfdetxrieqxf4ivyxgpdm";
@@ -801,21 +884,6 @@ mod tests {
         let original = TxId::Legacy("fb-tx-uuid-123".to_string());
         let roundtripped: TxId = original.to_string().parse().unwrap();
         assert_eq!(roundtripped, original);
-    }
-
-    #[test]
-    fn tx_id_serialize_hash_as_0x_hex_string() {
-        let tx_id = TxId::Hash(known_hash());
-        let json = serde_json::to_string(&tx_id).unwrap();
-        assert_eq!(json, format!("\"{HASH_HEX}\""));
-    }
-
-    #[test]
-    fn tx_id_serialize_legacy_as_raw_string() {
-        let raw = "fb-tx-uuid-123";
-        let tx_id = TxId::Legacy(raw.to_string());
-        let json = serde_json::to_string(&tx_id).unwrap();
-        assert_eq!(json, format!("\"{raw}\""));
     }
 
     #[test]
