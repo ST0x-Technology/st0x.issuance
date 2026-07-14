@@ -895,6 +895,26 @@ action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
 
+**Operator lifecycle notifications.** The V1 corporate-actions workflow sends
+operator notifications to the same Telegram chat, topic, and bot used by the
+liquidity service. Issuance reports a newly scheduled or approaching corporate
+action, a freeze or unfreeze that was applied, a redemption that was held or
+resumed, and failures in those workflows. The liquidity dividend-bump command
+reports the completed NAV bump through that same channel.
+
+Notifications describe the lifecycle transition and its correlation identifier
+but never include wallet balances, raw token quantities, credentials, or signing
+material. Delivery happens only after the corresponding durable state transition
+succeeds. Telegram unavailability cannot roll back or fail the financial
+workflow; a bounded delivery attempt records a structured error for the operator
+instead. Replaying an idempotent command that produces no new domain transition
+does not emit another notification.
+
+Telegram configuration is all-or-none: bot token and chat id must either both be
+present or both be absent, and the forum topic is optional only when the channel
+is configured. Partial configuration fails startup. The bot token is redacted
+from all debug and error output.
+
 ## Services
 
 Aggregates use services to interact with external systems while keeping business

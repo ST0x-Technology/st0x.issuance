@@ -9,6 +9,9 @@ use crate::auth::AuthConfig;
 use crate::chain::{
     ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
 };
+use crate::notifications::{
+    LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
+};
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
@@ -17,8 +20,8 @@ use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
 
 /// Default SQLite database URL when `DATABASE_URL` is unset. Production overrides
-/// it via the environment (see `docker-compose.template.yaml`). Single source of
-/// truth shared by the server config and the issuer CLI.
+/// it through deployment configuration. Single source of truth shared by the
+/// server config and the issuer CLI.
 pub(crate) const DEFAULT_DATABASE_URL: &str = "sqlite:data.db";
 
 /// Default SQLite connection-pool size, shared by the server config and the
@@ -58,6 +61,18 @@ impl Config {
     pub fn parse() -> Result<Self, ConfigError> {
         let env = Env::try_parse()?;
         env.into_config()
+    }
+
+    /// Parses service and lifecycle-notification configuration together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if command-line arguments, environment variables, or
+    /// the notification destination are invalid.
+    pub fn parse_with_lifecycle_notifications()
+    -> Result<(Self, LifecycleNotificationsConfig), ConfigError> {
+        let env = Env::try_parse()?;
+        env.into_config_with_lifecycle_notifications()
     }
 
     /// Builds a [`ChainRegistry`] from `chains`. Consumers route per-chain
@@ -137,6 +152,9 @@ struct Env {
 
     #[clap(flatten)]
     hyperdx: HyperDxEnv,
+
+    #[clap(flatten)]
+    notifications: LifecycleNotificationsEnv,
 
     #[clap(flatten)]
     pub(crate) alpaca: AlpacaConfig,
@@ -289,6 +307,19 @@ impl Env {
             subgraph_url,
             chains,
         })
+    }
+
+    fn into_config_with_lifecycle_notifications(
+        self,
+    ) -> Result<(Config, LifecycleNotificationsConfig), ConfigError> {
+        let notifications = LifecycleNotificationsConfig::assemble(
+            self.notifications.bot_token.clone(),
+            self.notifications.chat_id,
+            self.notifications.message_thread_id,
+        )?;
+        let config = self.into_config()?;
+
+        Ok((config, notifications))
     }
 
     /// Returns the Base runtime and the full chain list, Base first.
@@ -473,6 +504,23 @@ const fn subgraph_variable(network: Network) -> &'static str {
     }
 }
 
+#[derive(Args, Clone)]
+struct LifecycleNotificationsEnv {
+    #[arg(long = "telegram-bot-token", env = "TELEGRAM_BOT_TOKEN")]
+    bot_token: Option<String>,
+    #[arg(
+        long = "telegram-chat-id",
+        env = "TELEGRAM_CHAT_ID",
+        allow_negative_numbers = true
+    )]
+    chat_id: Option<i64>,
+    #[arg(
+        long = "telegram-message-thread-id",
+        env = "TELEGRAM_MESSAGE_THREAD_ID"
+    )]
+    message_thread_id: Option<i64>,
+}
+
 #[derive(clap::ValueEnum, Debug, Clone)]
 pub enum LogLevel {
     Trace,
@@ -565,6 +613,8 @@ pub enum ConfigError {
     ChainIdNotForNetwork { network: Network, configured: u64, expected: u64 },
     #[error("chain registry initialization failed: {0}")]
     ChainRegistry(#[source] Box<ChainRegistryError>),
+    #[error(transparent)]
+    LifecycleNotifications(#[from] LifecycleNotificationsConfigError),
 }
 
 /// RPC URL uses a scheme that cannot be mapped to HTTP.
@@ -603,6 +653,7 @@ const DOMAIN_TARGETS: &[&str] = &[
     "wallet",
     "admin",
     "vault",
+    "notifications",
 ];
 
 /// Builds a default `EnvFilter` string that includes both the crate module
@@ -920,6 +971,52 @@ mod tests {
         args.extend_from_slice(&["--environment", "staging"]);
         let staging_env = Env::try_parse_from(args).unwrap();
         assert_eq!(staging_env.environment, Environment::Staging);
+    }
+
+    #[test]
+    fn lifecycle_notification_arguments_are_additive_and_validated_together() {
+        let disabled = Env::try_parse_from(minimal_args())
+            .unwrap()
+            .into_config_with_lifecycle_notifications()
+            .unwrap()
+            .1;
+        assert!(!disabled.is_enabled());
+
+        let mut enabled_args = minimal_args();
+        enabled_args.extend_from_slice(&[
+            "--telegram-bot-token",
+            "123:abc",
+            "--telegram-chat-id",
+            "-1001234567890",
+            "--telegram-message-thread-id",
+            "42",
+        ]);
+        let enabled = Env::try_parse_from(enabled_args)
+            .unwrap()
+            .into_config_with_lifecycle_notifications()
+            .unwrap()
+            .1;
+        assert!(enabled.is_enabled());
+
+        let mut partial_args = minimal_args();
+        partial_args.extend_from_slice(&["--telegram-bot-token", "123:abc"]);
+        let result = Env::try_parse_from(partial_args)
+            .unwrap()
+            .into_config_with_lifecycle_notifications();
+        let Err(error) = result else {
+            panic!("partial notification configuration was accepted");
+        };
+        assert!(matches!(
+            error,
+            ConfigError::LifecycleNotifications(
+                LifecycleNotificationsConfigError::MissingChatId
+            )
+        ));
+
+        let mut compatibility_args = minimal_args();
+        compatibility_args
+            .extend_from_slice(&["--telegram-bot-token", "123:abc"]);
+        Env::try_parse_from(compatibility_args).unwrap().into_config().unwrap();
     }
 
     #[test]

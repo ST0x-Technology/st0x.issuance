@@ -1,16 +1,23 @@
-use st0x_issuance::{Config, initialize_rocket, setup_tracing};
+use st0x_issuance::{
+    Config, initialize_rocket_with_notifications, setup_tracing,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv_override().ok();
-    let config = Config::parse()?;
+    let (config, lifecycle_notifications) =
+        Config::parse_with_lifecycle_notifications()?;
 
     let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
         match hyperdx.setup_telemetry() {
             Ok(guard) => Some(guard),
             Err(err) => {
-                eprintln!("Failed to setup telemetry: {err}");
                 setup_tracing(&config.log_level);
+                tracing::error!(
+                    target: "startup",
+                    error = %err,
+                    "Telemetry setup failed; using local tracing"
+                );
                 None
             }
         }
@@ -19,7 +26,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let rocket = initialize_rocket(config).await?;
+    let rocket =
+        initialize_rocket_with_notifications(config, lifecycle_notifications)
+            .await?;
     let result = rocket.launch().await;
 
     drop(telemetry_guard);
