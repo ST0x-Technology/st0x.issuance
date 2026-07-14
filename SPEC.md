@@ -605,6 +605,12 @@ handlers, making aggregates testable with mock services.
 - Methods: `deposit()`, `withdraw()`
 - Two implementations: local key signing — `EVM_PRIVATE_KEY` or Turnkey —
   `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS` (prod)
+- Turnkey transaction signing uses `ACTIVITY_TYPE_SIGN_TRANSACTION_V2` with the
+  exact unsigned EIP-2718 transaction bytes. The returned signed envelope is
+  decoded locally and its signature must recover `TURNKEY_ADDRESS` over those
+  exact bytes before the transaction is accepted for broadcast. Decode,
+  recovery, content, or signer mismatches fail closed, and signed transaction
+  response bodies are never logged or embedded in decode errors.
 
 ### ReceiptService
 
