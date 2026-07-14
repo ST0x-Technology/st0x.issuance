@@ -9,7 +9,6 @@ use rocket::serde::json::Json;
 use rocket::{get, post};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -35,7 +34,9 @@ use crate::redemption::{
     next_burn_retry_external_tx_id_from_history,
 };
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
-use crate::vault::{BurnVerification, TxId, VaultError, VaultService};
+use crate::vault::{
+    BurnVerification, NetworkVaultServices, TxId, VaultError, VaultService,
+};
 
 #[async_trait]
 pub(crate) trait RedemptionBurnRecovery: Send + Sync {
@@ -80,33 +81,6 @@ impl RedemptionBurnRecovery for BurnManager {
         )
         .await
     }
-}
-
-/// Per-network vault services held in Rocket managed state for mint confirm,
-/// admin recovery, and stuck triage. Mirrors the map the live redemption path
-/// threads through `RedemptionServices`/`BurnManager`, so those routes query
-/// the same signing backend as the flow that submitted the transaction.
-pub(crate) struct NetworkVaultServices(HashMap<Network, Arc<dyn VaultService>>);
-
-impl NetworkVaultServices {
-    pub(crate) fn new(
-        services: HashMap<Network, Arc<dyn VaultService>>,
-    ) -> Self {
-        Self(services)
-    }
-
-    pub(crate) fn get(
-        &self,
-        network: Network,
-    ) -> Result<&Arc<dyn VaultService>, UnconfiguredNetworkError> {
-        self.0.get(&network).ok_or(UnconfiguredNetworkError { network })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("no vault service configured for network {network}")]
-pub(crate) struct UnconfiguredNetworkError {
-    network: Network,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
@@ -419,7 +393,7 @@ pub(crate) async fn recover_redemption(
     // network must have a configured vault service before any recovery step
     // runs — otherwise fail closed with a 422.
     let vault_service =
-        vault_services.get(context.metadata.network).map_err(|error| {
+        vault_services.service(context.metadata.network).map_err(|error| {
             error!(target: "admin", aggregate_id = %aggregate_id,
                 error = %error,
                 "Cannot recover redemption on an unconfigured network"
@@ -1935,7 +1909,6 @@ mod tests {
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
@@ -1965,11 +1938,12 @@ mod tests {
         RedemptionCommand, RedemptionEvent, RedemptionMetadata,
         RedemptionServices, RedemptionView,
     };
-    use crate::test_utils::logs_contain_at;
+    use crate::test_utils::{ANVIL_CHAIN_ID, logs_contain_at};
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
+        MultiBurnEntry, NetworkVaultServices, SendableTxWithHash, TxId,
+        VaultService,
     };
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
@@ -2006,11 +1980,12 @@ mod tests {
         }
     }
 
-    fn mock_network_vault_services() -> super::NetworkVaultServices {
-        super::NetworkVaultServices::new(HashMap::from([(
+    fn mock_network_vault_services() -> NetworkVaultServices {
+        NetworkVaultServices::with_single_vault(
             Network::Base,
+            ANVIL_CHAIN_ID,
             mock_vault_service(),
-        )]))
+        )
     }
 
     /// Configurable poll response for the test mock.

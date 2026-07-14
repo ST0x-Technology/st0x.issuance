@@ -21,7 +21,10 @@ use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
 use crate::vault::rain_meta::OaSchemaCache;
-use crate::vault::{VaultService, service::RealBlockchainService};
+use crate::vault::{
+    NetworkVault, NetworkVaultServices, VaultService,
+    service::RealBlockchainService,
+};
 use crate::wallet::{
     SignerConfig, SignerResolveError, local::resolve_local_signer,
     turnkey::resolve_turnkey_signer,
@@ -160,13 +163,23 @@ impl<P> ChainRegistry<P> {
         self.runtimes.keys().copied().collect()
     }
 
-    pub(crate) fn clone_vault_services(
-        &self,
-    ) -> HashMap<Network, Arc<dyn VaultService>> {
-        self.runtimes
-            .iter()
-            .map(|(network, runtime)| (*network, runtime.vault_service.clone()))
-            .collect()
+    /// Builds the shared per-network vault-service lookup handed to every
+    /// consumer that dispatches on-chain work by network.
+    pub(crate) fn network_vault_services(&self) -> NetworkVaultServices {
+        NetworkVaultServices::new(
+            self.runtimes
+                .iter()
+                .map(|(network, runtime)| {
+                    (
+                        *network,
+                        NetworkVault {
+                            service: runtime.vault_service.clone(),
+                            chain_id: runtime.chain_id,
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn runtimes(

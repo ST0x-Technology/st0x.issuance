@@ -57,6 +57,7 @@ use crate::tokenized_asset::{
     validate_no_cross_network_vault_collisions, view::list_enabled_assets,
 };
 use crate::underlying::Underlying;
+use crate::vault::NetworkVaultServices;
 use poll_checkpoint::load_receipt_backfill;
 
 pub mod account;
@@ -293,26 +294,21 @@ pub async fn initialize_rocket(
 
     let vault_service_for_rocket = base.vault_service.clone();
     let configured_networks = chain_registry.configured_networks();
+    let network_vault_services = chain_registry.network_vault_services();
 
     let AggregateCqrsSetup { mint_store, redemption_store } =
         setup_aggregate_cqrs(
             &pool,
             &receipt_inventory_store,
-            &chain_registry,
+            &network_vault_services,
             alpaca_service,
             bot_wallet,
         )
         .await?;
 
-    let chain_ids = chain_registry
-        .runtimes()
-        .map(|(network, runtime)| (*network, runtime.chain_id))
-        .collect();
-
     let managers = setup_redemption_managers(
         &config,
-        chain_registry.clone_vault_services(),
-        chain_ids,
+        network_vault_services.clone(),
         &redemption_store,
         &receipt_inventory_store,
         &pool,
@@ -451,9 +447,7 @@ pub async fn initialize_rocket(
         alpaca_service: rocket_alpaca,
         burn_recovery: managers.burn.clone()
             as Arc<dyn admin::RedemptionBurnRecovery>,
-        vault_services: admin::NetworkVaultServices::new(
-            chain_registry.clone_vault_services(),
-        ),
+        vault_services: network_vault_services,
         configured_networks,
     }))
 }
@@ -469,7 +463,7 @@ struct RocketState {
     redemption_store: Arc<Store<Redemption>>,
     alpaca_service: Arc<dyn AlpacaService>,
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
-    vault_services: admin::NetworkVaultServices,
+    vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
 }
 
@@ -547,26 +541,18 @@ fn mount_api_docs(
     )
 }
 
-async fn setup_aggregate_cqrs<P>(
+async fn setup_aggregate_cqrs(
     pool: &Pool<Sqlite>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
-    chain_registry: &ChainRegistry<P>,
+    network_vault_services: &NetworkVaultServices,
     alpaca_service: Arc<dyn AlpacaService>,
     bot_wallet: Address,
-) -> Result<AggregateCqrsSetup, anyhow::Error>
-where
-    P: Provider + Clone,
-{
+) -> Result<AggregateCqrsSetup, anyhow::Error> {
     // Create MintServices with all dependencies
     let receipt_service =
         Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone()));
-    let chain_ids = chain_registry
-        .runtimes()
-        .map(|(network, runtime)| (*network, runtime.chain_id))
-        .collect();
     let mint_services = MintServices::new(
-        chain_registry.clone_vault_services(),
-        chain_ids,
+        network_vault_services.clone(),
         alpaca_service,
         receipt_service,
         pool.clone(),
@@ -597,7 +583,7 @@ where
     // receipt_inventory_view at query time to compute available balance).
     prepare_event_sourced_startup::<Redemption>(pool).await?;
     let redemption_services =
-        RedemptionServices::new(chain_registry.clone_vault_services());
+        RedemptionServices::new(network_vault_services.clone());
     let redemption_store = StoreBuilder::<Redemption>::new(pool.clone())
         .with(Arc::new(RedemptionViewReactor::new(pool.clone())))
         .with(Arc::new(ReceiptBurnsViewReactor::new(pool.clone())))
@@ -705,8 +691,7 @@ async fn clear_canonical_projection_for_aggregate(
 
 fn setup_redemption_managers(
     config: &Config,
-    vault_services: HashMap<Network, Arc<dyn vault::VaultService>>,
-    chain_ids: HashMap<Network, u64>,
+    vault_services: NetworkVaultServices,
     redemption_store: &Arc<Store<Redemption>>,
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
@@ -729,7 +714,6 @@ fn setup_redemption_managers(
 
     let burn = Arc::new(BurnManager::new(
         vault_services,
-        chain_ids,
         pool.clone(),
         redemption_store.clone(),
         receipt_service,

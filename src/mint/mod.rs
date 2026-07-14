@@ -10,7 +10,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use event_sorcery::{EventSourced, Table};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -24,7 +23,8 @@ use crate::tokenized_asset::view::{
     TokenizedAssetViewError, TokenizedAssetViewFailure, find_vault,
 };
 use crate::vault::{
-    PreparedMintTx, ReceiptInformation, TxId, VaultError, VaultService,
+    NetworkVaultServices, PreparedMintTx, ReceiptInformation, TxId,
+    UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 pub use api::MintResponse;
@@ -42,8 +42,7 @@ pub(crate) use view::{
 /// Mint side effects resolve [`VaultService`] per aggregate `network` via
 /// [`Self::vault_for`] ([RAI-1206]).
 pub(crate) struct MintServices {
-    vaults: HashMap<Network, Arc<dyn VaultService>>,
-    chain_ids: HashMap<Network, u64>,
+    vaults: NetworkVaultServices,
     pub(crate) alpaca: Arc<dyn AlpacaService>,
     pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) pool: Pool<Sqlite>,
@@ -52,14 +51,13 @@ pub(crate) struct MintServices {
 
 impl MintServices {
     pub(crate) fn new(
-        vaults: HashMap<Network, Arc<dyn VaultService>>,
-        chain_ids: HashMap<Network, u64>,
+        vaults: NetworkVaultServices,
         alpaca: Arc<dyn AlpacaService>,
         receipts: Arc<dyn ReceiptService>,
         pool: Pool<Sqlite>,
         bot: Address,
     ) -> Self {
-        Self { vaults, chain_ids, alpaca, receipts, pool, bot }
+        Self { vaults, alpaca, receipts, pool, bot }
     }
 
     pub(crate) fn with_single_vault(
@@ -72,8 +70,7 @@ impl MintServices {
         bot: Address,
     ) -> Self {
         Self::new(
-            HashMap::from([(network, vault)]),
-            HashMap::from([(network, chain_id)]),
+            NetworkVaultServices::with_single_vault(network, chain_id, vault),
             alpaca,
             receipts,
             pool,
@@ -85,19 +82,14 @@ impl MintServices {
         &self,
         network: Network,
     ) -> Result<u64, MintError> {
-        self.chain_ids
-            .get(&network)
-            .copied()
-            .ok_or(MintError::NetworkNotConfigured { network })
+        Ok(self.vaults.chain_id(network)?)
     }
 
     fn vault_for(
         &self,
         network: Network,
     ) -> Result<&Arc<dyn VaultService>, MintError> {
-        self.vaults
-            .get(&network)
-            .ok_or(MintError::NetworkNotConfigured { network })
+        Ok(self.vaults.service(network)?)
     }
 }
 
@@ -2415,6 +2407,12 @@ impl From<TokenizedAssetViewError> for MintError {
     }
 }
 
+impl From<UnconfiguredNetworkError> for MintError {
+    fn from(error: UnconfiguredNetworkError) -> Self {
+        Self::NetworkNotConfigured { network: error.network }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use alloy::primitives::{Address, B256, U256, address, b256, uint};
@@ -2452,8 +2450,8 @@ pub(crate) mod tests {
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
-        PreparedMintTx, ReceiptInformation, SendableTxWithHash, SubmittedTx,
-        TxId, VaultError, VaultService,
+        NetworkVaultServices, PreparedMintTx, ReceiptInformation,
+        SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
     };
 
     pub(super) const VAULT: Address =
@@ -2842,8 +2840,7 @@ pub(crate) mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         MintServices::new(
-            HashMap::new(),
-            HashMap::new(),
+            NetworkVaultServices::new(HashMap::new()),
             Arc::new(MockAlpacaService::new_success()),
             Arc::new(CqrsReceiptService::new(receipt_store)),
             pool,
