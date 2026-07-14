@@ -15,6 +15,8 @@ use tracing::{error, info, warn};
 use crate::Quantity;
 use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+    alpaca_tokenization_request_id, issuance_issuer_request_id,
+    issuance_quantity, issuance_token_symbol, issuance_underlying_symbol,
 };
 use crate::auth::InternalAuth;
 use crate::mint::{
@@ -467,8 +469,10 @@ async fn recover_post_alpaca(
     // Verify journal status with Alpaca before resuming to Burning.
     // Burning without a completed journal would destroy on-chain tokens
     // without receiving the underlying shares.
+    let alpaca_tokenization_request_id =
+        alpaca_tokenization_request_id(&alpaca_data.tokenization_request_id);
     let request = alpaca_service
-        .poll_request_status(&alpaca_data.tokenization_request_id)
+        .poll_request_status(&alpaca_tokenization_request_id)
         .await
         .map_err(|err| {
             let (status, msg) = match &err {
@@ -508,12 +512,27 @@ async fn recover_post_alpaca(
             updated_at,
             ..
         } => {
+            let req_issuer_id = issuance_issuer_request_id(req_issuer_id)
+                .map_err(|error| {
+                    error!(target: "admin", aggregate_id = %aggregate_id, %error,
+                        "Alpaca issuer request id is invalid"
+                    );
+                    Status::BadGateway
+                })?;
+            let req_underlying = issuance_underlying_symbol(req_underlying);
+            let req_token = issuance_token_symbol(req_token);
+            let req_quantity = issuance_quantity(req_quantity).map_err(|error| {
+                error!(target: "admin", aggregate_id = %aggregate_id, %error,
+                    "Alpaca quantity is invalid"
+                );
+                Status::BadGateway
+            })?;
             // Validate Alpaca's response matches our records — defense-in-depth
             // against data corruption or misrouted requests.
-            if req_issuer_id != &metadata.issuer_request_id
-                || req_underlying != &metadata.underlying
-                || req_token != &metadata.token
-                || req_quantity != &alpaca_data.alpaca_quantity
+            if req_issuer_id != metadata.issuer_request_id
+                || req_underlying != metadata.underlying
+                || req_token != metadata.token
+                || req_quantity != alpaca_data.alpaca_quantity
                 || req_wallet != &metadata.wallet
             {
                 error!(target: "admin", aggregate_id = %aggregate_id,
@@ -1877,8 +1896,8 @@ mod tests {
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-        RedeemRequestStatus, RedeemResponse, TokenizationRequest,
-        service::AlpacaConfig,
+        RedeemRequestStatus, RedeemResponse, TestRedeemResponse,
+        TokenizationRequest, service::AlpacaConfig, test_redeem_response,
     };
     use crate::auth::{FailedAuthRateLimiter, test_auth_config};
     use crate::config::{Config, Environment, LogLevel};
@@ -2092,8 +2111,10 @@ mod tests {
         metadata: &RedemptionMetadata,
         alpaca_data: &AlpacaCalledData,
     ) -> TokenizationRequest {
-        TokenizationRequest::Redeem {
-            id: alpaca_data.tokenization_request_id.clone(),
+        test_redeem_response(TestRedeemResponse {
+            tokenization_request_id: alpaca_data
+                .tokenization_request_id
+                .clone(),
             issuer_request_id: metadata.issuer_request_id.clone(),
             status,
             underlying: metadata.underlying.clone(),
@@ -2102,7 +2123,8 @@ mod tests {
             wallet: metadata.wallet,
             tx_hash: None,
             updated_at: Some(Utc::now()),
-        }
+        })
+        .unwrap()
     }
 
     #[async_trait]
@@ -2123,7 +2145,7 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            _tokenization_request_id: &TokenizationRequestId,
+            _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
         ) -> Result<TokenizationRequest, AlpacaError> {
             match &self.response {
                 PollResponse::Ok(request) => Ok(request.clone()),
@@ -2722,7 +2744,8 @@ mod tests {
         if let TokenizationRequest::Redeem { ref mut underlying, .. } =
             mismatched
         {
-            *underlying = UnderlyingSymbol::new("WRONG");
+            *underlying =
+                st0x_alpaca::issuer::UnderlyingSymbol::new("WRONG").unwrap();
         }
 
         let alpaca: Arc<dyn AlpacaService> =
@@ -3745,7 +3768,7 @@ mod tests {
 
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Error(AlpacaError::RequestNotFound {
-                id: TokenizationRequestId::new("tok-test-1"),
+                id: crate::alpaca::TokenizationRequestId::new("tok-test-1"),
                 body: "not found".to_string(),
             }),
         });
@@ -3789,8 +3812,9 @@ mod tests {
         let store = setup_store(&pool);
         let (metadata, _alpaca_data) = setup_post_alpaca_failure(&store).await;
 
-        let requested = TokenizationRequestId::new("tok-test-1");
-        let returned = TokenizationRequestId::new("tok-other-id");
+        let requested = crate::alpaca::TokenizationRequestId::new("tok-test-1");
+        let returned =
+            crate::alpaca::TokenizationRequestId::new("tok-other-id");
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Error(AlpacaError::ResponseIdMismatch {
                 requested: requested.clone(),

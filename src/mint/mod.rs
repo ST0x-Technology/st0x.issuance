@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::alpaca::{AlpacaService, MintCallbackRequest};
+use crate::alpaca::{AlpacaService, mint_callback_request};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptService, Shares,
 };
@@ -905,13 +905,13 @@ impl Mint {
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
-        let callback_request = MintCallbackRequest {
-            tokenization_request_id: tokenization_request_id.clone(),
-            client_id: *client_id,
-            wallet_address: *wallet,
-            tx_hash: *tx_hash,
-            network: network.clone(),
-        };
+        let callback_request = mint_callback_request(
+            tokenization_request_id,
+            *client_id,
+            *wallet,
+            *tx_hash,
+            network,
+        );
 
         services
             .alpaca

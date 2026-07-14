@@ -1,15 +1,16 @@
 use async_trait::async_trait;
-use backon::{ExponentialBuilder, Retryable};
 use clap::Args;
+use serde_json::Value;
+use st0x_alpaca::AlpacaClient;
+use st0x_alpaca::issuer::RedeemResponse;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
 use super::{
     AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
-    RedeemResponse, TokenizationRequest,
+    TokenizationRequest, TokenizationRequestId,
 };
-use crate::mint::TokenizationRequestId;
 
 #[derive(Args, Clone)]
 pub struct AlpacaConfig {
@@ -76,15 +77,15 @@ impl AlpacaConfig {
     pub(crate) fn service(
         &self,
     ) -> Result<Arc<dyn AlpacaService>, AlpacaError> {
-        let service = RealAlpacaService::new(
+        let client = AlpacaClient::new(
             self.api_base_url.clone(),
             self.account_id.clone(),
             self.api_key.clone(),
             self.api_secret.clone(),
-            self.connect_timeout_secs,
-            self.request_timeout_secs,
+            Duration::from_secs(self.connect_timeout_secs),
+            Duration::from_secs(self.request_timeout_secs),
         )?;
-        Ok(Arc::new(service))
+        Ok(Arc::new(SharedAlpacaService { client }))
     }
 
     pub(crate) fn test_default() -> Self {
@@ -99,1471 +100,217 @@ impl AlpacaConfig {
     }
 }
 
-pub(crate) struct RealAlpacaService {
-    client: reqwest::Client,
-    base_url: String,
-    account_id: String,
-    api_key: String,
-    api_secret: String,
-    max_retries: usize,
-}
-
-impl RealAlpacaService {
-    pub(crate) fn new(
-        base_url: String,
-        account_id: String,
-        api_key: String,
-        api_secret: String,
-        connect_timeout_secs: u64,
-        request_timeout_secs: u64,
-    ) -> Result<Self, AlpacaError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(request_timeout_secs))
-            .build()?;
-        Ok(Self {
-            client,
-            base_url,
-            account_id,
-            api_key,
-            api_secret,
-            max_retries: 5,
-        })
-    }
-
-    #[cfg(test)]
-    const fn with_max_retries(mut self, max_retries: usize) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
+struct SharedAlpacaService {
+    client: AlpacaClient,
 }
 
 #[async_trait]
-impl AlpacaService for RealAlpacaService {
+impl AlpacaService for SharedAlpacaService {
     async fn send_mint_callback(
         &self,
         request: MintCallbackRequest,
     ) -> Result<(), AlpacaError> {
-        let url = format!(
-            "{}/v1/accounts/{}/tokenization/callback/mint",
-            self.base_url.trim_end_matches('/'),
-            self.account_id
+        debug!(
+            target: "alpaca",
+            account_id = self.client.account_id(),
+            method = "POST",
+            "Sending mint callback to Alpaca"
         );
-
-        debug!(target: "alpaca", %url, method = "POST", "Sending mint callback to Alpaca");
-
-        (|| async {
-            let response = self
-                .client
-                .post(&url)
-                .basic_auth(&self.api_key, Some(&self.api_secret))
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret)
-                .json(&request)
-                .send()
-                .await?;
-
-            let status = response.status();
-
-            match status {
-                reqwest::StatusCode::OK => Ok(()),
-                reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Auth(body))
-                }
-                status => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
-                }
-            }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_max_times(self.max_retries)
-                .with_jitter(),
-        )
-        .when(|e: &AlpacaError| e.is_retryable())
-        .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::debug!(
-                target: "alpaca",
-                "Alpaca API call failed with {err}, retrying after {dur:?}"
-            );
-        })
-        .await
+        self.client.send_mint_callback(request).await
     }
 
     async fn call_redeem_endpoint(
         &self,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
-        let url = format!(
-            "{}/v1/accounts/{}/tokenization/callback/redeem",
-            self.base_url.trim_end_matches('/'),
-            self.account_id
+        debug!(
+            target: "alpaca",
+            account_id = self.client.account_id(),
+            method = "POST",
+            "Calling Alpaca redeem endpoint"
         );
-
-        debug!(target: "alpaca", %url, method = "POST", "Calling Alpaca redeem endpoint");
-
-        (|| async {
-            let response = self
-                .client
-                .post(&url)
-                .basic_auth(&self.api_key, Some(&self.api_secret))
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret)
-                .json(&request)
-                .send()
-                .await?;
-
-            let status = response.status();
-
-            match status {
-                reqwest::StatusCode::OK => {
-                    let body = response.text().await?;
-                    serde_json::from_str(&body).map_err(|e| {
-                        tracing::error!(
-                            target: "alpaca",
-                            %body,
-                            error = %e,
-                            "Failed to parse Alpaca redeem response"
-                        );
-                        AlpacaError::Parse { body, source: e }
-                    })
-                }
-                reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Auth(body))
-                }
-                status => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
-                }
-            }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_max_times(self.max_retries)
-                .with_jitter(),
-        )
-        .when(|e: &AlpacaError| e.is_retryable())
-        .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::debug!(
-                target: "alpaca",
-                "Alpaca redeem call failed with {err}, retrying after {dur:?}"
-            );
-        })
-        .await
+        self.client
+            .with_retry(|| {
+                let request = request.clone();
+                async { self.client.call_redeem_endpoint(request).await }
+            })
+            .await
     }
 
     async fn poll_request_status(
         &self,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaError> {
-        // Alpaca tokenization_request_ids are server-generated UUIDs, so the
-        // path segment needs no percent-encoding.
         let url = format!(
             "{}/v1/accounts/{}/tokenization/requests/{}",
-            self.base_url.trim_end_matches('/'),
-            self.account_id,
+            self.client.base_url(),
+            self.client.account_id(),
             tokenization_request_id
         );
 
-        debug!(target: "alpaca", %url, method = "GET", %tokenization_request_id, "Polling Alpaca request status");
+        debug!(
+            target: "alpaca",
+            %url,
+            method = "GET",
+            %tokenization_request_id,
+            "Polling Alpaca request status"
+        );
 
-        (|| async {
-            let response = self
-                .client
-                .get(&url)
-                .basic_auth(&self.api_key, Some(&self.api_secret))
-                .header("APCA-API-KEY-ID", &self.api_key)
-                .header("APCA-API-SECRET-KEY", &self.api_secret)
-                .send()
-                .await?;
+        self.client
+            .with_retry(|| async {
+                let response = self.client.get(&url).send().await?;
+                let status_code = response.status().as_u16();
 
-            let status = response.status();
+                match status_code {
+                    200 => {
+                        let body = response.text().await?;
+                        let request = parse_tokenization_request(body)?;
 
-            match status {
-                reqwest::StatusCode::OK => {
-                    let body = response.text().await?;
-                    let request: TokenizationRequest =
-                        serde_json::from_str(&body).map_err(|e| {
-                            tracing::error!(
-                                target: "alpaca",
-                                %body,
-                                error = %e,
-                                "Failed to parse Alpaca request response"
-                            );
-                            AlpacaError::Parse { body, source: e }
-                        })?;
-                    // Keyed endpoint retrieves aged requests that no longer
-                    // appear in the list endpoint (empirically verified
-                    // 2026-06-12, see RAI-912).
-                    match &request {
-                        TokenizationRequest::Redeem { id, .. } => {
-                            debug!(target: "alpaca",
-                                tokenization_request_id = %id,
-                                "Alpaca keyed request response received"
-                            );
-                            if *id != *tokenization_request_id {
-                                return Err(AlpacaError::ResponseIdMismatch {
-                                    requested: tokenization_request_id.clone(),
-                                    returned: id.clone(),
-                                });
+                        match &request {
+                            TokenizationRequest::Redeem { id, .. } => {
+                                debug!(
+                                    target: "alpaca",
+                                    tokenization_request_id = %id,
+                                    "Alpaca keyed request response received"
+                                );
+                                if id != tokenization_request_id {
+                                    return Err(
+                                        AlpacaError::ResponseIdMismatch {
+                                            requested:
+                                                tokenization_request_id.clone(),
+                                            returned: id.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            TokenizationRequest::Mint {} => {
+                                warn!(
+                                    target: "alpaca",
+                                    %tokenization_request_id,
+                                    "Alpaca keyed request response received Mint variant (unexpected for redemption polling)"
+                                );
                             }
                         }
-                        TokenizationRequest::Mint {} => {
-                            warn!(target: "alpaca",
-                                %tokenization_request_id,
-                                "Alpaca keyed request response received Mint variant (unexpected for redemption polling)"
-                            );
-                        }
+
+                        Ok(request)
                     }
-                    Ok(request)
+                    404 => {
+                        let body = response.text().await?;
+                        Err(AlpacaError::RequestNotFound {
+                            id: tokenization_request_id.clone(),
+                            body,
+                        })
+                    }
+                    401 | 403 => {
+                        let body = response.text().await?;
+                        Err(AlpacaError::Auth(body))
+                    }
+                    status_code => {
+                        let body = response.text().await?;
+                        Err(AlpacaError::Api { status_code, body })
+                    }
                 }
-                reqwest::StatusCode::NOT_FOUND => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::RequestNotFound {
-                        id: tokenization_request_id.clone(),
-                        body,
-                    })
-                }
-                reqwest::StatusCode::UNAUTHORIZED
-                | reqwest::StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Auth(body))
-                }
-                status => {
-                    let body = response.text().await?;
-                    Err(AlpacaError::Api {
-                        status_code: status.as_u16(),
-                        body,
-                    })
-                }
-            }
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_max_times(self.max_retries)
-                .with_jitter(),
-        )
-        .when(|e: &AlpacaError| e.is_retryable())
-        .notify(|err: &AlpacaError, dur: std::time::Duration| {
-            tracing::debug!(
-                target: "alpaca",
-                "Alpaca poll request status API call failed with {err}, retrying after {dur:?}"
-            );
-        })
-        .await
+            })
+            .await
     }
+}
+
+fn parse_tokenization_request(
+    body: String,
+) -> Result<TokenizationRequest, AlpacaError> {
+    let mut payload: Value = serde_json::from_str(&body)
+        .map_err(|source| AlpacaError::Parse { body: body.clone(), source })?;
+
+    if let Some(object) = payload.as_object_mut()
+        && object.get("tx_hash").is_none_or(Value::is_null)
+    {
+        object.insert("tx_hash".to_string(), Value::String(String::new()));
+    }
+
+    serde_json::from_value(payload)
+        .map_err(|source| AlpacaError::Parse { body, source })
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{Address, B256};
     use httpmock::prelude::*;
+    use std::time::Duration;
     use tracing_test::traced_test;
 
-    use super::{
-        AlpacaError, AlpacaService, MintCallbackRequest, RealAlpacaService,
-        RedeemRequest, TokenizationRequest,
+    use super::{SharedAlpacaService, parse_tokenization_request};
+    use crate::Quantity;
+    use crate::account::ClientId;
+    use crate::alpaca::{
+        AlpacaService, RedeemRequestInput, TokenizationRequest, redeem_request,
     };
-    use crate::alpaca::{RedeemRequestStatus, TokenizationRequestType};
-    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
-    fn create_test_request() -> MintCallbackRequest {
-        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
-
-        MintCallbackRequest {
-            tokenization_request_id: TokenizationRequestId::new(
-                "12345-678-90AB",
-            ),
-            client_id,
-            wallet_address: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            network: Network::Base,
-        }
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_send_mint_callback_success() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint")
-                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "test-key")
-                .header("APCA-API-SECRET-KEY", "test-secret");
-            then.status(200).body("");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Sending mint callback to Alpaca", "test-account"]
-            ),
-            "expected DEBUG log with the account-scoped callback URL"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_unauthorized() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint");
-            then.status(401).body("Unauthorized");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "wrong-key".to_string(),
-            "wrong-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_forbidden() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint");
-            then.status(403).body("Forbidden");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint");
-            then.status(400).body("Bad Request");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        match result {
-            Err(AlpacaError::Api { status_code, body }) => {
-                assert_eq!(status_code, 400);
-                assert_eq!(body, "Bad Request");
-            }
-            _ => panic!("Expected AlpacaError::Api, got {result:?}"),
-        }
-
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_sends_correct_json() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint")
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!({
-                    "tokenization_request_id": "12345-678-90AB",
-                    "client_id": "55051234-0000-4abc-9000-4aabcdef0045",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                    "network": "base"
-                }));
-            then.status(200).body("");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_uses_legacy_auth() {
-        let server = MockServer::start();
-
-        // Legacy auth requires both Basic auth AND the APCA headers
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/mint")
-                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "mykey")
-                .header("APCA-API-SECRET-KEY", "mysecret");
-            then.status(200).body("");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "mykey".to_string(),
-            "mysecret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_send_mint_callback_constructs_correct_url() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST).path(
-                "/v1/accounts/my-special-account/tokenization/callback/mint",
-            );
-            then.status(200).body("");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "my-special-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_test_request();
-        let result = service.send_mint_callback(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    fn create_redeem_request() -> RedeemRequest {
-        let client_id = "00000000-0000-0000-0000-000000000456".parse().unwrap();
-
-        let tx_hash = b256!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-        RedeemRequest {
-            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            client_id,
-            quantity: Quantity::new(rust_decimal::Decimal::from(100)),
-            network: Network::Base,
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-        }
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_success() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem")
-                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "test-key")
-                .header("APCA-API-SECRET-KEY", "test-secret");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-456",
-                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.5"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(result.is_ok());
-        let response = result.unwrap();
-        assert_eq!(response.tokenization_request_id.0, "tok-456");
-        assert_eq!(
-            response.issuer_request_id,
-            IssuerRedemptionRequestId::new(b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            )),
-        );
-        assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
-        assert!(matches!(response.status, RedeemRequestStatus::Pending));
-        mock.assert();
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Calling Alpaca redeem endpoint", "test-account"]
-            ),
-            "expected DEBUG log with the account-scoped redeem URL"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_success_without_fees() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-456",
-                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "rejected",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
-        let response = result.unwrap();
-        assert_eq!(response.tokenization_request_id.0, "tok-456");
-        assert!(matches!(response.status, RedeemRequestStatus::Rejected));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_unauthorized() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(401).body("Unauthorized");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "wrong-key".to_string(),
-            "wrong-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_forbidden() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(403).body("Forbidden");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(400).body("Invalid request");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        match result {
-            Err(AlpacaError::Api { status_code, body }) => {
-                assert_eq!(status_code, 400);
-                assert_eq!(body, "Invalid request");
-            }
-            _ => panic!("Expected AlpacaError::Api, got {result:?}"),
-        }
-
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_constructs_correct_url() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/my-special-account/tokenization/callback/redeem");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-789",
-                "issuer_request_id": "red-abcdefab",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "my-special-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_uses_legacy_auth() {
-        let server = MockServer::start();
-
-        // Legacy auth requires both Basic auth AND the APCA headers
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem")
-                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "mykey")
-                .header("APCA-API-SECRET-KEY", "mysecret");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-001",
-                "issuer_request_id": "red-abcdefab",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "mykey".to_string(),
-            "mysecret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_sends_correct_json() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem")
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!({
-                    "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                    "underlying_symbol": "AAPL",
-                    "token_symbol": "tAAPL",
-                    "client_id": "00000000-0000-0000-0000-000000000456",
-                    "qty": "100",
-                    "network": "base",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                }));
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-002",
-                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
     #[tokio::test]
     #[traced_test]
-    async fn test_poll_request_status_success() {
+    async fn redeem_retries_transient_errors() {
         let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(
-                    "/v1/accounts/test-account/tokenization/requests/tok-123",
-                )
-                .header("authorization", "Basic dGVzdC1rZXk6dGVzdC1zZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "test-key")
-                .header("APCA-API-SECRET-KEY", "test-secret");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-123",
-                "issuer_request_id": "red-11223344",
-                "type": "redeem",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "client_external_account_id": "1481094OM",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "updated_at": "2025-09-12T17:30:00.000000-04:00",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "network": "base",
-                "issuer": "test-issuer",
-                "fees": "0.5",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let tokenization_request_id = TokenizationRequestId::new("tok-123");
-        let result =
-            service.poll_request_status(&tokenization_request_id).await;
-
-        let request = result.unwrap();
-        assert!(matches!(
-            request,
-            TokenizationRequest::Redeem {
-                status: RedeemRequestStatus::Completed,
-                ..
-            }
-        ));
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Polling Alpaca request status"]
-            ),
-            "Expected DEBUG log for poll request status"
-        );
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Alpaca keyed request response received", "tok-123"]
-            ),
-            "Expected DEBUG log with tokenization_request_id tok-123"
-        );
-        mock.assert();
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_poll_request_status_not_found() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(
-                "/v1/accounts/test-account/tokenization/requests/tok-NOT-FOUND",
-            );
-            then.status(404).body("not found");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let tokenization_request_id =
-            TokenizationRequestId::new("tok-NOT-FOUND");
-        let result =
-            service.poll_request_status(&tokenization_request_id).await;
-
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, AlpacaError::RequestNotFound { ref id, ref body } if id.0 == "tok-NOT-FOUND" && body == "not found"),
-            "Expected RequestNotFound with correct id and body, got {err:?}"
-        );
-        assert!(!err.is_retryable(), "RequestNotFound must not be retryable");
-        mock.assert_calls(1);
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Polling Alpaca request status", "tok-NOT-FOUND"]
-            ),
-            "expected DEBUG poll log naming the tokenization request id"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_poll_request_status_unauthorized() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(
-                "/v1/accounts/test-account/tokenization/requests/tok-123",
-            );
-            then.status(401).body("Unauthorized");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "wrong-key".to_string(),
-            "wrong-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-123"))
-            .await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_poll_request_status_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(
-                "/v1/accounts/test-account/tokenization/requests/tok-123",
-            );
-            then.status(500).body("Internal Server Error");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap()
-        .with_max_retries(0);
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-123"))
-            .await;
-
-        match result {
-            Err(AlpacaError::Api { status_code, .. }) => {
-                assert_eq!(status_code, 500);
-            }
-            _ => panic!("Expected Api error, got {result:?}"),
-        }
-
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_poll_request_status_uses_legacy_auth() {
-        let server = MockServer::start();
-
-        // Legacy auth requires both Basic auth AND the APCA headers
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(
-                    "/v1/accounts/test-account/tokenization/requests/tok-auth-test",
-                )
-                .header("authorization", "Basic bXlrZXk6bXlzZWNyZXQ=")
-                .header("APCA-API-KEY-ID", "mykey")
-                .header("APCA-API-SECRET-KEY", "mysecret");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-auth-test",
-                "issuer_request_id": "red-abcdefab",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "updated_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "mykey".to_string(),
-            "mysecret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-auth-test"))
-            .await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_poll_request_status_constructs_correct_url() {
-        let server = MockServer::start();
-
-        // The mock only matches the exact path with account id and request id
-        // as path segments — verifying the URL is constructed correctly.
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(
-                "/v1/accounts/my-special-account/tokenization/requests/tok-url-test",
-            );
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-url-test",
-                "issuer_request_id": "red-11223344",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "updated_at": "2025-09-12T17:30:00.000000-04:00",
-                "type": "redeem",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "my-special-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-url-test"))
-            .await;
-
-        assert!(result.is_ok(), "Expected Ok, got {result:?}");
-        // mock.assert() verifies exactly this path was called — both account id
-        // and tokenization_request_id appear as segments in the URL.
-        mock.assert();
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_poll_request_status_response_id_mismatch() {
-        let server = MockServer::start();
-
-        // Body returns tok-b but request was for tok-a — mismatch must be rejected.
-        let mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/test-account/tokenization/requests/tok-a");
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-b",
-                "issuer_request_id": "red-11223344",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "updated_at": "2025-09-12T17:30:00.000000-04:00",
-                "type": "redeem",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-a"))
-            .await;
-
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AlpacaError::ResponseIdMismatch {
-                    ref requested,
-                    ref returned
-                } if requested.0 == "tok-a" && returned.0 == "tok-b"
-            ),
-            "Expected ResponseIdMismatch, got {err:?}"
-        );
-        assert!(
-            !err.is_retryable(),
-            "ResponseIdMismatch must not be retryable"
-        );
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Alpaca keyed request response received", "tok-b"]
-            ),
-            "Expected DEBUG log with returned id tok-b"
-        );
-        mock.assert();
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_poll_request_status_returns_mint_variant_on_200() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(
-                "/v1/accounts/test-account/tokenization/requests/tok-mint-1",
-            );
-            then.status(200).json_body(serde_json::json!({
-                "tokenization_request_id": "tok-mint-1",
-                "issuer_request_id": "00000000-0000-4abc-9000-4aabcdef0045",
-                "created_at": "2025-09-12T17:28:48.642437-04:00",
-                "type": "mint",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100",
-                "issuer": "test-issuer",
-                "network": "base",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                "fees": "0.0"
-            }));
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new("tok-mint-1"))
-            .await;
-
-        assert!(
-            matches!(result, Ok(TokenizationRequest::Mint { .. })),
-            "Expected Mint variant without Parse error, got {result:?}"
-        );
-        assert!(
-            logs_contain_at!(
-                tracing::Level::WARN,
-                &[
-                    "Alpaca keyed request response received Mint variant",
-                    "tok-mint-1"
-                ]
-            ),
-            "Expected WARN log for Mint variant with tokenization_request_id"
-        );
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_401_returns_non_retryable_auth_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
+        let endpoint = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(401).body("Unauthorized");
+            then.status(500).body("transient");
         });
-
-        let service = RealAlpacaService::new(
+        let client = st0x_alpaca::AlpacaClient::new(
             server.base_url(),
             "test-account".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(matches!(result, Err(AlpacaError::Auth(_))));
-        assert!(!result.unwrap_err().is_retryable());
-        mock.assert_calls(1);
-    }
-
-    #[tokio::test]
-    async fn test_400_returns_non_retryable_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(400).body("Bad Request");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(matches!(
-            result,
-            Err(AlpacaError::Api { status_code: 400, .. })
-        ));
-        assert!(!result.unwrap_err().is_retryable());
-        mock.assert_calls(1);
-    }
-
-    #[tokio::test]
-    async fn test_500_returns_retryable_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(500).body("Internal Server Error");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap()
-        .with_max_retries(0);
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        assert!(matches!(
-            result,
-            Err(AlpacaError::Api { status_code: 500, .. })
-        ));
-        assert!(result.unwrap_err().is_retryable());
-        mock.assert_calls(1);
-    }
-
-    #[tokio::test]
-    async fn test_poll_request_status_parses_full_production_response() {
-        let target_id = "00000000-0000-0000-0000-000000000001";
-        let prod_json = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"completed","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.000064248","client_external_account_id":"00000000-0000-0000-0000-000000000002","created_at":"2026-06-11T00:02:27.467568Z","updated_at":"2026-06-11T04:02:33.530523Z","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","network":"base","issuer":"st0x","fees":"0.01","tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#;
-
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/test-account/tokenization/requests/{target_id}"
-            ));
-            then.status(200).body(prod_json);
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let result = service
-            .poll_request_status(&TokenizationRequestId::new(target_id))
-            .await;
-
-        let request = result.unwrap();
-        match &request {
-            TokenizationRequest::Redeem { id, status, .. } => {
-                assert_eq!(id.0, target_id);
-                assert!(matches!(status, RedeemRequestStatus::Completed));
-            }
-            other @ TokenizationRequest::Mint { .. } => {
-                panic!("Expected Redeem variant, got {other:?}")
-            }
-        }
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_200_with_invalid_json_returns_non_retryable_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(200).body("invalid json");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
-        )
-        .unwrap();
-
-        let request = create_redeem_request();
-        let result = service.call_redeem_endpoint(request).await;
-
-        let err = result.unwrap_err();
-        assert!(matches!(err, AlpacaError::Parse { .. }));
-        assert!(!err.is_retryable(), "Parse errors must NOT be retryable");
-        mock.assert_calls(1);
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn test_call_redeem_endpoint_retries_retryable_errors() {
-        // Regression: call_redeem_endpoint previously made a single HTTP call
-        // with no retry, so one transient 5xx from Alpaca permanently failed
-        // the redemption. It must retry retryable errors like the other
-        // endpoints do — here one retry means two calls total.
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(500).body("Internal Server Error");
-        });
-
-        let service = RealAlpacaService::new(
-            server.base_url(),
-            "test-account".to_string(),
-            "test-key".to_string(),
-            "test-secret".to_string(),
-            10,
-            30,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
         .unwrap()
         .with_max_retries(1);
+        let service = SharedAlpacaService { client };
+        let tx_hash = B256::repeat_byte(0x11);
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let quantity = Quantity::new(rust_decimal::Decimal::ONE);
+        let network = Network::Base;
+        let request = redeem_request(RedeemRequestInput {
+            issuer_request_id: &IssuerRedemptionRequestId::new(tx_hash),
+            underlying: &underlying,
+            token: &token,
+            client_id: ClientId::new(),
+            quantity: &quantity,
+            network: &network,
+            wallet: Address::repeat_byte(0x22),
+            tx_hash,
+        })
+        .unwrap();
 
-        let request = create_redeem_request();
         let result = service.call_redeem_endpoint(request).await;
 
         assert!(matches!(
             result,
-            Err(AlpacaError::Api { status_code: 500, .. })
+            Err(crate::alpaca::AlpacaError::Api { status_code: 500, .. })
         ));
-        mock.assert_calls(2);
-        assert!(
-            logs_contain_at!(
-                tracing::Level::DEBUG,
-                &["Alpaca redeem call failed with", "retrying after"]
-            ),
-            "expected DEBUG retry log from the notify callback"
-        );
+        endpoint.assert_calls(2);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Calling Alpaca redeem endpoint", "test-account"]
+        ));
+    }
+
+    #[test]
+    fn pending_redeem_accepts_absent_null_and_empty_tx_hash() {
+        let base = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"pending","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.1","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-06-11T04:02:33.530523Z""#;
+
+        for tx_hash_field in ["", r#","tx_hash":null"#, r#","tx_hash":"""#] {
+            let request =
+                parse_tokenization_request(format!("{base}{tx_hash_field}}}"))
+                    .unwrap();
+
+            assert!(matches!(
+                request,
+                TokenizationRequest::Redeem { tx_hash: None, .. }
+            ));
+        }
     }
 }

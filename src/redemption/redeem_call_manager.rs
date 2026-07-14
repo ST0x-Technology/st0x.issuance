@@ -12,7 +12,10 @@ use super::{
 use crate::QuantityConversionError;
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
-use crate::alpaca::{AlpacaError, AlpacaService, RedeemRequest};
+use crate::alpaca::{
+    AlpacaBoundaryError, AlpacaError, AlpacaService, RedeemRequestInput,
+    issuance_tokenization_request_id, redeem_request,
+};
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, list_enabled_assets,
 };
@@ -220,20 +223,20 @@ impl RedeemCallManager {
             "Calling Alpaca redeem endpoint"
         );
 
-        let request = RedeemRequest {
-            issuer_request_id: issuer_request_id.clone(),
-            underlying: metadata.underlying.clone(),
-            token: metadata.token.clone(),
+        let request = redeem_request(RedeemRequestInput {
+            issuer_request_id,
+            underlying: &metadata.underlying,
+            token: &metadata.token,
             client_id,
-            quantity: alpaca_quantity.clone(),
-            network,
+            quantity: &alpaca_quantity,
+            network: &network,
             wallet: metadata.wallet,
             tx_hash: metadata.detected_tx_hash,
-        };
+        })?;
 
         match self.alpaca_service.call_redeem_endpoint(request).await {
             Ok(response) => {
-                info!(target: "redemption", issuer_request_id = %response.issuer_request_id,
+                info!(target: "redemption", issuer_request_id = %response.issuer_request_id.0,
                     tokenization_request_id = %response.tokenization_request_id.0,
                     r#type = ?response.r#type,
                     status = ?response.status,
@@ -254,8 +257,10 @@ impl RedeemCallManager {
                         issuer_request_id,
                         RedemptionCommand::RecordAlpacaCall {
                             issuer_request_id: issuer_request_id.clone(),
-                            tokenization_request_id: response
-                                .tokenization_request_id,
+                            tokenization_request_id:
+                                issuance_tokenization_request_id(
+                                    response.tokenization_request_id,
+                                ),
                             alpaca_quantity,
                             dust_quantity,
                         },
@@ -298,6 +303,8 @@ impl RedeemCallManager {
 pub(crate) enum RedeemCallManagerError {
     #[error("Alpaca error: {0}")]
     Alpaca(#[from] AlpacaError),
+    #[error("Alpaca boundary conversion error: {0}")]
+    AlpacaBoundary(#[from] AlpacaBoundaryError),
     #[error("CQRS error: {0}")]
     Cqrs(Box<AggregateError<LifecycleError<Redemption>>>),
     #[error("Invalid aggregate state: {current_state}")]
