@@ -81,7 +81,7 @@ pub(crate) enum IssuerRedemptionRequestId {
 
 impl IssuerRedemptionRequestId {
     #[must_use]
-    pub(crate) const fn new(tx_hash: TxHash) -> Self {
+    pub const fn new(tx_hash: TxHash) -> Self {
         Self::Full(tx_hash)
     }
 
