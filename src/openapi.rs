@@ -32,6 +32,7 @@ expressed as an OpenAPI scheme."
         crate::admin::reprocess_mint,
         crate::admin::close_mint,
         crate::admin::list_stuck,
+        crate::admin::schedule_freeze_window,
     ),
     components(schemas(
         st0x_issuance_dto::TokenizedAssetDetailResponse,
@@ -53,6 +54,8 @@ expressed as an OpenAPI scheme."
         crate::admin::CloseRedemptionRequest,
         crate::admin::ForceCompleteRedemptionRequest,
         crate::admin::CloseMintRequest,
+        crate::admin::ScheduleFreezeWindowRequest,
+        crate::admin::ScheduleFreezeWindowResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -107,6 +110,7 @@ mod tests {
             "/admin/force-complete/redemption/{issuer_request_id}",
             "/admin/reprocess/mint/{aggregate_id}",
             "/admin/close/mint/{aggregate_id}",
+            "/admin/freeze-schedules",
         ] {
             assert!(
                 paths.contains_key(path),

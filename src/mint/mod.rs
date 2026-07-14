@@ -20,6 +20,8 @@ use crate::vault::{PreparedMintTx, TxId, UnconfiguredNetworkError};
 
 pub use api::MintResponse;
 
+#[cfg(test)]
+pub(crate) use api::test_utils;
 pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use cmd::MintCommand;
 pub(crate) use event::MintEvent;

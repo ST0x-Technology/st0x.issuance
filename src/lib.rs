@@ -270,11 +270,11 @@ pub async fn initialize_rocket(
     let (tokenized_asset_store, _tokenized_asset_projection) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
-    // The server never dispatches Underlying commands (freeze/unfreeze are
-    // issuer-CLI actions), but startup must still reconcile the schema version
-    // and catch the `underlying_view` projection up with the event log.
+    // Startup must reconcile the Underlying schema version and catch the
+    // `underlying_view` projection up before the CLI or scheduled freeze worker
+    // dispatches freeze/unfreeze commands.
     prepare_event_sourced_startup::<Underlying>(&pool).await?;
-    let (_underlying_store, _underlying_projection) =
+    let (underlying_store, _underlying_projection) =
         StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
     prepare_event_sourced_startup::<Account>(&pool).await?;
@@ -446,6 +446,11 @@ pub async fn initialize_rocket(
         }
     }
 
+    spawn_freeze_schedule_worker(apalis_pool.clone(), underlying_store);
+
+    let freeze_scheduler =
+        tokenized_asset::schedule::FreezeScheduler::new(&apalis_pool);
+
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
@@ -460,6 +465,7 @@ pub async fn initialize_rocket(
             as Arc<dyn admin::RedemptionBurnRecovery>,
         vault_services: network_vault_services,
         configured_networks,
+        freeze_scheduler,
     }))
 }
 
@@ -476,6 +482,7 @@ struct RocketState {
     burn_recovery: Arc<dyn admin::RedemptionBurnRecovery>,
     vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
+    freeze_scheduler: tokenized_asset::schedule::FreezeScheduler,
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -504,6 +511,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.configured_networks)
         .manage(state.pool)
         .manage(state.apalis_pool)
+        .manage(state.freeze_scheduler)
         .mount(
             "/",
             routes![
@@ -523,6 +531,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
                 admin::reprocess_mint,
                 admin::close_mint,
                 admin::list_stuck,
+                admin::schedule_freeze_window,
             ],
         )
         .register("/", catchers::json_catchers());
@@ -1733,6 +1742,25 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
         apalis_pool,
         Arc::new(SendCallbackContext { mint_store, alpaca }),
         "mint-callback-worker",
+    );
+}
+
+/// Spawns the drainer worker for scheduled freeze/unfreeze transitions armed
+/// via [`tokenized_asset::schedule::FreezeScheduler`]. Same supervision story
+/// as the mint job workers: fresh worker id per registration, restart loop on
+/// transient failures.
+fn spawn_freeze_schedule_worker(
+    apalis_pool: ApalisSqlitePool,
+    underlying_store: Arc<Store<Underlying>>,
+) {
+    spawn_drainer_worker!(
+        ::<tokenized_asset::schedule::FreezeScheduleCtx,
+            tokenized_asset::schedule::ApplyFreezeTransition>,
+        apalis_pool,
+        Arc::new(tokenized_asset::schedule::FreezeScheduleCtx {
+            underlying_store
+        }),
+        "freeze-schedule-worker",
     );
 }
 

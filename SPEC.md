@@ -751,6 +751,23 @@ action) resolve by `{underlying}:{network}` and take a required
 `--network <NETWORK>` flag (wire value) — there is deliberately no default
 network so an operator can never target the wrong chain's listing by omission.
 
+**Scheduled freeze windows.** For a corporate action known in advance (an
+ex-date), the freeze/unfreeze pair can be armed ahead of time instead of fired
+by hand at the exact instants. `POST /admin/freeze-schedules` (internal
+API-key + IP-allowlist auth, like all admin endpoints) takes an underlying and a
+`freeze_at`/`unfreeze_at` window and enqueues two durable apalis jobs — a
+`Freeze` at `freeze_at` and an `Unfreeze` at `unfreeze_at`. The worker
+dispatches the exact same `Underlying` commands the CLI does; only the
+trigger differs. Scheduled transitions survive restarts (apalis persists the due
+time), re-posting an identical window is an idempotent no-op (jobs are keyed by
+underlying + scheduled instant), and the commands themselves are idempotent, so
+a scheduled transition landing on an already-transitioned asset is harmless. An
+inverted window is rejected with 422; a fully elapsed window is rejected rather
+than flapping the asset; a `freeze_at` already in the past with `unfreeze_at`
+still ahead (window in progress) freezes immediately. This is the schedule
+mechanism the automated corporate-actions sourcing (M3) feeds; until then an
+operator arms windows manually.
+
 ## Services
 
 Aggregates use services to interact with external systems while keeping business

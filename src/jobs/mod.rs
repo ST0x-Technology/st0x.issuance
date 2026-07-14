@@ -96,6 +96,26 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static>
         Ok(TaskSink::push_task(&mut self.0, task).await?)
     }
 
+    /// Atomically enqueues a batch of scheduled tasks.
+    ///
+    /// The SQLite sink flushes the batch in one statement, so callers whose
+    /// tasks form one domain operation cannot persist only a prefix when an
+    /// insert fails.
+    pub(crate) async fn push_scheduled_batch<const N: usize>(
+        &mut self,
+        tasks: [(Task, String, Duration); N],
+    ) -> Result<(), QueuePushError> {
+        let mut tasks = futures::stream::iter(tasks.map(
+            |(task, idempotency_key, run_after)| {
+                TaskBuilder::new(task)
+                    .with_idempotency_key(idempotency_key)
+                    .run_after(run_after)
+                    .build()
+            },
+        ));
+        Ok(TaskSink::push_all(&mut self.0, &mut tasks).await?)
+    }
+
     /// Consumes the queue into the underlying `SqliteStorage` a worker drains.
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0

@@ -2,6 +2,7 @@ pub(crate) mod api;
 pub(crate) mod cli;
 mod cmd;
 mod event;
+pub(crate) mod schedule;
 pub(crate) mod view;
 
 use alloy::primitives::Address;

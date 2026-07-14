@@ -34,6 +34,7 @@ use crate::redemption::{
     find_stuck as find_stuck_redemptions,
     next_burn_retry_external_tx_id_from_history,
 };
+use crate::tokenized_asset::schedule::{FreezeScheduleError, FreezeScheduler};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
     BurnVerification, NetworkVaultServices, TxId, VaultError, VaultService,
@@ -1882,6 +1883,93 @@ fn mint_history_summary_from_events(
     }
 
     summary
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct ScheduleFreezeWindowRequest {
+    /// Underlying symbol whose supply freezes for the corporate action.
+    underlying: UnderlyingSymbol,
+    /// Instant the `Freeze` fires. May already be in the past for an
+    /// in-progress window (the freeze then applies immediately).
+    #[schema(value_type = String)]
+    freeze_at: DateTime<Utc>,
+    /// Instant the `Unfreeze` fires. Must be after `freeze_at` and in the
+    /// future.
+    #[schema(value_type = String)]
+    unfreeze_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ScheduleFreezeWindowResponse {
+    underlying: UnderlyingSymbol,
+    #[schema(value_type = String)]
+    freeze_at: DateTime<Utc>,
+    #[schema(value_type = String)]
+    unfreeze_at: DateTime<Utc>,
+    message: String,
+}
+
+/// Admin endpoint arming a scheduled freeze window for one asset.
+///
+/// Enqueues the durable `Freeze`/`Unfreeze` job pair (see
+/// `tokenized_asset::schedule`); re-posting the identical window is an
+/// idempotent no-op. This is the manual schedule source until the Alpaca
+/// corporate-actions sync arms windows automatically.
+#[utoipa::path(
+    post,
+    path = "/admin/freeze-schedules",
+    tag = "admin",
+    request_body = ScheduleFreezeWindowRequest,
+    responses(
+        (status = 200, description = "Freeze window armed",
+            body = ScheduleFreezeWindowResponse),
+        (status = 422, description = "Inverted or already-elapsed window"),
+        (status = 500, description = "Failed to enqueue the schedule jobs")
+    ),
+    security(("internal_api_key" = []))
+)]
+#[tracing::instrument(skip(_auth, scheduler))]
+#[post("/admin/freeze-schedules", format = "json", data = "<body>")]
+pub(crate) async fn schedule_freeze_window(
+    _auth: InternalAuth,
+    scheduler: &rocket::State<FreezeScheduler>,
+    body: Json<ScheduleFreezeWindowRequest>,
+) -> Result<Json<ScheduleFreezeWindowResponse>, Status> {
+    let ScheduleFreezeWindowRequest { underlying, freeze_at, unfreeze_at } =
+        body.into_inner();
+
+    let mut scheduler = scheduler.inner().clone();
+    scheduler
+        .schedule_window(&underlying, freeze_at, unfreeze_at, Utc::now())
+        .await
+        .map_err(|err| {
+            error!(target: "admin", underlying = %underlying,
+                %freeze_at,
+                %unfreeze_at,
+                error = %err,
+                "Failed to arm freeze window"
+            );
+            match err {
+                FreezeScheduleError::InvertedWindow { .. }
+                | FreezeScheduleError::ElapsedWindow { .. } => {
+                    Status::UnprocessableEntity
+                }
+                FreezeScheduleError::Push(_) => Status::InternalServerError,
+            }
+        })?;
+
+    info!(target: "admin", underlying = %underlying,
+        %freeze_at,
+        %unfreeze_at,
+        "Freeze window armed"
+    );
+
+    Ok(Json(ScheduleFreezeWindowResponse {
+        underlying,
+        freeze_at,
+        unfreeze_at,
+        message: "Freeze window armed".to_string(),
+    }))
 }
 
 #[cfg(test)]
