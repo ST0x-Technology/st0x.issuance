@@ -569,6 +569,8 @@ pub fn create_config_with_db(
             connect_timeout_secs: 10,
             request_timeout_secs: 30,
         },
+        lifecycle_notifications:
+            st0x_issuance::LifecycleNotificationsConfig::disabled(),
         chains: vec![ChainConfig {
             network: Network::Base,
             chain_id: evm.chain_id,

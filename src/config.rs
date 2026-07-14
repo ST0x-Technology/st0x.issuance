@@ -13,6 +13,9 @@ use crate::auth::AuthConfig;
 use crate::chain::{
     ChainConfig, ChainRegistry, ChainRegistryError, build_chain_registry,
 };
+use crate::notifications::{
+    LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
+};
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
@@ -220,6 +223,8 @@ pub struct Config {
     pub environment: Environment,
     pub hyperdx: Option<HyperDxConfig>,
     pub alpaca: AlpacaConfig,
+    /// Optional operator lifecycle-notification delivery configuration.
+    pub lifecycle_notifications: LifecycleNotificationsConfig,
     /// All chain runtimes the registry is built from, Base first. Legacy flat
     /// env vars preserve the Base-only path; complete `CHAIN_<NETWORK>_*`
     /// groups override Base or append additional networks.
@@ -343,6 +348,9 @@ struct Env {
     hyperdx: HyperDxEnv,
 
     #[clap(flatten)]
+    notifications: LifecycleNotificationsEnv,
+
+    #[clap(flatten)]
     pub(crate) alpaca: AlpacaConfig,
 
     #[arg(
@@ -444,6 +452,13 @@ impl Env {
     fn into_config(self) -> Result<Config, ConfigError> {
         let log_level_tracing = (&self.log_level).into();
         let (base, chains) = self.chain_configs()?;
+        let LifecycleNotificationsEnv { bot_token, chat_id, message_thread_id } =
+            self.notifications;
+        let lifecycle_notifications = LifecycleNotificationsConfig::assemble(
+            bot_token,
+            chat_id,
+            message_thread_id,
+        )?;
         let rpc_url = base.rpc_url.clone();
         let chain_id = base.chain_id;
         let backfill_start_block = base.backfill_start_block;
@@ -489,6 +504,7 @@ impl Env {
             environment: self.environment,
             hyperdx,
             alpaca: self.alpaca,
+            lifecycle_notifications,
             chains,
             vault_mode_config,
         })
@@ -620,6 +636,30 @@ struct ChainGroupEnv<'env> {
     backfill_start_block: Option<u64>,
 }
 
+#[derive(Args, Clone)]
+struct LifecycleNotificationsEnv {
+    #[arg(
+        long = "telegram-bot-token",
+        env = "TELEGRAM_BOT_TOKEN",
+        help = "Telegram bot token used for lifecycle notifications"
+    )]
+    bot_token: Option<String>,
+    #[arg(
+        long = "telegram-chat-id",
+        env = "TELEGRAM_CHAT_ID",
+        allow_negative_numbers = true,
+        help = "Telegram chat ID that receives lifecycle notifications"
+    )]
+    chat_id: Option<i64>,
+    #[arg(
+        long = "telegram-message-thread-id",
+        env = "TELEGRAM_MESSAGE_THREAD_ID",
+        requires_all = ["bot_token", "chat_id"],
+        help = "Telegram message thread ID that receives lifecycle notifications"
+    )]
+    message_thread_id: Option<i64>,
+}
+
 #[derive(clap::ValueEnum, Debug, Clone)]
 pub enum LogLevel {
     Trace,
@@ -720,6 +760,8 @@ pub enum ConfigError {
     },
     #[error("chain registry initialization failed: {0}")]
     ChainRegistry(#[source] Box<ChainRegistryError>),
+    #[error(transparent)]
+    LifecycleNotifications(#[from] LifecycleNotificationsConfigError),
     #[error("Failed to read config file '{path}': {error}")]
     ConfigFileRead {
         path: PathBuf,
@@ -977,6 +1019,7 @@ const DOMAIN_TARGETS: &[&str] = &[
     "wallet",
     "admin",
     "vault",
+    "notifications",
 ];
 
 /// Builds a default `EnvFilter` string that includes both the crate module
@@ -1260,6 +1303,56 @@ mod tests {
         args.extend_from_slice(&["--environment", "staging"]);
         let staging_env = Env::try_parse_from(args).unwrap();
         assert_eq!(staging_env.environment, Environment::Staging);
+    }
+
+    #[test]
+    fn lifecycle_notification_arguments_are_additive_and_validated_together() {
+        let disabled = Env::try_parse_from(minimal_args())
+            .unwrap()
+            .into_config()
+            .unwrap()
+            .lifecycle_notifications;
+        assert!(!disabled.is_enabled());
+
+        let mut enabled_args = minimal_args();
+        enabled_args.extend_from_slice(&[
+            "--telegram-bot-token",
+            "123:abc",
+            "--telegram-chat-id",
+            "-1001234567890",
+            "--telegram-message-thread-id",
+            "42",
+        ]);
+        let enabled = Env::try_parse_from(enabled_args)
+            .unwrap()
+            .into_config()
+            .unwrap()
+            .lifecycle_notifications;
+        assert!(enabled.is_enabled());
+
+        let mut partial_args = minimal_args();
+        partial_args.extend_from_slice(&["--telegram-bot-token", "123:abc"]);
+        let result = Env::try_parse_from(partial_args).unwrap().into_config();
+        let Err(error) = result else {
+            panic!("partial notification configuration was accepted");
+        };
+        assert!(matches!(
+            error,
+            ConfigError::LifecycleNotifications(
+                LifecycleNotificationsConfigError::MissingChatId
+            )
+        ));
+
+        let mut thread_only_args = minimal_args();
+        thread_only_args
+            .extend_from_slice(&["--telegram-message-thread-id", "42"]);
+        let Err(error) = Env::try_parse_from(thread_only_args) else {
+            panic!("thread-only notification configuration was accepted");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
