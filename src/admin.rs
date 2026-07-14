@@ -3328,6 +3328,15 @@ mod tests {
                 }),
             }
         }
+
+        async fn list_dividend_announcements(
+            &self,
+            _since: chrono::NaiveDate,
+            _until: chrono::NaiveDate,
+        ) -> Result<Vec<crate::alpaca::DividendAnnouncement>, AlpacaError>
+        {
+            unimplemented!("not used in recover_post_alpaca tests")
+        }
     }
 
     fn test_metadata() -> RedemptionMetadata {
