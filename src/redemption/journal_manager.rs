@@ -818,6 +818,15 @@ mod tests {
                 }
             }
         }
+
+        async fn list_dividend_announcements(
+            &self,
+            _since: chrono::NaiveDate,
+            _until: chrono::NaiveDate,
+        ) -> Result<Vec<crate::alpaca::DividendAnnouncement>, AlpacaError>
+        {
+            unreachable!("not used in journal manager tests")
+        }
     }
 
     #[tokio::test]
@@ -1377,6 +1386,15 @@ mod tests {
                     updated_at: Some(chrono::Utc::now()),
                 })
             }
+
+            async fn list_dividend_announcements(
+                &self,
+                _since: chrono::NaiveDate,
+                _until: chrono::NaiveDate,
+            ) -> Result<Vec<crate::alpaca::DividendAnnouncement>, AlpacaError>
+            {
+                unreachable!("not used in journal manager tests")
+            }
         }
 
         let mock = Arc::new(QuantityMismatchMock {
@@ -1547,6 +1565,15 @@ mod tests {
                 _tokenization_request_id: &TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
                 Ok(TokenizationRequest::Mint {})
+            }
+
+            async fn list_dividend_announcements(
+                &self,
+                _since: chrono::NaiveDate,
+                _until: chrono::NaiveDate,
+            ) -> Result<Vec<crate::alpaca::DividendAnnouncement>, AlpacaError>
+            {
+                unreachable!("not used in journal manager tests")
             }
         }
 

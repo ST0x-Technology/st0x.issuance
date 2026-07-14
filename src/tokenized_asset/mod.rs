@@ -1,6 +1,7 @@
 pub(crate) mod api;
 pub(crate) mod cli;
 mod cmd;
+pub(crate) mod corporate_actions;
 mod event;
 pub(crate) mod schedule;
 pub(crate) mod view;

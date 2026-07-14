@@ -487,6 +487,14 @@ pub async fn initialize_rocket(
         pool.clone(),
     );
 
+    tokenized_asset::corporate_actions::spawn_corporate_actions_sync(
+        tokenized_asset::corporate_actions::CorporateActionsSync::new(
+            alpaca_service.clone(),
+            freeze_scheduler.clone(),
+            pool.clone(),
+        ),
+    );
+
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
         config,
