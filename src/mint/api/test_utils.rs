@@ -50,6 +50,7 @@ pub(crate) struct TestHarness {
     pub(crate) account_store: Arc<Store<Account>>,
     pub(crate) asset_store: Arc<Store<TokenizedAsset>>,
     pub(crate) mint_store: Arc<Store<Mint>>,
+    pub(crate) vault: Arc<dyn VaultService>,
 }
 
 impl TestHarness {
@@ -114,7 +115,7 @@ impl TestHarness {
 
         let bot = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mint_services = MintServices {
-            vault,
+            vault: vault.clone(),
             alpaca: Arc::new(MockAlpacaService::new_success()),
             pool: pool.clone(),
             bot,
@@ -139,7 +140,14 @@ impl TestHarness {
             .await
             .expect("Failed to create apalis pool");
 
-        Self { pool, apalis_pool, account_store, asset_store, mint_store }
+        Self {
+            pool,
+            apalis_pool,
+            account_store,
+            asset_store,
+            mint_store,
+            vault,
+        }
     }
 }
 

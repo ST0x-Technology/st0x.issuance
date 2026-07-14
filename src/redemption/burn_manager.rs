@@ -3,6 +3,7 @@ use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::view::{
@@ -13,12 +14,14 @@ use super::{
     RedemptionError, RedemptionEvent,
     next_burn_retry_external_tx_id_from_history,
 };
-use crate::mint::QuantityConversionError;
+use crate::mint::{QuantityConversionError, has_unresolved_mint_intent};
 use crate::receipt_inventory::{
     BurnPlan, BurnTrackingError, ReceiptRegistrationError, ReceiptService,
     Shares,
 };
-use crate::redemption::{BurnRecord, RedemptionMetadata};
+use crate::redemption::{
+    BurnRecord, RedemptionMetadata, has_unresolved_burn_intent,
+};
 use crate::tokenized_asset::UnderlyingSymbol;
 use crate::tokenized_asset::view::{
     TokenizedAssetViewError, find_vault_by_underlying,
@@ -26,6 +29,8 @@ use crate::tokenized_asset::view::{
 use crate::vault::{
     BurnVerification, MultiBurnEntry, TxId, VaultError, VaultService,
 };
+
+const WALLET_INTENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outcome of recovering a single redemption stuck in a burning state.
 ///
@@ -1096,8 +1101,59 @@ impl BurnManager {
         plan: BurnPlan,
         external_tx_id: Option<BurnExternalTxId>,
     ) -> Result<(), BurnManagerError> {
+        self.execute_burn_with_wallet_intent_timeout(
+            issuer_request_id,
+            vault,
+            plan,
+            external_tx_id,
+            WALLET_INTENT_WAIT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn execute_burn_with_wallet_intent_timeout(
+        &self,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        vault: Address,
+        plan: BurnPlan,
+        external_tx_id: Option<BurnExternalTxId>,
+        wait_timeout: Duration,
+    ) -> Result<(), BurnManagerError> {
         let execution = BurnExecutionPlan::new(vault, &plan, external_tx_id);
-        let wallet_guard = self.vault_service.lock_wallet().await;
+        let wallet_guard = if let Ok(result) = tokio::time::timeout(wait_timeout, async {
+            loop {
+                let wallet_guard = self.vault_service.lock_wallet().await;
+                let unresolved_mint =
+                    has_unresolved_mint_intent(&self.view_pool, None).await?;
+                let unresolved_burn = has_unresolved_burn_intent(
+                    &self.view_pool,
+                    Some(issuer_request_id),
+                )
+                .await?;
+                if !unresolved_mint && !unresolved_burn {
+                    return Ok::<_, BurnManagerError>(wallet_guard);
+                }
+
+                drop(wallet_guard);
+                debug!(target: "redemption",
+                    issuer_request_id = %issuer_request_id,
+                    "Waiting for an earlier wallet intent before preparing burn"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await {
+            result?
+        } else {
+            warn!(target: "redemption",
+                issuer_request_id = %issuer_request_id,
+                wait_ms = wait_timeout.as_millis(),
+                "Deferring burn after wallet-intent wait deadline"
+            );
+            return Err(BurnManagerError::WalletIntentWaitTimeout {
+                issuer_request_id: issuer_request_id.clone(),
+            });
+        };
         if !self.is_burn_execution_current(issuer_request_id).await? {
             return Ok(());
         }
@@ -1613,6 +1669,10 @@ pub(crate) enum BurnManagerError {
     SharesOverflow,
     #[error("Receipt reservation error: {0}")]
     ReceiptRegistration(#[from] ReceiptRegistrationError),
+    #[error(
+        "Timed out waiting to prepare burn for redemption {issuer_request_id} behind an earlier wallet intent"
+    )]
+    WalletIntentWaitTimeout { issuer_request_id: IssuerRedemptionRequestId },
 }
 
 #[cfg(test)]
@@ -1623,6 +1683,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use std::time::Duration;
     use tracing_test::traced_test;
 
     use super::{
@@ -1927,6 +1988,108 @@ mod tests {
                 .is_empty(),
             "successful burn must leave no dangling reservation"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn burn_wait_for_earlier_wallet_intent_is_bounded() {
+        let vault_mock = Arc::new(MockVaultService::new_success());
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        harness.add_asset(&underlying, vault).await;
+        harness
+            .discover_receipt(
+                vault,
+                uint!(42_U256),
+                uint!(100_000000000000000000_U256),
+            )
+            .await;
+
+        let unresolved_mint_id = IssuerMintRequestId::random().to_string();
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'Mint',
+                ?,
+                1,
+                'MintEvent::MintTxIntended',
+                '4.0',
+                '{}',
+                '{}'
+            )
+            ",
+        )
+        .bind(unresolved_mint_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let manager = BurnManager::new(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            TEST_WALLET,
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        let plan = manager
+            .plan_burn(
+                &issuer_request_id,
+                vault,
+                &underlying,
+                uint!(100_000000000000000000_U256),
+                U256::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.execute_burn_with_wallet_intent_timeout(
+                &issuer_request_id,
+                vault,
+                plan,
+                None,
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("wallet-intent wait must return before its deadline");
+
+        assert!(matches!(
+            result,
+            Err(BurnManagerError::WalletIntentWaitTimeout {
+                issuer_request_id: blocked_id,
+            }) if blocked_id == issuer_request_id
+        ));
+        assert_eq!(vault_mock.get_multi_burn_call_count(), 0);
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &[
+                "Deferring burn after wallet-intent wait deadline",
+                &issuer_request_id.to_string(),
+                "wait_ms=100",
+            ]
+        ));
+        let aggregate = store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .expect("redemption should still exist");
+        assert!(matches!(aggregate, Redemption::Burning { .. }));
     }
 
     #[traced_test]

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::vault::TxId;
+use crate::vault::{PreparedMintTx, TxId};
 
 use super::{
     ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
@@ -35,6 +35,12 @@ pub(crate) enum MintEvent {
     MintingStarted {
         issuer_request_id: IssuerMintRequestId,
         started_at: DateTime<Utc>,
+    },
+    /// Exact signed transaction persisted before any broadcast.
+    MintTxIntended {
+        issuer_request_id: IssuerMintRequestId,
+        prepared_tx: PreparedMintTx,
+        intended_at: DateTime<Utc>,
     },
     TokensMinted {
         issuer_request_id: IssuerMintRequestId,
@@ -107,6 +113,9 @@ impl DomainEvent for MintEvent {
             }
             Self::MintingStarted { .. } => {
                 "MintEvent::MintingStarted".to_string()
+            }
+            Self::MintTxIntended { .. } => {
+                "MintEvent::MintTxIntended".to_string()
             }
             Self::TokensMinted { .. } => "MintEvent::TokensMinted".to_string(),
             Self::MintingFailed { .. } => {

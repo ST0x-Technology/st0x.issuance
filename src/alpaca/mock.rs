@@ -4,6 +4,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use super::{
     AlpacaError, AlpacaService, Fees, MintCallbackRequest, RedeemRequest,
@@ -29,6 +30,7 @@ pub(crate) struct MockAlpacaService {
     should_succeed: bool,
     #[cfg(test)]
     error_message: Option<String>,
+    callback_delay_ms: u64,
     call_count: Arc<AtomicUsize>,
 }
 
@@ -41,6 +43,7 @@ impl MockAlpacaService {
             should_succeed: true,
             #[cfg(test)]
             error_message: None,
+            callback_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -55,8 +58,16 @@ impl MockAlpacaService {
         Self {
             should_succeed: false,
             error_message: Some(error_message.into()),
+            callback_delay_ms: 0,
             call_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_callback_delay(mut self, delay_ms: u64) -> Self {
+        self.callback_delay_ms = delay_ms;
+        self
     }
 
     /// Returns the number of times `send_mint_callback()` was called.
@@ -73,6 +84,10 @@ impl AlpacaService for MockAlpacaService {
         _request: MintCallbackRequest,
     ) -> Result<(), AlpacaError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        if self.callback_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.callback_delay_ms))
+                .await;
+        }
 
         #[cfg(test)]
         {

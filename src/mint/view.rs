@@ -1,31 +1,26 @@
 use alloy::primitives::{Address, B256, U256};
 use chrono::{DateTime, Utc};
+use event_sorcery::{Projection, ProjectionError};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use uuid::Uuid;
 
 use super::{
-    ClientId, IssuerMintRequestId, Network, Quantity, TokenSymbol,
+    ClientId, IssuerMintRequestId, Mint, Network, Quantity, TokenSymbol,
     TokenizationRequestId, UnderlyingSymbol,
 };
+use crate::vault::{PreparedMintTx, TxId};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MintViewError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    #[error("Projection error: {0}")]
+    Projection(#[from] ProjectionError<Mint>),
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
-    #[error("UUID parse error: {0}")]
-    Uuid(#[from] uuid::Error),
 }
 
-/// Read model for a mint, projected from the `mint_view` table.
+/// Query-oriented representation of a live `Mint` projection.
 ///
-/// `mint_view` stores the event-sorcery `Lifecycle<Mint>` payload
-/// (`{"Live": {...}}`). The `find_*` queries extract the `$.Live` sub-object —
-/// which is one of the live `Mint` variants — and deserialize it into this
-/// enum, which mirrors those variants field-for-field. `NotFound` is the
-/// query-miss sentinel and is never a deserialize target.
+/// `NotFound` is the query-miss sentinel and is never a deserialize target.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) enum MintView {
     #[default]
@@ -79,7 +74,22 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
     },
-    #[serde(alias = "FireblocksSubmitted")]
+    #[serde(alias = "TxIntended")]
+    MintIntended {
+        issuer_request_id: IssuerMintRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        minting_started_at: DateTime<Utc>,
+        prepared_tx: PreparedMintTx,
+    },
+    #[serde(alias = "FireblocksSubmitted", alias = "TxSubmitted")]
     MintTxSubmitted {
         issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
@@ -93,7 +103,7 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
         external_tx_id: String,
-        tx_id: String,
+        tx_id: TxId,
     },
     CallbackPending {
         issuer_request_id: IssuerMintRequestId,
@@ -154,6 +164,10 @@ pub(crate) enum MintView {
 }
 
 impl MintView {
+    fn from_mint(mint: Mint) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(serde_json::to_value(mint)?)
+    }
+
     #[cfg(test)]
     pub(crate) const fn state_name(&self) -> &'static str {
         match self {
@@ -162,6 +176,7 @@ impl MintView {
             Self::JournalConfirmed { .. } => "JournalConfirmed",
             Self::JournalRejected { .. } => "JournalRejected",
             Self::Minting { .. } => "Minting",
+            Self::MintIntended { .. } => "MintIntended",
             Self::MintTxSubmitted { .. } => "MintTxSubmitted",
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
@@ -175,25 +190,12 @@ pub(crate) async fn find_by_issuer_request_id(
     pool: &Pool<Sqlite>,
     issuer_request_id: &IssuerMintRequestId,
 ) -> Result<Option<MintView>, MintViewError> {
-    let issuer_request_id_str = issuer_request_id.to_string();
-    let row = sqlx::query!(
-        r#"
-        SELECT json_extract(payload, '$.Live') as "live: String"
-        FROM mint_view
-        WHERE view_id = ?
-        "#,
-        issuer_request_id_str
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(live) = row.and_then(|row| row.live) else {
-        return Ok(None);
-    };
-
-    let view: MintView = serde_json::from_str(&live)?;
-
-    Ok(Some(view))
+    Projection::<Mint>::sqlite(pool.clone())
+        .load(issuer_request_id)
+        .await?
+        .map(MintView::from_mint)
+        .transpose()
+        .map_err(Into::into)
 }
 
 /// Finds all mints that need recovery (not in terminal states).
@@ -202,28 +204,28 @@ pub(crate) async fn find_by_issuer_request_id(
 pub(crate) async fn find_all_recoverable_mints(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT
-            view_id as "view_id!: String",
-            json_extract(payload, '$.Live') as "live: String"
-        FROM mint_view
-        WHERE json_extract(payload, '$.Live.JournalConfirmed') IS NOT NULL
-           OR json_extract(payload, '$.Live.Minting') IS NOT NULL
-           OR json_extract(payload, '$.Live.MintTxSubmitted') IS NOT NULL
-           OR json_extract(payload, '$.Live.MintingFailed') IS NOT NULL
-           OR json_extract(payload, '$.Live.CallbackPending') IS NOT NULL
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .filter_map(|row| row.live.map(|live| (row.view_id, live)))
-        .map(|(view_id, live)| {
-            let view: MintView = serde_json::from_str(&live)?;
-            let id = Uuid::parse_str(&view_id)?;
-            Ok((IssuerMintRequestId::new(id), view))
+    Projection::<Mint>::sqlite(pool.clone())
+        .load_all()
+        .await?
+        .into_iter()
+        .map(|(issuer_request_id, mint)| {
+            MintView::from_mint(mint)
+                .map(|view| (issuer_request_id, view))
+                .map_err(Into::into)
+        })
+        .filter(|result| {
+            matches!(
+                result,
+                Ok((
+                    _,
+                    MintView::JournalConfirmed { .. }
+                        | MintView::Minting { .. }
+                        | MintView::MintIntended { .. }
+                        | MintView::MintTxSubmitted { .. }
+                        | MintView::MintingFailed { .. }
+                        | MintView::CallbackPending { .. }
+                ))
+            ) || result.is_err()
         })
         .collect()
 }
@@ -239,30 +241,30 @@ pub(crate) async fn find_all_recoverable_mints(
 pub(crate) async fn find_stuck(
     pool: &Pool<Sqlite>,
 ) -> Result<Vec<(IssuerMintRequestId, MintView)>, MintViewError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT
-            view_id as "view_id!: String",
-            json_extract(payload, '$.Live') as "live: String"
-        FROM mint_view
-        WHERE json_extract(payload, '$.Live.Initiated')           IS NOT NULL
-           OR json_extract(payload, '$.Live.JournalConfirmed')    IS NOT NULL
-           OR json_extract(payload, '$.Live.JournalRejected')     IS NOT NULL
-           OR json_extract(payload, '$.Live.Minting')             IS NOT NULL
-           OR json_extract(payload, '$.Live.MintTxSubmitted')     IS NOT NULL
-           OR json_extract(payload, '$.Live.CallbackPending')     IS NOT NULL
-           OR json_extract(payload, '$.Live.MintingFailed')       IS NOT NULL
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .filter_map(|row| row.live.map(|live| (row.view_id, live)))
-        .map(|(view_id, live)| {
-            let view: MintView = serde_json::from_str(&live)?;
-            let id = Uuid::parse_str(&view_id)?;
-            Ok((IssuerMintRequestId::new(id), view))
+    Projection::<Mint>::sqlite(pool.clone())
+        .load_all()
+        .await?
+        .into_iter()
+        .map(|(issuer_request_id, mint)| {
+            MintView::from_mint(mint)
+                .map(|view| (issuer_request_id, view))
+                .map_err(Into::into)
+        })
+        .filter(|result| {
+            matches!(
+                result,
+                Ok((
+                    _,
+                    MintView::Initiated { .. }
+                        | MintView::JournalConfirmed { .. }
+                        | MintView::JournalRejected { .. }
+                        | MintView::Minting { .. }
+                        | MintView::MintIntended { .. }
+                        | MintView::MintTxSubmitted { .. }
+                        | MintView::CallbackPending { .. }
+                        | MintView::MintingFailed { .. }
+                ))
+            ) || result.is_err()
         })
         .collect()
 }
@@ -281,19 +283,50 @@ mod tests {
     use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
     use crate::vault::mock::MockVaultService;
 
-    /// Inserts a `Lifecycle<Mint>`-shaped row into `mint_view` for a given live
-    /// `Mint` variant. The projection stores `{"Live": {"<Variant>": {...}}}`,
-    /// which the `find_*` query helpers read via `$.Live`; serializing a
-    /// `MintView` (which mirrors the live `Mint` variants field-for-field)
-    /// produces the `{"<Variant>": {...}}` body, so wrapping it under `Live`
-    /// reproduces exactly what the running projection would write.
+    /// Inserts a `Lifecycle<Mint>`-shaped row into `mint_view` for a given
+    /// query view. The adjusted variants reproduce the production `Mint`
+    /// serialization rather than the query-oriented `MintView` names.
     async fn insert_mint_view(
         pool: &Pool<Sqlite>,
         issuer_request_id: &IssuerMintRequestId,
         view: &MintView,
     ) {
         let view_id = issuer_request_id.to_string();
-        let live = serde_json::to_value(view).unwrap();
+        let mut live = serde_json::to_value(view).unwrap();
+        let variants = live.as_object_mut().unwrap();
+
+        if let Some(mut fields) = variants.remove("MintIntended") {
+            variants.insert("TxIntended".to_owned(), fields.take());
+        }
+
+        if let Some(mut fields) = variants.remove("MintTxSubmitted") {
+            fields
+                .as_object_mut()
+                .unwrap()
+                .insert("prepared_tx".to_owned(), serde_json::Value::Null);
+            variants.insert("TxSubmitted".to_owned(), fields.take());
+        }
+
+        if let Some(fields) = variants.get_mut("MintingFailed") {
+            let fields = fields.as_object_mut().unwrap();
+            let predecessor = serde_json::json!({
+                "JournalConfirmed": {
+                    "issuer_request_id": fields["issuer_request_id"],
+                    "tokenization_request_id": fields["tokenization_request_id"],
+                    "quantity": fields["quantity"],
+                    "underlying": fields["underlying"],
+                    "token": fields["token"],
+                    "network": fields["network"],
+                    "client_id": fields["client_id"],
+                    "wallet": fields["wallet"],
+                    "initiated_at": fields["initiated_at"],
+                    "journal_confirmed_at": fields["journal_confirmed_at"],
+                }
+            });
+            fields.insert("attempts".to_owned(), serde_json::json!(1));
+            fields.insert("failed_from".to_owned(), predecessor);
+        }
+
         let payload =
             serde_json::to_string(&serde_json::json!({ "Live": live }))
                 .unwrap();
@@ -443,7 +476,7 @@ mod tests {
         pool: &Pool<Sqlite>,
     ) -> Vec<IssuerMintRequestId> {
         let now = Utc::now();
-        let fields: Vec<_> = (0..5).map(|_| test_mint_fields()).collect();
+        let fields: Vec<_> = (0..6).map(|_| test_mint_fields()).collect();
 
         let views: Vec<MintView> = vec![
             MintView::JournalConfirmed {
@@ -475,7 +508,7 @@ mod tests {
                 journal_confirmed_at: now,
                 minting_started_at: now,
             },
-            MintView::MintTxSubmitted {
+            MintView::MintIntended {
                 issuer_request_id: fields[2].issuer_request_id.clone(),
                 tokenization_request_id: fields[2]
                     .tokenization_request_id
@@ -489,10 +522,9 @@ mod tests {
                 initiated_at: fields[2].initiated_at,
                 journal_confirmed_at: now,
                 minting_started_at: now,
-                external_tx_id: "mint-base".to_string(),
-                tx_id: "fb-1".to_string(),
+                prepared_tx: PreparedMintTx::default(),
             },
-            MintView::MintingFailed {
+            MintView::MintTxSubmitted {
                 issuer_request_id: fields[3].issuer_request_id.clone(),
                 tokenization_request_id: fields[3]
                     .tokenization_request_id
@@ -505,10 +537,11 @@ mod tests {
                 wallet: fields[3].wallet,
                 initiated_at: fields[3].initiated_at,
                 journal_confirmed_at: now,
-                error: "Transaction reverted".to_string(),
-                failed_at: now,
+                minting_started_at: now,
+                external_tx_id: "mint-base".to_string(),
+                tx_id: TxId::Legacy("fb-1".to_string()),
             },
-            MintView::CallbackPending {
+            MintView::MintingFailed {
                 issuer_request_id: fields[4].issuer_request_id.clone(),
                 tokenization_request_id: fields[4]
                     .tokenization_request_id
@@ -520,6 +553,22 @@ mod tests {
                 client_id: fields[4].client_id,
                 wallet: fields[4].wallet,
                 initiated_at: fields[4].initiated_at,
+                journal_confirmed_at: now,
+                error: "Transaction reverted".to_string(),
+                failed_at: now,
+            },
+            MintView::CallbackPending {
+                issuer_request_id: fields[5].issuer_request_id.clone(),
+                tokenization_request_id: fields[5]
+                    .tokenization_request_id
+                    .clone(),
+                quantity: fields[5].quantity.clone(),
+                underlying: fields[5].underlying.clone(),
+                token: fields[5].token.clone(),
+                network: fields[5].network.clone(),
+                client_id: fields[5].client_id,
+                wallet: fields[5].wallet,
+                initiated_at: fields[5].initiated_at,
                 journal_confirmed_at: now,
                 tx_hash: b256!(
                     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -590,7 +639,7 @@ mod tests {
 
         let results = find_all_recoverable_mints(&pool).await.unwrap();
 
-        assert_eq!(results.len(), 5, "Expected 5 recoverable mints");
+        assert_eq!(results.len(), 6, "Expected 6 recoverable mints");
 
         let result_ids: Vec<_> =
             results.iter().map(|(id, _)| id.clone()).collect();
@@ -605,6 +654,7 @@ mod tests {
             results.iter().map(|(_, view)| view.state_name()).collect();
         assert!(state_names.contains(&"JournalConfirmed"));
         assert!(state_names.contains(&"Minting"));
+        assert!(state_names.contains(&"MintIntended"));
         assert!(state_names.contains(&"MintTxSubmitted"));
         assert!(state_names.contains(&"MintingFailed"));
         assert!(state_names.contains(&"CallbackPending"));
@@ -712,8 +762,8 @@ mod tests {
 
         assert_eq!(
             results.len(),
-            7,
-            "Expected 7 non-terminal mints, got ids: {result_ids:?}"
+            8,
+            "Expected 8 non-terminal mints, got ids: {result_ids:?}"
         );
         for id in &recoverable_ids {
             assert!(result_ids.contains(id), "Should include {id}");
@@ -738,6 +788,7 @@ mod tests {
         assert!(state_names.contains(&"JournalConfirmed"));
         assert!(state_names.contains(&"JournalRejected"));
         assert!(state_names.contains(&"Minting"));
+        assert!(state_names.contains(&"MintIntended"));
         assert!(state_names.contains(&"MintTxSubmitted"));
         assert!(state_names.contains(&"MintingFailed"));
         assert!(state_names.contains(&"CallbackPending"));

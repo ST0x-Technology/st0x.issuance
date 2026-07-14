@@ -43,11 +43,16 @@ pub(crate) enum MintCommand {
         issuer_request_id: IssuerMintRequestId,
     },
 
+    /// Builds and signs the exact mint transaction, then persists it before
+    /// any broadcast.
+    PrepareMint {
+        issuer_request_id: IssuerMintRequestId,
+    },
+
     /// Submits the on-chain deposit (minting) transaction to the signing backend.
     ///
-    /// Requires `Minting` state (set by prior `Deposit` command). Performs vault
-    /// lookup, builds receipt info, and calls `submit_mint()`. Produces
-    /// `TxSubmitted` on success or `MintingFailed` on failure.
+    /// Requires `MintIntended` state (set by prior `PrepareMint` command) and
+    /// broadcasts only the persisted signed bytes.
     SubmitMint {
         issuer_request_id: IssuerMintRequestId,
     },
@@ -78,6 +83,14 @@ pub(crate) enum MintCommand {
     /// For mints in `CallbackPending` state:
     /// - Retries sending the callback
     Recover {
+        issuer_request_id: IssuerMintRequestId,
+        mode: MintRecoveryMode,
+    },
+
+    /// Runs only recovery work that is safe while holding the wallet lock.
+    /// If the mint concurrently advances to callback delivery, this command
+    /// becomes a no-op so the next recovery iteration can send it unlocked.
+    RecoverWalletStep {
         issuer_request_id: IssuerMintRequestId,
         mode: MintRecoveryMode,
     },
