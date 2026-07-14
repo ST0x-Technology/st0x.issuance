@@ -630,6 +630,7 @@ mod tests {
     use super::{TransferPollError, watch_redemption_flow};
     use crate::alpaca::mock::MockAlpacaService;
     use crate::config::VaultModeConfig;
+    use crate::notifications::NoopLifecycleNotifier;
     use crate::poll_checkpoint::{
         self, TRANSFER_POLL, advance_transfer_poll, load_transfer_poll,
     };
@@ -716,6 +717,7 @@ mod tests {
                 alpaca_service.clone(),
                 store.clone(),
                 pool.clone(),
+                Arc::new(NoopLifecycleNotifier),
             ),
         );
         let journal_manager =

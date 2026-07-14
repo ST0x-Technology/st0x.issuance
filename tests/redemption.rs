@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 
 use st0x_issuance::account::AccountLinkResponse;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
 
 use crate::harness::create_provider;
+use crate::harness::initialize_rocket;
 
 async fn perform_mint_flow(
     client: &Client,
@@ -500,8 +500,10 @@ async fn test_redemption_recovery_after_restart()
         "Bot should have shares during redemption"
     );
 
-    // "Crash" - drop the client and rocket instance
-    drop(client);
+    // Stop the first service completely before starting a second instance on
+    // the same database. Dropping a tracked client only starts graceful
+    // shutdown, so its burn job can otherwise race startup reconciliation.
+    client.terminate().await;
 
     // Flip the flag so polls now return "completed"
     poll_should_succeed.store(true, Ordering::SeqCst);

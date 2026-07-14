@@ -120,6 +120,13 @@ struct AggregateCqrsSetup {
     redemption_store: Arc<Store<Redemption>>,
 }
 
+struct StartupStores {
+    tokenized_asset: Arc<Store<TokenizedAsset>>,
+    underlying: Arc<Store<Underlying>>,
+    account: Arc<Store<Account>>,
+    receipt_inventory: Arc<Store<ReceiptInventory>>,
+}
+
 struct RedemptionManagers {
     redeem_call: Arc<RedeemCallManager>,
     journal: Arc<JournalManager>,
@@ -289,12 +296,12 @@ pub async fn initialize_rocket(
     // connects after the migrator has created them.
     let apalis_pool = create_apalis_pool(&config).await?;
 
-    let EventSourcedStores {
+    let StartupStores {
         tokenized_asset: tokenized_asset_store,
         underlying: underlying_store,
         account: account_store,
         receipt_inventory: receipt_inventory_store,
-    } = setup_event_sourced_stores(&pool).await?;
+    } = setup_startup_stores(&pool).await?;
 
     let chain_registry = config.create_chain_registry().await?;
     let base = chain_registry.base()?;
@@ -322,6 +329,7 @@ pub async fn initialize_rocket(
         &receipt_inventory_store,
         &pool,
         bot_wallet,
+        lifecycle_notifier.clone(),
     )?;
 
     // Reprojections must complete BEFORE recovery runs, so recovery queries
@@ -535,36 +543,29 @@ async fn prepare_corporate_action_feed(
     Ok(feed)
 }
 
-struct EventSourcedStores {
-    tokenized_asset: Arc<Store<TokenizedAsset>>,
-    underlying: Arc<Store<Underlying>>,
-    account: Arc<Store<Account>>,
-    receipt_inventory: Arc<Store<ReceiptInventory>>,
-}
-
-async fn setup_event_sourced_stores(
+async fn setup_startup_stores(
     pool: &Pool<Sqlite>,
-) -> Result<EventSourcedStores, anyhow::Error> {
+) -> Result<StartupStores, anyhow::Error> {
     prepare_event_sourced_startup::<TokenizedAsset>(pool).await?;
-    let (tokenized_asset, _tokenized_asset_projection) =
+    let (tokenized_asset, _) =
         StoreBuilder::<TokenizedAsset>::new(pool.clone()).build(()).await?;
 
     // Startup must reconcile the Underlying schema version and catch the
     // `underlying_view` projection up before the CLI or scheduled freeze worker
     // dispatches freeze/unfreeze commands.
     prepare_event_sourced_startup::<Underlying>(pool).await?;
-    let (underlying, _underlying_projection) =
+    let (underlying, _) =
         StoreBuilder::<Underlying>::new(pool.clone()).build(()).await?;
 
     prepare_event_sourced_startup::<Account>(pool).await?;
-    let (account, _account_projection) =
+    let (account, _) =
         StoreBuilder::<Account>::new(pool.clone()).build(()).await?;
 
     prepare_event_sourced_startup::<ReceiptInventory>(pool).await?;
     let receipt_inventory =
         StoreBuilder::<ReceiptInventory>::new(pool.clone()).build(()).await?;
 
-    Ok(EventSourcedStores {
+    Ok(StartupStores {
         tokenized_asset,
         underlying,
         account,
@@ -975,12 +976,14 @@ fn setup_redemption_managers(
     receipt_inventory_store: &Arc<Store<ReceiptInventory>>,
     pool: &Pool<Sqlite>,
     bot_wallet: Address,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
 ) -> Result<RedemptionManagers, anyhow::Error> {
     let alpaca_service = config.alpaca.service()?;
     let redeem_call = Arc::new(RedeemCallManager::new(
         alpaca_service.clone(),
         redemption_store.clone(),
         pool.clone(),
+        lifecycle_notifier,
     ));
     let journal = Arc::new(JournalManager::new(
         alpaca_service,
