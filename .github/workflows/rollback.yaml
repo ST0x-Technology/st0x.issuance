@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -17,16 +21,19 @@ env:
 jobs:
   rollback:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Validate confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirm }}
         run: |
-          if [ "${{ github.event.inputs.confirm }}" != "rollback" ]; then
+          if [ "$CONFIRMATION" != "rollback" ]; then
             echo "ERROR: Confirmation failed. You must type 'rollback' to proceed."
             exit 1
           fi
           echo "Confirmation validated. Proceeding with rollback..."
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
