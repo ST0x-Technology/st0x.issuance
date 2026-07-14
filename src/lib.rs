@@ -81,6 +81,7 @@ pub(crate) mod chain;
 pub(crate) mod config;
 pub mod fireblocks;
 pub(crate) mod jobs;
+pub(crate) mod notifications;
 mod openapi;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
@@ -94,6 +95,11 @@ pub use alpaca::AlpacaConfig;
 pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use chain::ChainConfig;
 pub use config::{Config, Environment, LogLevel, setup_tracing};
+pub use notifications::{
+    FreezeTransitionKind, LifecycleNotification, LifecycleNotificationsConfig,
+    LifecycleNotificationsConfigError, LifecycleNotifier,
+    NotificationBuildError, NotificationKind,
+};
 pub use st0x_issuance_dto::Network;
 pub use telemetry::TelemetryGuard;
 pub use test_utils::{
@@ -256,6 +262,27 @@ pub(crate) enum QuantityConversionError {
 pub async fn initialize_rocket(
     config: Config,
 ) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    initialize_rocket_with_notifications(
+        config,
+        LifecycleNotificationsConfig::disabled(),
+    )
+    .await
+}
+
+/// Initializes the Rocket server with operator lifecycle notifications.
+///
+/// The notification client is validated and built before any database,
+/// blockchain, or broker side effects occur.
+///
+/// # Errors
+///
+/// Returns an error if notification-client construction or any ordinary server
+/// initialization step fails.
+pub async fn initialize_rocket_with_notifications(
+    config: Config,
+    lifecycle_notifications: LifecycleNotificationsConfig,
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    let lifecycle_notifier = lifecycle_notifications.build_notifier()?;
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -480,7 +507,15 @@ pub async fn initialize_rocket(
         );
     }
 
-    spawn_freeze_schedule_worker(apalis_pool.clone(), underlying_store);
+    spawn_freeze_schedule_worker(
+        apalis_pool.clone(),
+        underlying_store,
+        lifecycle_notifier.clone(),
+    );
+    spawn_lifecycle_notification_worker(
+        apalis_pool.clone(),
+        lifecycle_notifier.clone(),
+    );
 
     let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
         &apalis_pool,
@@ -492,6 +527,7 @@ pub async fn initialize_rocket(
             alpaca_service.clone(),
             freeze_scheduler.clone(),
             pool.clone(),
+            lifecycle_notifier.clone(),
         ),
     );
 
@@ -510,6 +546,7 @@ pub async fn initialize_rocket(
         vault_services: network_vault_services,
         configured_networks,
         freeze_scheduler,
+        lifecycle_notifier,
         shutdown: shutdown_tx,
     }))
 }
@@ -528,6 +565,7 @@ struct RocketState {
     vault_services: NetworkVaultServices,
     configured_networks: ConfiguredNetworks,
     freeze_scheduler: tokenized_asset::schedule::FreezeScheduler,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
     /// Stops the spawned chain-scanning loops when the server shuts down.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -565,6 +603,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.burn_recovery)
         .manage(state.vault_services)
         .manage(state.configured_networks)
+        .manage(state.lifecycle_notifier)
         .manage(state.pool)
         .manage(state.apalis_pool)
         .manage(state.freeze_scheduler)
@@ -1819,16 +1858,32 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
 fn spawn_freeze_schedule_worker(
     apalis_pool: ApalisSqlitePool,
     underlying_store: Arc<Store<Underlying>>,
+    notifier: Arc<dyn LifecycleNotifier>,
 ) {
     spawn_drainer_worker!(
         ::<tokenized_asset::schedule::FreezeScheduleCtx,
             tokenized_asset::schedule::ApplyFreezeTransition>,
         apalis_pool,
         Arc::new(tokenized_asset::schedule::FreezeScheduleCtx {
-            underlying_store
+            underlying_store,
+            notifier,
         }),
         "freeze-schedule-worker",
         target: "asset",
+    );
+}
+
+fn spawn_lifecycle_notification_worker(
+    apalis_pool: ApalisSqlitePool,
+    notifier: Arc<dyn LifecycleNotifier>,
+) {
+    spawn_drainer_worker!(
+        ::<notifications::LifecycleNotificationJobCtx,
+            notifications::SendLifecycleNotification>,
+        apalis_pool,
+        Arc::new(notifications::LifecycleNotificationJobCtx { notifier }),
+        "lifecycle-notification-worker",
+        target: "notifications",
     );
 }
 

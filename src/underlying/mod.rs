@@ -125,6 +125,10 @@ impl ActiveFreezeHolds {
         self.0.contains(hold_id)
     }
 
+    fn contains_only(&self, hold_id: &FreezeHoldId) -> bool {
+        self.0.len() == 1 && self.contains(hold_id)
+    }
+
     fn with(&self, hold_id: FreezeHoldId) -> Self {
         let mut holds = self.0.clone();
         holds.insert(hold_id);
@@ -226,6 +230,19 @@ pub(crate) struct Underlying {
 impl Underlying {
     fn has_freeze_hold(&self, hold_id: &FreezeHoldId) -> bool {
         self.freeze_state.contains(hold_id)
+    }
+
+    pub(crate) const fn freeze_status(&self) -> AssetStatus {
+        self.freeze_state.status()
+    }
+
+    pub(crate) fn has_only_freeze_hold(&self, hold_id: &FreezeHoldId) -> bool {
+        match &self.freeze_state {
+            FreezeState::Enabled => false,
+            FreezeState::Frozen { active_freeze_holds } => {
+                active_freeze_holds.contains_only(hold_id)
+            }
+        }
     }
 }
 
