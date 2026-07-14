@@ -228,6 +228,10 @@ impl Underlying {
     fn has_freeze_hold(&self, hold_id: &FreezeHoldId) -> bool {
         self.freeze_state.contains(hold_id)
     }
+
+    pub(crate) const fn freeze_status(&self) -> AssetStatus {
+        self.freeze_state.status()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

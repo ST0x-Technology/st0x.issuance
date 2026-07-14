@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
 };
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -44,6 +44,7 @@ use crate::mint::{
         vacuum_terminal_mint_side_effect_jobs, vacuum_terminal_recovery_jobs,
     },
 };
+use crate::notifications::LifecycleNotifier;
 use crate::receipt_inventory::backfill::{
     NoOpItnHandler, ReceiptBackfillDeps, ReceiptBackfiller,
 };
@@ -84,6 +85,7 @@ pub(crate) mod catchers;
 pub(crate) mod chain;
 pub(crate) mod config;
 pub(crate) mod jobs;
+pub(crate) mod notifications;
 mod openapi;
 pub(crate) mod poll_checkpoint;
 pub mod receipt_inventory;
@@ -98,6 +100,9 @@ pub use auth::{AuthConfig, InternalIpWhitelist, IpWhitelist, IssuerApiKey};
 pub use chain::ChainConfig;
 pub use config::{
     Config, Environment, LogLevel, VaultMode, VaultModeConfig, setup_tracing,
+};
+pub use notifications::{
+    LifecycleNotificationsConfig, LifecycleNotificationsConfigError,
 };
 pub use st0x_issuance_dto::Network;
 pub use telemetry::TelemetryGuard;
@@ -261,6 +266,27 @@ pub(crate) enum QuantityConversionError {
 pub async fn initialize_rocket(
     config: Config,
 ) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    initialize_rocket_with_notifications(
+        config,
+        LifecycleNotificationsConfig::disabled(),
+    )
+    .await
+}
+
+/// Initializes the Rocket server with operator lifecycle notifications.
+///
+/// The notification client is validated and built before any database,
+/// blockchain, or broker side effects occur.
+///
+/// # Errors
+///
+/// Returns an error if notification-client construction or any ordinary server
+/// initialization step fails.
+pub async fn initialize_rocket_with_notifications(
+    config: Config,
+    lifecycle_notifications: LifecycleNotificationsConfig,
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    let lifecycle_notifier = lifecycle_notifications.build_notifier()?;
     let pool = create_pool(&config).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -466,27 +492,18 @@ pub async fn initialize_rocket(
         }
     }
 
-    // Non-fatal, mirroring the mint jobs: without the reset a transition
-    // crashed mid-run waits for apalis's orphan re-enqueue timeout, and
-    // without the vacuum terminal rows accumulate and hold idempotency keys.
-    if let Err(error) =
-        tokenized_asset::schedule::reset_orphaned_freeze_schedule_jobs(&pool)
-            .await
-    {
-        warn!(target: "asset", error = %error,
-            "Failed to reset orphaned freeze-schedule jobs"
-        );
-    }
-    if let Err(error) =
-        tokenized_asset::schedule::vacuum_terminal_freeze_schedule_jobs(&pool)
-            .await
-    {
-        warn!(target: "asset", error = %error,
-            "Failed to vacuum terminal freeze-schedule jobs"
-        );
-    }
+    maintain_background_job_tables(&pool).await;
 
-    spawn_freeze_schedule_worker(apalis_pool.clone(), underlying_store);
+    spawn_freeze_schedule_worker(
+        apalis_pool.clone(),
+        pool.clone(),
+        underlying_store,
+        lifecycle_notifier.clone(),
+    );
+    spawn_lifecycle_notification_worker(
+        apalis_pool.clone(),
+        lifecycle_notifier.clone(),
+    );
 
     let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
         &apalis_pool,
@@ -498,6 +515,7 @@ pub async fn initialize_rocket(
             alpaca_service.clone(),
             freeze_scheduler.clone(),
             pool.clone(),
+            lifecycle_notifier.clone(),
         ),
     );
 
@@ -517,8 +535,45 @@ pub async fn initialize_rocket(
         configured_networks,
         freeze_scheduler,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
+        lifecycle_notifier,
         shutdown: shutdown_tx,
     }))
+}
+
+async fn maintain_background_job_tables(pool: &Pool<Sqlite>) {
+    // Non-fatal, mirroring the mint jobs: without the reset a transition
+    // crashed mid-run waits for apalis's orphan re-enqueue timeout, and
+    // without the vacuum terminal rows accumulate and hold idempotency keys.
+    if let Err(error) =
+        tokenized_asset::schedule::reset_orphaned_freeze_schedule_jobs(pool)
+            .await
+    {
+        warn!(target: "asset", error = %error,
+            "Failed to reset orphaned freeze-schedule jobs"
+        );
+    }
+    if let Err(error) =
+        tokenized_asset::schedule::vacuum_terminal_freeze_schedule_jobs(pool)
+            .await
+    {
+        warn!(target: "asset", error = %error,
+            "Failed to vacuum terminal freeze-schedule jobs"
+        );
+    }
+    if let Err(error) =
+        notifications::reset_orphaned_lifecycle_notification_jobs(pool).await
+    {
+        warn!(target: "notifications", error = %error,
+            "Failed to reset orphaned lifecycle-notification jobs"
+        );
+    }
+    if let Err(error) =
+        notifications::vacuum_terminal_lifecycle_notification_jobs(pool).await
+    {
+        warn!(target: "notifications", error = %error,
+            "Failed to vacuum terminal lifecycle-notification jobs"
+        );
+    }
 }
 
 struct RocketState {
@@ -538,6 +593,7 @@ struct RocketState {
     /// Receipt inventory reads for the admin close-mint safety gate (the
     /// vault-direct landed check).
     receipts: Arc<dyn ReceiptService>,
+    lifecycle_notifier: Arc<dyn LifecycleNotifier>,
     /// Stops the spawned chain-scanning loops when the server shuts down.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -575,6 +631,7 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
         .manage(state.burn_recovery)
         .manage(state.vault_services)
         .manage(state.configured_networks)
+        .manage(state.lifecycle_notifier)
         .manage(state.pool)
         .manage(state.apalis_pool)
         .manage(state.freeze_scheduler)
@@ -1842,17 +1899,37 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
 /// transient failures.
 fn spawn_freeze_schedule_worker(
     apalis_pool: ApalisSqlitePool,
+    pool: SqlitePool,
     underlying_store: Arc<Store<Underlying>>,
+    notifier: Arc<dyn LifecycleNotifier>,
 ) {
     spawn_drainer_worker!(
         ::<tokenized_asset::schedule::FreezeScheduleCtx,
             tokenized_asset::schedule::ApplyFreezeTransition>,
         apalis_pool,
         Arc::new(tokenized_asset::schedule::FreezeScheduleCtx {
-            underlying_store
+            pool,
+            underlying_store,
+            notifier,
+            #[cfg(test)]
+            before_dispatch_barriers: None,
         }),
         "freeze-schedule-worker",
         target: "asset",
+    );
+}
+
+fn spawn_lifecycle_notification_worker(
+    apalis_pool: ApalisSqlitePool,
+    notifier: Arc<dyn LifecycleNotifier>,
+) {
+    spawn_drainer_worker!(
+        ::<notifications::LifecycleNotificationJobCtx,
+            notifications::SendLifecycleNotification>,
+        apalis_pool,
+        Arc::new(notifications::LifecycleNotificationJobCtx { notifier }),
+        "lifecycle-notification-worker",
+        target: "notifications",
     );
 }
 

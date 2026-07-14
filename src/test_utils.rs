@@ -1036,6 +1036,8 @@ pub(crate) fn domain_target_for_module(module: &str) -> &'static str {
         "admin"
     } else if module.contains("::vault") {
         "vault"
+    } else if module.contains("::notifications") {
+        "notifications"
     } else {
         "startup"
     }

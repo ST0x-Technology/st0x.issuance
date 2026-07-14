@@ -1116,9 +1116,9 @@ token symbol) stays on `TokenizedAsset`.
 
 **Aggregate State:**
 
-- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty set
-  of typed, independently owned `FreezeHoldId`s. Mints are rejected across all
-  networks while any hold remains, but listings stay supported and in-flight
+- `freeze_state`: `Enabled` when no holds exist, or `Frozen` with a non-empty
+  set of typed, independently owned `FreezeHoldId`s. Mints are rejected across
+  all networks while any hold remains, but listings stay supported and in-flight
   redemptions still complete.
 
 A stream originates on the first legacy `Frozen` or new `FreezeHoldAcquired`
@@ -1606,8 +1606,8 @@ scheduler itself so every schedule source inherits it); an inverted or
 sub-second window is rejected with 422 (apalis schedules at second granularity,
 so a sub-second window has no defined execution order); a fully elapsed window
 is rejected rather than flapping the asset; a `freeze_at` already in the past
-with `unfreeze_at` still ahead (window in progress) freezes immediately. This
-is the schedule mechanism both the manual admin endpoint and the automated
+with `unfreeze_at` still ahead (window in progress) freezes immediately. This is
+the schedule mechanism both the manual admin endpoint and the automated
 corporate-actions sourcing feed.
 
 **Corporate-actions sourcing.** A periodic sync (every 6 hours) lists upcoming
@@ -1622,6 +1622,28 @@ already elapsed are skipped; a failed pass is retried at the next interval, and
 because re-arming the same window is an idempotent no-op the sync needs no state
 of its own. The issuer CLI owns an independent operator hold and cannot release
 a corporate-action window's hold.
+
+**Operator lifecycle notifications.** The V1 corporate-actions workflow sends
+operator notifications to the same Telegram chat, topic, and bot used by the
+liquidity service. Issuance reports a newly scheduled or approaching corporate
+action, a freeze or unfreeze that was applied, a redemption that was held or
+resumed, and failures in those workflows. The liquidity dividend-bump command
+reports the completed NAV bump through that same channel.
+
+Notifications describe the lifecycle transition and its correlation identifier
+but never include wallet balances, raw token quantities, credentials, or signing
+material. Delivery happens only after the corresponding durable state transition
+succeeds. Telegram unavailability cannot roll back or fail the financial
+workflow. A separately queued `SendLifecycleNotification` job returns delivery
+failures to apalis so the durable row retries; direct best-effort delivery after
+an already-committed transition records a structured error instead. Replaying an
+idempotent command that produces no new domain transition does not emit another
+notification.
+
+Telegram configuration is all-or-none: bot token and chat id must either both be
+present or both be absent, and the forum topic is optional only when the channel
+is configured. Partial configuration fails startup. The bot token is redacted
+from all debug and error output.
 
 ## Orchestrator Migration (ST0xOrchestrator)
 
