@@ -4,11 +4,15 @@ on: [push]
 
 concurrency:
   group: ${{ github.ref }}-rainix
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
@@ -22,7 +26,7 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           submodules: recursive
           fetch-depth: 0
@@ -35,10 +39,13 @@ jobs:
             keep-outputs = true
 
       - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
+          paths: |
+            ~/.cache/nix
+            ~root/.cache/nix
           gc-max-store-size-linux: 5G
 
       - run: nix run .#prepSolArtifacts
@@ -52,6 +59,7 @@ jobs:
 
   static:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DATABASE_URL: "sqlite:issuance.db"
     steps:
@@ -65,7 +73,7 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           submodules: recursive
           fetch-depth: 0
@@ -78,10 +86,13 @@ jobs:
             keep-outputs = true
 
       - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a  # v6
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
+          paths: |
+            ~/.cache/nix
+            ~root/.cache/nix
           gc-max-store-size-linux: 5G
 
       - run: nix run .#prepSolArtifacts
