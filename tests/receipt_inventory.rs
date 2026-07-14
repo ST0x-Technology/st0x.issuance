@@ -18,10 +18,10 @@ use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
     IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
-    initialize_rocket, receipt_inventory_aggregate_id,
+    receipt_inventory_aggregate_id,
 };
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 async fn wait_for_receipt_depleted(
     db_url: &str,

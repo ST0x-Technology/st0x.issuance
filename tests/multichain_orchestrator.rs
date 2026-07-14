@@ -23,13 +23,12 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::test_utils::{LocalEvm, ROLE_DEPOSIT, ROLE_WITHDRAW};
 use st0x_issuance::{
     ETHEREUM_TEST_CHAIN_ID, Network, VaultModeConfig, VaultModeKind,
-    initialize_rocket,
 };
 use std::collections::HashMap;
 
 use crate::harness::{
-    MintFlowRequest, TEST_API_KEY, confirm_mint_journal, initiate_mint_request,
-    tokens,
+    MintFlowRequest, TEST_API_KEY, confirm_mint_journal, initialize_rocket,
+    initiate_mint_request, tokens,
 };
 
 const USER_PRIVATE_KEY: B256 =

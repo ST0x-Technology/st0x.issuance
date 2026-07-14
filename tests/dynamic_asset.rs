@@ -8,9 +8,11 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
+use st0x_issuance::Network;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::test_utils::LocalEvm;
-use st0x_issuance::{Network, initialize_rocket};
+
+use crate::harness::initialize_rocket;
 
 /// Tests that adding a new tokenized asset at runtime is picked up by the
 /// receipt backfill loop and the transfer poller on their next polling pass,

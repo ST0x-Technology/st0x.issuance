@@ -29,7 +29,7 @@ use url::Url;
 use st0x_issuance::account::{AccountLinkResponse, RegisterAccountResponse};
 use st0x_issuance::bindings::IST0xOrchestratorV1;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
-use st0x_issuance::initialize_rocket;
+use st0x_issuance::initialize_rocket as initialize_application;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{
     LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT, ROLE_WITHDRAW,
@@ -43,7 +43,6 @@ use st0x_issuance::{
 /// the config value and the `X-API-KEY` header must stay identical, or every
 /// authenticated assertion fails with a 401 that hides the real cause.
 pub const TEST_API_KEY: &str = "test-key-12345678901234567890123456";
-
 pub type TestProviderBuilder = ProviderBuilder<
     Identity,
     JoinFill<
@@ -54,6 +53,21 @@ pub type TestProviderBuilder = ProviderBuilder<
         ChainIdFiller,
     >,
 >;
+
+/// Initializes the application after establishing the corporate-action
+/// baseline required by the fail-closed production startup path.
+pub async fn initialize_rocket(
+    config: Config,
+) -> Result<rocket::Rocket<rocket::Build>, anyhow::Error> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    pool.close().await;
+
+    initialize_application(config).await
+}
 
 pub fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
     const PATH: &str = "/v1beta1/events/corporate-actions";

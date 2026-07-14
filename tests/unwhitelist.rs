@@ -14,10 +14,9 @@ use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
     IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
-    initialize_rocket,
 };
 
-use crate::harness::create_provider;
+use crate::harness::{create_provider, initialize_rocket};
 
 fn setup_corporate_actions_stream_mock(mock_alpaca: &MockServer) -> String {
     mock_alpaca.mock(|when, then| {
@@ -36,6 +35,9 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 -> Result<(), Box<dyn std::error::Error>> {
     let evm = LocalEvm::new().await?;
     let mock_alpaca = MockServer::start();
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("unwhitelist.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     let bot_wallet = evm.wallet_address;
     let user_private_key = b256!(
@@ -51,7 +53,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
 
     let rpc_url = Url::parse(&evm.endpoint)?;
     let config = Config {
-        database_url: ":memory:".to_string(),
+        database_url: db_url,
         database_max_connections: 5,
         rpc_url: rpc_url.clone(),
         chain_id: ANVIL_CHAIN_ID,
