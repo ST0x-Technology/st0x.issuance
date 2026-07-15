@@ -546,11 +546,10 @@ async fn wrong_signer_authorization_is_rejected_and_nothing_mints()
 }
 
 /// Production ordering the happy path cannot prove: Alpaca confirms the
-/// journal on its own schedule, so the mint routinely reaches `Minting`
-/// before the liquidity bot delivers the recipient authorization. The submit
-/// job defers (never falls back to vault-direct), and the authorization's
-/// arrival wakes recovery — the mint must still complete end-to-end: exactly
-/// one `Minted` log and the Alpaca callback fired.
+/// journal before the liquidity bot delivers the recipient authorization.
+/// After those externally observable operations occur in that order, the mint
+/// must still complete end-to-end with exactly one `Minted` log and one Alpaca
+/// callback.
 #[tokio::test]
 async fn authorization_after_journal_confirmation_still_completes()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -604,14 +603,12 @@ async fn authorization_after_journal_confirmation_still_completes()
     )
     .await?;
 
-    // Journal first: the mint enters `Minting` with no authorization and the
-    // submit job's defer branch parks it — no event, no vault call.
+    // Complete the journal-confirmation request before delivering the
+    // authorization through the authorization-delivery service endpoint.
     confirm_mint_journal(&client, tokenization_request_id, &issuer_request_id)
         .await?;
 
-    // The late delivery is the wake-up: the endpoint records the
-    // authorization and kicks recovery, which re-drives the deferred
-    // submission.
+    // The later authorization request must still lead to one completed mint.
     let nonce = B256::with_last_byte(2);
     let signature = signed_mint_authorization(
         &evm,

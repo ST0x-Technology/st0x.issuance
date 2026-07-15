@@ -1306,8 +1306,11 @@ async fn execute(
                 FreezeOutcome::Froze => {
                     println!("Froze {underlying} on all networks.");
                 }
-                FreezeOutcome::AlreadyFrozen => {
-                    println!("{underlying} was already frozen.");
+                FreezeOutcome::OperatorHoldEnsured => {
+                    println!(
+                        "{underlying} was already frozen across all networks; \
+                         operator hold ensured."
+                    );
                 }
             }
             Ok(())
@@ -1323,6 +1326,9 @@ async fn execute(
                 UnfreezeOutcome::AlreadyEnabled => {
                     println!("{underlying} was already enabled.");
                 }
+                UnfreezeOutcome::RemainsFrozen => {
+                    println!("{underlying} remains frozen by another hold.");
+                }
             }
             Ok(())
         }
@@ -1332,21 +1338,21 @@ async fn execute(
 /// Issuer-host admin for freezing/unfreezing supported underlyings.
 ///
 /// Opens the same SQLite event store the server uses and dispatches the CQRS
-/// `Freeze` / `Unfreeze` commands through the event-sorcery `Store` — never
-/// writing the `events` table directly.
+/// operator-hold `Freeze` / `Unfreeze` commands through the event-sorcery
+/// `Store` — never writing the `events` table directly.
 pub(crate) struct AssetAdmin {
     store: Arc<Store<Underlying>>,
     pool: Pool<Sqlite>,
 }
 
-/// Outcome of a freeze request, so the caller can report an idempotent no-op
-/// distinctly from an actual state change. An underlying with no listing is an
-/// `AssetAdminError::NotFound`, not an outcome: `execute` rejects unknown
-/// underlyings up front, so `freeze` only runs against one that exists.
+/// Outcome of a freeze request, so the caller can distinguish the first hold
+/// from ensuring the operator owns a hold on an already-frozen underlying. An
+/// underlying with no listing is an `AssetAdminError::NotFound`, not an outcome:
+/// `execute` rejects unknown underlyings up front.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FreezeOutcome {
     Froze,
-    AlreadyFrozen,
+    OperatorHoldEnsured,
 }
 
 /// Outcome of an unfreeze request. An underlying with no listing is an
@@ -1355,6 +1361,7 @@ pub(crate) enum FreezeOutcome {
 pub(crate) enum UnfreezeOutcome {
     Unfroze,
     AlreadyEnabled,
+    RemainsFrozen,
 }
 
 /// An underlying's freeze status, formatted for the CLI.
@@ -1461,9 +1468,11 @@ impl AssetAdmin {
 
     /// Freezes the underlying on all networks. Always dispatches `Freeze`
     /// through the store so the aggregate — the source of truth — decides the
-    /// final state; an already-frozen underlying is a zero-event no-op there,
-    /// so it is guaranteed frozen afterwards even if a concurrent writer
-    /// changed it since the operator's status read. The returned
+    /// final state. If another owner already holds the freeze, this acquires the
+    /// operator hold too; if the operator hold is already present it is a
+    /// zero-event no-op. The underlying is therefore guaranteed frozen
+    /// afterwards even if a concurrent writer changed it since the operator's
+    /// status read. The returned
     /// `FreezeOutcome` only labels the message from a status read taken
     /// immediately before dispatch: it is best-effort under a concurrent
     /// write, but the persisted state is always correct. Deriving the label
@@ -1487,19 +1496,16 @@ impl AssetAdmin {
             .await?;
 
         Ok(if already_frozen {
-            FreezeOutcome::AlreadyFrozen
+            FreezeOutcome::OperatorHoldEnsured
         } else {
             FreezeOutcome::Froze
         })
     }
 
-    /// Unfreezes the underlying. Always dispatches `Unfreeze` through the store
-    /// so the aggregate decides the final state; an already-enabled underlying
-    /// is a zero-event no-op there. The returned `UnfreezeOutcome` labels the
-    /// message from a pre-dispatch status read (best-effort under a concurrent
-    /// write); the persisted state is always correct. See `freeze` for why the
-    /// label is derived from the live store rather than a caller-supplied
-    /// snapshot.
+    /// Releases the operator freeze hold. Always dispatches `Unfreeze` through
+    /// the store so the underlying aggregate decides the final state. The
+    /// post-dispatch status distinguishes a full unfreeze from an underlying
+    /// that remains frozen by another owner.
     pub(crate) async fn unfreeze(
         &self,
         underlying: &UnderlyingSymbol,
@@ -1516,7 +1522,14 @@ impl AssetAdmin {
             )
             .await?;
 
-        Ok(if already_enabled {
+        let remains_frozen = matches!(
+            self.status(underlying).await?.map(|report| report.status),
+            Some(AssetStatus::Frozen)
+        );
+
+        Ok(if remains_frozen {
+            UnfreezeOutcome::RemainsFrozen
+        } else if already_enabled {
             UnfreezeOutcome::AlreadyEnabled
         } else {
             UnfreezeOutcome::Unfroze
@@ -1576,6 +1589,7 @@ mod tests {
         AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         TokenizedAssetEvent,
     };
+    use crate::underlying::{FreezeHoldId, FreezeWindow};
 
     const TEST_SIGNER_KEY: &str =
         "0x0000000000000000000000000000000000000000000000000000000000000001";
@@ -1705,15 +1719,14 @@ mod tests {
 
         // A second freeze of an already-frozen underlying (and a second
         // unfreeze of an already-enabled one) is a zero-event no-op the
-        // aggregate dedups, and is reported as the AlreadyFrozen /
-        // AlreadyEnabled label.
+        // reported as the OperatorHoldEnsured / AlreadyEnabled label.
         assert_eq!(
             admin.freeze(&underlying).await.unwrap(),
             FreezeOutcome::Froze
         );
         assert_eq!(
             admin.freeze(&underlying).await.unwrap(),
-            FreezeOutcome::AlreadyFrozen
+            FreezeOutcome::OperatorHoldEnsured
         );
 
         assert_eq!(
@@ -1723,6 +1736,58 @@ mod tests {
         assert_eq!(
             admin.unfreeze(&underlying).await.unwrap(),
             UnfreezeOutcome::AlreadyEnabled
+        );
+    }
+
+    #[tokio::test]
+    async fn unfreeze_reports_when_a_corporate_action_keeps_the_asset_frozen() {
+        let admin = admin_with_asset("SGOV", &[Network::Base]).await;
+        let underlying = UnderlyingSymbol::new("SGOV").unwrap();
+        let freeze_at = chrono::Utc::now();
+        let unfreeze_at = freeze_at + chrono::Duration::hours(1);
+        let hold_id = || {
+            FreezeHoldId::corporate_action(
+                FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
+            )
+        };
+        admin.freeze(&underlying).await.unwrap();
+        admin
+            .store
+            .send(
+                &underlying,
+                UnderlyingCommand::AcquireFreezeHold {
+                    underlying: underlying.clone(),
+                    hold_id: hold_id(),
+                    acquired_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admin.unfreeze(&underlying).await.unwrap(),
+            UnfreezeOutcome::RemainsFrozen
+        );
+        assert_eq!(
+            admin.status(&underlying).await.unwrap().expect("exists").status,
+            AssetStatus::Frozen
+        );
+
+        admin
+            .store
+            .send(
+                &underlying,
+                UnderlyingCommand::ReleaseFreezeHold {
+                    underlying: underlying.clone(),
+                    hold_id: hold_id(),
+                    released_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            admin.status(&underlying).await.unwrap().expect("exists").status,
+            AssetStatus::Enabled
         );
     }
 
