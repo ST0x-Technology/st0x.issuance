@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM redemption_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "8ddeb7d12e1ff6e620d747f67b876f7b01622e939bf651d71025734b5568bb91"
+}

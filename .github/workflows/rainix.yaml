@@ -4,7 +4,7 @@ on: [push]
 
 concurrency:
   group: ${{ github.ref }}-rainix
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -28,9 +28,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: nixbuild/nix-quick-install-action@5bb6a3b3abe66fd09bbf250dce8ada94f856a703  # v30
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v35 and pin a
+          # working release.
+          nix_version: "2.31.5"
           nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             keep-env-derivations = true
             keep-outputs = true
 
@@ -41,7 +49,6 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
-      - run: nix run .#prepSolArtifacts
       - run: nix flake check
 
       - run: nix develop -c sqlx db create
@@ -71,9 +78,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: nixbuild/nix-quick-install-action@5bb6a3b3abe66fd09bbf250dce8ada94f856a703  # v30
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v35 and pin a
+          # working release.
+          nix_version: "2.31.5"
           nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             keep-env-derivations = true
             keep-outputs = true
 

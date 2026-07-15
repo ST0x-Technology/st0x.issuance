@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM account_view\n        WHERE EXISTS(\n            SELECT 1\n            FROM json_each(payload, '$.Live.LinkedToAlpaca.whitelisted_wallets')\n            WHERE value = ?\n        )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "live: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9bcf755f5894724fde77014fe835804739d803db04132851bc29a57afefd8db8"
+}

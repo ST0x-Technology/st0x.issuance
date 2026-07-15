@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM account_view",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "cc6c8f68eaa5e3ffa467e0cd3c8d2c72b91e1ded7c162d5391414aad22aefc03"
+}
