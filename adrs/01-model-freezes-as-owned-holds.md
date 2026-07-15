@@ -8,9 +8,9 @@
 ## Context
 
 `Underlying`, keyed by `UnderlyingSymbol`, currently represents supply gating as
-a single `Enabled` or `Frozen` status. Both the issuer CLI and each scheduled
-corporate-action window dispatch the same idempotent `Freeze` and `Unfreeze`
-commands.
+a single `Enabled` or `Frozen` status across every network listing. Both the
+issuer CLI and each scheduled corporate-action window dispatch the same
+idempotent `Freeze` and `Unfreeze` commands.
 
 That model cannot preserve the business invariant when freeze requirements
 overlap. Given windows `[A, C)` and `[B, D)`, the first window's `Unfreeze` at
@@ -80,8 +80,9 @@ Overlapping, adjacent, retried, and out-of-order scheduled windows become safe
 by construction. Freeze ownership is auditable in the event stream, and new
 freeze sources can compose without learning about scheduler internals.
 
-The `Underlying` state, commands, events, projection, CLI, scheduler jobs, and
-lifecycle notifications must carry hold identity. Backward-compatible event
-replay and projection migration need explicit regression coverage. Operator
-unfreeze semantics become precise: it releases the operator hold and cannot
-override an active corporate-action hold.
+The `Underlying` state, commands, events, projections, CLI, scheduler jobs, and
+lifecycle notifications must carry hold identity. Per-network `TokenizedAsset`
+listings remain unchanged. Backward-compatible event replay and projection
+migration need explicit regression coverage. Operator unfreeze semantics become
+precise: it releases the operator hold and cannot override an active
+corporate-action hold.
