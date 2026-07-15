@@ -710,6 +710,11 @@ impl VaultService for MockVaultService {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::PrepareTxFails) {
+            return Err(VaultError::InvalidReceipt);
+        }
+
+        #[cfg(test)]
         {
             *self.last_call.lock().unwrap() = Some(MintTokensCall {
                 vault,
