@@ -195,10 +195,10 @@ initial request through journal confirmation to on-chain minting and callback.
   deposit transaction. Requires `Minting` state. Produces `MintTxIntended`,
   which persists the raw transaction, hash, nonce, signing time, and stable
   external transaction ID before any broadcast
-- `SubmitMint { issuer_request_id }` - Broadcast the exact transaction stored
-  by `MintTxIntended`. Requires `MintIntended` state. Produces
-  `MintTxSubmitted` on success. An uncertain broadcast failure leaves the
-  aggregate in `MintIntended`, so recovery rebroadcasts the same bytes
+- `SubmitMint { issuer_request_id }` - Broadcast the exact transaction stored by
+  `MintTxIntended`. Requires `MintIntended` state. Produces `MintTxSubmitted` on
+  success. An uncertain broadcast failure leaves the aggregate in
+  `MintIntended`, so recovery rebroadcasts the same bytes
 - `ConfirmMint { issuer_request_id, tx_id }` - Confirm a previously submitted
   mint transaction. Re-fetches the on-chain receipt for the stored `tx_id` and
   produces `TokensMinted` or `MintingFailed`
@@ -206,26 +206,25 @@ initial request through journal confirmation to on-chain minting and callback.
   mint completion
 - `Recover { issuer_request_id, mode }` - Recover a mint stuck in an incomplete
   state. Startup recovery drives any mint in `JournalConfirmed`, `Minting`,
-  `MintIntended`, `TxSubmitted`, `MintingFailed`, or `CallbackPending` state;
-  at runtime, live retry scheduling
-  is triggered specifically when a mint lands in `MintingFailed` during the
-  journal-confirmation flow. Both paths hand a mint that is waiting on a retry
-  window to a background scheduled-recovery task, so retries fire on schedule
-  without waiting for a restart. Queries the receipt inventory for a receipt
-  matching the `issuer_request_id`. If a matching receipt is found, the mint
-  already succeeded on-chain, so recovery records the existing mint
-  (`ExistingMintRecovered`) and proceeds to callback. If no receipt is found and
-  the previous transaction is terminally failed, automatic recovery submits up
-  to four retry transactions after 1m, 10m, 30m, and 1h delays. Manual admin
-  reprocess uses the same recovery path but bypasses the automatic retry cap so
-  an operator can retry after fixing the underlying cause. This prevents
-  double-minting after crashes while ensuring terminal failures can be retried
-  with new `externalTxId`s
+  `MintIntended`, `TxSubmitted`, `MintingFailed`, or `CallbackPending` state; at
+  runtime, live retry scheduling is triggered specifically when a mint lands in
+  `MintingFailed` during the journal-confirmation flow. Both paths hand a mint
+  that is waiting on a retry window to a background scheduled-recovery task, so
+  retries fire on schedule without waiting for a restart. Queries the receipt
+  inventory for a receipt matching the `issuer_request_id`. If a matching
+  receipt is found, the mint already succeeded on-chain, so recovery records the
+  existing mint (`ExistingMintRecovered`) and proceeds to callback. If no
+  receipt is found and the previous transaction is terminally failed, automatic
+  recovery submits up to four retry transactions after 1m, 10m, 30m, and 1h
+  delays. Manual admin reprocess uses the same recovery path but bypasses the
+  automatic retry cap so an operator can retry after fixing the underlying
+  cause. This prevents double-minting after crashes while ensuring terminal
+  failures can be retried with new `externalTxId`s
 - `RecoverWalletStep { issuer_request_id, mode }` - Internal recovery variant
   used only while the wallet lock is held. It performs the same recoverable
   on-chain steps as `Recover`, but becomes a no-op if a concurrent transition
-  already reached `CallbackPending`; the next recovery iteration then sends
-  the callback without the wallet lock
+  already reached `CallbackPending`; the next recovery iteration then sends the
+  callback without the wallet lock
 - `RecoverFromReceipt { issuer_request_id, tx_hash }` - Recover a mint that
   failed during the minting step, or whose broadcast outcome was not persisted,
   when an ITN receipt is discovered on-chain. Triggered by the receipt monitor
@@ -244,7 +243,7 @@ initial request through journal confirmation to on-chain minting and callback.
 - `MintingStarted` - Mint intent recorded (aggregate moves to `Minting`)
 - `MintTxIntended` - Exact signed mint transaction persisted before broadcast
   (carries raw bytes, hash, nonce, signing time, and external transaction ID)
-- `MintTxSubmitted` - Mint transaction submitted to signing backend (carries
+- `MintTxSubmitted` - Persisted signed mint transaction broadcast (carries
   `external_tx_id` and `tx_id` — the on-chain tx hash — for crash recovery)
 - `TokensMinted` - On-chain mint succeeded (carries tx details)
 - `MintingFailed` - On-chain mint failed
@@ -270,47 +269,46 @@ dual-format reader or restore the pre-cutover backup.
 
 **Command -> Event Mappings:**
 
-| Command              | Events                  | Notes                                           |
-| -------------------- | ----------------------- | ----------------------------------------------- |
-| `Initiate`           | `Initiated`             | Mint request created                            |
-| `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                               |
-| `RejectJournal`      | `JournalRejected`       | Terminal failure                                |
-| `Deposit`            | `MintingStarted`        | Records intent (no network call)                |
-| `PrepareMint`        | `MintTxIntended`         | Persists exact signed tx before broadcast       |
-| `SubmitMint`         | `MintTxSubmitted`        | Broadcasts the persisted transaction            |
-| `ConfirmMint`        | See below               | Confirms submitted tx                           |
-| `SendCallback`       | `MintCompleted`         | Calls Alpaca callback                           |
-| `Recover`            | See below               | Checks receipt inventory                        |
-| `RecoverWalletStep`  | See below               | Never sends callbacks while wallet-locked       |
-| `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt recovery from intended or failed state  |
+| Command              | Events                  | Notes                                          |
+| -------------------- | ----------------------- | ---------------------------------------------- |
+| `Initiate`           | `Initiated`             | Mint request created                           |
+| `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                              |
+| `RejectJournal`      | `JournalRejected`       | Terminal failure                               |
+| `Deposit`            | `MintingStarted`        | Records intent (no network call)               |
+| `PrepareMint`        | `MintTxIntended`        | Persists exact signed tx before broadcast      |
+| `SubmitMint`         | `MintTxSubmitted`       | Broadcasts the persisted transaction           |
+| `ConfirmMint`        | See below               | Confirms submitted tx                          |
+| `SendCallback`       | `MintCompleted`         | Calls Alpaca callback                          |
+| `Recover`            | See below               | Checks receipt inventory                       |
+| `RecoverWalletStep`  | See below               | Never sends callbacks while wallet-locked      |
+| `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt recovery from intended or failed state |
 
 `Deposit` emits only `MintingStarted` (business intent). `PrepareMint` builds
 and signs the transaction, then persists the exact bytes and hash in
-`MintTxIntended`. Only `SubmitMint` may broadcast those persisted bytes. A
-crash before `MintTxIntended` cannot have broadcast anything; a crash after it
-causes recovery to rebroadcast or poll that same transaction, never prepare a
-second one. A crash after broadcast but before `MintTxSubmitted` therefore
-remains safe because rebroadcasting identical signed bytes is idempotent.
-Preparing, persisting, and initially broadcasting a mint transaction share one
-wallet critical section. Startup mint recovery processes its persisted intents
-in nonce order before mint states that may prepare a new transaction. Mint and
-redemption recovery run concurrently so persisted transactions from either
-domain can fill lower nonce gaps while higher transactions await confirmation.
-Live mint and burn preparation query the authoritative event log and are
-blocked while any other wallet intent remains unresolved; this safety check
-does not depend on a fallible read-model projection. Together these rules
-prevent two aggregate commands from signing the same wallet nonce without
-relying on in-memory nonce state that would be lost on restart.
-Each live burn attempt waits at most 30 seconds behind an earlier unresolved
-wallet intent. On timeout it prepares and broadcasts nothing, leaves the
-redemption recoverable, and defers the burn to recovery rather than occupying
-the live flow indefinitely.
+`MintTxIntended`. Only `SubmitMint` may broadcast those persisted bytes. A crash
+before `MintTxIntended` cannot have broadcast anything; a crash after it causes
+recovery to rebroadcast or poll that same transaction, never prepare a second
+one. A crash after broadcast but before `MintTxSubmitted` therefore remains safe
+because rebroadcasting identical signed bytes is idempotent. Preparing,
+persisting, and initially broadcasting a mint transaction share one wallet
+critical section. Startup mint recovery processes its persisted intents in nonce
+order before mint states that may prepare a new transaction. Mint and redemption
+recovery run concurrently so persisted transactions from either domain can fill
+lower nonce gaps while higher transactions await confirmation. Live mint and
+burn preparation query the authoritative event log and are blocked while any
+other wallet intent remains unresolved; this safety check does not depend on a
+fallible read-model projection. Together these rules prevent two aggregate
+commands from signing the same wallet nonce without relying on in-memory nonce
+state that would be lost on restart. Each live burn attempt waits at most 30
+seconds behind an earlier unresolved wallet intent. On timeout it prepares and
+broadcasts nothing, leaves the redemption recoverable, and defers the burn to
+recovery rather than occupying the live flow indefinitely.
 
 The issuer is a single-writer service: exactly one process may own a given
 SQLite event store and signing wallet at a time. Horizontal replicas sharing a
 wallet are unsupported because the wallet critical section is process-local.
-Deployments must terminate the old process before the replacement begins
-serving or recovering work.
+Deployments must terminate the old process before the replacement begins serving
+or recovering work.
 
 `ConfirmMint` re-fetches the on-chain receipt for the submitted `tx_id` and
 emits either `TokensMinted` (success) or `MintingFailed` (failure).
@@ -321,25 +319,23 @@ in `Minting` state, prepares and persists `MintTxIntended`. If in
 `MintIntended`, rebroadcasts the persisted raw transaction. If in `TxSubmitted`
 (or `MintingFailed` with a known prior transaction), calls `ConfirmMint` with
 the stored `tx_id` to re-fetch the on-chain receipt. `TxSubmitted` means the
-signing backend accepted the submission and returned a transaction identifier;
-it does not mean the transaction succeeded on-chain. `ConfirmMint` waits for
-the receipt and emits `TokensMinted` for a successful transaction or
-`MintingFailed` for a reverted or otherwise failed transaction. Retry
-transactions use
-`mint-{issuer_request_id}-retry-{n}` where automatic retries use n = 1..4 and
-the delay schedule is 1m, 10m, 30m, then 1h.
+persisted transaction was broadcast; it does not mean the transaction succeeded
+on-chain. `ConfirmMint` waits for the receipt and emits `TokensMinted` for a
+successful transaction or `MintingFailed` for a reverted or otherwise failed
+transaction. Retry transactions use `mint-{issuer_request_id}-retry-{n}` where
+automatic retries use n = 1..4 and the delay schedule is 1m, 10m, 30m, then 1h.
 
 The retry-delay/exhaustion schedule is driven by a `MintingFailed` attempt
-counter. A transaction-preparation failure records `MintingFailed`; an
-uncertain broadcast failure instead preserves `MintIntended` and recovery
-rebroadcasts the exact same signed bytes without advancing the attempt. A
-running service keeps driving deferred retries via a background
-scheduled-recovery task (also spawned at startup and after a manual reprocess),
-rather than waiting for the next restart.
+counter. A transaction-preparation failure records `MintingFailed`; an uncertain
+broadcast failure instead preserves `MintIntended` and recovery rebroadcasts the
+exact same signed bytes without advancing the attempt. A running service keeps
+driving deferred retries via a background scheduled-recovery task (also spawned
+at startup and after a manual reprocess), rather than waiting for the next
+restart.
 
 `RecoverFromReceipt` is triggered when the receipt monitor discovers an on-chain
-receipt for a mint in `MintIntended`, or in `MintingFailed` where the predecessor
-was `Minting`. It emits `ExistingMintRecovered`, transitions to
+receipt for a mint in `MintIntended`, or in `MintingFailed` where the
+predecessor was `Minting`. It emits `ExistingMintRecovered`, transitions to
 `CallbackPending`, then continues through the existing `SendCallback` ->
 `MintCompleted` flow without rebroadcasting. Automated recovery persists the
 `CallbackPending` boundary before delivering the callback, so receipt polling
@@ -368,12 +364,15 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `RecordAlpacaCall` - Alpaca redeem API called successfully
 - `RecordAlpacaFailure` - Alpaca redeem API call failed
 - `ConfirmAlpacaComplete` - Alpaca journal transfer completed
-- `BurnTokens` - Submit burn transaction to signing backend. Produces
-  `BurnTxSubmitted` on success
+- `IntendBurn` - Prepare and sign the exact burn transaction, then persist its
+  raw bytes, hash, nonce, and receipt plan in `BurnIntended` before any
+  broadcast. Only valid from `Burning`.
+- `BurnTokens` - Broadcast the exact transaction persisted by `IntendBurn`.
+  Produces `BurnTxSubmitted` on success; it never signs a replacement.
 - `ConfirmBurn { tx_id, dust_shares }` - Confirm a previously submitted burn
   transaction. Produces `TokensBurned` on success
-- `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before
-  its external side effect
+- `RecordBurnRecoveryAttempt` - Persist one automatic recovery action before its
+  external side effect
 - `RecordBurnPreparationRecoveryAttempt` - Persist one automatic retry before
   resuming a failed redemption that has no signed burn transaction
 - `ReplaceDeadBurn` - Re-check that the persisted transaction is provably dead,
@@ -411,16 +410,16 @@ on-chain transfer through calling Alpaca to burning tokens.
   event. The admin recovery path immediately invokes burn recovery in-process so
   the on-chain burn does not wait for a service restart.
 - `CloseRedemption { issuer_request_id, reason,
-  acknowledged_unresolved_burn_tx_hash }` - Admin-close a redemption that
-  cannot be automatically recovered, recording an operator `reason`. Valid
-  from `Failed`, `Burning`, `BurnIntended`, or `BurnSubmitted`. A redemption
-  with a persisted signed transaction is rejected by default because that
-  transaction may still land. Closing it requires
+  acknowledged_unresolved_burn_tx_hash }` -
+  Admin-close a redemption that cannot be automatically recovered, recording an
+  operator `reason`. Valid from `Failed`, `Burning`, `BurnIntended`, or
+  `BurnSubmitted`. A redemption with a persisted signed transaction is rejected
+  by default because that transaction may still land. Closing it requires
   `acknowledged_unresolved_burn_tx_hash` to equal the persisted hash exactly;
   the signed identity is retained across a transition to `Failed`, and the
   acknowledgement is recorded in the terminal event. An acknowledgement is
-  rejected when no persisted signed burn exists. This is the
-  honest terminal path for a redemption whose burn cannot or should not be re-submitted and is
+  rejected when no persisted signed burn exists. This is the honest terminal
+  path for a redemption whose burn cannot or should not be re-submitted and is
   **not** verifiable on-chain (e.g. a `Failed -> Burning` recovery regression
   where no burn ever landed, or an ambiguous case pending off-chain
   reconciliation). A held receipt reservation is **left in place** (the
@@ -428,31 +427,30 @@ on-chain transfer through calling Alpaca to burning tokens.
   landed. Emits `RedemptionClosed`.
 - `ForceCompleteBurn { issuer_request_id, burn_tx_hash, block_number, reason,
   acknowledged_unresolved_burn_tx_hash }` -
-  Admin-terminalize a redemption stuck in
-  `BurnIntended`/`BurnSubmitted` whose persisted exact burn transaction
-  **already landed on-chain** but was never recorded (e.g. the bot crashed
-  between the burn and `TokensBurned`). The admin layer verifies the
-  operator-supplied `burn_tx_hash` on-chain first — the receipt must have
-  succeeded and contain a real burn (`Transfer(bot_wallet -> 0x0)`) of the
-  vault's shares — then records the proving tx hash and block number. The
-  receipt reservation is settled (mirror reduced) just like a normal burn
-  completion. Emits `BurnForceCompleted`, transitioning to `Completed`.
-  The persisted bytes must decode with matching hash and nonce and recover the
-  configured bot wallet as signer; the supplied hash must then equal that exact
-  transaction hash unless the operator explicitly acknowledges the persisted
-  hash with `acknowledged_unresolved_burn_tx_hash`. A different proving hash is
-  rejected by default while the persisted transaction may still land. The
-  acknowledgement must equal the persisted hash exactly and is recorded in the
-  terminal event. The alternate transaction's per-receipt withdrawals,
-  recipient wallet, and dust share transfer must also match the persisted burn
-  semantics exactly, including the aggregate burned-share total. Its signer
-  nonce must equal the persisted transaction's nonce, proving it is a mined
-  replacement rather than an unrelated burn and ensuring the acknowledged
-  transaction can no longer land. This prevents
-  another redemption's same-vault burn from being used as proof. Legacy or pre-intent
-  states without a trustworthy persisted
-  transaction are **not** force-completed; ops use `CloseRedemption` after
-  off-chain reconciliation instead.
+  Admin-terminalize a redemption stuck in `BurnIntended`/`BurnSubmitted` whose
+  persisted exact burn transaction **already landed on-chain** but was never
+  recorded (e.g. the bot crashed between the burn and `TokensBurned`). The admin
+  layer verifies the operator-supplied `burn_tx_hash` on-chain first — the
+  receipt must have succeeded and contain a real burn
+  (`Transfer(bot_wallet -> 0x0)`) of the vault's shares — then records the
+  proving tx hash and block number. The receipt reservation is settled (mirror
+  reduced) just like a normal burn completion. Emits `BurnForceCompleted`,
+  transitioning to `Completed`. The persisted bytes must decode with matching
+  hash and nonce and recover the configured bot wallet as signer; the supplied
+  hash must then equal that exact transaction hash unless the operator
+  explicitly acknowledges the persisted hash with
+  `acknowledged_unresolved_burn_tx_hash`. A different proving hash is rejected
+  by default while the persisted transaction may still land. The acknowledgement
+  must equal the persisted hash exactly and is recorded in the terminal event.
+  The alternate transaction's per-receipt withdrawals, recipient wallet, and
+  dust share transfer must also match the persisted burn semantics exactly,
+  including the aggregate burned-share total. Its signer nonce must equal the
+  persisted transaction's nonce, proving it is a mined replacement rather than
+  an unrelated burn and ensuring the acknowledged transaction can no longer
+  land. This prevents another redemption's same-vault burn from being used as
+  proof. Legacy or pre-intent states without a trustworthy persisted transaction
+  are **not** force-completed; ops use `CloseRedemption` after off-chain
+  reconciliation instead.
 
 **Events:**
 
@@ -460,10 +458,10 @@ on-chain transfer through calling Alpaca to burning tokens.
 - `AlpacaCalled` - Alpaca redeem endpoint called
 - `AlpacaCallFailed` - Alpaca API call failed (terminal)
 - `AlpacaJournalCompleted` - Alpaca confirmed journal transfer
-- `BurnTxSubmitted` - Burn transaction submitted to signing backend (carries
+- `BurnTxSubmitted` - Persisted signed burn transaction broadcast (carries
   `external_tx_id`, `tx_id` — the pending tx identifier — and `planned_burns`).
   The burn manager reserves the `planned_burns` in the receipt inventory
-  **before** this submission, so a concurrent redemption that already committed
+  **before** this broadcast, so a concurrent redemption that already committed
   the same receipt balance fails to reserve and never submits an unbacked burn.
   On confirmation the reservation is settled (mirror balance reduced); on a
   definitive terminal/reverted failure it is released.
@@ -479,8 +477,8 @@ on-chain transfer through calling Alpaca to burning tokens.
   These events form the durable redemption-wide recovery budget across process
   restarts.
 - `BurnPreparationRecoveryAttempted` - Records an automatic retry before a
-  failed redemption without a signed burn transaction resumes preparation.
-  These attempts share the same redemption-wide budget.
+  failed redemption without a signed burn transaction resumes preparation. These
+  attempts share the same redemption-wide budget.
 - `BurnRecoveryExhausted` - Records that the automatic recovery budget is spent,
   including the latest hash, nonce, attempt count, and timestamp. It leaves the
   aggregate unresolved and the receipt reservation held for operator recovery.
@@ -496,18 +494,18 @@ on-chain transfer through calling Alpaca to burning tokens.
   `planned_burns` for recovery of previously submitted transactions
 - `ExistingBurnRecovered` - Existing on-chain burn discovered during recovery
 - `RedemptionClosed` - Admin-closed redemption (terminal). Carries the operator
-  `reason`, `closed_at`, and optional
-  `acknowledged_unresolved_burn_tx_hash`. Closed redemptions do not appear in
-  stuck queries. Receipt reservations remain held, including after an
-  acknowledged close, because the unresolved transaction may still land.
+  `reason`, `closed_at`, and optional `acknowledged_unresolved_burn_tx_hash`.
+  Closed redemptions do not appear in stuck queries. Receipt reservations remain
+  held, including after an acknowledged close, because the unresolved
+  transaction may still land.
 - `BurnForceCompleted` - Admin-recorded terminal success for a stuck
   `BurnIntended`/`BurnSubmitted` redemption whose persisted exact burn was
   verified on-chain. Carries the proving `burn_tx_hash`, `block_number`,
   operator `reason`, optional `acknowledged_unresolved_burn_tx_hash`, and
   `completed_at`. Transitions to `Completed` (terminal success). Its receipt
   reservation is settled after the terminal event, including when the operator
-  acknowledged the persisted transaction superseded by the proving
-  same-nonce replacement.
+  acknowledged the persisted transaction superseded by the proving same-nonce
+  replacement.
 - `Reprocessed` - Redemption reset to `Detected` state for reprocessing. Carries
   the original `RedemptionMetadata`, the previous state name, and a timestamp.
   Used for audit trail — shows when and from what state a manual reprocess was
@@ -521,26 +519,26 @@ on-chain transfer through calling Alpaca to burning tokens.
 
 **Command -> Event Mappings:**
 
-| Command                 | Events                   | Notes                                         |
-| ----------------------- | ------------------------ | --------------------------------------------- |
-| `DetectRedemption`      | `RedemptionDetected`     | Transfer detected                             |
-| `RecordAlpacaCall`      | `AlpacaCalled`           | Alpaca API called                             |
-| `RecordAlpacaFailure`   | `AlpacaCallFailed`       | Terminal failure                              |
-| `ConfirmAlpacaComplete` | `AlpacaJournalCompleted` | Journal complete                              |
-| `IntendBurn`            | `BurnIntended`           | Persist exact signed tx before broadcasting   |
-| `BurnTokens`            | `BurnTxSubmitted`        | Submits to signing backend                    |
-| `ConfirmBurn`           | `TokensBurned`           | Confirms burn, terminal success               |
-| `RecordBurnRecoveryAttempt` | `BurnRecoveryAttempted` | Reserve one durable automatic recovery action |
-| `RecordBurnPreparationRecoveryAttempt` | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation |
-| `ReplaceDeadBurn`       | `BurnIntended`            | Re-check dead predicate, then persist replacement |
-| `RecordBurnRecoveryExhausted` | `BurnRecoveryExhausted` | Stop automatic recovery durably          |
-| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably |
-| `RecordBurnFailure`     | `BurningFailed`          | Records failure with optional tx metadata     |
-| `RecordExistingBurn`    | `ExistingBurnRecovered`  | Recovery from Failed with known tx            |
-| `Reprocess`             | `Reprocessed`            | Reset to Detected for reprocessing            |
-| `ResumeBurn`            | `BurnResumed`            | Resume to Burning for post-Alpaca recovery    |
-| `CloseRedemption`       | `RedemptionClosed`       | Admin close an unresolved redemption        |
-| `ForceCompleteBurn`     | `BurnForceCompleted`     | Admin terminalize a verified-on-chain burn    |
+| Command                                  | Events                             | Notes                                             |
+| ---------------------------------------- | ---------------------------------- | ------------------------------------------------- |
+| `DetectRedemption`                       | `RedemptionDetected`               | Transfer detected                                 |
+| `RecordAlpacaCall`                       | `AlpacaCalled`                     | Alpaca API called                                 |
+| `RecordAlpacaFailure`                    | `AlpacaCallFailed`                 | Terminal failure                                  |
+| `ConfirmAlpacaComplete`                  | `AlpacaJournalCompleted`           | Journal complete                                  |
+| `IntendBurn`                             | `BurnIntended`                     | Persist exact signed tx before broadcasting       |
+| `BurnTokens`                             | `BurnTxSubmitted`                  | Broadcasts persisted signed transaction           |
+| `ConfirmBurn`                            | `TokensBurned`                     | Confirms burn, terminal success                   |
+| `RecordBurnRecoveryAttempt`              | `BurnRecoveryAttempted`            | Reserve one durable automatic recovery action     |
+| `RecordBurnPreparationRecoveryAttempt`   | `BurnPreparationRecoveryAttempted` | Reserve a retry before burn preparation           |
+| `ReplaceDeadBurn`                        | `BurnIntended`                     | Re-check dead predicate, then persist replacement |
+| `RecordBurnRecoveryExhausted`            | `BurnRecoveryExhausted`            | Stop automatic recovery durably                   |
+| `RecordBurnPreparationRecoveryExhausted` | `BurnPreparationRecoveryExhausted` | Stop preparation retries durably                  |
+| `RecordBurnFailure`                      | `BurningFailed`                    | Records failure with optional tx metadata         |
+| `RecordExistingBurn`                     | `ExistingBurnRecovered`            | Recovery from Failed with known tx                |
+| `Reprocess`                              | `Reprocessed`                      | Reset to Detected for reprocessing                |
+| `ResumeBurn`                             | `BurnResumed`                      | Resume to Burning for post-Alpaca recovery        |
+| `CloseRedemption`                        | `RedemptionClosed`                 | Admin close an unresolved redemption              |
+| `ForceCompleteBurn`                      | `BurnForceCompleted`               | Admin terminalize a verified-on-chain burn        |
 
 Burn transaction recovery runs once during startup and every five minutes while
 the service is running. Before any recovery side effect, the issuer classifies
@@ -550,16 +548,16 @@ the latest persisted signed transaction `(H, N)` for wallet `W` in this order:
    is confirmed and recorded; no transaction is signed or re-broadcast.
 2. A receipt for `H` with a block number and failed status is **reverted**. The
    nonce is consumed and the failed attempt is recorded before any later retry.
-3. With no receipt, if the finalized account nonce for `W` is at
-   most `N`, the transaction is **still mineable**. Recovery may only
-   re-broadcast the exact persisted bytes, producing the same hash `H`.
-4. With no receipt, if the finalized account nonce for `W` is
-   greater than `N`, the transaction is **provably dead** and can never land.
-   Only this case permits signing a replacement at a fresh nonce. The
-   replacement preserves the persisted transaction's destination, value, and
-   calldata exactly; only its nonce, gas limit, and fee fields are regenerated.
-   Its fresh nonce is the authoritative pending account nonce so it cannot
-   collide with another live transaction from the signing wallet.
+3. With no receipt, if the finalized account nonce for `W` is at most `N`, the
+   transaction is **still mineable**. Recovery may only re-broadcast the exact
+   persisted bytes, producing the same hash `H`.
+4. With no receipt, if the finalized account nonce for `W` is greater than `N`,
+   the transaction is **provably dead** and can never land. Only this case
+   permits signing a replacement at a fresh nonce. The replacement preserves the
+   persisted transaction's destination, value, and calldata exactly; only its
+   nonce, gas limit, and fee fields are regenerated. Its fresh nonce is the
+   authoritative pending account nonce so it cannot collide with another live
+   transaction from the signing wallet.
 
 Equivalently, the exact replacement predicate is
 `receipt(H) = None AND finalized_nonce(W) > N`. Receipt lookup is evaluated
@@ -575,22 +573,21 @@ redemption's complete event history, including preparation retries,
 re-broadcasts, and fresh-nonce replacements. The initial live submission is not
 a recovery action. Once the budget is exhausted, `BurnRecoveryExhausted` or
 `BurnPreparationRecoveryExhausted` is persisted once and automatic recovery
-stops. An accepted action is resumed after restart without consuming
-another budget slot until its side effect is complete: an accepted re-broadcast
-resubmits the same bytes, and a persisted replacement intent is submitted as
-the continuation of the action that created it only while it remains mineable.
-If its nonce became finalized while the service was down, signing a further
-replacement requires another budgeted action. Classification and confirmation
-of a transaction produced by the fifth action remain allowed because they do
-not create another side effect. If that transaction is still non-terminal or
+stops. An accepted action is resumed after restart without consuming another
+budget slot until its side effect is complete: an accepted re-broadcast
+resubmits the same bytes, and a persisted replacement intent is submitted as the
+continuation of the action that created it only while it remains mineable. If
+its nonce became finalized while the service was down, signing a further
+replacement requires another budgeted action. Classification and confirmation of
+a transaction produced by the fifth action remain allowed because they do not
+create another side effect. If that transaction is still non-terminal or
 provably dead, the history check persists exhaustion before accepting any
 further action. A failed fifth replacement preparation retains the preceding
 exact transaction identity long enough to persist exhaustion safely. An
-exhausted persisted intent cannot
-be re-armed through the admin recover endpoint: the operator must force-complete
-a verified landed burn or close only after off-chain reconciliation. At every
-point there is at most one transaction hash that can still land for a
-redemption.
+exhausted persisted intent cannot be re-armed through the admin recover
+endpoint: the operator must force-complete a verified landed burn or close only
+after off-chain reconciliation. At every point there is at most one transaction
+hash that can still land for a redemption.
 
 ### Account Aggregate
 
@@ -1240,16 +1237,20 @@ sequenceDiagram
     Alpaca->>Alpaca: Journal 10 AAPL shares<br/>From: AP -> To: Issuer account
     Alpaca->>Us: POST /inkind/issuance/confirm<br/>{status: "completed"}
     Note right of Us: ConfirmJournal command<br/>Event: JournalConfirmed
+    Note right of Us: Deposit command<br/>Event: MintingStarted
+    Note right of Us: PrepareMint command<br/>Event: MintTxIntended<br/>(signed transaction persisted)
 
     rect rgb(200, 220, 250)
         Note over Us,Blockchain: Single Atomic Transaction (multicall)
-        Us->>Blockchain: 1. deposit(10 AAPL, bot_wallet)
+        Us->>Blockchain: SubmitMint: broadcast persisted transaction
+        Note right of Us: Event: MintTxSubmitted
+        Note right of Blockchain: 1. deposit(10 AAPL, bot_wallet)
         Note right of Blockchain: Bot receives shares + receipts
-        Us->>Blockchain: 2. transfer(ap_wallet, 10 AAPL)
+        Note right of Blockchain: 2. transfer(ap_wallet, 10 AAPL)
         Note right of Blockchain: Bot transfers shares to AP<br/>(keeps receipts)
     end
     Blockchain->>Us: Transaction confirmed (both steps succeeded)
-    Note right of Us: Deposit command<br/>Events: MintingStarted,<br/>TokensMinted
+    Note right of Us: ConfirmMint command<br/>Event: TokensMinted
 
     Us->>Alpaca: POST /tokenization/callback/mint<br/>{tx_hash, wallet_address}
     Note right of Us: SendCallback command<br/>Event: MintCompleted<br/>Status: completed
@@ -1591,10 +1592,12 @@ sequenceDiagram
 
     Note right of Us: ConfirmAlpacaComplete command<br/>AlpacaJournalCompleted<br/>Status: burning
 
-    Us->>Blockchain: vault.withdraw(10 AAPL0x, receipt_id)<br/>owner=bot_wallet
-    Note right of Us: Bot burns using<br/>shares + receipts<br/>it now holds
+    Note right of Us: IntendBurn command<br/>Event: BurnIntended<br/>Exact signed burn multicall persisted
+    Note right of Us: BurnTokens command
+    Us->>Blockchain: Broadcast persisted burn multicall
+    Note right of Us: Event: BurnTxSubmitted
     Blockchain->>Us: Transaction confirmed
-    Note right of Us: RecordBurnSuccess command<br/>Event: TokensBurned (final success state)
+    Note right of Us: ConfirmBurn command<br/>Event: TokensBurned (final success state)
 
     Us->>AP: Redemption completed ✓
     Note left of AP: AP now has 10 AAPL shares<br/>in their Alpaca account
@@ -1879,15 +1882,17 @@ stateDiagram-v2
     Detected --> Failed: MarkFailed
     AlpacaCalled --> Burning: ConfirmAlpacaComplete
     AlpacaCalled --> Failed: RecordAlpacaFailure / MarkFailed
-    Burning --> Completed: RecordBurnSuccess
     Burning --> BurnIntended: IntendBurn
-    Burning --> BurnSubmitted: BurnTokens (BurnTxSubmitted)
     Burning --> Failed: RecordBurnFailure / MarkFailed
     Burning --> Closed: CloseRedemption (admin)
     BurnIntended --> BurnSubmitted: BurnTokens (BurnTxSubmitted)
+    BurnIntended --> Completed: ConfirmBurn (TokensBurned, crash recovery)
+    BurnIntended --> Failed: RecordBurnFailure
     BurnIntended --> BurnIntended: ReplaceDeadBurn / recovery annotations
     BurnIntended --> Completed: ForceCompleteBurn (admin, verified on-chain)
     BurnIntended --> Closed: CloseRedemption (admin)
+    BurnSubmitted --> BurnIntended: ReplaceDeadBurn
+    BurnSubmitted --> BurnSubmitted: recovery annotations
     BurnSubmitted --> Completed: ConfirmBurn (TokensBurned)
     BurnSubmitted --> Failed: RecordBurnFailure / MarkFailed
     BurnSubmitted --> Completed: ForceCompleteBurn (admin, verified on-chain)
@@ -2349,9 +2354,9 @@ weren't recorded (e.g. a crash between submit and confirmation). The completed
 transaction receipt must include its block number; recovery fails without
 emitting a permanent event when that proof is incomplete. A successfully mined
 receipt without a block number returns `500`. A replacement burn is authorized
-only after the prior transaction is confirmed reverted. Pending
-transactions, RPC failures, unknown outcomes, and legacy transaction IDs that
-cannot be verified on-chain return `422`, preserve the failed state and receipt
+only after the prior transaction is confirmed reverted. Pending transactions,
+RPC failures, unknown outcomes, and legacy transaction IDs that cannot be
+verified on-chain return `422`, preserve the failed state and receipt
 reservation, and require manual intervention instead of risking a second burn.
 
 **Examples:**
@@ -2380,12 +2385,12 @@ permanently rejected the journal, or tokens were consumed by other operations).
 **Endpoint:** `POST /admin/close/redemption/<issuer_request_id>`
 
 **Request body:**
-`{ "reason": "string", "acknowledged_unresolved_burn_tx_hash": "0x..." }`.
-The acknowledgement is optional unless the redemption has a persisted signed
-burn transaction. In that case omission or a hash mismatch returns `422`; the
+`{ "reason": "string", "acknowledged_unresolved_burn_tx_hash": "0x..." }`. The
+acknowledgement is optional unless the redemption has a persisted signed burn
+transaction. In that case omission or a hash mismatch returns `422`; the
 operator must echo the exact persisted hash shown by `/admin/stuck` after
-off-chain reconciliation. Supplying an acknowledgement when no persisted
-signed burn exists also returns `422`.
+off-chain reconciliation. Supplying an acknowledgement when no persisted signed
+burn exists also returns `422`.
 
 **Commands/Events:**
 
@@ -2397,13 +2402,12 @@ signed burn exists also returns `422`.
 - `409`: Already completed or closed
 - `422`: Invalid state, or a persisted signed burn was not acknowledged exactly
 
-Close responses and structured logs include the acknowledged persisted hash
-when an override is used. Closing never releases a held receipt reservation.
+Close responses and structured logs include the acknowledged persisted hash when
+an override is used. Closing never releases a held receipt reservation.
 
 ### Force-complete Redemption Burn
 
-**Endpoint:**
-`POST /admin/force-complete/redemption/<issuer_request_id>`
+**Endpoint:** `POST /admin/force-complete/redemption/<issuer_request_id>`
 
 **Request body:**
 `{ "burn_tx_hash": "0x...", "reason": "string",
@@ -2415,11 +2419,10 @@ rejected unless `acknowledged_unresolved_burn_tx_hash` exactly echoes the
 persisted hash being superseded. The terminal event, response, and structured
 logs record both identities, and the alternate proof's per-receipt withdrawals,
 receiver, dust transfer, and signer nonce must equal the persisted burn
-semantics, so the mined proof is a replacement and the persisted transaction
-can no longer land. The held
-receipt reservation is settled after the
-terminal event; operators must reconcile the acknowledged transaction before
-using this override.
+semantics, so the mined proof is a replacement and the persisted transaction can
+no longer land. The held receipt reservation is settled after the terminal
+event; operators must reconcile the acknowledged transaction before using this
+override.
 
 ### List Stuck Aggregates
 

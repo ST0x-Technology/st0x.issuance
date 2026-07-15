@@ -60,7 +60,6 @@ Per environment (`staging`, then `prod`):
 | File                                              | Contents                                  |
 | ------------------------------------------------- | ----------------------------------------- |
 | `secret/st0x-issuance-{env}.env.age`              | Service env (from `.env.secrets.example`) |
-| `secret/fireblocks-secret-issuance-{env}.key.age` | Fireblocks RSA private key                |
 
 Shared:
 

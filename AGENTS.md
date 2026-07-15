@@ -1,22 +1,17 @@
 # AGENTS.md
 
-This file provides guidance to AI agents working with code in this repository.
-
 **CRITICAL: File Size Limit** - AGENTS.md must not exceed 40,000 characters.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
 the limit, condense explanations without removing any rules.
 
 ## Documentation
 
-**Before doing any work**, read these two documents:
+**Before doing any work**, read:
 
-1. **[SPEC.md](SPEC.md)** — the north star. Describes what this service should
-   be. All new features must be spec'ed here first. If your change contradicts
-   the spec, either update the spec first (with user approval) or change your
-   approach. Implementation is downstream from the spec.
-2. **[docs/workflow.md](docs/workflow.md)** — the mandatory process for all
-   changes. Describes how to get from current behavior to the desired behavior
-   defined in the spec.
+1. **[SPEC.md](SPEC.md)** — the north star. Spec new features first. If a change
+   contradicts it, update it with user approval or change the approach.
+2. **[docs/workflow.md](docs/workflow.md)** — the mandatory change process from
+   current behavior to the spec.
 
 **Read when relevant** to your task:
 
@@ -35,8 +30,8 @@ the limit, condense explanations without removing any rules.
 
 ### While implementing
 
-- **Work until done:** Don't stop until all tasks are complete or you need user
-  input. Keep working through the task list autonomously.
+- **Work until done:** Continue autonomously until every task is complete or
+  user input is required.
   - The user manually reviews all git diffs, so changes must be minimal and
     focused
   - **Any diff not required to complete the task is a guideline violation** - no
@@ -46,8 +41,7 @@ the limit, condense explanations without removing any rules.
   - When creating implementation plans, ensure tasks are in the correct order
   - Earlier tasks MUST NOT depend on code from later tasks
   - All tests SHOULD pass at the end of each task whenever possible
-  - Focused git diffs and passing tests make reviewing much easier than large
-    changesets or verbose changelogs
+  - Keep diffs focused and tests passing for easy review
 - The code diffs themselves should be self-explanatory and easy to review
 
 ### After completing a plan
@@ -70,16 +64,10 @@ clarifies.
 
 ## Project Overview
 
-This is a Rust-based issuance bot that acts as the **Issuer** in Alpaca's
-Instant Tokenization Network (ITN). The bot implements the Issuer-side endpoints
-that Alpaca calls during mint/redeem operations, and coordinates with the Rain
-`OffchainAssetReceiptVault` contracts to execute the on-chain minting and
-burning of tokenized shares.
-
-**This is general infrastructure** - any Authorized Participant (AP) can use it
-to mint and redeem tokenized equities. The bot bridges traditional equity
-holdings (at Alpaca) and on-chain (semi-fungible) tokenized representations
-(Rain SFT contracts).
+Rust **Issuer** bot for Alpaca's Instant Tokenization Network (ITN). It serves
+Alpaca's mint/redeem endpoints and coordinates Rain
+`OffchainAssetReceiptVault` contracts. This is general infrastructure for any
+Authorized Participant, bridging Alpaca equity holdings and Rain SFTs.
 
 The system uses **Event Sourcing (ES)** and **CQRS** to maintain a complete
 audit trail, enable time-travel debugging, and provide a single source of truth.
@@ -93,11 +81,9 @@ audit trail, enable time-travel debugging, and provide a single source of truth.
 
 ### Dependency Management
 
-- **CRITICAL: Always use `cargo add` to add dependencies** - NEVER manually edit
-  version numbers in Cargo.toml
-  - `cargo add` automatically selects the latest compatible version
-  - Once `cargo add` has determined the version, you can then modify Cargo.toml
-    with that knowledge if needed
+- **CRITICAL: Always use `cargo add`; NEVER manually choose Cargo.toml versions.**
+  - It selects the latest compatible version; Cargo.toml may then be modified
+    with that version if needed
   - Example: `cargo add chrono` (NOT manually adding `chrono = "0.4.40"`)
   - For workspace dependencies: `cargo add --workspace chrono`, then add to
     package with `chrono.workspace = true`
@@ -356,11 +342,11 @@ Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
 3. Alpaca journals shares from AP to our custodian account
 4. Alpaca confirms journal -> `/inkind/issuance/confirm` (Command:
    `ConfirmJournal`, Events: `JournalConfirmed`, `MintingStarted`)
-5. We mint on-chain via `vault.multicall()`, atomically: `deposit()` (mints
-   receipts + shares to bot wallet) + `transfer()` (transfers only shares to
-   user) (Command: `RecordMintSuccess`, Event: `TokensMinted`)
-6. We call Alpaca's callback (Command: `RecordCallback`, Events: `CallbackSent`,
-   `MintCompleted`)
+5. We prepare and persist the exact signed mint multicall (Command:
+   `PrepareMint`, Event: `MintTxIntended`)
+6. We broadcast and confirm it (Commands: `SubmitMint`, `ConfirmMint`; Events:
+   `MintTxSubmitted`, `TokensMinted`)
+7. We call Alpaca's callback (Command: `SendCallback`, Event: `MintCompleted`)
 
 **Redemption Flow:**
 
@@ -370,8 +356,10 @@ Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
    `AlpacaCalled`)
 3. We poll for journal completion (Command: `ConfirmAlpacaComplete`, Event:
    `AlpacaJournalCompleted`)
-4. We burn on-chain via `vault.withdraw()` (Command: `RecordBurnSuccess`, Event:
-   `TokensBurned` - final success state)
+4. We prepare and persist the exact signed burn multicall (Command:
+   `IntendBurn`, Event: `BurnIntended`)
+5. We broadcast and confirm it (Commands: `BurnTokens`, `ConfirmBurn`; Events:
+   `BurnTxSubmitted`, `TokensBurned`)
 
 ### Configuration
 

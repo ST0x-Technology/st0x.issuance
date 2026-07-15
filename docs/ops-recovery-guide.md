@@ -29,17 +29,26 @@ entry shows:
 | `tokenization_request_id` | Alpaca's ID for cross-referencing           |
 | `state`                   | Where it got stuck (see state tables below) |
 | `detail`                  | Error message explaining why                |
+| `tx_id`                   | Current stuck transaction ID, when recorded |
 | `timestamp`               | When it entered this state                  |
+
+`/admin/stuck` projects plain `Burning`, `BurnIntended`, and `BurnSubmitted`
+aggregates as `state: "Burning"`. `detail: "Waiting for burn confirmation"` and
+`tx_id` show that a transaction was recorded; "Waiting for burn submission"
+means none was. A 32-byte `0x...` hash is force-complete eligible only when it
+identifies the exact persisted signed intent. The endpoint verifies that
+identity and rejects legacy or pre-intent transactions even if their burn was
+reconciled separately.
 
 ## How automatic recovery works
 
 On every startup, the bot automatically attempts to recover stuck transactions.
 Mint recovery (`run_mint_recovery`) covers mints in `JournalConfirmed`,
-`Minting`, `FireblocksSubmitted`, `MintingFailed`, and `CallbackPending`.
+`Minting`, `TxIntended`, `TxSubmitted`, `MintingFailed`, and `CallbackPending`.
 Redemption recovery covers redemptions in `Detected`
 (`recover_detected_redemptions`), `AlpacaCalled`
-(`recover_alpaca_called_redemptions`), `Burning`
-(`recover_burning_redemptions`), and `BurnFailed`
+(`recover_alpaca_called_redemptions`), `Burning` (`recover_burning_redemptions`,
+including aggregate `BurnIntended` and `BurnSubmitted` states), and `BurnFailed`
 (`recover_burn_failed_redemptions`), plus stuck-reservation cleanup
 (`recover_stuck_reservations`). This runs with a **30-second timeout** before
 the HTTP server starts accepting requests.
@@ -48,30 +57,33 @@ Persisted burn transactions are also reconciled every five minutes. Recovery
 confirms mined transactions, re-broadcasts the exact signed bytes while a
 transaction can still land, and signs a fresh-nonce replacement only after the
 old hash is provably dead. After five durable automatic actions across the
-redemption's lifetime, it logs `Automatic burn recovery exhausted` once with
-the request ID, transaction hash, nonce, and required operator action.
+redemption's lifetime, it logs `Automatic burn recovery exhausted` once with the
+request ID, transaction hash, nonce, and required operator action.
 
 - If recovery completes within 30 seconds, everything is handled automatically.
 - If recovery times out (e.g., the RPC is slow or unavailable), the remaining
   stuck transactions are left for manual intervention via the admin endpoints
   below.
 - If a burn recovery finds that the **on-chain balance is insufficient**, it
-  skips the burn and logs `MANUAL INTERVENTION REQUIRED`. This usually means the
-  burn already succeeded on-chain but wasn't recorded — verify on Basescan and
-  use `/admin/close` if confirmed.
+  skips the burn and logs `MANUAL INTERVENTION REQUIRED`. Verify the relevant
+  transaction and receipt inventory before choosing an action. For a `Failed`
+  redemption with a recorded transaction ID, use `/admin/recover/redemption`.
+  Force-complete only a `BurnIntended` or `BurnSubmitted` redemption with a
+  persisted signed transaction. Reconcile legacy or unverifiable burns off-chain
+  before closing.
 
 ## Step 2: Diagnose the failure
 
 ### Common failure patterns
 
-| Detail message contains                      | Cause                                | Action                                                                                  |
-| -------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------- |
-| `error sending request for url`              | Transient network/API                | Reprocess/recover — will likely work on retry                                           |
-| `Transaction reverted on-chain: 0x...`       | On-chain tx reverted                 | Check Basescan for the tx hash in `detail`, then reprocess/recover                      |
-| `Event not found in transaction: 0x...`      | Tx succeeded but emitted no event    | Inspect the tx on Basescan; if it looks correct use `/admin/close`, otherwise reprocess |
-| `insufficient funds for gas * price + value` | Bot wallet out of gas                | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover               |
-| `Tokenization request not found`             | Request genuinely absent from Alpaca | 404 returned by per-request GET endpoint — see "Alpaca request not found" below         |
-| `aggregate conflict` (409 response)          | Already recovered                    | No action needed — it already completed                                                 |
+| Detail message contains                      | Cause                                | Action                                                                              |
+| -------------------------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------- |
+| `error sending request for url`              | Transient network/API                | Reprocess/recover — will likely work on retry                                       |
+| `Transaction reverted on-chain: 0x...`       | On-chain tx reverted                 | Check Basescan for the tx hash in `detail`, then reprocess/recover                  |
+| `Event not found in transaction: 0x...`      | Tx succeeded but emitted no event    | Inspect it; recover `Failed`, or force-complete a persisted intended/submitted burn |
+| `insufficient funds for gas * price + value` | Bot wallet out of gas                | Fund the bot wallet with native gas (ETH on Base), then reprocess/recover           |
+| `Tokenization request not found`             | Request genuinely absent from Alpaca | 404 returned by per-request GET endpoint — see "Alpaca request not found" below     |
+| `aggregate conflict` (409 response)          | Already recovered                    | No action needed — it already completed                                             |
 
 When many transactions share `insufficient funds for gas * price + value` as the
 cause, the bot wallet has run dry — fund it once, then recover them all.
@@ -124,29 +136,29 @@ on-chain confirmation before responding.
 
 Possible responses:
 
-| Response message                                                           | Meaning                                                                                             |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                    |
-| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                              |
-| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold the tokens to burn — manual intervention (see "Insufficient receipt balance"). |
-| `409 Conflict`                                                             | Already recovered/completed — no action needed.                                                     |
-| `422 Unprocessable`                                                        | Alpaca journal is still `Pending`, or was `Rejected` — cannot burn. See "Alpaca request rejected".  |
-| `404 Not Found`                                                            | The tokenization request is genuinely absent from Alpaca — see "Alpaca request not found" below.    |
-| `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited or network error). See below.     |
+| Response message                                                           | Meaning                                                                                                                      |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `Recovered from Failed and executed burn immediately`                      | Success — burn submitted and confirmed on-chain.                                                                             |
+| `Recovered to Detected — RedeemCallManager will re-call Alpaca`            | Failed before Alpaca was called; it will re-call Alpaca automatically.                                                       |
+| `Recovered to Burning but burn skipped: on-chain balance insufficient ...` | The bot doesn't hold enough vault shares — manual intervention (see "Insufficient on-chain share balance").                  |
+| `409 Conflict`                                                             | Already recovered/completed — no action needed.                                                                              |
+| `422 Unprocessable`                                                        | Recovery refused: Alpaca is pending/rejected, prior burn is ambiguous/legacy, or automatic recovery is exhausted. See below. |
+| `404 Not Found`                                                            | The tokenization request is genuinely absent from Alpaca — see "Alpaca request not found" below.                             |
+| `502 Bad Gateway`                                                          | The Alpaca journal re-verification call failed (e.g. rate-limited or network error). See below.                              |
 
 Then check `/admin/stuck` again to confirm it cleared.
 
-### Closing (manually marking as done)
+### Closing an unresolved redemption
 
-Use close endpoints when a transaction cannot or should not be retried — for
-example, when the on-chain action already succeeded but the bot didn't record
-it.
+Use close when a transaction cannot or should not be retried and no burn can be
+verified on-chain. Closing is an acknowledgement of unresolved off-chain state,
+not proof that a burn succeeded.
 
 **Close a redemption:**
 
 ```bash
 curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/json" \
-  -d '{"reason": "Burn succeeded on-chain (tx 0x...) but reported as failure"}' \
+  -d '{"reason": "Reconciled off-chain; do not retry this redemption"}' \
   http://localhost:8000/admin/close/redemption/<issuer_request_id> | python3 -m json.tool
 ```
 
@@ -159,7 +171,39 @@ curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/js
 ```
 
 Closing just marks the transaction as done in our system. **It does not perform
-any on-chain action.** The reason is recorded in the event store for audit.
+or prove any on-chain action.** If the redemption has a persisted signed burn,
+the JSON body must also include
+`"acknowledged_unresolved_burn_tx_hash": "0x..."` with that exact hash. The
+reservation remains held because the acknowledged transaction may still land.
+The reason and acknowledgement are recorded in the event store for audit.
+
+### Force-completing a verified burn
+
+Use force-complete when a `BurnIntended` or `BurnSubmitted` redemption's exact
+persisted burn landed but the bot did not record completion:
+
+```bash
+curl -s -X POST -H "X-API-KEY: $ISSUER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"burn_tx_hash": "0x...", "reason": "Verified expected burn on-chain"}' \
+  http://localhost:8000/admin/force-complete/redemption/<issuer_request_id> | python3 -m json.tool
+```
+
+The endpoint verifies a successful receipt and the expected vault burn before
+recording `Completed`. The proving hash normally must equal the persisted burn
+hash. A same-nonce replacement can be used only when the request also echoes the
+persisted hash as `acknowledged_unresolved_burn_tx_hash` and the replacement
+matches the persisted recipient, withdrawals, and dust transfer.
+
+`POST /admin/recover/redemption` treats a previously recorded burn transaction
+as follows:
+
+| On-chain result                               | Recovery behavior                                                               |
+| --------------------------------------------- | ------------------------------------------------------------------------------- |
+| Completed                                     | Records the existing burn and completes the redemption.                         |
+| Reverted                                      | May prepare the next deterministic retry after the old transaction is terminal. |
+| Pending                                       | Returns `422` and leaves the state and reservation unchanged.                   |
+| Unknown/RPC failure                           | Returns `422` and fails closed; no replacement is signed.                       |
+| Legacy transaction ID that cannot be verified | Returns `422`; reconcile manually, then close if no burn can be proven.         |
 
 ## Before closing: verify on-chain state
 
@@ -175,27 +219,42 @@ Check the bot wallet on [Basescan](https://basescan.org):
 
 **Only close if:**
 
-- The on-chain action already succeeded (tokens minted/burned) but the bot
-  didn't record it, OR
-- The situation has been manually resolved outside the bot
+- The situation has been reconciled outside the bot, and
+- Any persisted signed burn hash has been explicitly acknowledged
 
-Always include a descriptive reason with the on-chain tx hash when closing.
+If a `Failed` redemption has a recorded burn transaction, recover it so the
+endpoint can inspect and record the receipt. If an intended/submitted persisted
+burn succeeded, force-complete it instead of closing it. Legacy and pre-intent
+states cannot be force-completed; close only after off-chain reconciliation.
+
+Always include a descriptive reason when closing. Acknowledge the persisted
+on-chain transaction hash only when one exists; never provide an unrelated or
+fabricated hash.
+
+## Insufficient on-chain share balance
+
+`on-chain balance insufficient` means the bot wallet's ERC-20 vault share
+balance is below the amount the redemption must burn. Refreshing the receipt
+inventory cannot restore those shares. Check whether an earlier burn landed or
+the shares moved elsewhere, then follow the state-specific recovery,
+force-complete, or reconciliation guidance above. Escalate if the missing shares
+cannot be accounted for.
 
 ## Insufficient receipt balance (ERC1155InsufficientBalance)
 
-A burn skipped with `on-chain balance insufficient` (or a revert error
-containing `execution reverted: 0x03dee4c5`) means the bot tried to withdraw
-more receipt tokens than it holds for a specific receipt ID. This happens when
-deposit events were missed (e.g., a gap in the receipt-backfill poller), so the
-bot doesn't know about receipts it actually owns.
+A revert containing `execution reverted: 0x03dee4c5` means the bot tried to
+redeem more ERC-1155 receipt tokens than it holds for a specific receipt ID. The
+receipt inventory therefore overstates that on-chain balance, for example
+because it missed a prior burn or outbound receipt change, or did not settle a
+reservation completely.
 
 **Recovery:** Restart the container to refresh the receipt inventory (startup
 reconciliation re-scans on-chain balances), then recover again. If it keeps
 failing, the bot may genuinely not have enough receipts — escalate to
 engineering.
 
-**Alternative (less disruptive):** Wait up to 60 seconds for the next periodic
-receipt-backfill pass to discover the missing receipts, then recover again.
+**Alternative (less disruptive):** Wait until the next periodic
+receipt-reconciliation pass refreshes balances, then recover again.
 
 ## Alpaca request rejected
 
@@ -232,13 +291,14 @@ check.
 
 ## Quick reference
 
-| Action             | Endpoint                         | Method           | Needs restart? |
-| ------------------ | -------------------------------- | ---------------- | -------------- |
-| List stuck         | `/admin/stuck`                   | GET              | No             |
-| Retry mint         | `/admin/reprocess/mint/<id>`     | POST             | No             |
-| Recover redemption | `/admin/recover/redemption/<id>` | POST             | No             |
-| Close redemption   | `/admin/close/redemption/<id>`   | POST (JSON body) | No             |
-| Close mint         | `/admin/close/mint/<id>`         | POST (JSON body) | No             |
+| Action              | Endpoint                                | Method           | Needs restart? |
+| ------------------- | --------------------------------------- | ---------------- | -------------- |
+| List stuck          | `/admin/stuck`                          | GET              | No             |
+| Retry mint          | `/admin/reprocess/mint/<id>`            | POST             | No             |
+| Recover redemption  | `/admin/recover/redemption/<id>`        | POST             | No             |
+| Close redemption    | `/admin/close/redemption/<id>`          | POST (JSON body) | No             |
+| Force-complete burn | `/admin/force-complete/redemption/<id>` | POST (JSON body) | No             |
+| Close mint          | `/admin/close/mint/<id>`                | POST (JSON body) | No             |
 
 ## Checking container logs
 
