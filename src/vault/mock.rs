@@ -517,6 +517,7 @@ impl MockVaultService {
         *self.pending_burn_result.lock().unwrap() = None;
         *self.prepared_tx.lock().unwrap() = None;
         self.submitted_burn_txs.lock().unwrap().clear();
+        self.verify_burn_call_count.store(0, Ordering::Relaxed);
         self.burn_classification_call_count.store(0, Ordering::Relaxed);
         self.burn_preparation_call_count.store(0, Ordering::Relaxed);
         self.replacement_preparation_call_count.store(0, Ordering::Relaxed);
@@ -1055,16 +1056,16 @@ impl VaultService for MockVaultService {
         _sendable_tx: &SendableTxWithHash,
     ) -> Result<BurnTxStatus, VaultError> {
         #[cfg(test)]
-        self.burn_classification_call_count.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        let classification = *self.burn_tx_status.lock().unwrap();
-        #[cfg(test)]
-        return match classification {
-            MockBurnTxClassification::Status(status) => Ok(status),
-            MockBurnTxClassification::RpcError => {
-                Err(VaultError::InvalidReceipt)
-            }
-        };
+        {
+            self.burn_classification_call_count.fetch_add(1, Ordering::Relaxed);
+            let classification = *self.burn_tx_status.lock().unwrap();
+            return match classification {
+                MockBurnTxClassification::Status(status) => Ok(status),
+                MockBurnTxClassification::RpcError => {
+                    Err(VaultError::InvalidReceipt)
+                }
+            };
+        }
         #[cfg(not(test))]
         Ok(BurnTxStatus::StillMineable)
     }
@@ -1075,14 +1076,16 @@ impl VaultService for MockVaultService {
         _sendable_tx: &SendableTxWithHash,
     ) -> Result<SendableTxWithHash, VaultError> {
         #[cfg(test)]
-        self.replacement_preparation_call_count.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        return self
-            .prepared_tx
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(VaultError::InvalidReceipt);
+        {
+            self.replacement_preparation_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            return self
+                .prepared_tx
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(VaultError::InvalidReceipt);
+        }
         #[cfg(not(test))]
         Ok(SendableTxWithHash::default())
     }
@@ -1142,7 +1145,7 @@ impl VaultService for MockVaultService {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use rust_decimal::Decimal;
 
@@ -1426,9 +1429,14 @@ mod tests {
         mock.prepare_replacement_burn_tx(params.owner, &sendable_tx)
             .await
             .unwrap();
+        mock.verify_burn_tx(test_vault(), test_receiver(), B256::ZERO)
+            .await
+            .unwrap();
 
         assert_eq!(mock.get_multi_burn_call_count(), 2);
+        assert!(mock.get_last_multi_burn_params().is_some());
         assert_eq!(mock.submitted_burn_txs().len(), 2);
+        assert_eq!(mock.verify_burn_call_count(), 1);
         assert_eq!(mock.burn_classification_call_count(), 1);
         assert_eq!(mock.burn_preparation_call_count(), 1);
         assert_eq!(mock.replacement_preparation_call_count(), 1);
@@ -1438,9 +1446,14 @@ mod tests {
         assert_eq!(mock.get_multi_burn_call_count(), 0);
         assert!(mock.get_last_multi_burn_params().is_none());
         assert!(mock.submitted_burn_txs().is_empty());
+        assert_eq!(mock.verify_burn_call_count(), 0);
         assert_eq!(mock.burn_classification_call_count(), 0);
         assert_eq!(mock.burn_preparation_call_count(), 0);
         assert_eq!(mock.replacement_preparation_call_count(), 0);
+        assert_eq!(
+            mock.prepare_burn_tx(&test_multi_burn_params()).await.unwrap(),
+            SendableTxWithHash::default(),
+        );
     }
 
     #[tokio::test]

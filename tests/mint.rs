@@ -4,14 +4,13 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
-use alloy::providers::ProviderBuilder;
-use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
 
 use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
+use harness::create_provider;
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
@@ -76,12 +75,7 @@ async fn perform_mint_flow(
     );
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .with_gas_estimation()
-        .filler(BlobGasFiller)
-        .with_simple_nonce_management()
-        .filler(ChainIdFiller::default())
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -139,7 +133,7 @@ async fn test_tokenization_flow() -> Result<(), Box<dyn std::error::Error>> {
     harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -219,7 +213,7 @@ async fn test_mint_burn_mint_nonce_synchronization()
     harness::setup_roles(&evm, user_wallet, bot_wallet).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
