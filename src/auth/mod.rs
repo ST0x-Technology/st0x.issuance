@@ -327,7 +327,7 @@ mod tests {
     use super::*;
     use crate::alpaca::service::AlpacaConfig;
     use crate::config::{Environment, LogLevel};
-    use crate::fireblocks::SignerConfig;
+    use crate::wallet::SignerConfig;
 
     #[rocket::get("/issuer-test")]
     fn issuer_endpoint(_auth: IssuerAuth) -> &'static str {

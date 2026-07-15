@@ -144,10 +144,8 @@ pub(crate) enum RedemptionEvent {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
         failed_at: DateTime<Utc>,
-        /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
-        /// Absent for non-Fireblocks backends or pre-enrichment events.
-        #[serde(default)]
-        fireblocks_tx_id: Option<TxId>,
+        #[serde(default, alias = "fireblocks_tx_id")]
+        tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         /// Absent for pre-enrichment events.
         #[serde(default)]
@@ -169,21 +167,24 @@ pub(crate) enum RedemptionEvent {
     },
     /// Burn transaction submitted to the signing backend.
     /// Persists the backend transaction ID so polling can resume after a restart.
-    BurnFireblocksSubmitted {
+    #[serde(alias = "BurnFireblocksSubmitted")]
+    BurnTxSubmitted {
         issuer_request_id: IssuerRedemptionRequestId,
         external_tx_id: BurnExternalTxId,
-        fireblocks_tx_id: TxId,
+        #[serde(alias = "fireblocks_tx_id")]
+        tx_id: TxId,
         /// Planned burns at the time of submission (for recovery use).
         planned_burns: Vec<BurnRecord>,
         submitted_at: DateTime<Utc>,
     },
 
-    /// Existing on-chain burn discovered during recovery via Fireblocks tx lookup.
+    /// Existing on-chain burn discovered during recovery via tx lookup.
     /// Mirrors mint's `ExistingMintRecovered` — the burn already landed on-chain
-    /// but the bot failed to record it (e.g., Fireblocks polling timeout).
+    /// but the bot failed to record it (e.g. polling timeout).
     ExistingBurnRecovered {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: TxId,
+        #[serde(alias = "fireblocks_tx_id")]
+        tx_id: TxId,
         tx_hash: B256,
         burns: Vec<BurnRecord>,
         block_number: u64,
@@ -229,7 +230,7 @@ pub(crate) enum RedemptionEvent {
         /// Alpaca's `updated_at` for the completed journal — the closest
         /// approximation we have to the actual journal completion time.
         alpaca_journal_completed_at: DateTime<Utc>,
-        /// Optional deterministic Fireblocks `externalTxId` for the next burn
+        /// Optional deterministic transaction `externalTxId` for the next burn
         /// submission. Old events did not carry this field.
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
@@ -237,7 +238,7 @@ pub(crate) enum RedemptionEvent {
     },
     BurnIntended {
         issuer_request_id: IssuerRedemptionRequestId,
-        sendable_tx: Option<SendableTxWithHash>,
+        sendable_tx: SendableTxWithHash,
         planned_burns: Vec<BurnRecord>,
     },
 }
@@ -270,8 +271,8 @@ impl DomainEvent for RedemptionEvent {
             Self::BurnResumed { .. } => {
                 "RedemptionEvent::BurnResumed".to_string()
             }
-            Self::BurnFireblocksSubmitted { .. } => {
-                "RedemptionEvent::BurnFireblocksSubmitted".to_string()
+            Self::BurnTxSubmitted { .. } => {
+                "RedemptionEvent::BurnTxSubmitted".to_string()
             }
             Self::ExistingBurnRecovered { .. } => {
                 "RedemptionEvent::ExistingBurnRecovered".to_string()
@@ -389,7 +390,7 @@ mod tests {
             issuer_request_id: test_redemption_id(),
             error: "Blockchain error: timeout".to_string(),
             failed_at: Utc::now(),
-            fireblocks_tx_id: None,
+            tx_id: None,
             planned_burns: vec![],
         };
 
@@ -403,7 +404,7 @@ mod tests {
             issuer_request_id: test_redemption_id(),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
-            fireblocks_tx_id: Some(TxId::Legacy("fb-tx-123".to_string())),
+            tx_id: Some(TxId::random()),
             planned_burns: vec![BurnRecord {
                 receipt_id: uint!(7_U256),
                 shares_burned: uint!(100_000000000000000000_U256),
@@ -430,17 +431,38 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::BurningFailed {
-            fireblocks_tx_id,
-            planned_burns,
-            ..
-        } = event
+        let RedemptionEvent::BurningFailed { tx_id, planned_burns, .. } = event
         else {
             panic!("Expected BurningFailed variant");
         };
 
-        assert_eq!(fireblocks_tx_id, None);
+        assert_eq!(tx_id, None);
         assert!(planned_burns.is_empty());
+    }
+
+    /// Old BurningFailed events stored the transaction id under `fireblocks_tx_id`.
+    /// The alias ensures these deserialize into `tx_id` without data loss, so
+    /// `/admin/stuck` correctly reports them as awaiting confirmation rather than
+    /// awaiting burn submission.
+    #[test]
+    fn test_backwards_compat_burning_failed_with_fireblocks_tx_id() {
+        let json = r#"{
+            "BurningFailed": {
+                "issuer_request_id": "red-abcdef12",
+                "error": "polling timeout",
+                "failed_at": "2025-01-01T00:00:00Z",
+                "fireblocks_tx_id": "fb-tx-999",
+                "planned_burns": []
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::BurningFailed { tx_id, .. } = event else {
+            panic!("Expected BurningFailed variant");
+        };
+
+        assert_eq!(tx_id, Some(TxId::Legacy("fb-tx-999".to_string())));
     }
 
     #[test]

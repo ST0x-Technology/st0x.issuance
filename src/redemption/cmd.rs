@@ -38,7 +38,7 @@ pub(crate) enum RedemptionCommand {
         reason: String,
     },
     /// Submits burn transaction to the signing backend.
-    /// Produces `BurnFireblocksSubmitted` on success, or the caller records failure.
+    /// Produces `BurnTxSubmitted` on success, or the caller records failure.
     BurnTokens {
         issuer_request_id: IssuerRedemptionRequestId,
         vault: Address,
@@ -47,9 +47,9 @@ pub(crate) enum RedemptionCommand {
         /// Dust to return to user
         dust_shares: U256,
         owner: Address,
-        /// Optional deterministic Fireblocks `externalTxId` override.
+        /// Optional deterministic transaction `externalTxId` override.
         /// Used when retrying a replacement burn after a prior accepted
-        /// Fireblocks burn terminally failed.
+        /// transaction burn terminally failed.
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
     },
@@ -58,14 +58,13 @@ pub(crate) enum RedemptionCommand {
     /// Polls the signing backend and produces `TokensBurned` or error.
     ConfirmBurn {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: TxId,
+        tx_id: TxId,
         dust_shares: U256,
     },
     RecordBurnFailure {
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
-        /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
-        fireblocks_tx_id: Option<TxId>,
+        tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         planned_burns: Vec<super::BurnRecord>,
     },
@@ -78,12 +77,12 @@ pub(crate) enum RedemptionCommand {
         issuer_request_id: IssuerRedemptionRequestId,
         metadata: super::RedemptionMetadata,
     },
-    /// Records an existing on-chain burn discovered via Fireblocks tx lookup.
-    /// Only valid from `Failed` state. Used when the Fireblocks transaction
+    /// Records an existing on-chain burn discovered via tx lookup.
+    /// Only valid from `Failed` state. Used when the transaction
     /// succeeded on-chain but the bot timed out before recording it.
     RecordExistingBurn {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: TxId,
+        tx_id: TxId,
         tx_hash: B256,
         planned_burns: Vec<super::BurnRecord>,
         block_number: u64,
@@ -119,9 +118,9 @@ pub(crate) enum RedemptionCommand {
         called_at: chrono::DateTime<chrono::Utc>,
         /// Alpaca's `updated_at` for the completed journal.
         alpaca_journal_completed_at: chrono::DateTime<chrono::Utc>,
-        /// Optional deterministic Fireblocks `externalTxId` for the next burn
+        /// Optional deterministic transaction `externalTxId` for the next burn
         /// submission. Persisted through `BurnResumed` so a retry submission
-        /// that fails before Fireblocks accepts it can be retried idempotently.
+        /// that fails before transaction accepts it can be retried idempotently.
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
     },

@@ -11,11 +11,11 @@ use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
 use crate::config::{Config, Environment, LogLevel};
-use crate::fireblocks::SignerConfig;
 use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::mock::MockVaultService;
+use crate::wallet::SignerConfig;
 
 pub(crate) fn test_config() -> Config {
     Config {

@@ -79,7 +79,8 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
     },
-    FireblocksSubmitted {
+    #[serde(alias = "FireblocksSubmitted")]
+    MintTxSubmitted {
         issuer_request_id: IssuerMintRequestId,
         tokenization_request_id: TokenizationRequestId,
         quantity: Quantity,
@@ -92,7 +93,7 @@ pub(crate) enum MintView {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
         external_tx_id: String,
-        fireblocks_tx_id: String,
+        tx_id: String,
     },
     CallbackPending {
         issuer_request_id: IssuerMintRequestId,
@@ -161,7 +162,7 @@ impl MintView {
             Self::JournalConfirmed { .. } => "JournalConfirmed",
             Self::JournalRejected { .. } => "JournalRejected",
             Self::Minting { .. } => "Minting",
-            Self::FireblocksSubmitted { .. } => "FireblocksSubmitted",
+            Self::MintTxSubmitted { .. } => "MintTxSubmitted",
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
             Self::Completed { .. } => "Completed",
@@ -209,7 +210,7 @@ pub(crate) async fn find_all_recoverable_mints(
         FROM mint_view
         WHERE json_extract(payload, '$.Live.JournalConfirmed') IS NOT NULL
            OR json_extract(payload, '$.Live.Minting') IS NOT NULL
-           OR json_extract(payload, '$.Live.FireblocksSubmitted') IS NOT NULL
+           OR json_extract(payload, '$.Live.MintTxSubmitted') IS NOT NULL
            OR json_extract(payload, '$.Live.MintingFailed') IS NOT NULL
            OR json_extract(payload, '$.Live.CallbackPending') IS NOT NULL
         "#
@@ -248,7 +249,7 @@ pub(crate) async fn find_stuck(
            OR json_extract(payload, '$.Live.JournalConfirmed')    IS NOT NULL
            OR json_extract(payload, '$.Live.JournalRejected')     IS NOT NULL
            OR json_extract(payload, '$.Live.Minting')             IS NOT NULL
-           OR json_extract(payload, '$.Live.FireblocksSubmitted') IS NOT NULL
+           OR json_extract(payload, '$.Live.MintTxSubmitted')     IS NOT NULL
            OR json_extract(payload, '$.Live.CallbackPending')     IS NOT NULL
            OR json_extract(payload, '$.Live.MintingFailed')       IS NOT NULL
         "#
@@ -436,7 +437,7 @@ mod tests {
     }
 
     /// Seeds one view per recoverable state. `find_all_recoverable_mints` and
-    /// `find_stuck` both match `FireblocksSubmitted`, so it is seeded here
+    /// `find_stuck` both match `TxSubmitted`, so it is seeded here
     /// alongside the other recoverable states.
     async fn seed_recoverable_mint_views(
         pool: &Pool<Sqlite>,
@@ -474,7 +475,7 @@ mod tests {
                 journal_confirmed_at: now,
                 minting_started_at: now,
             },
-            MintView::FireblocksSubmitted {
+            MintView::MintTxSubmitted {
                 issuer_request_id: fields[2].issuer_request_id.clone(),
                 tokenization_request_id: fields[2]
                     .tokenization_request_id
@@ -489,7 +490,7 @@ mod tests {
                 journal_confirmed_at: now,
                 minting_started_at: now,
                 external_tx_id: "mint-base".to_string(),
-                fireblocks_tx_id: "fb-1".to_string(),
+                tx_id: "fb-1".to_string(),
             },
             MintView::MintingFailed {
                 issuer_request_id: fields[3].issuer_request_id.clone(),
@@ -604,7 +605,7 @@ mod tests {
             results.iter().map(|(_, view)| view.state_name()).collect();
         assert!(state_names.contains(&"JournalConfirmed"));
         assert!(state_names.contains(&"Minting"));
-        assert!(state_names.contains(&"FireblocksSubmitted"));
+        assert!(state_names.contains(&"MintTxSubmitted"));
         assert!(state_names.contains(&"MintingFailed"));
         assert!(state_names.contains(&"CallbackPending"));
     }
@@ -622,7 +623,7 @@ mod tests {
         let now = Utc::now();
 
         // Seed the 5 recoverable variants (JournalConfirmed, Minting,
-        // FireblocksSubmitted, MintingFailed, CallbackPending).
+        // TxSubmitted, MintingFailed, CallbackPending).
         let recoverable_ids = seed_recoverable_mint_views(&pool).await;
 
         // Seed Initiated and JournalRejected (non-terminal-but-not-recoverable).
@@ -737,7 +738,7 @@ mod tests {
         assert!(state_names.contains(&"JournalConfirmed"));
         assert!(state_names.contains(&"JournalRejected"));
         assert!(state_names.contains(&"Minting"));
-        assert!(state_names.contains(&"FireblocksSubmitted"));
+        assert!(state_names.contains(&"MintTxSubmitted"));
         assert!(state_names.contains(&"MintingFailed"));
         assert!(state_names.contains(&"CallbackPending"));
     }

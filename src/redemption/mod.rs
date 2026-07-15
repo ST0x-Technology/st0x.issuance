@@ -22,8 +22,7 @@ use tracing::warn;
 use crate::Quantity;
 use crate::mint::TokenizationRequestId;
 use crate::redemption::burn_manager::{
-    extract_fireblocks_tx_id, is_pending_burn_confirmation,
-    should_release_reserved_burn,
+    extract_tx_hash, is_pending_burn_confirmation, should_release_reserved_burn,
 };
 
 /// Issuer request ID for redemption operations.
@@ -138,6 +137,10 @@ impl BurnExternalTxId {
             .rsplit_once(Redemption::BURN_RETRY_EXTERNAL_TX_MARKER)
             .and_then(|(_, attempt)| attempt.parse().ok())
     }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
 }
 
 impl std::fmt::Display for BurnExternalTxId {
@@ -203,7 +206,7 @@ pub(crate) enum Redemption {
         called_at: DateTime<Utc>,
         alpaca_journal_completed_at: DateTime<Utc>,
         external_tx_id: BurnExternalTxId,
-        fireblocks_tx_id: TxId,
+        tx_id: TxId,
         planned_burns: Vec<event::BurnRecord>,
     },
     Completed {
@@ -234,7 +237,7 @@ pub(crate) enum Redemption {
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
         #[serde(default)]
-        sendable_tx: Option<SendableTxWithHash>,
+        sendable_tx: SendableTxWithHash,
     },
 }
 
@@ -397,7 +400,7 @@ impl Redemption {
     }
 
     /// Submits the burn transaction to the signing backend.
-    /// Produces `BurnFireblocksSubmitted` on success; failure is propagated to caller.
+    /// Produces `BurnTxSubmitted` on success; failure is propagated to caller.
     async fn handle_burn_tokens(
         &self,
         services: &Arc<dyn VaultService>,
@@ -438,14 +441,16 @@ impl Redemption {
             .await
             .map_err(|error: VaultError| RedemptionError::Vault {
                 release_reservation: should_release_reserved_burn(&error),
-                fireblocks_tx_id: extract_fireblocks_tx_id(&error),
+                tx_id: extract_tx_hash(&error).map(Into::into),
                 message: error.to_string(),
             })?;
 
-        Ok(vec![RedemptionEvent::BurnFireblocksSubmitted {
+        Ok(vec![RedemptionEvent::BurnTxSubmitted {
             issuer_request_id,
-            external_tx_id: submitted.external_tx_id,
-            fireblocks_tx_id: submitted.fireblocks_tx_id,
+            external_tx_id: BurnExternalTxId::from_string(
+                submitted.external_tx_id,
+            ),
+            tx_id: submitted.tx_id,
             planned_burns,
             submitted_at: Utc::now(),
         }])
@@ -456,16 +461,12 @@ impl Redemption {
         &self,
         services: &Arc<dyn VaultService>,
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: TxId,
+        tx_id: TxId,
         dust_shares: U256,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         let stored_tx_id = match self {
-            Self::BurnSubmitted { fireblocks_tx_id, .. } => {
-                fireblocks_tx_id.clone()
-            }
-            Self::BurnIntended { sendable_tx: Some(tx), .. } => {
-                TxId::Hash(tx.hash)
-            }
+            Self::BurnSubmitted { tx_id, .. } => tx_id.clone(),
+            Self::BurnIntended { sendable_tx, .. } => sendable_tx.hash.into(),
             _ => {
                 return Err(RedemptionError::InvalidState {
                     expected: "BurnSubmitted or BurnIntended".to_string(),
@@ -474,30 +475,29 @@ impl Redemption {
             }
         };
 
-        if stored_tx_id != fireblocks_tx_id {
-            return Err(RedemptionError::FireblocksTxIdMismatch {
-                expected: stored_tx_id.to_string(),
-                provided: fireblocks_tx_id.to_string(),
+        if stored_tx_id != tx_id {
+            return Err(RedemptionError::TxIdMismatch {
+                expected: stored_tx_id,
+                provided: tx_id,
             });
         }
 
-        let result = services
-            .confirm_burn(&fireblocks_tx_id, dust_shares)
-            .await
-            .map_err(|error| {
+        let result = services.confirm_burn(&tx_id, dust_shares).await.map_err(
+            |error| {
                 if is_pending_burn_confirmation(&error) {
                     return RedemptionError::BurnConfirmationPending {
-                        tx_id: fireblocks_tx_id.clone(),
+                        tx_id: tx_id.clone(),
                         message: error.to_string(),
                     };
                 }
 
                 RedemptionError::Vault {
                     release_reservation: should_release_reserved_burn(&error),
-                    fireblocks_tx_id: extract_fireblocks_tx_id(&error),
+                    tx_id: extract_tx_hash(&error).map(Into::into),
                     message: error.to_string(),
                 }
-            })?;
+            },
+        )?;
 
         let burns = result
             .burns
@@ -523,7 +523,7 @@ impl Redemption {
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
         error: String,
-        fireblocks_tx_id: Option<TxId>,
+        tx_id: Option<TxId>,
         planned_burns: Vec<BurnRecord>,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
         if !matches!(
@@ -542,7 +542,7 @@ impl Redemption {
             issuer_request_id,
             error,
             failed_at: Utc::now(),
-            fireblocks_tx_id,
+            tx_id,
             planned_burns,
         }])
     }
@@ -625,7 +625,7 @@ impl Redemption {
     fn handle_record_existing_burn(
         &self,
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: TxId,
+        tx_id: TxId,
         tx_hash: B256,
         planned_burns: Vec<BurnRecord>,
         block_number: u64,
@@ -644,7 +644,7 @@ impl Redemption {
 
         Ok(vec![RedemptionEvent::ExistingBurnRecovered {
             issuer_request_id,
-            fireblocks_tx_id,
+            tx_id,
             tx_hash,
             burns: planned_burns,
             block_number,
@@ -810,13 +810,13 @@ impl Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         input: BurnInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let (Self::Burning { metadata, .. }
-        | Self::BurnIntended { metadata, sendable_tx: None, .. }) = self
-        else {
+        // `BurnIntended` always holds a signed transaction, so re-preparing
+        // from it would sign a replacement that could burn twice if the
+        // original already reached the node. Recovery re-broadcasts the
+        // persisted transaction instead.
+        let Self::Burning { metadata, .. } = self else {
             return Err(RedemptionError::InvalidState {
-                expected:
-                    "Burning or BurnIntended without a signed transaction"
-                        .to_string(),
+                expected: "Burning".to_string(),
                 found: self.state_name().to_string(),
             });
         };
@@ -868,12 +868,12 @@ pub(crate) fn next_burn_retry_external_tx_id_from_history<'a>(
                 external_tx_id: Some(external_tx_id),
                 ..
             } => Some(Ok(external_tx_id.clone())),
-            RedemptionEvent::BurnFireblocksSubmitted {
-                external_tx_id, ..
-            } => Some(Redemption::next_burn_retry_external_tx_id(
-                detected_tx_hash,
-                external_tx_id,
-            )),
+            RedemptionEvent::BurnTxSubmitted { external_tx_id, .. } => {
+                Some(Redemption::next_burn_retry_external_tx_id(
+                    detected_tx_hash,
+                    external_tx_id,
+                ))
+            }
             _ => None,
         })
         .transpose()
@@ -898,14 +898,14 @@ pub(crate) enum RedemptionError {
         /// requires this error to be serializable, so the `VaultError` itself
         /// cannot cross into the burn orchestrator.
         release_reservation: bool,
-        /// Fireblocks transaction id pulled from the `VaultError`, if any, so a
+        /// Transaction id pulled from the `VaultError`, if any, so a
         /// possibly-in-flight burn stays recoverable after the type is erased.
-        fireblocks_tx_id: Option<TxId>,
+        tx_id: Option<TxId>,
     },
     #[error(
-        "Fireblocks tx ID mismatch. Expected: {expected}, provided: {provided}"
+        "Transaction ID mismatch. Expected: {expected}, provided: {provided}"
     )]
-    FireblocksTxIdMismatch { expected: String, provided: String },
+    TxIdMismatch { expected: TxId, provided: TxId },
     #[error("Burn confirmation remains pending for {tx_id}: {message}")]
     BurnConfirmationPending { tx_id: TxId, message: String },
     #[error(
@@ -1101,13 +1101,13 @@ impl EventSourced for Redemption {
             }
             RedemptionCommand::ConfirmBurn {
                 issuer_request_id,
-                fireblocks_tx_id,
+                tx_id,
                 dust_shares,
             } => {
                 self.handle_confirm_burn(
                     services,
                     issuer_request_id,
-                    fireblocks_tx_id,
+                    tx_id,
                     dust_shares,
                 )
                 .await
@@ -1115,23 +1115,23 @@ impl EventSourced for Redemption {
             RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error,
-                fireblocks_tx_id,
+                tx_id,
                 planned_burns,
             } => self.handle_record_burn_failure(
                 issuer_request_id,
                 error,
-                fireblocks_tx_id,
+                tx_id,
                 planned_burns,
             ),
             RedemptionCommand::RecordExistingBurn {
                 issuer_request_id,
-                fireblocks_tx_id,
+                tx_id,
                 tx_hash,
                 planned_burns,
                 block_number,
             } => self.handle_record_existing_burn(
                 issuer_request_id,
-                fireblocks_tx_id,
+                tx_id,
                 tx_hash,
                 planned_burns,
                 block_number,
@@ -1230,7 +1230,7 @@ impl Redemption {
                 issuer_request_id,
                 *alpaca_journal_completed_at,
             ),
-            RedemptionEvent::BurnFireblocksSubmitted { .. } => {
+            RedemptionEvent::BurnTxSubmitted { .. } => {
                 self.apply_burn_submitted_event(event);
             }
             RedemptionEvent::BurnResumed { .. } => {
@@ -1313,9 +1313,9 @@ impl Redemption {
     }
 
     fn apply_burn_submitted_event(&mut self, event: RedemptionEvent) {
-        let RedemptionEvent::BurnFireblocksSubmitted {
+        let RedemptionEvent::BurnTxSubmitted {
             external_tx_id,
-            fireblocks_tx_id,
+            tx_id,
             planned_burns,
             ..
         } = event
@@ -1353,7 +1353,7 @@ impl Redemption {
             called_at,
             alpaca_journal_completed_at,
             external_tx_id,
-            fireblocks_tx_id,
+            tx_id,
             planned_burns,
         };
     }
@@ -1525,10 +1525,10 @@ mod tests {
         let detected_tx_hash = b256!(
             "0x1111111111111111111111111111111111111111111111111111111111111111"
         );
-        let events = [RedemptionEvent::BurnFireblocksSubmitted {
+        let events = [RedemptionEvent::BurnTxSubmitted {
             issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
             external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
-            fireblocks_tx_id: TxId::Legacy("fb-1".to_string()),
+            tx_id: TxId::Legacy("fb-1".to_string()),
             planned_burns: vec![],
             submitted_at: Utc::now(),
         }];
@@ -1556,12 +1556,12 @@ mod tests {
         let retry_external_tx_id =
             Redemption::retry_burn_external_tx_id_typed(&detected_tx_hash, 1);
         let events = [
-            RedemptionEvent::BurnFireblocksSubmitted {
+            RedemptionEvent::BurnTxSubmitted {
                 issuer_request_id: IssuerRedemptionRequestId::new(
                     detected_tx_hash,
                 ),
                 external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
-                fireblocks_tx_id: TxId::Legacy("fb-1".to_string()),
+                tx_id: TxId::Legacy("fb-1".to_string()),
                 planned_burns: vec![],
                 submitted_at: Utc::now(),
             },
@@ -2137,7 +2137,7 @@ mod tests {
         let RedemptionEvent::BurnIntended {
             issuer_request_id: event_id,
             planned_burns,
-            sendable_tx,
+            ..
         } = &events[0]
         else {
             panic!("Expected BurnIntended event, got {:?}", &events[0]);
@@ -2147,8 +2147,6 @@ mod tests {
         assert_eq!(planned_burns.len(), 1);
         assert_eq!(planned_burns[0].receipt_id, receipt_id);
         assert_eq!(planned_burns[0].shares_burned, burn_shares);
-        // Default mock prepare_tx returns None (local signing not configured)
-        assert!(sendable_tx.is_none());
     }
 
     #[tokio::test]
@@ -2192,9 +2190,7 @@ mod tests {
         assert_eq!(
             error,
             RedemptionError::InvalidState {
-                expected:
-                    "Burning or BurnIntended without a signed transaction"
-                        .to_string(),
+                expected: "Burning".to_string(),
                 found: "Detected".to_string(),
             }
         );
@@ -2247,7 +2243,7 @@ mod tests {
             },
             RedemptionEvent::BurnIntended {
                 issuer_request_id: issuer_request_id.clone(),
-                sendable_tx: None,
+                sendable_tx: SendableTxWithHash::default(),
                 planned_burns: planned_burns.clone(),
             },
         ])
@@ -2274,7 +2270,7 @@ mod tests {
                 alpaca_journal_completed_at,
                 planned_burns,
                 external_tx_id: None,
-                sendable_tx: None,
+                sendable_tx: SendableTxWithHash::default(),
             }
         );
     }
@@ -2316,7 +2312,7 @@ mod tests {
                 },
                 RedemptionEvent::BurnIntended {
                     issuer_request_id: issuer_request_id.clone(),
-                    sendable_tx: None,
+                    sendable_tx: SendableTxWithHash::default(),
                     planned_burns: vec![BurnRecord {
                         receipt_id,
                         shares_burned: burn_shares,
@@ -2341,16 +2337,13 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        let RedemptionEvent::BurnFireblocksSubmitted {
+        let RedemptionEvent::BurnTxSubmitted {
             issuer_request_id: event_id,
             planned_burns,
             ..
         } = &events[0]
         else {
-            panic!(
-                "Expected BurnFireblocksSubmitted event, got {:?}",
-                &events[0]
-            );
+            panic!("Expected BurnTxSubmitted event, got {:?}", &events[0]);
         };
 
         assert_eq!(event_id, &issuer_request_id);
@@ -2442,7 +2435,7 @@ mod tests {
             .when(RedemptionCommand::RecordBurnFailure {
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
-                fireblocks_tx_id: None,
+                tx_id: None,
                 planned_burns: vec![],
             })
             .await
@@ -2474,7 +2467,7 @@ mod tests {
             .when(RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error: "Some error".to_string(),
-                fireblocks_tx_id: None,
+                tx_id: None,
                 planned_burns: vec![],
             })
             .await
@@ -2530,12 +2523,12 @@ mod tests {
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Vec<RedemptionEvent> {
         let mut events = burning_given_events(issuer_request_id);
-        events.push(RedemptionEvent::BurnFireblocksSubmitted {
+        events.push(RedemptionEvent::BurnTxSubmitted {
             issuer_request_id: issuer_request_id.clone(),
             external_tx_id: BurnExternalTxId::base(&b256!(
                 "0x4444444444444444444444444444444444444444444444444444444444444444"
             )),
-            fireblocks_tx_id: TxId::Legacy("fb-799".to_string()),
+            tx_id: TxId::Legacy("fb-799".to_string()),
             planned_burns: vec![],
             submitted_at: Utc::now(),
         });
@@ -2549,13 +2542,13 @@ mod tests {
         let mut events = burning_given_events(issuer_request_id);
         events.push(RedemptionEvent::BurnIntended {
             issuer_request_id: issuer_request_id.clone(),
-            sendable_tx: Some(SendableTxWithHash {
+            sendable_tx: SendableTxWithHash {
                 tx: vec![1, 2, 3],
                 hash: tx_hash,
                 nonce: 7,
                 signed_at: Utc::now(),
                 dust_shares: U256::ZERO,
-            }),
+            },
             planned_burns: vec![],
         });
         events
@@ -2572,7 +2565,7 @@ mod tests {
             .given(burn_intended_given_events(&issuer_request_id, tx_hash))
             .when(RedemptionCommand::ConfirmBurn {
                 issuer_request_id,
-                fireblocks_tx_id: TxId::Hash(tx_hash),
+                tx_id: TxId::Hash(tx_hash),
                 dust_shares: U256::ZERO,
             })
             .await
@@ -2598,7 +2591,7 @@ mod tests {
             .given(burn_intended_given_events(&issuer_request_id, stored_hash))
             .when(RedemptionCommand::ConfirmBurn {
                 issuer_request_id,
-                fireblocks_tx_id: TxId::Hash(provided_hash),
+                tx_id: TxId::Hash(provided_hash),
                 dust_shares: U256::ZERO,
             })
             .await
@@ -2609,9 +2602,9 @@ mod tests {
         };
         assert_eq!(
             error,
-            RedemptionError::FireblocksTxIdMismatch {
-                expected: TxId::Hash(stored_hash).to_string(),
-                provided: TxId::Hash(provided_hash).to_string(),
+            RedemptionError::TxIdMismatch {
+                expected: TxId::Hash(stored_hash),
+                provided: TxId::Hash(provided_hash),
             }
         );
     }
@@ -2628,7 +2621,7 @@ mod tests {
             .when(RedemptionCommand::RecordBurnFailure {
                 issuer_request_id,
                 error: "receipt reverted".to_string(),
-                fireblocks_tx_id: Some(TxId::Hash(tx_hash)),
+                tx_id: Some(TxId::Hash(tx_hash)),
                 planned_burns: vec![],
             })
             .await
@@ -2701,7 +2694,7 @@ mod tests {
             issuer_request_id: issuer_request_id.clone(),
             error: "burn reverted".to_string(),
             failed_at: Utc::now(),
-            fireblocks_tx_id: None,
+            tx_id: None,
             planned_burns: vec![],
         });
 
@@ -3031,7 +3024,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 error: error.clone(),
                 failed_at,
-                fireblocks_tx_id: None,
+                tx_id: None,
                 planned_burns: vec![],
             },
         ])
