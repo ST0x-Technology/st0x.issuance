@@ -264,12 +264,31 @@ impl JournalManager {
             &metadata.wallet,
             req_wallet,
         )?;
-        Self::check_field_match(
-            issuer_request_id,
-            "Transaction hash",
-            &Some(metadata.detected_tx_hash),
-            req_tx_hash,
-        )?;
+        // Alpaca returns an empty tx_hash (deserialized to `None` by
+        // `deserialize_optional_b256`) while the redeem journal is still
+        // Pending, before the on-chain transaction is recorded. Treating its
+        // absence as a mismatch would terminalize an in-flight redemption on a
+        // normal Pending poll and strand the user's tokens. Only that state may
+        // omit the hash: it is the tie between the Alpaca journal and the
+        // on-chain transfer we detected, so a terminal status without one must
+        // fail validation rather than silently skip the check.
+        match (req_tx_hash, status) {
+            (Some(actual_tx_hash), _) => Self::check_field_match(
+                issuer_request_id,
+                "Transaction hash",
+                &metadata.detected_tx_hash,
+                actual_tx_hash,
+            )?,
+            (None, RedeemRequestStatus::Pending) => {}
+            (None, _) => {
+                return Err(JournalManagerError::ValidationFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: format!(
+                        "Missing tx_hash on non-Pending response (status: {status:?})"
+                    ),
+                });
+            }
+        }
 
         Ok(status.clone())
     }
@@ -314,7 +333,12 @@ impl JournalManager {
             "Polling timeout reached, marking redemption as failed"
         );
 
-        self.store
+        // The timeout is the real, actionable failure. If marking the
+        // redemption failed also errors, log that separately but still surface
+        // `Timeout` — propagating the `MarkFailed` error instead would mislabel
+        // the incident as a generic CQRS error in the recovery log.
+        if let Err(mark_err) = self
+            .store
             .send(
                 issuer_request_id,
                 RedemptionCommand::MarkFailed {
@@ -325,7 +349,13 @@ impl JournalManager {
                     ),
                 },
             )
-            .await?;
+            .await
+        {
+            error!(target: "redemption", issuer_request_id = %issuer_request_id,
+                error = %mark_err,
+                "Failed to mark redemption as failed after polling timeout"
+            );
+        }
 
         Err(JournalManagerError::Timeout {
             issuer_request_id: issuer_request_id.clone(),
@@ -437,7 +467,7 @@ impl JournalManager {
                         })
                     }
                     RedeemRequestStatus::Pending => {
-                        info!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                             tokenization_request_id = %tokenization_request_id,
                             status = "pending",
                             next_poll_in = ?poll_interval,
@@ -551,7 +581,7 @@ impl From<AggregateError<LifecycleError<Redemption>>> for JournalManagerError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256};
+    use alloy::primitives::{Address, TxHash, address, b256};
     use async_trait::async_trait;
     use event_sorcery::{Store, StoreBuilder};
     use rust_decimal::Decimal;
@@ -653,9 +683,18 @@ mod tests {
 
     enum MockResponse {
         Success(RedeemRequestStatus),
-        Error { status_code: u16, body: String },
+        /// Alpaca returns the given status with an empty `tx_hash` (which
+        /// `deserialize_optional_b256` maps to `None`), as it does for a
+        /// still-Pending redeem before the on-chain transaction is recorded.
+        SuccessNoTxHash(RedeemRequestStatus),
+        Error {
+            status_code: u16,
+            body: String,
+        },
         NotFound,
-        ResponseIdMismatch { returned_id: String },
+        ResponseIdMismatch {
+            returned_id: String,
+        },
     }
 
     struct StatefulMockAlpacaService {
@@ -680,6 +719,19 @@ mod tests {
             &self,
             status: RedeemRequestStatus,
         ) -> TokenizationRequest {
+            self.create_mock_request_with_tx_hash(
+                status,
+                Some(b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                )),
+            )
+        }
+
+        fn create_mock_request_with_tx_hash(
+            &self,
+            status: RedeemRequestStatus,
+            tx_hash: Option<TxHash>,
+        ) -> TokenizationRequest {
             TokenizationRequest::Redeem {
                 id: TokenizationRequestId::new("mock-tok"),
                 issuer_request_id: self.issuer_request_id.clone(),
@@ -688,9 +740,7 @@ mod tests {
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(Decimal::from(100)),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-                tx_hash: Some(b256!(
-                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-                )),
+                tx_hash,
                 updated_at: Some(chrono::Utc::now()),
             }
         }
@@ -732,6 +782,10 @@ mod tests {
             match response {
                 MockResponse::Success(status) => {
                     Ok(self.create_mock_request(status.clone()))
+                }
+                MockResponse::SuccessNoTxHash(status) => {
+                    Ok(self
+                        .create_mock_request_with_tx_hash(status.clone(), None))
                 }
                 MockResponse::Error { status_code, body } => {
                     Err(AlpacaError::Api {
@@ -845,6 +899,145 @@ mod tests {
                 &["Polling Alpaca for journal status"]
             ),
             "Polling log must not appear at INFO level (loop body noise)"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_poll_pending_with_empty_tx_hash_does_not_fail() {
+        // Regression: Alpaca returns an empty `tx_hash` (deserialized to `None`)
+        // while the redeem journal is still Pending. The poller must keep
+        // polling rather than terminalize the redemption as Failed. A follow-up
+        // Completed poll (with the tx_hash now populated) then confirms it.
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-pending-empty-txhash-456");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![
+                MockResponse::SuccessNoTxHash(RedeemRequestStatus::Pending),
+                MockResponse::Success(RedeemRequestStatus::Completed),
+            ],
+            issuer_request_id.clone(),
+        ));
+
+        let manager = JournalManager::new(
+            mock.clone() as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id,
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "empty tx_hash on a Pending poll must not fail the redemption: {result:?}"
+        );
+        assert_eq!(
+            mock.call_count(),
+            2,
+            "poller should continue past the empty-tx_hash Pending response and poll again"
+        );
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::WARN,
+                &["Validation failed", "Transaction hash"]
+            ),
+            "an empty tx_hash on a Pending poll must not trigger a validation failure"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Journal still pending, will retry"]
+            ),
+            "the empty-tx_hash Pending poll must log the retry at DEBUG"
+        );
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::INFO,
+                &["Journal still pending, will retry"]
+            ),
+            "the still-pending log must not appear at INFO (loop body noise)"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::INFO,
+                &["Alpaca journal completed, confirming completion"]
+            ),
+            "the follow-up Completed poll must log completion at INFO"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_poll_completed_with_empty_tx_hash_fails_validation() {
+        // The tx_hash ties the Alpaca journal to the on-chain transfer we
+        // detected. Only a still-Pending poll may omit it; a terminal
+        // Completed response without one must fail validation rather than
+        // confirm the redemption unverified.
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-completed-empty-txhash-456");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::SuccessNoTxHash(RedeemRequestStatus::Completed)],
+            issuer_request_id.clone(),
+        ));
+
+        let manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool,
+        );
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::ValidationFailed { .. })),
+            "a Completed response without a tx_hash must fail validation, got {result:?}"
+        );
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::Failed { .. }),
+            "Expected Failed state, got {aggregate:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &["Validation failed", "marking redemption as failed"]
+            ),
+            "the validation failure must be logged at WARN"
         );
     }
 
@@ -998,6 +1191,77 @@ mod tests {
                 &["Polling timeout reached, marking redemption as failed"]
             ),
             "Expected WARN log for polling timeout"
+        );
+    }
+
+    /// `handle_timeout` must surface `Timeout` even when the follow-up
+    /// `MarkFailed` store call itself fails: the timeout is the actionable
+    /// incident, and mislabeling it as a generic CQRS error would misdirect
+    /// recovery. The events table is hidden so `Store::send(MarkFailed)`
+    /// errors, then restored for the state assertion.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_poll_timeout_returns_timeout_when_mark_failed_errors() {
+        let (store, pool) = setup_test_store().await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tokenization_request_id =
+            TokenizationRequestId::new("alp-timeout-markfail-456");
+
+        create_test_redemption_in_alpaca_called_state(
+            &store,
+            &issuer_request_id,
+            &tokenization_request_id,
+        )
+        .await;
+
+        sqlx::query("ALTER TABLE events RENAME TO events_hidden")
+            .execute(&pool)
+            .await
+            .expect("Failed to hide events table");
+
+        let mock = Arc::new(StatefulMockAlpacaService::new(
+            vec![MockResponse::Success(RedeemRequestStatus::Pending)],
+            issuer_request_id.clone(),
+        ));
+
+        let mut manager = JournalManager::new(
+            mock as Arc<dyn AlpacaService>,
+            store.clone(),
+            pool.clone(),
+        );
+
+        manager.max_duration = std::time::Duration::ZERO;
+
+        let result = manager
+            .handle_alpaca_called(
+                &test_alpaca_account(),
+                issuer_request_id.clone(),
+                tokenization_request_id,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(JournalManagerError::Timeout { .. })),
+            "Timeout must be surfaced even when MarkFailed fails, got {result:?}"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::ERROR,
+                &["Failed to mark redemption as failed after polling timeout"]
+            ),
+            "the MarkFailed failure must be logged separately at ERROR"
+        );
+
+        sqlx::query("ALTER TABLE events_hidden RENAME TO events")
+            .execute(&pool)
+            .await
+            .expect("Failed to restore events table");
+
+        let aggregate = store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(aggregate, Redemption::AlpacaCalled { .. }),
+            "Redemption must remain AlpacaCalled when MarkFailed errored; got {aggregate:?}"
         );
     }
 
