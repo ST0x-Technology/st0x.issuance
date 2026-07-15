@@ -34,13 +34,9 @@ let
     )
   );
 
-  # One Fireblocks signing key per environment, scoped to that environment only.
-  fireblocksKeyRules = builtins.listToAttrs (
-    map (env: {
-      name = "fireblocks-secret-issuance-${env}.key.age";
-      value.publicKeys = roles.${env}.service;
-    }) envNames
-  );
-
 in
-envSecretRules // fireblocksKeyRules
+envSecretRules
+// {
+  "tailscale-authkey-prod.age".publicKeys = roles.prod.service;
+  "tailscale-authkey-staging.age".publicKeys = roles.staging.service;
+}
