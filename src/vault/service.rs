@@ -21,7 +21,8 @@ use super::rain_meta::OaSchemaCache;
 use super::{
     BurnVerification, MintResult, MultiBurnResult, MultiBurnResultEntry,
     PreparedMintTx, ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId,
-    VaultError, VaultService, WalletNonceGuard, verify_burn_in_receipt,
+    VaultError, VaultService, WalletNonceGuard, classify_checked_receipt,
+    verify_burn_in_receipt,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
@@ -449,13 +450,7 @@ impl VaultService for RealBlockchainService {
         .get_receipt()
         .await?;
 
-        // A mined-but-reverted burn consumes no receipts, so it is a definitive
-        // failure distinct from an anomalous missing-Withdraw parse error.
-        if !receipt.status() {
-            return Err(VaultError::Reverted { tx_hash });
-        }
-
-        Ok(receipt)
+        classify_checked_receipt(tx_hash, receipt)
     }
 
     async fn lock_wallet(&self) -> WalletNonceGuard {
@@ -871,6 +866,121 @@ mod tests {
                 consensus_receipt,
                 Bloom::default(),
             )),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_tx_rejects_reverted_receipt_without_block_number() {
+        let vault_address = test_vault_address();
+        let tx_hash = fixed_bytes!(
+            "0x7070707070707070707070707070707070707070707070707070707070707070"
+        );
+        let mut receipt = create_empty_receipt(vault_address, tx_hash);
+        receipt.block_hash = None;
+        receipt.block_number = None;
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(false),
+                cumulative_gas_used: 0x6100,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.check_tx(&TxId::Hash(tx_hash)).await;
+
+        assert!(
+            matches!(result, Err(VaultError::InvalidReceipt)),
+            "unexpected check result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_tx_rejects_successful_receipt_without_block_number() {
+        let vault_address = test_vault_address();
+        let tx_hash = fixed_bytes!(
+            "0x7272727272727272727272727272727272727272727272727272727272727272"
+        );
+        let mut receipt = create_empty_receipt(vault_address, tx_hash);
+        receipt.block_hash = None;
+        receipt.block_number = None;
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.check_tx(&TxId::Hash(tx_hash)).await;
+
+        assert!(
+            matches!(result, Err(VaultError::MissingBlockNumber { tx_hash: hash }) if hash == tx_hash),
+            "unexpected check result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_tx_reports_mined_revert() {
+        let vault_address = test_vault_address();
+        let tx_hash = fixed_bytes!(
+            "0x7171717171717171717171717171717171717171717171717171717171717171"
+        );
+        let mut receipt = create_empty_receipt(vault_address, tx_hash);
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(false),
+                cumulative_gas_used: 0x6100,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.check_tx(&TxId::Hash(tx_hash)).await;
+
+        assert!(
+            matches!(result, Err(VaultError::Reverted { tx_hash: hash }) if hash == tx_hash),
+            "unexpected check result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_tx_rejects_mismatched_receipt_hash() {
+        let vault_address = test_vault_address();
+        let requested_tx_hash = fixed_bytes!(
+            "0x7272727272727272727272727272727272727272727272727272727272727272"
+        );
+        let receipt_tx_hash = fixed_bytes!(
+            "0x7373737373737373737373737373737373737373737373737373737373737373"
+        );
+
+        for succeeded in [true, false] {
+            let mut receipt =
+                create_empty_receipt(vault_address, receipt_tx_hash);
+            receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                Receipt {
+                    status: Eip658Value::Eip658(succeeded),
+                    cumulative_gas_used: 0x6100,
+                    logs: vec![],
+                },
+                Bloom::default(),
+            ));
+            let asserter = Asserter::new();
+            asserter.push_success(&receipt);
+            asserter.push_success(&receipt);
+            let service = create_service_with_asserter(asserter);
+
+            let result = service.check_tx(&TxId::Hash(requested_tx_hash)).await;
+
+            assert!(
+                matches!(result, Err(VaultError::InvalidReceipt)),
+                "succeeded: {succeeded}, unexpected check result: {result:?}"
+            );
         }
     }
 

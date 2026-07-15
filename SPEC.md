@@ -2234,7 +2234,12 @@ on-chain, dispatches `RecordExistingBurn` → `ExistingBurnRecovered` event →
 `Completed` state. This handles the scenario where burns landed on-chain but
 weren't recorded (e.g. a crash between submit and confirmation). The completed
 transaction receipt must include its block number; recovery fails without
-emitting a permanent event when that proof is incomplete.
+emitting a permanent event when that proof is incomplete. A successfully mined
+receipt without a block number returns `500`. A replacement burn is authorized
+only after the prior transaction is confirmed reverted. Pending
+transactions, RPC failures, unknown outcomes, and legacy transaction IDs that
+cannot be verified on-chain return `422`, preserve the failed state and receipt
+reservation, and require manual intervention instead of risking a second burn.
 
 **Examples:**
 
@@ -2247,8 +2252,10 @@ emitting a permanent event when that proof is incomplete.
 - `200`: Recovery initiated
 - `404`: Aggregate not found
 - `409`: Aggregate already completed or closed (cannot recover)
-- `422`: Aggregate in a state that cannot be recovered, or Alpaca journal not
-  completed (for post-Alpaca redemption recovery)
+- `422`: Aggregate in a state that cannot be recovered, Alpaca journal not
+  completed, or prior burn not confirmed reverted (for post-Alpaca redemption
+  recovery)
+- `500`: A successfully mined burn receipt is missing its block number
 - `502`: Failed to poll Alpaca for journal status, or failed to execute the burn
   recovery (post-Alpaca recovery only)
 

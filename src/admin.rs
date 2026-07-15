@@ -299,9 +299,9 @@ async fn load_reprocess_context(
         (status = 409, description = "Redemption already completed"),
         (status = 422,
             description = "Cannot recover: Alpaca journal pending/rejected, \
-                Transaction burn still pending, or invalid aggregate state"),
+                prior burn not confirmed reverted, or invalid aggregate state"),
         (status = 502,
-            description = "Alpaca poll, Transaction lookup, or burn execution failed"),
+            description = "Alpaca poll or burn execution failed"),
         (status = 500, description = "Event load/deserialize or internal failure")
     ),
     security(("internal_api_key" = []))
@@ -586,15 +586,15 @@ enum PriorBurnDisposition {
     /// The prior burn already completed on-chain and was recorded; the caller
     /// should return this response directly.
     AlreadyRecorded(ReprocessResponse),
-    /// No conclusive prior burn — resume with this (possibly fallback) retry
-    /// `externalTxId`.
+    /// No prior burn exists, or the prior burn conclusively reverted; resume
+    /// with this (possibly fallback) retry `externalTxId`.
     ResumeWith(Option<BurnExternalTxId>),
 }
 
 /// Inspects the prior tx (if any) from a previous `BurningFailed` event to
-/// decide whether the on-chain burn already succeeded (record it), is still
-/// pending (cannot recover yet), or terminally failed (resume with a fresh
-/// replacement `externalTxId`).
+/// decide whether the on-chain burn already succeeded (record it), conclusively
+/// reverted (resume with a fresh replacement `externalTxId`), or remains
+/// ambiguous (require manual intervention).
 async fn inspect_prior_burn(
     store: &Store<Redemption>,
     vault_service: &Arc<dyn VaultService>,
@@ -663,37 +663,42 @@ async fn inspect_prior_burn(
                     .to_string(),
             }))
         }
-        Err(e) => {
-            if matches!(e, VaultError::Reverted { .. }) {
-                // The terminally failed tx permanently reserves its
-                // externalTxId, so the replacement burn must never reuse the base
-                // id. When event history has no recorded retry id, fall back to
-                // retry-1 — mirror of the startup recovery path in BurnManager.
-                let retry_external_tx_id =
-                    burn_retry_external_tx_id.or_else(|| {
-                        Some(Redemption::retry_burn_external_tx_id_typed(
-                            detected_tx_hash,
-                            1,
-                        ))
-                    });
+        Err(VaultError::Reverted { .. }) => {
+            // The terminally failed tx permanently reserves its externalTxId,
+            // so the replacement burn must never reuse the base id. When event
+            // history has no recorded retry id, fall back to retry-1 — mirror
+            // of the startup recovery path in BurnManager.
+            let retry_external_tx_id =
+                burn_retry_external_tx_id.or_else(|| {
+                    Some(Redemption::retry_burn_external_tx_id_typed(
+                        detected_tx_hash,
+                        1,
+                    ))
+                });
 
-                info!(target: "admin", aggregate_id = %aggregate_id,
-                    tx_hash = %tx_id,
-                    retry_external_tx_id = ?retry_external_tx_id,
-                    "Transaction reverted onchain, proceeding with ResumeBurn"
-                );
-
-                return Ok(PriorBurnDisposition::ResumeWith(
-                    retry_external_tx_id,
-                ));
-            }
-
-            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
-                %tx_id,
-                error = %e,
-                "Failed to confirm previously submitted burn"
+            info!(target: "admin", aggregate_id = %aggregate_id,
+                tx_hash = %tx_id,
+                retry_external_tx_id = ?retry_external_tx_id,
+                "Transaction reverted onchain, proceeding with ResumeBurn"
             );
-            Ok(PriorBurnDisposition::ResumeWith(burn_retry_external_tx_id))
+
+            Ok(PriorBurnDisposition::ResumeWith(retry_external_tx_id))
+        }
+        Err(VaultError::MissingBlockNumber { tx_hash }) => {
+            error!(target: "admin", aggregate_id = %aggregate_id,
+                %tx_hash,
+                "Completed burn transaction receipt is missing block number"
+            );
+            Err(Status::InternalServerError)
+        }
+        Err(error) => {
+            warn!(target: "admin", aggregate_id = %aggregate_id,
+                issuer_request_id = %issuer_request_id,
+                %tx_id,
+                error = %error,
+                "Prior burn outcome is ambiguous; manual intervention required"
+            );
+            Err(Status::UnprocessableEntity)
         }
     }
 }
@@ -1761,7 +1766,7 @@ mod tests {
     use alloy::consensus::{
         Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
     };
-    use alloy::primitives::{Address, Bloom, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bloom, U256, address, b256};
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -1785,9 +1790,13 @@ mod tests {
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
+    use crate::receipt_inventory::{
+        ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
+        Shares,
+    };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
-        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
@@ -1799,12 +1808,13 @@ mod tests {
         Arc::new(MockVaultService::new_success())
     }
 
-    fn checked_burn_receipt(block_number: Option<u64>) -> TransactionReceipt {
-        let transaction_hash = b256!(
-            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
-        );
+    fn checked_burn_receipt(
+        transaction_hash: B256,
+        block_number: Option<u64>,
+        succeeded: bool,
+    ) -> TransactionReceipt {
         let consensus_receipt = Receipt {
-            status: Eip658Value::Eip658(true),
+            status: Eip658Value::Eip658(succeeded),
             cumulative_gas_used: 21_000,
             logs: Vec::new(),
         };
@@ -1885,6 +1895,47 @@ mod tests {
 
         fn force_calls(&self) -> usize {
             self.force_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    struct ReservationTrackingBurnRecovery {
+        calls: AtomicUsize,
+        receipt_inventory_store: Arc<Store<ReceiptInventory>>,
+        vault: Address,
+    }
+
+    impl ReservationTrackingBurnRecovery {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl super::RedemptionBurnRecovery for ReservationTrackingBurnRecovery {
+        async fn execute_recovered_burn(
+            &self,
+            issuer_request_id: &IssuerRedemptionRequestId,
+        ) -> Result<super::RecoveryOutcome, super::BurnManagerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.receipt_inventory_store
+                .send(
+                    &self.vault,
+                    ReceiptInventoryCommand::ReleaseBurn {
+                        redemption_issuer_request_id: issuer_request_id.clone(),
+                    },
+                )
+                .await
+                .expect("test recovery should release the reservation");
+            Ok(super::RecoveryOutcome::Executed)
+        }
+
+        async fn force_complete_burn(
+            &self,
+            _issuer_request_id: &IssuerRedemptionRequestId,
+            _burn_tx_hash: alloy::primitives::B256,
+            _reason: String,
+        ) -> Result<super::BurnVerification, super::BurnManagerError> {
+            unimplemented!("not used by redemption recovery route tests")
         }
     }
 
@@ -2353,8 +2404,15 @@ mod tests {
                 &alpaca_data,
             )),
         });
+        let prior_tx_id = TxId::random();
         let vault: Arc<dyn VaultService> =
-            Arc::new(MockVaultService::new_success().with_reverted_burn());
+            Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
+                checked_burn_receipt(
+                    prior_tx_id.to_hash().unwrap(),
+                    Some(12_345),
+                    false,
+                ),
+            ));
 
         let result = recover_post_alpaca(
             &store,
@@ -2367,7 +2425,7 @@ mod tests {
                 metadata: metadata.clone(),
                 alpaca_data,
                 burning_failed: Some(BurningFailedData {
-                    tx_id: Some(TxId::random()),
+                    tx_id: Some(prior_tx_id),
                     planned_burns: vec![],
                 }),
                 burn_retry_external_tx_id: None,
@@ -2785,13 +2843,68 @@ mod tests {
                     issuer_request_id: metadata.issuer_request_id.clone(),
                     error: "burn terminally failed".to_string(),
                     tx_id: Some(tx_id),
-                    planned_burns: vec![],
+                    planned_burns: vec![BurnRecord {
+                        receipt_id: U256::from(99),
+                        shares_burned: U256::from(100),
+                    }],
                 },
             )
             .await
             .expect("RecordBurnFailure failed");
 
         (metadata, alpaca_data)
+    }
+
+    async fn seed_receipt_reservation(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> (Arc<Store<ReceiptInventory>>, Address) {
+        let store = Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(U256::from(99)),
+                    balance: Shares::from(U256::from(100)),
+                    block_number: 12_345,
+                    tx_hash: b256!(
+                        "0xa4f500a4f500a4f500a4f500a4f500a4f500a4f500a4f500a4f500a4f500a4f5"
+                    ),
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .expect("receipt discovery should succeed");
+
+        store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::ReserveBurn {
+                    redemption_issuer_request_id: issuer_request_id.clone(),
+                    burns: vec![BurnRecord {
+                        receipt_id: U256::from(99),
+                        shares_burned: U256::from(100),
+                    }],
+                },
+            )
+            .await
+            .expect("receipt reservation should succeed");
+
+        let inventory = store
+            .load(&vault)
+            .await
+            .expect("receipt inventory should load")
+            .expect("receipt inventory should exist");
+        assert_eq!(
+            inventory.reserved_redemptions(),
+            vec![issuer_request_id.clone()]
+        );
+
+        (store, vault)
     }
 
     #[traced_test]
@@ -2900,7 +3013,8 @@ mod tests {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
         let tx_id = TxId::random();
-        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let (metadata, alpaca_data) =
+            setup_burn_failure(&store, tx_id.clone()).await;
         let aggregate_id = metadata.issuer_request_id.to_string();
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2909,10 +3023,10 @@ mod tests {
                 &alpaca_data,
             )),
         });
-        let vault_service: Arc<dyn VaultService> = Arc::new(
-            MockVaultService::new_success()
-                .with_checked_tx_receipt(checked_burn_receipt(None)),
-        );
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
+                checked_burn_receipt(tx_id.to_hash().unwrap(), None, true),
+            ));
         let burn_recovery = Arc::new(MockBurnRecovery::default());
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
@@ -2959,7 +3073,8 @@ mod tests {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
         let tx_id = TxId::random();
-        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let (metadata, alpaca_data) =
+            setup_burn_failure(&store, tx_id.clone()).await;
         let aggregate_id = metadata.issuer_request_id.to_string();
         let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
             response: PollResponse::Ok(redeem_response(
@@ -2968,10 +3083,14 @@ mod tests {
                 &alpaca_data,
             )),
         });
-        let vault_service: Arc<dyn VaultService> = Arc::new(
-            MockVaultService::new_success()
-                .with_checked_tx_receipt(checked_burn_receipt(Some(12_345))),
-        );
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
+                checked_burn_receipt(
+                    tx_id.to_hash().unwrap(),
+                    Some(12_345),
+                    true,
+                ),
+            ));
         let burn_recovery = Arc::new(MockBurnRecovery::default());
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
@@ -3019,6 +3138,229 @@ mod tests {
         assert!(logs_contain_at!(
             Level::INFO,
             &[&aggregate_id, "recording existing burn"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_ambiguous_prior_burns() {
+        let incomplete_revert_tx_id = TxId::random();
+        let mismatched_success_tx_id = TxId::random();
+        let mismatched_revert_tx_id = TxId::random();
+        let cases = [
+            (
+                "pending",
+                TxId::random(),
+                MockVaultService::new_success().with_pending_checked_tx(),
+            ),
+            (
+                "rpc_failed",
+                TxId::random(),
+                MockVaultService::new_success().with_rpc_checked_tx_error(),
+            ),
+            (
+                "unknown",
+                TxId::random(),
+                MockVaultService::new_success().with_invalid_checked_tx(),
+            ),
+            (
+                "legacy",
+                TxId::Legacy("legacy-fireblocks-id".to_string()),
+                MockVaultService::new_success().with_invalid_checked_tx(),
+            ),
+            (
+                "incomplete_revert",
+                incomplete_revert_tx_id.clone(),
+                MockVaultService::new_success().with_checked_tx_receipt(
+                    checked_burn_receipt(
+                        incomplete_revert_tx_id.to_hash().unwrap(),
+                        None,
+                        false,
+                    ),
+                ),
+            ),
+            (
+                "mismatched_success",
+                mismatched_success_tx_id,
+                MockVaultService::new_success().with_checked_tx_receipt(
+                    checked_burn_receipt(B256::ZERO, Some(12_345), true),
+                ),
+            ),
+            (
+                "mismatched_revert",
+                mismatched_revert_tx_id,
+                MockVaultService::new_success().with_checked_tx_receipt(
+                    checked_burn_receipt(B256::ZERO, Some(12_345), false),
+                ),
+            ),
+        ];
+
+        for (case, tx_id, vault_service) in cases {
+            let pool = setup_pool().await;
+            let store = setup_store(&pool);
+            let (metadata, alpaca_data) =
+                setup_burn_failure(&store, tx_id.clone()).await;
+            let aggregate_id = metadata.issuer_request_id.to_string();
+            let (receipt_inventory_store, vault) =
+                seed_receipt_reservation(&pool, &metadata.issuer_request_id)
+                    .await;
+            let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+                response: PollResponse::Ok(redeem_response(
+                    RedeemRequestStatus::Completed,
+                    &metadata,
+                    &alpaca_data,
+                )),
+            });
+            let vault_service: Arc<dyn VaultService> = Arc::new(vault_service);
+            let burn_recovery = Arc::new(ReservationTrackingBurnRecovery {
+                calls: AtomicUsize::new(0),
+                receipt_inventory_store: receipt_inventory_store.clone(),
+                vault,
+            });
+            let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+                burn_recovery.clone();
+            let rocket = post_alpaca_rocket(
+                store.clone(),
+                pool.clone(),
+                alpaca,
+                vault_service,
+                burn_recovery_state,
+            );
+
+            let (status, _body) = dispatch_recover_redemption(
+                rocket,
+                &metadata.issuer_request_id,
+            )
+            .await;
+
+            assert_eq!(status, Status::UnprocessableEntity, "case: {case}");
+            assert_eq!(burn_recovery.calls(), 0, "case: {case}");
+            let redemption =
+                store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+            assert!(
+                matches!(redemption, Redemption::Failed { .. }),
+                "case: {case}"
+            );
+            let context =
+                load_reprocess_context(&pool, &metadata.issuer_request_id)
+                    .await
+                    .unwrap();
+            let planned_burns = context.burning_failed.unwrap().planned_burns;
+            assert_eq!(planned_burns.len(), 1, "case: {case}");
+            let planned_burn = planned_burns.first().unwrap();
+            assert_eq!(planned_burn.receipt_id, U256::from(99));
+            assert_eq!(planned_burn.shares_burned, U256::from(100));
+            let receipt_inventory =
+                receipt_inventory_store.load(&vault).await.unwrap().unwrap();
+            assert_eq!(
+                receipt_inventory.reserved_redemptions(),
+                vec![metadata.issuer_request_id.clone()],
+                "case: {case}"
+            );
+            let advancing_events: i64 = sqlx::query_scalar(
+                "
+                SELECT COUNT(*)
+                FROM events
+                WHERE aggregate_type = 'Redemption'
+                  AND aggregate_id = ?
+                  AND event_type IN (
+                      'RedemptionEvent::BurnResumed',
+                      'RedemptionEvent::ExistingBurnRecovered'
+                  )
+                ",
+            )
+            .bind(&aggregate_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(advancing_events, 0, "case: {case}");
+            assert!(
+                logs_contain_at!(
+                    Level::WARN,
+                    &[&aggregate_id, "manual intervention"]
+                ),
+                "case: {case}"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_replaces_only_confirmed_reverted_prior_burn() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let tx_hash = tx_id.to_hash().unwrap();
+        let (metadata, alpaca_data) =
+            setup_burn_failure(&store, tx_id.clone()).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let (receipt_inventory_store, vault) =
+            seed_receipt_reservation(&pool, &metadata.issuer_request_id).await;
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> =
+            Arc::new(MockVaultService::new_success().with_checked_tx_receipt(
+                checked_burn_receipt(tx_hash, Some(12_345), false),
+            ));
+        let burn_recovery = Arc::new(ReservationTrackingBurnRecovery {
+            calls: AtomicUsize::new(0),
+            receipt_inventory_store: receipt_inventory_store.clone(),
+            vault,
+        });
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(body.contains("executed burn"));
+        assert_eq!(burn_recovery.calls(), 1);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        let Redemption::Burning { external_tx_id, .. } = redemption else {
+            panic!("expected Burning state, got {redemption:?}");
+        };
+        assert_eq!(
+            external_tx_id,
+            Some(Redemption::retry_burn_external_tx_id_typed(
+                &metadata.detected_tx_hash,
+                1,
+            ))
+        );
+        let receipt_inventory =
+            receipt_inventory_store.load(&vault).await.unwrap().unwrap();
+        assert!(receipt_inventory.reserved_redemptions().is_empty());
+        let resumed_events: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::BurnResumed'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(resumed_events, 1);
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "Transaction reverted onchain", "ResumeBurn"]
         ));
     }
 

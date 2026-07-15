@@ -453,6 +453,9 @@ pub(crate) enum VaultError {
     /// Transaction receipt is missing required data
     #[error("Invalid receipt")]
     InvalidReceipt,
+    /// A transaction receipt was returned without proof of block inclusion.
+    #[error("Transaction receipt is missing a block number: {tx_hash:?}")]
+    MissingBlockNumber { tx_hash: B256 },
     /// Expected event (e.g., Deposit) not found in transaction logs
     #[error("Event not found in transaction: {tx_hash:?}")]
     EventNotFound { tx_hash: B256 },
@@ -502,6 +505,26 @@ pub(crate) enum VaultError {
     ),
     #[error(transparent)]
     SendableTxErr(#[from] Box<SendableTxErr<TransactionRequest>>),
+}
+
+fn classify_checked_receipt(
+    tx_hash: B256,
+    receipt: TransactionReceipt,
+) -> Result<TransactionReceipt, VaultError> {
+    if receipt.transaction_hash != tx_hash {
+        return Err(VaultError::InvalidReceipt);
+    }
+    if !receipt.status() {
+        if receipt.block_number.is_none() {
+            return Err(VaultError::InvalidReceipt);
+        }
+        return Err(VaultError::Reverted { tx_hash });
+    }
+    if receipt.block_number.is_none() {
+        return Err(VaultError::MissingBlockNumber { tx_hash });
+    }
+
+    Ok(receipt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
