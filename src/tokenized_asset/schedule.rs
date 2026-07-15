@@ -3,21 +3,18 @@
 //! Around an ex-date the supply freeze must flip on and off at known
 //! instants. This module automates the trigger the issuer CLI fires by hand:
 //! a [`FreezeScheduler`] enqueues two durable apalis jobs per corporate-action
-//! window — a `Freeze` before the ex-date and an `Unfreeze` after — and the
-//! worker dispatches the exact same underlying-scoped commands the CLI does.
-//! Only the trigger changes; the mint gate reacts to the status flip identically
-//! however it was dispatched, across every network listing.
+//! window — acquire that window's hold before the ex-date and release it after.
+//! The aggregate stays frozen while any operator or corporate-action hold is
+//! active on the underlying, so one window cannot release another window's
+//! cross-network freeze.
 //!
 //! Durability and idempotency: apalis persists the due time, so a scheduled
-//! transition survives restarts, and the idempotency key (underlying + the
-//! full scheduled instant, including subseconds) collapses re-submissions of
-//! the same window while its jobs are still pending or running. Terminal rows
-//! (done, killed, or out of retries) release their keys when the same window
-//! is re-armed, so an infrastructure failure never permanently blocks a
-//! window. Overlapping windows are **not** safe under the binary
-//! Freeze/Unfreeze model — an Unfreeze for one schedule can release another
-//! still-active window — so operators must not arm overlapping windows for
-//! the same underlying.
+//! transition survives restarts, and the idempotency key (underlying + both
+//! window boundaries) collapses re-submissions of the same window while its
+//! jobs are still pending or running. Terminal rows (done, killed, or out of
+//! retries) release their keys when the same window is re-armed, so an
+//! infrastructure failure never permanently blocks a window. Acquiring or
+//! releasing the same hold twice is a no-op.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cqrs_es::AggregateError;
@@ -30,7 +27,9 @@ use tracing::{error, warn};
 use super::UnderlyingSymbol;
 use super::view::{TokenizedAssetViewError, underlying_has_listing};
 use crate::jobs::{Job, JobQueue, QueuePushError, ScheduledTask, job_type};
-use crate::underlying::{Underlying, UnderlyingCommand};
+use crate::underlying::{
+    FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
+};
 
 /// Which side of the freeze window a scheduled job applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,27 +48,13 @@ impl FreezeTransition {
             Self::Unfreeze => "unfreeze",
         }
     }
-
-    /// The `(job_type, idempotency_key)` dedup key for this transition of
-    /// `underlying`'s window, scheduled at `scheduled_for` (full instant,
-    /// including subseconds, so windows in the same second stay distinct).
-    fn idempotency_key(
-        self,
-        underlying: &UnderlyingSymbol,
-        scheduled_for: DateTime<Utc>,
-    ) -> String {
-        format!(
-            "{}:{underlying}:{}",
-            self.key_prefix(),
-            scheduled_for.to_rfc3339()
-        )
-    }
 }
 
 /// Durable job applying one scheduled freeze transition to one asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ApplyFreezeTransition {
     pub(crate) underlying: UnderlyingSymbol,
+    pub(crate) hold_id: FreezeHoldId,
     pub(crate) transition: FreezeTransition,
     /// The instant this transition was scheduled for. Part of the
     /// idempotency key, and recorded for audit in worker logs.
@@ -103,13 +88,20 @@ impl Job<FreezeScheduleCtx> for ApplyFreezeTransition {
         &self,
         ctx: &FreezeScheduleCtx,
     ) -> Result<Self::Output, Self::Error> {
+        let transitioned_at = Utc::now();
         let command = match self.transition {
-            FreezeTransition::Freeze => UnderlyingCommand::Freeze {
+            FreezeTransition::Freeze => UnderlyingCommand::AcquireFreezeHold {
                 underlying: self.underlying.clone(),
+                hold_id: self.hold_id,
+                acquired_at: transitioned_at,
             },
-            FreezeTransition::Unfreeze => UnderlyingCommand::Unfreeze {
-                underlying: self.underlying.clone(),
-            },
+            FreezeTransition::Unfreeze => {
+                UnderlyingCommand::ReleaseFreezeHold {
+                    underlying: self.underlying.clone(),
+                    hold_id: self.hold_id,
+                    released_at: transitioned_at,
+                }
+            }
         };
 
         ctx.underlying_store.send(&self.underlying, command).await.map_err(
@@ -182,18 +174,18 @@ impl FreezeScheduler {
         Self { queue: JobQueue::new(apalis_pool), pool }
     }
 
-    /// Arms one freeze window for `underlying`: a `Freeze` at `freeze_at`
-    /// and an `Unfreeze` at `unfreeze_at`.
+    /// Arms one freeze window for `underlying`: acquire its hold at `freeze_at`
+    /// and release that hold at `unfreeze_at`.
     ///
     /// A `freeze_at` already in the past (window in progress) schedules the
     /// freeze immediately; a fully elapsed window is rejected rather than
     /// flapping the asset. Both jobs are idempotency-keyed by underlying and
-    /// scheduled instant, so re-arming the same window while it is pending or
-    /// running is a no-op — but a terminal row (done, killed, or out of
-    /// retries) releases its key first, so re-arming after an infrastructure
-    /// failure enqueues fresh jobs instead of silently deduping against the
-    /// dead ones. Re-applying a transition that already fired is an
-    /// idempotent no-op at the command level.
+    /// both window boundaries, so re-arming the same window while it is
+    /// pending or running is a no-op — but a terminal row (done, killed, or
+    /// out of retries) releases its key first, so re-arming after an
+    /// infrastructure failure enqueues fresh jobs instead of silently deduping
+    /// against the dead ones. Acquiring or releasing the same hold twice is
+    /// an idempotent no-op at the command level.
     pub(crate) async fn schedule_window(
         &mut self,
         underlying: &UnderlyingSymbol,
@@ -211,12 +203,12 @@ impl FreezeScheduler {
             });
         }
 
-        if freeze_at >= unfreeze_at {
+        let Some(window) = FreezeWindow::new(freeze_at, unfreeze_at) else {
             return Err(FreezeScheduleError::InvertedWindow {
                 freeze_at,
                 unfreeze_at,
             });
-        }
+        };
 
         // apalis stores due times at second granularity; two jobs due in the
         // same second have no defined execution order, so a sub-second window
@@ -239,11 +231,21 @@ impl FreezeScheduler {
             (freeze_at - now).to_std().unwrap_or(std::time::Duration::ZERO);
         let unfreeze_delay =
             (unfreeze_at - now).to_std().unwrap_or(std::time::Duration::ZERO);
+        let hold_id = FreezeHoldId::corporate_action(window);
+        let window_key = format!(
+            "{underlying}:{}:{}",
+            window
+                .freeze_at()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            window
+                .unfreeze_at()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        );
 
         let freeze_key =
-            FreezeTransition::Freeze.idempotency_key(underlying, freeze_at);
+            format!("{}:{window_key}", FreezeTransition::Freeze.key_prefix());
         let unfreeze_key =
-            FreezeTransition::Unfreeze.idempotency_key(underlying, unfreeze_at);
+            format!("{}:{window_key}", FreezeTransition::Unfreeze.key_prefix());
 
         self.release_terminal_window_jobs([&freeze_key, &unfreeze_key]).await?;
 
@@ -252,6 +254,7 @@ impl FreezeScheduler {
                 ScheduledTask {
                     task: ApplyFreezeTransition {
                         underlying: underlying.clone(),
+                        hold_id,
                         transition: FreezeTransition::Freeze,
                         scheduled_for: freeze_at,
                     },
@@ -261,6 +264,7 @@ impl FreezeScheduler {
                 ScheduledTask {
                     task: ApplyFreezeTransition {
                         underlying: underlying.clone(),
+                        hold_id,
                         transition: FreezeTransition::Unfreeze,
                         scheduled_for: unfreeze_at,
                     },
@@ -449,15 +453,27 @@ mod tests {
     use crate::mint::test_utils::TestHarness;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::UnderlyingSymbol;
-    use crate::underlying::{AssetStatus, Underlying, load_freeze_status};
+    use crate::underlying::{
+        AssetStatus, FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
+        load_freeze_status,
+    };
 
     fn scheduler_for(harness: &TestHarness) -> FreezeScheduler {
         FreezeScheduler::new(&harness.apalis_pool, harness.pool.clone())
     }
 
-    // The job dispatches the same command path the CLI uses: perform on a
-    // Freeze transition flips the asset to Frozen, Unfreeze flips it back,
-    // and re-performing either is an idempotent no-op.
+    fn hold_id(
+        freeze_at: chrono::DateTime<Utc>,
+        unfreeze_at: chrono::DateTime<Utc>,
+    ) -> FreezeHoldId {
+        FreezeHoldId::corporate_action(
+            FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
+        )
+    }
+
+    // A window owns one stable hold: acquiring it freezes the asset, releasing
+    // it enables the asset only if no other holds remain, and repeating either
+    // transition is an idempotent no-op.
     #[traced_test]
     #[tokio::test]
     async fn perform_applies_freeze_then_unfreeze_idempotently() {
@@ -470,11 +486,15 @@ mod tests {
                 .await
                 .unwrap();
         let ctx = FreezeScheduleCtx { underlying_store };
+        let freeze_at = Utc::now();
+        let unfreeze_at = freeze_at + ChronoDuration::hours(1);
+        let hold_id = hold_id(freeze_at, unfreeze_at);
 
         let freeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
+            hold_id,
             transition: FreezeTransition::Freeze,
-            scheduled_for: Utc::now(),
+            scheduled_for: freeze_at,
         };
         freeze.perform(&ctx).await.unwrap();
         freeze.perform(&ctx).await.unwrap();
@@ -485,17 +505,18 @@ mod tests {
         );
         assert!(logs_contain_at!(
             Level::INFO,
-            &["Freezing underlying", underlying.as_str()]
+            &["Acquiring underlying freeze hold", underlying.as_str()]
         ));
         assert!(logs_contain_at!(
             Level::DEBUG,
-            &["already frozen", underlying.as_str()]
+            &["Freeze hold already active", underlying.as_str()]
         ));
 
         let unfreeze = ApplyFreezeTransition {
             underlying: underlying.clone(),
+            hold_id,
             transition: FreezeTransition::Unfreeze,
-            scheduled_for: Utc::now(),
+            scheduled_for: unfreeze_at,
         };
         unfreeze.perform(&ctx).await.unwrap();
         unfreeze.perform(&ctx).await.unwrap();
@@ -506,11 +527,11 @@ mod tests {
         );
         assert!(logs_contain_at!(
             Level::INFO,
-            &["Unfreezing underlying", underlying.as_str()]
+            &["Releasing underlying freeze hold", underlying.as_str()]
         ));
         assert!(logs_contain_at!(
             Level::DEBUG,
-            &["already enabled", underlying.as_str()]
+            &["Freeze hold already absent", underlying.as_str()]
         ));
     }
 
@@ -543,6 +564,163 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(window_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn overlapping_windows_remain_frozen_until_the_last_window_releases()
+    {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let pool = harness.pool.clone();
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let ctx = FreezeScheduleCtx { underlying_store };
+        let now = Utc::now();
+        let first_hold = hold_id(
+            now + ChronoDuration::hours(1),
+            now + ChronoDuration::hours(3),
+        );
+        let second_hold = hold_id(
+            now + ChronoDuration::hours(2),
+            now + ChronoDuration::hours(4),
+        );
+
+        let first_freeze = ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: first_hold,
+            transition: FreezeTransition::Freeze,
+            scheduled_for: now + ChronoDuration::hours(1),
+        };
+        let second_freeze = ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: second_hold,
+            transition: FreezeTransition::Freeze,
+            scheduled_for: now + ChronoDuration::hours(2),
+        };
+        let first_unfreeze = ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: first_hold,
+            transition: FreezeTransition::Unfreeze,
+            scheduled_for: now + ChronoDuration::hours(3),
+        };
+        let second_unfreeze = ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: second_hold,
+            transition: FreezeTransition::Unfreeze,
+            scheduled_for: now + ChronoDuration::hours(4),
+        };
+
+        first_freeze.perform(&ctx).await.unwrap();
+        second_freeze.perform(&ctx).await.unwrap();
+        first_unfreeze.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            load_freeze_status(&pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen
+        );
+
+        second_unfreeze.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            load_freeze_status(&pool, &underlying).await.unwrap(),
+            AssetStatus::Enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_freeze_after_its_window_ends_does_not_refreeze_the_asset()
+    {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let pool = harness.pool.clone();
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let ctx = FreezeScheduleCtx { underlying_store };
+        let now = Utc::now();
+        let expired_hold = hold_id(
+            now - ChronoDuration::hours(2),
+            now - ChronoDuration::hours(1),
+        );
+
+        ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id: expired_hold,
+            transition: FreezeTransition::Freeze,
+            scheduled_for: now - ChronoDuration::hours(2),
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&pool, &underlying).await.unwrap(),
+            AssetStatus::Enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_release_does_not_release_the_operator_hold() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let pool = harness.pool.clone();
+        let (underlying_store, _projection) =
+            StoreBuilder::<Underlying>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let ctx = FreezeScheduleCtx { underlying_store };
+        let freeze_at = Utc::now();
+        let unfreeze_at = freeze_at + ChronoDuration::hours(1);
+        let hold_id = hold_id(freeze_at, unfreeze_at);
+
+        ctx.underlying_store
+            .send(
+                &underlying,
+                UnderlyingCommand::Freeze { underlying: underlying.clone() },
+            )
+            .await
+            .unwrap();
+        ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id,
+            transition: FreezeTransition::Freeze,
+            scheduled_for: freeze_at,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+        ApplyFreezeTransition {
+            underlying: underlying.clone(),
+            hold_id,
+            transition: FreezeTransition::Unfreeze,
+            scheduled_for: unfreeze_at,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_freeze_status(&pool, &underlying).await.unwrap(),
+            AssetStatus::Frozen
+        );
+
+        ctx.underlying_store
+            .send(
+                &underlying,
+                UnderlyingCommand::Unfreeze { underlying: underlying.clone() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            load_freeze_status(&pool, &underlying).await.unwrap(),
+            AssetStatus::Enabled
+        );
     }
 
     #[tokio::test]
@@ -830,6 +1008,37 @@ mod tests {
             freeze_keys, 2,
             "subsecond-distinct freeze schedules must not collide"
         );
+    }
+
+    #[tokio::test]
+    async fn distinct_subsecond_windows_get_distinct_jobs() {
+        let harness = TestHarness::new().await;
+        let underlying = harness.setup_account_and_asset().await.underlying;
+        let mut scheduler = scheduler_for(&harness);
+        let now = Utc::now();
+        let freeze_at = now + ChronoDuration::hours(1);
+        let unfreeze_at = now + ChronoDuration::hours(3);
+
+        scheduler
+            .schedule_window(&underlying, freeze_at, unfreeze_at, now)
+            .await
+            .unwrap();
+        scheduler
+            .schedule_window(
+                &underlying,
+                freeze_at + ChronoDuration::nanoseconds(1),
+                unfreeze_at + ChronoDuration::nanoseconds(1),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let persisted_transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs")
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted_transitions, 4);
     }
 
     #[tokio::test]
