@@ -41,47 +41,52 @@ jobs:
             exit 1
           fi
 
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25  # v22
+      # nix-quick-install + rainlanguage Cachix + per-runner store cache replace
+      # the Determinate installer + magic-nix-cache (EOL'd upstream: it fails
+      # FlakeHub auth and caches nothing) and share the cache raindex CI populates.
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v35 and pin a
+          # working release.
+          nix_version: "2.31.5"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d  # v14
+      # Shared rainlanguage Cachix that raindex CI populates; read works
+      # anonymously (the cache is public), pushes need CACHIX_AUTH_TOKEN.
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
         continue-on-error: true
-
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
 
-      - name: Resolve deploy host via Tailscale
-        run: |
-          DEPLOY_HOST=$(nix eval --raw --file keys.nix tailscaleHost.prod)
-          echo "DEPLOY_HOST=$DEPLOY_HOST" >> "$GITHUB_ENV"
-          echo "::add-mask::$DEPLOY_HOST"
+      # Cargo.lock is in the key (unlike CI's) because the deploy builds the
+      # service closure with crane: a dependency bump changes the vendored-deps
+      # derivations, and without a key miss the post-run save is skipped and
+      # those layers would be rebuilt on every deploy.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7.0.2
+        with:
+          primary-key: nix-deploy-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', '**/Cargo.lock') }}
+          restore-prefixes-first-match: nix-deploy-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
 
+      # The deploy script resolves the droplet IP from infra/.remote-prod.age
+      # (encrypted to roles.prod.ssh, which includes the CI key) and pins the
+      # host key from keys.nix into known_hosts itself.
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -R "$DEPLOY_HOST" >/dev/null 2>&1 || true
-          echo "$DEPLOY_HOST $(nix eval --raw --file keys.nix keys.host-prod)" >> ~/.ssh/known_hosts
-
-      - name: Warm up Tailscale tunnel
-        run: |
-          for attempt in {1..6}; do
-            if tailscale ping --c 1 "$DEPLOY_HOST"; then
-              exit 0
-            fi
-            echo "Tailscale ping failed on attempt $attempt; retrying..."
-            sleep 5
-          done
-          tailscale status
-          exit 1
 
       - name: Deploy all profiles
         run: nix run .#prodDeployAll

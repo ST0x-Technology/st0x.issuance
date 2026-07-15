@@ -20,8 +20,10 @@ let
       export DATABASE_URL="''${DATABASE_URL:-sqlite:///mnt/data/issuance.db}"
       export FIREBLOCKS_SECRET_PATH="''${FIREBLOCKS_SECRET_PATH:-/run/agenix/fireblocks-secret-issuance.key}"
       if [ -f /run/agenix/st0x-issuance.env ]; then
-        # shellcheck disable=SC1091
-        set -a; . /run/agenix/st0x-issuance.env; set +a
+        set -a
+        # shellcheck source=/dev/null
+        . /run/agenix/st0x-issuance.env
+        set +a
       fi
       exec /nix/var/nix/profiles/per-service/st0x-issuance/bin/issuer "$@"
     '';
@@ -32,7 +34,7 @@ in
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
     ./disko.nix
-    ./nix/tailscale.nix
+    ./nix/cloud-init.nix
     ./nix/upgradeable-services.nix
   ];
 
@@ -44,55 +46,9 @@ in
   networking.useDHCP = lib.mkForce false;
 
   services = {
-    cloud-init = {
-      enable = true;
-      network.enable = true;
-      settings = {
-        datasource_list = [
-          "ConfigDrive"
-          "Digitalocean"
-        ];
-        datasource.ConfigDrive = { };
-        datasource.Digitalocean = { };
-        cloud_init_modules = [
-          "seed_random"
-          "bootcmd"
-          "write_files"
-          "growpart"
-          "resizefs"
-          "set_hostname"
-          "update_hostname"
-          "set_password"
-        ];
-        cloud_config_modules = [
-          "ssh-import-id"
-          "keyboard"
-          "runcmd"
-          "disable_ec2_metadata"
-        ];
-        cloud_final_modules = [
-          "write_files_deferred"
-          "puppet"
-          "chef"
-          "ansible"
-          "mcollective"
-          "salt_minion"
-          "reset_rmc"
-          "scripts_per_once"
-          "scripts_per_boot"
-          "scripts_user"
-          "ssh_authkey_fingerprints"
-          "keys_to_console"
-          "install_hotplug"
-          "phone_home"
-          "final_message"
-        ];
-      };
-    };
-
     openssh = {
       enable = true;
-      openFirewall = false;
+      openFirewall = true;
       settings = {
         PasswordAuthentication = false;
         PermitRootLogin = "prohibit-password";
@@ -119,7 +75,8 @@ in
   networking.firewall = {
     enable = true;
     # Public Alpaca callbacks keep the pre-NixOS Docker endpoint on port 8000.
-    # SSH/admin traffic remains tailnet-only via trustedInterfaces in tailscale.nix.
+    # SSH is public too (openssh.openFirewall above): key-only auth enforced by
+    # PasswordAuthentication=false, brute-force noise curbed by fail2ban.
     allowedTCPPorts = [ 8000 ];
   };
 

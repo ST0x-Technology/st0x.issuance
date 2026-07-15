@@ -56,20 +56,18 @@
       ...
     }:
     let
-      inherit (import ./keys.nix) keys tailscaleHost tailnetSuffix;
+      inherit (import ./keys.nix) keys;
       inherit (rainix.inputs.nixpkgs) lib;
       environments = {
         prod = {
           nodeName = "st0x-issuance";
           volumeName = "st0x-issuance-data";
           hostKey = keys.host-prod;
-          tailscaleMagicDnsName = "${tailscaleHost.prod}.${tailnetSuffix}";
         };
         staging = {
           nodeName = "st0x-issuance-staging";
           volumeName = "st0x-issuance-staging-data";
           hostKey = keys.host-staging;
-          tailscaleMagicDnsName = "${tailscaleHost.staging}.${tailnetSuffix}";
         };
       };
       envNames = builtins.attrNames environments;
@@ -83,7 +81,7 @@
               system = "x86_64-linux";
               specialArgs = {
                 inherit environment;
-                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
+                inherit (environments.${environment}) volumeName;
                 inherit (self.packages.x86_64-linux) st0x-issuance issuer;
               };
               modules = [ disko.nixosModules.disko ] ++ modules;
@@ -300,12 +298,19 @@
 
             bootstrap = pkgs.writeShellApplication {
               name = "bootstrap-nixos";
-              runtimeInputs = infraPkgs.buildInputs ++ [
-                nixosAnywherePkg
-                pkgs.gnused
-              ];
+              runtimeInputs =
+                infraPkgs.buildInputs
+                ++ infraPkgs.sshBuildInputs
+                ++ [
+                  nixosAnywherePkg
+                  pkgs.nushell
+                  pkgs.openssh
+                ];
               text = ''
-                env="''${1:?usage: bootstrap <prod|staging>}"
+                ${infraPkgs.parseIdentity}
+                trap _cleanup_identity EXIT
+
+                env="''${1:?usage: bootstrap [-i identity] <prod|staging>}"
                 shift
 
                 case "$env" in
@@ -320,12 +325,10 @@
                     exit 1 ;;
                 esac
 
-                ${infraPkgs.parseIdentity}
-                trap _cleanup_identity EXIT
-
+                # No exec: replacing the shell would skip the EXIT trap and
+                # leak the 1Password temp identity file.
                 export env flake_config host_key_field identity
-
-                ${./scripts/bootstrap.sh} "$@"
+                nu ${./scripts/bootstrap.nu} "$@"
               '';
             };
 

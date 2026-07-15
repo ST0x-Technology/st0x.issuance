@@ -17,7 +17,7 @@ variable "do_token" {
 variable "ssh_key_name" {
   description = "Name of the SSH key in DigitalOcean to add to the droplet"
   type        = string
-  default     = "rain_node"
+  default     = "st0x-op"
 }
 
 variable "region" {

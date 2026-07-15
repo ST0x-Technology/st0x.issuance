@@ -73,7 +73,9 @@ let
     set -eo pipefail
 
     _identity_tmpfile=""
-    _cleanup_identity() { [ -n "$_identity_tmpfile" ] && rm -f "$_identity_tmpfile"; }
+    # The guard must not be `[ -n ... ] && rm`: as the last command of an EXIT
+    # trap, its exit 1 (no tmpfile) would override the script's exit code.
+    _cleanup_identity() { if [ -n "$_identity_tmpfile" ]; then rm -f "$_identity_tmpfile"; fi; }
 
     if [ "''${1:-}" = "--op" ]; then
       if [ -z "''${2:-}" ]; then
@@ -109,8 +111,8 @@ let
       shift 2
     elif [ -n "''${SSH_IDENTITY:-}" ]; then
       identity="$SSH_IDENTITY"
-    elif [ -f "${"HOME:-"}/.ssh/id_ed25519" ]; then
-      identity="${"HOME:-"}/.ssh/id_ed25519"
+    elif [ -f "$HOME/.ssh/id_ed25519" ]; then
+      identity="$HOME/.ssh/id_ed25519"
     else
       echo "ERROR: no identity found -- pass -i <path>, set SSH_IDENTITY, or use --op" >&2
       exit 1
@@ -161,36 +163,20 @@ let
     ${vars.decrypt}
   '';
 
-  inherit (import ../keys.nix) tailscaleHost;
-
   mkEnv =
     env:
     let
       remoteFile = remoteFiles.${env};
-      outputKey = "${env}_droplet_ipv4";
       sshInputs = sshBuildInputs ++ [ pkgs.openssh ];
-
-      resolveIp = ''
-        ${parseIdentity}
-        trap 'rm -f ${state.path}; _cleanup_identity' EXIT
-        ${state.decrypt}
-        host_ip=$(jq -r '.outputs.${outputKey}.value' ${state.path})
-        rm -f ${state.path}
-        if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
-          echo "ERROR: could not resolve IP from terraform output '${outputKey}' in ${state.path}" >&2
-          exit 1
-        fi
-      '';
 
       resolveHost = ''
         ${parseIdentity}
-        if tailscale status >/dev/null 2>&1; then
-          host_ip="${tailscaleHost.${env}}"
-        else
-          echo "Tailscale not connected, resolving ${env} host via encrypted IP cache..." >&2
-          ${remoteFile.decrypt}
-          host_ip=$(cat ${remoteFile.path})
-          rm -f ${remoteFile.path}
+        ${remoteFile.decrypt}
+        host_ip=$(cat ${remoteFile.path})
+        rm -f ${remoteFile.path}
+        if [ -z "$host_ip" ]; then
+          echo "ERROR: could not resolve ${env} host from ${remoteFile.agePath}" >&2
+          exit 1
         fi
       '';
 
@@ -213,7 +199,7 @@ let
 
     in
     {
-      inherit resolveIp resolveHost;
+      inherit resolveHost;
 
       "${env}Remote" = pkgs.writeShellApplication {
         name = "${env}-remote";
@@ -346,15 +332,10 @@ let
     }) environments
   );
 
-  perEnv = builtins.mapAttrs (_: result: { inherit (result) resolveIp resolveHost; }) envResults;
+  perEnv = builtins.mapAttrs (_: result: { inherit (result) resolveHost; }) envResults;
 
   envPkgs = builtins.foldl' (
-    acc: env:
-    acc
-    // builtins.removeAttrs envResults.${env} [
-      "resolveIp"
-      "resolveHost"
-    ]
+    acc: env: acc // builtins.removeAttrs envResults.${env} [ "resolveHost" ]
   ) { } environments;
 
 in

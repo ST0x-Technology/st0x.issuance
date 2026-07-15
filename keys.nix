@@ -1,14 +1,4 @@
 rec {
-  # Tailscale MagicDNS host labels per environment. Used by infra/default.nix
-  # (local tooling) and the deploy workflows to resolve the deploy target.
-  # The full MagicDNS name is "<label>.<tailnet-suffix>.ts.net" — update
-  # tailnetSuffix below to match your Tailscale account if it differs.
-  tailnetSuffix = "taile5cf8a.ts.net";
-  tailscaleHost = {
-    prod = "st0x-issuance-nixos";
-    staging = "st0x-issuance-staging";
-  };
-
   keys = {
     # purpose: dev/ops
     gleb = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHepyxN9hvXzbCY/z0amzldy7DXjNdyetnVaQexRgDEX";
@@ -18,7 +8,7 @@ rec {
     alastair = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJArH3PA+bFIon0JkCVQGs9aWr45lnVjiiTLLO9BPItn";
 
     # purpose: deployments from github actions
-    ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIARWUchVuQvkFm2tzspdC79hhRyYbWzRjs5iimhxewUy";
+    ci = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOkrujoBNXILB8Ypv90puKKhmKq161gitlvUFM5n0c+d";
     # purpose: initial key for Digital Ocean to include when first creating
     # the instance and it's matched by name in their dashboard
     st0x-op = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
@@ -26,10 +16,10 @@ rec {
     # purpose: used by the remote host to decrypt ragenix secrets we need for
     # the system to work at all. auto-generated during bootstrap when
     # nixos-anywhere turns the initially ubuntu instance into nixos.
-    # PLACEHOLDER: replace with real key after `nix run .#prodBootstrap`
-    host-prod = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    # PLACEHOLDER: replace with real key after `nix run .#stagingBootstrap`.
-    host-staging = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    # Set after provisioning the infra running `nix run .#bootstrap -- prod`.
+    host-prod = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOg0aUOHOUB39qgMvT5Z66yVl/FGfN808X0Tla3WGfvo";
+    # Set after provisioning the infra running `nix run .#bootstrap -- staging`.
+    host-staging = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIARxfgHmttVQAyhhqwIZG4UAM/ZjuShUkCCyN2h9Ma/H";
   };
 
   roles = with keys; {
