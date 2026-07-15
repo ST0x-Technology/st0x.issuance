@@ -24,8 +24,6 @@ the limit, condense explanations without removing any rules.
   `::random()`, mocks, encoding, compile-time macros
 - [docs/cqrs.md](docs/cqrs.md) - CQRS/ES patterns (upcasters, views, replay,
   services)
-- [docs/fireblocks.md](docs/fireblocks.md) - Fireblocks integration
-  (externalTxId, SDK error handling)
 
 **Update at the end** (see "After completing a plan" checklist below):
 
@@ -330,14 +328,19 @@ monitor it for incoming transfers.
 **MonitorService:** watches the redemption wallet via a WebSocket subscription;
 methods `watch_transfers()`, `get_transfer_details()`.
 
-**Signing Backends (`src/fireblocks/`):** two mutually exclusive backends, both
-implementing `VaultService`:
+**Signing Backends (`src/wallet/`):** two mutually exclusive backends, both
+resolving into a `ResolvedSigner` holding an `EthereumWallet`. `config.rs` then
+wraps that wallet into a signing `Provider` via `ProviderBuilder` and passes it
+to `RealBlockchainService`:
 
-- **Local**: `EVM_PRIVATE_KEY` → `RealBlockchainService` (dev/test)
-- **Fireblocks**: CONTRACT_CALL → `FireblocksVaultService` (prod, TAP policies)
+- **Local**: `EVM_PRIVATE_KEY` → raw private key signer (dev/test)
+- **Turnkey**: `TURNKEY_ORG_ID` + `TURNKEY_API_PRIVATE_KEY` + `TURNKEY_ADDRESS`
+  → remote signing via Turnkey's AWS Nitro secure enclaves;
+  `TURNKEY_API_PRIVATE_KEY` is a P-256 key used to authenticate requests to
+  Turnkey, not the wallet signing key (prod)
 
-Key files: `fireblocks/mod.rs` (SignerConfig), `fireblocks/vault_service.rs`
-(FireblocksVaultService), `config.rs` (backend selection)
+Key files: `wallet/mod.rs` (SignerConfig, ResolvedSigner), `wallet/local.rs`,
+`wallet/turnkey.rs`, `config.rs` (backend selection, Provider construction)
 
 ### Core Flows
 
