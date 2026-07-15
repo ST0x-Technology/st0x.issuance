@@ -1,3 +1,4 @@
+use alloy::consensus::transaction::SignerRecoverable;
 #[cfg(test)]
 use alloy::consensus::{SignableTransaction, TxLegacy};
 use alloy::consensus::{Transaction, TxEnvelope};
@@ -10,6 +11,10 @@ use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
 use alloy::primitives::{Signature, TxKind};
 use alloy::providers::SendableTxErr;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+#[cfg(test)]
+use alloy::signers::SignerSync;
+#[cfg(test)]
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -127,11 +132,39 @@ pub(crate) trait VaultService: Send + Sync {
         tx_hash: B256,
     ) -> Result<BurnVerification, VaultError>;
 
-    /// Prepares asigned raw tx that is sendable via eth_sendRawTransaction
+    /// Prepares a signed raw transaction for `eth_sendRawTransaction`.
     async fn prepare_burn_tx(
         &self,
         _params: &MultiBurnParams,
     ) -> Result<SendableTxWithHash, VaultError>;
+
+    /// Classifies whether a persisted signed burn transaction can still land.
+    ///
+    /// Implementations must check the exact hash receipt before comparing the
+    /// owner's finalized nonce. Any provider uncertainty returns an error so
+    /// callers fail closed and keep the persisted transaction live.
+    async fn classify_burn_tx(
+        &self,
+        _owner: Address,
+        _sendable_tx: &SendableTxWithHash,
+    ) -> Result<BurnTxStatus, VaultError> {
+        Ok(BurnTxStatus::StillMineable)
+    }
+
+    /// Re-signs the persisted burn's exact call at a fresh nonce.
+    ///
+    /// Callers may invoke this only after [`VaultService::classify_burn_tx`]
+    /// proves the persisted hash dead. Implementations must preserve the
+    /// destination, value, and calldata rather than reconstructing the burn
+    /// from a lossy projection, and must assign the owner's pending account
+    /// nonce rather than relying on a local nonce cache.
+    async fn prepare_replacement_burn_tx(
+        &self,
+        _owner: Address,
+        _sendable_tx: &SendableTxWithHash,
+    ) -> Result<SendableTxWithHash, VaultError> {
+        Err(VaultError::InvalidReceipt)
+    }
 
     /// Fetches the on-chain receipt for `tx_hash`, returning an error if the
     /// transaction reverted.
@@ -147,6 +180,117 @@ pub(crate) trait VaultService: Send + Sync {
 }
 
 pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurnTxStatus {
+    Mined,
+    Reverted,
+    StillMineable,
+    ProvablyDead,
+}
+
+impl SendableTxWithHash {
+    pub(crate) fn validate(&self) -> Result<TxEnvelope, VaultError> {
+        let envelope = TxEnvelope::decode_2718_exact(&self.tx)?;
+        let decoded_hash = *envelope.tx_hash();
+        if decoded_hash != self.hash {
+            return Err(VaultError::PreparedBurnHashMismatch {
+                expected: self.hash,
+                decoded: decoded_hash,
+            });
+        }
+        let decoded_nonce = envelope.nonce();
+        if decoded_nonce != self.nonce {
+            return Err(VaultError::PreparedBurnNonceMismatch {
+                expected: self.nonce,
+                decoded: decoded_nonce,
+            });
+        }
+        Ok(envelope)
+    }
+
+    pub(crate) fn validate_for_owner(
+        &self,
+        owner: Address,
+    ) -> Result<TxEnvelope, VaultError> {
+        let envelope = self.validate()?;
+        let signer = envelope.recover_signer()?;
+        if signer != owner {
+            return Err(VaultError::PreparedBurnSignerMismatch {
+                expected: owner,
+                decoded: signer,
+            });
+        }
+        Ok(envelope)
+    }
+
+    pub(crate) fn validate_replacement_for_owner(
+        &self,
+        previous: &Self,
+        owner: Address,
+    ) -> Result<(), VaultError> {
+        let previous_envelope = previous.validate_for_owner(owner)?;
+        let replacement_envelope = self.validate_for_owner(owner)?;
+        if replacement_envelope.to() != previous_envelope.to() {
+            return Err(VaultError::BurnReplacementDestinationMismatch {
+                previous: previous_envelope.to(),
+                replacement: replacement_envelope.to(),
+            });
+        }
+        if replacement_envelope.value() != previous_envelope.value() {
+            return Err(VaultError::BurnReplacementValueMismatch {
+                previous: previous_envelope.value(),
+                replacement: replacement_envelope.value(),
+            });
+        }
+        if replacement_envelope.input() != previous_envelope.input() {
+            return Err(VaultError::BurnReplacementInputMismatch {
+                previous: previous_envelope.input().clone(),
+                replacement: replacement_envelope.input().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test(
+        nonce: u64,
+        destination: Address,
+        input: Bytes,
+    ) -> Self {
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1,
+            gas_limit: 100_000,
+            to: TxKind::Call(destination),
+            value: U256::ZERO,
+            input,
+        };
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let signature = signer
+            .sign_hash_sync(&transaction.signature_hash())
+            .expect("test transaction should sign");
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+
+        Self {
+            tx: envelope.encoded_2718(),
+            hash: *envelope.tx_hash(),
+            nonce: envelope.nonce(),
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signer_for_test(&self) -> Address {
+        self.validate()
+            .expect("test burn transaction should decode")
+            .recover_signer()
+            .expect("test burn transaction signature should recover")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct PreparedMintTx {
@@ -482,6 +626,33 @@ pub(crate) enum VaultError {
         "Persisted mint transaction nonce {expected} does not match decoded nonce {decoded}"
     )]
     PreparedMintNonceMismatch { expected: u64, decoded: u64 },
+    #[error(
+        "Persisted burn transaction hash {expected:?} does not match decoded hash {decoded:?}"
+    )]
+    PreparedBurnHashMismatch { expected: B256, decoded: B256 },
+    #[error(
+        "Persisted burn transaction nonce {expected} does not match decoded nonce {decoded}"
+    )]
+    PreparedBurnNonceMismatch { expected: u64, decoded: u64 },
+    #[error(
+        "Persisted burn transaction signer {decoded:?} does not match wallet {expected:?}"
+    )]
+    PreparedBurnSignerMismatch { expected: Address, decoded: Address },
+    #[error(
+        "Burn replacement destination {replacement:?} differs from persisted destination {previous:?}"
+    )]
+    BurnReplacementDestinationMismatch {
+        previous: Option<Address>,
+        replacement: Option<Address>,
+    },
+    #[error(
+        "Burn replacement value {replacement} differs from persisted value {previous}"
+    )]
+    BurnReplacementValueMismatch { previous: U256, replacement: U256 },
+    #[error("Burn replacement calldata differs from persisted calldata")]
+    BurnReplacementInputMismatch { previous: Bytes, replacement: Bytes },
+    #[error(transparent)]
+    SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
     #[error(transparent)]
     Eip2718(#[from] alloy::eips::eip2718::Eip2718Error),
     /// Contract call error

@@ -45,6 +45,12 @@ pub(crate) async fn has_unresolved_burn_intent(
                   WHERE later.aggregate_type = intent.aggregate_type
                     AND later.aggregate_id = intent.aggregate_id
                     AND later.sequence > intent.sequence
+                    AND later.event_type NOT IN (
+                        'RedemptionEvent::BurnRecoveryAttempted',
+                        'RedemptionEvent::BurnPreparationRecoveryAttempted',
+                        'RedemptionEvent::BurnRecoveryExhausted',
+                        'RedemptionEvent::BurnPreparationRecoveryExhausted'
+                    )
               )
         )
         ",
@@ -180,8 +186,10 @@ impl std::fmt::Display for BurnExternalTxId {
     }
 }
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
-use crate::vault::{MultiBurnEntry, MultiBurnParams, VaultService};
-use crate::vault::{SendableTxWithHash, TxId, VaultError};
+use crate::vault::{
+    BurnTxStatus, MultiBurnEntry, MultiBurnParams, SendableTxWithHash, TxId,
+    VaultError, VaultService,
+};
 
 pub(crate) use cmd::RedemptionCommand;
 pub(crate) use event::{BurnRecord, RedemptionEvent, TokensBurnedData};
@@ -227,6 +235,10 @@ pub(crate) enum Redemption {
         alpaca_journal_completed_at: DateTime<Utc>,
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
+        /// Exact transaction from a failed attempt whose identity is retained
+        /// while a reserved replacement is prepared.
+        #[serde(default)]
+        prior_burn_tx: Option<SendableTxWithHash>,
     },
     /// Burn transaction submitted to signing backend, awaiting on-chain confirmation.
     BurnSubmitted {
@@ -239,6 +251,8 @@ pub(crate) enum Redemption {
         external_tx_id: BurnExternalTxId,
         tx_id: TxId,
         planned_burns: Vec<event::BurnRecord>,
+        #[serde(default)]
+        sendable_tx: SendableTxWithHash,
     },
     Completed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -249,6 +263,10 @@ pub(crate) enum Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
         failed_at: DateTime<Utc>,
+        /// Exact prior transaction used to validate durable recovery
+        /// exhaustion after replacement preparation fails.
+        #[serde(default)]
+        prior_burn_tx: Option<SendableTxWithHash>,
     },
     Closed {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -270,6 +288,12 @@ pub(crate) enum Redemption {
         #[serde(default)]
         sendable_tx: SendableTxWithHash,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum BurnRecoveryAction {
+    Rebroadcast,
+    Replace,
 }
 
 /// Input parameters for the BurnTokens command handler.
@@ -330,7 +354,8 @@ impl Redemption {
             Self::Detected { metadata }
             | Self::AlpacaCalled { metadata, .. }
             | Self::Burning { metadata, .. }
-            | Self::BurnSubmitted { metadata, .. } => Some(metadata),
+            | Self::BurnSubmitted { metadata, .. }
+            | Self::BurnIntended { metadata, .. } => Some(metadata),
             _ => None,
         }
     }
@@ -438,9 +463,11 @@ impl Redemption {
         issuer_request_id: IssuerRedemptionRequestId,
         input: BurnInput,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let Self::BurnIntended { metadata, sendable_tx, .. } = self else {
+        let (Self::BurnIntended { metadata, sendable_tx, .. }
+        | Self::BurnSubmitted { metadata, sendable_tx, .. }) = self
+        else {
             return Err(RedemptionError::InvalidState {
-                expected: "BurnIntended".to_string(),
+                expected: "BurnIntended or BurnSubmitted".to_string(),
                 found: self.state_name().to_string(),
             });
         };
@@ -684,7 +711,7 @@ impl Redemption {
     }
 
     /// Admin-closes a redemption that cannot be auto-recovered. Valid from
-    /// `Failed`, `Burning`, or `BurnSubmitted` — the honest terminal path for a
+    /// `Failed`, `Burning`, `BurnIntended`, or `BurnSubmitted` — the honest terminal path for a
     /// redemption whose burn cannot/should not be re-submitted and is not
     /// verifiable on-chain. Widening beyond `Failed` covers redemptions stuck in
     /// `Burning` (including the `Failed -> Burning` recovery regression, which
@@ -698,6 +725,7 @@ impl Redemption {
             self,
             Self::Failed { .. }
                 | Self::Burning { .. }
+                | Self::BurnIntended { .. }
                 | Self::BurnSubmitted { .. }
         ) {
             return Err(match self {
@@ -705,7 +733,8 @@ impl Redemption {
                     RedemptionError::AlreadyCompleted { issuer_request_id }
                 }
                 _ => RedemptionError::InvalidState {
-                    expected: "Failed, Burning, or BurnSubmitted".to_string(),
+                    expected: "Failed, Burning, BurnIntended, or BurnSubmitted"
+                        .to_string(),
                     found: self.state_name().to_string(),
                 },
             });
@@ -746,6 +775,13 @@ impl Redemption {
                         .to_string(),
                     found: self.state_name().to_string(),
                 },
+            });
+        }
+        let persisted_burn_hash = self.persisted_burn_hash()?;
+        if persisted_burn_hash != burn_tx_hash {
+            return Err(RedemptionError::BurnHashMismatch {
+                expected: persisted_burn_hash,
+                provided: burn_tx_hash,
             });
         }
 
@@ -830,6 +866,7 @@ impl Redemption {
             called_at: *called_at,
             alpaca_journal_completed_at,
             external_tx_id: None,
+            prior_burn_tx: None,
         };
     }
 
@@ -883,6 +920,210 @@ impl Redemption {
         Ok(vec![RedemptionEvent::BurnIntended {
             issuer_request_id,
             sendable_tx,
+            planned_burns,
+        }])
+    }
+
+    const fn current_sendable_tx(&self) -> Option<&SendableTxWithHash> {
+        match self {
+            Self::BurnIntended { sendable_tx, .. }
+            | Self::BurnSubmitted { sendable_tx, .. } => Some(sendable_tx),
+            _ => None,
+        }
+    }
+
+    fn persisted_burn_hash(&self) -> Result<B256, RedemptionError> {
+        Ok(self.persisted_burn_tx()?.hash)
+    }
+
+    fn persisted_burn_tx(
+        &self,
+    ) -> Result<&SendableTxWithHash, RedemptionError> {
+        self.current_sendable_tx()
+            .filter(|sendable_tx| !sendable_tx.tx.is_empty())
+            .ok_or(RedemptionError::PersistedBurnHashUnavailable)
+    }
+
+    fn verify_recovery_transaction(
+        &self,
+        tx_hash: B256,
+        nonce: u64,
+    ) -> Result<(), RedemptionError> {
+        let sendable_tx = self.current_sendable_tx().ok_or_else(|| {
+            RedemptionError::InvalidState {
+                expected: "BurnIntended or BurnSubmitted".to_string(),
+                found: self.state_name().to_string(),
+            }
+        })?;
+        if sendable_tx.hash != tx_hash || sendable_tx.nonce != nonce {
+            return Err(RedemptionError::RecoveryTransactionMismatch {
+                expected_hash: sendable_tx.hash,
+                expected_nonce: sendable_tx.nonce,
+                provided_hash: tx_hash,
+                provided_nonce: nonce,
+            });
+        }
+        Ok(())
+    }
+
+    fn handle_record_burn_recovery_attempt(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        action: BurnRecoveryAction,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        self.verify_recovery_transaction(tx_hash, nonce)?;
+        Ok(vec![RedemptionEvent::BurnRecoveryAttempted {
+            issuer_request_id,
+            tx_hash,
+            nonce,
+            action,
+            attempted_at: Utc::now(),
+        }])
+    }
+
+    fn handle_record_burn_preparation_recovery_attempt(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempt: u32,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::Failed { .. }) {
+            return Err(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: self.state_name().to_string(),
+            });
+        }
+        Ok(vec![RedemptionEvent::BurnPreparationRecoveryAttempted {
+            issuer_request_id,
+            attempt,
+            attempted_at: Utc::now(),
+        }])
+    }
+
+    fn handle_record_burn_recovery_exhausted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        attempts: u32,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        self.verify_recovery_exhaustion_transaction(tx_hash, nonce)?;
+        Ok(vec![RedemptionEvent::BurnRecoveryExhausted {
+            issuer_request_id,
+            tx_hash,
+            nonce,
+            attempts,
+            exhausted_at: Utc::now(),
+        }])
+    }
+
+    fn handle_record_burn_preparation_recovery_exhausted(
+        &self,
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempts: u32,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        if !matches!(self, Self::Failed { .. }) {
+            return Err(RedemptionError::InvalidState {
+                expected: "Failed".to_string(),
+                found: self.state_name().to_string(),
+            });
+        }
+        Ok(vec![RedemptionEvent::BurnPreparationRecoveryExhausted {
+            issuer_request_id,
+            attempts,
+            exhausted_at: Utc::now(),
+        }])
+    }
+
+    fn verify_recovery_exhaustion_transaction(
+        &self,
+        tx_hash: B256,
+        nonce: u64,
+    ) -> Result<(), RedemptionError> {
+        let sendable_tx = self.current_sendable_tx().or(match self {
+            Self::Burning { prior_burn_tx, .. }
+            | Self::Failed { prior_burn_tx, .. } => prior_burn_tx.as_ref(),
+            _ => None,
+        });
+        let sendable_tx =
+            sendable_tx.ok_or_else(|| RedemptionError::InvalidState {
+                expected: "state with an exact recovery transaction"
+                    .to_string(),
+                found: self.state_name().to_string(),
+            })?;
+        if sendable_tx.hash != tx_hash || sendable_tx.nonce != nonce {
+            return Err(RedemptionError::RecoveryTransactionMismatch {
+                expected_hash: sendable_tx.hash,
+                expected_nonce: sendable_tx.nonce,
+                provided_hash: tx_hash,
+                provided_nonce: nonce,
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_replace_dead_burn(
+        &self,
+        services: &Arc<dyn VaultService>,
+        issuer_request_id: IssuerRedemptionRequestId,
+        owner: Address,
+    ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
+        let sendable_tx = self.current_sendable_tx().ok_or_else(|| {
+            RedemptionError::InvalidState {
+                expected: "BurnIntended or BurnSubmitted".to_string(),
+                found: self.state_name().to_string(),
+            }
+        })?;
+        if services.classify_burn_tx(owner, sendable_tx).await.map_err(
+            |_| RedemptionError::BurnRecoveryClassificationFailed {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            },
+        )? != BurnTxStatus::ProvablyDead
+        {
+            return Err(RedemptionError::BurnReplacementNotSafe {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            });
+        }
+
+        let planned_burns = match self {
+            Self::BurnIntended { planned_burns, .. }
+            | Self::BurnSubmitted { planned_burns, .. } => {
+                planned_burns.clone()
+            }
+            _ => Vec::new(),
+        };
+        let replacement = services
+            .prepare_replacement_burn_tx(owner, sendable_tx)
+            .await
+            .map_err(|_| RedemptionError::BurnReplacementPreparationFailed {
+                tx_hash: sendable_tx.hash,
+                nonce: sendable_tx.nonce,
+            })?;
+        replacement
+            .validate_replacement_for_owner(sendable_tx, owner)
+            .map_err(|_| RedemptionError::BurnReplacementValidationFailed {
+                previous_hash: sendable_tx.hash,
+                previous_nonce: sendable_tx.nonce,
+                replacement_hash: replacement.hash,
+                replacement_nonce: replacement.nonce,
+            })?;
+        if replacement.nonce <= sendable_tx.nonce
+            || replacement.hash == sendable_tx.hash
+        {
+            return Err(RedemptionError::BurnReplacementNotFresh {
+                previous_hash: sendable_tx.hash,
+                previous_nonce: sendable_tx.nonce,
+                replacement_hash: replacement.hash,
+                replacement_nonce: replacement.nonce,
+            });
+        }
+
+        Ok(vec![RedemptionEvent::BurnIntended {
+            issuer_request_id,
+            sendable_tx: replacement,
             planned_burns,
         }])
     }
@@ -940,6 +1181,51 @@ pub(crate) enum RedemptionError {
     #[error("Burn confirmation remains pending for {tx_id}: {message}")]
     BurnConfirmationPending { tx_id: TxId, message: String },
     #[error(
+        "Burn hash mismatch: expected persisted hash {expected:?}, provided {provided:?}"
+    )]
+    BurnHashMismatch { expected: B256, provided: B256 },
+    #[error(
+        "Force-completion requires a non-empty exact transaction persisted for this redemption"
+    )]
+    PersistedBurnHashUnavailable,
+    #[error(
+        "Recovery transaction mismatch: expected {expected_hash:?}/{expected_nonce}, provided {provided_hash:?}/{provided_nonce}"
+    )]
+    RecoveryTransactionMismatch {
+        expected_hash: B256,
+        expected_nonce: u64,
+        provided_hash: B256,
+        provided_nonce: u64,
+    },
+    #[error(
+        "Burn transaction {tx_hash:?} at nonce {nonce} can still land; replacement refused"
+    )]
+    BurnReplacementNotSafe { tx_hash: B256, nonce: u64 },
+    #[error("Failed to classify persisted burn {tx_hash:?} at nonce {nonce}")]
+    BurnRecoveryClassificationFailed { tx_hash: B256, nonce: u64 },
+    #[error(
+        "Failed to prepare replacement for burn {tx_hash:?} at nonce {nonce}"
+    )]
+    BurnReplacementPreparationFailed { tx_hash: B256, nonce: u64 },
+    #[error(
+        "Burn replacement {replacement_hash:?}/{replacement_nonce} failed validation against {previous_hash:?}/{previous_nonce}"
+    )]
+    BurnReplacementValidationFailed {
+        previous_hash: B256,
+        previous_nonce: u64,
+        replacement_hash: B256,
+        replacement_nonce: u64,
+    },
+    #[error(
+        "Burn replacement {replacement_hash:?}/{replacement_nonce} is not fresh relative to {previous_hash:?}/{previous_nonce}"
+    )]
+    BurnReplacementNotFresh {
+        previous_hash: B256,
+        previous_nonce: u64,
+        replacement_hash: B256,
+        replacement_nonce: u64,
+    },
+    #[error(
         "Burn retry attempt counter overflowed for external tx id: {latest_external_tx_id}"
     )]
     RetryAttemptOverflow { latest_external_tx_id: BurnExternalTxId },
@@ -958,7 +1244,7 @@ impl EventSourced for Redemption {
 
     const AGGREGATE_TYPE: &'static str = "Redemption";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
@@ -1044,6 +1330,20 @@ impl EventSourced for Redemption {
                     expected:
                         "Burning or BurnIntended without a signed transaction"
                             .to_string(),
+                    found: "Uninitialized".to_string(),
+                })
+            }
+            RedemptionCommand::RecordBurnRecoveryAttempt { .. }
+            | RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
+                ..
+            }
+            | RedemptionCommand::RecordBurnRecoveryExhausted { .. }
+            | RedemptionCommand::RecordBurnPreparationRecoveryExhausted {
+                ..
+            }
+            | RedemptionCommand::ReplaceDeadBurn { .. } => {
+                Err(RedemptionError::InvalidState {
+                    expected: "BurnIntended or BurnSubmitted".to_string(),
                     found: "Uninitialized".to_string(),
                 })
             }
@@ -1225,6 +1525,50 @@ impl EventSourced for Redemption {
                 )
                 .await
             }
+            RedemptionCommand::RecordBurnRecoveryAttempt {
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                action,
+            } => self.handle_record_burn_recovery_attempt(
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                action,
+            ),
+            RedemptionCommand::RecordBurnPreparationRecoveryAttempt {
+                issuer_request_id,
+                attempt,
+            } => self.handle_record_burn_preparation_recovery_attempt(
+                issuer_request_id,
+                attempt,
+            ),
+            RedemptionCommand::RecordBurnRecoveryExhausted {
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                attempts,
+            } => self.handle_record_burn_recovery_exhausted(
+                issuer_request_id,
+                tx_hash,
+                nonce,
+                attempts,
+            ),
+            RedemptionCommand::RecordBurnPreparationRecoveryExhausted {
+                issuer_request_id,
+                attempts,
+            } => self.handle_record_burn_preparation_recovery_exhausted(
+                issuer_request_id,
+                attempts,
+            ),
+            RedemptionCommand::ReplaceDeadBurn { issuer_request_id, owner } => {
+                self.handle_replace_dead_burn(
+                    services,
+                    issuer_request_id,
+                    owner,
+                )
+                .await
+            }
         }
     }
 }
@@ -1276,6 +1620,10 @@ impl Redemption {
             RedemptionEvent::BurnIntended { .. } => {
                 self.apply_burn_intended_event(event);
             }
+            RedemptionEvent::BurnRecoveryAttempted { .. }
+            | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
+            | RedemptionEvent::BurnRecoveryExhausted { .. }
+            | RedemptionEvent::BurnPreparationRecoveryExhausted { .. } => {}
         }
     }
 
@@ -1320,6 +1668,12 @@ impl Redemption {
     }
 
     fn apply_failure_event(&mut self, event: RedemptionEvent) {
+        let prior_burn_tx =
+            self.current_sendable_tx().cloned().or_else(|| match self {
+                Self::Burning { prior_burn_tx, .. }
+                | Self::Failed { prior_burn_tx, .. } => prior_burn_tx.clone(),
+                _ => None,
+            });
         let (issuer_request_id, reason, failed_at) = match event {
             RedemptionEvent::AlpacaCallFailed {
                 issuer_request_id,
@@ -1340,7 +1694,12 @@ impl Redemption {
             _ => return,
         };
 
-        *self = Self::Failed { issuer_request_id, reason, failed_at };
+        *self = Self::Failed {
+            issuer_request_id,
+            reason,
+            failed_at,
+            prior_burn_tx,
+        };
     }
 
     fn apply_burn_submitted_event(&mut self, event: RedemptionEvent) {
@@ -1376,6 +1735,9 @@ impl Redemption {
             return;
         };
 
+        let sendable_tx =
+            self.current_sendable_tx().cloned().unwrap_or_default();
+
         *self = Self::BurnSubmitted {
             metadata,
             tokenization_request_id,
@@ -1386,10 +1748,15 @@ impl Redemption {
             external_tx_id,
             tx_id,
             planned_burns,
+            sendable_tx,
         };
     }
 
     fn apply_burn_resumed_event(&mut self, event: RedemptionEvent) {
+        let prior_burn_tx = match self {
+            Self::Failed { prior_burn_tx, .. } => prior_burn_tx.clone(),
+            _ => None,
+        };
         let RedemptionEvent::BurnResumed {
             issuer_request_id,
             underlying,
@@ -1428,6 +1795,7 @@ impl Redemption {
             called_at,
             alpaca_journal_completed_at,
             external_tx_id,
+            prior_burn_tx,
         };
     }
 
@@ -1488,7 +1856,56 @@ impl Redemption {
             return;
         };
 
-        let (Self::Burning {
+        let transition = match self.clone() {
+            Self::Burning {
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id,
+                ..
+            }
+            | Self::BurnIntended {
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id,
+                ..
+            } => Some((
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id,
+            )),
+            Self::BurnSubmitted {
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                external_tx_id,
+                ..
+            } => Some((
+                metadata,
+                tokenization_request_id,
+                alpaca_quantity,
+                dust_quantity,
+                called_at,
+                alpaca_journal_completed_at,
+                Some(external_tx_id),
+            )),
+            _ => None,
+        };
+        let Some((
             metadata,
             tokenization_request_id,
             alpaca_quantity,
@@ -1496,17 +1913,7 @@ impl Redemption {
             called_at,
             alpaca_journal_completed_at,
             external_tx_id,
-        }
-        | Self::BurnIntended {
-            metadata,
-            tokenization_request_id,
-            alpaca_quantity,
-            dust_quantity,
-            called_at,
-            alpaca_journal_completed_at,
-            external_tx_id,
-            ..
-        }) = self.clone()
+        )) = transition
         else {
             return;
         };
@@ -1527,28 +1934,84 @@ impl Redemption {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, TxHash, U256, address, b256, uint};
+    use alloy::primitives::{
+        Address, B256, Bytes, TxHash, U256, address, b256, uint,
+    };
     use chrono::Utc;
+    use cqrs_es::DomainEvent;
     use event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use tracing_test::traced_test;
 
     use super::{
-        BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, Redemption,
-        RedemptionCommand, RedemptionError, RedemptionEvent,
-        RedemptionMetadata, TokensBurnedData, TxId,
+        BurnExternalTxId, BurnRecord, BurnRecoveryAction,
+        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
+        RedemptionError, RedemptionEvent, RedemptionMetadata, TokensBurnedData,
+        has_unresolved_burn_intent,
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
+    use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{MultiBurnEntry, SendableTxWithHash, VaultService};
+    use crate::vault::{
+        BurnTxStatus, MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
+    };
 
     fn mock_services() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
+    }
+
+    #[tokio::test]
+    async fn recovery_annotations_keep_the_wallet_intent_gate_closed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+        let aggregate_id = IssuerRedemptionRequestId::random().to_string();
+
+        for (sequence, event_type) in [
+            (1, "RedemptionEvent::BurnIntended"),
+            (2, "RedemptionEvent::BurnRecoveryAttempted"),
+            (3, "RedemptionEvent::BurnRecoveryExhausted"),
+        ] {
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('Redemption', ?, ?, ?, '1.0', '{}', '{}')
+                ",
+            )
+            .bind(&aggregate_id)
+            .bind(sequence)
+            .bind(event_type)
+            .execute(&pool)
+            .await
+            .expect("test event should insert");
+        }
+
+        assert!(
+            has_unresolved_burn_intent(&pool, None)
+                .await
+                .expect("intent query should succeed"),
+            "recovery bookkeeping must not permit another wallet transaction"
+        );
     }
 
     #[test]
@@ -1559,7 +2022,7 @@ mod tests {
         let events = [RedemptionEvent::BurnTxSubmitted {
             issuer_request_id: IssuerRedemptionRequestId::new(detected_tx_hash),
             external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
-            tx_id: TxId::Legacy("fb-1".to_string()),
+            tx_id: TxId::random(),
             planned_burns: vec![],
             submitted_at: Utc::now(),
         }];
@@ -1592,7 +2055,7 @@ mod tests {
                     detected_tx_hash,
                 ),
                 external_tx_id: BurnExternalTxId::base(&detected_tx_hash),
-                tx_id: TxId::Legacy("fb-1".to_string()),
+                tx_id: TxId::random(),
                 planned_burns: vec![],
                 submitted_at: Utc::now(),
             },
@@ -2052,6 +2515,7 @@ mod tests {
                 called_at,
                 alpaca_journal_completed_at,
                 external_tx_id: None,
+                prior_burn_tx: None,
             }
         );
     }
@@ -2225,6 +2689,285 @@ mod tests {
                 found: "Detected".to_string(),
             }
         );
+    }
+
+    fn intended_burn_history(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        sendable_tx: SendableTxWithHash,
+    ) -> Vec<RedemptionEvent> {
+        vec![
+            RedemptionEvent::Detected {
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                quantity: Quantity::new(Decimal::from(100)),
+                tx_hash: b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                ),
+                block_number: 12345,
+                detected_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-replace-456",
+                ),
+                alpaca_quantity: Quantity::new(Decimal::from(100)),
+                dust_quantity: Quantity::new(Decimal::ZERO),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: issuer_request_id.clone(),
+                alpaca_journal_completed_at: Utc::now(),
+            },
+            RedemptionEvent::BurnIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                sendable_tx,
+                planned_burns: vec![BurnRecord {
+                    receipt_id: uint!(42_U256),
+                    shares_burned: uint!(100_000000000000000000_U256),
+                }],
+            },
+        ]
+    }
+
+    fn replace_dead_burn_command(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        owner: Address,
+    ) -> RedemptionCommand {
+        RedemptionCommand::ReplaceDeadBurn {
+            issuer_request_id: issuer_request_id.clone(),
+            owner,
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_dead_burn_refuses_a_still_mineable_hash() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let old_tx = SendableTxWithHash {
+            hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            nonce: 7,
+            ..SendableTxWithHash::default()
+        };
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::StillMineable),
+        );
+
+        let error = TestHarness::<Redemption>::with(services)
+            .given(intended_burn_history(&issuer_request_id, old_tx))
+            .when(replace_dead_burn_command(
+                &issuer_request_id,
+                address!("0x1111111111111111111111111111111111111111"),
+            ))
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::BurnReplacementNotSafe { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_dead_burn_persists_a_fresh_hash() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let replacement_hash = replacement_tx.hash;
+        let owner = old_tx.signer_for_test();
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_prepared_tx(replacement_tx),
+        );
+
+        let events = TestHarness::<Redemption>::with(services)
+            .given(intended_burn_history(&issuer_request_id, old_tx))
+            .when(replace_dead_burn_command(&issuer_request_id, owner))
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnIntended { sendable_tx, .. }]
+                if sendable_tx.hash == replacement_hash
+                    && sendable_tx.nonce == 8
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_dead_burn_refuses_a_non_fresh_nonce() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let non_fresh_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = old_tx.signer_for_test();
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_prepared_tx(non_fresh_tx),
+        );
+
+        let error = TestHarness::<Redemption>::with(services)
+            .given(intended_burn_history(&issuer_request_id, old_tx))
+            .when(replace_dead_burn_command(&issuer_request_id, owner))
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::BurnReplacementNotFresh { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_dead_burn_refuses_changed_calldata() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let changed_call = SendableTxWithHash::valid_for_test(
+            8,
+            destination,
+            Bytes::from_static(&[0xbe, 0xef]),
+        );
+        let owner = old_tx.signer_for_test();
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_prepared_tx(changed_call),
+        );
+
+        let error = TestHarness::<Redemption>::with(services)
+            .given(intended_burn_history(&issuer_request_id, old_tx))
+            .when(replace_dead_burn_command(&issuer_request_id, owner))
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::BurnReplacementValidationFailed { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn dead_submitted_burn_replays_to_the_fresh_intent() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let destination =
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_tx = SendableTxWithHash::valid_for_test(
+            7,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let replacement_tx = SendableTxWithHash::valid_for_test(
+            8,
+            destination,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = old_tx.signer_for_test();
+        let mut history =
+            intended_burn_history(&issuer_request_id, old_tx.clone());
+        history.push(RedemptionEvent::BurnTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&B256::random()),
+            tx_id: old_tx.hash.into(),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            submitted_at: Utc::now(),
+        });
+        let services: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_burn_tx_status(BurnTxStatus::ProvablyDead)
+                .with_prepared_tx(replacement_tx.clone()),
+        );
+
+        let events = TestHarness::<Redemption>::with(services)
+            .given(history.clone())
+            .when(replace_dead_burn_command(&issuer_request_id, owner))
+            .await
+            .events();
+        let replacement_event = events
+            .first()
+            .expect("replacement should append one event")
+            .clone();
+        history.push(replacement_event);
+        let aggregate = replay::<Redemption>(history)
+            .expect("replacement history should replay")
+            .expect("redemption should exist");
+
+        assert!(matches!(
+            aggregate,
+            Redemption::BurnIntended { sendable_tx, .. }
+                if sendable_tx == replacement_tx
+        ));
+    }
+
+    #[test]
+    fn recovery_annotation_events_do_not_change_burn_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let sendable_tx = SendableTxWithHash {
+            hash: B256::random(),
+            nonce: 7,
+            ..SendableTxWithHash::default()
+        };
+        let mut events =
+            intended_burn_history(&issuer_request_id, sendable_tx.clone());
+        events.push(RedemptionEvent::BurnRecoveryAttempted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+            action: BurnRecoveryAction::Rebroadcast,
+            attempted_at: Utc::now(),
+        });
+        events.push(RedemptionEvent::BurnRecoveryExhausted {
+            issuer_request_id,
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+            attempts: 5,
+            exhausted_at: Utc::now(),
+        });
+
+        let aggregate = replay::<Redemption>(events)
+            .expect("history should replay")
+            .expect("aggregate should exist");
+
+        assert!(matches!(aggregate, Redemption::BurnIntended { .. }));
     }
 
     #[test]
@@ -2424,7 +3167,7 @@ mod tests {
         assert_eq!(
             error,
             RedemptionError::InvalidState {
-                expected: "BurnIntended".to_string(),
+                expected: "BurnIntended or BurnSubmitted".to_string(),
                 found: "Detected".to_string(),
             }
         );
@@ -2559,7 +3302,7 @@ mod tests {
             external_tx_id: BurnExternalTxId::base(&b256!(
                 "0x4444444444444444444444444444444444444444444444444444444444444444"
             )),
-            tx_id: TxId::Legacy("fb-799".to_string()),
+            tx_id: TxId::random(),
             planned_burns: vec![],
             submitted_at: Utc::now(),
         });
@@ -2772,6 +3515,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_close_redemption_from_exhausted_burn_intended_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let sendable_tx = SendableTxWithHash::default();
+        let mut history =
+            intended_burn_history(&issuer_request_id, sendable_tx.clone());
+        history.push(RedemptionEvent::BurnRecoveryExhausted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+            attempts: 5,
+            exhausted_at: Utc::now(),
+        });
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::CloseRedemption {
+                issuer_request_id,
+                reason: "operator reconciled exhausted burn".to_string(),
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::RedemptionClosed { .. }]
+        ));
+    }
+
+    #[tokio::test]
     async fn test_close_redemption_from_detected_fails() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
 
@@ -2803,88 +3575,90 @@ mod tests {
         assert_eq!(
             error,
             RedemptionError::InvalidState {
-                expected: "Failed, Burning, or BurnSubmitted".to_string(),
+                expected: "Failed, Burning, BurnIntended, or BurnSubmitted"
+                    .to_string(),
                 found: "Detected".to_string(),
             }
         );
     }
 
     #[tokio::test]
-    async fn test_force_complete_burn_from_burning_state() {
+    async fn test_force_complete_burn_without_persisted_hash_fails() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let burn_tx_hash = b256!(
-            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
-        );
-        let block_number = 45_989_009;
-        let reason = "burn confirmed on-chain, unrecorded".to_string();
-
-        let events = TestHarness::<Redemption>::with(mock_services())
+        let error = TestHarness::<Redemption>::with(mock_services())
             .given(burning_given_events(&issuer_request_id))
             .when(RedemptionCommand::ForceCompleteBurn {
-                issuer_request_id: issuer_request_id.clone(),
-                burn_tx_hash,
-                block_number,
-                reason: reason.clone(),
+                issuer_request_id,
+                burn_tx_hash: B256::random(),
+                block_number: 45_989_009,
+                reason: "another redemption's verified burn".to_string(),
             })
             .await
-            .events();
+            .then_expect_error();
 
-        assert_eq!(events.len(), 1);
-
-        let RedemptionEvent::BurnForceCompleted {
-            issuer_request_id: event_id,
-            burn_tx_hash: event_tx_hash,
-            block_number: event_block,
-            reason: event_reason,
-            ..
-        } = &events[0]
-        else {
-            panic!("Expected BurnForceCompleted event, got {:?}", &events[0]);
-        };
-
-        assert_eq!(event_id, &issuer_request_id);
-        assert_eq!(event_tx_hash, &burn_tx_hash);
-        assert_eq!(event_block, &block_number);
-        assert_eq!(event_reason, &reason);
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::PersistedBurnHashUnavailable
+            )
+        ));
     }
 
     #[tokio::test]
-    async fn test_force_complete_burn_from_burn_submitted_state() {
+    async fn test_force_complete_legacy_submitted_burn_without_hash_fails() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let burn_tx_hash = b256!(
-            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
-        );
-        let block_number = 45_989_009;
-        let reason = "submitted burn confirmed on-chain".to_string();
-
-        let events = TestHarness::<Redemption>::with(mock_services())
+        let error = TestHarness::<Redemption>::with(mock_services())
             .given(burn_submitted_given_events(&issuer_request_id))
             .when(RedemptionCommand::ForceCompleteBurn {
-                issuer_request_id: issuer_request_id.clone(),
-                burn_tx_hash,
-                block_number,
-                reason: reason.clone(),
+                issuer_request_id,
+                burn_tx_hash: B256::random(),
+                block_number: 45_989_009,
+                reason: "another redemption's verified burn".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                RedemptionError::PersistedBurnHashUnavailable
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_force_complete_burn_from_exhausted_burn_intended_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let sendable_tx = SendableTxWithHash::valid_for_test(
+            7,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let mut history =
+            intended_burn_history(&issuer_request_id, sendable_tx.clone());
+        history.push(RedemptionEvent::BurnRecoveryExhausted {
+            issuer_request_id: issuer_request_id.clone(),
+            tx_hash: sendable_tx.hash,
+            nonce: sendable_tx.nonce,
+            attempts: 5,
+            exhausted_at: Utc::now(),
+        });
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(history)
+            .when(RedemptionCommand::ForceCompleteBurn {
+                issuer_request_id,
+                burn_tx_hash: sendable_tx.hash,
+                block_number: 45_989_009,
+                reason: "verified exhausted burn".to_string(),
             })
             .await
             .events();
 
-        assert_eq!(events.len(), 1);
-
-        let RedemptionEvent::BurnForceCompleted {
-            issuer_request_id: event_id,
-            burn_tx_hash: event_tx_hash,
-            block_number: event_block,
-            reason: event_reason,
-            ..
-        } = &events[0]
-        else {
-            panic!("Expected BurnForceCompleted event, got {:?}", &events[0]);
-        };
-
-        assert_eq!(event_id, &issuer_request_id);
-        assert_eq!(event_tx_hash, &burn_tx_hash);
-        assert_eq!(event_block, &block_number);
-        assert_eq!(event_reason, &reason);
+        assert!(matches!(
+            events.as_slice(),
+            [RedemptionEvent::BurnForceCompleted { .. }]
+        ));
     }
 
     #[test]
@@ -3064,7 +3838,12 @@ mod tests {
 
         assert_eq!(
             redemption,
-            Redemption::Failed { issuer_request_id, reason: error, failed_at }
+            Redemption::Failed {
+                issuer_request_id,
+                reason: error,
+                failed_at,
+                prior_burn_tx: None,
+            }
         );
     }
 
@@ -3760,6 +4539,88 @@ mod tests {
         assert_eq!(*alpaca_journal_completed_at, journal_completed_at);
     }
 
+    #[test]
+    fn prior_burn_transaction_survives_failure_resume_and_snapshot_roundtrip() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let mut history =
+            intended_burn_history(&issuer_request_id, persisted_tx.clone());
+        history.push(RedemptionEvent::BurningFailed {
+            issuer_request_id: issuer_request_id.clone(),
+            error: "replacement preparation failed".to_string(),
+            failed_at: Utc::now(),
+            tx_id: None,
+            planned_burns: vec![],
+        });
+        let failed = replay::<Redemption>(history.clone())
+            .expect("failed history should replay")
+            .expect("redemption should exist");
+        assert!(matches!(
+            &failed,
+            Redemption::Failed {
+                prior_burn_tx: Some(prior_burn_tx),
+                ..
+            } if prior_burn_tx == &persisted_tx
+        ));
+
+        history.push(RedemptionEvent::BurnResumed {
+            issuer_request_id,
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            quantity: Quantity::new(Decimal::from(100)),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            block_number: 12345,
+            detected_at: Utc::now(),
+            tokenization_request_id: TokenizationRequestId::new(
+                "alp-replace-456",
+            ),
+            alpaca_quantity: Quantity::new(Decimal::from(100)),
+            dust_quantity: Quantity::new(Decimal::ZERO),
+            called_at: Utc::now(),
+            alpaca_journal_completed_at: Utc::now(),
+            external_tx_id: None,
+            resumed_at: Utc::now(),
+        });
+        let burning = replay::<Redemption>(history)
+            .expect("resumed history should replay")
+            .expect("redemption should exist");
+        let snapshot = serde_json::to_string(&burning)
+            .expect("burning snapshot should serialize");
+        let roundtripped: Redemption = serde_json::from_str(&snapshot)
+            .expect("burning snapshot should deserialize");
+        assert!(matches!(
+            &roundtripped,
+            Redemption::Burning {
+                prior_burn_tx: Some(prior_burn_tx),
+                ..
+            } if prior_burn_tx == &persisted_tx
+        ));
+
+        for (aggregate, variant) in [(failed, "Failed"), (burning, "Burning")] {
+            let mut old_snapshot = serde_json::to_value(aggregate)
+                .expect("snapshot should serialize");
+            old_snapshot
+                .pointer_mut(&format!("/{variant}"))
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("snapshot variant should exist")
+                .remove("prior_burn_tx");
+            let restored: Redemption = serde_json::from_value(old_snapshot)
+                .expect("old snapshot should deserialize");
+            assert!(matches!(
+                restored,
+                Redemption::Failed { prior_burn_tx: None, .. }
+                    | Redemption::Burning { prior_burn_tx: None, .. }
+            ));
+        }
+    }
+
     proptest! {
         #[test]
         fn test_serde_roundtrip_proptest(id in arb_issuer_redemption_request_id()) {
@@ -3775,6 +4636,160 @@ mod tests {
             prop_assert!(display.starts_with("0x"));
             prop_assert_eq!(display.len(), 66);
         }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn redemption_v3_burn_submitted_snapshot_replays_the_persisted_transaction()
+     {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!().run(&pool).await.expect("migrations should run");
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            Bytes::from_static(&[0xca, 0xfe]),
+        );
+        let mut history =
+            intended_burn_history(&issuer_request_id, persisted_tx.clone());
+        history.push(RedemptionEvent::BurnTxSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&B256::random()),
+            tx_id: persisted_tx.hash.into(),
+            planned_burns: vec![BurnRecord {
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(100_000000000000000000_U256),
+            }],
+            submitted_at: Utc::now(),
+        });
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES (
+                'SchemaRegistry',
+                'schema',
+                1,
+                'SchemaRegistryEvent::VersionUpdated',
+                '1.0',
+                ?,
+                '{}'
+            )
+            ",
+        )
+        .bind(
+            serde_json::json!({
+                "VersionUpdated": { "name": "Redemption", "version": 3 }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .expect("v3 schema registry event should seed");
+
+        for (index, event) in history.iter().enumerate() {
+            let sequence = i64::try_from(index + 1)
+                .expect("test event sequence should fit i64");
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                VALUES ('Redemption', ?, ?, ?, ?, ?, '{}')
+                ",
+            )
+            .bind(issuer_request_id.to_string())
+            .bind(sequence)
+            .bind(event.event_type())
+            .bind(event.event_version())
+            .bind(
+                serde_json::to_string(event)
+                    .expect("redemption event should serialize"),
+            )
+            .execute(&pool)
+            .await
+            .expect("redemption history should seed");
+        }
+
+        let last_sequence = i64::try_from(history.len())
+            .expect("test event count should fit i64");
+        let aggregate = replay::<Redemption>(history)
+            .expect("history should replay")
+            .expect("history should originate a redemption");
+        let mut stale_snapshot = serde_json::json!({ "Live": aggregate });
+        stale_snapshot
+            .pointer_mut("/Live/BurnSubmitted")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("snapshot should contain BurnSubmitted")
+            .remove("sendable_tx");
+        sqlx::query(
+            "
+            INSERT INTO snapshots (
+                aggregate_type,
+                aggregate_id,
+                last_sequence,
+                snapshot_version,
+                payload,
+                timestamp
+            )
+            VALUES (
+                'Redemption',
+                ?,
+                ?,
+                3,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .bind(last_sequence)
+        .bind(stale_snapshot.to_string())
+        .execute(&pool)
+        .await
+        .expect("v3 snapshot should seed");
+
+        prepare_event_sourced_startup::<Redemption>(&pool)
+            .await
+            .expect("schema reconciliation should succeed");
+        let store = StoreBuilder::<Redemption>::new(pool.clone())
+            .build(mock_services())
+            .await
+            .expect("redemption store should rebuild");
+        let replayed = store
+            .load(&issuer_request_id)
+            .await
+            .expect("redemption should load")
+            .expect("redemption should exist");
+
+        assert!(matches!(
+            replayed,
+            Redemption::BurnSubmitted { sendable_tx, .. }
+                if sendable_tx == persisted_tx
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Cleared stale snapshots", "Redemption"]
+        ));
     }
 
     /// Regression: pre-event-sorcery snapshot payloads must be cleared before

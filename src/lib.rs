@@ -15,7 +15,7 @@ use sqlx::sqlite::{
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 
@@ -350,7 +350,7 @@ pub async fn initialize_rocket(
     // synchronous startup re-scan above finishes, so a mint is never driven by
     // two recovery drivers at once: the re-scan reads recoverable mints
     // independently of the Jobs table, so a worker draining a leftover job
-    // from t=0 would execute the same external side effects (Fireblocks
+    // from t=0 would execute the same external side effects (transaction
     // submission, Alpaca callback) for the same mint concurrently with the
     // re-scan. The only cost is that jobs enqueued by the re-scan start
     // draining moments later.
@@ -365,6 +365,7 @@ pub async fn initialize_rocket(
     // time), so a stranded mint is picked up promptly at startup and then once
     // per interval instead of waiting for the next process restart.
     spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
+    spawn_burn_recovery_reconciler(managers.burn.clone());
 
     spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
         pool: pool.clone(),
@@ -779,6 +780,7 @@ async fn run_mint_recovery(
 
 /// Interval between periodic mint-recovery reconciliation passes.
 const MINT_RECOVERY_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+const BURN_RECOVERY_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Periodically re-enqueues recoverable mints that lack a recovery job, closing
 /// the window where a mint whose enqueue failed (a transient SQLite outage at
@@ -797,6 +799,29 @@ fn spawn_mint_recovery_reconciler(
     });
 }
 
+async fn run_burn_recovery_reconciler<Recover, RecoveryFuture>(
+    interval: Duration,
+    mut recover: Recover,
+) where
+    Recover: FnMut() -> RecoveryFuture,
+    RecoveryFuture: Future<Output = ()>,
+{
+    loop {
+        tokio::time::sleep(interval).await;
+        recover().await;
+    }
+}
+
+fn spawn_burn_recovery_reconciler(burn: Arc<BurnManager>) {
+    tokio::spawn(async move {
+        run_burn_recovery_reconciler(BURN_RECOVERY_RECONCILE_INTERVAL, || {
+            let burn = burn.clone();
+            async move { burn.recover_unresolved_burns().await }
+        })
+        .await;
+    });
+}
+
 async fn run_redemption_recovery(
     redeem_call: &RedeemCallManager,
     journal: &JournalManager,
@@ -807,8 +832,7 @@ async fn run_redemption_recovery(
 
     redeem_call.recover_detected_redemptions().await;
     journal.recover_alpaca_called_redemptions().await;
-    burn.recover_burning_redemptions().await;
-    burn.recover_burn_failed_redemptions().await;
+    burn.recover_unresolved_burns().await;
     // Runs last, after the recovery passes above have re-confirmed in-flight
     // burns. It only SETTLES reservations whose redemption confirmed
     // (Completed) but whose settlement was missed; ambiguous/in-flight
@@ -1362,12 +1386,55 @@ mod tests {
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     use super::{
-        Environment, Quantity, QuantityConversionError, ReceiptContractAddress,
-        VaultAddress, cached_receipt_contract, mount_api_docs,
-        next_receipt_backfill_block,
+        BURN_RECOVERY_RECONCILE_INTERVAL, Environment, Quantity,
+        QuantityConversionError, ReceiptContractAddress, VaultAddress,
+        cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
+        run_burn_recovery_reconciler,
     };
+
+    #[tokio::test]
+    async fn burn_recovery_reconciler_repeats_after_each_interval() {
+        assert_eq!(BURN_RECOVERY_RECONCILE_INTERVAL, Duration::from_secs(300));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let two_calls = Arc::new(Notify::new());
+        let task_calls = calls.clone();
+        let task_two_calls = two_calls.clone();
+        let task = tokio::spawn(run_burn_recovery_reconciler(
+            Duration::from_millis(20),
+            move || {
+                let task_calls = task_calls.clone();
+                let task_two_calls = task_two_calls.clone();
+                async move {
+                    if task_calls.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                        task_two_calls.notify_one();
+                    }
+                }
+            },
+        ));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                two_calls.notified()
+            )
+            .await
+            .is_err(),
+            "reconciler must not run before its interval"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), two_calls.notified())
+            .await
+            .expect("reconciler should run more than once");
+        task.abort();
+
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
 
     /// The receipt-contract cache must resolve once on-chain and serve every
     /// subsequent call from memory — a receipt contract is immutable per vault,

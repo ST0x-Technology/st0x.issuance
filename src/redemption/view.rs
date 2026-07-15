@@ -391,7 +391,11 @@ impl RedemptionView {
             // View stays in Burning — BurnTxSubmitted and BurnIntended is an internal
             // detail that doesn't change the query-facing state.
             RedemptionEvent::BurnIntended { .. }
-            | RedemptionEvent::BurnTxSubmitted { .. } => self,
+            | RedemptionEvent::BurnTxSubmitted { .. }
+            | RedemptionEvent::BurnRecoveryAttempted { .. }
+            | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
+            | RedemptionEvent::BurnRecoveryExhausted { .. }
+            | RedemptionEvent::BurnPreparationRecoveryExhausted { .. } => self,
             RedemptionEvent::RedemptionClosed {
                 issuer_request_id,
                 reason,

@@ -24,7 +24,8 @@ use crate::mint::{
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
-    BurnManager, BurnManagerError, RecoveryOutcome,
+    BurnManager, BurnManagerError, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+    RecoveryOutcome,
 };
 use crate::redemption::{
     BurnExternalTxId, BurnRecord, IssuerRedemptionRequestId, RedemptionCommand,
@@ -42,9 +43,9 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Result<RecoveryOutcome, BurnManagerError>;
 
-    /// Terminalizes a redemption stuck in `Burning`/`BurnSubmitted` whose burn
-    /// already landed on-chain, after verifying `burn_tx_hash` against the
-    /// chain. Returns the on-chain verification for the admin response.
+    /// Terminalizes a redemption whose persisted exact burn already landed
+    /// on-chain, after binding and verifying `burn_tx_hash` against the chain.
+    /// Returns the on-chain verification for the admin response.
     async fn force_complete_burn(
         &self,
         issuer_request_id: &IssuerRedemptionRequestId,
@@ -147,6 +148,7 @@ struct ReprocessContext {
     /// Replacement externalTxId for a retry burn, when event
     /// history shows a prior accepted burn or an unaccepted retry attempt.
     burn_retry_external_tx_id: Option<BurnExternalTxId>,
+    burn_recovery_exhausted: bool,
 }
 
 /// Loads all events for a redemption and extracts:
@@ -268,12 +270,38 @@ async fn load_reprocess_context(
             );
             Status::InternalServerError
         })?;
+    let burn_recovery_exhausted = events.iter().any(|event| {
+        matches!(
+            event,
+            RedemptionEvent::BurnRecoveryExhausted { .. }
+                | RedemptionEvent::BurnPreparationRecoveryExhausted { .. }
+        )
+    }) || events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                RedemptionEvent::BurnRecoveryAttempted { .. }
+                    | RedemptionEvent::BurnPreparationRecoveryAttempted { .. }
+            )
+        })
+        .count()
+        >= usize::try_from(MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS).map_err(
+            |error| {
+                error!(target: "admin", aggregate_id = %aggregate_id_str,
+                    %error,
+                    "Burn recovery limit does not fit this platform"
+                );
+                Status::InternalServerError
+            },
+        )?;
 
     Ok(ReprocessContext {
         metadata,
         alpaca_called,
         burning_failed,
         burn_retry_external_tx_id,
+        burn_recovery_exhausted,
     })
 }
 
@@ -328,6 +356,13 @@ pub(crate) async fn recover_redemption(
 
     let context =
         load_reprocess_context(pool.inner(), &issuer_request_id).await?;
+
+    if context.burn_recovery_exhausted {
+        warn!(target: "admin", aggregate_id = %aggregate_id,
+            "Refusing to re-arm a redemption with exhausted automatic burn recovery"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
 
     let Some(alpaca_data) = context.alpaca_called else {
         // Pre-Alpaca failure: safe to reset to Detected and re-call Alpaca.
@@ -1766,7 +1801,7 @@ mod tests {
     use alloy::consensus::{
         Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
     };
-    use alloy::primitives::{Address, B256, Bloom, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bloom, Bytes, U256, address, b256};
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -1779,7 +1814,9 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
-    use super::{AggregateKind, StuckAggregate};
+    use super::{
+        AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
+    };
     use super::{
         AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
         recover_post_alpaca,
@@ -1796,13 +1833,15 @@ mod tests {
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
-        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionMetadata, RedemptionView,
+        BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId, Redemption,
+        RedemptionCommand, RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
-    use crate::vault::{MultiBurnEntry, TxId, VaultService};
+    use crate::vault::{
+        MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
+    };
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -2205,6 +2244,13 @@ mod tests {
     fn setup_store(pool: &sqlx::Pool<sqlx::Sqlite>) -> Arc<Store<Redemption>> {
         let vault_service: Arc<dyn VaultService> =
             Arc::new(MockVaultService::new_success());
+        setup_store_with_vault(pool, vault_service)
+    }
+
+    fn setup_store_with_vault(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        vault_service: Arc<dyn VaultService>,
+    ) -> Arc<Store<Redemption>> {
         Arc::new(test_store::<Redemption>(pool.clone(), vault_service))
     }
 
@@ -3284,6 +3330,131 @@ mod tests {
         }
     }
 
+    async fn assert_endpoint_refuses_exhausted_burn_recovery(
+        with_marker: bool,
+    ) {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let tx_hash = tx_id.to_hash().unwrap();
+        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let annotations = if with_marker {
+            vec![RedemptionEvent::BurnRecoveryExhausted {
+                issuer_request_id: metadata.issuer_request_id.clone(),
+                tx_hash,
+                nonce: 4,
+                attempts: MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
+                exhausted_at: Utc::now(),
+            }]
+        } else {
+            (0..MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS)
+                .map(|_| RedemptionEvent::BurnRecoveryAttempted {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    tx_hash,
+                    nonce: 4,
+                    action: BurnRecoveryAction::Rebroadcast,
+                    attempted_at: Utc::now(),
+                })
+                .collect()
+        };
+        for annotation in annotations {
+            let event_type = match annotation {
+                RedemptionEvent::BurnRecoveryAttempted { .. } => {
+                    "RedemptionEvent::BurnRecoveryAttempted"
+                }
+                RedemptionEvent::BurnRecoveryExhausted { .. } => {
+                    "RedemptionEvent::BurnRecoveryExhausted"
+                }
+                _ => unreachable!(),
+            };
+            sqlx::query(
+                "
+                INSERT INTO events (
+                    aggregate_type,
+                    aggregate_id,
+                    sequence,
+                    event_type,
+                    event_version,
+                    payload,
+                    metadata
+                )
+                SELECT
+                    'Redemption',
+                    ?,
+                    COALESCE(MAX(sequence), 0) + 1,
+                    ?,
+                    '1.0',
+                    ?,
+                    '{}'
+                FROM events
+                WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+                ",
+            )
+            .bind(&aggregate_id)
+            .bind(event_type)
+            .bind(serde_json::to_string(&annotation).unwrap())
+            .bind(&aggregate_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store,
+            pool.clone(),
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(burn_recovery.calls(), 0);
+        let resumed_events: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption' AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::BurnResumed'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(resumed_events, 0);
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[&aggregate_id, "exhausted automatic burn recovery"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_marked_exhausted_burn_recovery() {
+        assert_endpoint_refuses_exhausted_burn_recovery(true).await;
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_refuses_count_only_exhausted_burn_recovery() {
+        assert_endpoint_refuses_exhausted_burn_recovery(false).await;
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn endpoint_replaces_only_confirmed_reverted_prior_burn() {
@@ -3708,8 +3879,37 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_force_complete_records_verified_burn() {
         let pool = setup_pool().await;
-        let store = setup_store(&pool);
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let store = setup_store_with_vault(&pool, vault_service);
         let metadata = setup_burning(&store).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(42),
+                        burn_shares: U256::from(17),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: persisted_tx.signer_for_test(),
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
 
         // In production `force_complete_burn` appends `BurnForceCompleted` before
         // the endpoint reads the prior state; the mock can't, so append it here
@@ -3720,7 +3920,7 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::ForceCompleteBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    burn_tx_hash: alloy::primitives::B256::ZERO,
+                    burn_tx_hash: persisted_tx.hash,
                     block_number: 45_989_009,
                     reason: "burn confirmed on-chain".to_string(),
                 },
@@ -3733,17 +3933,20 @@ mod tests {
             burn_recovery.clone();
 
         let rocket = force_complete_rocket(pool, burn_recovery_state);
-        let body = r#"{"burn_tx_hash":"0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf","reason":"burn confirmed on-chain"}"#;
+        let body = format!(
+            r#"{{"burn_tx_hash":"{:#x}","reason":"burn confirmed on-chain"}}"#,
+            persisted_tx.hash
+        );
 
         let (status, body) =
-            dispatch_force_complete(rocket, &metadata.issuer_request_id, body)
+            dispatch_force_complete(rocket, &metadata.issuer_request_id, &body)
                 .await;
 
         assert_eq!(status, Status::Ok);
         // Response reports the proven block and the true previous state.
         assert!(body.contains("Force-completed"), "body: {body}");
         assert!(body.contains("45989009"), "body: {body}");
-        assert!(body.contains("Burning"), "body: {body}");
+        assert!(body.contains("BurnIntended"), "body: {body}");
         assert_eq!(burn_recovery.force_calls(), 1);
         assert!(logs_contain_at!(Level::INFO, &["Redemption force-completed"]));
     }

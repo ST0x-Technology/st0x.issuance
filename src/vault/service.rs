@@ -9,7 +9,7 @@ use alloy::providers::fillers::{
 use alloy::providers::{
     Identity, PendingTransactionBuilder, Provider, RootProvider,
 };
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
@@ -19,10 +19,10 @@ use tracing::debug;
 
 use super::rain_meta::OaSchemaCache;
 use super::{
-    BurnVerification, MintResult, MultiBurnResult, MultiBurnResultEntry,
-    PreparedMintTx, ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId,
-    VaultError, VaultService, WalletNonceGuard, classify_checked_receipt,
-    verify_burn_in_receipt,
+    BurnTxStatus, BurnVerification, MintResult, MultiBurnResult,
+    MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
+    SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
+    WalletNonceGuard, classify_checked_receipt, verify_burn_in_receipt,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
@@ -249,21 +249,32 @@ impl VaultService for RealBlockchainService {
         params: super::MultiBurnParams,
         sendable_tx: SendableTxWithHash,
     ) -> Result<SubmittedTx, VaultError> {
-        if let Err(error) =
-            self.provider.send_raw_transaction(&sendable_tx.tx).await
-        {
-            if self
-                .provider
-                .get_transaction_by_hash(sendable_tx.hash)
-                .await?
-                .is_none()
-            {
-                return Err(error.into());
-            }
+        sendable_tx.validate_for_owner(params.owner)?;
 
-            debug!(target: "vault", tx_hash = %sendable_tx.hash,
-                "Burn broadcast errored but the node holds the persisted transaction"
-            );
+        match self.provider.send_raw_transaction(&sendable_tx.tx).await {
+            Ok(pending_tx) => {
+                let returned = *pending_tx.tx_hash();
+                if returned != sendable_tx.hash {
+                    return Err(VaultError::BroadcastHashMismatch {
+                        expected: sendable_tx.hash,
+                        returned,
+                    });
+                }
+            }
+            Err(error) => {
+                if self
+                    .provider
+                    .get_transaction_by_hash(sendable_tx.hash)
+                    .await?
+                    .is_none()
+                {
+                    return Err(error.into());
+                }
+
+                debug!(target: "vault", tx_hash = %sendable_tx.hash,
+                    "Burn broadcast errored but the node holds the persisted transaction"
+                );
+            }
         }
 
         Ok(SubmittedTx {
@@ -436,6 +447,115 @@ impl VaultService for RealBlockchainService {
         })
     }
 
+    async fn classify_burn_tx(
+        &self,
+        owner: Address,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<BurnTxStatus, VaultError> {
+        sendable_tx.validate_for_owner(owner)?;
+        let status = if let Some(receipt) =
+            self.provider.get_transaction_receipt(sendable_tx.hash).await?
+        {
+            if receipt.transaction_hash != sendable_tx.hash
+                || receipt.block_number.is_none()
+            {
+                return Err(VaultError::InvalidReceipt);
+            }
+
+            if receipt.status() {
+                BurnTxStatus::Mined
+            } else {
+                BurnTxStatus::Reverted
+            }
+        } else {
+            let latest_nonce =
+                self.provider.get_transaction_count(owner).latest().await?;
+            let finalized_nonce =
+                self.provider.get_transaction_count(owner).finalized().await?;
+            let status = if finalized_nonce > sendable_tx.nonce {
+                match self
+                    .provider
+                    .get_transaction_receipt(sendable_tx.hash)
+                    .await?
+                {
+                    Some(receipt) => {
+                        if receipt.transaction_hash != sendable_tx.hash
+                            || receipt.block_number.is_none()
+                        {
+                            return Err(VaultError::InvalidReceipt);
+                        }
+                        if receipt.status() {
+                            BurnTxStatus::Mined
+                        } else {
+                            BurnTxStatus::Reverted
+                        }
+                    }
+                    None => BurnTxStatus::ProvablyDead,
+                }
+            } else {
+                BurnTxStatus::StillMineable
+            };
+            debug!(target: "vault",
+                owner = %owner,
+                tx_hash = %sendable_tx.hash,
+                nonce = sendable_tx.nonce,
+                latest_nonce,
+                finalized_nonce,
+                status = ?status,
+                "Classified persisted burn transaction"
+            );
+            return Ok(status);
+        };
+        debug!(target: "vault",
+            owner = %owner,
+            tx_hash = %sendable_tx.hash,
+            nonce = sendable_tx.nonce,
+            status = ?status,
+            "Classified persisted burn transaction"
+        );
+        Ok(status)
+    }
+
+    async fn prepare_replacement_burn_tx(
+        &self,
+        owner: Address,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<SendableTxWithHash, VaultError> {
+        let envelope = sendable_tx.validate_for_owner(owner)?;
+        let mut transaction = TransactionRequest::from_transaction(envelope);
+        transaction.from = Some(owner);
+        transaction.nonce =
+            Some(self.provider.get_transaction_count(owner).pending().await?);
+        transaction.gas = None;
+        transaction.gas_price = None;
+        transaction.max_fee_per_gas = None;
+        transaction.max_priority_fee_per_gas = None;
+        transaction.max_fee_per_blob_gas = None;
+
+        let replacement = self
+            .provider
+            .fill(transaction)
+            .await?
+            .try_into_envelope()
+            .map_err(Box::new)?;
+        let replacement = SendableTxWithHash {
+            tx: replacement.encoded_2718(),
+            hash: *replacement.tx_hash(),
+            nonce: replacement.nonce(),
+            signed_at: Utc::now(),
+            dust_shares: sendable_tx.dust_shares,
+        };
+        debug!(target: "vault",
+            owner = %owner,
+            previous_tx_hash = %sendable_tx.hash,
+            previous_nonce = sendable_tx.nonce,
+            replacement_tx_hash = %replacement.hash,
+            replacement_nonce = replacement.nonce,
+            "Prepared fresh-nonce burn replacement"
+        );
+        Ok(replacement)
+    }
+
     async fn check_tx(
         &self,
         tx_id: &TxId,
@@ -464,30 +584,35 @@ mod tests {
         Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, Transaction,
         TxEnvelope,
     };
-    use alloy::eips::Decodable2718;
+    use alloy::eips::{Decodable2718, Encodable2718};
     use alloy::network::EthereumWallet;
     use alloy::primitives::{
         Address, B256, Bloom, Bytes, IntoLogData, U256, address, b256,
         fixed_bytes,
     };
-    use alloy::providers::ProviderBuilder;
     use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
     use alloy::providers::mock::Asserter;
-    use alloy::rpc::types::{Block, FeeHistory, TransactionReceipt};
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::rpc::types::{
+        Block, FeeHistory, TransactionReceipt, TransactionRequest,
+    };
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
     use rust_decimal::Decimal;
     use std::sync::Arc;
+    use tracing::Level;
+    use tracing_test::traced_test;
 
-    use super::RealBlockchainService;
+    use super::{RealBlockchainService, RealBlockchainServiceProvider};
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::mint::{
         IssuerMintRequestId, Quantity, TokenizationRequestId, UnderlyingSymbol,
     };
     use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
+    use crate::test_utils::{LocalEvm, logs_contain_at};
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, ReceiptInformation,
+        BurnTxStatus, MultiBurnEntry, MultiBurnParams, ReceiptInformation,
         SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
@@ -517,6 +642,26 @@ mod tests {
 
     fn test_vault_address() -> Address {
         address!("0000000000000000000000000000000000000002")
+    }
+
+    fn test_multi_burn_params(owner: Address) -> MultiBurnParams {
+        MultiBurnParams {
+            vault: test_vault_address(),
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: None,
+            }],
+            dust_shares: U256::ZERO,
+            owner,
+            user: address!("0x3333333333333333333333333333333333333333"),
+            issuer_request_id: test_issuer_redemption_id(),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        }
     }
 
     fn test_fee_history() -> FeeHistory {
@@ -557,7 +702,13 @@ mod tests {
     }
 
     fn create_service_with_asserter(asserter: Asserter) -> impl VaultService {
-        let signer = PrivateKeySigner::random();
+        create_service_with_signer(asserter, PrivateKeySigner::random())
+    }
+
+    fn create_service_with_signer(
+        asserter: Asserter,
+        signer: PrivateKeySigner,
+    ) -> impl VaultService {
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .with_gas_estimation()
@@ -570,6 +721,136 @@ mod tests {
             provider,
             Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
         )
+    }
+
+    async fn sign_test_transaction(
+        provider: &RealBlockchainServiceProvider,
+        transaction: TransactionRequest,
+    ) -> SendableTxWithHash {
+        let envelope = provider
+            .fill(transaction)
+            .await
+            .expect("test transaction should fill")
+            .try_into_envelope()
+            .expect("test transaction should be signed");
+        SendableTxWithHash {
+            tx: envelope.encoded_2718(),
+            hash: *envelope.tx_hash(),
+            nonce: envelope.nonce(),
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn anvil_classifies_persisted_transactions_for_recovery() {
+        let evm = LocalEvm::new().await.expect("Anvil should start");
+        let signer = PrivateKeySigner::from_bytes(&evm.private_key)
+            .expect("Anvil key should parse");
+        let owner = signer.address();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .with_simple_nonce_management()
+            .filler(ChainIdFiller::default())
+            .wallet(EthereumWallet::from(signer))
+            .connect(&evm.endpoint)
+            .await
+            .expect("provider should connect");
+        let service = RealBlockchainService::new(
+            provider.clone(),
+            Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
+        );
+        let recipient = address!("0x3333333333333333333333333333333333333333");
+
+        let mineable = sign_test_transaction(
+            &provider,
+            TransactionRequest::default()
+                .from(owner)
+                .to(recipient)
+                .value(U256::from(1u8)),
+        )
+        .await;
+        assert_eq!(
+            service.classify_burn_tx(owner, &mineable).await.unwrap(),
+            BurnTxStatus::StillMineable
+        );
+
+        provider
+            .send_raw_transaction(&mineable.tx)
+            .await
+            .expect("persisted transaction should broadcast")
+            .get_receipt()
+            .await
+            .expect("persisted transaction should mine");
+        assert_eq!(
+            service.classify_burn_tx(owner, &mineable).await.unwrap(),
+            BurnTxStatus::Mined
+        );
+
+        let dead = sign_test_transaction(
+            &provider,
+            TransactionRequest::default()
+                .from(owner)
+                .to(recipient)
+                .value(U256::from(2u8)),
+        )
+        .await;
+        for nonce_offset in 0..3 {
+            provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .from(owner)
+                        .to(recipient)
+                        .nonce(dead.nonce + nonce_offset)
+                        .value(U256::from(3u64 + nonce_offset)),
+                )
+                .await
+                .expect("competing transaction should broadcast")
+                .get_receipt()
+                .await
+                .expect("competing transaction should mine");
+        }
+        assert_eq!(
+            service.classify_burn_tx(owner, &dead).await.unwrap(),
+            BurnTxStatus::StillMineable,
+            "Anvil's unfinalized nonce advance must not prove death"
+        );
+
+        let invalid_redeem =
+            OffchainAssetReceiptVault::new(evm.vault_address, &provider)
+                .redeem(U256::from(1u8), owner, owner, U256::MAX, Bytes::new())
+                .calldata()
+                .clone();
+        let reverted = sign_test_transaction(
+            &provider,
+            TransactionRequest::default()
+                .from(owner)
+                .to(evm.vault_address)
+                .input(invalid_redeem.into())
+                .gas_limit(100_000),
+        )
+        .await;
+        let receipt = provider
+            .send_raw_transaction(&reverted.tx)
+            .await
+            .expect("reverting transaction should broadcast")
+            .get_receipt()
+            .await
+            .expect("reverting transaction should mine");
+        assert!(!receipt.status(), "test transaction must revert");
+        assert_eq!(
+            service.classify_burn_tx(owner, &reverted).await.unwrap(),
+            BurnTxStatus::Reverted
+        );
+        for status in ["StillMineable", "Mined", "Reverted"] {
+            assert!(logs_contain_at!(
+                Level::DEBUG,
+                &["Classified persisted burn transaction", status]
+            ));
+        }
     }
 
     #[tokio::test]
@@ -869,6 +1150,194 @@ mod tests {
         }
     }
 
+    fn persisted_burn_tx(nonce: u64) -> SendableTxWithHash {
+        SendableTxWithHash::valid_for_test(
+            nonce,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        )
+    }
+
+    #[tokio::test]
+    async fn classify_burn_tx_reports_mined_and_reverted_receipts() {
+        for (succeeded, expected) in
+            [(true, BurnTxStatus::Mined), (false, BurnTxStatus::Reverted)]
+        {
+            let persisted = persisted_burn_tx(7);
+            let owner = persisted.signer_for_test();
+            let mut receipt =
+                create_empty_receipt(test_vault_address(), persisted.hash);
+            receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                Receipt {
+                    status: Eip658Value::Eip658(succeeded),
+                    cumulative_gas_used: 0x6100,
+                    logs: vec![],
+                },
+                Bloom::default(),
+            ));
+            let asserter = Asserter::new();
+            asserter.push_success(&receipt);
+            let service = create_service_with_asserter(asserter);
+
+            let status = service
+                .classify_burn_tx(owner, &persisted)
+                .await
+                .expect("receipt should classify");
+
+            assert_eq!(status, expected);
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn classify_burn_tx_requires_finalized_nonce_to_prove_death() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+
+        for (latest_nonce, finalized_nonce, expected) in [
+            (7, 7, BurnTxStatus::StillMineable),
+            (8, 7, BurnTxStatus::StillMineable),
+            (8, 8, BurnTxStatus::ProvablyDead),
+        ] {
+            let asserter = Asserter::new();
+            asserter.push_success(&Option::<TransactionReceipt>::None);
+            asserter.push_success(&latest_nonce);
+            asserter.push_success(&finalized_nonce);
+            if finalized_nonce > persisted.nonce {
+                asserter.push_success(&Option::<TransactionReceipt>::None);
+            }
+            let service = create_service_with_asserter(asserter);
+
+            let status = service
+                .classify_burn_tx(owner, &persisted)
+                .await
+                .expect("missing receipt should classify by finalized nonce");
+
+            assert_eq!(status, expected);
+        }
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "Classified persisted burn transaction",
+                "latest_nonce=8",
+                "finalized_nonce=7",
+                "StillMineable"
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn classify_burn_tx_rechecks_receipt_after_nonce_advances() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        let asserter = Asserter::new();
+        asserter.push_success(&Option::<TransactionReceipt>::None);
+        asserter.push_success(&8u64);
+        asserter.push_success(&8u64);
+        asserter.push_success(&Some(receipt));
+        let service = create_service_with_asserter(asserter);
+
+        let status = service
+            .classify_burn_tx(owner, &persisted)
+            .await
+            .expect("the second receipt read should win the nonce race");
+
+        assert_eq!(status, BurnTxStatus::Mined);
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &["Classified persisted burn transaction", "Mined"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn replacement_uses_pending_nonce_to_avoid_live_transaction_collision()
+     {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let pending_nonce = 11u64;
+        let asserter = Asserter::new();
+        asserter.push_success(&pending_nonce);
+        asserter.push_success(&100_000u64);
+        asserter.push_success(&test_fee_history());
+        asserter
+            .push_success(&Block::<alloy::rpc::types::Transaction>::default());
+        asserter.push_success(&1_000_000_000u64);
+        asserter.push_success(&100_000u64);
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(1))
+            .expect("test private key should be valid");
+        let service = create_service_with_signer(asserter, signer);
+
+        let replacement = service
+            .prepare_replacement_burn_tx(owner, &persisted)
+            .await
+            .expect("replacement should use the pending wallet nonce");
+
+        assert_eq!(replacement.nonce, pending_nonce);
+        let previous_envelope =
+            persisted.validate().expect("persisted tx should decode");
+        let replacement_envelope =
+            replacement.validate().expect("replacement should decode");
+        assert_eq!(replacement_envelope.to(), previous_envelope.to());
+        assert_eq!(replacement_envelope.value(), previous_envelope.value());
+        assert_eq!(replacement_envelope.input(), previous_envelope.input());
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "Prepared fresh-nonce burn replacement",
+                "previous_nonce=7",
+                "replacement_nonce=11"
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_burn_tx_rejects_unmined_receipt_shape() {
+        let persisted = persisted_burn_tx(7);
+        let owner = persisted.signer_for_test();
+        let mut receipt =
+            create_empty_receipt(test_vault_address(), persisted.hash);
+        receipt.block_number = None;
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service.classify_burn_tx(owner, &persisted).await;
+
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
+    }
+
+    #[tokio::test]
+    async fn classify_burn_tx_rejects_corrupt_persisted_identity_before_rpc() {
+        let mut persisted = persisted_burn_tx(7);
+        persisted.hash = B256::ZERO;
+        let service = create_service_with_asserter(Asserter::new());
+
+        let result =
+            service.classify_burn_tx(test_receiver(), &persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedBurnHashMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_burn_tx_rejects_a_different_signer_before_rpc() {
+        let persisted = persisted_burn_tx(7);
+        let service = create_service_with_asserter(Asserter::new());
+
+        let result = service.classify_burn_tx(Address::ZERO, &persisted).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::PreparedBurnSignerMismatch { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn check_tx_rejects_reverted_receipt_without_block_number() {
         let vault_address = test_vault_address();
@@ -1053,12 +1522,15 @@ mod tests {
     #[tokio::test]
     async fn test_submit_and_confirm_burn_two_burns() {
         let vault_address = test_vault_address();
-        let owner = test_receiver();
         let user = address!("0x3333333333333333333333333333333333333333");
 
-        let tx_hash = fixed_bytes!(
-            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            0,
+            vault_address,
+            Bytes::from_static(&[0xde, 0xad]),
         );
+        let tx_hash = prepared_tx.hash;
+        let owner = prepared_tx.signer_for_test();
 
         let burns = vec![
             (U256::from(1), U256::from(100)),
@@ -1081,13 +1553,6 @@ mod tests {
         let detected_tx_hash = b256!(
             "0xabababababababababababababababababababababababababababababababab"
         );
-        let prepared_tx = SendableTxWithHash {
-            tx: vec![],
-            hash: tx_hash,
-            nonce: 0,
-            signed_at: Utc::now(),
-            dust_shares: U256::ZERO,
-        };
         let submitted = service
             .submit_burn(
                 MultiBurnParams {
@@ -1131,12 +1596,15 @@ mod tests {
     #[tokio::test]
     async fn test_submit_burn_propagates_external_tx_id_override() {
         let vault_address = test_vault_address();
-        let owner = test_receiver();
         let user = address!("0x3333333333333333333333333333333333333333");
 
-        let tx_hash = fixed_bytes!(
-            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            0,
+            vault_address,
+            Bytes::from_static(&[0xde, 0xad]),
         );
+        let tx_hash = prepared_tx.hash;
+        let owner = prepared_tx.signer_for_test();
 
         let burns = vec![(U256::from(1), U256::from(100))];
 
@@ -1158,13 +1626,6 @@ mod tests {
         );
         let override_id = "burn-0xabab-retry-2".to_string();
 
-        let prepared_tx = SendableTxWithHash {
-            tx: vec![],
-            hash: tx_hash,
-            nonce: 0,
-            signed_at: Utc::now(),
-            dust_shares: U256::ZERO,
-        };
         let submitted = service
             .submit_burn(
                 MultiBurnParams {
@@ -1198,14 +1659,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_burn_rejects_a_node_hash_for_different_bytes() {
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            0,
+            test_vault_address(),
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let returned = B256::random();
+        let asserter = Asserter::new();
+        asserter.push_success(&returned);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .submit_burn(
+                test_multi_burn_params(prepared_tx.signer_for_test()),
+                prepared_tx.clone(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::BroadcastHashMismatch { expected, returned: actual })
+                if expected == prepared_tx.hash && actual == returned
+        ));
+    }
+
+    #[tokio::test]
     async fn test_submit_burn_returns_error_on_missing_events() {
         let vault_address = test_vault_address();
-        let owner = test_receiver();
         let user = address!("0x6666666666666666666666666666666666666666");
 
-        let tx_hash = fixed_bytes!(
-            "0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+        let prepared_tx = SendableTxWithHash::valid_for_test(
+            0,
+            vault_address,
+            Bytes::from_static(&[0xde, 0xad]),
         );
+        let tx_hash = prepared_tx.hash;
+        let owner = prepared_tx.signer_for_test();
 
         let receipt = create_empty_receipt(vault_address, tx_hash);
 
@@ -1214,13 +1704,6 @@ mod tests {
 
         let service = create_service_with_asserter(asserter);
 
-        let prepared_tx = SendableTxWithHash {
-            tx: vec![],
-            hash: tx_hash,
-            nonce: 0,
-            signed_at: Utc::now(),
-            dust_shares: U256::ZERO,
-        };
         let submit_result = service
             .submit_burn(MultiBurnParams {
                 vault: vault_address,

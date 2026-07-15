@@ -136,4 +136,28 @@ pub(crate) enum RedemptionCommand {
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
     },
+    RecordBurnRecoveryAttempt {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        action: super::BurnRecoveryAction,
+    },
+    RecordBurnPreparationRecoveryAttempt {
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempt: u32,
+    },
+    RecordBurnRecoveryExhausted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        attempts: u32,
+    },
+    RecordBurnPreparationRecoveryExhausted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempts: u32,
+    },
+    ReplaceDeadBurn {
+        issuer_request_id: IssuerRedemptionRequestId,
+        owner: Address,
+    },
 }
