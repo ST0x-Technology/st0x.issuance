@@ -205,41 +205,56 @@ impl AlpacaService for RealAlpacaService {
 
         debug!(target: "alpaca", %url, method = "POST", "Calling Alpaca redeem endpoint");
 
-        let response = self
-            .client
-            .post(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .json(&request)
-            .send()
-            .await?;
+        (|| async {
+            let response = self
+                .client
+                .post(&url)
+                .basic_auth(&self.api_key, Some(&self.api_secret))
+                .header("APCA-API-KEY-ID", &self.api_key)
+                .header("APCA-API-SECRET-KEY", &self.api_secret)
+                .json(&request)
+                .send()
+                .await?;
 
-        let status = response.status();
+            let status = response.status();
 
-        match status {
-            reqwest::StatusCode::OK => {
-                let body = response.text().await?;
-                serde_json::from_str(&body).map_err(|e| {
-                    tracing::error!(
-                        target: "alpaca",
-                        %body,
-                        error = %e,
-                        "Failed to parse Alpaca redeem response"
-                    );
-                    AlpacaError::Parse { body, source: e }
-                })
+            match status {
+                reqwest::StatusCode::OK => {
+                    let body = response.text().await?;
+                    serde_json::from_str(&body).map_err(|e| {
+                        tracing::error!(
+                            target: "alpaca",
+                            %body,
+                            error = %e,
+                            "Failed to parse Alpaca redeem response"
+                        );
+                        AlpacaError::Parse { body, source: e }
+                    })
+                }
+                reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::Auth(body))
+                }
+                status => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
+                }
             }
-            reqwest::StatusCode::UNAUTHORIZED
-            | reqwest::StatusCode::FORBIDDEN => {
-                let body = response.text().await?;
-                Err(AlpacaError::Auth(body))
-            }
-            status => {
-                let body = response.text().await?;
-                Err(AlpacaError::Api { status_code: status.as_u16(), body })
-            }
-        }
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_max_times(self.max_retries)
+                .with_jitter(),
+        )
+        .when(|e: &AlpacaError| e.is_retryable())
+        .notify(|err: &AlpacaError, dur: std::time::Duration| {
+            tracing::debug!(
+                target: "alpaca",
+                "Alpaca redeem call failed with {err}, retrying after {dur:?}"
+            );
+        })
+        .await
     }
 
     async fn poll_request_status(
@@ -378,6 +393,7 @@ mod tests {
         }
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_send_mint_callback_success() {
         let server = MockServer::start();
@@ -406,6 +422,13 @@ mod tests {
 
         assert!(result.is_ok());
         mock.assert();
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Sending mint callback to Alpaca", "test-account"]
+            ),
+            "expected DEBUG log with the account-scoped callback URL"
+        );
     }
 
     #[tokio::test]
@@ -610,6 +633,7 @@ mod tests {
         }
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_call_redeem_endpoint_success() {
         let server = MockServer::start();
@@ -662,6 +686,13 @@ mod tests {
         assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
         mock.assert();
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Calling Alpaca redeem endpoint", "test-account"]
+            ),
+            "expected DEBUG log with the account-scoped redeem URL"
+        );
     }
 
     #[tokio::test]
@@ -1038,6 +1069,13 @@ mod tests {
         );
         assert!(!err.is_retryable(), "RequestNotFound must not be retryable");
         mock.assert_calls(1);
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Polling Alpaca request status", "tok-NOT-FOUND"]
+            ),
+            "expected DEBUG poll log naming the tokenization request id"
+        );
     }
 
     #[tokio::test]
@@ -1484,5 +1522,48 @@ mod tests {
         assert!(matches!(err, AlpacaError::Parse { .. }));
         assert!(!err.is_retryable(), "Parse errors must NOT be retryable");
         mock.assert_calls(1);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_call_redeem_endpoint_retries_retryable_errors() {
+        // Regression: call_redeem_endpoint previously made a single HTTP call
+        // with no retry, so one transient 5xx from Alpaca permanently failed
+        // the redemption. It must retry retryable errors like the other
+        // endpoints do — here one retry means two calls total.
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let service = RealAlpacaService::new(
+            server.base_url(),
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            10,
+            30,
+        )
+        .unwrap()
+        .with_max_retries(1);
+
+        let request = create_redeem_request();
+        let result = service.call_redeem_endpoint(request).await;
+
+        assert!(matches!(
+            result,
+            Err(AlpacaError::Api { status_code: 500, .. })
+        ));
+        mock.assert_calls(2);
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["Alpaca redeem call failed with", "retrying after"]
+            ),
+            "expected DEBUG retry log from the notify callback"
+        );
     }
 }
