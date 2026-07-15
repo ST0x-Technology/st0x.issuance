@@ -12,6 +12,7 @@ use cqrs_es::DomainEvent;
 use event_sorcery::{EventSourced, Never, Table};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
+use std::collections::BTreeSet;
 
 use st0x_issuance_dto::TokenizedAssetStatus;
 pub use st0x_issuance_dto::UnderlyingSymbol;
@@ -48,23 +49,225 @@ impl From<AssetStatus> for TokenizedAssetStatus {
     }
 }
 
+/// A validated interval during which a corporate action owns the supply gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct FreezeWindow {
+    freeze_at: DateTime<Utc>,
+    unfreeze_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for FreezeWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedFreezeWindow {
+            freeze_at: DateTime<Utc>,
+            unfreeze_at: DateTime<Utc>,
+        }
+
+        let serialized = SerializedFreezeWindow::deserialize(deserializer)?;
+        Self::new(serialized.freeze_at, serialized.unfreeze_at).ok_or_else(
+            || {
+                serde::de::Error::custom(
+                    "freeze_at must precede unfreeze_at in a freeze window",
+                )
+            },
+        )
+    }
+}
+
+impl FreezeWindow {
+    pub(crate) fn new(
+        freeze_at: DateTime<Utc>,
+        unfreeze_at: DateTime<Utc>,
+    ) -> Option<Self> {
+        (freeze_at < unfreeze_at).then_some(Self { freeze_at, unfreeze_at })
+    }
+
+    pub(crate) const fn freeze_at(&self) -> DateTime<Utc> {
+        self.freeze_at
+    }
+
+    pub(crate) const fn unfreeze_at(&self) -> DateTime<Utc> {
+        self.unfreeze_at
+    }
+}
+
+/// Stable identity of one independent requirement to keep an underlying frozen.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub(crate) struct FreezeHoldId(FreezeHoldSource);
+
+impl FreezeHoldId {
+    pub(crate) const fn operator() -> Self {
+        Self(FreezeHoldSource::Operator)
+    }
+
+    pub(crate) const fn corporate_action(window: FreezeWindow) -> Self {
+        Self(FreezeHoldSource::CorporateAction(window))
+    }
+
+    pub(crate) fn is_expired_at(self, now: DateTime<Utc>) -> bool {
+        match self.0 {
+            FreezeHoldSource::Operator => false,
+            FreezeHoldSource::CorporateAction(window) => {
+                window.unfreeze_at() <= now
+            }
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+enum FreezeHoldSource {
+    Operator,
+    CorporateAction(FreezeWindow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct ActiveFreezeHolds(BTreeSet<FreezeHoldId>);
+
+impl ActiveFreezeHolds {
+    fn one(hold_id: FreezeHoldId) -> Self {
+        Self(BTreeSet::from([hold_id]))
+    }
+
+    fn legacy_operator() -> Self {
+        Self::one(FreezeHoldId::operator())
+    }
+
+    fn contains(&self, hold_id: &FreezeHoldId) -> bool {
+        self.0.contains(hold_id)
+    }
+
+    fn with(&self, hold_id: FreezeHoldId) -> Self {
+        let mut holds = self.0.clone();
+        holds.insert(hold_id);
+        Self(holds)
+    }
+
+    fn without(&self, hold_id: &FreezeHoldId) -> Option<Self> {
+        let mut holds = self.0.clone();
+        holds.remove(hold_id);
+        (!holds.is_empty()).then_some(Self(holds))
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveFreezeHolds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let holds = BTreeSet::<FreezeHoldId>::deserialize(deserializer)?;
+        if holds.is_empty() {
+            return Err(serde::de::Error::custom(
+                "a frozen underlying must have at least one active freeze hold",
+            ));
+        }
+        Ok(Self(holds))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status")]
+enum FreezeState {
+    Enabled,
+    Frozen {
+        #[serde(default = "ActiveFreezeHolds::legacy_operator")]
+        active_freeze_holds: ActiveFreezeHolds,
+    },
+}
+
+impl FreezeState {
+    const fn status(&self) -> AssetStatus {
+        match self {
+            Self::Enabled => AssetStatus::Enabled,
+            Self::Frozen { .. } => AssetStatus::Frozen,
+        }
+    }
+
+    fn contains(&self, hold_id: &FreezeHoldId) -> bool {
+        match self {
+            Self::Enabled => false,
+            Self::Frozen { active_freeze_holds } => {
+                active_freeze_holds.contains(hold_id)
+            }
+        }
+    }
+
+    fn acquire(&self, hold_id: FreezeHoldId) -> Option<Self> {
+        match self {
+            Self::Enabled => Some(Self::Frozen {
+                active_freeze_holds: ActiveFreezeHolds::one(hold_id),
+            }),
+            Self::Frozen { active_freeze_holds }
+                if !active_freeze_holds.contains(&hold_id) =>
+            {
+                Some(Self::Frozen {
+                    active_freeze_holds: active_freeze_holds.with(hold_id),
+                })
+            }
+            Self::Frozen { .. } => None,
+        }
+    }
+
+    fn release(&self, hold_id: &FreezeHoldId) -> Option<Self> {
+        let Self::Frozen { active_freeze_holds } = self else {
+            return None;
+        };
+        if !active_freeze_holds.contains(hold_id) {
+            return None;
+        }
+        Some(
+            active_freeze_holds
+                .without(hold_id)
+                .map_or(Self::Enabled, |active_freeze_holds| Self::Frozen {
+                    active_freeze_holds,
+                }),
+        )
+    }
+}
+
 /// Corporate-action state of one underlying equity, across all networks.
 ///
-/// A stream originates on the first `Frozen` event; an underlying with no
-/// stream is `Enabled` by definition (see [`load_freeze_status`]).
+/// A stream originates on the first legacy `Frozen` or new
+/// `FreezeHoldAcquired` event; an underlying with no stream is `Enabled` by
+/// definition (see [`load_freeze_status`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Underlying {
-    status: AssetStatus,
+    #[serde(flatten)]
+    freeze_state: FreezeState,
+}
+
+impl Underlying {
+    fn has_freeze_hold(&self, hold_id: &FreezeHoldId) -> bool {
+        self.freeze_state.contains(hold_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum UnderlyingCommand {
-    /// Stop accepting new mints for every listing of this underlying.
-    /// Idempotent — freezing a frozen underlying is a no-op.
+    /// Acquire the operator hold for this underlying.
     Freeze { underlying: UnderlyingSymbol },
-    /// Resume accepting mints. Idempotent; a no-op when the underlying was
-    /// never frozen (no stream exists).
+    /// Release only the operator hold.
     Unfreeze { underlying: UnderlyingSymbol },
+    /// Acquire one independently owned freeze hold.
+    AcquireFreezeHold {
+        underlying: UnderlyingSymbol,
+        hold_id: FreezeHoldId,
+        acquired_at: DateTime<Utc>,
+    },
+    /// Release only the named freeze hold.
+    ReleaseFreezeHold {
+        underlying: UnderlyingSymbol,
+        hold_id: FreezeHoldId,
+        released_at: DateTime<Utc>,
+    },
 }
 
 /// The payloads must stay wire-compatible with the pre-multichain
@@ -75,6 +278,8 @@ pub(crate) enum UnderlyingCommand {
 pub(crate) enum UnderlyingEvent {
     Frozen { frozen_at: DateTime<Utc> },
     Unfrozen { unfrozen_at: DateTime<Utc> },
+    FreezeHoldAcquired { hold_id: FreezeHoldId, acquired_at: DateTime<Utc> },
+    FreezeHoldReleased { hold_id: FreezeHoldId, released_at: DateTime<Utc> },
 }
 
 impl DomainEvent for UnderlyingEvent {
@@ -82,6 +287,12 @@ impl DomainEvent for UnderlyingEvent {
         match self {
             Self::Frozen { .. } => "UnderlyingEvent::Frozen".to_string(),
             Self::Unfrozen { .. } => "UnderlyingEvent::Unfrozen".to_string(),
+            Self::FreezeHoldAcquired { .. } => {
+                "UnderlyingEvent::FreezeHoldAcquired".to_string()
+            }
+            Self::FreezeHoldReleased { .. } => {
+                "UnderlyingEvent::FreezeHoldReleased".to_string()
+            }
         }
     }
 
@@ -101,7 +312,7 @@ impl EventSourced for Underlying {
 
     const AGGREGATE_TYPE: &'static str = "Underlying";
     const PROJECTION: Table = Table("underlying_view");
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     // Snapshots are disabled: event-sorcery hardwires snapshot-every-N with no
     // off switch, so usize::MAX makes the next-snapshot threshold unreachable.
@@ -110,12 +321,20 @@ impl EventSourced for Underlying {
 
     fn originate(event: &Self::Event) -> Option<Self> {
         match event {
-            UnderlyingEvent::Frozen { .. } => {
-                Some(Self { status: AssetStatus::Frozen })
-            }
+            UnderlyingEvent::Frozen { .. } => Some(Self {
+                freeze_state: FreezeState::Frozen {
+                    active_freeze_holds: ActiveFreezeHolds::legacy_operator(),
+                },
+            }),
+            UnderlyingEvent::FreezeHoldAcquired { hold_id, .. } => Some(Self {
+                freeze_state: FreezeState::Frozen {
+                    active_freeze_holds: ActiveFreezeHolds::one(*hold_id),
+                },
+            }),
             // `Unfreeze` on a stream-less underlying is a no-op (already
             // `Enabled` by definition), so `Unfrozen` never starts a stream.
-            UnderlyingEvent::Unfrozen { .. } => None,
+            UnderlyingEvent::Unfrozen { .. }
+            | UnderlyingEvent::FreezeHoldReleased { .. } => None,
         }
     }
 
@@ -123,13 +342,34 @@ impl EventSourced for Underlying {
         entity: &Self,
         event: &Self::Event,
     ) -> Result<Option<Self>, Self::Error> {
-        let _ = entity;
         match event {
-            UnderlyingEvent::Frozen { .. } => {
-                Ok(Some(Self { status: AssetStatus::Frozen }))
+            UnderlyingEvent::Frozen { .. } => Ok(Some(Self {
+                freeze_state: entity
+                    .freeze_state
+                    .acquire(FreezeHoldId::operator())
+                    .unwrap_or_else(|| entity.freeze_state.clone()),
+            })),
+            UnderlyingEvent::Unfrozen { .. } => Ok(Some(Self {
+                freeze_state: entity
+                    .freeze_state
+                    .release(&FreezeHoldId::operator())
+                    .unwrap_or_else(|| entity.freeze_state.clone()),
+            })),
+            UnderlyingEvent::FreezeHoldAcquired { hold_id, .. } => {
+                Ok(Some(Self {
+                    freeze_state: entity
+                        .freeze_state
+                        .acquire(*hold_id)
+                        .unwrap_or_else(|| entity.freeze_state.clone()),
+                }))
             }
-            UnderlyingEvent::Unfrozen { .. } => {
-                Ok(Some(Self { status: AssetStatus::Enabled }))
+            UnderlyingEvent::FreezeHoldReleased { hold_id, .. } => {
+                Ok(Some(Self {
+                    freeze_state: entity
+                        .freeze_state
+                        .release(hold_id)
+                        .unwrap_or_else(|| entity.freeze_state.clone()),
+                }))
             }
         }
     }
@@ -143,7 +383,10 @@ impl EventSourced for Underlying {
                 tracing::info!(target: "asset", underlying = %underlying,
                     "Freezing underlying across all networks"
                 );
-                Ok(vec![UnderlyingEvent::Frozen { frozen_at: Utc::now() }])
+                Ok(vec![UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id: FreezeHoldId::operator(),
+                    acquired_at: Utc::now(),
+                }])
             }
 
             // No stream means the underlying was never frozen — `Enabled` by
@@ -151,6 +394,44 @@ impl EventSourced for Underlying {
             UnderlyingCommand::Unfreeze { underlying } => {
                 tracing::debug!(target: "asset", underlying = %underlying,
                     "Underlying was never frozen, skipping unfreeze"
+                );
+                Ok(vec![])
+            }
+
+            UnderlyingCommand::AcquireFreezeHold {
+                underlying,
+                hold_id,
+                acquired_at,
+            } => {
+                if hold_id.is_expired_at(Utc::now()) {
+                    tracing::info!(target: "asset",
+                        underlying = %underlying,
+                        ?hold_id,
+                        "Skipping expired underlying freeze hold"
+                    );
+                    return Ok(vec![]);
+                }
+
+                tracing::info!(target: "asset",
+                    underlying = %underlying,
+                    ?hold_id,
+                    "Acquiring underlying freeze hold"
+                );
+                Ok(vec![UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id,
+                    acquired_at,
+                }])
+            }
+
+            UnderlyingCommand::ReleaseFreezeHold {
+                underlying,
+                hold_id,
+                ..
+            } => {
+                tracing::debug!(target: "asset",
+                    underlying = %underlying,
+                    ?hold_id,
+                    "Freeze hold already absent, skipping"
                 );
                 Ok(vec![])
             }
@@ -164,9 +445,10 @@ impl EventSourced for Underlying {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             UnderlyingCommand::Freeze { underlying } => {
-                if self.status == AssetStatus::Frozen {
+                let hold_id = FreezeHoldId::operator();
+                if self.has_freeze_hold(&hold_id) {
                     tracing::debug!(target: "asset", underlying = %underlying,
-                        "Underlying already frozen, skipping"
+                        "Operator freeze hold already active, skipping"
                     );
                     return Ok(vec![]);
                 }
@@ -174,13 +456,17 @@ impl EventSourced for Underlying {
                 tracing::info!(target: "asset", underlying = %underlying,
                     "Freezing underlying across all networks"
                 );
-                Ok(vec![UnderlyingEvent::Frozen { frozen_at: Utc::now() }])
+                Ok(vec![UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id,
+                    acquired_at: Utc::now(),
+                }])
             }
 
             UnderlyingCommand::Unfreeze { underlying } => {
-                if self.status == AssetStatus::Enabled {
+                let hold_id = FreezeHoldId::operator();
+                if !self.has_freeze_hold(&hold_id) {
                     tracing::debug!(target: "asset", underlying = %underlying,
-                        "Underlying already enabled, skipping"
+                        "Operator freeze hold already absent, skipping"
                     );
                     return Ok(vec![]);
                 }
@@ -188,7 +474,68 @@ impl EventSourced for Underlying {
                 tracing::info!(target: "asset", underlying = %underlying,
                     "Unfreezing underlying across all networks"
                 );
-                Ok(vec![UnderlyingEvent::Unfrozen { unfrozen_at: Utc::now() }])
+                Ok(vec![UnderlyingEvent::FreezeHoldReleased {
+                    hold_id,
+                    released_at: Utc::now(),
+                }])
+            }
+
+            UnderlyingCommand::AcquireFreezeHold {
+                underlying,
+                hold_id,
+                acquired_at,
+            } => {
+                if hold_id.is_expired_at(Utc::now()) {
+                    tracing::info!(target: "asset",
+                        underlying = %underlying,
+                        ?hold_id,
+                        "Skipping expired underlying freeze hold"
+                    );
+                    return Ok(vec![]);
+                }
+                if self.has_freeze_hold(&hold_id) {
+                    tracing::debug!(target: "asset",
+                        underlying = %underlying,
+                        ?hold_id,
+                        "Freeze hold already active, skipping"
+                    );
+                    return Ok(vec![]);
+                }
+
+                tracing::info!(target: "asset",
+                    underlying = %underlying,
+                    ?hold_id,
+                    "Acquiring underlying freeze hold"
+                );
+                Ok(vec![UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id,
+                    acquired_at,
+                }])
+            }
+
+            UnderlyingCommand::ReleaseFreezeHold {
+                underlying,
+                hold_id,
+                released_at,
+            } => {
+                if !self.has_freeze_hold(&hold_id) {
+                    tracing::debug!(target: "asset",
+                        underlying = %underlying,
+                        ?hold_id,
+                        "Freeze hold already absent, skipping"
+                    );
+                    return Ok(vec![]);
+                }
+
+                tracing::info!(target: "asset",
+                    underlying = %underlying,
+                    ?hold_id,
+                    "Releasing underlying freeze hold"
+                );
+                Ok(vec![UnderlyingEvent::FreezeHoldReleased {
+                    hold_id,
+                    released_at,
+                }])
             }
         }
     }
@@ -241,17 +588,19 @@ pub(crate) async fn load_freeze_status(
 
     let view: Underlying = serde_json::from_str(&live)?;
 
-    Ok(view.status)
+    Ok(view.freeze_state.status())
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
     use event_sorcery::TestHarness;
     use tracing_test::traced_test;
 
     use super::{
-        AssetStatus, Underlying, UnderlyingCommand, UnderlyingEvent,
-        UnderlyingSymbol, UnderlyingViewError, load_freeze_status,
+        AssetStatus, FreezeHoldId, FreezeWindow, Underlying, UnderlyingCommand,
+        UnderlyingEvent, UnderlyingSymbol, UnderlyingViewError,
+        load_freeze_status,
     };
     use crate::prepare_event_sourced_startup;
     use crate::test_utils::logs_contain_at;
@@ -260,9 +609,18 @@ mod tests {
         UnderlyingSymbol::new("AAPL").unwrap()
     }
 
+    fn corporate_action_hold(
+        freeze_at: chrono::DateTime<Utc>,
+        unfreeze_at: chrono::DateTime<Utc>,
+    ) -> FreezeHoldId {
+        FreezeHoldId::corporate_action(
+            FreezeWindow::new(freeze_at, unfreeze_at).unwrap(),
+        )
+    }
+
     #[traced_test]
     #[tokio::test]
-    async fn test_freeze_never_frozen_underlying_emits_frozen() {
+    async fn test_freeze_never_frozen_underlying_acquires_operator_hold() {
         let events = TestHarness::<Underlying>::with(())
             .given_no_previous_events()
             .when(UnderlyingCommand::Freeze { underlying: aapl() })
@@ -271,10 +629,13 @@ mod tests {
 
         assert_eq!(events.len(), 1, "Expected exactly one event");
 
-        let UnderlyingEvent::Frozen { frozen_at } = &events[0] else {
-            panic!("Expected Frozen event, got: {:?}", events[0])
+        let UnderlyingEvent::FreezeHoldAcquired { hold_id, acquired_at } =
+            &events[0]
+        else {
+            panic!("Expected FreezeHoldAcquired event, got: {:?}", events[0])
         };
-        assert!(frozen_at.timestamp() > 0);
+        assert_eq!(*hold_id, FreezeHoldId::operator());
+        assert!(acquired_at.timestamp() > 0);
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
@@ -295,13 +656,13 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
-            &["Underlying already frozen, skipping", "AAPL"]
+            &["Operator freeze hold already active, skipping", "AAPL"]
         ));
     }
 
     #[traced_test]
     #[tokio::test]
-    async fn test_unfreeze_frozen_underlying_emits_unfrozen() {
+    async fn test_unfreeze_frozen_underlying_releases_operator_hold() {
         let events = TestHarness::<Underlying>::with(())
             .given(vec![UnderlyingEvent::Frozen {
                 frozen_at: chrono::Utc::now(),
@@ -312,10 +673,13 @@ mod tests {
 
         assert_eq!(events.len(), 1, "Expected exactly one event");
 
-        let UnderlyingEvent::Unfrozen { unfrozen_at } = &events[0] else {
-            panic!("Expected Unfrozen event, got: {:?}", events[0])
+        let UnderlyingEvent::FreezeHoldReleased { hold_id, released_at } =
+            &events[0]
+        else {
+            panic!("Expected FreezeHoldReleased event, got: {:?}", events[0])
         };
-        assert!(unfrozen_at.timestamp() > 0);
+        assert_eq!(*hold_id, FreezeHoldId::operator());
+        assert!(released_at.timestamp() > 0);
 
         assert!(logs_contain_at!(
             tracing::Level::INFO,
@@ -352,8 +716,174 @@ mod tests {
 
         assert!(logs_contain_at!(
             tracing::Level::DEBUG,
-            &["Underlying already enabled, skipping", "AAPL"]
+            &["Operator freeze hold already absent, skipping", "AAPL"]
         ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn overlapping_holds_keep_underlying_frozen_until_final_release() {
+        let now = Utc::now();
+        let first_hold = corporate_action_hold(
+            now + ChronoDuration::hours(1),
+            now + ChronoDuration::hours(3),
+        );
+        let second_hold = corporate_action_hold(
+            now + ChronoDuration::hours(2),
+            now + ChronoDuration::hours(4),
+        );
+
+        let underlying = TestHarness::<Underlying>::with(())
+            .given(vec![
+                UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id: first_hold,
+                    acquired_at: now + ChronoDuration::hours(1),
+                },
+                UnderlyingEvent::FreezeHoldAcquired {
+                    hold_id: second_hold,
+                    acquired_at: now + ChronoDuration::hours(2),
+                },
+                UnderlyingEvent::FreezeHoldReleased {
+                    hold_id: first_hold,
+                    released_at: now + ChronoDuration::hours(3),
+                },
+            ])
+            .when(UnderlyingCommand::ReleaseFreezeHold {
+                underlying: aapl(),
+                hold_id: second_hold,
+                released_at: now + ChronoDuration::hours(4),
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            underlying,
+            vec![UnderlyingEvent::FreezeHoldReleased {
+                hold_id: second_hold,
+                released_at: now + ChronoDuration::hours(4),
+            }]
+        );
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Releasing underlying freeze hold", "AAPL"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn releasing_one_hold_does_not_release_another() {
+        let now = Utc::now();
+        let scheduled_hold =
+            corporate_action_hold(now, now + ChronoDuration::hours(1));
+        let underlying = event_sorcery::replay::<Underlying>(vec![
+            UnderlyingEvent::FreezeHoldAcquired {
+                hold_id: FreezeHoldId::operator(),
+                acquired_at: now,
+            },
+            UnderlyingEvent::FreezeHoldAcquired {
+                hold_id: scheduled_hold,
+                acquired_at: now,
+            },
+            UnderlyingEvent::FreezeHoldReleased {
+                hold_id: scheduled_hold,
+                released_at: now + ChronoDuration::hours(1),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(underlying.freeze_state.status(), AssetStatus::Frozen);
+        assert!(underlying.has_freeze_hold(&FreezeHoldId::operator()));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn expired_hold_is_not_acquired() {
+        let now = Utc::now();
+        let expired_hold = corporate_action_hold(
+            now - ChronoDuration::hours(2),
+            now - ChronoDuration::hours(1),
+        );
+
+        TestHarness::<Underlying>::with(())
+            .given_no_previous_events()
+            .when(UnderlyingCommand::AcquireFreezeHold {
+                underlying: aapl(),
+                hold_id: expired_hold,
+                acquired_at: now - ChronoDuration::hours(3),
+            })
+            .await
+            .then_expect_events(&[]);
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Skipping expired underlying freeze hold", "AAPL"]
+        ));
+    }
+
+    #[test]
+    fn freeze_window_deserialization_accepts_valid_boundaries() {
+        let freeze_at = Utc::now();
+        let unfreeze_at = freeze_at + ChronoDuration::hours(1);
+
+        let window: FreezeWindow = serde_json::from_value(serde_json::json!({
+            "freeze_at": freeze_at,
+            "unfreeze_at": unfreeze_at,
+        }))
+        .unwrap();
+
+        assert_eq!(window, FreezeWindow::new(freeze_at, unfreeze_at).unwrap());
+    }
+
+    #[test]
+    fn freeze_window_deserialization_rejects_equal_boundaries() {
+        let boundary = Utc::now();
+
+        let result =
+            serde_json::from_value::<FreezeWindow>(serde_json::json!({
+                "freeze_at": boundary,
+                "unfreeze_at": boundary,
+            }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn freeze_window_deserialization_rejects_inverted_boundaries() {
+        let unfreeze_at = Utc::now();
+        let freeze_at = unfreeze_at + ChronoDuration::hours(1);
+
+        let result =
+            serde_json::from_value::<FreezeWindow>(serde_json::json!({
+                "freeze_at": freeze_at,
+                "unfreeze_at": unfreeze_at,
+            }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_frozen_projection_defaults_to_operator_hold() {
+        let underlying: Underlying =
+            serde_json::from_value(serde_json::json!({ "status": "Frozen" }))
+                .unwrap();
+
+        assert!(underlying.has_freeze_hold(&FreezeHoldId::operator()));
+        let serialized = serde_json::to_value(underlying).unwrap();
+        assert_eq!(serialized["status"], "Frozen");
+        assert_eq!(
+            serialized["active_freeze_holds"],
+            serde_json::json!(["Operator"])
+        );
+    }
+
+    #[test]
+    fn frozen_projection_rejects_empty_hold_set() {
+        let result = serde_json::from_value::<Underlying>(serde_json::json!({
+            "status": "Frozen",
+            "active_freeze_holds": [],
+        }));
+
+        assert!(result.is_err());
     }
 
     #[traced_test]
