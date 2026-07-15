@@ -578,18 +578,17 @@ pub(crate) async fn vacuum_terminal_recovery_jobs(
     Ok(())
 }
 
-/// Flips mint-recovery jobs left `Running` by a dead process back to `Pending`,
-/// clearing their lock columns (`lock_at`, `lock_by`).
+/// Flips mint recovery and side-effect jobs left `Running` by a dead process
+/// back to `Pending`, clearing their lock columns (`lock_at`, `lock_by`).
 ///
 /// At startup no worker from this process is running yet, so any `Running` row
-/// is an orphan from the previous process; without this reset a crashed-mid-run
-/// recovery job blocks its mint until apalis's orphan re-enqueue timeout
-/// (`reenqueue_orphaned_after`, default ~300s). Scoped to
-/// [`mint_recovery_job_type`] so `Running` rows of other apalis job types
-/// sharing the `Jobs` table are left for their own recovery. Runs on the
-/// event-store pool because both pools address the same SQLite file (see
-/// [`vacuum_terminal_recovery_jobs`]).
-pub(crate) async fn reset_orphaned_recovery_jobs(
+/// is an orphan from the previous process. Without this reset a job crashed
+/// during submit, confirmation, callback, or recovery blocks the same
+/// idempotency key until apalis's orphan re-enqueue timeout. The query is scoped
+/// to the four mint job types so unrelated apalis jobs sharing the table are
+/// left for their own recovery. Runs on the event-store pool because both pools
+/// address the same SQLite file (see [`vacuum_terminal_recovery_jobs`]).
+pub(crate) async fn reset_orphaned_mint_jobs(
     pool: &Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -600,11 +599,14 @@ pub(crate) async fn reset_orphaned_recovery_jobs(
             lock_at = NULL,
             lock_by = NULL
         WHERE
-            job_type = ?
+            job_type IN (?, ?, ?, ?)
             AND status = 'Running'
         ",
     )
     .bind(mint_recovery_job_type())
+    .bind(job_type::<SubmitMintJob>())
+    .bind(job_type::<ConfirmMintJob>())
+    .bind(job_type::<SendCallbackJob>())
     .execute(pool)
     .await?;
 
@@ -638,39 +640,6 @@ pub(crate) async fn vacuum_terminal_mint_side_effect_jobs(
                     status IN ('Done', 'Killed')
                     OR (status = 'Failed' AND max_attempts <= attempts)
                 )
-            ",
-        )
-        .bind(side_effect_job_type)
-        .execute(pool)
-        .await?;
-    }
-
-    Ok(())
-}
-
-/// Flips submit/confirm/callback jobs left `Running` by a dead process back to
-/// `Pending`, clearing their lock columns. Mirrors
-/// [`reset_orphaned_recovery_jobs`] for the per-state side-effect chain so a
-/// crash mid-job does not strand recovery behind apalis's orphan timeout
-/// (re-enqueue would otherwise dedupe against the orphaned `Running` row).
-pub(crate) async fn reset_orphaned_mint_side_effect_jobs(
-    pool: &Pool<Sqlite>,
-) -> Result<(), sqlx::Error> {
-    for side_effect_job_type in [
-        job_type::<SubmitMintJob>(),
-        job_type::<ConfirmMintJob>(),
-        job_type::<SendCallbackJob>(),
-    ] {
-        sqlx::query(
-            "
-            UPDATE Jobs
-            SET
-                status = 'Pending',
-                lock_at = NULL,
-                lock_by = NULL
-            WHERE
-                job_type = ?
-                AND status = 'Running'
             ",
         )
         .bind(side_effect_job_type)
@@ -1838,7 +1807,7 @@ mod tests {
         RecoveredReceipt, Shares,
     };
     use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
-    use crate::test_utils::{log_count_at, logs_contain_at};
+    use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{AssetKey, TokenizedAssetCommand};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
@@ -2971,15 +2940,48 @@ mod tests {
         );
     }
 
-    /// The startup reset must flip a `Running` job orphaned by a dead process
-    /// back to `Pending` with its lock columns cleared, so the fresh worker
-    /// picks it up without waiting out apalis's orphan re-enqueue timeout.
+    /// The startup reset must flip every `Running` mint job orphaned by a dead
+    /// process back to `Pending` with its lock columns cleared, so the fresh
+    /// workers pick them up without waiting out apalis's orphan timeout.
     #[tokio::test]
-    async fn reset_orphaned_recovery_jobs_flips_running_to_pending() {
+    async fn reset_orphaned_mint_jobs_flips_every_running_job_to_pending() {
         let harness = TestHarness::new().await;
         let issuer_request_id = test_issuer_request_id();
+        let idempotency_key = issuer_request_id.to_string();
 
         push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+        JobQueue::<SubmitMintJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                SubmitMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: VAULT,
+                    chain_id: ANVIL_CHAIN_ID,
+                },
+                &idempotency_key,
+            )
+            .await
+            .unwrap();
+        JobQueue::<ConfirmMintJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                ConfirmMintJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                    vault: VAULT,
+                    chain_id: ANVIL_CHAIN_ID,
+                    tx_id: TxId::Legacy("orphaned-confirm".to_string()),
+                },
+                &idempotency_key,
+            )
+            .await
+            .unwrap();
+        JobQueue::<SendCallbackJob>::new(&harness.apalis_pool)
+            .push_with_idempotency_key(
+                SendCallbackJob {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+                &idempotency_key,
+            )
             .await
             .unwrap();
 
@@ -3006,34 +3008,36 @@ mod tests {
             WHERE idempotency_key = ?
             ",
         )
-        .bind(issuer_request_id.to_string())
+        .bind(&idempotency_key)
         .execute(&harness.pool)
         .await
         .unwrap();
 
-        reset_orphaned_recovery_jobs(&harness.pool).await.unwrap();
+        reset_orphaned_mint_jobs(&harness.pool).await.unwrap();
 
-        let (status, lock_at, lock_by): (String, Option<i64>, Option<String>) =
-            sqlx::query_as(
-                "
+        let jobs: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "
                 SELECT status, lock_at, lock_by
                 FROM Jobs
                 WHERE idempotency_key = ?
                 ",
-            )
-            .bind(issuer_request_id.to_string())
-            .fetch_one(&harness.pool)
-            .await
-            .unwrap();
+        )
+        .bind(&idempotency_key)
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
 
         assert_eq!(
-            status, "Pending",
-            "an orphaned Running job must flip back to Pending"
+            jobs.len(),
+            4,
+            "the fixture must cover the recovery and three side-effect jobs"
         );
         assert!(
-            lock_at.is_none() && lock_by.is_none(),
-            "the reset must clear the lock columns, got lock_at={lock_at:?} \
-             lock_by={lock_by:?}"
+            jobs.iter().all(|(status, lock_at, lock_by)| status == "Pending"
+                && lock_at.is_none()
+                && lock_by.is_none()),
+            "the reset must make every orphaned mint job pending and unlocked; \
+             got {jobs:?}"
         );
     }
 
