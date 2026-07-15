@@ -1,15 +1,21 @@
 use alloy::primitives::TxHash;
+use apalis::prelude::{AbortError, Data, TaskBuilder, TaskSink};
+use apalis_sqlite::{SqlitePool, SqliteStorage};
 use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
+use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, MintError,
-    MintRecoveryMode,
+    MintRecoveryMode, find_all_recoverable_mints,
 };
 use crate::receipt_inventory::ItnReceiptHandler;
 
@@ -89,30 +95,429 @@ const MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS: usize =
 /// be hammered indefinitely. The next restart re-picks the mint.
 const MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS: usize = 8;
 
-pub(crate) fn spawn_scheduled_mint_recovery(
-    mint_store: Arc<Store<Mint>>,
+/// Durable apalis job that resumes one mint's automatic recovery.
+///
+/// Replaces the old fire-and-forget `tokio::spawn`: the job row persists in the
+/// apalis `Jobs` table, so a crash mid-recovery no longer drops the work. A job
+/// left `Running` by a crash is not re-fetched directly (apalis's `fetch_next`
+/// only picks `Pending`/`Failed` rows); instead apalis's orphan-reenqueue resets
+/// it to `Pending` once the dead worker's heartbeat goes stale
+/// (`reenqueue_orphaned_after`, default 300s) — which works only because each
+/// process registers a unique worker id, so a restart never refreshes the dead
+/// worker's `last_seen`. On a full process restart the synchronous startup
+/// re-scan also drives any still-recoverable mint directly, independent of the
+/// queue row. The job body is the unchanged
+/// [`recover_mint_until_automatic_budget_exhausted`] budget loop, which is
+/// idempotent (recovery commands the aggregate guards against double-applying),
+/// so re-running is safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MintRecoveryJob {
     issuer_request_id: IssuerMintRequestId,
-) {
-    tokio::spawn(async move {
-        recover_mint_until_automatic_budget_exhausted(
-            mint_store.as_ref(),
-            issuer_request_id,
+}
+
+impl MintRecoveryJob {
+    pub(crate) async fn run(
+        self,
+        mint_store: Data<Arc<Store<Mint>>>,
+    ) -> Result<(), AbortError> {
+        match recover_mint_until_automatic_budget_exhausted(
+            &mint_store,
+            &self.issuer_request_id,
             SCHEDULED_RECOVERY_BACKOFF,
         )
-        .await;
-    });
+        .await
+        {
+            RecoveryConclusion::Resolved => Ok(()),
+            // The mint is still incomplete. Return `AbortError` so apalis records
+            // the failure in `last_result` and marks the job `Killed` — not a
+            // clean `Done` that hides a stuck mint, and not a retryable `Failed`
+            // that would re-run the whole budget loop up to `max_attempts`. The
+            // startup re-scan re-attempts it; the ERROR surfaces the stuck mint.
+            RecoveryConclusion::Abandoned { reason } => {
+                error!(target: "mint", issuer_request_id = %self.issuer_request_id,
+                    reason = %reason,
+                    "Scheduled mint recovery abandoned the mint while still incomplete"
+                );
+
+                Err(AbortError::new(format!(
+                    "mint recovery abandoned: {reason}"
+                )))
+            }
+        }
+    }
+}
+
+/// The apalis storage that persists and drains [`MintRecoveryJob`]s. Backed by
+/// the apalis-sqlite (sqlx 0.8) pool, distinct from the event store's sqlx 0.9
+/// pool but addressing the same SQLite file.
+pub(crate) type MintRecoveryQueue = SqliteStorage<MintRecoveryJob, (), ()>;
+
+/// A unique apalis worker id for one [`MintRecoveryJob`] worker registration.
+///
+/// A FRESH id per registration is load-bearing for crash recovery: apalis
+/// re-enqueues a job orphaned in `Running` only once its locking worker's
+/// heartbeat goes stale, so a constant id would let each restart — including the
+/// in-process restart loop in `spawn_mint_recovery_worker` — refresh the dead
+/// worker's `last_seen` and strand the orphaned job. The random `uuid` suffix
+/// guarantees a registration never reuses a crashed worker's id, so
+/// `reenqueue_orphaned` reclaims its jobs once the dead worker's heartbeat goes
+/// stale (`reenqueue_orphaned_after`).
+pub(crate) struct MintRecoveryWorkerId(Uuid);
+
+impl MintRecoveryWorkerId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for MintRecoveryWorkerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "mint-recovery-{}", self.0)
+    }
+}
+
+/// The `job_type` apalis-sqlite assigns to [`MintRecoveryJob`]: `SqliteStorage`
+/// derives it from `std::any::type_name` of the task type (`SqliteStorage::new`
+/// → `Config::new(type_name::<T>())`) and binds that on both push and fetch.
+/// Terminal-job cleanup scopes its `DELETE`s to exactly this value so it never
+/// reaps rows belonging to other apalis job types that share the `Jobs` table.
+/// Deriving it the same way apalis does (rather than hardcoding the path) keeps
+/// it in lockstep with whatever string apalis actually stores.
+///
+/// WARNING: renaming or moving [`MintRecoveryJob`] (or renaming this crate)
+/// changes `type_name`'s output but NOT the `job_type` already persisted in the
+/// `Jobs` table, so terminal-job cleanup would silently stop matching old rows.
+/// [`pushed_job_type_matches_cleanup_scope`] catches the mismatch at test time;
+/// fixing it then requires a data migration to update `Jobs.job_type` for
+/// existing rows.
+fn mint_recovery_job_type() -> &'static str {
+    std::any::type_name::<MintRecoveryJob>()
+}
+
+/// How many times to attempt enqueuing a recovery job before giving up. The
+/// apalis write can transiently fail when its pool cannot win the single-writer
+/// SQLite lock within `busy_timeout`; a few bounded retries ride that out rather
+/// than dropping the mint's automatic recovery until the next restart.
+const ENQUEUE_ATTEMPTS: usize = 3;
+
+/// Backoff between enqueue attempts.
+const ENQUEUE_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Enqueues a scheduled recovery job for `issuer_request_id`. The worker
+/// registered in `initialize_rocket` drains the queue and drives the mint to a
+/// terminal or budget-exhausted state.
+///
+/// First releases this mint's idempotency key from any TERMINAL prior job
+/// (`Done`/`Killed`, or an exhausted `Failed`) so a live re-trigger — an admin
+/// reprocess of an already-abandoned mint, the startup re-scan, a receipt-driven
+/// retry — actually re-enqueues. A still-ACTIVE (`Pending`/`Running`) job for
+/// the mint is left in place, so the insert collapses against it via apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` rather than queuing a
+/// duplicate. Without the release a terminal row would hold the key until the
+/// next restart's vacuum and silently drop the re-enqueue (the conflict is not
+/// an error), stranding the mint while reporting success.
+///
+/// `pool` is the event-store (sqlx 0.9) pool; the release runs there because
+/// both pools address the same SQLite file and apalis-sqlite exposes no query
+/// API on its own (sqlx 0.8) pool here.
+pub(crate) async fn enqueue_scheduled_mint_recovery(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &SqlitePool,
+    issuer_request_id: IssuerMintRequestId,
+) -> Result<(), anyhow::Error> {
+    release_terminal_recovery_job(pool, &issuer_request_id).await?;
+    push_mint_recovery_job(apalis_pool, issuer_request_id).await
+}
+
+/// Pushes a [`MintRecoveryJob`] for the mint, retrying transient enqueue
+/// failures with a bounded backoff. The idempotency key makes the insert a
+/// no-op when ANY job already exists for the mint — including a TERMINAL
+/// (`Killed`/`Done`) one — via apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING`.
+///
+/// This is the half of [`enqueue_scheduled_mint_recovery`] AFTER the terminal
+/// release. Callers that want to re-enqueue an already-abandoned mint go through
+/// `enqueue_scheduled_mint_recovery` (which frees the terminal key first); the
+/// periodic reconciler calls this directly so a mint that merely lost its job is
+/// re-enqueued while an abandoned (`Killed`) mint dedups against its terminal row
+/// instead of being retried every pass.
+pub(crate) async fn push_mint_recovery_job(
+    apalis_pool: &SqlitePool,
+    issuer_request_id: IssuerMintRequestId,
+) -> Result<(), anyhow::Error> {
+    let mut attempt = 0;
+    // The storage handle is reusable across attempts (`push_task` takes
+    // `&mut self`); only the `task` is consumed per iteration, so build the
+    // queue once rather than reconstructing it on every retry.
+    let mut queue = MintRecoveryQueue::new(apalis_pool);
+
+    loop {
+        attempt += 1;
+
+        let task = TaskBuilder::new(MintRecoveryJob {
+            issuer_request_id: issuer_request_id.clone(),
+        })
+        .with_idempotency_key(issuer_request_id.to_string())
+        .build();
+
+        match queue.push_task(task).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < ENQUEUE_ATTEMPTS => {
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                    attempt, error = %error,
+                    "Failed to enqueue scheduled mint recovery; retrying after backoff"
+                );
+                tokio::time::sleep(ENQUEUE_BACKOFF).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Deletes a TERMINAL recovery job for one mint so its idempotency key is free
+/// to re-enqueue, leaving any active (`Pending`/`Running`) job so the
+/// re-enqueue still dedups against it. Runs on the event-store pool (same
+/// SQLite file as the apalis pool).
+async fn release_terminal_recovery_job(
+    pool: &Pool<Sqlite>,
+    issuer_request_id: &IssuerMintRequestId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "
+        DELETE FROM Jobs
+        WHERE
+            job_type = ?
+            AND idempotency_key = ?
+            AND (
+                status IN ('Done', 'Killed')
+                OR (status = 'Failed' AND max_attempts <= attempts)
+            )
+        ",
+    )
+    .bind(mint_recovery_job_type())
+    .bind(issuer_request_id.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Deletes terminal apalis recovery jobs (`Done`/`Killed`, and `Failed` rows
+/// that exhausted their attempts) to reclaim the `Jobs` table at startup.
+///
+/// apalis only ever UPDATEs a job's status to a terminal value — it never
+/// deletes, and its `vacuum()` is a manual call we otherwise never make — so
+/// without this every restart's re-scan would leave another terminal row behind
+/// forever. This runs once at startup; within a single long-running process,
+/// [`release_terminal_recovery_job`] reaps a mint's terminal row whenever it is
+/// re-enqueued, so the only rows that linger between restarts belong to mints
+/// that concluded and are never re-triggered (bounded by recovery volume, which
+/// is low — only failed mints ever enqueue). Runs on the event-store pool
+/// because both pools address the
+/// same SQLite file; it must run BEFORE the recovery re-scan so a still-stuck
+/// mint's idempotency key is free and it can be re-enqueued. Only terminal rows
+/// are removed, so orphaned `Pending`/`Running` jobs that apalis will re-pick
+/// are left untouched, and the delete is scoped to [`mint_recovery_job_type`]
+/// so terminal rows of any other apalis job type sharing the `Jobs` table
+/// survive.
+///
+/// The exhausted-`Failed` clause mirrors apalis-sqlite's own `vacuum.sql`:
+/// apalis marks an out-of-attempts job `Killed` (already covered above), so the
+/// `Failed`-at-exhaustion case is a defensive guard against apalis status-model
+/// drift, not a state the current version reaches.
+pub(crate) async fn vacuum_terminal_recovery_jobs(
+    pool: &Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "
+        DELETE FROM Jobs
+        WHERE
+            job_type = ?
+            AND (
+                status IN ('Done', 'Killed')
+                OR (status = 'Failed' AND max_attempts <= attempts)
+            )
+        ",
+    )
+    .bind(mint_recovery_job_type())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Flips mint-recovery jobs left `Running` by a dead process back to `Pending`,
+/// clearing their lock columns (`lock_at`, `lock_by`).
+///
+/// At startup no worker from this process is running yet, so any `Running` row
+/// is an orphan from the previous process; without this reset a crashed-mid-run
+/// recovery job blocks its mint until apalis's orphan re-enqueue timeout
+/// (`reenqueue_orphaned_after`, default ~300s). Scoped to
+/// [`mint_recovery_job_type`] so `Running` rows of other apalis job types
+/// sharing the `Jobs` table are left for their own recovery. Runs on the
+/// event-store pool because both pools address the same SQLite file (see
+/// [`vacuum_terminal_recovery_jobs`]).
+pub(crate) async fn reset_orphaned_recovery_jobs(
+    pool: &Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "
+        UPDATE Jobs
+        SET
+            status = 'Pending',
+            lock_at = NULL,
+            lock_by = NULL
+        WHERE
+            job_type = ?
+            AND status = 'Running'
+        ",
+    )
+    .bind(mint_recovery_job_type())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Deletes `Workers` rows for the mint-recovery worker type that no job
+/// references via `Jobs.lock_by`, so the table stays bounded across restarts.
+///
+/// Every registration uses a fresh unique id (see [`MintRecoveryWorkerId`]),
+/// and apalis only ever INSERTs into `Workers` — so without this cleanup each
+/// restart (and each in-process worker restart) leaves another dead row behind
+/// forever. apalis-sqlite stores the worker's queue —
+/// `Config::new(type_name::<T>())`, the same string as
+/// [`mint_recovery_job_type`] — in `Workers.worker_type`
+/// (apalis-sqlite `register_worker.rs` binds `config.queue()` as the
+/// `worker_type` column), so the delete is scoped to exactly our worker rows.
+/// Rows still referenced by a job's `lock_by` are kept, preserving the
+/// heartbeat trail apalis's orphan re-enqueue relies on.
+pub(crate) async fn prune_unreferenced_recovery_workers(
+    pool: &Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "
+        DELETE FROM Workers
+        WHERE
+            worker_type = ?
+            AND id NOT IN (
+                SELECT lock_by
+                FROM Jobs
+                WHERE lock_by IS NOT NULL
+            )
+        ",
+    )
+    .bind(mint_recovery_job_type())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Ensures every currently-recoverable mint has a recovery job. Pushes a job for
+/// EVERY recoverable mint and leans on apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` to dedup — the insert is
+/// a silent no-op for any mint that already has a job row (`Pending`, `Running`,
+/// `Done`, or `Killed`), so only a mint that genuinely lost its job gets a fresh
+/// one. Unlike the startup re-scan (`run_mint_recovery` in `lib.rs`) this
+/// neither vacuums nor drives synchronously and — crucially — pushes WITHOUT
+/// releasing terminal jobs ([`push_mint_recovery_job`]), so a mint whose
+/// recovery was deliberately abandoned (`Killed`) dedups against its terminal
+/// row rather than being retried every pass; the worker drives the jobs this
+/// re-enqueues.
+pub(crate) async fn reconcile_recoverable_mints(
+    pool: &Pool<Sqlite>,
+    apalis_pool: &SqlitePool,
+) {
+    let recoverable_mints = match find_all_recoverable_mints(pool).await {
+        Ok(mints) => mints,
+        Err(err) => {
+            // Degraded but self-recovering (the reconciler retries in
+            // MINT_RECOVERY_RECONCILE_INTERVAL), so WARN, not ERROR — an
+            // ERROR here would raise a false unrecoverable alert for a
+            // transient, self-healing miss.
+            warn!(target: "mint", error = %err,
+                "Failed to query recoverable mints during reconcile"
+            );
+            return;
+        }
+    };
+
+    if recoverable_mints.is_empty() {
+        return;
+    }
+
+    let count = recoverable_mints.len();
+    for (issuer_request_id, _view) in recoverable_mints {
+        if let Err(error) =
+            push_mint_recovery_job(apalis_pool, issuer_request_id.clone()).await
+        {
+            warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                error = %error,
+                "Failed to re-enqueue recoverable mint during reconcile"
+            );
+        }
+    }
+
+    debug!(target: "mint", recoverable_mints = count,
+        "Reconcile pass pushed an idempotent recovery job for each recoverable \
+         mint; pushes for mints that already have a Pending, Running, Done, or \
+         Killed job are silent no-ops"
+    );
+}
+
+/// Why [`recover_mint_until_automatic_budget_exhausted`] abandoned a mint while
+/// it was still incomplete. A closed set of causes, so callers match on the
+/// variant rather than comparing free-text strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbandonReason {
+    /// The mint could not be loaded after the maximum load-failure backoffs.
+    FailedToLoadMint,
+    /// The aggregate's automatic-retry attempts ran out.
+    AutomaticRetriesExhausted,
+    /// The transient-failure backoff budget was spent.
+    TransientFailureBudgetExhausted,
+    /// The retry-wakeup budget was spent.
+    RetryWakeupBudgetExhausted,
+}
+
+impl fmt::Display for AbandonReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::FailedToLoadMint => "failed to load mint",
+            Self::AutomaticRetriesExhausted => "automatic retries exhausted",
+            Self::TransientFailureBudgetExhausted => {
+                "transient failure budget exhausted"
+            }
+            Self::RetryWakeupBudgetExhausted => "retry wakeup budget exhausted",
+        };
+
+        formatter.write_str(text)
+    }
+}
+
+/// Why [`recover_mint_until_automatic_budget_exhausted`] stopped, so the durable
+/// [`MintRecoveryJob`] records a clean success versus an abandoned mint that is
+/// still incomplete and needs surfacing.
+enum RecoveryConclusion {
+    /// Recovery reached a definitive conclusion: the mint completed, is
+    /// genuinely non-recoverable, or no longer exists. Nothing more to do.
+    Resolved,
+    /// Recovery gave up while the mint was still incomplete — a budget was
+    /// exhausted, automatic retries ran out, or the mint could not be loaded.
+    Abandoned { reason: AbandonReason },
 }
 
 async fn recover_mint_until_automatic_budget_exhausted(
     mint_store: &Store<Mint>,
-    issuer_request_id: IssuerMintRequestId,
+    issuer_request_id: &IssuerMintRequestId,
     backoff: Duration,
-) {
+) -> RecoveryConclusion {
     let mut retry_wakeups = 0;
     let mut failure_backoffs = 0;
 
     loop {
-        let mint = match mint_store.load(&issuer_request_id).await {
+        let mint = match mint_store.load(issuer_request_id).await {
             Ok(Some(mint)) => mint,
             // A missing mint cannot be recovered — the same outcome the old
             // default (`Uninitialized`) aggregate produced via
@@ -121,14 +526,32 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     "Mint not found for scheduled recovery"
                 );
-                return;
+                return RecoveryConclusion::Resolved;
             }
+            // A load failure is transient (e.g. a SQLite blip): back off and
+            // retry within the same budget as `DriveOutcome::Failed` rather than
+            // abandoning the mint immediately and killing the durable job over a
+            // single read error.
             Err(err) => {
-                warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                failure_backoffs += 1;
+                if failure_backoffs > MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS {
+                    warn!(target: "mint", issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        max_failure_backoffs = MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS,
+                        "Failed to load mint for scheduled recovery after maximum backoffs"
+                    );
+                    return RecoveryConclusion::Abandoned {
+                        reason: AbandonReason::FailedToLoadMint,
+                    };
+                }
+
+                debug!(target: "mint", issuer_request_id = %issuer_request_id,
                     error = %err,
-                    "Failed to load mint for scheduled recovery"
+                    backoff_ms = backoff.as_millis(),
+                    "Failed to load mint for scheduled recovery; backing off"
                 );
-                return;
+                tokio::time::sleep(backoff).await;
+                continue;
             }
         };
 
@@ -136,7 +559,14 @@ async fn recover_mint_until_automatic_budget_exhausted(
             AutomaticRetryDecision::Ready => {
                 match recover_mint(mint_store, issuer_request_id.clone()).await
                 {
-                    DriveOutcome::Done | DriveOutcome::Exhausted => return,
+                    DriveOutcome::Done => {
+                        return RecoveryConclusion::Resolved;
+                    }
+                    DriveOutcome::Exhausted => {
+                        return RecoveryConclusion::Abandoned {
+                            reason: AbandonReason::AutomaticRetriesExhausted,
+                        };
+                    }
                     // A transient error: back off and retry a bounded number of
                     // times so a persistent error surfaces rather than looping.
                     DriveOutcome::Failed => {
@@ -148,7 +578,9 @@ async fn recover_mint_until_automatic_budget_exhausted(
                                 max_failure_backoffs = MAX_SCHEDULED_RECOVERY_FAILURE_BACKOFFS,
                                 "Scheduled mint recovery stopped after maximum failure backoffs"
                             );
-                            return;
+                            return RecoveryConclusion::Abandoned {
+                                reason: AbandonReason::TransientFailureBudgetExhausted,
+                            };
                         }
 
                         debug!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -168,7 +600,10 @@ async fn recover_mint_until_automatic_budget_exhausted(
                                 max_retry_wakeups = MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS,
                                 "Scheduled mint recovery stopped after maximum retry wakeups"
                             );
-                            return;
+                            return RecoveryConclusion::Abandoned {
+                                reason:
+                                    AbandonReason::RetryWakeupBudgetExhausted,
+                            };
                         }
 
                         tokio::time::sleep(backoff).await;
@@ -182,7 +617,9 @@ async fn recover_mint_until_automatic_budget_exhausted(
                         max_retry_wakeups = MAX_SCHEDULED_RECOVERY_RETRY_WAKEUPS,
                         "Scheduled mint recovery stopped after maximum retry wakeups"
                     );
-                    return;
+                    return RecoveryConclusion::Abandoned {
+                        reason: AbandonReason::RetryWakeupBudgetExhausted,
+                    };
                 }
 
                 debug!(target: "mint", issuer_request_id = %issuer_request_id,
@@ -191,8 +628,14 @@ async fn recover_mint_until_automatic_budget_exhausted(
                 );
                 tokio::time::sleep(wait).await;
             }
-            AutomaticRetryDecision::Exhausted
-            | AutomaticRetryDecision::NotRecoverable => return,
+            AutomaticRetryDecision::Exhausted => {
+                return RecoveryConclusion::Abandoned {
+                    reason: AbandonReason::AutomaticRetriesExhausted,
+                };
+            }
+            AutomaticRetryDecision::NotRecoverable => {
+                return RecoveryConclusion::Resolved;
+            }
         }
     }
 }
@@ -284,6 +727,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca::mock::MockAlpacaService;
+    use crate::mint::api::test_utils::{TestAccountAndAsset, TestHarness};
     use crate::mint::tests::{BOT, VAULT};
     use crate::mint::{
         ClientId, IssuerMintRequestId, MintEvent, MintServices, Network,
@@ -939,7 +1383,7 @@ mod tests {
         // Zero backoff so the test does not sleep.
         recover_mint_until_automatic_budget_exhausted(
             mint_store.as_ref(),
-            issuer_request_id.clone(),
+            &issuer_request_id,
             Duration::ZERO,
         )
         .await;
@@ -952,6 +1396,438 @@ mod tests {
                 ]
             ) > 0,
             "Expected exhaustion warning after max failure backoffs"
+        );
+    }
+
+    /// A re-enqueue for the same mint while a job is already queued must collapse
+    /// via the idempotency key instead of inserting a duplicate `Jobs` row —
+    /// otherwise every restart's re-scan would pile up jobs for a stuck mint.
+    #[tokio::test]
+    async fn enqueue_dedups_per_mint_via_idempotency_key() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+        enqueue_scheduled_mint_recovery(
+            &harness.pool,
+            &harness.apalis_pool,
+            issuer_request_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queued, 1,
+            "re-enqueue for the same mint must collapse to one job row"
+        );
+    }
+
+    /// The periodic reconciler pushes WITHOUT releasing terminal jobs, so a mint
+    /// whose recovery was abandoned (a `Killed` job) must NOT be re-enqueued —
+    /// the idempotency key collapses the insert — or the reconciler would retry
+    /// a hopeless mint every pass. (Enqueue a real job first so its `job_type`
+    /// matches apalis's, then abandon it.)
+    #[tokio::test]
+    async fn push_dedups_against_a_killed_job_so_abandoned_mints_are_not_requeued()
+     {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Killed' WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+
+        let statuses: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM Jobs WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            statuses,
+            vec!["Killed".to_string()],
+            "push must dedup against the terminal Killed job, not re-enqueue \
+             the abandoned mint"
+        );
+    }
+
+    /// The startup vacuum must delete terminal jobs (so the table stays bounded
+    /// and idempotency keys are freed) while leaving still-active and retryable
+    /// jobs that apalis will re-pick.
+    #[tokio::test]
+    async fn vacuum_clears_terminal_jobs_but_keeps_active() {
+        let harness = TestHarness::new().await;
+
+        let rows = [
+            ("done", "Done", 0, 25),
+            ("killed", "Killed", 3, 25),
+            ("failed_exhausted", "Failed", 25, 25),
+            ("failed_retryable", "Failed", 1, 25),
+            ("pending", "Pending", 0, 25),
+            ("running", "Running", 1, 25),
+        ];
+
+        for (id, status, attempts, max_attempts) in rows {
+            sqlx::query(
+                "
+                INSERT INTO Jobs
+                    (job, id, job_type, status, attempts, max_attempts)
+                VALUES (X'00', ?, ?, ?, ?, ?)
+                ",
+            )
+            .bind(id)
+            .bind(mint_recovery_job_type())
+            .bind(status)
+            .bind(attempts)
+            .bind(max_attempts)
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        }
+
+        // A terminal job belonging to a DIFFERENT apalis job type must survive:
+        // the vacuum is scoped to MintRecoveryJob's job_type and must not reap
+        // rows that share the Jobs table with other queues.
+        sqlx::query(
+            "
+            INSERT INTO Jobs
+                (job, id, job_type, status, attempts, max_attempts)
+            VALUES (X'00', 'other_type_done', 'some::other::OtherJob', 'Done', 0, 25)
+            ",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        vacuum_terminal_recovery_jobs(&harness.pool).await.unwrap();
+
+        let survivors: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM Jobs ORDER BY id")
+                .fetch_all(&harness.pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            survivors,
+            vec![
+                "failed_retryable".to_string(),
+                "other_type_done".to_string(),
+                "pending".to_string(),
+                "running".to_string(),
+            ],
+            "vacuum must drop only MintRecoveryJob Done/Killed/exhausted-Failed \
+             rows, keeping active jobs and every other job type's terminal rows"
+        );
+    }
+
+    /// apalis-sqlite stores a job's `job_type` as `std::any::type_name` of the
+    /// task type, and our terminal-job cleanup scopes its deletes to exactly
+    /// [`mint_recovery_job_type`]. Pin that contract against a really-pushed job
+    /// so a future apalis change to the derivation fails loudly here instead of
+    /// silently stranding recovery jobs whose terminal rows never get reaped.
+    #[tokio::test]
+    async fn pushed_job_type_matches_cleanup_scope() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+
+        let job_type: String = sqlx::query_scalar(
+            "SELECT job_type FROM Jobs WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            job_type,
+            mint_recovery_job_type(),
+            "apalis must store the job_type our terminal-job cleanup deletes by"
+        );
+    }
+
+    /// `MintRecoveryJob::run` resolves cleanly (`Ok`) when there is nothing to
+    /// recover — an absent mint — so apalis records the job as Done. Also
+    /// exercises the job's `Data`-injected dispatch into the budget loop.
+    #[traced_test]
+    #[tokio::test]
+    async fn run_resolves_when_mint_absent() {
+        let fixture = MintRecoveryFixture::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        let result = MintRecoveryJob { issuer_request_id }
+            .run(Data::new(fixture.mint_store.clone()))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "recovery of an absent mint must resolve cleanly"
+        );
+
+        let test = "run_resolves_when_mint_absent";
+        assert!(
+            log_count_at!(
+                Level::DEBUG,
+                &[test, "Mint not found for scheduled recovery"]
+            ) >= 1,
+            "an absent mint must log the not-found path"
+        );
+    }
+
+    /// `MintRecoveryJob::run` returns `Err(AbortError)` when recovery abandons a
+    /// still-incomplete mint (here, automatic retries exhausted), so apalis marks
+    /// the job Killed instead of a `Done` that would hide the stuck mint. This is
+    /// the load-bearing Abandoned→Err arm; without it a stuck mint looks like a
+    /// successful recovery.
+    #[traced_test]
+    #[tokio::test]
+    async fn run_returns_abort_error_when_recovery_abandons() {
+        let issuer_request_id = test_issuer_request_id();
+        let failed_at = Utc::now() - chrono::Duration::hours(2);
+        let mut events = tx_submitted_events(&issuer_request_id);
+        // Five pre-acceptance failures push `attempts` past
+        // MAX_AUTOMATIC_MINT_RETRY_ATTEMPT (4), so the mint is exhausted and the
+        // budget loop abandons it on the first pass with no backoff sleep.
+        for _ in 0..5 {
+            events.push(MintEvent::MintingFailed {
+                issuer_request_id: issuer_request_id.clone(),
+                error: "submission rejected".to_string(),
+                failed_at,
+            });
+        }
+        let fixture = MintRecoveryFixture::new().await;
+        fixture.seed_mint_events(&issuer_request_id, events).await;
+
+        let error = MintRecoveryJob { issuer_request_id }
+            .run(Data::new(fixture.mint_store.clone()))
+            .await
+            .expect_err("an exhausted mint must abort, not resolve");
+
+        assert!(
+            error.to_string().contains("automatic retries exhausted"),
+            "abort reason should name the abandonment cause, got: {error}"
+        );
+
+        let test = "run_returns_abort_error_when_recovery_abandons";
+        assert!(
+            log_count_at!(
+                Level::ERROR,
+                &[test, "abandoned the mint while still incomplete"]
+            ) >= 1,
+            "the abandon→abort path must log the ERROR for operators"
+        );
+    }
+
+    /// Drives a mint to `JournalConfirmed` — a recoverable state — through the
+    /// harness's command flow, so the `mint_view` projection the reconciler
+    /// queries is populated (raw event seeding would leave the view empty).
+    async fn seed_recoverable_mint(
+        harness: &TestHarness,
+        issuer_request_id: &IssuerMintRequestId,
+    ) {
+        let TestAccountAndAsset {
+            client_id,
+            underlying,
+            token,
+            network,
+            wallet,
+        } = harness.setup_account_and_asset().await;
+
+        harness
+            .mint_store
+            .send(
+                issuer_request_id,
+                MintCommand::Initiate {
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "tok-reconcile",
+                    ),
+                    quantity: Quantity::new(Decimal::from(100)),
+                    underlying,
+                    token,
+                    network,
+                    client_id,
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .mint_store
+            .send(
+                issuer_request_id,
+                MintCommand::ConfirmJournal {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The reconciler must enqueue a job for a recoverable mint that has no
+    /// job row at all — the "lost enqueue" case it exists to close.
+    #[tokio::test]
+    async fn reconcile_enqueues_job_for_recoverable_mint_without_row() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+
+        reconcile_recoverable_mints(&harness.pool, &harness.apalis_pool).await;
+
+        let queued: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM Jobs
+            WHERE
+                job_type = ?
+                AND idempotency_key = ?
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .bind(issuer_request_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queued, 1,
+            "the reconciler must enqueue exactly one job for a recoverable \
+             mint that lost its job row"
+        );
+    }
+
+    /// The reconciler pushes WITHOUT releasing terminal jobs, so a mint whose
+    /// recovery was deliberately abandoned (`Killed`) must dedup against its
+    /// terminal row instead of being resurrected every pass.
+    #[tokio::test]
+    async fn reconcile_does_not_resurrect_killed_job() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+        seed_recoverable_mint(&harness, &issuer_request_id).await;
+
+        push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE Jobs SET status = 'Killed' WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        reconcile_recoverable_mints(&harness.pool, &harness.apalis_pool).await;
+
+        let statuses: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM Jobs WHERE idempotency_key = ?",
+        )
+        .bind(issuer_request_id.to_string())
+        .fetch_all(&harness.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            statuses,
+            vec!["Killed".to_string()],
+            "the reconciler must not resurrect a deliberately abandoned \
+             mint's Killed job"
+        );
+    }
+
+    /// The startup reset must flip a `Running` job orphaned by a dead process
+    /// back to `Pending` with its lock columns cleared, so the fresh worker
+    /// picks it up without waiting out apalis's orphan re-enqueue timeout.
+    #[tokio::test]
+    async fn reset_orphaned_recovery_jobs_flips_running_to_pending() {
+        let harness = TestHarness::new().await;
+        let issuer_request_id = test_issuer_request_id();
+
+        push_mint_recovery_job(&harness.apalis_pool, issuer_request_id.clone())
+            .await
+            .unwrap();
+
+        // A fake dead worker to hold the lock; a Workers row is required
+        // because Jobs.lock_by carries a foreign key to Workers(id).
+        sqlx::query(
+            "
+            INSERT INTO Workers (id, worker_type, storage_name)
+            VALUES ('dead-worker', ?, 'SqliteStorage')
+            ",
+        )
+        .bind(mint_recovery_job_type())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "
+            UPDATE Jobs
+            SET
+                status = 'Running',
+                lock_at = strftime('%s', 'now'),
+                lock_by = 'dead-worker'
+            WHERE idempotency_key = ?
+            ",
+        )
+        .bind(issuer_request_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        reset_orphaned_recovery_jobs(&harness.pool).await.unwrap();
+
+        let (status, lock_at, lock_by): (String, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "
+                SELECT status, lock_at, lock_by
+                FROM Jobs
+                WHERE idempotency_key = ?
+                ",
+            )
+            .bind(issuer_request_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status, "Pending",
+            "an orphaned Running job must flip back to Pending"
+        );
+        assert!(
+            lock_at.is_none() && lock_by.is_none(),
+            "the reset must clear the lock columns, got lock_at={lock_at:?} \
+             lock_by={lock_by:?}"
         );
     }
 }

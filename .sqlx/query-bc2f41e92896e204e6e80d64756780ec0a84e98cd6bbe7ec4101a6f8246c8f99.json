@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        DELETE FROM events\n        WHERE aggregate_type = 'Mint'\n          AND aggregate_id = ?\n          AND sequence > 3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "bc2f41e92896e204e6e80d64756780ec0a84e98cd6bbe7ec4101a6f8246c8f99"
+}

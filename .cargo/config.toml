@@ -1,0 +1,12 @@
+# Build against the bundled offline query caches (`.sqlx/`) instead of verifying
+# compile-time `sqlx::query!` macros against a live database. apalis-sqlite (the
+# job store, built on sqlx 0.8) ships its own `.sqlx/` cache; our own crate's
+# macros are cached in `./.sqlx` via `cargo sqlx prepare`. Offline mode keeps
+# `cargo check` / `nix build` hermetic and lets the sqlx-0.8 (apalis) and
+# sqlx-0.9 (event store) macros coexist without a live connection.
+#
+# To regenerate our cache after changing a `query!`, point DATABASE_URL at an
+# ABSOLUTE path to a migrated database and run `cargo sqlx prepare` — the
+# absolute path lets apalis-sqlite's own macros resolve too.
+[env]
+SQLX_OFFLINE = "true"

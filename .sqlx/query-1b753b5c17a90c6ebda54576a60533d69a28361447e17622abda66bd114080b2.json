@@ -1,0 +1,19 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT COUNT(*) as \"count!: i32\"\n        FROM events\n        WHERE aggregate_type = 'Mint' AND aggregate_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "count!: i32",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [false]
+  },
+  "hash": "1b753b5c17a90c6ebda54576a60533d69a28361447e17622abda66bd114080b2"
+}
