@@ -12,9 +12,10 @@ use event_sorcery::{EventSourced, LifecycleError, Nil, SendError, Store};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::mint::IssuerMintRequestId;
 use crate::redemption::{BurnRecord, IssuerRedemptionRequestId};
@@ -29,6 +30,8 @@ pub(crate) use burn_tracking::{
 pub(crate) use cmd::ReceiptInventoryCommand;
 pub(crate) use event::{ReceiptInventoryEvent, ReceiptSource};
 use reconcile::ReconcileError;
+
+const RECEIPT_INVENTORY_MAX_ATTEMPTS: usize = 3;
 
 /// Receipt data recovered from the inventory for mint recovery.
 #[derive(Debug, Clone)]
@@ -332,6 +335,68 @@ pub(crate) async fn load_inventory(
     Ok(store.load(vault).await?.unwrap_or_default())
 }
 
+const fn receipt_inventory_operation(
+    command: &ReceiptInventoryCommand,
+) -> &'static str {
+    match command {
+        ReceiptInventoryCommand::DiscoverReceipt { .. } => "discover",
+        ReceiptInventoryCommand::ReconcileBalance { .. } => "reconcile_balance",
+        ReceiptInventoryCommand::ReserveBurn { .. } => "reserve_burn",
+        ReceiptInventoryCommand::ReleaseBurn { .. } => "release_burn",
+        ReceiptInventoryCommand::SettleBurn { .. } => "settle_burn",
+    }
+}
+
+async fn retry_receipt_inventory_conflicts<Send, SendFuture>(
+    vault: Address,
+    operation: &'static str,
+    mut send: Send,
+) -> Result<(), SendError<ReceiptInventory>>
+where
+    Send: FnMut() -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError<ReceiptInventory>>>,
+{
+    let mut attempt = 1;
+    let exhausted_attempt = loop {
+        match send().await {
+            Ok(()) => return Ok(()),
+            Err(AggregateError::AggregateConflict)
+                if attempt < RECEIPT_INVENTORY_MAX_ATTEMPTS =>
+            {
+                debug!(target: "receipt", %vault,
+                    attempt,
+                    max_attempts = RECEIPT_INVENTORY_MAX_ATTEMPTS,
+                    operation,
+                    "Receipt inventory optimistic-concurrency conflict; retrying"
+                );
+                attempt += 1;
+            }
+            Err(AggregateError::AggregateConflict) => break attempt,
+            Err(error) => return Err(error),
+        }
+    };
+
+    warn!(target: "receipt", %vault,
+        attempt = exhausted_attempt,
+        max_attempts = RECEIPT_INVENTORY_MAX_ATTEMPTS,
+        operation,
+        "Receipt inventory conflict retry budget exhausted"
+    );
+    Err(AggregateError::AggregateConflict)
+}
+
+pub(crate) async fn send_receipt_inventory_command(
+    store: &Store<ReceiptInventory>,
+    vault: &Address,
+    command: ReceiptInventoryCommand,
+) -> Result<(), SendError<ReceiptInventory>> {
+    let operation = receipt_inventory_operation(&command);
+    retry_receipt_inventory_conflicts(*vault, operation, || {
+        store.send(vault, command.clone())
+    })
+    .await
+}
+
 /// Translates an `event_sorcery` send/load error back into the
 /// `AggregateError<ReceiptInventoryError>` the service contract exposes.
 ///
@@ -402,20 +467,20 @@ impl ReceiptService for CqrsReceiptService {
     ) -> Result<(), ReceiptRegistrationError> {
         let issuer_request_id = params.receipt_info.issuer_request_id.clone();
 
-        self.store
-            .send(
-                &params.vault,
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: params.receipt_id,
-                    balance: params.shares,
-                    block_number: params.block_number,
-                    tx_hash: params.tx_hash,
-                    source: ReceiptSource::Itn { issuer_request_id },
-                    receipt_info: Some(Box::new(params.receipt_info)),
-                    receipt_info_bytes: Some(params.receipt_info_bytes),
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &params.vault,
+            ReceiptInventoryCommand::DiscoverReceipt {
+                receipt_id: params.receipt_id,
+                balance: params.shares,
+                block_number: params.block_number,
+                tx_hash: params.tx_hash,
+                source: ReceiptSource::Itn { issuer_request_id },
+                receipt_info: Some(Box::new(params.receipt_info)),
+                receipt_info_bytes: Some(params.receipt_info_bytes),
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -440,15 +505,15 @@ impl ReceiptService for CqrsReceiptService {
         redemption_issuer_request_id: IssuerRedemptionRequestId,
         burns: Vec<BurnRecord>,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.store
-            .send(
-                &vault,
-                ReceiptInventoryCommand::ReserveBurn {
-                    redemption_issuer_request_id,
-                    burns,
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &vault,
+            ReceiptInventoryCommand::ReserveBurn {
+                redemption_issuer_request_id,
+                burns,
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -458,14 +523,14 @@ impl ReceiptService for CqrsReceiptService {
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.store
-            .send(
-                &vault,
-                ReceiptInventoryCommand::ReleaseBurn {
-                    redemption_issuer_request_id,
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &vault,
+            ReceiptInventoryCommand::ReleaseBurn {
+                redemption_issuer_request_id,
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -475,14 +540,14 @@ impl ReceiptService for CqrsReceiptService {
         vault: Address,
         redemption_issuer_request_id: IssuerRedemptionRequestId,
     ) -> Result<(), ReceiptRegistrationError> {
-        self.store
-            .send(
-                &vault,
-                ReceiptInventoryCommand::SettleBurn {
-                    redemption_issuer_request_id,
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &vault,
+            ReceiptInventoryCommand::SettleBurn {
+                redemption_issuer_request_id,
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -1136,6 +1201,8 @@ mod tests {
     use event_sorcery::{StoreBuilder, test_store};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Barrier;
     use tracing::Level;
     use tracing_test::traced_test;
 
@@ -1650,6 +1717,193 @@ mod tests {
             "the From<SendError> conversion BurnManager relies on must \
              preserve AggregateConflict"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_receipt_inventory_conflicts_retry_until_success() {
+        let vault = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        retry_receipt_inventory_conflicts(vault, "discover", || {
+            let attempts = attempts.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < RECEIPT_INVENTORY_MAX_ATTEMPTS {
+                    Err(SendError::<ReceiptInventory>::AggregateConflict)
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("the final attempt should succeed");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            RECEIPT_INVENTORY_MAX_ATTEMPTS
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "vault=0x",
+                "attempt=1",
+                "operation=\"discover\"",
+                "optimistic-concurrency conflict; retrying",
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_vault_writes_reload_and_preserve_both_receipts() {
+        let store = setup_store().await;
+        let vault = address!("0xdddddddddddddddddddddddddddddddddddddddd");
+        let tx_hash = b256!(
+            "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        );
+        let pair_count = 8u64;
+
+        for pair_index in 0..pair_count {
+            let barrier = Arc::new(Barrier::new(3));
+            let first_store = store.clone();
+            let first_barrier = barrier.clone();
+            let first_receipt_id = make_receipt_id(pair_index * 2);
+            let first = tokio::spawn(async move {
+                first_barrier.wait().await;
+                send_receipt_inventory_command(
+                    &first_store,
+                    &vault,
+                    discover_receipt_cmd(
+                        first_receipt_id,
+                        make_shares(100),
+                        pair_index,
+                        tx_hash,
+                    ),
+                )
+                .await
+            });
+
+            let second_store = store.clone();
+            let second_barrier = barrier.clone();
+            let second_receipt_id = make_receipt_id(pair_index * 2 + 1);
+            let second = tokio::spawn(async move {
+                second_barrier.wait().await;
+                send_receipt_inventory_command(
+                    &second_store,
+                    &vault,
+                    discover_receipt_cmd(
+                        second_receipt_id,
+                        make_shares(200),
+                        pair_index,
+                        tx_hash,
+                    ),
+                )
+                .await
+            });
+
+            barrier.wait().await;
+            first
+                .await
+                .expect("first task should join")
+                .expect("first receipt should persist");
+            second
+                .await
+                .expect("second task should join")
+                .expect("second receipt should persist after retry");
+        }
+
+        let inventory = load_inventory(&store, &vault)
+            .await
+            .expect("inventory should load");
+        let expected_receipt_count = usize::try_from(pair_count * 2)
+            .expect("test receipt count should fit usize");
+        assert_eq!(inventory.receipts.len(), expected_receipt_count);
+        assert!(
+            inventory
+                .receipts
+                .values()
+                .any(|receipt| { receipt.balance == make_shares(100) })
+        );
+        assert!(
+            inventory
+                .receipts
+                .values()
+                .any(|receipt| { receipt.balance == make_shares(200) })
+        );
+        assert!(logs_contain_at!(
+            Level::DEBUG,
+            &[
+                "vault=0x",
+                "attempt=1",
+                "operation=\"discover\"",
+                "optimistic-concurrency conflict; retrying",
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_receipt_inventory_conflict_exhaustion_is_propagated() {
+        let vault = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = retry_receipt_inventory_conflicts(
+            vault,
+            "reconcile_balance",
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(SendError::<ReceiptInventory>::AggregateConflict) }
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(AggregateError::AggregateConflict)));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            RECEIPT_INVENTORY_MAX_ATTEMPTS
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "vault=0x",
+                "attempt=3",
+                "operation=\"reconcile_balance\"",
+                "retry budget exhausted",
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_receipt_inventory_domain_error_is_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let receipt_id = make_receipt_id(42);
+
+        let result = retry_receipt_inventory_conflicts(
+            address!("0xcccccccccccccccccccccccccccccccccccccccc"),
+            "reserve_burn",
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(SendError::<ReceiptInventory>::UserError(
+                        LifecycleError::Apply(
+                            ReceiptInventoryError::UnknownReceipt {
+                                receipt_id,
+                            },
+                        ),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                ReceiptInventoryError::UnknownReceipt { .. }
+            )))
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

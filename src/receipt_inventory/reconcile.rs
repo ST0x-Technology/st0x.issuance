@@ -9,6 +9,7 @@ use tracing::{debug, info, trace};
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, Shares, load_inventory,
+    send_receipt_inventory_command,
 };
 use crate::bindings::Receipt;
 
@@ -108,6 +109,9 @@ where
                 Ok(false) => {
                     checked += 1;
                 }
+                Err(error @ ReconcileError::Aggregate(_)) => {
+                    return Err(error);
+                }
                 Err(err) => {
                     debug!(target: "receipt", vault = %self.vault,
                         error = %err,
@@ -158,15 +162,15 @@ where
             "Balance mismatch detected"
         );
 
-        self.store
-            .send(
-                &self.vault,
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id,
-                    on_chain_balance: on_chain_shares,
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &self.vault,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id,
+                on_chain_balance: on_chain_shares,
+            },
+        )
+        .await?;
 
         Ok(true)
     }
