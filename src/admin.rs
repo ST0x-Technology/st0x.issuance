@@ -613,6 +613,14 @@ async fn inspect_prior_burn(
 
     match vault_service.check_tx(tx_id).await {
         Ok(receipt) => {
+            let Some(block_number) = receipt.block_number() else {
+                error!(target: "admin", aggregate_id = %aggregate_id,
+                    tx_hash = ?tx_id,
+                    "Completed burn transaction receipt is missing block number"
+                );
+                return Err(Status::InternalServerError);
+            };
+
             if bf_data.planned_burns.is_empty() {
                 warn!(target: "admin", aggregate_id = %aggregate_id,
                     tx_hash = ?tx_id,
@@ -635,9 +643,7 @@ async fn inspect_prior_burn(
                         tx_id: tx_id.clone(),
                         tx_hash: receipt.transaction_hash(),
                         planned_burns: bf_data.planned_burns.clone(),
-                        block_number: receipt
-                            .block_number()
-                            .unwrap_or_default(),
+                        block_number,
                     },
                 )
                 .await
@@ -1752,7 +1758,11 @@ fn mint_history_summary_from_events(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256};
+    use alloy::consensus::{
+        Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
+    };
+    use alloy::primitives::{Address, Bloom, U256, address, b256};
+    use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::Utc;
     use event_sorcery::{Store, test_store};
@@ -1787,6 +1797,35 @@ mod tests {
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
+    }
+
+    fn checked_burn_receipt(block_number: Option<u64>) -> TransactionReceipt {
+        let transaction_hash = b256!(
+            "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
+        );
+        let consensus_receipt = Receipt {
+            status: Eip658Value::Eip658(true),
+            cumulative_gas_used: 21_000,
+            logs: Vec::new(),
+        };
+
+        TransactionReceipt {
+            transaction_hash,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number,
+            from: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            to: Some(address!("0xcccccccccccccccccccccccccccccccccccccccc")),
+            gas_used: 21_000,
+            effective_gas_price: 1,
+            contract_address: None,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
     }
 
     /// Configurable poll response for the test mock.
@@ -2182,115 +2221,12 @@ mod tests {
     async fn test_load_reprocess_context_derives_retry_id_from_history() {
         let pool = setup_pool().await;
         let store = setup_store(&pool);
-
-        let metadata = test_metadata();
-        let alpaca_data = test_alpaca_data();
         let tx_id = TxId::random();
 
         // Drive the redemption through a real burn submission that then fails,
         // so event history carries a BurnTxSubmitted event the
         // derivation must scan — rather than injecting the retry id directly.
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::Detect {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    underlying: metadata.underlying.clone(),
-                    token: metadata.token.clone(),
-                    wallet: metadata.wallet,
-                    quantity: metadata.quantity.clone(),
-                    tx_hash: metadata.detected_tx_hash,
-                    block_number: metadata.block_number,
-                },
-            )
-            .await
-            .expect("Detect failed");
-
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::RecordAlpacaCall {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    tokenization_request_id: alpaca_data
-                        .tokenization_request_id
-                        .clone(),
-                    alpaca_quantity: alpaca_data.alpaca_quantity.clone(),
-                    dust_quantity: alpaca_data.dust_quantity.clone(),
-                },
-            )
-            .await
-            .expect("RecordAlpacaCall failed");
-
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::ConfirmAlpacaComplete {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                },
-            )
-            .await
-            .expect("ConfirmAlpacaComplete failed");
-
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::IntendBurn {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
-                    external_tx_id: Some(BurnExternalTxId::base(
-                        &metadata.detected_tx_hash,
-                    )),
-                },
-            )
-            .await
-            .expect("IntendBurn failed");
-
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::BurnTokens {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
-                    external_tx_id: Some(BurnExternalTxId::base(
-                        &metadata.detected_tx_hash,
-                    )),
-                },
-            )
-            .await
-            .expect("BurnTokens failed");
-
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::RecordBurnFailure {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    error: "burn terminally failed".to_string(),
-                    tx_id: Some(tx_id.clone()),
-                    planned_burns: vec![],
-                },
-            )
-            .await
-            .expect("RecordBurnFailure failed");
+        let (metadata, _) = setup_burn_failure(&store, tx_id.clone()).await;
 
         let context =
             load_reprocess_context(&pool, &metadata.issuer_request_id)
@@ -2791,6 +2727,73 @@ mod tests {
         (metadata, alpaca_data)
     }
 
+    /// Drives a redemption through a submitted burn that then fails, leaving
+    /// the transaction ID in event history for the admin recovery route.
+    async fn setup_burn_failure(
+        store: &Store<Redemption>,
+        tx_id: TxId,
+    ) -> (RedemptionMetadata, AlpacaCalledData) {
+        let metadata = setup_burning(store).await;
+        let alpaca_data = test_alpaca_data();
+        let burns = vec![MultiBurnEntry {
+            receipt_id: U256::from(99),
+            burn_shares: U256::from(100),
+            receipt_info: None,
+            receipt_info_bytes: None,
+        }];
+        let external_tx_id =
+            Some(BurnExternalTxId::base(&metadata.detected_tx_hash));
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns: burns.clone(),
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id: external_tx_id.clone(),
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::BurnTokens {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault: address!(
+                        "0xcccccccccccccccccccccccccccccccccccccccc"
+                    ),
+                    burns,
+                    dust_shares: U256::ZERO,
+                    owner: Address::ZERO,
+                    external_tx_id,
+                },
+            )
+            .await
+            .expect("BurnTokens failed");
+
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::RecordBurnFailure {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    error: "burn terminally failed".to_string(),
+                    tx_id: Some(tx_id),
+                    planned_burns: vec![],
+                },
+            )
+            .await
+            .expect("RecordBurnFailure failed");
+
+        (metadata, alpaca_data)
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_endpoint_pre_alpaca_recovery_resets_to_detected() {
@@ -2832,6 +2835,7 @@ mod tests {
         store: Arc<Store<Redemption>>,
         pool: sqlx::Pool<sqlx::Sqlite>,
         alpaca: Arc<dyn AlpacaService>,
+        vault_service: Arc<dyn VaultService>,
         burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
     ) -> rocket::Rocket<rocket::Build> {
         use crate::alpaca::service::AlpacaConfig;
@@ -2863,7 +2867,7 @@ mod tests {
             .manage(store)
             .manage(pool)
             .manage(alpaca)
-            .manage(mock_vault_service())
+            .manage(vault_service)
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::recover_redemption])
     }
@@ -2892,6 +2896,134 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
+    async fn endpoint_rejects_burn_receipt_without_block_number() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_checked_tx_receipt(checked_burn_receipt(None)),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, _body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::InternalServerError);
+        assert_eq!(burn_recovery.calls(), 0);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(redemption, Redemption::Failed { .. }));
+        let recovered_events: i64 = sqlx::query_scalar(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::ExistingBurnRecovered'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered_events, 0);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[&aggregate_id, "missing block number"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn endpoint_records_burn_receipt_block_number() {
+        let pool = setup_pool().await;
+        let store = setup_store(&pool);
+        let tx_id = TxId::random();
+        let (metadata, alpaca_data) = setup_burn_failure(&store, tx_id).await;
+        let aggregate_id = metadata.issuer_request_id.to_string();
+        let alpaca: Arc<dyn AlpacaService> = Arc::new(PollMockAlpaca {
+            response: PollResponse::Ok(redeem_response(
+                RedeemRequestStatus::Completed,
+                &metadata,
+                &alpaca_data,
+            )),
+        });
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_checked_tx_receipt(checked_burn_receipt(Some(12_345))),
+        );
+        let burn_recovery = Arc::new(MockBurnRecovery::default());
+        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
+            burn_recovery.clone();
+        let rocket = post_alpaca_rocket(
+            store.clone(),
+            pool.clone(),
+            alpaca,
+            vault_service,
+            burn_recovery_state,
+        );
+
+        let (status, body) =
+            dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(body.contains("Existing on-chain burn recorded"));
+        assert_eq!(burn_recovery.calls(), 0);
+        let redemption =
+            store.load(&metadata.issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(redemption, Redemption::Completed { .. }));
+        let payload: String = sqlx::query_scalar(
+            "
+            SELECT payload
+            FROM events
+            WHERE aggregate_type = 'Redemption'
+              AND aggregate_id = ?
+              AND event_type = 'RedemptionEvent::ExistingBurnRecovered'
+            ",
+        )
+        .bind(&aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let event: crate::redemption::RedemptionEvent =
+            serde_json::from_str(&payload).unwrap();
+        let crate::redemption::RedemptionEvent::ExistingBurnRecovered {
+            block_number,
+            ..
+        } = event
+        else {
+            panic!("expected existing burn recovery event");
+        };
+        assert_eq!(block_number, 12_345);
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[&aggregate_id, "recording existing burn"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
     async fn test_endpoint_post_alpaca_recovery_resumes_to_burning() {
         // Build the Alpaca mock from the actual metadata produced by setup so
         // the endpoint's field validation passes.
@@ -2911,8 +3043,13 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket =
-            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
 
         let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -2951,8 +3088,13 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket =
-            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
 
         let (status, body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -2991,8 +3133,13 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket =
-            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
 
         let (status, _body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -3024,8 +3171,13 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket =
-            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
 
         let (status, _body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)
@@ -3067,8 +3219,13 @@ mod tests {
         let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
             burn_recovery.clone();
 
-        let rocket =
-            post_alpaca_rocket(store, pool, alpaca, burn_recovery_state);
+        let rocket = post_alpaca_rocket(
+            store,
+            pool,
+            alpaca,
+            mock_vault_service(),
+            burn_recovery_state,
+        );
 
         let (status, _body) =
             dispatch_recover_redemption(rocket, &metadata.issuer_request_id)

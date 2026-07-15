@@ -113,6 +113,8 @@ pub(crate) struct MockVaultService {
     /// Signed tx returned by `prepare_tx` when local signing is configured.
     #[cfg(test)]
     prepared_tx: Arc<Mutex<Option<SendableTxWithHash>>>,
+    #[cfg(test)]
+    checked_tx_receipt: Arc<Mutex<Option<TransactionReceipt>>>,
 }
 
 impl MockVaultService {
@@ -138,6 +140,8 @@ impl MockVaultService {
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             #[cfg(test)]
             prepared_tx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -157,6 +161,7 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -176,6 +181,7 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -195,6 +201,7 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -221,6 +228,7 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -240,6 +248,7 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
+            checked_tx_receipt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -336,6 +345,15 @@ impl MockVaultService {
         sendable_tx: SendableTxWithHash,
     ) -> Self {
         *self.prepared_tx.lock().unwrap() = Some(sendable_tx);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_checked_tx_receipt(
+        self,
+        receipt: TransactionReceipt,
+    ) -> Self {
+        *self.checked_tx_receipt.lock().unwrap() = Some(receipt);
         self
     }
 }
@@ -691,6 +709,13 @@ impl VaultService for MockVaultService {
         &self,
         _tx_id: &TxId,
     ) -> Result<TransactionReceipt, VaultError> {
+        #[cfg(test)]
+        let checked_tx_receipt =
+            self.checked_tx_receipt.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(receipt) = checked_tx_receipt {
+            return Ok(receipt);
+        }
         #[cfg(test)]
         if matches!(*self.verify_burn.lock().unwrap(), MockVerifyBurn::Reverted)
         {
