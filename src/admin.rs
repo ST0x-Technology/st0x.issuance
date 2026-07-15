@@ -51,6 +51,7 @@ pub(crate) trait RedemptionBurnRecovery: Send + Sync {
         issuer_request_id: &IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         reason: String,
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError>;
 }
 
@@ -68,8 +69,15 @@ impl RedemptionBurnRecovery for BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         reason: String,
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError> {
-        self.force_complete_burn(issuer_request_id, burn_tx_hash, reason).await
+        self.force_complete_burn(
+            issuer_request_id,
+            burn_tx_hash,
+            reason,
+            acknowledged_unresolved_burn_tx_hash,
+        )
+        .await
     }
 }
 
@@ -112,8 +120,8 @@ pub(crate) struct StuckAggregate {
     tx_hash: Option<B256>,
     /// Transaction ID associated with this aggregate's current
     /// stuck step. For mints, sourced from the most recent
-    /// `MintTxSubmitted` event. For redemptions, populated only on
-    /// `BurnFailed` (the view carries it for that variant).
+    /// `MintTxSubmitted` event. For redemptions, populated from the persisted
+    /// burn intent or a later submission/failure event.
     #[serde(skip_serializing_if = "Option::is_none")]
     tx_id: Option<String>,
 }
@@ -790,6 +798,8 @@ const fn map_redemption_error(
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CloseRedemptionRequest {
     reason: String,
+    #[schema(value_type = Option<String>)]
+    acknowledged_unresolved_burn_tx_hash: Option<B256>,
 }
 
 /// Admin endpoint to close a redemption that cannot be automatically recovered.
@@ -832,18 +842,22 @@ pub(crate) async fn close_redemption(
     body: Json<CloseRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let aggregate_id = issuer_request_id.to_string();
+    let CloseRedemptionRequest { reason, acknowledged_unresolved_burn_tx_hash } =
+        body.into_inner();
 
     store
         .send(
             &issuer_request_id,
             RedemptionCommand::CloseRedemption {
                 issuer_request_id: issuer_request_id.clone(),
-                reason: body.into_inner().reason,
+                reason,
+                acknowledged_unresolved_burn_tx_hash,
             },
         )
         .await
         .map_err(|err| {
             error!(target: "admin", aggregate_id = %aggregate_id,
+                acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
                 error = %err,
                 "Failed to close redemption"
             );
@@ -855,14 +869,24 @@ pub(crate) async fn close_redemption(
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         previous_state = %previous_state,
+        acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
         "Redemption closed"
+    );
+
+    let message = acknowledged_unresolved_burn_tx_hash.map_or_else(
+        || "Redemption closed by admin".to_string(),
+        |acknowledged_hash| {
+            format!(
+                "Redemption closed by admin after acknowledging unresolved burn {acknowledged_hash:#x}"
+            )
+        },
     );
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Redemption,
         aggregate_id,
         previous_state,
-        message: "Redemption closed by admin".to_string(),
+        message,
     }))
 }
 
@@ -874,6 +898,8 @@ pub(crate) struct ForceCompleteRedemptionRequest {
     burn_tx_hash: B256,
     /// Operator-supplied audit reason recorded with the terminal event.
     reason: String,
+    #[schema(value_type = Option<String>)]
+    acknowledged_unresolved_burn_tx_hash: Option<B256>,
 }
 
 /// Admin endpoint to terminalize a redemption stuck in `Burning`/`BurnSubmitted`
@@ -918,14 +944,24 @@ pub(crate) async fn force_complete_redemption(
     body: Json<ForceCompleteRedemptionRequest>,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let aggregate_id = issuer_request_id.to_string();
-    let ForceCompleteRedemptionRequest { burn_tx_hash, reason } =
-        body.into_inner();
+    let ForceCompleteRedemptionRequest {
+        burn_tx_hash,
+        reason,
+        acknowledged_unresolved_burn_tx_hash,
+    } = body.into_inner();
 
     let verification = burn_recovery
-        .force_complete_burn(&issuer_request_id, burn_tx_hash, reason)
+        .force_complete_burn(
+            &issuer_request_id,
+            burn_tx_hash,
+            reason,
+            acknowledged_unresolved_burn_tx_hash,
+        )
         .await
         .map_err(|err| {
             error!(target: "admin", aggregate_id = %aggregate_id,
+                burn_tx_hash = ?burn_tx_hash,
+                acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
                 error = %err,
                 "Failed to force-complete redemption"
             );
@@ -937,6 +973,7 @@ pub(crate) async fn force_complete_redemption(
 
     info!(target: "admin", aggregate_id = %aggregate_id,
         burn_tx_hash = ?burn_tx_hash,
+        acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
         block_number = verification.block_number,
         previous_state = %previous_state,
         "Redemption force-completed"
@@ -946,9 +983,17 @@ pub(crate) async fn force_complete_redemption(
         aggregate_type: AggregateKind::Redemption,
         aggregate_id,
         previous_state,
-        message: format!(
-            "Force-completed: burn verified on-chain at block {} ({} shares)",
-            verification.block_number, verification.shares_burned
+        message: acknowledged_unresolved_burn_tx_hash.map_or_else(
+            || {
+                format!(
+                    "Force-completed: burn verified on-chain at block {} ({} shares)",
+                    verification.block_number, verification.shares_burned
+                )
+            },
+            |acknowledged_hash| format!(
+                "Force-completed: burn {burn_tx_hash:#x} verified on-chain at block {} ({} shares) after acknowledging unresolved burn {acknowledged_hash:#x}",
+                verification.block_number, verification.shares_burned
+            ),
         ),
     }))
 }
@@ -1029,6 +1074,8 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
             | VaultError::Reverted { .. },
         )
         | BurnManagerError::InvalidAggregateState { .. }
+        | BurnManagerError::Redemption(_)
+        | BurnManagerError::AlternateBurnSemanticsMismatch { .. }
         | BurnManagerError::Cqrs(AggregateError::UserError(_)) => {
             Status::UnprocessableEntity
         }
@@ -1576,6 +1623,11 @@ fn redemption_history_summary_from_events(
             | RedemptionEvent::BurningFailed { tx_id: Some(tx_id), .. } => {
                 summary.tx_id = Some(tx_id);
             }
+            RedemptionEvent::BurnIntended { sendable_tx, .. }
+                if !sendable_tx.tx.is_empty() =>
+            {
+                summary.tx_id = Some(TxId::Hash(sendable_tx.hash));
+            }
             _ => {}
         }
     }
@@ -1805,7 +1857,7 @@ mod tests {
     use alloy::rpc::types::TransactionReceipt;
     use async_trait::async_trait;
     use chrono::Utc;
-    use event_sorcery::{Store, test_store};
+    use event_sorcery::{Store, StoreBuilder, test_store};
     use rocket::http::Status;
     use rust_decimal::Decimal;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -1813,6 +1865,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::Level;
     use tracing_test::traced_test;
+    use url::Url;
 
     use super::{
         AggregateKind, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS, StuckAggregate,
@@ -1825,11 +1878,14 @@ mod tests {
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
         RedeemRequestStatus, RedeemResponse, TokenizationRequest,
+        service::AlpacaConfig,
     };
+    use crate::auth::{FailedAuthRateLimiter, test_auth_config};
+    use crate::config::{Config, Environment, LogLevel};
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
-        ReceiptId, ReceiptInventory, ReceiptInventoryCommand, ReceiptSource,
-        Shares,
+        CqrsReceiptService, ReceiptId, ReceiptInventory,
+        ReceiptInventoryCommand, ReceiptService, ReceiptSource, Shares,
     };
     use crate::redemption::BurnExternalTxId;
     use crate::redemption::{
@@ -1837,11 +1893,15 @@ mod tests {
         RedemptionCommand, RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
     use crate::test_utils::logs_contain_at;
-    use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::tokenized_asset::{
+        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        UnderlyingSymbol,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
+        MultiBurnEntry, SendableTxWithHash, TxId, VaultService, VerifiedBurn,
     };
+    use crate::wallet::SignerConfig;
 
     fn mock_vault_service() -> Arc<dyn VaultService> {
         Arc::new(MockVaultService::new_success())
@@ -1973,6 +2033,9 @@ mod tests {
             _issuer_request_id: &IssuerRedemptionRequestId,
             _burn_tx_hash: alloy::primitives::B256,
             _reason: String,
+            _acknowledged_unresolved_burn_tx_hash: Option<
+                alloy::primitives::B256,
+            >,
         ) -> Result<super::BurnVerification, super::BurnManagerError> {
             unimplemented!("not used by redemption recovery route tests")
         }
@@ -1998,12 +2061,18 @@ mod tests {
             _issuer_request_id: &IssuerRedemptionRequestId,
             burn_tx_hash: alloy::primitives::B256,
             _reason: String,
+            _acknowledged_unresolved_burn_tx_hash: Option<
+                alloy::primitives::B256,
+            >,
         ) -> Result<super::BurnVerification, super::BurnManagerError> {
             self.force_calls.fetch_add(1, Ordering::Relaxed);
             match self.force_result {
                 MockForceResult::Verified => Ok(super::BurnVerification {
                     block_number: 45_989_009,
+                    nonce: 0,
                     shares_burned: alloy::primitives::U256::from(17u64),
+                    burns: vec![],
+                    share_transfers: vec![],
                 }),
                 MockForceResult::NotABurn => {
                     Err(super::BurnManagerError::Vault(
@@ -3813,18 +3882,47 @@ mod tests {
         metadata
     }
 
-    fn force_complete_rocket(
-        pool: sqlx::Pool<sqlx::Sqlite>,
-        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
-    ) -> rocket::Rocket<rocket::Build> {
-        use crate::alpaca::service::AlpacaConfig;
-        use crate::auth::{FailedAuthRateLimiter, test_auth_config};
-        use crate::config::{Config, Environment, LogLevel};
-        use crate::wallet::SignerConfig;
-        use alloy::primitives::B256;
-        use url::Url;
+    async fn setup_burn_intended(
+        store: &Store<Redemption>,
+        persisted_tx: &SendableTxWithHash,
+        vault: Address,
+    ) -> RedemptionMetadata {
+        setup_burn_intended_with_dust(store, persisted_tx, vault, U256::ZERO)
+            .await
+    }
 
-        let config = Config {
+    async fn setup_burn_intended_with_dust(
+        store: &Store<Redemption>,
+        persisted_tx: &SendableTxWithHash,
+        vault: Address,
+        dust_shares: U256,
+    ) -> RedemptionMetadata {
+        let metadata = setup_burning(store).await;
+        store
+            .send(
+                &metadata.issuer_request_id,
+                RedemptionCommand::IntendBurn {
+                    issuer_request_id: metadata.issuer_request_id.clone(),
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: U256::from(42),
+                        burn_shares: U256::from(17),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares,
+                    owner: persisted_tx.signer_for_test(),
+                    external_tx_id: None,
+                },
+            )
+            .await
+            .expect("IntendBurn failed");
+
+        metadata
+    }
+
+    fn admin_test_config() -> Config {
+        Config {
             database_url: "sqlite::memory:".to_string(),
             database_max_connections: 5,
             rpc_url: Url::parse("wss://localhost:8545").unwrap(),
@@ -3838,14 +3936,247 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
-        };
+        }
+    }
 
+    fn close_redemption_rocket(
+        store: Arc<Store<Redemption>>,
+        pool: sqlx::Pool<sqlx::Sqlite>,
+    ) -> rocket::Rocket<rocket::Build> {
         rocket::build()
-            .manage(config)
+            .manage(admin_test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(store)
+            .manage(pool)
+            .mount("/", rocket::routes![super::close_redemption])
+    }
+
+    async fn dispatch_close_redemption(
+        rocket: rocket::Rocket<rocket::Build>,
+        issuer_request_id: &IssuerRedemptionRequestId,
+        body: &str,
+    ) -> (Status, String) {
+        let client =
+            rocket::local::asynchronous::Client::tracked(rocket).await.unwrap();
+        let response = client
+            .post(format!("/admin/close/redemption/{issuer_request_id}"))
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .body(body)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap();
+        (status, body)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn close_endpoint_rejects_unacknowledged_persisted_burn() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let store = setup_store_with_vault(&pool, vault_service);
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+
+        let rocket = close_redemption_rocket(store.clone(), pool);
+        let (status, _) = dispatch_close_redemption(
+            rocket,
+            &metadata.issuer_request_id,
+            r#"{"reason":"operator reconciled externally"}"#,
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to close redemption",
+                "requires explicit operator acknowledgement",
+                &persisted_hash,
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn close_endpoint_records_and_reports_burn_acknowledgement() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_service: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let store = setup_store_with_vault(&pool, vault_service);
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        receipt_store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(U256::from(42)),
+                    balance: Shares::new(U256::from(17)),
+                    block_number: 1,
+                    tx_hash: B256::random(),
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .expect("receipt discovery should succeed");
+        let receipt_service = CqrsReceiptService::new(receipt_store);
+        receipt_service
+            .reserve_burn(
+                vault,
+                metadata.issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(42),
+                    shares_burned: U256::from(17),
+                }],
+            )
+            .await
+            .expect("reservation should seed");
+
+        let rocket = close_redemption_rocket(store.clone(), pool);
+        let body = format!(
+            r#"{{"reason":"operator reconciled externally","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
+            persisted_tx.hash
+        );
+        let (status, response_body) = dispatch_close_redemption(
+            rocket,
+            &metadata.issuer_request_id,
+            &body,
+        )
+        .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(
+            response_body.contains(&format!("{:#x}", persisted_tx.hash)),
+            "body: {response_body}"
+        );
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Closed { .. })
+        ));
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![metadata.issuer_request_id.clone()],
+            "acknowledged close must retain the unresolved reservation"
+        );
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Redemption closed",
+                "acknowledged_unresolved_burn_tx_hash",
+                &persisted_hash,
+            ]
+        ));
+    }
+
+    fn force_complete_rocket(
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        burn_recovery: Arc<dyn super::RedemptionBurnRecovery>,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .manage(admin_test_config())
             .manage(FailedAuthRateLimiter::new().unwrap())
             .manage(pool)
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::force_complete_redemption])
+    }
+
+    async fn real_burn_recovery(
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+        store: Arc<Store<Redemption>>,
+        vault_service: Arc<dyn VaultService>,
+        vault: Address,
+        owner: Address,
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> (Arc<dyn super::RedemptionBurnRecovery>, Arc<CqrsReceiptService>) {
+        let (asset_store, _asset_projection) =
+            StoreBuilder::<TokenizedAsset>::new(pool.clone())
+                .build(())
+                .await
+                .expect("tokenized asset store should build");
+        let underlying = UnderlyingSymbol::new("AAPL");
+        asset_store
+            .send(
+                &underlying,
+                TokenizedAssetCommand::Add {
+                    underlying: underlying.clone(),
+                    token: TokenSymbol::new("tAAPL"),
+                    network: Network::Base,
+                    vault,
+                },
+            )
+            .await
+            .expect("tokenized asset should seed");
+
+        let receipt_store =
+            Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
+        receipt_store
+            .send(
+                &vault,
+                ReceiptInventoryCommand::DiscoverReceipt {
+                    receipt_id: ReceiptId::from(U256::from(42)),
+                    balance: Shares::new(U256::from(17)),
+                    block_number: 1,
+                    tx_hash: B256::random(),
+                    source: ReceiptSource::External,
+                    receipt_info: None,
+                    receipt_info_bytes: None,
+                },
+            )
+            .await
+            .expect("receipt should seed");
+        let receipt_service = Arc::new(CqrsReceiptService::new(receipt_store));
+        receipt_service
+            .reserve_burn(
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: U256::from(42),
+                    shares_burned: U256::from(17),
+                }],
+            )
+            .await
+            .expect("reservation should seed");
+        let burn_recovery: Arc<dyn super::RedemptionBurnRecovery> =
+            Arc::new(super::BurnManager::new(
+                vault_service,
+                pool.clone(),
+                store,
+                receipt_service.clone(),
+                owner,
+            ));
+
+        (burn_recovery, receipt_service)
     }
 
     async fn dispatch_force_complete(
@@ -3875,6 +4206,91 @@ mod tests {
         (status, body)
     }
 
+    fn stuck_rocket(
+        pool: sqlx::Pool<sqlx::Sqlite>,
+        vault_service: Arc<dyn VaultService>,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .manage(admin_test_config())
+            .manage(FailedAuthRateLimiter::new().unwrap())
+            .manage(pool)
+            .manage(vault_service)
+            .mount("/", rocket::routes![super::list_stuck])
+    }
+
+    #[tokio::test]
+    async fn stuck_endpoint_exposes_persisted_burn_intent_hash() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_service = Arc::new(
+            MockVaultService::new_success()
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let alpaca = test_alpaca_data();
+        let old_timestamp = Utc::now() - chrono::Duration::hours(2);
+        let view = RedemptionView::Burning {
+            issuer_request_id: metadata.issuer_request_id.clone(),
+            tokenization_request_id: alpaca.tokenization_request_id,
+            underlying: metadata.underlying,
+            token: metadata.token,
+            wallet: metadata.wallet,
+            quantity: metadata.quantity,
+            alpaca_quantity: alpaca.alpaca_quantity,
+            dust_quantity: alpaca.dust_quantity,
+            tx_hash: metadata.detected_tx_hash,
+            block_number: metadata.block_number,
+            detected_at: metadata.detected_at,
+            called_at: old_timestamp,
+            alpaca_journal_completed_at: old_timestamp,
+            burning_entered_at: old_timestamp,
+        };
+        let payload = serde_json::to_string(&view).unwrap();
+        sqlx::query(
+            "
+            INSERT INTO redemption_view (
+                view_id,
+                version,
+                payload
+            )
+            VALUES (?, 4, ?)
+            ",
+        )
+        .bind(metadata.issuer_request_id.to_string())
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let client = rocket::local::asynchronous::Client::tracked(
+            stuck_rocket(pool, vault_service),
+        )
+        .await
+        .unwrap();
+        let response = client
+            .get("/admin/stuck")
+            .header(rocket::http::Header::new(
+                "X-API-KEY",
+                "test-key-12345678901234567890123456",
+            ))
+            .remote("127.0.0.1:8000".parse().unwrap())
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body = response.into_string().await.unwrap();
+        assert!(
+            body.contains(&format!("{:#x}", persisted_tx.hash)),
+            "body: {body}"
+        );
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn test_endpoint_force_complete_records_verified_burn() {
@@ -3885,54 +4301,25 @@ mod tests {
             vault,
             Bytes::from_static(&[0xde, 0xad]),
         );
-        let vault_service: Arc<dyn VaultService> = Arc::new(
+        let vault_mock = Arc::new(
             MockVaultService::new_success()
+                .with_verified_burn(45_989_009, U256::from(17))
                 .with_prepared_tx(persisted_tx.clone()),
         );
-        let store = setup_store_with_vault(&pool, vault_service);
-        let metadata = setup_burning(&store).await;
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::IntendBurn {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(42),
-                        burn_shares: U256::from(17),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: persisted_tx.signer_for_test(),
-                    external_tx_id: None,
-                },
-            )
-            .await
-            .expect("IntendBurn failed");
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
 
-        // In production `force_complete_burn` appends `BurnForceCompleted` before
-        // the endpoint reads the prior state; the mock can't, so append it here
-        // to reproduce the real on-disk shape (terminal event = `BurnForceCompleted`,
-        // so `redemption_state_before_last_event` resolves to `Burning`).
-        store
-            .send(
-                &metadata.issuer_request_id,
-                RedemptionCommand::ForceCompleteBurn {
-                    issuer_request_id: metadata.issuer_request_id.clone(),
-                    burn_tx_hash: persisted_tx.hash,
-                    block_number: 45_989_009,
-                    reason: "burn confirmed on-chain".to_string(),
-                },
-            )
-            .await
-            .expect("ForceCompleteBurn failed");
-
-        let burn_recovery = Arc::new(MockBurnRecovery::default());
-        let burn_recovery_state: Arc<dyn super::RedemptionBurnRecovery> =
-            burn_recovery.clone();
-
-        let rocket = force_complete_rocket(pool, burn_recovery_state);
+        let rocket = force_complete_rocket(pool, burn_recovery);
         let body = format!(
             r#"{{"burn_tx_hash":"{:#x}","reason":"burn confirmed on-chain"}}"#,
             persisted_tx.hash
@@ -3947,8 +4334,400 @@ mod tests {
         assert!(body.contains("Force-completed"), "body: {body}");
         assert!(body.contains("45989009"), "body: {body}");
         assert!(body.contains("BurnIntended"), "body: {body}");
-        assert_eq!(burn_recovery.force_calls(), 1);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Completed { .. })
+        ));
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(vault_mock.verify_burn_call_count(), 1);
         assert!(logs_contain_at!(Level::INFO, &["Redemption force-completed"]));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_endpoint_passes_and_reports_burn_acknowledgement() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let proving_burn_tx_hash = B256::random();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: persisted_tx.signer_for_test(),
+                        receiver: test_metadata().wallet,
+                        receipt_id: U256::from(42),
+                        shares_burned: U256::from(17),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
+        let rocket = force_complete_rocket(pool, burn_recovery);
+        let body = format!(
+            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn reconciled","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
+            persisted_tx.hash
+        );
+
+        let (status, response_body) =
+            dispatch_force_complete(rocket, &metadata.issuer_request_id, &body)
+                .await;
+
+        assert_eq!(status, Status::Ok);
+        assert!(
+            response_body.contains(&format!("{proving_burn_tx_hash:#x}")),
+            "body: {response_body}"
+        );
+        assert!(
+            response_body.contains(&format!("{:#x}", persisted_tx.hash)),
+            "body: {response_body}"
+        );
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::Completed { burn_tx_hash, .. })
+                if burn_tx_hash == proving_burn_tx_hash
+        ));
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(vault_mock.verify_burn_call_count(), 1);
+        let proving_hash = format!("{proving_burn_tx_hash:?}");
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Redemption force-completed",
+                "acknowledged_unresolved_burn_tx_hash",
+                &proving_hash,
+                &persisted_hash,
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_endpoint_rejects_alternate_burn_missing_dust() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let dust_shares = U256::from(3);
+        let mut persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        persisted_tx.dust_shares = dust_shares;
+        let proving_burn_tx_hash = B256::random();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: persisted_tx.signer_for_test(),
+                        receiver: test_metadata().wallet,
+                        receipt_id: U256::from(42),
+                        shares_burned: U256::from(17),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended_with_dust(
+            &store,
+            &persisted_tx,
+            vault,
+            dust_shares,
+        )
+        .await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
+        let body = format!(
+            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn omitted dust","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
+            persisted_tx.hash
+        );
+
+        let (status, _) = dispatch_force_complete(
+            force_complete_rocket(pool, burn_recovery),
+            &metadata.issuer_request_id,
+            &body,
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(vault_mock.verify_burn_call_count(), 1);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![metadata.issuer_request_id]
+        );
+        let proving_hash = format!("{proving_burn_tx_hash:?}");
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to force-complete redemption",
+                "Alternate proving transaction does not match",
+                "expected nonce 7",
+                "dust 3",
+                &proving_hash,
+                &persisted_hash,
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_endpoint_rejects_mismatched_aggregate_burn_total() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let proving_burn_tx_hash = B256::random();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns_and_total(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    U256::from(18),
+                    vec![VerifiedBurn {
+                        sender: persisted_tx.signer_for_test(),
+                        receiver: test_metadata().wallet,
+                        receipt_id: U256::from(42),
+                        shares_burned: U256::from(17),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
+        let body = format!(
+            r#"{{"burn_tx_hash":"{proving_burn_tx_hash:#x}","reason":"alternate burn has mismatched total","acknowledged_unresolved_burn_tx_hash":"{:#x}"}}"#,
+            persisted_tx.hash
+        );
+
+        let (status, _) = dispatch_force_complete(
+            force_complete_rocket(pool, burn_recovery),
+            &metadata.issuer_request_id,
+            &body,
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(vault_mock.verify_burn_call_count(), 1);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![metadata.issuer_request_id]
+        );
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to force-complete redemption",
+                "expected nonce 7",
+                "total shares 17",
+                "verified nonce 7",
+                "total shares 18",
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_endpoint_rejects_wrong_burn_acknowledgement() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: persisted_tx.signer_for_test(),
+                        receiver: test_metadata().wallet,
+                        receipt_id: U256::from(42),
+                        shares_burned: U256::from(17),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
+        let proving_hash = B256::random();
+        let wrong_acknowledgement = B256::random();
+        let body = format!(
+            r#"{{"burn_tx_hash":"{proving_hash:#x}","reason":"wrong acknowledgement","acknowledged_unresolved_burn_tx_hash":"{wrong_acknowledgement:#x}"}}"#
+        );
+
+        let (status, _) = dispatch_force_complete(
+            force_complete_rocket(pool, burn_recovery),
+            &metadata.issuer_request_id,
+            &body,
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(vault_mock.verify_burn_call_count(), 0);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![metadata.issuer_request_id]
+        );
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        let wrong_hash = format!("{wrong_acknowledgement:?}");
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to force-complete redemption",
+                &persisted_hash,
+                &wrong_hash,
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn force_complete_endpoint_rejects_redundant_burn_acknowledgement() {
+        let pool = setup_pool().await;
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: persisted_tx.signer_for_test(),
+                        receiver: test_metadata().wallet,
+                        receipt_id: U256::from(42),
+                        shares_burned: U256::from(17),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let vault_service: Arc<dyn VaultService> = vault_mock.clone();
+        let store = setup_store_with_vault(&pool, vault_service.clone());
+        let metadata = setup_burn_intended(&store, &persisted_tx, vault).await;
+        let (burn_recovery, receipt_service) = real_burn_recovery(
+            &pool,
+            store.clone(),
+            vault_service,
+            vault,
+            persisted_tx.signer_for_test(),
+            &metadata.issuer_request_id,
+        )
+        .await;
+        let body = format!(
+            r#"{{"burn_tx_hash":"{0:#x}","reason":"persisted burn verified","acknowledged_unresolved_burn_tx_hash":"{0:#x}"}}"#,
+            persisted_tx.hash
+        );
+
+        let (status, _) = dispatch_force_complete(
+            force_complete_rocket(pool, burn_recovery),
+            &metadata.issuer_request_id,
+            &body,
+        )
+        .await;
+
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(vault_mock.verify_burn_call_count(), 0);
+        assert!(matches!(
+            store.load(&metadata.issuer_request_id).await.unwrap(),
+            Some(Redemption::BurnIntended { .. })
+        ));
+        assert_eq!(
+            receipt_service.reserved_redemptions(vault).await.unwrap(),
+            vec![metadata.issuer_request_id]
+        );
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
+        assert!(logs_contain_at!(
+            Level::ERROR,
+            &[
+                "Failed to force-complete redemption",
+                "redundant because the proving burn is the persisted signed burn",
+                &persisted_hash,
+            ]
+        ));
     }
 
     #[traced_test]
@@ -4005,6 +4784,15 @@ mod tests {
                     current_state: "Completed".to_string()
                 }
             ),
+            Status::UnprocessableEntity
+        );
+        assert_eq!(
+            map_burn_manager_error(&super::BurnManagerError::Redemption(
+                crate::redemption::RedemptionError::UnresolvedBurnAcknowledgementMismatch {
+                    expected: tx,
+                    provided: B256::random(),
+                },
+            )),
             Status::UnprocessableEntity
         );
         // A hash that resolves to no receipt (or one that doesn't prove a burn)
@@ -4623,5 +5411,24 @@ mod tests {
         );
         // tokenization_request_id is preserved (it doesn't reset).
         assert_eq!(summary.tokenization_request_id, Some(tok_id));
+    }
+
+    #[test]
+    fn redemption_history_summary_exposes_persisted_burn_intent_hash() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let sendable_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let summary = super::redemption_history_summary_from_events([
+            RedemptionEvent::BurnIntended {
+                issuer_request_id: IssuerRedemptionRequestId::random(),
+                sendable_tx: sendable_tx.clone(),
+                planned_burns: vec![],
+            },
+        ]);
+
+        assert_eq!(summary.tx_id, Some(TxId::Hash(sendable_tx.hash)));
     }
 }

@@ -400,6 +400,7 @@ impl RedemptionView {
                 issuer_request_id,
                 reason,
                 closed_at,
+                ..
             } => Self::Closed {
                 issuer_request_id: issuer_request_id.clone(),
                 reason: reason.clone(),
@@ -959,6 +960,7 @@ mod tests {
                 RedemptionEvent::RedemptionClosed {
                     issuer_request_id: id.clone(),
                     reason: reason.to_string(),
+                    acknowledged_unresolved_burn_tx_hash: None,
                     closed_at: Utc::now(),
                 },
             )
@@ -2285,6 +2287,7 @@ mod tests {
                 RedemptionEvent::RedemptionClosed {
                     issuer_request_id: issuer_request_id.clone(),
                     reason: reason.clone(),
+                    acknowledged_unresolved_burn_tx_hash: None,
                     closed_at,
                 },
             )
@@ -2326,6 +2329,7 @@ mod tests {
                     burn_tx_hash,
                     block_number,
                     reason: "admin recovery".to_string(),
+                    acknowledged_unresolved_burn_tx_hash: None,
                     completed_at,
                 },
             )

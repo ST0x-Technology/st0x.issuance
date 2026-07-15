@@ -410,16 +410,24 @@ on-chain transfer through calling Alpaca to burning tokens.
   transaction lands, recovery reuses the same retry id. Emits `BurnResumed`
   event. The admin recovery path immediately invokes burn recovery in-process so
   the on-chain burn does not wait for a service restart.
-- `CloseRedemption { issuer_request_id, reason }` - Admin-close a redemption
-  that cannot be automatically recovered, recording an operator `reason`. Valid
-  from `Failed`, `Burning`, `BurnIntended`, or `BurnSubmitted`. This is the
+- `CloseRedemption { issuer_request_id, reason,
+  acknowledged_unresolved_burn_tx_hash }` - Admin-close a redemption that
+  cannot be automatically recovered, recording an operator `reason`. Valid
+  from `Failed`, `Burning`, `BurnIntended`, or `BurnSubmitted`. A redemption
+  with a persisted signed transaction is rejected by default because that
+  transaction may still land. Closing it requires
+  `acknowledged_unresolved_burn_tx_hash` to equal the persisted hash exactly;
+  the signed identity is retained across a transition to `Failed`, and the
+  acknowledgement is recorded in the terminal event. An acknowledgement is
+  rejected when no persisted signed burn exists. This is the
   honest terminal path for a redemption whose burn cannot or should not be re-submitted and is
   **not** verifiable on-chain (e.g. a `Failed -> Burning` recovery regression
   where no burn ever landed, or an ambiguous case pending off-chain
   reconciliation). A held receipt reservation is **left in place** (the
   conservative policy for `Closed`), since an ambiguous burn may still have
   landed. Emits `RedemptionClosed`.
-- `ForceCompleteBurn { issuer_request_id, burn_tx_hash, block_number, reason }` -
+- `ForceCompleteBurn { issuer_request_id, burn_tx_hash, block_number, reason,
+  acknowledged_unresolved_burn_tx_hash }` -
   Admin-terminalize a redemption stuck in
   `BurnIntended`/`BurnSubmitted` whose persisted exact burn transaction
   **already landed on-chain** but was never recorded (e.g. the bot crashed
@@ -431,9 +439,20 @@ on-chain transfer through calling Alpaca to burning tokens.
   completion. Emits `BurnForceCompleted`, transitioning to `Completed`.
   The persisted bytes must decode with matching hash and nonce and recover the
   configured bot wallet as signer; the supplied hash must then equal that exact
-  transaction hash. Legacy or pre-intent states without a trustworthy
-  persisted transaction are **not** force-completed; ops use `CloseRedemption`
-  after off-chain reconciliation instead.
+  transaction hash unless the operator explicitly acknowledges the persisted
+  hash with `acknowledged_unresolved_burn_tx_hash`. A different proving hash is
+  rejected by default while the persisted transaction may still land. The
+  acknowledgement must equal the persisted hash exactly and is recorded in the
+  terminal event. The alternate transaction's per-receipt withdrawals,
+  recipient wallet, and dust share transfer must also match the persisted burn
+  semantics exactly, including the aggregate burned-share total. Its signer
+  nonce must equal the persisted transaction's nonce, proving it is a mined
+  replacement rather than an unrelated burn and ensuring the acknowledged
+  transaction can no longer land. This prevents
+  another redemption's same-vault burn from being used as proof. Legacy or pre-intent
+  states without a trustworthy persisted
+  transaction are **not** force-completed; ops use `CloseRedemption` after
+  off-chain reconciliation instead.
 
 **Events:**
 
@@ -477,12 +496,18 @@ on-chain transfer through calling Alpaca to burning tokens.
   `planned_burns` for recovery of previously submitted transactions
 - `ExistingBurnRecovered` - Existing on-chain burn discovered during recovery
 - `RedemptionClosed` - Admin-closed redemption (terminal). Carries the operator
-  `reason` and `closed_at`. Closed redemptions do not appear in stuck queries.
+  `reason`, `closed_at`, and optional
+  `acknowledged_unresolved_burn_tx_hash`. Closed redemptions do not appear in
+  stuck queries. Receipt reservations remain held, including after an
+  acknowledged close, because the unresolved transaction may still land.
 - `BurnForceCompleted` - Admin-recorded terminal success for a stuck
   `BurnIntended`/`BurnSubmitted` redemption whose persisted exact burn was
   verified on-chain. Carries the proving `burn_tx_hash`, `block_number`,
-  operator `reason`, and `completed_at`. Transitions to `Completed` (terminal
-  success).
+  operator `reason`, optional `acknowledged_unresolved_burn_tx_hash`, and
+  `completed_at`. Transitions to `Completed` (terminal success). Its receipt
+  reservation is settled after the terminal event, including when the operator
+  acknowledged the persisted transaction superseded by the proving
+  same-nonce replacement.
 - `Reprocessed` - Redemption reset to `Detected` state for reprocessing. Carries
   the original `RedemptionMetadata`, the previous state name, and a timestamp.
   Used for audit trail — shows when and from what state a manual reprocess was
@@ -2354,7 +2379,13 @@ permanently rejected the journal, or tokens were consumed by other operations).
 
 **Endpoint:** `POST /admin/close/redemption/<issuer_request_id>`
 
-**Request body:** `{ "reason": "string" }`
+**Request body:**
+`{ "reason": "string", "acknowledged_unresolved_burn_tx_hash": "0x..." }`.
+The acknowledgement is optional unless the redemption has a persisted signed
+burn transaction. In that case omission or a hash mismatch returns `422`; the
+operator must echo the exact persisted hash shown by `/admin/stuck` after
+off-chain reconciliation. Supplying an acknowledgement when no persisted
+signed burn exists also returns `422`.
 
 **Commands/Events:**
 
@@ -2364,7 +2395,31 @@ permanently rejected the journal, or tokens were consumed by other operations).
 
 - `200`: Redemption closed
 - `409`: Already completed or closed
-- `422`: Not in `Failed` state
+- `422`: Invalid state, or a persisted signed burn was not acknowledged exactly
+
+Close responses and structured logs include the acknowledged persisted hash
+when an override is used. Closing never releases a held receipt reservation.
+
+### Force-complete Redemption Burn
+
+**Endpoint:**
+`POST /admin/force-complete/redemption/<issuer_request_id>`
+
+**Request body:**
+`{ "burn_tx_hash": "0x...", "reason": "string",
+"acknowledged_unresolved_burn_tx_hash": "0x..." }`.
+
+The proving `burn_tx_hash` must normally equal the redemption's persisted signed
+transaction hash. If a different transaction proves the burn, the request is
+rejected unless `acknowledged_unresolved_burn_tx_hash` exactly echoes the
+persisted hash being superseded. The terminal event, response, and structured
+logs record both identities, and the alternate proof's per-receipt withdrawals,
+receiver, dust transfer, and signer nonce must equal the persisted burn
+semantics, so the mined proof is a replacement and the persisted transaction
+can no longer land. The held
+receipt reservation is settled after the
+terminal event; operators must reconcile the acknowledged transaction before
+using this override.
 
 ### List Stuck Aggregates
 

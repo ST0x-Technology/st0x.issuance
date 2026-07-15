@@ -195,6 +195,8 @@ pub(crate) enum RedemptionEvent {
     RedemptionClosed {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
+        #[serde(default)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
         closed_at: DateTime<Utc>,
     },
     /// Admin-recorded terminal success for a redemption stuck in
@@ -208,6 +210,8 @@ pub(crate) enum RedemptionEvent {
         burn_tx_hash: B256,
         block_number: u64,
         reason: String,
+        #[serde(default)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
         completed_at: DateTime<Utc>,
     },
     /// Post-Alpaca failed redemption resumed directly to Burning state.
@@ -330,7 +334,9 @@ impl DomainEvent for RedemptionEvent {
             Self::TokensBurned(_)
             | Self::BurningFailed { .. }
             | Self::BurnTxSubmitted { .. }
-            | Self::ExistingBurnRecovered { .. } => "2.0".to_string(),
+            | Self::ExistingBurnRecovered { .. }
+            | Self::RedemptionClosed { .. }
+            | Self::BurnForceCompleted { .. } => "2.0".to_string(),
             _ => "1.0".to_string(),
         }
     }
@@ -340,6 +346,7 @@ impl DomainEvent for RedemptionEvent {
 mod tests {
     use alloy::primitives::{U256, b256, uint};
     use chrono::Utc;
+    use serde_json::{from_value, to_value};
 
     use super::*;
 
@@ -392,11 +399,57 @@ mod tests {
             ),
             block_number: 1000,
             reason: "admin recovery".to_string(),
+            acknowledged_unresolved_burn_tx_hash: None,
             completed_at: Utc::now(),
         };
 
         assert_eq!(event.event_type(), "RedemptionEvent::BurnForceCompleted");
-        assert_eq!(event.event_version(), "1.0");
+        assert_eq!(event.event_version(), "2.0");
+    }
+
+    #[test]
+    fn terminal_admin_events_replay_without_acknowledgement_field() {
+        let events = [
+            RedemptionEvent::RedemptionClosed {
+                issuer_request_id: test_redemption_id(),
+                reason: "legacy close".to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+                closed_at: Utc::now(),
+            },
+            RedemptionEvent::BurnForceCompleted {
+                issuer_request_id: test_redemption_id(),
+                burn_tx_hash: B256::random(),
+                block_number: 1000,
+                reason: "legacy force-complete".to_string(),
+                acknowledged_unresolved_burn_tx_hash: None,
+                completed_at: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            let mut value = to_value(&event).unwrap();
+            let payload = value
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            payload.remove("acknowledged_unresolved_burn_tx_hash");
+
+            let replayed: RedemptionEvent = from_value(value).unwrap();
+            assert!(matches!(
+                replayed,
+                RedemptionEvent::RedemptionClosed {
+                    acknowledged_unresolved_burn_tx_hash: None,
+                    ..
+                } | RedemptionEvent::BurnForceCompleted {
+                    acknowledged_unresolved_burn_tx_hash: None,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
