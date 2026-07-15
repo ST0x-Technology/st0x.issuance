@@ -4,13 +4,14 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+use crate::harness::create_provider;
 
 /// Tests that redemptions are detected and completed on ALL vaults, not just one.
 ///
@@ -107,7 +108,7 @@ async fn test_multi_vault_redemption_detects_on_all_vaults()
 
     // Setup user provider for transfers
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -259,7 +260,7 @@ async fn test_transfer_backfill_detects_transfers_while_down()
     .await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

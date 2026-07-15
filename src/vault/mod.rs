@@ -1,5 +1,7 @@
+use alloy::hex::decode;
 use alloy::primitives::{Address, B256, Bytes, U256};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::providers::SendableTxErr;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -94,7 +96,8 @@ pub(crate) trait VaultService: Send + Sync {
     async fn submit_burn(
         &self,
         params: MultiBurnParams,
-    ) -> Result<SubmittedTx, VaultError>;
+        prepared_tx: Option<SendableTxWithHash>,
+    ) -> Result<SubmittedTx<BurnExternalTxId, TxId>, VaultError>;
 
     /// Confirms a previously submitted burn transaction.
     ///
@@ -107,7 +110,7 @@ pub(crate) trait VaultService: Send + Sync {
     ///   from the original request since it cannot be derived from on-chain events)
     async fn confirm_burn(
         &self,
-        fireblocks_tx_id: &str,
+        fireblocks_tx_id: &TxId,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError>;
 
@@ -124,6 +127,33 @@ pub(crate) trait VaultService: Send + Sync {
         owner: Address,
         tx_hash: B256,
     ) -> Result<BurnVerification, VaultError>;
+
+    /// Prepares asigned raw tx that is sendable via eth_sendRawTransaction
+    ///
+    /// Currently returns Option<>, since fireblocks path doesnt use this,
+    /// but options return will be removed once fireblocks is completely removed
+    async fn prepare_burn_tx(
+        &self,
+        _params: &MultiBurnParams,
+    ) -> Result<Option<SendableTxWithHash>, VaultError> {
+        Ok(None)
+    }
+
+    /// Serializes the local wallet's nonce assignment through broadcast.
+    async fn lock_wallet(&self) -> WalletNonceGuard {
+        None
+    }
+}
+
+pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SendableTxWithHash {
+    pub(crate) tx: Vec<u8>,
+    pub(crate) hash: B256,
+    pub(crate) nonce: u64,
+    pub(crate) signed_at: DateTime<Utc>,
+    pub(crate) dust_shares: U256,
 }
 
 /// Proof that a burn transaction landed on-chain, returned by
@@ -367,14 +397,68 @@ impl ReceiptInformation {
 /// persisted in an intermediate CQRS event so that `confirm_mint`/`confirm_burn`
 /// can resume polling after a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SubmittedTx {
+pub(crate) struct SubmittedTx<ExternalTxId = String, TransactionId = String> {
     /// Deterministic ID used for Fireblocks idempotency (`externalTxId`).
     /// Format: `{operation}-{issuer_request_id}`.
-    pub(crate) external_tx_id: String,
+    pub(crate) external_tx_id: ExternalTxId,
     /// Backend-specific transaction identifier.
     /// For Fireblocks: the Fireblocks transaction ID.
     /// For local backends: the on-chain transaction hash.
-    pub(crate) fireblocks_tx_id: String,
+    pub(crate) fireblocks_tx_id: TransactionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxId {
+    Hash(B256),
+    Legacy(String),
+}
+
+impl From<B256> for TxId {
+    fn from(value: B256) -> Self {
+        Self::Hash(value)
+    }
+}
+
+impl std::fmt::Display for TxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hash(tx_hash) => write!(f, "{tx_hash:#x}"),
+            Self::Legacy(id) => f.write_str(id),
+        }
+    }
+}
+
+impl std::str::FromStr for TxId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(bytes) = decode(value)
+            && bytes.len() == B256::len_bytes()
+        {
+            return Ok(Self::Hash(B256::from_slice(&bytes)));
+        }
+
+        Ok(Self::Legacy(value.to_string()))
+    }
+}
+
+impl Serialize for TxId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TxId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Errors that can occur when encoding receipt information.
@@ -415,6 +499,11 @@ pub(crate) enum VaultError {
     /// Failed to get transaction receipt
     #[error(transparent)]
     PendingTransaction(#[from] alloy::providers::PendingTransactionError),
+    /// The transaction may still be pending after receipt confirmation ended.
+    /// Retrying with a newly signed transaction is unsafe until this exact
+    /// transaction reaches a definitive terminal state.
+    #[error("Transaction confirmation remains pending for {tx_id}: {message}")]
+    ConfirmationPending { tx_id: TxId, message: String },
     /// RPC transport error (e.g., fetching receipt by tx hash during recovery)
     #[error(transparent)]
     Rpc(
@@ -424,6 +513,10 @@ pub(crate) enum VaultError {
     /// Fireblocks vault service error
     #[error(transparent)]
     Fireblocks(#[from] crate::fireblocks::FireblocksVaultError),
+    #[error(transparent)]
+    SendableTxErr(#[from] Box<SendableTxErr<TransactionRequest>>),
+    #[error("Expected a prepared signed tx but got none")]
+    ExpectedPreparedTx,
 }
 
 #[cfg(test)]
@@ -647,5 +740,27 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, VaultError::NotABurn { .. }));
+    }
+
+    #[test]
+    fn tx_id_deserializes_hashes_without_changing_wire_format() {
+        let hash = B256::repeat_byte(0x42);
+        let json = serde_json::to_string(&TxId::Hash(hash)).unwrap();
+
+        assert_eq!(json, format!("\"{hash:#x}\""));
+        assert_eq!(
+            serde_json::from_str::<TxId>(&json).unwrap(),
+            TxId::Hash(hash)
+        );
+    }
+
+    #[test]
+    fn tx_id_preserves_legacy_backend_identifiers() {
+        let json = r#""fireblocks-transaction-id""#;
+
+        assert_eq!(
+            serde_json::from_str::<TxId>(json).unwrap(),
+            TxId::Legacy("fireblocks-transaction-id".to_string())
+        );
     }
 }

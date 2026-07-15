@@ -11,6 +11,7 @@ use super::IssuerRedemptionRequestId;
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::redemption::{Redemption, RedemptionEvent, TokensBurnedData};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::TxId;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) enum RedemptionView {
@@ -193,7 +194,7 @@ impl RedemptionView {
         self,
         error: &str,
         failed_at: DateTime<Utc>,
-        fireblocks_tx_id: Option<&String>,
+        fireblocks_tx_id: Option<&TxId>,
         planned_burns: &[super::BurnRecord],
     ) -> Self {
         let Self::Burning {
@@ -232,7 +233,7 @@ impl RedemptionView {
             alpaca_journal_completed_at,
             error: error.to_string(),
             failed_at,
-            fireblocks_tx_id: fireblocks_tx_id.cloned(),
+            fireblocks_tx_id: fireblocks_tx_id.map(ToString::to_string),
             planned_burns: planned_burns.to_vec(),
         }
     }
@@ -387,9 +388,10 @@ impl RedemptionView {
                 block_number: *block_number,
                 completed_at: *recovered_at,
             },
-            // View stays in Burning — BurnFireblocksSubmitted is an internal
+            // View stays in Burning — BurnFireblocksSubmitted and BurnIntended is an internal
             // detail that doesn't change the query-facing state.
-            RedemptionEvent::BurnFireblocksSubmitted { .. } => self,
+            RedemptionEvent::BurnIntended { .. }
+            | RedemptionEvent::BurnFireblocksSubmitted { .. } => self,
             RedemptionEvent::RedemptionClosed {
                 issuer_request_id,
                 reason,
@@ -732,6 +734,7 @@ mod tests {
         TokensBurnedData,
     };
     use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+    use crate::vault::TxId;
 
     async fn migrated_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -2236,7 +2239,9 @@ mod tests {
                 issuer_request_id.clone(),
                 RedemptionEvent::ExistingBurnRecovered {
                     issuer_request_id: issuer_request_id.clone(),
-                    fireblocks_tx_id: "fb-recovered-123".to_string(),
+                    fireblocks_tx_id: TxId::Legacy(
+                        "fb-recovered-123".to_string(),
+                    ),
                     tx_hash,
                     burns: vec![],
                     block_number,

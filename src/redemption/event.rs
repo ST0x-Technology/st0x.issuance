@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{BurnExternalTxId, IssuerRedemptionRequestId};
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{TokenSymbol, UnderlyingSymbol};
+use crate::vault::{SendableTxWithHash, TxId};
 
 /// A single burn operation within a multi-receipt burn.
 ///
@@ -146,7 +147,7 @@ pub(crate) enum RedemptionEvent {
         /// Fireblocks transaction ID, if the burn was submitted via Fireblocks.
         /// Absent for non-Fireblocks backends or pre-enrichment events.
         #[serde(default)]
-        fireblocks_tx_id: Option<String>,
+        fireblocks_tx_id: Option<TxId>,
         /// Planned burns at the time of failure.
         /// Absent for pre-enrichment events.
         #[serde(default)]
@@ -171,7 +172,7 @@ pub(crate) enum RedemptionEvent {
     BurnFireblocksSubmitted {
         issuer_request_id: IssuerRedemptionRequestId,
         external_tx_id: BurnExternalTxId,
-        fireblocks_tx_id: String,
+        fireblocks_tx_id: TxId,
         /// Planned burns at the time of submission (for recovery use).
         planned_burns: Vec<BurnRecord>,
         submitted_at: DateTime<Utc>,
@@ -182,7 +183,7 @@ pub(crate) enum RedemptionEvent {
     /// but the bot failed to record it (e.g., Fireblocks polling timeout).
     ExistingBurnRecovered {
         issuer_request_id: IssuerRedemptionRequestId,
-        fireblocks_tx_id: String,
+        fireblocks_tx_id: TxId,
         tx_hash: B256,
         burns: Vec<BurnRecord>,
         block_number: u64,
@@ -234,6 +235,11 @@ pub(crate) enum RedemptionEvent {
         external_tx_id: Option<BurnExternalTxId>,
         resumed_at: DateTime<Utc>,
     },
+    BurnIntended {
+        issuer_request_id: IssuerRedemptionRequestId,
+        sendable_tx: Option<SendableTxWithHash>,
+        planned_burns: Vec<BurnRecord>,
+    },
 }
 
 impl DomainEvent for RedemptionEvent {
@@ -275,6 +281,9 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnForceCompleted { .. } => {
                 "RedemptionEvent::BurnForceCompleted".to_string()
+            }
+            Self::BurnIntended { .. } => {
+                "RedemptionEvent::BurnIntended".to_string()
             }
         }
     }
@@ -394,7 +403,7 @@ mod tests {
             issuer_request_id: test_redemption_id(),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
-            fireblocks_tx_id: Some("fb-tx-123".to_string()),
+            fireblocks_tx_id: Some(TxId::Legacy("fb-tx-123".to_string())),
             planned_burns: vec![BurnRecord {
                 receipt_id: uint!(7_U256),
                 shares_burned: uint!(100_000000000000000000_U256),

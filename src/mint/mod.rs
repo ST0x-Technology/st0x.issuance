@@ -2158,8 +2158,8 @@ pub(crate) mod tests {
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, FireblocksTxStatus, MintResult, MultiBurnParams,
-        MultiBurnResult, ReceiptInformation, SubmittedTx, VaultError,
-        VaultService,
+        MultiBurnResult, ReceiptInformation, SendableTxWithHash, SubmittedTx,
+        VaultError, VaultService,
     };
 
     pub(super) const VAULT: Address =
@@ -2235,13 +2235,20 @@ pub(crate) mod tests {
         async fn submit_burn(
             &self,
             _params: MultiBurnParams,
-        ) -> Result<SubmittedTx, VaultError> {
+            _prepared_tx: Option<SendableTxWithHash>,
+        ) -> Result<
+            SubmittedTx<
+                crate::redemption::BurnExternalTxId,
+                crate::vault::TxId,
+            >,
+            VaultError,
+        > {
             Err(VaultError::InvalidReceipt)
         }
 
         async fn confirm_burn(
             &self,
-            _fireblocks_tx_id: &str,
+            _fireblocks_tx_id: &crate::vault::TxId,
             _expected_dust_shares: U256,
         ) -> Result<MultiBurnResult, VaultError> {
             Err(VaultError::InvalidReceipt)
@@ -2304,13 +2311,20 @@ pub(crate) mod tests {
         async fn submit_burn(
             &self,
             _params: MultiBurnParams,
-        ) -> Result<SubmittedTx, VaultError> {
+            _prepared_tx: Option<SendableTxWithHash>,
+        ) -> Result<
+            SubmittedTx<
+                crate::redemption::BurnExternalTxId,
+                crate::vault::TxId,
+            >,
+            VaultError,
+        > {
             Err(VaultError::InvalidReceipt)
         }
 
         async fn confirm_burn(
             &self,
-            _fireblocks_tx_id: &str,
+            _fireblocks_tx_id: &crate::vault::TxId,
             _expected_dust_shares: U256,
         ) -> Result<MultiBurnResult, VaultError> {
             Err(VaultError::InvalidReceipt)

@@ -1,3 +1,4 @@
+use alloy::providers::fillers::BlobGasFiller;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::{RpcError, TransportErrorKind};
 use clap::{Args, Parser};
@@ -97,6 +98,11 @@ impl Config {
                     .map_err(|err| ConfigError::SignerResolve(Box::new(err)))?;
 
                 let signing_provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .with_gas_estimation()
+                    .filler(BlobGasFiller)
+                    .with_simple_nonce_management()
+                    .with_chain_id(self.chain_id)
                     .wallet(resolved.wallet)
                     .connect_http(wss_to_http(&self.rpc_url)?);
 

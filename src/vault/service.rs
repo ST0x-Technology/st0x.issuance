@@ -1,20 +1,44 @@
+use alloy::consensus::Transaction;
+use alloy::eips::Encodable2718;
+use alloy::network::EthereumWallet;
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill,
+    NonceFiller, SimpleNonceManager, WalletFiller,
+};
+use alloy::providers::{
+    Identity, PendingTransactionBuilder, Provider, RootProvider,
+};
+use async_trait::async_trait;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use alloy::primitives::{Address, B256, Bytes, U256};
-use alloy::providers::Provider;
-use async_trait::async_trait;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::rain_meta::OaSchemaCache;
 use super::{
     BurnVerification, MintResult, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, SubmittedTx, VaultError, VaultService,
-    verify_burn_in_receipt,
+    ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
+    VaultService, WalletNonceGuard, verify_burn_in_receipt,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
+
+pub type RealBlockchainServiceProvider = FillProvider<
+    JoinFill<
+        JoinFill<
+            JoinFill<
+                JoinFill<JoinFill<Identity, GasFiller>, BlobGasFiller>,
+                NonceFiller<SimpleNonceManager>,
+            >,
+            ChainIdFiller,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    RootProvider,
+>;
 
 /// Alloy-based blockchain service that interacts with the Rain OffchainAssetReceiptVault
 /// contract.
@@ -22,26 +46,35 @@ use crate::redemption::BurnExternalTxId;
 /// Generic over the provider type to support both production RPC providers and mock providers
 /// for testing.
 ///
-/// Since this backend submits and confirms transactions synchronously (no Fireblocks),
-/// `submit_mint`/`submit_burn` execute the full operation and cache the result for
-/// `confirm_mint`/`confirm_burn` to return. Results are keyed by tx hash to prevent
+/// Since this backend submits and confirms mint transactions synchronously (no Fireblocks),
+/// `submit_mint` executes the full operation and caches the result for
+/// `confirm_mint` to return. Results are keyed by tx hash to prevent
 /// concurrent operations from overwriting each other.
+/// Burns use a different flow: the signed transaction and its precomputed hash
+/// are persisted before the transaction is broadcast.
 ///
-/// **Dev/test only.** This backend does not provide crash-safe idempotency:
-/// if the process crashes after the on-chain transaction completes but before
-/// the CQRS event is persisted, recovery will re-submit a new transaction
-/// (no `externalTxId` deduplication). The Fireblocks backend handles this
-/// via deterministic `externalTxId` and duplicate detection.
-pub(crate) struct RealBlockchainService<P> {
-    provider: P,
+/// **Crash-safe idempotency:**
+/// - **Mints**: handled at the application layer — the receipt backfiller runs at
+///   startup before recovery, scans the chain for `Deposit` events, and populates
+///   the receipt inventory by `issuer_request_id`. `recover_from_existing_receipt`
+///   finds the existing deposit and emits `ExistingMintRecovered`, preventing a
+///   double-mint. `submit_mint` also scans for an existing deposit before sending
+///   as defense-in-depth (covers periodic-backfill gaps during live operation).
+/// - **Burns**: through `prepare_burn_tx()` which prepares a signed transaction
+///   whose hash commits to the complete encoded transaction, including its
+///   assigned nonce. On startup recovery, the exact persisted transaction is
+///   re-broadcast before `confirm_burn` polls for its receipt, so a crash
+///   between persistence, submission, and confirmation cannot cause a
+///   replacement transaction to double-burn.
+pub(crate) struct RealBlockchainService {
+    provider: RealBlockchainServiceProvider,
     oa_schema_cache: Arc<OaSchemaCache>,
     /// Cached results from `submit_mint`, keyed by tx hash string.
     cached_mints: Arc<Mutex<HashMap<String, MintResult>>>,
-    /// Cached results from `submit_burn`, keyed by tx hash string.
-    cached_burns: Arc<Mutex<HashMap<String, MultiBurnResult>>>,
+    wallet_nonce_lock: Arc<Mutex<()>>,
 }
 
-impl<P: Provider + Clone> RealBlockchainService<P> {
+impl RealBlockchainService {
     /// Creates a new blockchain service instance.
     ///
     /// # Arguments
@@ -49,22 +82,20 @@ impl<P: Provider + Clone> RealBlockchainService<P> {
     /// * `provider` - Alloy provider for blockchain communication
     /// * `oa_schema_cache` - Cache for querying OA schema hashes from the subgraph
     pub(crate) fn new(
-        provider: P,
+        provider: RealBlockchainServiceProvider,
         oa_schema_cache: Arc<OaSchemaCache>,
     ) -> Self {
         Self {
             provider,
             oa_schema_cache,
             cached_mints: Arc::new(Mutex::new(HashMap::new())),
-            cached_burns: Arc::new(Mutex::new(HashMap::new())),
+            wallet_nonce_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 #[async_trait]
-impl<P: Provider + Clone + Send + Sync + 'static> VaultService
-    for RealBlockchainService<P>
-{
+impl VaultService for RealBlockchainService {
     async fn submit_mint(
         &self,
         vault: Address,
@@ -96,13 +127,13 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
         let transfer_call =
             vault_contract.transfer(user, shares).calldata().clone();
 
-        // Execute both operations atomically via multicall
-        let receipt = vault_contract
+        let wallet_guard = self.wallet_nonce_lock.clone().lock_owned().await;
+        let pending = vault_contract
             .multicall(vec![deposit_call, transfer_call])
             .send()
-            .await?
-            .get_receipt()
             .await?;
+        drop(wallet_guard);
+        let receipt = pending.get_receipt().await?;
 
         let (receipt_id, shares_minted) = receipt
             .inner
@@ -213,150 +244,62 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
     async fn submit_burn(
         &self,
         params: super::MultiBurnParams,
-    ) -> Result<SubmittedTx, VaultError> {
-        let vault_contract =
-            OffchainAssetReceiptVault::new(params.vault, &self.provider);
-
-        let needs_encoding = params.burns.iter().any(|b| {
-            b.receipt_info_bytes.is_none() && b.receipt_info.is_some()
-        });
-
-        let oa_schema = if needs_encoding {
-            self.oa_schema_cache.get(params.vault).await
-        } else {
-            None
-        };
-
-        let redeem_calls: Vec<Bytes> = params
-            .burns
-            .iter()
-            .map(|burn| {
-                let receipt_bytes = if let Some(raw) = &burn.receipt_info_bytes
+        prepared_tx: Option<SendableTxWithHash>,
+    ) -> Result<SubmittedTx<BurnExternalTxId, TxId>, VaultError> {
+        if let Some(sendable_tx) = prepared_tx {
+            if let Err(error) =
+                self.provider.send_raw_transaction(&sendable_tx.tx).await
+            {
+                if self
+                    .provider
+                    .get_transaction_by_hash(sendable_tx.hash)
+                    .await?
+                    .is_none()
                 {
-                    raw.clone()
-                } else {
-                    burn.receipt_info
-                        .as_ref()
-                        .map(|info| info.encode(oa_schema.as_deref()))
-                        .transpose()?
-                        .unwrap_or_default()
-                };
+                    return Err(error.into());
+                }
 
-                Ok(vault_contract
-                    .redeem(
-                        burn.burn_shares,
-                        params.user,
-                        params.owner,
-                        burn.receipt_id,
-                        receipt_bytes,
-                    )
-                    .calldata()
-                    .clone())
-            })
-            .collect::<Result<Vec<_>, VaultError>>()?;
+                debug!(target: "vault", tx_hash = %sendable_tx.hash,
+                    "Burn broadcast errored but the node holds the persisted transaction"
+                );
+            }
 
-        // Build multicall: all redeems, plus optional dust transfer
-        let calls = if params.dust_shares > U256::ZERO {
-            let transfer_call = vault_contract
-                .transfer(params.user, params.dust_shares)
-                .calldata()
-                .clone();
-            redeem_calls
-                .into_iter()
-                .chain(std::iter::once(transfer_call))
-                .collect()
-        } else {
-            redeem_calls
-        };
-
-        let receipt =
-            vault_contract.multicall(calls).send().await?.get_receipt().await?;
-
-        // The local backend executes the burn synchronously, so a mined-but-
-        // reverted transaction is a definitive no-consumption outcome here (the
-        // Fireblocks backend, which submits asynchronously, catches reverts at
-        // confirm time instead). Surface it as a definitive failure so the
-        // reservation is released rather than retained as ambiguous.
-        if !receipt.status() {
-            return Err(VaultError::Reverted {
-                tx_hash: receipt.transaction_hash,
-            });
-        }
-
-        // Parse all Withdraw events from the receipt
-        let burns: Vec<super::MultiBurnResultEntry> = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter_map(|log| {
-                log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
-                    .ok()
-                    .map(|decoded| {
-                        let event_data = decoded.data();
-                        super::MultiBurnResultEntry {
-                            receipt_id: event_data.id,
-                            shares_burned: event_data.shares,
-                        }
-                    })
-            })
-            .collect();
-
-        if burns.is_empty() {
-            return Err(VaultError::EventNotFound {
-                tx_hash: receipt.transaction_hash,
-            });
-        }
-
-        let gas_used = receipt.gas_used;
-        let block_number =
-            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
-
-        let tx_hash_str = receipt.transaction_hash.to_string();
-        let result = super::MultiBurnResult {
-            tx_hash: receipt.transaction_hash,
-            burns,
-            dust_returned: params.dust_shares,
-            gas_used,
-            block_number,
-        };
-
-        self.cached_burns.lock().await.insert(tx_hash_str.clone(), result);
-
-        Ok(SubmittedTx {
-            external_tx_id: params
-                .external_tx_id
-                .unwrap_or_else(|| {
+            return Ok(SubmittedTx {
+                external_tx_id: params.external_tx_id.unwrap_or_else(|| {
                     BurnExternalTxId::base(&params.detected_tx_hash)
-                })
-                .into_string(),
-            fireblocks_tx_id: tx_hash_str,
-        })
+                }),
+                fireblocks_tx_id: TxId::Hash(sendable_tx.hash),
+            });
+        }
+        Err(VaultError::ExpectedPreparedTx)
     }
 
     async fn confirm_burn(
         &self,
-        fireblocks_tx_id: &str,
+        fireblocks_tx_id: &TxId,
         dust_shares: U256,
     ) -> Result<MultiBurnResult, VaultError> {
-        // Try cache first (normal path when submit and confirm happen in same process)
-        let cached = self.cached_burns.lock().await.remove(fireblocks_tx_id);
-        if let Some(result) = cached {
-            return Ok(result);
-        }
-
-        // Cache empty (process restarted) — re-fetch receipt from chain using tx hash
+        // Fetch receipt from chain using tx hash
         debug!(target: "vault", tx_hash = %fireblocks_tx_id,
-            "Burn cache empty, recovering from chain"
+            "Getting burn tx data from chain"
         );
 
-        let tx_hash: B256 =
-            fireblocks_tx_id.parse().map_err(|_| VaultError::InvalidReceipt)?;
+        let TxId::Hash(tx_hash) = fireblocks_tx_id else {
+            return Err(VaultError::InvalidReceipt);
+        };
+        let tx_hash = *tx_hash;
 
-        let receipt = self
-            .provider
-            .get_transaction_receipt(tx_hash)
-            .await?
-            .ok_or(VaultError::InvalidReceipt)?;
+        let receipt = PendingTransactionBuilder::new(
+            self.provider.root().clone(),
+            tx_hash,
+        )
+        .with_timeout(Some(Duration::from_secs(120)))
+        .get_receipt()
+        .await
+        .map_err(|error| VaultError::ConfirmationPending {
+            tx_id: TxId::Hash(tx_hash),
+            message: error.to_string(),
+        })?;
 
         // A mined-but-reverted burn consumes no receipts, so it is a definitive
         // failure distinct from an anomalous missing-Withdraw parse error.
@@ -410,6 +353,92 @@ impl<P: Provider + Clone + Send + Sync + 'static> VaultService
 
         verify_burn_in_receipt(&receipt, vault, owner, tx_hash)
     }
+
+    /// Prepares a signed tx that can be sent on-chain via eth_sendRawTransaction
+    async fn prepare_burn_tx(
+        &self,
+        params: &super::MultiBurnParams,
+    ) -> Result<Option<SendableTxWithHash>, VaultError> {
+        let vault_contract =
+            OffchainAssetReceiptVault::new(params.vault, &self.provider);
+
+        let needs_encoding = params.burns.iter().any(|burn| {
+            burn.receipt_info_bytes.is_none() && burn.receipt_info.is_some()
+        });
+
+        let oa_schema = if needs_encoding {
+            self.oa_schema_cache.get(params.vault).await
+        } else {
+            None
+        };
+
+        let redeem_calls: Vec<Bytes> = params
+            .burns
+            .iter()
+            .map(|burn| {
+                let receipt_bytes = if let Some(raw) = &burn.receipt_info_bytes
+                {
+                    raw.clone()
+                } else {
+                    burn.receipt_info
+                        .as_ref()
+                        .map(|info| info.encode(oa_schema.as_deref()))
+                        .transpose()?
+                        .unwrap_or_default()
+                };
+
+                Ok(vault_contract
+                    .redeem(
+                        burn.burn_shares,
+                        params.user,
+                        params.owner,
+                        burn.receipt_id,
+                        receipt_bytes,
+                    )
+                    .calldata()
+                    .clone())
+            })
+            .collect::<Result<Vec<_>, VaultError>>()?;
+
+        // Build multicall: all redeems, plus optional dust transfer
+        let calls = if params.dust_shares > U256::ZERO {
+            let transfer_call = vault_contract
+                .transfer(params.user, params.dust_shares)
+                .calldata()
+                .clone();
+            redeem_calls
+                .into_iter()
+                .chain(std::iter::once(transfer_call))
+                .collect()
+        } else {
+            redeem_calls
+        };
+
+        let tx = vault_contract.multicall(calls).into_transaction_request();
+
+        // Fill nonce, gas price, gas limit, chain_id from the provider
+        let envelop = self
+            .provider
+            .fill(tx)
+            .await?
+            .try_into_envelope()
+            .map_err(Box::new)?;
+        let nonce = envelop.nonce();
+        let hash = *envelop.tx_hash();
+        let tx = envelop.encoded_2718();
+
+        Ok(Some(SendableTxWithHash {
+            tx,
+            hash,
+            nonce,
+            signed_at: Utc::now(),
+            dust_shares: params.dust_shares,
+        }))
+    }
+
+    async fn lock_wallet(&self) -> WalletNonceGuard {
+        Some(self.wallet_nonce_lock.clone().lock_owned().await)
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +452,7 @@ mod tests {
         fixed_bytes,
     };
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::fillers::{BlobGasFiller, ChainIdFiller};
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::{Block, FeeHistory, TransactionReceipt};
     use alloy::signers::local::PrivateKeySigner;
@@ -438,8 +468,8 @@ mod tests {
     use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
-        MultiBurnEntry, MultiBurnParams, ReceiptInformation, VaultError,
-        VaultService,
+        MultiBurnEntry, MultiBurnParams, ReceiptInformation,
+        SendableTxWithHash, VaultError, VaultService,
     };
 
     const TEST_OA_SCHEMA: &str =
@@ -486,22 +516,35 @@ mod tests {
         tx_hash: alloy::primitives::B256,
         receipt: &TransactionReceipt,
     ) {
-        let block: Block<alloy::rpc::types::Transaction> = Block::default();
-        asserter.push_success(&0u64); // eth_getTransactionCount
-        asserter.push_success(&test_fee_history()); // eth_feeHistory
-        asserter.push_success(&block); // eth_getBlockByNumber
-        asserter.push_success(&1u64); // eth_chainId
-        asserter.push_success(&100_000_u64); // eth_estimateGas
-        asserter.push_success(&1_000_000_000_u64); // eth_maxPriorityFeePerGas
-        asserter.push_success(&0u64); // eth_getTransactionCount again
         asserter.push_success(&tx_hash); // eth_sendRawTransaction
         asserter.push_success(receipt); // eth_getTransactionReceipt
         asserter.push_success(receipt); // eth_getTransactionReceipt (polling)
     }
 
+    /// Sets up mock responses for `provider.fill(tx)`:
+    /// ChainIdFiller → eth_chainId,
+    /// GasFiller → eth_feeHistory / eth_getBlockByNumber / eth_estimateGas / eth_maxPriorityFeePerGas,
+    /// NonceFiller → eth_getTransactionCount,
+    /// WalletFiller → eth_chainId (signing uses chain_id for replay protection).
+    fn setup_asserter_for_fill(asserter: &Asserter, nonce: u64) {
+        let block: Block<alloy::rpc::types::Transaction> = Block::default();
+        asserter.push_success(&1u64); // eth_chainId (ChainIdFiller)
+        asserter.push_success(&test_fee_history()); // eth_feeHistory (GasFiller)
+        asserter.push_success(&block); // eth_getBlockByNumber (GasFiller)
+        asserter.push_success(&100_000_u64); // eth_estimateGas (GasFiller)
+        asserter.push_success(&1_000_000_000_u64); // eth_maxPriorityFeePerGas (GasFiller)
+        asserter.push_success(&nonce); // eth_getTransactionCount (NonceFiller)
+        asserter.push_success(&1u64); // eth_chainId (WalletFiller, for EIP-155 signing)
+    }
+
     fn create_service_with_asserter(asserter: Asserter) -> impl VaultService {
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .with_simple_nonce_management()
+            .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
         RealBlockchainService::new(
@@ -605,6 +648,11 @@ mod tests {
 
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .with_simple_nonce_management()
+            .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
         let service = RealBlockchainService::new(
@@ -702,6 +750,11 @@ mod tests {
 
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .filler(BlobGasFiller)
+            .with_simple_nonce_management()
+            .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
             .connect_mocked_client(asserter);
         let service = RealBlockchainService::new(
@@ -856,25 +909,35 @@ mod tests {
         let detected_tx_hash = b256!(
             "0xabababababababababababababababababababababababababababababababab"
         );
+        let prepared_tx = SendableTxWithHash {
+            tx: vec![],
+            hash: tx_hash,
+            nonce: 0,
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        };
         let submitted = service
-            .submit_burn(MultiBurnParams {
-                vault: vault_address,
-                burns: burns
-                    .iter()
-                    .map(|(receipt_id, burn_shares)| MultiBurnEntry {
-                        receipt_id: *receipt_id,
-                        burn_shares: *burn_shares,
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    })
-                    .collect(),
-                dust_shares: U256::ZERO,
-                owner,
-                user,
-                issuer_request_id: test_issuer_redemption_id(),
-                detected_tx_hash,
-                external_tx_id: None,
-            })
+            .submit_burn(
+                MultiBurnParams {
+                    vault: vault_address,
+                    burns: burns
+                        .iter()
+                        .map(|(receipt_id, burn_shares)| MultiBurnEntry {
+                            receipt_id: *receipt_id,
+                            burn_shares: *burn_shares,
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        })
+                        .collect(),
+                    dust_shares: U256::ZERO,
+                    owner,
+                    user,
+                    issuer_request_id: test_issuer_redemption_id(),
+                    detected_tx_hash,
+                    external_tx_id: None,
+                },
+                Some(prepared_tx),
+            )
             .await;
 
         assert!(submitted.is_ok(), "Expected Ok but got: {submitted:?}");
@@ -924,33 +987,46 @@ mod tests {
         );
         let override_id = "burn-0xabab-retry-2".to_string();
 
+        let prepared_tx = SendableTxWithHash {
+            tx: vec![],
+            hash: tx_hash,
+            nonce: 0,
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        };
         let submitted = service
-            .submit_burn(MultiBurnParams {
-                vault: vault_address,
-                burns: burns
-                    .iter()
-                    .map(|(receipt_id, burn_shares)| MultiBurnEntry {
-                        receipt_id: *receipt_id,
-                        burn_shares: *burn_shares,
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    })
-                    .collect(),
-                dust_shares: U256::ZERO,
-                owner,
-                user,
-                issuer_request_id: test_issuer_redemption_id(),
-                detected_tx_hash,
-                external_tx_id: Some(BurnExternalTxId::from_string(
-                    override_id.clone(),
-                )),
-            })
+            .submit_burn(
+                MultiBurnParams {
+                    vault: vault_address,
+                    burns: burns
+                        .iter()
+                        .map(|(receipt_id, burn_shares)| MultiBurnEntry {
+                            receipt_id: *receipt_id,
+                            burn_shares: *burn_shares,
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        })
+                        .collect(),
+                    dust_shares: U256::ZERO,
+                    owner,
+                    user,
+                    issuer_request_id: test_issuer_redemption_id(),
+                    detected_tx_hash,
+                    external_tx_id: Some(BurnExternalTxId::from_string(
+                        override_id.clone(),
+                    )),
+                },
+                Some(prepared_tx),
+            )
             .await
             .expect("submit_burn should succeed");
 
         // A caller-provided externalTxId (used for replacement burn retries)
         // must propagate verbatim rather than be replaced by the local default.
-        assert_eq!(submitted.external_tx_id, override_id);
+        assert_eq!(
+            submitted.external_tx_id,
+            BurnExternalTxId::from_string(override_id)
+        );
     }
 
     #[tokio::test]
@@ -970,7 +1046,14 @@ mod tests {
 
         let service = create_service_with_asserter(asserter);
 
-        let result = service
+        let prepared_tx = SendableTxWithHash {
+            tx: vec![],
+            hash: tx_hash,
+            nonce: 0,
+            signed_at: Utc::now(),
+            dust_shares: U256::ZERO,
+        };
+        let submit_result = service
             .submit_burn(MultiBurnParams {
                 vault: vault_address,
                 burns: vec![MultiBurnEntry {
@@ -987,7 +1070,11 @@ mod tests {
                     "0xabababababababababababababababababababababababababababababababab"
                 ),
                 external_tx_id: None,
-            })
+            }, Some(prepared_tx))
+            .await
+            .expect("Expected a successfull tx submit, but failed1");
+        let result = service
+            .confirm_burn(&submit_result.fireblocks_tx_id, U256::ZERO)
             .await;
 
         assert!(result.is_err(), "Expected Err but got Ok: {result:?}");
@@ -995,5 +1082,87 @@ mod tests {
             result.unwrap_err(),
             VaultError::EventNotFound { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn prepare_tx_returns_signed_tx_with_correct_nonce_and_dust_shares() {
+        let vault_address = test_vault_address();
+        let owner = test_receiver();
+        let user = address!("0x3333333333333333333333333333333333333333");
+        let detected_tx_hash = b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        );
+        let expected_nonce = 7u64;
+        let dust_shares = U256::from(500);
+
+        let asserter = Asserter::new();
+        setup_asserter_for_fill(&asserter, expected_nonce);
+
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: vault_address,
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(1),
+                burn_shares: U256::from(100),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"test".to_vec())),
+            }],
+            dust_shares,
+            owner,
+            user,
+            issuer_request_id: test_issuer_redemption_id(),
+            detected_tx_hash,
+            external_tx_id: None,
+        };
+
+        let result = service.prepare_burn_tx(&params).await.unwrap();
+
+        let sendable = result.expect("expected Some(SendableTxWithHash)");
+        assert_eq!(sendable.nonce, expected_nonce, "nonce must match mock");
+        assert_eq!(
+            sendable.dust_shares, dust_shares,
+            "dust_shares must be propagated from params"
+        );
+        assert!(!sendable.tx.is_empty(), "encoded tx must be non-empty");
+        assert_ne!(sendable.hash, B256::ZERO, "tx hash must be non-zero");
+        assert!(sendable.signed_at.timestamp() > 0, "signed_at must be set");
+    }
+
+    #[tokio::test]
+    async fn prepare_tx_zero_dust_shares_when_params_has_no_dust() {
+        let vault_address = test_vault_address();
+        let owner = test_receiver();
+        let user = address!("0x3333333333333333333333333333333333333333");
+        let detected_tx_hash = b256!(
+            "0xabababababababababababababababababababababababababababababababab"
+        );
+
+        let asserter = Asserter::new();
+        setup_asserter_for_fill(&asserter, 0);
+
+        let service = create_service_with_asserter(asserter);
+
+        let params = MultiBurnParams {
+            vault: vault_address,
+            burns: vec![MultiBurnEntry {
+                receipt_id: U256::from(42),
+                burn_shares: U256::from(200),
+                receipt_info: None,
+                receipt_info_bytes: Some(Bytes::from(b"receipt".to_vec())),
+            }],
+            dust_shares: U256::ZERO,
+            owner,
+            user,
+            issuer_request_id: test_issuer_redemption_id(),
+            detected_tx_hash,
+            external_tx_id: None,
+        };
+
+        let result = service.prepare_burn_tx(&params).await.unwrap();
+
+        let sendable = result.expect("expected Some(SendableTxWithHash)");
+        assert_eq!(sendable.dust_shares, U256::ZERO);
+        assert!(!sendable.tx.is_empty());
     }
 }

@@ -4,7 +4,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, TxHash, U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::Mock;
 use httpmock::prelude::*;
@@ -18,6 +17,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::mint::MintResponse;
 use st0x_issuance::test_utils::{LocalEvm, test_alpaca_legacy_auth};
+
+use crate::harness::create_provider;
 
 async fn perform_mint_flow(
     client: &Client,
@@ -77,7 +78,7 @@ async fn perform_mint_flow(
     );
     let user_signer = PrivateKeySigner::from_bytes(&user_private_key)?;
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -308,7 +309,7 @@ async fn test_burn_tracking_computes_available_balance_correctly()
 
     // Setup user provider
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -466,7 +467,7 @@ async fn test_redemption_recovery_after_restart()
 
     // Setup user provider for transfer
     let user_wallet_instance = EthereumWallet::from(user_signer.clone());
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

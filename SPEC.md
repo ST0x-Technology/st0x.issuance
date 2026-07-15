@@ -377,6 +377,13 @@ on-chain transfer through calling Alpaca to burning tokens.
   balance fails to reserve and never submits an unbacked burn. On confirmation
   the reservation is settled (mirror balance reduced); on a definitive
   terminal/reverted failure it is released.
+- `BurnIntended` - For a locally signed burn, persists the exact signed raw
+  transaction and its hash before any broadcast attempt. A prepared
+  transaction is immutable: live execution and recovery may only broadcast
+  those persisted bytes, never sign a replacement while its outcome is
+  unknown. Recovery re-broadcasts the same bytes before confirming the stored
+  hash. If the broadcast outcome remains ambiguous, the redemption stays in
+  `BurnIntended` with its receipt reservation held for operator resolution.
 - `TokensBurned` - On-chain burn succeeded, redemption complete (terminal
   success). Payload contains `burns: Vec<BurnRecord>` where each `BurnRecord`
   has `receipt_id` and `shares_burned`, supporting multi-receipt burns when a
@@ -409,6 +416,7 @@ on-chain transfer through calling Alpaca to burning tokens.
 | `RecordAlpacaCall`      | `AlpacaCalled`            | Alpaca API called                             |
 | `RecordAlpacaFailure`   | `AlpacaCallFailed`        | Terminal failure                              |
 | `ConfirmAlpacaComplete` | `AlpacaJournalCompleted`  | Journal complete                              |
+| `IntendBurn`            | `BurnIntended`            | Persist exact signed tx before broadcasting   |
 | `BurnTokens`            | `BurnFireblocksSubmitted` | Submits to signing backend                    |
 | `ConfirmBurn`           | `TokensBurned`            | Confirms burn, terminal success               |
 | `RecordBurnFailure`     | `BurningFailed`           | Records failure with optional tx metadata     |

@@ -4,13 +4,15 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256, b256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+use crate::harness::create_provider;
 
 const UNDERLYING: &str = "TSLA";
 const TOKEN: &str = "tTSLA";
@@ -90,7 +92,7 @@ async fn test_three_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     let client_id = link_body.client_id.to_string();
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;

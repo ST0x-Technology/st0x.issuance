@@ -9,6 +9,11 @@ pub mod alpaca_mocks;
 
 use alloy::hex;
 use alloy::primitives::{Address, U256};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller,
+    SimpleNonceManager,
+};
+use alloy::providers::{Identity, ProviderBuilder};
 use chrono::Utc;
 use httpmock::Mock;
 use httpmock::prelude::*;
@@ -30,6 +35,17 @@ use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, Config, Environment, IpWhitelist,
     LogLevel, SignerConfig,
 };
+
+pub type TestProviderBuilder = ProviderBuilder<
+    Identity,
+    JoinFill<
+        JoinFill<
+            JoinFill<JoinFill<Identity, GasFiller>, BlobGasFiller>,
+            NonceFiller<SimpleNonceManager>,
+        >,
+        ChainIdFiller,
+    >,
+>;
 
 pub async fn wait_for_shares<T>(
     vault: &OffchainAssetReceiptVaultInstance<T>,
@@ -777,4 +793,13 @@ pub async fn seed_pre_lifecycle_view_row(
         .await?;
 
     Ok(())
+}
+
+pub fn create_provider() -> TestProviderBuilder {
+    ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .with_gas_estimation()
+        .filler(BlobGasFiller)
+        .with_simple_nonce_management()
+        .filler(ChainIdFiller::default())
 }

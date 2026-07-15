@@ -4,7 +4,6 @@ mod harness;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, U256, b256};
-use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use httpmock::prelude::*;
 use serde_json::json;
@@ -17,6 +16,8 @@ use harness::alpaca_mocks::{setup_mint_mocks, setup_redemption_mocks};
 use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaultInstance;
 use st0x_issuance::initialize_rocket;
 use st0x_issuance::test_utils::LocalEvm;
+
+use crate::harness::create_provider;
 
 static RECOVERY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -223,7 +224,7 @@ async fn test_mint_recovery_after_view_deletion()
 
     // Wait for mint to complete
     let user_wallet_instance = EthereumWallet::from(user_signer.clone());
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -386,7 +387,7 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
     .await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer.clone());
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -551,7 +552,7 @@ async fn test_mint_recovery_from_minting_state_when_no_receipt()
 
     // Wait for recovery and mint to complete
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -660,7 +661,7 @@ async fn test_mint_recovery_prevents_double_mint()
 
     // Get initial share balance of bot_wallet (which received shares from the manual mint)
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -939,7 +940,7 @@ async fn test_mint_recovery_from_minting_failed_state()
 
     // Wait for recovery and mint to complete
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
@@ -1197,7 +1198,7 @@ async fn test_detected_redemption_auto_failed_when_no_account()
 
     // Assert: service still works — can process a new mint
     let user_wallet_instance = EthereumWallet::from(user_signer);
-    let user_provider = ProviderBuilder::new()
+    let user_provider = create_provider()
         .wallet(user_wallet_instance)
         .connect(&evm.endpoint)
         .await?;
