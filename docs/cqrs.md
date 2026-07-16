@@ -40,40 +40,55 @@ against the new shape. Events are unaffected.
 DELETE FROM snapshots WHERE aggregate_type = 'Mint';
 ```
 
-## Event Upcasters
+## Evolving Event Structure
 
-When you MUST change event structure (e.g., adding required fields to existing
-events), use upcasters to transform old events to the new format at load time:
+event-sorcery has no upcaster layer. When an event's structure must change (a
+field is added, or a legacy layout must still deserialize), normalize the old
+and new shapes during deserialization with `#[serde(try_from = "Wire")]`:
 
 ```rust
-use cqrs_es::persist::{EventUpcaster, SemanticVersionEventUpcaster};
-
-// Transform function: takes old JSON, returns new JSON
-fn upcast_v1_to_v2(mut payload: Value) -> Value {
-    // Add new field with default value
-    payload["new_field"] = json!("default");
-    payload
+/// The union of every wire shape this event has had.
+#[derive(Deserialize)]
+struct MyEventWire {
+    new_field: Option<String>,
+    legacy_field: Option<String>,
 }
 
-// Create upcaster targeting specific event type and version
-pub fn create_my_upcaster() -> Box<dyn EventUpcaster> {
-    Box::new(SemanticVersionEventUpcaster::new(
-        "MyAggregate::MyEvent",  // event_type to match
-        "2.0",                    // target version (events < this get upcasted)
-        Box::new(upcast_v1_to_v2),
-    ))
+#[derive(Serialize, Deserialize)]
+#[serde(try_from = "MyEventWire")]
+struct MyEvent {
+    new_field: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("MyEvent carries neither new_field nor legacy_field")]
+struct MissingFieldError;
+
+impl TryFrom<MyEventWire> for MyEvent {
+    type Error = MissingFieldError;
+
+    fn try_from(wire: MyEventWire) -> Result<Self, Self::Error> {
+        // Normalize the legacy layout into the current one, or error if the
+        // payload is unusable.
+        wire.new_field
+            .or(wire.legacy_field)
+            .map(|new_field| Self { new_field })
+            .ok_or(MissingFieldError)
+    }
 }
 ```
 
-Register upcasters on the event store:
+The transformation runs at load time during deserialization, so historical
+events read back as the current shape. Reference implementation:
+`TokensBurnedData` / `TokensBurnedDataWire` in `src/redemption/event.rs`.
 
-```rust
-let event_store = PersistedEventStore::new(event_repo)
-    .with_upcasters(vec![create_my_upcaster()]);
-```
+When the wire shape changes, also bump `event_version()` for newly emitted
+events of that variant so stored rows record which shape they carry —
+`RedemptionEvent::event_version()` emits `"2.0"` for `TokensBurned` while the
+other variants stay `"1.0"`.
 
-**Update `event_version()` in your event enum** to return the new version for
-new events.
+**Events are immutable** — never rewrite stored payloads; evolve the in-memory
+type and let `TryFrom<Wire>` bridge the old and new layouts.
 
 ## Views and GenericQuery
 
@@ -108,47 +123,75 @@ impl View<MyAggregate> for MyView {
 }
 ```
 
-## Re-projecting Views with `replay_all_or_fail`
+## Re-projecting Views by Rebuilding
 
-When you add a new view or need to rebuild an existing one from events, use the
-shared `crate::replay::replay_all_or_fail` helper:
+event-sorcery reactors only observe newly committed events, so a view added or
+changed after events already exist must be rebuilt by replaying the historical
+streams. How a view rebuilds depends on which kind it is:
+
+- **Canonical `Table` projections** (one per aggregate, e.g. `mint_view`) are
+  rebuilt through event-sorcery itself: `StoreBuilder::build` catches the
+  projection up at startup, and `rebuild_all()` replays the full history
+  (`mint_projection.rebuild_all()` in `src/lib.rs`). No hand-written SQL replay.
+- **Secondary views maintained by explicit reactors** (`receipt_inventory_view`,
+  `redemption_view`, `receipt_burns_view`) each own a `rebuild_<view>_view`
+  function that queries the aggregate's events, clears the view table, and
+  replays each event through the view's reactor:
 
 ```rust
-use crate::replay::replay_all_or_fail;
+pub(crate) async fn rebuild_my_view(
+    pool: &Pool<Sqlite>,
+) -> Result<(), MyViewError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            aggregate_id as "aggregate_id!: String",
+            payload as "payload!: String"
+        FROM events
+        WHERE aggregate_type = 'MyAggregate'
+        ORDER BY aggregate_id, sequence
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
 
-pub async fn replay_my_view(pool: Pool<Sqlite>) -> Result<(), MyError> {
-    // Clear the target view first so the rebuild starts from a clean slate.
-    sqlx::query!("DELETE FROM my_view").execute(&pool).await?;
+    // Parse every event before deleting anything, so a malformed row aborts
+    // the rebuild while the existing (possibly stale) rows are still intact
+    // rather than leaving the view table empty after the DELETE.
+    let events = rows
+        .into_iter()
+        .map(|row| -> Result<_, MyViewError> {
+            let aggregate_id: MyAggregateId = row.aggregate_id.parse()?;
+            let event: MyEvent = serde_json::from_str(&row.payload)?;
+            Ok((aggregate_id, event))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let view_repo = Arc::new(SqliteViewRepository::<MyView, MyAggregate>::new(
-        pool.clone(),
-        "my_view".to_string(),
-    ));
-    let event_repo = SqliteEventRepository::new(pool);
+    sqlx::query!("DELETE FROM my_view").execute(pool).await?;
 
-    // Pass the SAME upcasters registered on this aggregate's live event store
-    // (`vec![]` if it registers none) — otherwise legacy event versions the
-    // live store upcasts successfully would deserialize-fail here.
-    replay_all_or_fail(event_repo, view_repo, vec![]).await?;
+    let reactor = MyViewReactor::new(pool.clone());
+    for (aggregate_id, event) in events {
+        reactor.project(&aggregate_id, &event).await;
+    }
 
     Ok(())
 }
 ```
 
-This replays ALL events through the view's `update()` method, rebuilding the
-entire view from scratch. It's idempotent - running it multiple times produces
-the same result.
+Ordering by `(aggregate_id, sequence)` groups each aggregate's events so the
+reactor sees them in order. Reference implementation:
+`rebuild_receipt_inventory_view` in `src/receipt_inventory/view.rs` (also
+`rebuild_redemption_view` and `rebuild_receipt_burns_view`, which predate the
+parse-before-delete safeguard).
 
-**Do NOT call `QueryReplay::replay_all()` directly.** Without an installed error
-handler, `cqrs-es` delivers per-event failures (deserialization, stream reads,
-view writes) to an optional handler and **silently drops them when none is set**
-— `replay_all()` then returns `Ok(())` regardless, leaving a view partially or
-fully un-rebuilt while startup reports success. `replay_all_or_fail` installs
-collecting handlers on both silent-drop points and fails fast with a typed
-`ReplayError::EventsDropped` instead.
-
-**Call replay at startup** to ensure views are up-to-date with any schema
-changes.
+**Call the rebuild functions at startup** so views reflect any schema changes.
+The `events` table is the single source of truth, so a rebuild is idempotent:
+re-running it reproduces the same view rows. Two failure modes temper that
+guarantee: in the pattern above a deserialization error fails fast, aborting
+before the `DELETE`, while a per-event projection write failure is logged and
+skipped inside the reactor's `project()` (see
+`ReceiptInventoryViewReactor::project`), so a rebuild that returns `Ok` can
+still have skipped events — watch for the reactor's WARN logs after a rebuild.
 
 ## Services Pattern
 
@@ -186,7 +229,13 @@ For aggregates that don't need services, use `type Services = ()`.
 
 ## Forbidden Patterns
 
-1. **Never query the `events` table directly** - use `EventStore` trait methods
+1. **Never query the `events` table inside aggregate handlers or commands** -
+   reconstruct state by loading the aggregate. Raw `events` reads are sanctioned
+   only as a class: the `rebuild_<view>_view` startup functions (replaying
+   history through a reactor) and read-side event-history inspection where
+   `event_sorcery::Store` exposes no event-log read — the admin
+   reprocess/history endpoints in `src/admin.rs` and `BurnManager`'s retry
+   externalTxId derivation in `src/redemption/burn_manager.rs`.
 2. **Never query view tables with raw SQL** - use `GenericQuery::load()`
 3. **Never modify or delete events** - they're immutable historical facts
 4. **Never worry about changing aggregates/views** - they're just
