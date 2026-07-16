@@ -2232,7 +2232,9 @@ submit the next deterministic retry even after automatic retries have exhausted.
 a tx ID, the endpoint scans on-chain for the transaction. If the tx completed
 on-chain, dispatches `RecordExistingBurn` → `ExistingBurnRecovered` event →
 `Completed` state. This handles the scenario where burns landed on-chain but
-weren't recorded (e.g. a crash between submit and confirmation).
+weren't recorded (e.g. a crash between submit and confirmation). The completed
+transaction receipt must include its block number; recovery fails without
+emitting a permanent event when that proof is incomplete.
 
 **Examples:**
 
