@@ -20,8 +20,8 @@ use tracing::debug;
 use super::rain_meta::OaSchemaCache;
 use super::{
     BurnVerification, MintResult, MultiBurnResult, MultiBurnResultEntry,
-    ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
-    VaultService, WalletNonceGuard, verify_burn_in_receipt,
+    PreparedMintTx, ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId,
+    VaultError, VaultService, WalletNonceGuard, verify_burn_in_receipt,
 };
 use crate::bindings::OffchainAssetReceiptVault;
 use crate::redemption::BurnExternalTxId;
@@ -47,11 +47,10 @@ pub type RealBlockchainServiceProvider = FillProvider<
 /// for testing.
 ///
 /// **Crash-safe idempotency:**
-/// - **Mints**: handled at the application layer — the receipt backfiller runs at
-///   startup before recovery, scans the chain for `Deposit` events, and populates
-///   the receipt inventory by `issuer_request_id`. `recover_from_existing_receipt`
-///   finds the existing deposit and emits `ExistingMintRecovered`, preventing a
-///   double-mint.
+/// - **Mints**: `prepare_mint_tx()` returns exact signed bytes and their hash for
+///   persistence before `submit_mint()` broadcasts them. Recovery rebroadcasts
+///   or polls that same transaction; receipt backfill remains a second line of
+///   defense for transactions that already mined.
 /// - **Burns**: through `prepare_burn_tx()` which prepares a signed transaction
 ///   whose hash commits to the complete encoded transaction, including its
 ///   assigned nonce. On startup recovery, the exact persisted transaction is
@@ -85,7 +84,7 @@ impl RealBlockchainService {
 
 #[async_trait]
 impl VaultService for RealBlockchainService {
-    async fn submit_mint(
+    async fn prepare_mint_tx(
         &self,
         vault: Address,
         assets: U256,
@@ -93,7 +92,10 @@ impl VaultService for RealBlockchainService {
         user: Address,
         receipt_info: ReceiptInformation,
         external_tx_id: Option<String>,
-    ) -> Result<SubmittedTx, VaultError> {
+    ) -> Result<PreparedMintTx, VaultError> {
+        let external_tx_id = external_tx_id.unwrap_or_else(|| {
+            format!("mint-{}", receipt_info.issuer_request_id)
+        });
         let oa_schema = self.oa_schema_cache.get(vault).await;
         let receipt_info_bytes = receipt_info.encode(oa_schema.as_deref())?;
 
@@ -116,21 +118,62 @@ impl VaultService for RealBlockchainService {
         let transfer_call =
             vault_contract.transfer(user, shares).calldata().clone();
 
-        // Execute both operations atomically via multicall
-        let wallet_guard = self.wallet_nonce_lock.clone().lock_owned().await;
-        let pending_tx = vault_contract
+        let transaction = vault_contract
             .multicall(vec![deposit_call, transfer_call])
-            .send()
-            .await?;
-        drop(wallet_guard);
+            .into_transaction_request();
+        let envelope = self
+            .provider
+            .fill(transaction)
+            .await?
+            .try_into_envelope()
+            .map_err(Box::new)?;
+        let prepared_tx = PreparedMintTx {
+            nonce: envelope.nonce(),
+            hash: *envelope.tx_hash(),
+            tx: envelope.encoded_2718(),
+            signed_at: Utc::now(),
+            external_tx_id,
+        };
+        prepared_tx.validate()?;
 
-        let tx_id = TxId::from(*pending_tx.tx_hash());
+        Ok(prepared_tx)
+    }
+
+    async fn submit_mint(
+        &self,
+        prepared_tx: &PreparedMintTx,
+    ) -> Result<SubmittedTx, VaultError> {
+        prepared_tx.validate()?;
+
+        match self.provider.send_raw_transaction(&prepared_tx.tx).await {
+            Ok(pending_tx) => {
+                let returned = *pending_tx.tx_hash();
+                if returned != prepared_tx.hash {
+                    return Err(VaultError::BroadcastHashMismatch {
+                        expected: prepared_tx.hash,
+                        returned,
+                    });
+                }
+            }
+            Err(error) => {
+                if self
+                    .provider
+                    .get_transaction_by_hash(prepared_tx.hash)
+                    .await?
+                    .is_none()
+                {
+                    return Err(error.into());
+                }
+
+                debug!(target: "vault", tx_hash = %prepared_tx.hash,
+                    "Mint broadcast errored but the node holds the persisted transaction"
+                );
+            }
+        }
 
         Ok(SubmittedTx {
-            external_tx_id: external_tx_id.unwrap_or_else(|| {
-                format!("mint-{}", receipt_info.issuer_request_id)
-            }),
-            tx_id,
+            external_tx_id: prepared_tx.external_tx_id.clone(),
+            tx_id: prepared_tx.hash.into(),
         })
     }
 
@@ -423,8 +466,10 @@ impl VaultService for RealBlockchainService {
 #[cfg(test)]
 mod tests {
     use alloy::consensus::{
-        Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
+        Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, Transaction,
+        TxEnvelope,
     };
+    use alloy::eips::Decodable2718;
     use alloy::network::EthereumWallet;
     use alloy::primitives::{
         Address, B256, Bloom, Bytes, IntoLogData, U256, address, b256,
@@ -448,7 +493,7 @@ mod tests {
     use crate::vault::rain_meta::OaSchemaCache;
     use crate::vault::{
         MultiBurnEntry, MultiBurnParams, ReceiptInformation,
-        SendableTxWithHash, VaultError, VaultService,
+        SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_OA_SCHEMA: &str =
@@ -539,6 +584,8 @@ mod tests {
         let user_wallet =
             address!("0x2222222222222222222222222222222222222222");
         let receipt_info = test_receipt_info();
+        let expected_external_tx_id =
+            format!("mint-{}", receipt_info.issuer_request_id);
         let vault_address = test_vault_address();
 
         let tx_hash = fixed_bytes!(
@@ -583,7 +630,7 @@ mod tests {
         let receipt_with_bloom =
             ReceiptWithBloom::new(consensus_receipt, Bloom::default());
 
-        let receipt = TransactionReceipt {
+        let mut receipt = TransactionReceipt {
             transaction_hash: tx_hash,
             transaction_index: Some(0),
             block_hash: Some(fixed_bytes!(
@@ -621,10 +668,6 @@ mod tests {
         asserter.push_success(&100_000_u64);
         asserter.push_success(&1_000_000_000_u64);
         asserter.push_success(&0u64);
-        asserter.push_success(&tx_hash);
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
-
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -633,14 +676,14 @@ mod tests {
             .with_simple_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
-            .connect_mocked_client(asserter);
+            .connect_mocked_client(asserter.clone());
         let service = RealBlockchainService::new(
             provider,
             Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
         );
 
-        let submitted = service
-            .submit_mint(
+        let prepared = service
+            .prepare_mint_tx(
                 vault_address,
                 assets,
                 bot_wallet,
@@ -650,14 +693,48 @@ mod tests {
             )
             .await;
 
-        assert!(submitted.is_ok(), "Expected Ok but got: {submitted:?}");
-        let submitted = submitted.unwrap();
+        assert!(prepared.is_ok(), "Expected Ok but got: {prepared:?}");
+        let prepared = prepared.unwrap();
+        assert!(!prepared.tx.is_empty());
+        assert_eq!(prepared.external_tx_id, expected_external_tx_id);
+        let decoded = TxEnvelope::decode_2718(&mut prepared.tx.as_slice())
+            .expect("prepared mint must contain a valid EIP-2718 transaction");
+        assert_eq!(decoded.nonce(), prepared.nonce);
+        assert_eq!(*decoded.tx_hash(), prepared.hash);
+
+        let mut malformed = prepared.clone();
+        malformed.tx = vec![0x02];
+        assert!(matches!(
+            service.submit_mint(&malformed).await,
+            Err(VaultError::Eip2718(_))
+        ));
+
+        let mut wrong_hash = prepared.clone();
+        wrong_hash.hash = B256::ZERO;
+        assert!(matches!(
+            service.submit_mint(&wrong_hash).await,
+            Err(VaultError::PreparedMintHashMismatch { .. })
+        ));
+
+        let mut wrong_nonce = prepared.clone();
+        wrong_nonce.nonce = prepared.nonce + 1;
+        assert!(matches!(
+            service.submit_mint(&wrong_nonce).await,
+            Err(VaultError::PreparedMintNonceMismatch { .. })
+        ));
+
+        receipt.transaction_hash = prepared.hash;
+        asserter.push_success(&prepared.hash);
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let submitted = service.submit_mint(&prepared).await.unwrap();
+        assert_eq!(submitted.tx_id, TxId::from(prepared.hash));
 
         let result = service.confirm_mint(&submitted.tx_id).await;
 
         assert!(result.is_ok(), "Expected Ok but got: {result:?}");
         let mint_result = result.unwrap();
-        assert_eq!(mint_result.tx_hash, tx_hash);
+        assert_eq!(mint_result.tx_hash, prepared.hash);
         assert_eq!(mint_result.receipt_id, receipt_id);
         assert_eq!(mint_result.shares_minted, shares);
         assert_eq!(mint_result.gas_used, 0x5208);
@@ -686,7 +763,7 @@ mod tests {
         let receipt_with_bloom =
             ReceiptWithBloom::new(consensus_receipt, Bloom::default());
 
-        let receipt = TransactionReceipt {
+        let mut receipt = TransactionReceipt {
             transaction_hash: tx_hash,
             transaction_index: Some(0),
             block_hash: Some(fixed_bytes!(
@@ -723,10 +800,6 @@ mod tests {
         asserter.push_success(&100_000_u64);
         asserter.push_success(&1_000_000_000_u64);
         asserter.push_success(&0u64);
-        asserter.push_success(&tx_hash);
-        asserter.push_success(&receipt);
-        asserter.push_success(&receipt);
-
         let signer = PrivateKeySigner::random();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -735,14 +808,14 @@ mod tests {
             .with_simple_nonce_management()
             .filler(ChainIdFiller::default())
             .wallet(EthereumWallet::from(signer))
-            .connect_mocked_client(asserter);
+            .connect_mocked_client(asserter.clone());
         let service = RealBlockchainService::new(
             provider,
             Arc::new(OaSchemaCache::fixed(TEST_OA_SCHEMA)),
         );
 
-        let submitted = service
-            .submit_mint(
+        let prepared = service
+            .prepare_mint_tx(
                 vault_address,
                 assets,
                 bot_wallet,
@@ -752,8 +825,13 @@ mod tests {
             )
             .await;
 
-        assert!(submitted.is_ok(), "Expected Ok but got: {submitted:?}");
-        let submitted = submitted.unwrap();
+        assert!(prepared.is_ok(), "Expected Ok but got: {prepared:?}");
+        let prepared = prepared.unwrap();
+        receipt.transaction_hash = prepared.hash;
+        asserter.push_success(&prepared.hash);
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let submitted = service.submit_mint(&prepared).await.unwrap();
 
         let result = service.confirm_mint(&submitted.tx_id).await;
 

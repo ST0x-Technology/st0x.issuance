@@ -191,9 +191,14 @@ initial request through journal confirmation to on-chain minting and callback.
   `MintingStarted`. Intent is persisted before the network call so that a crash
   during submission leaves the aggregate in a recoverable `Minting` state rather
   than `JournalConfirmed` (which would lose track of the submission)
-- `SubmitMint { issuer_request_id }` - Submit the on-chain deposit to the
-  signing backend. Requires `Minting` state. Produces `MintTxSubmitted` on
-  success or `MintingFailed` on failure
+- `PrepareMint { issuer_request_id }` - Build and sign the exact on-chain
+  deposit transaction. Requires `Minting` state. Produces `MintTxIntended`,
+  which persists the raw transaction, hash, nonce, signing time, and stable
+  external transaction ID before any broadcast
+- `SubmitMint { issuer_request_id }` - Broadcast the exact transaction stored
+  by `MintTxIntended`. Requires `MintIntended` state. Produces
+  `MintTxSubmitted` on success. An uncertain broadcast failure leaves the
+  aggregate in `MintIntended`, so recovery rebroadcasts the same bytes
 - `ConfirmMint { issuer_request_id, tx_id }` - Confirm a previously submitted
   mint transaction. Re-fetches the on-chain receipt for the stored `tx_id` and
   produces `TokensMinted` or `MintingFailed`
@@ -201,7 +206,8 @@ initial request through journal confirmation to on-chain minting and callback.
   mint completion
 - `Recover { issuer_request_id, mode }` - Recover a mint stuck in an incomplete
   state. Startup recovery drives any mint in `JournalConfirmed`, `Minting`,
-  `MintingFailed`, or `CallbackPending` state; at runtime, live retry scheduling
+  `MintIntended`, `TxSubmitted`, `MintingFailed`, or `CallbackPending` state;
+  at runtime, live retry scheduling
   is triggered specifically when a mint lands in `MintingFailed` during the
   journal-confirmation flow. Both paths hand a mint that is waiting on a retry
   window to a background scheduled-recovery task, so retries fire on schedule
@@ -215,15 +221,20 @@ initial request through journal confirmation to on-chain minting and callback.
   an operator can retry after fixing the underlying cause. This prevents
   double-minting after crashes while ensuring terminal failures can be retried
   with new `externalTxId`s
+- `RecoverWalletStep { issuer_request_id, mode }` - Internal recovery variant
+  used only while the wallet lock is held. It performs the same recoverable
+  on-chain steps as `Recover`, but becomes a no-op if a concurrent transition
+  already reached `CallbackPending`; the next recovery iteration then sends
+  the callback without the wallet lock
 - `RecoverFromReceipt { issuer_request_id, tx_hash }` - Recover a mint that
-  failed during the minting step when an ITN receipt is discovered on-chain.
-  Triggered by the receipt monitor when it finds a Deposit event with a matching
-  `issuer_request_id` for a mint in `MintingFailed` state. Unlike `Recover`,
-  this command only accepts `MintingFailed` state where the non-failed
-  predecessor was `Minting` (meaning a transaction was actually submitted).
-  Rejects `JournalConfirmed` and `Minting` states because receipt discovery only
-  justifies recovery when the mint was marked as failed after submission. Emits
-  `ExistingMintRecovered` and proceeds to callback
+  failed during the minting step, or whose broadcast outcome was not persisted,
+  when an ITN receipt is discovered on-chain. Triggered by the receipt monitor
+  when it finds a Deposit event with a matching `issuer_request_id`. Accepts
+  `MintIntended`, because the persisted transaction may have been mined before
+  submission recording, and `MintingFailed` when the non-failed predecessor was
+  `Minting`. Rejects `JournalConfirmed` and `Minting` because neither state
+  proves a transaction was signed or submitted. Emits `ExistingMintRecovered`
+  and proceeds to callback
 
 **Events:**
 
@@ -231,6 +242,8 @@ initial request through journal confirmation to on-chain minting and callback.
 - `JournalConfirmed` - Alpaca journal transfer confirmed
 - `JournalRejected` - Alpaca journal transfer rejected (terminal)
 - `MintingStarted` - Mint intent recorded (aggregate moves to `Minting`)
+- `MintTxIntended` - Exact signed mint transaction persisted before broadcast
+  (carries raw bytes, hash, nonce, signing time, and external transaction ID)
 - `MintTxSubmitted` - Mint transaction submitted to signing backend (carries
   `external_tx_id` and `tx_id` — the on-chain tx hash — for crash recovery)
 - `TokensMinted` - On-chain mint succeeded (carries tx details)
@@ -263,48 +276,74 @@ dual-format reader or restore the pre-cutover backup.
 | `ConfirmJournal`     | `JournalConfirmed`      | Journal confirmed                               |
 | `RejectJournal`      | `JournalRejected`       | Terminal failure                                |
 | `Deposit`            | `MintingStarted`        | Records intent (no network call)                |
-| `SubmitMint`         | See below               | Submits to signing backend                      |
+| `PrepareMint`        | `MintTxIntended`         | Persists exact signed tx before broadcast       |
+| `SubmitMint`         | `MintTxSubmitted`        | Broadcasts the persisted transaction            |
 | `ConfirmMint`        | See below               | Confirms submitted tx                           |
 | `SendCallback`       | `MintCompleted`         | Calls Alpaca callback                           |
 | `Recover`            | See below               | Checks receipt inventory                        |
-| `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt-triggered recovery from `MintingFailed` |
+| `RecoverWalletStep`  | See below               | Never sends callbacks while wallet-locked       |
+| `RecoverFromReceipt` | `ExistingMintRecovered` | Receipt recovery from intended or failed state  |
 
-`Deposit` emits only `MintingStarted` (intent). The actual submission is handled
-by `SubmitMint`, which emits either `MintTxSubmitted` (success) or
-`MintingFailed` (failure). This two-step design persists intent before the
-network call, so a crash during submission leaves the aggregate in `Minting`
-state (recoverable) rather than `JournalConfirmed`.
+`Deposit` emits only `MintingStarted` (business intent). `PrepareMint` builds
+and signs the transaction, then persists the exact bytes and hash in
+`MintTxIntended`. Only `SubmitMint` may broadcast those persisted bytes. A
+crash before `MintTxIntended` cannot have broadcast anything; a crash after it
+causes recovery to rebroadcast or poll that same transaction, never prepare a
+second one. A crash after broadcast but before `MintTxSubmitted` therefore
+remains safe because rebroadcasting identical signed bytes is idempotent.
+Preparing, persisting, and initially broadcasting a mint transaction share one
+wallet critical section. Startup mint recovery processes its persisted intents
+in nonce order before mint states that may prepare a new transaction. Mint and
+redemption recovery run concurrently so persisted transactions from either
+domain can fill lower nonce gaps while higher transactions await confirmation.
+Live mint and burn preparation query the authoritative event log and are
+blocked while any other wallet intent remains unresolved; this safety check
+does not depend on a fallible read-model projection. Together these rules
+prevent two aggregate commands from signing the same wallet nonce without
+relying on in-memory nonce state that would be lost on restart.
+Each live burn attempt waits at most 30 seconds behind an earlier unresolved
+wallet intent. On timeout it prepares and broadcasts nothing, leaves the
+redemption recoverable, and defers the burn to recovery rather than occupying
+the live flow indefinitely.
+
+The issuer is a single-writer service: exactly one process may own a given
+SQLite event store and signing wallet at a time. Horizontal replicas sharing a
+wallet are unsupported because the wallet critical section is process-local.
+Deployments must terminate the old process before the replacement begins
+serving or recovering work.
 
 `ConfirmMint` re-fetches the on-chain receipt for the submitted `tx_id` and
 emits either `TokensMinted` (success) or `MintingFailed` (failure).
 
 `Recover` checks the receipt inventory for a receipt matching the
 `issuer_request_id`. If found, emits `ExistingMintRecovered`. If not found and
-in `Minting` state, submits and emits `MintTxSubmitted` (or `MintingFailed` on
-failure). If in `TxSubmitted` (or `MintingFailed` with a known prior
-transaction), calls `ConfirmMint` with the stored `tx_id` to re-fetch the
-on-chain receipt. `TxSubmitted` means the signing backend accepted the
-submission and returned a transaction identifier; it does not mean the
-transaction succeeded on-chain. `ConfirmMint` waits for the receipt and emits
-`TokensMinted` for a successful transaction or `MintingFailed` for a reverted or
-otherwise failed transaction. Retry transactions use
+in `Minting` state, prepares and persists `MintTxIntended`. If in
+`MintIntended`, rebroadcasts the persisted raw transaction. If in `TxSubmitted`
+(or `MintingFailed` with a known prior transaction), calls `ConfirmMint` with
+the stored `tx_id` to re-fetch the on-chain receipt. `TxSubmitted` means the
+signing backend accepted the submission and returned a transaction identifier;
+it does not mean the transaction succeeded on-chain. `ConfirmMint` waits for
+the receipt and emits `TokensMinted` for a successful transaction or
+`MintingFailed` for a reverted or otherwise failed transaction. Retry
+transactions use
 `mint-{issuer_request_id}-retry-{n}` where automatic retries use n = 1..4 and
 the delay schedule is 1m, 10m, 30m, then 1h.
 
 The retry-delay/exhaustion schedule is driven by a `MintingFailed` attempt
-counter that advances on every failure — including a submission that fails
-before the transaction lands (no `MintTxSubmitted` predecessor). In that case
-the `external_tx_id` is reused unchanged; the receipt backfiller's on-chain scan
-for existing deposits guards against double-minting, so resubmission stays
-idempotent, while the schedule still escalates and eventually exhausts. A
+counter. A transaction-preparation failure records `MintingFailed`; an
+uncertain broadcast failure instead preserves `MintIntended` and recovery
+rebroadcasts the exact same signed bytes without advancing the attempt. A
 running service keeps driving deferred retries via a background
 scheduled-recovery task (also spawned at startup and after a manual reprocess),
 rather than waiting for the next restart.
 
 `RecoverFromReceipt` is triggered when the receipt monitor discovers an on-chain
-receipt for a mint in `MintingFailed` state (where the predecessor was
-`Minting`). Emits `ExistingMintRecovered`, transitioning to `CallbackPending`,
-then continues through the existing `SendCallback` -> `MintCompleted` flow.
+receipt for a mint in `MintIntended`, or in `MintingFailed` where the predecessor
+was `Minting`. It emits `ExistingMintRecovered`, transitions to
+`CallbackPending`, then continues through the existing `SendCallback` ->
+`MintCompleted` flow without rebroadcasting. Automated recovery persists the
+`CallbackPending` boundary before delivering the callback, so receipt polling
+and Alpaca requests do not hold the wallet transaction lock.
 
 ### Redemption Aggregate
 
@@ -1371,11 +1410,14 @@ stateDiagram-v2
     PendingJournal --> JournalConfirmed: ConfirmJournal
     PendingJournal --> JournalRejected: RejectJournal
     JournalConfirmed --> Minting: Deposit (MintingStarted)
-    Minting --> TxSubmitted: SubmitMint (MintTxSubmitted)
-    Minting --> MintingFailed: SubmitMint (MintingFailed)
+    Minting --> MintIntended: PrepareMint (MintTxIntended)
+    Minting --> MintingFailed: PrepareMint (MintingFailed)
+    MintIntended --> TxSubmitted: SubmitMint (MintTxSubmitted)
+    MintIntended --> MintIntended: SubmitMint uncertain failure (no event)
+    MintIntended --> CallbackPending: Recover or RecoverFromReceipt (ExistingMintRecovered)
     TxSubmitted --> CallbackPending: ConfirmMint (TokensMinted)
     TxSubmitted --> MintingFailed: ConfirmMint (MintingFailed)
-    MintingFailed --> TxSubmitted: Recover after automatic retry delay, or manual reprocess (MintRetryStarted + MintTxSubmitted)
+    MintingFailed --> MintIntended: Recover after automatic retry delay, or manual reprocess (MintRetryStarted + MintTxIntended)
     MintingFailed --> CallbackPending: Recover (ExistingMintRecovered)
     MintingFailed --> CallbackPending: RecoverFromReceipt (ExistingMintRecovered)
     CallbackPending --> Completed: SendCallback

@@ -1,4 +1,8 @@
-use alloy::primitives::{Address, B256, Bytes, U256, b256};
+use alloy::consensus::{
+    SignableTransaction, Transaction, TxEnvelope, TxLegacy,
+};
+use alloy::eips::Encodable2718;
+use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256, b256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -7,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
-    MultiBurnResultEntry, ReceiptInformation, SubmittedTx, VaultError,
-    VaultService,
+    MultiBurnResultEntry, PreparedMintTx, ReceiptInformation, SubmittedTx,
+    VaultError, VaultService, WalletNonceGuard,
 };
 use crate::redemption::BurnExternalTxId;
 use crate::vault::{SendableTxWithHash, TxId};
@@ -50,6 +54,8 @@ enum MockBehavior {
     /// where signed-tx preparation fails before the tx is stored in the event.
     #[cfg(test)]
     PrepareTxFails,
+    #[cfg(test)]
+    InvalidPreparedMint,
 }
 
 /// Configured outcome for `verify_burn_tx` in tests, exercising the admin
@@ -85,6 +91,9 @@ impl Default for MockVerifyBurn {
 pub(crate) struct MockVaultService {
     behavior: MockBehavior,
     mint_delay_ms: u64,
+    wallet_nonce_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    wallet_lock_call_count: Arc<AtomicUsize>,
     call_count: Arc<AtomicUsize>,
     multi_burn_call_count: Arc<AtomicUsize>,
     /// Cached MintResult from submit_mint for retrieval in confirm_mint.
@@ -112,6 +121,9 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Success,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -134,6 +146,8 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Failure,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -151,6 +165,8 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::SubmitFailure,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -168,6 +184,8 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::ConfirmRevert,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -192,6 +210,8 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::SubmitRevert,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -209,6 +229,8 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::PrepareTxFails,
             mint_delay_ms: 0,
+            wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
             call_count: Arc::new(AtomicUsize::new(0)),
             multi_burn_call_count: Arc::new(AtomicUsize::new(0)),
             pending_mint_result: Arc::new(Mutex::new(None)),
@@ -222,6 +244,13 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_invalid_prepared_mint() -> Self {
+        let mut service = Self::new_success();
+        service.behavior = MockBehavior::InvalidPreparedMint;
+        service
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_delay(mut self, delay_ms: u64) -> Self {
         self.mint_delay_ms = delay_ms;
@@ -231,6 +260,11 @@ impl MockVaultService {
     #[cfg(test)]
     pub(crate) fn get_call_count(&self) -> usize {
         self.call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_wallet_lock_call_count(&self) -> usize {
+        self.wallet_lock_call_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -250,6 +284,7 @@ impl MockVaultService {
 
     #[cfg(test)]
     pub(crate) fn reset(&self) {
+        self.wallet_lock_call_count.store(0, Ordering::Relaxed);
         self.call_count.store(0, Ordering::Relaxed);
         self.multi_burn_call_count.store(0, Ordering::Relaxed);
         *self.last_call.lock().unwrap() = None;
@@ -327,7 +362,7 @@ fn default_multi_burn_result(dust_shares: U256) -> MultiBurnResult {
 #[async_trait]
 impl VaultService for MockVaultService {
     #[cfg_attr(not(test), allow(unused_variables))]
-    async fn submit_mint(
+    async fn prepare_mint_tx(
         &self,
         vault: Address,
         assets: U256,
@@ -335,12 +370,7 @@ impl VaultService for MockVaultService {
         _user: Address,
         receipt_info: ReceiptInformation,
         external_tx_id: Option<String>,
-    ) -> Result<SubmittedTx, VaultError> {
-        #[cfg(test)]
-        if matches!(self.behavior, MockBehavior::SubmitFailure) {
-            return Err(VaultError::InvalidReceipt);
-        }
-
+    ) -> Result<PreparedMintTx, VaultError> {
         if self.mint_delay_ms > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 self.mint_delay_ms,
@@ -370,11 +400,24 @@ impl VaultService for MockVaultService {
             }
         };
 
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce: 1,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(vault),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(1), false);
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+        let tx_hash = *envelope.tx_hash();
+
         *self
             .pending_mint_result
             .lock()
             .expect("pending_mint_result mutex poisoned") = Some(MintResult {
-            tx_hash: MOCK_MINT_TX_HASH,
+            tx_hash,
             receipt_id: U256::from(1),
             shares_minted: assets,
             gas_used: 21000,
@@ -382,10 +425,38 @@ impl VaultService for MockVaultService {
             receipt_info_bytes,
         });
 
-        Ok(SubmittedTx {
+        #[cfg(test)]
+        let persisted_hash =
+            if matches!(self.behavior, MockBehavior::InvalidPreparedMint) {
+                B256::ZERO
+            } else {
+                tx_hash
+            };
+        #[cfg(not(test))]
+        let persisted_hash = tx_hash;
+
+        Ok(PreparedMintTx {
+            tx: envelope.encoded_2718(),
+            hash: persisted_hash,
+            nonce: envelope.nonce(),
+            signed_at: chrono::Utc::now(),
             external_tx_id: external_tx_id
                 .unwrap_or_else(|| "mock-mint".to_string()),
-            tx_id: MOCK_MINT_TX_HASH.into(),
+        })
+    }
+
+    async fn submit_mint(
+        &self,
+        prepared_tx: &PreparedMintTx,
+    ) -> Result<SubmittedTx, VaultError> {
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitFailure) {
+            return Err(VaultError::InvalidReceipt);
+        }
+
+        Ok(SubmittedTx {
+            external_tx_id: prepared_tx.external_tx_id.clone(),
+            tx_id: prepared_tx.hash.into(),
         })
     }
 
@@ -436,7 +507,10 @@ impl VaultService for MockVaultService {
             MockBehavior::ConfirmRevert
             | MockBehavior::ConfirmPending
             | MockBehavior::SubmitRevert
-            | MockBehavior::PrepareTxFails => Err(VaultError::InvalidReceipt),
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
+                Err(VaultError::InvalidReceipt)
+            }
         }
     }
 
@@ -552,7 +626,9 @@ impl VaultService for MockVaultService {
             // PrepareTxFails never reaches confirm (fails before submit);
             // if somehow called, return the cached result.
             #[cfg(test)]
-            MockBehavior::SubmitRevert | MockBehavior::PrepareTxFails => {
+            MockBehavior::SubmitRevert
+            | MockBehavior::PrepareTxFails
+            | MockBehavior::InvalidPreparedMint => {
                 let result = self
                     .pending_burn_result
                     .lock()
@@ -622,6 +698,12 @@ impl VaultService for MockVaultService {
         }
         Err(VaultError::InvalidReceipt)
     }
+
+    async fn lock_wallet(&self) -> WalletNonceGuard {
+        #[cfg(test)]
+        self.wallet_lock_call_count.fetch_add(1, Ordering::Relaxed);
+        Some(self.wallet_nonce_lock.clone().lock_owned().await)
+    }
 }
 
 #[cfg(test)]
@@ -673,8 +755,8 @@ mod tests {
             address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        let submitted = mock
-            .submit_mint(
+        let prepared = mock
+            .prepare_mint_tx(
                 vault,
                 assets,
                 bot_wallet,
@@ -684,6 +766,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let submitted = mock.submit_mint(&prepared).await.unwrap();
 
         assert_eq!(submitted.external_tx_id, "mock-mint");
 
@@ -706,8 +789,8 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         // Submit always succeeds
-        let submitted = mock
-            .submit_mint(
+        let prepared = mock
+            .prepare_mint_tx(
                 vault,
                 assets,
                 bot_wallet,
@@ -717,6 +800,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let submitted = mock.submit_mint(&prepared).await.unwrap();
 
         // Confirm returns the failure
         let result = mock.confirm_mint(&submitted.tx_id).await;
@@ -734,7 +818,7 @@ mod tests {
 
         assert_eq!(mock.get_call_count(), 0);
 
-        mock.submit_mint(
+        mock.prepare_mint_tx(
             vault,
             assets,
             bot_wallet,
@@ -759,7 +843,7 @@ mod tests {
 
         assert!(mock.get_last_call().is_none());
 
-        mock.submit_mint(
+        mock.prepare_mint_tx(
             vault,
             assets,
             bot_wallet,
@@ -795,7 +879,7 @@ mod tests {
         let receipt_info = test_receipt_info();
 
         let start = tokio::time::Instant::now();
-        mock.submit_mint(
+        mock.prepare_mint_tx(
             vault,
             assets,
             bot_wallet,
@@ -820,7 +904,7 @@ mod tests {
             address!("0x1111111111111111111111111111111111111111");
         let receipt_info = test_receipt_info();
 
-        mock.submit_mint(
+        mock.prepare_mint_tx(
             vault,
             assets,
             bot_wallet,
@@ -915,8 +999,8 @@ mod tests {
     #[tokio::test]
     async fn test_submit_mint_failure() {
         let mock = MockVaultService::new_submit_failure();
-        let result = mock
-            .submit_mint(
+        let prepared = mock
+            .prepare_mint_tx(
                 test_vault(),
                 U256::from(1000),
                 test_receiver(),
@@ -924,7 +1008,9 @@ mod tests {
                 test_receipt_info(),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
+        let result = mock.submit_mint(&prepared).await;
 
         assert!(
             matches!(result, Err(VaultError::InvalidReceipt)),

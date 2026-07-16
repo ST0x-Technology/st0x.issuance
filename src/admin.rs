@@ -1,6 +1,5 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
-use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::AggregateError;
@@ -19,9 +18,9 @@ use crate::alpaca::{
 };
 use crate::auth::InternalAuth;
 use crate::mint::{
-    IssuerMintRequestId, Mint, MintCommand, MintEvent, MintView,
+    DriveOutcome, IssuerMintRequestId, Mint, MintCommand, MintEvent, MintView,
     TokenizationRequestId, find_by_issuer_request_id,
-    find_stuck as find_stuck_mints, recovery::enqueue_scheduled_mint_recovery,
+    find_stuck as find_stuck_mints, recover_mint_manually,
 };
 use crate::redemption::Redemption;
 use crate::redemption::burn_manager::{
@@ -1010,13 +1009,13 @@ const fn map_burn_manager_error(err: &BurnManagerError) -> Status {
     ),
     security(("internal_api_key" = []))
 )]
-#[tracing::instrument(skip(_auth, store, pool, apalis_pool))]
+#[tracing::instrument(skip(_auth, store, vault_service, pool))]
 #[post("/admin/reprocess/mint/<aggregate_id>")]
 pub(crate) async fn reprocess_mint(
     _auth: InternalAuth,
     store: &rocket::State<Arc<Store<Mint>>>,
+    vault_service: &rocket::State<Arc<dyn VaultService>>,
     pool: &rocket::State<Pool<Sqlite>>,
-    apalis_pool: &rocket::State<ApalisSqlitePool>,
     aggregate_id: &str,
 ) -> Result<Json<ReprocessResponse>, Status> {
     let issuer_request_id: IssuerMintRequestId = aggregate_id
@@ -1041,6 +1040,7 @@ pub(crate) async fn reprocess_mint(
                 MintView::JournalConfirmed { .. } => "JournalConfirmed",
                 MintView::JournalRejected { .. } => "JournalRejected",
                 MintView::Minting { .. } => "Minting",
+                MintView::MintIntended { .. } => "MintIntended",
                 MintView::MintTxSubmitted { .. } => "MintTxSubmitted",
                 MintView::CallbackPending { .. } => "CallbackPending",
                 MintView::MintingFailed { .. } => "MintingFailed",
@@ -1054,48 +1054,24 @@ pub(crate) async fn reprocess_mint(
         }
     };
 
-    store
-        .send(
-            &issuer_request_id,
-            MintCommand::Recover {
-                issuer_request_id: issuer_request_id.clone(),
-                mode: crate::mint::MintRecoveryMode::Manual,
-            },
-        )
-        .await
-        .map_err(|err| {
-            error!(target: "admin", aggregate_id = aggregate_id,
-                error = %err,
-                "Failed to reprocess mint"
-            );
-            match err {
-                AggregateError::UserError(_) => Status::UnprocessableEntity,
-                _ => Status::InternalServerError,
-            }
-        })?;
+    let outcome = recover_mint_manually(
+        store.inner().as_ref(),
+        vault_service.inner(),
+        issuer_request_id,
+    )
+    .await;
+    if !matches!(outcome, DriveOutcome::Done) {
+        error!(target: "admin", aggregate_id = aggregate_id,
+            ?outcome,
+            "Failed to drive manual mint recovery to completion"
+        );
+        return Err(Status::UnprocessableEntity);
+    }
 
     info!(target: "admin", aggregate_id = aggregate_id,
         previous_state = %current_state,
         "Mint reprocessed successfully"
     );
-
-    // A single manual Recover advances the mint by one step (e.g. submits the
-    // next retry, leaving it in TxSubmitted). Enqueue a durable recovery
-    // job so it is driven to completion instead of stalling until the next
-    // restart or another manual reprocess.
-    enqueue_scheduled_mint_recovery(
-        pool.inner(),
-        apalis_pool.inner(),
-        issuer_request_id,
-    )
-    .await
-    .map_err(|error| {
-        error!(target: "admin", aggregate_id = aggregate_id,
-            error = %error,
-            "Failed to enqueue scheduled mint recovery after reprocess"
-        );
-        Status::InternalServerError
-    })?;
 
     Ok(Json(ReprocessResponse {
         aggregate_type: AggregateKind::Mint,
@@ -1619,6 +1595,17 @@ fn mint_view_summary(view: &MintView) -> Option<MintStuckSummary> {
             detail: "Deposit in progress".to_string(),
             timestamp: *minting_started_at,
         }),
+        MintView::MintIntended {
+            tokenization_request_id,
+            minting_started_at,
+            ..
+        } => Some(MintStuckSummary {
+            class: InProgress,
+            tokenization_request_id: Some(tokenization_request_id.clone()),
+            state: "MintIntended".to_string(),
+            detail: "Signed transaction awaiting broadcast".to_string(),
+            timestamp: *minting_started_at,
+        }),
         MintView::MintTxSubmitted {
             tokenization_request_id,
             minting_started_at,
@@ -1667,6 +1654,7 @@ fn mint_view_asset(
         | MintView::JournalConfirmed { underlying, quantity, .. }
         | MintView::JournalRejected { underlying, quantity, .. }
         | MintView::Minting { underlying, quantity, .. }
+        | MintView::MintIntended { underlying, quantity, .. }
         | MintView::MintTxSubmitted { underlying, quantity, .. }
         | MintView::MintingFailed { underlying, quantity, .. }
         | MintView::CallbackPending { underlying, quantity, .. } => {

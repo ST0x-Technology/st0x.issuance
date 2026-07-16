@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -24,6 +25,36 @@ use crate::mint::TokenizationRequestId;
 use crate::redemption::burn_manager::{
     extract_tx_hash, is_pending_burn_confirmation, should_release_reserved_burn,
 };
+
+pub(crate) async fn has_unresolved_burn_intent(
+    pool: &Pool<Sqlite>,
+    excluding: Option<&IssuerRedemptionRequestId>,
+) -> Result<bool, sqlx::Error> {
+    let excluding = excluding.map(ToString::to_string).unwrap_or_default();
+    let exists = sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM events AS intent
+            WHERE intent.aggregate_type = 'Redemption'
+              AND intent.event_type = 'RedemptionEvent::BurnIntended'
+              AND intent.aggregate_id != ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM events AS later
+                  WHERE later.aggregate_type = intent.aggregate_type
+                    AND later.aggregate_id = intent.aggregate_id
+                    AND later.sequence > intent.sequence
+              )
+        )
+        ",
+    )
+    .bind(excluding)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
 
 /// Issuer request ID for redemption operations.
 ///

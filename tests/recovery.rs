@@ -337,16 +337,18 @@ async fn test_mint_recovery_after_view_deletion()
     Ok(())
 }
 
-/// Tests recovery from `Minting` state when the on-chain mint already succeeded.
+/// Tests restart recovery from `MintIntended` after the exact transaction
+/// broadcast and mined but before submission was durably recorded.
 ///
 /// Scenario:
 /// 1. Complete a mint normally (creates on-chain receipt)
-/// 2. Roll back event store to `Minting` state (delete TokensMinted and later events)
+/// 2. Roll back the event store to `MintIntended` (keep the persisted raw tx)
 /// 3. Restart service — views are cleared and rebuilt repopulates from rolled-back events
 /// 4. Recovery detects the existing receipt via receipt inventory and records
 ///    mint success without re-minting
+#[tracing_test::traced_test]
 #[tokio::test]
-async fn test_mint_recovery_from_minting_state_when_receipt_exists()
+async fn test_mint_recovery_from_intended_state_when_receipt_exists()
 -> Result<(), Box<dyn std::error::Error>> {
     let _recovery_test_guard = recovery_test_guard().await;
 
@@ -396,23 +398,30 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         &user_provider,
     );
     let shares_before = harness::wait_for_shares(&vault, user_wallet).await?;
+    harness::wait_for_mock_hits(&mint_callback_mock, 1).await?;
 
-    drop(client1);
+    client1.terminate().await;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        1,
+        "the first service must finish exactly one callback before restart"
+    );
 
     let query_pool =
         SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
 
-    // Roll back to Minting state: keep events 1-3 (Initiated, JournalConfirmed, MintingStarted)
+    // Keep the exact persisted intent but remove MintTxSubmitted and every
+    // later event, reproducing a crash after broadcast and mining.
     let aggregate_id = issuer_request_id.clone();
-    sqlx::query!(
-        r#"
+    sqlx::query(
+        r"
         DELETE FROM events
         WHERE aggregate_type = 'Mint'
           AND aggregate_id = ?
-          AND sequence > 3
-        "#,
-        aggregate_id
+          AND sequence > 4
+        ",
     )
+    .bind(&aggregate_id)
     .execute(&query_pool)
     .await?;
 
@@ -427,44 +436,28 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
     .fetch_one(&query_pool)
     .await?;
     assert_eq!(
-        event_count.count, 3,
-        "Expected exactly 3 events (Initiated, JournalConfirmed, MintingStarted)"
+        event_count.count, 4,
+        "Expected the lifecycle prefix through MintTxIntended"
     );
 
     query_pool.close().await;
 
     // Restart — views are cleared and rebuilt repopulates from events, recovery
-    // finds the Minting mint and checks for an existing receipt.
+    // finds the MintIntended mint and checks the backfilled receipt before
+    // attempting another broadcast.
     let (config2, _mock_subgraph2) =
         harness::create_config_with_db(&db_url, &mock_alpaca, &evm)?;
     let rocket2 = initialize_rocket(config2).await?;
     let _client2 =
         rocket::local::asynchronous::Client::tracked(rocket2).await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    let query_pool2 =
-        SqlitePoolOptions::new().max_connections(1).connect(&db_url).await?;
-
-    let final_event_count = sqlx::query!(
-        r#"
-        SELECT COUNT(*) as "count!: i32"
-        FROM events
-        WHERE aggregate_type = 'Mint' AND aggregate_id = ?
-        "#,
-        aggregate_id
-    )
-    .fetch_one(&query_pool2)
-    .await?;
-
-    // Recovery should have added TokensMinted event (recognizing the existing receipt)
-    // and possibly MintCompleted after callback
-    assert!(
-        final_event_count.count > 3,
-        "Recovery should have processed the Minting mint and added events. \
-         Expected >3 events, found {}. Recovery for Minting state not implemented.",
-        final_event_count.count
+    harness::wait_for_mock_hits(&mint_callback_mock, 2).await?;
+    assert_eq!(
+        mint_callback_mock.calls_async().await,
+        2,
+        "restart recovery must deliver exactly one additional callback"
     );
+    assert!(logs_contain("Found existing receipt, recording recovery"));
 
     // Verify the user still has the same shares (no double mint)
     let shares_after = vault.balanceOf(user_wallet).call().await?;
@@ -472,8 +465,6 @@ async fn test_mint_recovery_from_minting_state_when_receipt_exists()
         shares_after, shares_before,
         "User should have same shares (no double mint)"
     );
-
-    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     Ok(())
 }

@@ -316,7 +316,7 @@ async fn test_redemption_returns_dust_to_user()
         "Minted shares should match expected amount"
     );
 
-    mint_callback_mock.assert();
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = create_provider()
@@ -415,7 +415,7 @@ async fn test_redemption_no_dust_when_9_decimals()
     let expected_shares = U256::from(123_456_789_000_000_000_u64);
     assert_eq!(minted_shares, expected_shares);
 
-    mint_callback_mock.assert();
+    harness::wait_for_mock_hit(&mint_callback_mock).await?;
 
     let user_wallet_instance = EthereumWallet::from(user_signer);
     let user_provider = create_provider()

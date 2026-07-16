@@ -18,14 +18,18 @@ use crate::alpaca::{AlpacaService, MintCallbackRequest};
 use crate::receipt_inventory::{
     MintedReceiptParams, ReceiptId, ReceiptService, Shares,
 };
+use crate::redemption::has_unresolved_burn_intent;
 use crate::tokenized_asset::view::find_vault_by_underlying;
-use crate::vault::{ReceiptInformation, TxId, VaultError, VaultService};
+use crate::vault::{
+    PreparedMintTx, ReceiptInformation, TxId, VaultError, VaultService,
+};
 
 pub use api::MintResponse;
 
 pub(crate) use api::{confirm_journal, initiate_mint};
 pub(crate) use cmd::{MintCommand, MintRecoveryMode};
 pub(crate) use event::MintEvent;
+pub(crate) use recovery::{DriveOutcome, recover_mint_manually};
 pub(crate) use view::{
     MintView, find_all_recoverable_mints, find_by_issuer_request_id, find_stuck,
 };
@@ -37,6 +41,41 @@ pub(crate) struct MintServices {
     pub(crate) receipts: Arc<dyn ReceiptService>,
     pub(crate) pool: Pool<Sqlite>,
     pub(crate) bot: Address,
+}
+
+pub(crate) async fn has_unresolved_mint_intent(
+    pool: &Pool<Sqlite>,
+    excluding: Option<&IssuerMintRequestId>,
+) -> Result<bool, sqlx::Error> {
+    let excluding = excluding.map(ToString::to_string).unwrap_or_default();
+    let exists = sqlx::query_scalar::<_, bool>(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM events AS intent
+            WHERE intent.aggregate_type = 'Mint'
+              AND intent.event_type = 'MintEvent::MintTxIntended'
+              AND intent.aggregate_id != ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM events AS later
+                  WHERE later.aggregate_type = intent.aggregate_type
+                    AND later.aggregate_id = intent.aggregate_id
+                    AND later.sequence > intent.sequence
+                    AND later.event_type IN (
+                        'MintEvent::MintTxSubmitted',
+                        'MintEvent::TokensMinted',
+                        'MintEvent::ExistingMintRecovered'
+                    )
+              )
+        )
+        ",
+    )
+    .bind(excluding)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
 }
 
 pub(crate) use crate::account::ClientId;
@@ -141,6 +180,21 @@ pub(crate) enum Mint {
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
     },
+    /// Exact signed transaction persisted before broadcast.
+    TxIntended {
+        issuer_request_id: IssuerMintRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        quantity: Quantity,
+        underlying: UnderlyingSymbol,
+        token: TokenSymbol,
+        network: Network,
+        client_id: ClientId,
+        wallet: Address,
+        initiated_at: DateTime<Utc>,
+        journal_confirmed_at: DateTime<Utc>,
+        minting_started_at: DateTime<Utc>,
+        prepared_tx: PreparedMintTx,
+    },
     /// Transaction submitted to signing backend, awaiting on-chain confirmation.
     /// The `tx_id` enables recovery: on restart, the bot resumes
     /// polling this transaction instead of resubmitting (which would double-mint).
@@ -156,6 +210,7 @@ pub(crate) enum Mint {
         initiated_at: DateTime<Utc>,
         journal_confirmed_at: DateTime<Utc>,
         minting_started_at: DateTime<Utc>,
+        prepared_tx: Option<PreparedMintTx>,
         external_tx_id: String,
         tx_id: TxId,
     },
@@ -276,6 +331,7 @@ impl Mint {
             Self::JournalConfirmed { .. } => "JournalConfirmed",
             Self::JournalRejected { .. } => "JournalRejected",
             Self::Minting { .. } => "Minting",
+            Self::TxIntended { .. } => "MintIntended",
             Self::TxSubmitted { .. } => "TxSubmitted",
             Self::CallbackPending { .. } => "CallbackPending",
             Self::MintingFailed { .. } => "MintingFailed",
@@ -364,6 +420,7 @@ impl Mint {
             return match self {
                 Self::JournalConfirmed { .. }
                 | Self::Minting { .. }
+                | Self::TxIntended { .. }
                 | Self::TxSubmitted { .. }
                 | Self::CallbackPending { .. } => AutomaticRetryDecision::Ready,
                 _ => AutomaticRetryDecision::NotRecoverable,
@@ -395,6 +452,7 @@ impl Mint {
             | Self::JournalConfirmed { tokenization_request_id, .. }
             | Self::JournalRejected { tokenization_request_id, .. }
             | Self::Minting { tokenization_request_id, .. }
+            | Self::TxIntended { tokenization_request_id, .. }
             | Self::TxSubmitted { tokenization_request_id, .. }
             | Self::CallbackPending { tokenization_request_id, .. }
             | Self::MintingFailed { tokenization_request_id, .. }
@@ -484,9 +542,8 @@ impl Mint {
         }])
     }
 
-    /// Submits the on-chain mint transaction to the signing backend.
-    /// Requires `Minting` state (set by prior `Deposit` command).
-    async fn handle_submit_mint(
+    /// Builds and signs the exact mint transaction without broadcasting it.
+    async fn handle_prepare_mint(
         &self,
         services: &MintServices,
         issuer_request_id: IssuerMintRequestId,
@@ -508,7 +565,7 @@ impl Mint {
 
         Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
 
-        let event = Self::execute_mint_submission(
+        let event = Self::execute_mint_preparation(
             services,
             MintSubmissionInput {
                 issuer_request_id,
@@ -526,9 +583,9 @@ impl Mint {
         Ok(vec![event])
     }
 
-    /// Shared submission logic: vault lookup, receipt info, submit_mint call.
-    /// Returns a single `TxSubmitted` or `MintingFailed` event.
-    async fn execute_mint_submission(
+    /// Shared preparation logic: vault lookup, receipt info, and signing.
+    /// Returns a persisted exact intent or a pre-broadcast failure.
+    async fn execute_mint_preparation(
         services: &MintServices,
         input: MintSubmissionInput<'_>,
     ) -> Result<MintEvent, MintError> {
@@ -542,6 +599,21 @@ impl Mint {
             receipt_note,
             external_tx_id,
         } = input;
+
+        let unresolved_mint = has_unresolved_mint_intent(
+            &services.pool,
+            Some(&issuer_request_id),
+        )
+        .await
+        .map_err(|error| MintError::AssetView { message: error.to_string() })?;
+        let unresolved_burn =
+            has_unresolved_burn_intent(&services.pool, None).await.map_err(
+                |error| MintError::AssetView { message: error.to_string() },
+            )?;
+        if unresolved_mint || unresolved_burn {
+            return Err(MintError::PendingWalletIntent);
+        }
+
         let vault = find_vault_by_underlying(&services.pool, underlying)
             .await
             .map_err(|e| MintError::AssetView { message: e.to_string() })?
@@ -566,7 +638,7 @@ impl Mint {
 
         match services
             .vault
-            .submit_mint(
+            .prepare_mint_tx(
                 vault,
                 assets,
                 services.bot,
@@ -576,20 +648,35 @@ impl Mint {
             )
             .await
         {
-            Ok(submitted) => {
+            Ok(prepared_tx) => {
+                if let Err(err) = prepared_tx.validate() {
+                    warn!(
+                        target: "mint",
+                        issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Mint transaction preparation returned an invalid signed envelope"
+                    );
+
+                    return Ok(MintEvent::MintingFailed {
+                        issuer_request_id,
+                        error: err.to_string(),
+                        failed_at: now,
+                    });
+                }
+
                 info!(
                     target: "mint",
                     issuer_request_id = %issuer_request_id,
-                    external_tx_id = %submitted.external_tx_id,
-                    tx_id = %submitted.tx_id,
-                    "Mint transaction submitted to signing backend"
+                    external_tx_id = %prepared_tx.external_tx_id,
+                    tx_hash = %prepared_tx.hash,
+                    nonce = prepared_tx.nonce,
+                    "Mint transaction intent prepared"
                 );
 
-                Ok(MintEvent::MintTxSubmitted {
+                Ok(MintEvent::MintTxIntended {
                     issuer_request_id,
-                    external_tx_id: submitted.external_tx_id,
-                    tx_id: submitted.tx_id,
-                    submitted_at: now,
+                    prepared_tx,
+                    intended_at: now,
                 })
             }
             Err(err) => {
@@ -597,7 +684,7 @@ impl Mint {
                     target: "mint",
                     issuer_request_id = %issuer_request_id,
                     error = %err,
-                    "Mint submission failed"
+                    "Mint transaction preparation failed"
                 );
 
                 Ok(MintEvent::MintingFailed {
@@ -607,6 +694,63 @@ impl Mint {
                 })
             }
         }
+    }
+
+    /// Broadcasts only the exact signed transaction persisted by
+    /// `MintTxIntended`. A broadcast error is returned without an event so the
+    /// aggregate remains recoverable in `MintIntended`.
+    async fn handle_submit_mint(
+        &self,
+        services: &MintServices,
+        issuer_request_id: IssuerMintRequestId,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        let Self::TxIntended {
+            issuer_request_id: expected_id,
+            prepared_tx,
+            ..
+        } = self
+        else {
+            return Err(MintError::NotInMintIntendedState {
+                current_state: self.state_name().to_string(),
+            });
+        };
+
+        Self::validate_issuer_request_id(expected_id, &issuer_request_id)?;
+
+        let submitted = match services.vault.submit_mint(prepared_tx).await {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                warn!(
+                    target: "mint",
+                    issuer_request_id = %issuer_request_id,
+                    tx_hash = %prepared_tx.hash,
+                    error = %error,
+                    "Persisted mint transaction broadcast failed; keeping intent for recovery"
+                );
+                return Err(MintError::Vault { message: error.to_string() });
+            }
+        };
+
+        if submitted.tx_id != TxId::from(prepared_tx.hash)
+            || submitted.external_tx_id != prepared_tx.external_tx_id
+        {
+            return Err(MintError::SubmittedTransactionMismatch);
+        }
+
+        info!(
+            target: "mint",
+            issuer_request_id = %issuer_request_id,
+            external_tx_id = %submitted.external_tx_id,
+            tx_id = %submitted.tx_id,
+            "Persisted mint transaction broadcast"
+        );
+
+        Ok(vec![MintEvent::MintTxSubmitted {
+            issuer_request_id,
+            external_tx_id: submitted.external_tx_id,
+            tx_id: submitted.tx_id,
+            submitted_at: Utc::now(),
+        }])
     }
 
     /// Confirms a previously submitted mint transaction by polling the backend.
@@ -799,6 +943,30 @@ impl Mint {
                 // Recover again, which hits the Minting arm to submit.
                 self.handle_deposit(issuer_request_id)
             }
+            Self::TxIntended { underlying, .. } => {
+                let vault =
+                    find_vault_by_underlying(&services.pool, underlying)
+                        .await
+                        .map_err(|error| MintError::AssetView {
+                            message: error.to_string(),
+                        })?
+                        .ok_or_else(|| MintError::AssetNotFound {
+                            underlying: underlying.clone(),
+                        })?;
+
+                if let Some(deposit_events) =
+                    Self::recover_from_existing_receipt(
+                        services,
+                        &vault,
+                        &issuer_request_id,
+                    )
+                    .await?
+                {
+                    Ok(deposit_events)
+                } else {
+                    self.handle_submit_mint(services, issuer_request_id).await
+                }
+            }
             Self::TxSubmitted { tx_id, .. } => {
                 let deposit_events = self
                     .handle_confirm_mint(
@@ -807,12 +975,7 @@ impl Mint {
                         tx_id.clone(),
                     )
                     .await?;
-                self.advance_through_callback(
-                    services,
-                    issuer_request_id,
-                    deposit_events,
-                )
-                .await
+                Ok(deposit_events)
             }
             Self::MintingFailed { .. } => {
                 // Preserve the previous tx so recovery can
@@ -829,12 +992,7 @@ impl Mint {
                         mode,
                     )
                     .await?;
-                self.advance_through_callback(
-                    services,
-                    issuer_request_id,
-                    deposit_events,
-                )
-                .await
+                Ok(deposit_events)
             }
             Self::Minting { .. } => {
                 let deposit_events = self
@@ -846,12 +1004,7 @@ impl Mint {
                         mode,
                     )
                     .await?;
-                self.advance_through_callback(
-                    services,
-                    issuer_request_id,
-                    deposit_events,
-                )
-                .await
+                Ok(deposit_events)
             }
             Self::CallbackPending { .. } => {
                 self.handle_send_callback(services, issuer_request_id).await
@@ -860,6 +1013,22 @@ impl Mint {
                 current_state: self.state_name().to_string(),
             }),
         }
+    }
+
+    async fn handle_recover_wallet_step(
+        &self,
+        services: &MintServices,
+        issuer_request_id: IssuerMintRequestId,
+        mode: MintRecoveryMode,
+    ) -> Result<Vec<MintEvent>, MintError> {
+        if matches!(self, Self::CallbackPending { .. }) {
+            debug!(target: "mint", issuer_request_id = %issuer_request_id,
+                "Deferring callback from wallet-locked recovery step"
+            );
+            return Ok(vec![]);
+        }
+
+        self.handle_recover(services, issuer_request_id, mode).await
     }
 
     /// Handles recovery triggered by receipt discovery. Only accepts
@@ -878,6 +1047,28 @@ impl Mint {
         tx_hash: TxHash,
     ) -> Result<Vec<MintEvent>, MintError> {
         match self {
+            Self::TxIntended { underlying, .. } => {
+                let vault =
+                    find_vault_by_underlying(&services.pool, underlying)
+                        .await
+                        .map_err(|error| MintError::AssetView {
+                            message: error.to_string(),
+                        })?
+                        .ok_or_else(|| MintError::AssetNotFound {
+                            underlying: underlying.clone(),
+                        })?;
+                let deposit_events = Self::recover_from_existing_receipt(
+                    services,
+                    &vault,
+                    &issuer_request_id,
+                )
+                .await?
+                .ok_or_else(|| MintError::ReceiptNotFound {
+                    issuer_request_id: issuer_request_id.clone(),
+                })?;
+
+                Ok(deposit_events)
+            }
             Self::MintingFailed { .. }
                 if matches!(
                     self.non_failed_predecessor(),
@@ -895,76 +1086,12 @@ impl Mint {
                         MintRecoveryMode::Manual,
                     )
                     .await?;
-                self.advance_through_callback(
-                    services,
-                    issuer_request_id,
-                    deposit_events,
-                )
-                .await
+                Ok(deposit_events)
             }
             _ => Err(MintError::NotRecoverable {
                 current_state: self.state_name().to_string(),
             }),
         }
-    }
-
-    /// If `deposit_events` contain a successful deposit (`TokensMinted` or
-    /// `ExistingMintRecovered`), advance through `CallbackPending` by
-    /// sending the Alpaca callback in the same command execution and
-    /// return the combined event list. Otherwise return `deposit_events`
-    /// unchanged.
-    ///
-    /// Keeps recovery atomic: a single `Recover` command takes the
-    /// aggregate from a stuck pre-callback state straight to `Completed`,
-    /// so the aggregate never lingers in `CallbackPending` between
-    /// commands and so any recovery entry-point (admin reprocess, the
-    /// boot-time loop, or receipt-discovery handler) picks up the same
-    /// advancing behavior.
-    async fn advance_through_callback(
-        &self,
-        services: &MintServices,
-        issuer_request_id: IssuerMintRequestId,
-        deposit_events: Vec<MintEvent>,
-    ) -> Result<Vec<MintEvent>, MintError> {
-        let deposit_succeeded = deposit_events.iter().any(|event| {
-            matches!(
-                event,
-                MintEvent::TokensMinted { .. }
-                    | MintEvent::ExistingMintRecovered { .. }
-            )
-        });
-
-        if !deposit_succeeded {
-            return Ok(deposit_events);
-        }
-
-        let mut intermediate = self.clone();
-        for event in &deposit_events {
-            intermediate.apply_event(event.clone());
-        }
-
-        // If callback delivery fails after a successful on-chain deposit,
-        // preserve the deposit events so the aggregate advances to
-        // CallbackPending. The next recovery picks up from there instead
-        // of re-running the deposit path.
-        let callback_events = match intermediate
-            .handle_send_callback(services, issuer_request_id.clone())
-            .await
-        {
-            Ok(events) => events,
-            Err(err) => {
-                warn!(
-                    target: "mint",
-                    issuer_request_id = %issuer_request_id,
-                    error = %err,
-                    "Callback failed after successful deposit; \
-                     keeping mint in CallbackPending"
-                );
-                return Ok(deposit_events);
-            }
-        };
-
-        Ok(deposit_events.into_iter().chain(callback_events).collect())
     }
 
     async fn handle_recover_incomplete(
@@ -1214,19 +1341,19 @@ impl Mint {
         });
         input.external_tx_id = external_tx_id;
 
-        let submission_event =
-            Self::execute_mint_submission(services, input).await?;
+        let preparation_event =
+            Self::execute_mint_preparation(services, input).await?;
 
-        // Only record MintRetryStarted alongside a *successful* submission.
-        // execute_mint_submission returns Ok(MintingFailed) when the backend
-        // rejects the submission; emitting MintRetryStarted in that case would
+        // Only record MintRetryStarted alongside a successfully persisted
+        // transaction intent. Preparation failures emit MintingFailed;
+        // emitting MintRetryStarted in that case would
         // move the aggregate MintingFailed -> Minting, discarding the
         // TxSubmitted predecessor (its tx_id and the retry
         // counter derived from external_tx_id). Re-emitting only the failure
         // keeps the predecessor chain intact for the next retry.
         let retry_event = matches!(
-            (retrying_failed_mint, &submission_event),
-            (true, MintEvent::MintTxSubmitted { .. })
+            (retrying_failed_mint, &preparation_event),
+            (true, MintEvent::MintTxIntended { .. })
         )
         .then(|| MintEvent::MintRetryStarted {
             issuer_request_id,
@@ -1236,7 +1363,7 @@ impl Mint {
 
         Ok(retry_event
             .into_iter()
-            .chain(std::iter::once(submission_event))
+            .chain(std::iter::once(preparation_event))
             .collect())
     }
 
@@ -1375,6 +1502,62 @@ impl Mint {
         tx_id: TxId,
         _submitted_at: DateTime<Utc>,
     ) {
+        let prepared_tx = match self {
+            Self::TxIntended { prepared_tx, .. } => Some(prepared_tx.clone()),
+            Self::Minting { .. } => None,
+            _ => return,
+        };
+
+        let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+        }
+        | Self::TxIntended {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+            ..
+        }) = self.clone()
+        else {
+            return;
+        };
+
+        *self = Self::TxSubmitted {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            minting_started_at,
+            prepared_tx,
+            external_tx_id,
+            tx_id,
+        };
+    }
+
+    fn apply_mint_intended(&mut self, prepared_tx: PreparedMintTx) {
         let Self::Minting {
             issuer_request_id,
             tokenization_request_id,
@@ -1392,7 +1575,7 @@ impl Mint {
             return;
         };
 
-        *self = Self::TxSubmitted {
+        *self = Self::TxIntended {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -1404,8 +1587,7 @@ impl Mint {
             initiated_at,
             journal_confirmed_at,
             minting_started_at,
-            external_tx_id,
-            tx_id,
+            prepared_tx,
         };
     }
 
@@ -1419,6 +1601,19 @@ impl Mint {
         minted_at: DateTime<Utc>,
     ) {
         let (Self::Minting {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
+        | Self::TxIntended {
             issuer_request_id,
             tokenization_request_id,
             quantity,
@@ -1618,6 +1813,19 @@ impl Mint {
             journal_confirmed_at,
             ..
         }
+        | Self::TxIntended {
+            issuer_request_id,
+            tokenization_request_id,
+            quantity,
+            underlying,
+            token,
+            network,
+            client_id,
+            wallet,
+            initiated_at,
+            journal_confirmed_at,
+            ..
+        }
         | Self::TxSubmitted {
             issuer_request_id,
             tokenization_request_id,
@@ -1731,7 +1939,7 @@ impl EventSourced for Mint {
 
     const AGGREGATE_TYPE: &'static str = "Mint";
     const PROJECTION: Table = Table("mint_view");
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so
@@ -1812,8 +2020,13 @@ impl EventSourced for Mint {
                     current_state: "Uninitialized".to_string(),
                 })
             }
-            MintCommand::SubmitMint { .. } => {
+            MintCommand::PrepareMint { .. } => {
                 Err(MintError::NotInMintingState {
+                    current_state: "Uninitialized".to_string(),
+                })
+            }
+            MintCommand::SubmitMint { .. } => {
+                Err(MintError::NotInMintIntendedState {
                     current_state: "Uninitialized".to_string(),
                 })
             }
@@ -1828,6 +2041,7 @@ impl EventSourced for Mint {
                 })
             }
             MintCommand::Recover { .. }
+            | MintCommand::RecoverWalletStep { .. }
             | MintCommand::RecoverFromReceipt { .. }
             | MintCommand::CloseMint { .. } => Err(MintError::NotRecoverable {
                 current_state: "Uninitialized".to_string(),
@@ -1878,6 +2092,9 @@ impl EventSourced for Mint {
             MintCommand::Deposit { issuer_request_id } => {
                 self.handle_deposit(issuer_request_id)
             }
+            MintCommand::PrepareMint { issuer_request_id } => {
+                self.handle_prepare_mint(services, issuer_request_id).await
+            }
             MintCommand::SubmitMint { issuer_request_id } => {
                 self.handle_submit_mint(services, issuer_request_id).await
             }
@@ -1890,6 +2107,14 @@ impl EventSourced for Mint {
             }
             MintCommand::Recover { issuer_request_id, mode } => {
                 self.handle_recover(services, issuer_request_id, mode).await
+            }
+            MintCommand::RecoverWalletStep { issuer_request_id, mode } => {
+                self.handle_recover_wallet_step(
+                    services,
+                    issuer_request_id,
+                    mode,
+                )
+                .await
             }
             MintCommand::RecoverFromReceipt { issuer_request_id, tx_hash } => {
                 self.handle_recover_from_receipt(
@@ -1944,6 +2169,11 @@ impl Mint {
             MintEvent::MintingStarted { issuer_request_id: _, started_at } => {
                 self.apply_minting_started(started_at);
             }
+            MintEvent::MintTxIntended {
+                issuer_request_id: _,
+                prepared_tx,
+                intended_at: _,
+            } => self.apply_mint_intended(prepared_tx),
             MintEvent::TokensMinted {
                 issuer_request_id: _,
                 tx_hash,
@@ -2031,6 +2261,8 @@ pub(crate) enum MintError {
     },
     #[error("Mint not in Minting state. Current state: {current_state}")]
     NotInMintingState { current_state: String },
+    #[error("Mint not in MintIntended state. Current state: {current_state}")]
+    NotInMintIntendedState { current_state: String },
     #[error(
         "Mint not in Minting or MintingFailed state. Current state: {current_state}"
     )]
@@ -2047,6 +2279,10 @@ pub(crate) enum MintError {
         "Transaction ID mismatch. Expected: {expected}, provided: {provided}"
     )]
     TxIdMismatch { expected: TxId, provided: TxId },
+    #[error(
+        "Vault returned transaction metadata that differs from mint intent"
+    )]
+    SubmittedTransactionMismatch,
     #[error("Asset not found for underlying: {underlying}")]
     AssetNotFound { underlying: UnderlyingSymbol },
     #[error("Quantity conversion: {message}")]
@@ -2057,6 +2293,12 @@ pub(crate) enum MintError {
     Alpaca { message: String },
     #[error("Receipt lookup: {message}")]
     ReceiptLookup { message: String },
+    #[error("No receipt found for mint {issuer_request_id}")]
+    ReceiptNotFound { issuer_request_id: IssuerMintRequestId },
+    #[error(
+        "Cannot prepare a new mint while another wallet intent is unresolved"
+    )]
+    PendingWalletIntent,
     #[error("Vault: {message}")]
     Vault { message: String },
 }
@@ -2085,6 +2327,7 @@ pub(crate) mod tests {
         MintCommand, MintError, MintEvent, MintRecoveryMode, MintServices,
         MintView, Network, Quantity, TokenSymbol, TokenizationRequestId,
         UnderlyingSymbol, find_by_issuer_request_id,
+        has_unresolved_mint_intent,
     };
     use crate::alpaca::mock::MockAlpacaService;
     use crate::prepare_event_sourced_startup;
@@ -2094,8 +2337,8 @@ pub(crate) mod tests {
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         BurnVerification, MintResult, MultiBurnParams, MultiBurnResult,
-        ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
-        VaultService,
+        PreparedMintTx, ReceiptInformation, SendableTxWithHash, SubmittedTx,
+        TxId, VaultError, VaultService,
     };
 
     pub(super) const VAULT: Address =
@@ -2122,7 +2365,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl VaultService for TerminalFailedMintVault {
-        async fn submit_mint(
+        async fn prepare_mint_tx(
             &self,
             _vault: Address,
             _assets: U256,
@@ -2130,13 +2373,23 @@ pub(crate) mod tests {
             _user: Address,
             _receipt_info: ReceiptInformation,
             external_tx_id: Option<String>,
-        ) -> Result<SubmittedTx, VaultError> {
+        ) -> Result<PreparedMintTx, VaultError> {
             let external_tx_id =
                 external_tx_id.unwrap_or_else(|| "mint-base".to_string());
             *self.submitted_external_tx_id.lock().unwrap() =
                 Some(external_tx_id.clone());
 
-            Ok(SubmittedTx { external_tx_id, tx_id: TxId::random() })
+            Ok(PreparedMintTx::valid_for_test(1, external_tx_id))
+        }
+
+        async fn submit_mint(
+            &self,
+            prepared_tx: &PreparedMintTx,
+        ) -> Result<SubmittedTx, VaultError> {
+            Ok(SubmittedTx {
+                external_tx_id: prepared_tx.external_tx_id.clone(),
+                tx_id: prepared_tx.hash.into(),
+            })
         }
 
         async fn confirm_mint(
@@ -2200,7 +2453,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl VaultService for RetrySubmitFailsVault {
-        async fn submit_mint(
+        async fn prepare_mint_tx(
             &self,
             _vault: Address,
             _assets: U256,
@@ -2208,6 +2461,13 @@ pub(crate) mod tests {
             _user: Address,
             _receipt_info: ReceiptInformation,
             _external_tx_id: Option<String>,
+        ) -> Result<PreparedMintTx, VaultError> {
+            Err(VaultError::InvalidReceipt)
+        }
+
+        async fn submit_mint(
+            &self,
+            _prepared_tx: &PreparedMintTx,
         ) -> Result<SubmittedTx, VaultError> {
             Err(VaultError::InvalidReceipt)
         }
@@ -2504,6 +2764,7 @@ pub(crate) mod tests {
             MintEvent::JournalConfirmed { .. }
             | MintEvent::JournalRejected { .. }
             | MintEvent::MintingStarted { .. }
+            | MintEvent::MintTxIntended { .. }
             | MintEvent::MintTxSubmitted { .. }
             | MintEvent::TokensMinted { .. }
             | MintEvent::MintingFailed { .. }
@@ -3329,6 +3590,15 @@ pub(crate) mod tests {
     /// flow can be driven end to end and the resulting `MintView` inspected via
     /// the view query helpers.
     async fn setup_projected_mint_store() -> (Arc<Store<Mint>>, Pool<Sqlite>) {
+        setup_projected_mint_store_with_vault(Arc::new(
+            MockVaultService::new_success(),
+        ))
+        .await
+    }
+
+    async fn setup_projected_mint_store_with_vault(
+        vault: Arc<dyn VaultService>,
+    ) -> (Arc<Store<Mint>>, Pool<Sqlite>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(":memory:")
@@ -3360,7 +3630,7 @@ pub(crate) mod tests {
             Arc::new(test_store::<ReceiptInventory>(pool.clone(), ()));
 
         let services = MintServices {
-            vault: Arc::new(MockVaultService::new_success()),
+            vault,
             alpaca: Arc::new(MockAlpacaService::new_success()),
             receipts: Arc::new(CqrsReceiptService::new(receipt_store)),
             pool: pool.clone(),
@@ -3374,6 +3644,157 @@ pub(crate) mod tests {
                 .unwrap();
 
         (mint_store, pool)
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn prepare_mint_rejects_invalid_signed_envelope() {
+        let (store, pool) = setup_projected_mint_store_with_vault(Arc::new(
+            MockVaultService::new_invalid_prepared_mint(),
+        ))
+        .await;
+        let data = TestMintData::new();
+
+        for command in [
+            MintCommand::Initiate {
+                issuer_request_id: data.issuer_request_id.clone(),
+                tokenization_request_id: data.tokenization_request_id.clone(),
+                quantity: data.quantity.clone(),
+                underlying: data.underlying.clone(),
+                token: data.token.clone(),
+                network: data.network.clone(),
+                client_id: data.client_id,
+                wallet: data.wallet,
+            },
+            MintCommand::ConfirmJournal {
+                issuer_request_id: data.issuer_request_id.clone(),
+            },
+            MintCommand::Deposit {
+                issuer_request_id: data.issuer_request_id.clone(),
+            },
+            MintCommand::PrepareMint {
+                issuer_request_id: data.issuer_request_id.clone(),
+            },
+        ] {
+            store.send(&data.issuer_request_id, command).await.unwrap();
+        }
+
+        let mint = store.load(&data.issuer_request_id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, Mint::MintingFailed { .. }),
+            "invalid prepared envelope must fail the mint, got {}",
+            mint.state_name()
+        );
+        assert_eq!(
+            count_events_of_type(
+                &pool,
+                &data.issuer_request_id,
+                "MintEvent::MintTxIntended"
+            )
+            .await,
+            0,
+        );
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                &data.issuer_request_id.to_string(),
+                "Mint transaction preparation returned an invalid signed envelope"
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_intent_is_detected_without_a_projection_row() {
+        let (_store, pool) = setup_projected_mint_store().await;
+        let pending_id = IssuerMintRequestId::random();
+        let pending_id_string = pending_id.to_string();
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 1, 'MintEvent::MintTxIntended', '4.0', '{}', '{}')
+            ",
+        )
+        .bind(&pending_id_string)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            has_unresolved_mint_intent(
+                &pool,
+                Some(&IssuerMintRequestId::random()),
+            )
+            .await
+            .unwrap(),
+            "the event store must remain authoritative when projection writes fail"
+        );
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 2, 'MintEvent::MintClosed', '4.0', '{}', '{}')
+            ",
+        )
+        .bind(&pending_id_string)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            has_unresolved_mint_intent(
+                &pool,
+                Some(&IssuerMintRequestId::random()),
+            )
+            .await
+            .unwrap(),
+            "closing a mint must not release signed bytes that can still land"
+        );
+
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, 3, 'MintEvent::MintTxSubmitted', '4.0', '{}', '{}')
+            ",
+        )
+        .bind(pending_id_string)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !has_unresolved_mint_intent(
+                &pool,
+                Some(&IssuerMintRequestId::random()),
+            )
+            .await
+            .unwrap(),
+            "an explicit transaction-resolution event must release the wallet-intent gate"
+        );
     }
 
     /// Regression: pre-event-sorcery snapshot payloads (`{"Completed": ...}`)
@@ -3820,7 +4241,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // SubmitMint does the network call (emits TxSubmitted)
+        // PrepareMint signs and persists the exact transaction before any
+        // broadcast (emits MintTxIntended).
+        store
+            .send(
+                &data.issuer_request_id,
+                MintCommand::PrepareMint {
+                    issuer_request_id: data.issuer_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let Some(Mint::TxIntended { prepared_tx, .. }) =
+            store.load(&data.issuer_request_id).await.unwrap()
+        else {
+            panic!("Expected MintIntended state after PrepareMint");
+        };
+        assert!(!prepared_tx.tx.is_empty());
+
+        // SubmitMint broadcasts only the persisted transaction.
         store
             .send(
                 &data.issuer_request_id,
@@ -3868,7 +4308,7 @@ pub(crate) mod tests {
             "Expected Completed state"
         );
 
-        // The split flow must emit exactly these six events in order.
+        // The split flow must emit exactly these seven events in order.
         let event_types: Vec<String> = sqlx::query_scalar(
             "
             SELECT event_type
@@ -3890,11 +4330,12 @@ pub(crate) mod tests {
                 "MintEvent::Initiated",
                 "MintEvent::JournalConfirmed",
                 "MintEvent::MintingStarted",
+                "MintEvent::MintTxIntended",
                 "MintEvent::MintTxSubmitted",
                 "MintEvent::TokensMinted",
                 "MintEvent::MintCompleted",
             ],
-            "Expected 6 events in the split flow, in order"
+            "Expected 7 events in the split flow, in order"
         );
 
         let view = find_by_issuer_request_id(&pool, &data.issuer_request_id)
@@ -3924,6 +4365,152 @@ pub(crate) mod tests {
         assert!(view_completed_at >= view_minted_at);
         assert!(view_minted_at >= view_journal_confirmed_at);
         assert!(view_journal_confirmed_at >= view_initiated_at);
+    }
+
+    fn persisted_mint_intent_events(
+        issuer_request_id: &IssuerMintRequestId,
+        prepared_tx: PreparedMintTx,
+    ) -> Vec<MintEvent> {
+        let now = Utc::now();
+        vec![
+            MintEvent::Initiated {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new("tok-123"),
+                quantity: Quantity::new(Decimal::from(100)),
+                underlying: UnderlyingSymbol::new("AAPL"),
+                token: TokenSymbol::new("tAAPL"),
+                network: Network::Base,
+                client_id: ClientId::new(),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                initiated_at: now,
+            },
+            MintEvent::JournalConfirmed {
+                issuer_request_id: issuer_request_id.clone(),
+                confirmed_at: now,
+            },
+            MintEvent::MintingStarted {
+                issuer_request_id: issuer_request_id.clone(),
+                started_at: now,
+            },
+            MintEvent::MintTxIntended {
+                issuer_request_id: issuer_request_id.clone(),
+                prepared_tx,
+                intended_at: now,
+            },
+        ]
+    }
+
+    fn test_prepared_mint_tx(
+        issuer_request_id: &IssuerMintRequestId,
+    ) -> PreparedMintTx {
+        PreparedMintTx::valid_for_test(17, format!("mint-{issuer_request_id}"))
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn restart_rebroadcasts_persisted_mint_without_preparing_another_tx()
+    {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = test_prepared_mint_tx(&issuer_request_id);
+        let vault = Arc::new(MockVaultService::new_success());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture
+            .seed_mint_events(
+                &issuer_request_id.to_string(),
+                persisted_mint_intent_events(
+                    &issuer_request_id,
+                    prepared_tx.clone(),
+                ),
+            )
+            .await;
+
+        fixture
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        let Mint::TxSubmitted { prepared_tx: Some(replayed_tx), tx_id, .. } =
+            mint
+        else {
+            panic!("Expected TxSubmitted with its persisted transaction");
+        };
+        assert_eq!(replayed_tx, prepared_tx);
+        assert_eq!(tx_id, TxId::from(prepared_tx.hash));
+        assert_eq!(vault.get_call_count(), 0, "recovery must not re-prepare");
+        assert_eq!(
+            count_events_of_type(
+                &fixture.pool,
+                &issuer_request_id,
+                "MintEvent::MintTxIntended",
+            )
+            .await,
+            1,
+            "restart recovery must retain the single persisted intent"
+        );
+        assert!(logs_contain_at!(
+            Level::INFO,
+            &[
+                "Persisted mint transaction broadcast",
+                &prepared_tx.hash.to_string()
+            ]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn uncertain_broadcast_failure_keeps_exact_mint_intent() {
+        let issuer_request_id = IssuerMintRequestId::random();
+        let prepared_tx = test_prepared_mint_tx(&issuer_request_id);
+        let vault = Arc::new(MockVaultService::new_submit_failure());
+        let fixture = MintTestFixture::new_with_vault(vault.clone()).await;
+        fixture
+            .seed_mint_events(
+                &issuer_request_id.to_string(),
+                persisted_mint_intent_events(
+                    &issuer_request_id,
+                    prepared_tx.clone(),
+                ),
+            )
+            .await;
+
+        let result = fixture
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+
+        let mint =
+            fixture.mint_store.load(&issuer_request_id).await.unwrap().unwrap();
+        assert!(matches!(
+            mint,
+            Mint::TxIntended {
+                prepared_tx: ref stored,
+                ..
+            } if stored == &prepared_tx
+        ));
+        assert_eq!(vault.get_call_count(), 0, "failure must not re-prepare");
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Persisted mint transaction broadcast failed",
+                &prepared_tx.hash.to_string(),
+            ]
+        ));
     }
 
     #[test]
@@ -3969,6 +4556,18 @@ pub(crate) mod tests {
             vault.submitted_external_tx_id(),
             Some(format!("mint-{issuer_request_id}-retry-1"))
         );
+
+        fixture
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Automatic,
+                },
+            )
+            .await
+            .unwrap();
 
         let Some(Mint::TxSubmitted { external_tx_id, .. }) =
             fixture.mint_store.load(&issuer_request_id).await.unwrap()
@@ -4087,6 +4686,18 @@ pub(crate) mod tests {
             Some(format!("mint-{issuer_request_id}-retry-5"))
         );
 
+        fixture
+            .mint_store
+            .send(
+                &issuer_request_id,
+                MintCommand::Recover {
+                    issuer_request_id: issuer_request_id.clone(),
+                    mode: MintRecoveryMode::Manual,
+                },
+            )
+            .await
+            .unwrap();
+
         let mint = fixture
             .mint_store
             .load(&issuer_request_id)
@@ -4113,7 +4724,7 @@ pub(crate) mod tests {
                 Level::INFO,
                 &[
                     test,
-                    "Mint transaction submitted to signing backend",
+                    "Persisted mint transaction broadcast",
                     expected_external.as_str(),
                 ]
             ),

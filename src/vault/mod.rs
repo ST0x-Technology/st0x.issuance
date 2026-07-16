@@ -1,5 +1,13 @@
+#[cfg(test)]
+use alloy::consensus::{SignableTransaction, TxLegacy};
+use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::eips::Decodable2718;
+#[cfg(test)]
+use alloy::eips::Encodable2718;
 use alloy::hex::decode;
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
+#[cfg(test)]
+use alloy::primitives::{Signature, TxKind};
 use alloy::providers::SendableTxErr;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use async_trait::async_trait;
@@ -23,15 +31,14 @@ pub(crate) mod service;
 /// services or mocks for testing.
 #[async_trait]
 pub(crate) trait VaultService: Send + Sync {
-    /// Submits a mint transaction (deposit + share transfer) to the signing backend.
+    /// Builds and signs a mint transaction without broadcasting it.
     ///
-    /// Encodes the multicall calldata and submits it via the backend. Returns a
-    /// [`SubmittedTx`] whose `tx_id` is persisted in a CQRS event so that `confirm_mint`
-    /// can resume polling after a restart.
+    /// The returned bytes and hash must be persisted before calling
+    /// [`VaultService::submit_mint`].
     ///
     /// Uses a deterministic `external_tx_id` so that resubmitting the same mint
     /// after a crash triggers transaction duplicate rejection instead of a double-mint.
-    async fn submit_mint(
+    async fn prepare_mint_tx(
         &self,
         vault: Address,
         assets: U256,
@@ -39,6 +46,14 @@ pub(crate) trait VaultService: Send + Sync {
         user: Address,
         receipt_info: ReceiptInformation,
         external_tx_id: Option<String>,
+    ) -> Result<PreparedMintTx, VaultError>;
+
+    /// Broadcasts the exact signed mint transaction that was persisted before
+    /// this call. Repeated calls must rebroadcast the same bytes rather than
+    /// prepare a replacement transaction.
+    async fn submit_mint(
+        &self,
+        prepared_tx: &PreparedMintTx,
     ) -> Result<SubmittedTx, VaultError>;
 
     /// Confirms a previously submitted mint transaction.
@@ -132,6 +147,63 @@ pub(crate) trait VaultService: Send + Sync {
 }
 
 pub(crate) type WalletNonceGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct PreparedMintTx {
+    pub(crate) tx: Vec<u8>,
+    pub(crate) hash: FixedBytes<32>,
+    pub(crate) nonce: u64,
+    pub(crate) signed_at: DateTime<Utc>,
+    pub(crate) external_tx_id: String,
+}
+
+impl PreparedMintTx {
+    /// Verifies that the redundant persisted identity fields describe the
+    /// exact signed envelope bytes.
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+        let envelope = TxEnvelope::decode_2718_exact(&self.tx)?;
+        let decoded_hash = *envelope.tx_hash();
+        if decoded_hash != self.hash {
+            return Err(VaultError::PreparedMintHashMismatch {
+                expected: self.hash,
+                decoded: decoded_hash,
+            });
+        }
+
+        let decoded_nonce = envelope.nonce();
+        if decoded_nonce != self.nonce {
+            return Err(VaultError::PreparedMintNonceMismatch {
+                expected: self.nonce,
+                decoded: decoded_nonce,
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test(nonce: u64, external_tx_id: String) -> Self {
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(1), false);
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+
+        Self {
+            tx: envelope.encoded_2718(),
+            hash: *envelope.tx_hash(),
+            nonce: envelope.nonce(),
+            signed_at: Utc::now(),
+            external_tx_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct SendableTxWithHash {
@@ -395,6 +467,20 @@ pub(crate) enum VaultError {
     /// The operator-supplied hash cannot terminalize the redemption.
     #[error("Transaction is not a burn of the expected shares: {tx_hash:?}")]
     NotABurn { tx_hash: B256 },
+    #[error(
+        "Node returned transaction hash {returned:?} for persisted transaction {expected:?}"
+    )]
+    BroadcastHashMismatch { expected: B256, returned: B256 },
+    #[error(
+        "Persisted mint transaction hash {expected:?} does not match decoded hash {decoded:?}"
+    )]
+    PreparedMintHashMismatch { expected: B256, decoded: B256 },
+    #[error(
+        "Persisted mint transaction nonce {expected} does not match decoded nonce {decoded}"
+    )]
+    PreparedMintNonceMismatch { expected: u64, decoded: u64 },
+    #[error(transparent)]
+    Eip2718(#[from] alloy::eips::eip2718::Eip2718Error),
     /// Contract call error
     #[error(transparent)]
     Contract(#[from] alloy::contract::Error),
