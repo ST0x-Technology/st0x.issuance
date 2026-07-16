@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use event_sorcery::{EntityList, Never, Reactor, deps};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite, SqlitePool};
+use sqlx::{Pool, Sqlite, SqliteConnection, SqlitePool};
 use tracing::{debug, warn};
 
 use crate::mint::{IssuerMintRequestId, Mint, MintEvent};
@@ -32,10 +32,6 @@ pub(crate) async fn rebuild_receipt_inventory_view(
 ) -> Result<(), ReceiptInventoryViewError> {
     debug!(target: "receipt", "Rebuilding receipt inventory view from events");
 
-    sqlx::query!("DELETE FROM receipt_inventory_view").execute(pool).await?;
-
-    let reactor = ReceiptInventoryViewReactor::new(pool.clone());
-
     let rows = sqlx::query!(
         r#"
         SELECT
@@ -49,11 +45,32 @@ pub(crate) async fn rebuild_receipt_inventory_view(
     .fetch_all(pool)
     .await?;
 
-    for row in rows {
-        let mint_id: IssuerMintRequestId = row.aggregate_id.parse()?;
-        let event: MintEvent = serde_json::from_str(&row.payload)?;
-        reactor.project(&mint_id, &event).await;
+    // Parse every event before deleting anything, so a malformed row aborts the
+    // rebuild while the existing (possibly stale) rows are still intact rather
+    // than leaving the view table empty after the DELETE.
+    let events = rows
+        .into_iter()
+        .map(|row| -> Result<_, ReceiptInventoryViewError> {
+            let mint_id: IssuerMintRequestId = row.aggregate_id.parse()?;
+            let event: MintEvent = serde_json::from_str(&row.payload)?;
+            Ok((mint_id, event))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query!("DELETE FROM receipt_inventory_view")
+        .execute(&mut *transaction)
+        .await?;
+
+    for (mint_id, event) in events {
+        ReceiptInventoryViewReactor::project_on(
+            &mut transaction,
+            &mint_id,
+            &event,
+        )
+        .await?;
     }
+    transaction.commit().await?;
 
     debug!(target: "receipt", "Receipt inventory view rebuild complete");
 
@@ -149,6 +166,30 @@ impl ReceiptInventoryViewReactor {
     }
 
     async fn project(&self, mint_id: &IssuerMintRequestId, event: &MintEvent) {
+        let mut connection = match self.pool.acquire().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(target: "receipt", view_id = %mint_id, error = %error,
+                    "Failed to acquire connection for receipt inventory view"
+                );
+                return;
+            }
+        };
+
+        if let Err(error) =
+            Self::project_on(&mut connection, mint_id, event).await
+        {
+            warn!(target: "receipt", view_id = %mint_id, error = %error,
+                "Failed to project receipt inventory view"
+            );
+        }
+    }
+
+    async fn project_on(
+        connection: &mut SqliteConnection,
+        mint_id: &IssuerMintRequestId,
+        event: &MintEvent,
+    ) -> Result<(), ReceiptInventoryViewError> {
         // Only these events transition the view; skip the rest to avoid a
         // pointless read-write cycle.
         if !matches!(
@@ -157,20 +198,11 @@ impl ReceiptInventoryViewReactor {
                 | MintEvent::TokensMinted { .. }
                 | MintEvent::ExistingMintRecovered { .. }
         ) {
-            return;
+            return Ok(());
         }
 
         let view_id = mint_id.to_string();
-
-        let current = match self.load(&view_id).await {
-            Ok(view) => view,
-            Err(error) => {
-                warn!(target: "receipt", view_id, error = %error,
-                    "Failed to load receipt inventory view; skipping update"
-                );
-                return;
-            }
-        };
+        let current = Self::load(connection, &view_id).await?;
 
         let updated = match event {
             MintEvent::Initiated { underlying, token, .. } => {
@@ -199,18 +231,14 @@ impl ReceiptInventoryViewReactor {
                 *shares_minted,
                 *recovered_at,
             ),
-            _ => return,
+            _ => return Ok(()),
         };
 
-        if let Err(error) = self.upsert(&view_id, &updated).await {
-            warn!(target: "receipt", view_id, error = %error,
-                "Failed to write receipt inventory view"
-            );
-        }
+        Self::upsert(connection, &view_id, &updated).await
     }
 
     async fn load(
-        &self,
+        connection: &mut SqliteConnection,
         view_id: &str,
     ) -> Result<ReceiptInventoryView, ReceiptInventoryViewError> {
         let row = sqlx::query!(
@@ -221,7 +249,7 @@ impl ReceiptInventoryViewReactor {
             "#,
             view_id
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(connection)
         .await?;
 
         match row {
@@ -231,7 +259,7 @@ impl ReceiptInventoryViewReactor {
     }
 
     async fn upsert(
-        &self,
+        connection: &mut SqliteConnection,
         view_id: &str,
         view: &ReceiptInventoryView,
     ) -> Result<(), ReceiptInventoryViewError> {
@@ -249,7 +277,7 @@ impl ReceiptInventoryViewReactor {
             payload,
             payload
         )
-        .execute(&self.pool)
+        .execute(connection)
         .await?;
 
         Ok(())
@@ -719,5 +747,194 @@ mod tests {
 
             assert_eq!(load_view(&pool, &mint_id).await, original_view);
         }
+    }
+
+    /// Inserts a raw `Mint` event row the way `rebuild_receipt_inventory_view`
+    /// reads it back (only `aggregate_id` and `payload` matter to the rebuild
+    /// query).
+    async fn insert_mint_event_row(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "
+            INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('Mint', ?, ?, 'MintEvent', '1.0', ?, '{}')
+            ",
+        )
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("Failed to insert event row");
+    }
+
+    async fn seed_view_row(
+        pool: &SqlitePool,
+        view_id: &str,
+        view: &ReceiptInventoryView,
+    ) {
+        let payload = serde_json::to_string(view).unwrap();
+        sqlx::query(
+            "
+            INSERT INTO receipt_inventory_view (view_id, version, payload)
+            VALUES (?, 1, ?)
+            ",
+        )
+        .bind(view_id)
+        .bind(&payload)
+        .execute(pool)
+        .await
+        .expect("Failed to seed view row");
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_replays_mint_events_and_replaces_stale_rows() {
+        let pool = migrated_pool().await;
+
+        let mint_id = IssuerMintRequestId::random();
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let token = TokenSymbol::new("tAAPL");
+        let receipt_id = uint!(42_U256);
+        let shares_minted = uint!(100_000000000000000000_U256);
+
+        let initiated = serde_json::to_string(&initiated_event(
+            underlying.clone(),
+            token.clone(),
+            "alp-rebuild",
+            address!("0x1234567890abcdef1234567890abcdef12345678"),
+        ))
+        .unwrap();
+        let minted = serde_json::to_string(&MintEvent::TokensMinted {
+            issuer_request_id: IssuerMintRequestId::random(),
+            tx_hash: b256!(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ),
+            receipt_id,
+            shares_minted,
+            gas_used: 50000,
+            block_number: 1000,
+            minted_at: Utc::now(),
+        })
+        .unwrap();
+
+        let aggregate_id = mint_id.to_string();
+        insert_mint_event_row(&pool, &aggregate_id, 1, &initiated).await;
+        insert_mint_event_row(&pool, &aggregate_id, 2, &minted).await;
+
+        // A stale pre-rebuild row must be replaced by the replay, not kept.
+        let stale = ReceiptInventoryView::Pending {
+            underlying: UnderlyingSymbol::new("STALE"),
+            token: TokenSymbol::new("tSTALE"),
+        };
+        seed_view_row(&pool, &aggregate_id, &stale).await;
+
+        rebuild_receipt_inventory_view(&pool)
+            .await
+            .expect("rebuild must succeed on well-formed events");
+
+        let ReceiptInventoryView::Active {
+            receipt_id: view_receipt_id,
+            underlying: view_underlying,
+            initial_amount,
+            current_balance,
+            ..
+        } = load_view(&pool, &mint_id).await
+        else {
+            panic!("Expected Active variant after rebuild");
+        };
+        assert_eq!(view_receipt_id, receipt_id);
+        assert_eq!(view_underlying, underlying);
+        assert_eq!(initial_amount, shares_minted);
+        assert_eq!(current_balance, shares_minted);
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_aborts_without_clearing_view_on_malformed_event() {
+        let pool = migrated_pool().await;
+
+        // Existing view content that must survive a failed rebuild.
+        let survivor_id = IssuerMintRequestId::random();
+        let survivor_view = ReceiptInventoryView::Pending {
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+        };
+        seed_view_row(&pool, &survivor_id.to_string(), &survivor_view).await;
+
+        let aggregate_id = IssuerMintRequestId::random().to_string();
+        insert_mint_event_row(&pool, &aggregate_id, 1, "not valid json").await;
+
+        let result = rebuild_receipt_inventory_view(&pool).await;
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptInventoryViewError::Deserialization(_))
+            ),
+            "a malformed event payload must abort the rebuild, got {result:?}"
+        );
+
+        assert_eq!(
+            load_view(&pool, &survivor_id).await,
+            survivor_view,
+            "a failed rebuild must leave existing view rows intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_rolls_back_when_projection_write_fails() {
+        let pool = migrated_pool().await;
+
+        let survivor_id = IssuerMintRequestId::random();
+        let survivor_view = ReceiptInventoryView::Pending {
+            underlying: UnderlyingSymbol::new("AAPL"),
+            token: TokenSymbol::new("tAAPL"),
+        };
+        seed_view_row(&pool, &survivor_id.to_string(), &survivor_view).await;
+
+        let replay_id = IssuerMintRequestId::random();
+        let initiated = serde_json::to_string(&initiated_event(
+            UnderlyingSymbol::new("TSLA"),
+            TokenSymbol::new("tTSLA"),
+            "alp-rebuild-write-failure",
+            address!("0x1234567890abcdef1234567890abcdef12345678"),
+        ))
+        .unwrap();
+        insert_mint_event_row(&pool, &replay_id.to_string(), 1, &initiated)
+            .await;
+
+        sqlx::query(
+            "
+            CREATE TRIGGER fail_receipt_inventory_rebuild
+            BEFORE INSERT ON receipt_inventory_view
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated projection write failure');
+            END
+            ",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create projection failure trigger");
+
+        let result = rebuild_receipt_inventory_view(&pool).await;
+        assert!(
+            matches!(result, Err(ReceiptInventoryViewError::Database(_))),
+            "a projection write failure must fail the rebuild, got {result:?}"
+        );
+        assert_eq!(
+            load_view(&pool, &survivor_id).await,
+            survivor_view,
+            "a projection write failure must roll back the cleared view"
+        );
     }
 }
