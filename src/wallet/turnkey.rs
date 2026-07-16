@@ -7,7 +7,7 @@
 
 use alloy::consensus::SignableTransaction;
 use alloy::network::{EthereumWallet, TxSigner};
-use alloy::primitives::{Address, B256, ChainId, Signature, hex, normalize_v};
+use alloy::primitives::{Address, B256, ChainId, Signature, U256, hex};
 use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
 use async_trait::async_trait;
 use reqwest::header::CONTENT_TYPE;
@@ -467,8 +467,8 @@ pub enum TracingTurnkeySignerError {
     Hex(#[from] hex::FromHexError),
     #[error("signature component {component:?} has invalid byte length: {len}")]
     BadComponentLength { component: SignatureComponent, len: usize },
-    #[error("signature v value {v} is not a valid recovery id")]
-    UnnormalizableV { v: u8 },
+    #[error("signature v value {value} is not a supported Turnkey recovery id")]
+    UnnormalizableV { value: String },
     #[error("transaction is missing a chain id")]
     MissingTxChainId,
     #[error("system time is before UNIX epoch: {source}")]
@@ -509,38 +509,66 @@ impl TracingTurnkeySigner {
     fn parse_signature(
         response: &SignRawPayloadResult,
     ) -> Result<Signature, TracingTurnkeySignerError> {
-        let r_bytes = hex::decode(&response.r)?;
-        let s_bytes = hex::decode(&response.s)?;
-        let v_bytes = hex::decode(&response.v)?;
-
-        if r_bytes.len() > 32 {
-            return Err(TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::R,
-                len: r_bytes.len(),
-            });
-        }
-        let r = B256::left_padding_from(&r_bytes).into();
-
-        if s_bytes.len() > 32 {
-            return Err(TracingTurnkeySignerError::BadComponentLength {
-                component: SignatureComponent::S,
-                len: s_bytes.len(),
-            });
-        }
-        let s = B256::left_padding_from(&s_bytes).into();
-
-        let [v_byte]: [u8; 1] =
-            v_bytes.try_into().map_err(|bytes: Vec<u8>| {
-                TracingTurnkeySignerError::BadComponentLength {
-                    component: SignatureComponent::V,
-                    len: bytes.len(),
-                }
-            })?;
-
-        let parity = normalize_v(u64::from(v_byte))
-            .ok_or(TracingTurnkeySignerError::UnnormalizableV { v: v_byte })?;
+        let r = Self::parse_scalar(&response.r, SignatureComponent::R)?;
+        let s = Self::parse_scalar(&response.s, SignatureComponent::S)?;
+        let parity = Self::parse_recovery_id(&response.v)?;
 
         Ok(Signature::new(r, s, parity))
+    }
+
+    fn parse_scalar(
+        value: &str,
+        component: SignatureComponent,
+    ) -> Result<U256, TracingTurnkeySignerError> {
+        let hex_digits = Self::strip_hex_prefix(value);
+        let byte_len = hex_digits.len().div_ceil(2);
+        if byte_len == 0 || byte_len > 32 {
+            return Err(TracingTurnkeySignerError::BadComponentLength {
+                component,
+                len: byte_len,
+            });
+        }
+
+        let bytes = Self::decode_even_width_hex(hex_digits)?;
+        Ok(B256::left_padding_from(&bytes).into())
+    }
+
+    fn parse_recovery_id(
+        value: &str,
+    ) -> Result<bool, TracingTurnkeySignerError> {
+        let digits = Self::strip_hex_prefix(value);
+        let byte_len = digits.len().div_ceil(2);
+        if byte_len == 0 || byte_len > 1 {
+            return Err(TracingTurnkeySignerError::BadComponentLength {
+                component: SignatureComponent::V,
+                len: byte_len,
+            });
+        }
+
+        match digits {
+            "0" | "00" | "1b" | "1B" => Ok(false),
+            "1" | "01" | "1c" | "1C" => Ok(true),
+            _ => Err(TracingTurnkeySignerError::UnnormalizableV {
+                value: value.to_string(),
+            }),
+        }
+    }
+
+    fn strip_hex_prefix(value: &str) -> &str {
+        value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value)
+    }
+
+    fn decode_even_width_hex(
+        hex_digits: &str,
+    ) -> Result<Vec<u8>, hex::FromHexError> {
+        if hex_digits.len().is_multiple_of(2) {
+            hex::decode(hex_digits)
+        } else {
+            hex::decode(format!("0{hex_digits}"))
+        }
     }
 }
 
@@ -741,6 +769,77 @@ mod tests {
     }
 
     #[test]
+    fn parse_signature_decodes_sanitized_real_turnkey_result() {
+        let result: SignRawPayloadResult = serde_json::from_str(include_str!(
+            "fixtures/turnkey_sign_raw_payload_result.json"
+        ))
+        .unwrap();
+
+        let signature = TracingTurnkeySigner::parse_signature(&result).unwrap();
+
+        assert_eq!(
+            signature.r(),
+            U256::from_be_slice(
+                &hex::decode(
+                    "d80ea712806e483e220b81017e35be1aa1de6cd4e8bd3e293713cf3ccb2b8ca6"
+                )
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            signature.s(),
+            U256::from_be_slice(
+                &hex::decode(
+                    "3faae45047a55fb9092d36b000f3f77e423118086915eba94dee254933e64219"
+                )
+                .unwrap()
+            )
+        );
+        assert!(signature.v());
+    }
+
+    #[test]
+    fn parse_signature_normalizes_short_odd_width_components() {
+        let result = signature_result("f", "0xabc", "1");
+
+        let signature = TracingTurnkeySigner::parse_signature(&result).unwrap();
+
+        assert_eq!(signature.r(), U256::from(15));
+        assert_eq!(signature.s(), U256::from(0xabc));
+        assert!(signature.v());
+    }
+
+    #[test]
+    fn parse_signature_accepts_supported_recovery_id_encodings() {
+        let cases = [
+            ("0", false),
+            ("00", false),
+            ("0x0", false),
+            ("1", true),
+            ("01", true),
+            ("0x01", true),
+            ("1b", false),
+            ("0x1B", false),
+            ("1c", true),
+            ("0X1C", true),
+        ];
+
+        for (recovery_id, expected_parity) in cases {
+            let result =
+                signature_result(VALID_R_HEX, VALID_S_HEX, recovery_id);
+
+            let signature =
+                TracingTurnkeySigner::parse_signature(&result).unwrap();
+
+            assert_eq!(
+                signature.v(),
+                expected_parity,
+                "unexpected parity for recovery id {recovery_id}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_signature_rejects_oversized_r_component() {
         let result = signature_result(
             "001111111100111111110011111111001111111100111111110011111111111111",
@@ -776,14 +875,64 @@ mod tests {
 
     #[test]
     fn parse_signature_rejects_unnormalizable_v() {
-        // v = 2 is not a valid recovery id (not 0/1, 27/28, or >= 35).
+        // A raw secp256k1 signature only carries recovery id 0/1 (or the
+        // equivalent Ethereum 27/28 form), never an EIP-155 transaction v.
         let result = signature_result(VALID_R_HEX, VALID_S_HEX, "02");
 
         let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
 
         assert!(matches!(
             error,
-            TracingTurnkeySignerError::UnnormalizableV { v: 2 }
+            TracingTurnkeySignerError::UnnormalizableV { value }
+                if value == "02"
+        ));
+    }
+
+    #[test]
+    fn parse_signature_rejects_eip_155_transaction_v() {
+        let result = signature_result(VALID_R_HEX, VALID_S_HEX, "25");
+
+        let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::UnnormalizableV { value }
+                if value == "25"
+        ));
+    }
+
+    #[test]
+    fn parse_signature_rejects_ambiguous_unprefixed_recovery_ids() {
+        for recovery_id in ["27", "28"] {
+            let result =
+                signature_result(VALID_R_HEX, VALID_S_HEX, recovery_id);
+
+            let error =
+                TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    TracingTurnkeySignerError::UnnormalizableV { ref value }
+                        if value == recovery_id
+                ),
+                "ambiguous recovery id {recovery_id} must be rejected, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_signature_rejects_empty_scalar() {
+        let result = signature_result("0x", VALID_S_HEX, "00");
+
+        let error = TracingTurnkeySigner::parse_signature(&result).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::BadComponentLength {
+                component: SignatureComponent::R,
+                len: 0
+            }
         ));
     }
 
