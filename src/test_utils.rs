@@ -5,9 +5,14 @@ pub const ROLE_CERTIFY: &str = "CERTIFY";
 use alloy::hex;
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
+use alloy::primitives::{
+    Address, B256, Bytes, U256, address, bytes, keccak256,
+};
 use alloy::providers::{PendingTransactionError, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol;
+use alloy::sol_types::SolCall;
 use alloy::sol_types::SolValue;
 use alloy::transports::{RpcError, TransportErrorKind};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
@@ -30,7 +35,7 @@ use crate::alpaca::service::AlpacaConfig;
 use crate::auth::{FailedAuthRateLimiter, test_auth_config};
 use crate::bindings::{
     CloneFactory, OffchainAssetReceiptVault,
-    OffchainAssetReceiptVaultAuthorizerV1, Receipt,
+    OffchainAssetReceiptVaultAuthorizerV1, Receipt, ST0xOrchestrator,
 };
 use crate::config::{Config, Environment, LogLevel};
 use crate::mint::Mint;
@@ -67,6 +72,58 @@ fn find_anvil() -> Option<PathBuf> {
             .find(|candidate| candidate.is_file())
     })
 }
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    UpgradeableBeacon,
+    env!("ST0X_UPGRADEABLE_BEACON_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    BeaconProxy,
+    env!("ST0X_BEACON_PROXY_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    StoxReceipt,
+    env!("ST0X_STOX_RECEIPT_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    StoxReceiptVault,
+    env!("ST0X_STOX_RECEIPT_VAULT_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    StoxOffchainAssetReceiptVaultBeaconSetDeployer,
+    env!("ST0X_STOX_OARV_BEACON_SET_DEPLOYER_ABI")
+);
+
+/// The Zoltu deterministic CREATE2 factory (salt 0), as pinned by
+/// rain-deploy's `LibRainDeploy.sol` (`ZOLTU_FACTORY`,
+/// `ZOLTU_FACTORY_BYTECODE`). st0x.deploy deploys its production contracts
+/// through this factory, so their addresses depend only on creation code —
+/// etching the factory on Anvil and replaying the deploys reproduces the
+/// exact production addresses baked into `ST0xOrchestrator`'s bytecode.
+const ZOLTU_FACTORY: Address =
+    address!("0x7A0D94F55792C434d74a40883C6ed8545E406D12");
+
+const ZOLTU_FACTORY_BYTECODE: Bytes =
+    bytes!("0x60003681823780368234f58015156014578182fd5b80825250506014600cf3");
 
 /// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
@@ -110,6 +167,7 @@ fn test_config() -> Result<Config, anyhow::Error> {
         alpaca: AlpacaConfig::test_default(),
         subgraph_url: Url::parse("http://localhost:0/subgraph")?,
         chains: Vec::new(),
+        vault_mode_config: crate::config::VaultModeConfig::default(),
     })
 }
 
@@ -285,6 +343,16 @@ impl LocalEvm {
     /// - Any contract deployment step fails
     pub async fn new() -> Result<Self, LocalEvmError> {
         Self::with_chain_id(ANVIL_CHAIN_ID).await
+    }
+
+    async fn connect(&self) -> Result<impl Provider, LocalEvmError> {
+        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
+        let wallet = EthereumWallet::from(signer);
+
+        Ok(ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&self.endpoint)
+            .await?)
     }
 
     /// Creates a new [`LocalEvm`] on an Anvil instance with the given chain ID.
@@ -550,13 +618,7 @@ impl LocalEvm {
         &self,
         until: U256,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let vault =
             OffchainAssetReceiptVault::new(self.vault_address, &provider);
@@ -575,13 +637,7 @@ impl LocalEvm {
         role_name: &str,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let authorizer = OffchainAssetReceiptVaultAuthorizerV1::new(
             self.authorizer_address,
@@ -627,13 +683,7 @@ impl LocalEvm {
         to: Address,
         receipt_information: Bytes,
     ) -> Result<(U256, U256, Bytes), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let vault =
             OffchainAssetReceiptVault::new(self.vault_address, &provider);
@@ -679,13 +729,7 @@ impl LocalEvm {
     pub async fn deploy_additional_vault(
         &self,
     ) -> Result<(Address, Address), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         Self::deploy_vault(&provider, self.wallet_address).await
     }
@@ -704,13 +748,7 @@ impl LocalEvm {
         amount: U256,
         to: Address,
     ) -> Result<(U256, U256), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
         let share_ratio = U256::from(10).pow(U256::from(18));
@@ -753,13 +791,7 @@ impl LocalEvm {
         shares: U256,
         receiver: Address,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let vault =
             OffchainAssetReceiptVault::new(self.vault_address, &provider);
@@ -791,13 +823,7 @@ impl LocalEvm {
         role_name: &str,
         to: Address,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let authorizer = OffchainAssetReceiptVaultAuthorizerV1::new(
             authorizer_address,
@@ -805,6 +831,154 @@ impl LocalEvm {
         );
         let role = keccak256(role_name);
         authorizer.grantRole(role, to).send().await?.get_receipt().await?;
+
+        Ok(())
+    }
+
+    /// Deploys `ST0xOrchestrator` behind a beacon proxy, wires it to the
+    /// default vault, and grants `MINT_ROLE` + `BURN_ROLE` to the deployer
+    /// wallet so tests can call `mint` / `burn` directly.
+    ///
+    /// Setup steps:
+    /// 1. Reproduce the pinned production vault beacon set at its canonical
+    ///    addresses so the orchestrator's vault-logic version lock passes
+    ///    (see `deploy_pinned_vault_beacon_set`).
+    /// 2. Deploy `ST0xOrchestrator` as the implementation contract. The
+    ///    constructor calls `_disableInitializers()` on the impl's own storage
+    ///    — this is the standard OZ upgradeable pattern and does NOT prevent
+    ///    `initialize()` from succeeding on a proxy.
+    /// 3. Deploy `UpgradeableBeacon(impl, wallet)` to hold the implementation.
+    /// 4. Deploy `BeaconProxy(beacon, initialize_calldata)` — the constructor
+    ///    delegatecalls `initialize(wallet)` via the beacon, setting up roles.
+    /// 5. Grant `MINT_ROLE` + `BURN_ROLE` on the proxy to the deployer wallet.
+    /// 6. Grant `DEPOSIT` + `WITHDRAW` on the vault's authorizer to the proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any deployment or role-granting transaction fails.
+    pub async fn deploy_orchestrator(&self) -> Result<Address, LocalEvmError> {
+        let provider = self.connect().await?;
+
+        Self::deploy_pinned_vault_beacon_set(&provider).await?;
+
+        // Deploy the implementation. Constructor calls _disableInitializers()
+        // on the impl's own storage — that's intentional OZ pattern.
+        let impl_instance = ST0xOrchestrator::deploy(&provider).await?;
+        let impl_address = *impl_instance.address();
+
+        // Deploy a beacon pointing to the implementation.
+        let beacon = UpgradeableBeacon::deploy(
+            &provider,
+            impl_address,
+            self.wallet_address,
+        )
+        .await?;
+        let beacon_address = *beacon.address();
+
+        // Encode initialize(owner) as BeaconProxy init calldata. The proxy
+        // constructor delegatecalls this on the implementation via the beacon,
+        // initialising the proxy's own storage (fresh — separate from impl).
+        let init_data = Bytes::from(
+            ST0xOrchestrator::initializeCall { owner: self.wallet_address }
+                .abi_encode(),
+        );
+
+        let proxy =
+            BeaconProxy::deploy(&provider, beacon_address, init_data).await?;
+        let orchestrator_address = *proxy.address();
+
+        // Grant MINT_ROLE + BURN_ROLE on the proxy to the deployer wallet.
+        // This must happen before the grant_role_on_authorizer calls below:
+        // `provider`'s recommended fillers cache nonces locally
+        // (alloy-provider fillers/nonce.rs: `NonceFiller<M: NonceManager =
+        // CachedNonceManager>`), while each helper builds a fresh provider —
+        // interleaving their transactions leaves this provider's cached
+        // nonce stale and its next send fails with "nonce too low".
+        let orchestrator =
+            ST0xOrchestrator::new(orchestrator_address, &provider);
+        let mint_role = orchestrator.MINT_ROLE().call().await?;
+        let burn_role = orchestrator.BURN_ROLE().call().await?;
+
+        orchestrator
+            .grantRole(mint_role, self.wallet_address)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        orchestrator
+            .grantRole(burn_role, self.wallet_address)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        // Grant DEPOSIT + WITHDRAW on the vault's authorizer to the orchestrator,
+        // using the same `provider` to avoid the nonce-caching hazard described above.
+        let authorizer = OffchainAssetReceiptVaultAuthorizerV1::new(
+            self.authorizer_address,
+            &provider,
+        );
+        authorizer
+            .grantRole(keccak256(ROLE_DEPOSIT), orchestrator_address)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        authorizer
+            .grantRole(keccak256(ROLE_WITHDRAW), orchestrator_address)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(orchestrator_address)
+    }
+
+    // ST0xOrchestrator refuses to initialize (and mint/burn) unless the
+    // production vault beacon set exists at the address baked into its
+    // bytecode and its beacons point at the pinned implementations:
+    // ST0xOrchestrator.initialize -> _checkVaultLogic (ST0xOrchestrator.sol)
+    // reads IST0xVaultBeaconSet(LibProdDeployCurrent
+    // .STOX_OFFCHAIN_ASSET_RECEIPT_VAULT_BEACON_SET_DEPLOYER) and compares
+    // beacon implementations against LibProdDeployCurrent.STOX_RECEIPT_VAULT
+    // and .STOX_RECEIPT. Those addresses are CREATE2 outputs of the Zoltu
+    // factory (salt 0), so replaying the same deploys on Anvil reproduces
+    // them exactly — this mirrors upstream's test setup
+    // (st0x.deploy test/lib/LibTestDeploy.sol
+    // `deployOffchainAssetReceiptVaultBeaconSet`). Order matters: the
+    // beacon-set deployer's constructor points its beacons at the receipt
+    // and vault implementations, which must already have code.
+    async fn deploy_pinned_vault_beacon_set(
+        provider: &impl Provider,
+    ) -> Result<(), LocalEvmError> {
+        provider
+            .raw_request::<_, ()>(
+                "anvil_setCode".into(),
+                (ZOLTU_FACTORY, ZOLTU_FACTORY_BYTECODE),
+            )
+            .await?;
+
+        for creation_code in [
+            &StoxReceipt::BYTECODE,
+            &StoxReceiptVault::BYTECODE,
+            &StoxOffchainAssetReceiptVaultBeaconSetDeployer::BYTECODE,
+        ] {
+            let deploy_via_factory = TransactionRequest::default()
+                .to(ZOLTU_FACTORY)
+                .input(creation_code.clone().into());
+
+            let receipt = provider
+                .send_transaction(deploy_via_factory)
+                .await?
+                .get_receipt()
+                .await?;
+
+            if !receipt.status() {
+                return Err(LocalEvmError::EventNotFound);
+            }
+        }
 
         Ok(())
     }
@@ -819,13 +993,7 @@ impl LocalEvm {
         vault_address: Address,
         until: U256,
     ) -> Result<(), LocalEvmError> {
-        let signer = PrivateKeySigner::from_bytes(&self.private_key)?;
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&self.endpoint)
-            .await?;
+        let provider = self.connect().await?;
 
         let vault = OffchainAssetReceiptVault::new(vault_address, &provider);
         vault

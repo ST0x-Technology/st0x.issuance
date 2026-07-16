@@ -45,6 +45,18 @@ let
             throw "Unsupported environment '${environment}'"
         }"
         "LOG_LEVEL=debug"
+        # Per-environment orchestrator/vault-mode TOML config; the committed
+        # files are dark (no orchestrator entries = every asset vault-direct).
+        # Interpolating the path copies the file into the nix store, so the
+        # unit always sees the config that shipped with the deployed rev.
+        "CONFIG=${
+          if environment == "prod" then
+            ../config.prod.toml
+          else if environment == "staging" then
+            ../config.staging.toml
+          else
+            throw "Unsupported environment '${environment}'"
+        }"
       ]
     else
       [ ];

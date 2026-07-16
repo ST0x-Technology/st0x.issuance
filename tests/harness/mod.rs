@@ -33,7 +33,7 @@ use st0x_issuance::test_utils::{
 };
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig,
+    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
 };
 
 pub type TestProviderBuilder = ProviderBuilder<
@@ -583,6 +583,7 @@ pub fn create_config_with_db(
                 subgraph_url,
                 backfill_start_block: 0,
             }],
+            vault_mode_config: VaultModeConfig::default(),
         },
         mock_subgraph,
     ))
