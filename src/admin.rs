@@ -3120,6 +3120,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             chains: Vec::new(),
+            vault_mode_config: crate::config::VaultModeConfig::default(),
         };
 
         let pool = setup_pool().await;
@@ -3420,6 +3421,7 @@ mod tests {
             alpaca: AlpacaConfig::test_default(),
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             chains: Vec::new(),
+            vault_mode_config: crate::config::VaultModeConfig::default(),
         };
 
         rocket::build()
@@ -4336,6 +4338,7 @@ mod tests {
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             chains: Vec::new(),
+            vault_mode_config: crate::config::VaultModeConfig::default(),
         };
 
         rocket::build()

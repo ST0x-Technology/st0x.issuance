@@ -1,5 +1,9 @@
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use clap::{Args, Parser};
+use st0x_issuance_dto::{UnderlyingSymbol, UnderlyingSymbolError};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{Level, warn};
 use url::Url;
@@ -12,6 +16,31 @@ use crate::chain::{
 use crate::telemetry::{HyperDxApiKey, HyperDxConfig};
 use crate::tokenized_asset::Network;
 use crate::wallet::{SignerConfig, SignerConfigError, SignerEnv};
+
+/// How a specific tokenized asset's mint/burn is executed on-chain.
+///
+/// `VaultDirect` calls the `OffchainAssetReceiptVault` directly (existing
+/// behaviour). `Orchestrator` routes through the `ST0xOrchestrator` contract
+/// at the given address, which handles the EIP-712 mint-auth and the
+/// receipt-walk for burns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaultMode {
+    #[default]
+    VaultDirect,
+    Orchestrator {
+        address: Address,
+    },
+}
+
+/// Resolved per-asset vault-mode configuration loaded from the optional TOML
+/// config file. Defaults to all-`VaultDirect` when no file is provided.
+#[derive(Debug, Clone, Default)]
+pub struct VaultModeConfig {
+    /// Per-asset overrides keyed by the underlying symbol string (e.g. "AAPL").
+    per_asset: HashMap<String, VaultMode>,
+    /// Fallback used for any asset not listed in `per_asset`.
+    default: VaultMode,
+}
 
 /// Default chain ID (Base mainnet)
 pub const DEFAULT_CHAIN_ID: u64 = 8453;
@@ -47,6 +76,7 @@ pub struct Config {
     /// env vars preserve the Base-only path; complete `CHAIN_<NETWORK>_*`
     /// groups override Base or append additional networks.
     pub chains: Vec<ChainConfig>,
+    pub vault_mode_config: VaultModeConfig,
 }
 
 impl Config {
@@ -70,6 +100,20 @@ impl Config {
         build_chain_registry(self.chains.clone(), &self.signer)
             .await
             .map_err(|error| ConfigError::ChainRegistry(Box::new(error)))
+    }
+
+    /// Returns the `VaultMode` for the given underlying asset symbol.
+    ///
+    /// Uses the per-asset override from the TOML config if present, otherwise
+    /// falls back to the configured default (which itself defaults to
+    /// `VaultDirect` when no TOML file is provided).
+    #[must_use]
+    pub fn vault_mode_for(&self, underlying: &UnderlyingSymbol) -> VaultMode {
+        self.vault_mode_config
+            .per_asset
+            .get(underlying.as_str())
+            .copied()
+            .unwrap_or(self.vault_mode_config.default)
     }
 }
 
@@ -260,6 +304,15 @@ struct Env {
         help = "Receipt-backfill start block for the HyperEVM group"
     )]
     chain_hyperevm_backfill_start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "CONFIG",
+        help = "Path to TOML configuration file for orchestrator/vault-mode settings. \
+                Omitting this arg (or providing a file with no [orchestrator] section) \
+                keeps every asset in vault-direct mode (safe default)."
+    )]
+    config: Option<PathBuf>,
 }
 
 impl Env {
@@ -272,6 +325,16 @@ impl Env {
         let backfill_start_block = base.backfill_start_block;
         let signer = self.signer.into_config()?;
         let hyperdx = self.hyperdx.into_config(log_level_tracing);
+        let vault_mode_config = if let Some(config_path) = self.config {
+            let content =
+                std::fs::read_to_string(&config_path).map_err(|error| {
+                    ConfigError::ConfigFileRead { path: config_path, error }
+                })?;
+            let toml_file: TomlFile = toml::from_str(&content)?;
+            resolve_vault_modes(&toml_file)?
+        } else {
+            VaultModeConfig::default()
+        };
 
         Ok(Config {
             database_url: self.database_url,
@@ -288,6 +351,7 @@ impl Env {
             alpaca: self.alpaca,
             subgraph_url,
             chains,
+            vault_mode_config,
         })
     }
 
@@ -576,6 +640,139 @@ pub enum ConfigError {
     },
     #[error("chain registry initialization failed: {0}")]
     ChainRegistry(#[source] Box<ChainRegistryError>),
+    #[error("Failed to read config file '{path}': {error}")]
+    ConfigFileRead {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("Failed to parse toml config file: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error(
+        "[orchestrator].address is required when any asset resolves to \
+         orchestrator mode"
+    )]
+    MissingOrchestratorAddress,
+    #[error("Invalid [orchestrator].address '{0}': not a valid EVM address")]
+    InvalidOrchestratorAddress(String),
+    #[error("Invalid [assets] key '{symbol}': {error}")]
+    InvalidAssetSymbol {
+        symbol: String,
+        #[source]
+        error: UnderlyingSymbolError,
+    },
+    #[error(
+        "multiple [assets] keys normalize to '{symbol}'; keep exactly one \
+         entry per asset"
+    )]
+    DuplicateAssetSymbol { symbol: String },
+}
+
+// Sourced from the file given to `--config`.  All structs carry
+// `deny_unknown_fields` so a typo in the config is a startup error rather than
+// a silent no-op.
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlFile {
+    orchestrator: Option<OrchestratorSection>,
+    #[serde(default)]
+    assets: HashMap<String, AssetSection>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrchestratorSection {
+    address: Option<String>,
+    default_vault_mode: Option<VaultModeStr>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetSection {
+    vault_mode: VaultModeStr,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VaultModeStr {
+    VaultDirect,
+    Orchestrator,
+}
+
+/// Converts the raw TOML file into a validated `VaultModeConfig`.
+///
+/// Validation rules:
+/// - `default_vault_mode = "orchestrator"` requires `[orchestrator].address`.
+/// - Any `[assets.<X>].vault_mode = "orchestrator"` requires
+///   `[orchestrator].address`.
+/// - An unknown `vault_mode` string fails via serde (see `VaultModeStr`).
+/// - `[assets.<X>]` keys are validated as underlying symbols and normalized
+///   to upper case (matching how assets are keyed everywhere else), so
+///   `[assets.rklb]` configures RKLB instead of silently configuring
+///   nothing; `deny_unknown_fields` cannot catch map keys, so this is where
+///   a typo'd key becomes a startup error instead of a silent no-op. Two
+///   keys normalizing to the same symbol are rejected rather than one
+///   silently winning.
+fn resolve_vault_modes(
+    toml: &TomlFile,
+) -> Result<VaultModeConfig, ConfigError> {
+    let orchestrator_address =
+        match toml.orchestrator.as_ref().and_then(|o| o.address.as_ref()) {
+            Some(addr_str) => {
+                let address = addr_str.parse::<Address>().map_err(|_| {
+                    ConfigError::InvalidOrchestratorAddress(addr_str.clone())
+                })?;
+                if address.is_zero() {
+                    return Err(ConfigError::InvalidOrchestratorAddress(
+                        addr_str.clone(),
+                    ));
+                }
+                Some(address)
+            }
+            None => None,
+        };
+
+    let resolve_mode =
+        |mode_str: &VaultModeStr| -> Result<VaultMode, ConfigError> {
+            match mode_str {
+                VaultModeStr::VaultDirect => Ok(VaultMode::VaultDirect),
+                VaultModeStr::Orchestrator => {
+                    let address = orchestrator_address
+                        .ok_or(ConfigError::MissingOrchestratorAddress)?;
+                    Ok(VaultMode::Orchestrator { address })
+                }
+            }
+        };
+
+    let default = match toml
+        .orchestrator
+        .as_ref()
+        .and_then(|o| o.default_vault_mode.as_ref())
+    {
+        None => VaultMode::VaultDirect,
+        Some(mode_str) => resolve_mode(mode_str)?,
+    };
+
+    let mut per_asset = HashMap::new();
+    for (symbol, asset_section) in &toml.assets {
+        let normalized = UnderlyingSymbol::new(symbol.to_ascii_uppercase())
+            .map_err(|error| ConfigError::InvalidAssetSymbol {
+                symbol: symbol.clone(),
+                error,
+            })?
+            .as_str()
+            .to_string();
+
+        let mode = resolve_mode(&asset_section.vault_mode)?;
+        if per_asset.insert(normalized.clone(), mode).is_some() {
+            return Err(ConfigError::DuplicateAssetSymbol {
+                symbol: normalized,
+            });
+        }
+    }
+
+    Ok(VaultModeConfig { per_asset, default })
 }
 
 /// RPC URL uses a scheme that cannot be mapped to HTTP.
@@ -1171,5 +1368,323 @@ mod tests {
         let expected = address!("7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
 
         assert_eq!(config.signer.address().unwrap(), expected);
+    }
+
+    const ORCH_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
+    fn orch_address() -> Address {
+        ORCH_ADDR.parse().unwrap()
+    }
+
+    #[test]
+    fn no_config_file_every_asset_vault_direct() {
+        let cfg = VaultModeConfig::default();
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert!(cfg.per_asset.is_empty());
+    }
+
+    // Pins the committed per-environment deploy configs (baked into the
+    // systemd unit as CONFIG=<store path>, see nix/upgradeable-services.nix)
+    // to the strict parser: they must always parse, and while the rollout is
+    // dark they must resolve every asset to vault-direct.
+    #[test]
+    fn deploy_config_files_parse_and_stay_dark() {
+        for (name, content) in [
+            ("config.prod.toml", include_str!("../config.prod.toml")),
+            ("config.staging.toml", include_str!("../config.staging.toml")),
+        ] {
+            let toml_file: TomlFile = toml::from_str(content)
+                .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+
+            let cfg = resolve_vault_modes(&toml_file)
+                .unwrap_or_else(|error| panic!("{name} must resolve: {error}"));
+
+            assert_eq!(cfg.default, VaultMode::VaultDirect, "{name} not dark");
+            assert!(cfg.per_asset.is_empty(), "{name} has asset overrides");
+        }
+    }
+
+    // Pins config.example.toml to the strict parser so the committed example
+    // can never drift into something the bot would reject at startup.
+    #[test]
+    fn example_config_file_parses_and_resolves() {
+        let toml_file: TomlFile =
+            toml::from_str(include_str!("../config.example.toml")).unwrap();
+
+        let cfg = resolve_vault_modes(&toml_file).unwrap();
+
+        assert_eq!(
+            cfg.per_asset.get("RKLB").copied(),
+            Some(VaultMode::Orchestrator { address: orch_address() })
+        );
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+    }
+
+    #[test]
+    fn per_asset_override_to_orchestrator() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::from([(
+                "AAPL".to_string(),
+                AssetSection { vault_mode: VaultModeStr::Orchestrator },
+            )]),
+        };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(
+            cfg.per_asset.get("AAPL").copied(),
+            Some(VaultMode::Orchestrator { address: orch_address() })
+        );
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+    }
+
+    #[test]
+    fn per_asset_override_to_vault_direct_ignores_default() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: Some(VaultModeStr::Orchestrator),
+            }),
+            assets: HashMap::from([(
+                "TSLA".to_string(),
+                AssetSection { vault_mode: VaultModeStr::VaultDirect },
+            )]),
+        };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(
+            cfg.per_asset.get("TSLA").copied(),
+            Some(VaultMode::VaultDirect)
+        );
+        assert_eq!(
+            cfg.default,
+            VaultMode::Orchestrator { address: orch_address() }
+        );
+    }
+
+    #[test]
+    fn no_per_asset_override_uses_default_vault_mode() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: Some(VaultModeStr::Orchestrator),
+            }),
+            assets: HashMap::new(),
+        };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(
+            cfg.default,
+            VaultMode::Orchestrator { address: orch_address() }
+        );
+    }
+
+    #[test]
+    fn no_orchestrator_section_defaults_to_vault_direct() {
+        let toml = TomlFile { orchestrator: None, assets: HashMap::new() };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(cfg.default, VaultMode::VaultDirect);
+        assert!(cfg.per_asset.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_asset_without_address_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: None,
+                default_vault_mode: None,
+            }),
+            assets: HashMap::from([(
+                "AAPL".to_string(),
+                AssetSection { vault_mode: VaultModeStr::Orchestrator },
+            )]),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::MissingOrchestratorAddress)
+        ));
+    }
+
+    #[test]
+    fn default_orchestrator_without_address_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: None,
+                default_vault_mode: Some(VaultModeStr::Orchestrator),
+            }),
+            assets: HashMap::new(),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::MissingOrchestratorAddress)
+        ));
+    }
+
+    #[test]
+    fn invalid_orchestrator_address_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some("not-an-address".to_string()),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::new(),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::InvalidOrchestratorAddress(_))
+        ));
+    }
+
+    #[test]
+    fn zero_orchestrator_address_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(Address::ZERO.to_string()),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::from([(
+                "AAPL".to_string(),
+                AssetSection { vault_mode: VaultModeStr::Orchestrator },
+            )]),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::InvalidOrchestratorAddress(message))
+                if message == Address::ZERO.to_string()
+        ));
+    }
+
+    // A lowercase key must configure the same asset the uppercase symbol
+    // names — before normalization, `[assets.rklb]` parsed and resolved
+    // cleanly but never matched the stored uppercase symbol, silently
+    // leaving the asset vault-direct.
+    #[test]
+    fn lowercase_asset_key_normalizes_to_the_stored_symbol() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: None,
+            }),
+            assets: HashMap::from([(
+                "rklb".to_string(),
+                AssetSection { vault_mode: VaultModeStr::Orchestrator },
+            )]),
+        };
+
+        let cfg = resolve_vault_modes(&toml).unwrap();
+
+        assert_eq!(
+            cfg.per_asset.get("RKLB").copied(),
+            Some(VaultMode::Orchestrator { address: orch_address() })
+        );
+        assert!(!cfg.per_asset.contains_key("rklb"));
+    }
+
+    #[test]
+    fn blank_asset_key_is_startup_error() {
+        let toml = TomlFile {
+            orchestrator: None,
+            assets: HashMap::from([(
+                "  ".to_string(),
+                AssetSection { vault_mode: VaultModeStr::VaultDirect },
+            )]),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::InvalidAssetSymbol { symbol, .. })
+                if symbol == "  "
+        ));
+    }
+
+    #[test]
+    fn asset_keys_colliding_after_normalization_are_a_startup_error() {
+        let toml = TomlFile {
+            orchestrator: None,
+            assets: HashMap::from([
+                (
+                    "rklb".to_string(),
+                    AssetSection { vault_mode: VaultModeStr::VaultDirect },
+                ),
+                (
+                    "RKLB".to_string(),
+                    AssetSection { vault_mode: VaultModeStr::VaultDirect },
+                ),
+            ]),
+        };
+
+        assert!(matches!(
+            resolve_vault_modes(&toml),
+            Err(ConfigError::DuplicateAssetSymbol { symbol })
+                if symbol == "RKLB"
+        ));
+    }
+
+    #[test]
+    fn unknown_vault_mode_string_in_toml_is_parse_error() {
+        let bad_toml = r#"
+            [orchestrator]
+            address = "0x1234567890abcdef1234567890abcdef12345678"
+
+            [assets.AAPL]
+            vault_mode = "not_a_valid_mode"
+        "#;
+
+        let result = toml::from_str::<TomlFile>(bad_toml);
+        assert!(result.is_err(), "expected parse error for unknown vault_mode");
+    }
+
+    #[test]
+    fn unknown_toml_key_is_parse_error() {
+        let bad_toml = r#"
+            [orchestrator]
+            address = "0x1234567890abcdef1234567890abcdef12345678"
+            unexpected_key = "oops"
+        "#;
+
+        let result = toml::from_str::<TomlFile>(bad_toml);
+        assert!(result.is_err(), "expected parse error for unknown key");
+    }
+
+    #[test]
+    fn vault_mode_for_uses_per_asset_override_then_default() {
+        let toml = TomlFile {
+            orchestrator: Some(OrchestratorSection {
+                address: Some(ORCH_ADDR.to_string()),
+                default_vault_mode: Some(VaultModeStr::Orchestrator),
+            }),
+            assets: HashMap::from([(
+                "TSLA".to_string(),
+                AssetSection { vault_mode: VaultModeStr::VaultDirect },
+            )]),
+        };
+        let args = minimal_args();
+        let env = Env::try_parse_from(args).unwrap();
+        let mut config = env.into_config().unwrap();
+        config.vault_mode_config = resolve_vault_modes(&toml).unwrap();
+
+        // Explicit VaultDirect override wins over the orchestrator default
+        assert_eq!(
+            config.vault_mode_for(&UnderlyingSymbol::new("TSLA").unwrap()),
+            VaultMode::VaultDirect
+        );
+
+        // Asset not in per_asset falls back to default (orchestrator)
+        assert_eq!(
+            config.vault_mode_for(&UnderlyingSymbol::new("AAPL").unwrap()),
+            VaultMode::Orchestrator { address: orch_address() }
+        );
     }
 }
