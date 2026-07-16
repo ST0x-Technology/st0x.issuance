@@ -18,8 +18,8 @@ use st0x_issuance::bindings::Receipt::ReceiptInstance;
 use st0x_issuance::test_utils::{LocalEvm, ROLE_CERTIFY, ROLE_DEPOSIT};
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, initialize_rocket,
-    receipt_inventory_aggregate_id,
+    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
+    initialize_rocket, receipt_inventory_aggregate_id,
 };
 
 use crate::harness::create_provider;
@@ -327,6 +327,7 @@ async fn test_multi_vault_backfill_discovers_receipts_from_all_assets()
             subgraph_url,
             backfill_start_block: 0,
         }],
+        vault_mode_config: VaultModeConfig::default(),
     };
 
     // Start rocket - backfill should run and discover the TSLA receipt

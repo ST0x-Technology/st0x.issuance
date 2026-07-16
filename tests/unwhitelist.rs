@@ -14,7 +14,8 @@ use st0x_issuance::bindings::OffchainAssetReceiptVault::OffchainAssetReceiptVaul
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::{
     ANVIL_CHAIN_ID, AlpacaConfig, AuthConfig, ChainConfig, Config, Environment,
-    IpWhitelist, LogLevel, Network, SignerConfig, initialize_rocket,
+    IpWhitelist, LogLevel, Network, SignerConfig, VaultModeConfig,
+    initialize_rocket,
 };
 
 use crate::harness::create_provider;
@@ -83,6 +84,7 @@ async fn test_unwhitelist_wallet_blocks_mint_and_redemption()
             subgraph_url,
             backfill_start_block: 0,
         }],
+        vault_mode_config: VaultModeConfig::default(),
     };
 
     let rocket = initialize_rocket(config).await?;
