@@ -1,6 +1,7 @@
 {
   pkgs,
   mkAbi,
+  mkSoldeerAbi,
   sources,
 }:
 
@@ -17,6 +18,10 @@ let
     ethgild = import ./ethgild.nix {
       inherit mkAbi;
       src = sources.ethgild;
+    };
+    st0x-deploy = import ./st0x-deploy.nix {
+      inherit mkSoldeerAbi;
+      src = sources.st0x-deploy;
     };
   };
 
