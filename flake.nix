@@ -40,6 +40,13 @@
       flake = false;
       submodules = true;
     };
+    st0x-deploy = {
+      type = "git";
+      url = "https://github.com/S01-Issuer/st0x.deploy";
+      rev = "c526422e4c493b9e8be30ddfd7f7ec536efe2fb0";
+      flake = false;
+      submodules = true;
+    };
   };
 
   outputs =
@@ -53,6 +60,7 @@
       ethgild,
       disko,
       nixos-anywhere,
+      st0x-deploy,
       ...
     }:
     let
@@ -237,13 +245,14 @@
             solc = rainix.pkgs.${system}.solc_0_8_25;
           })
           mkAbi
+          mkSoldeerAbi
           ;
 
         inherit
           (import ./nix/abis.nix {
-            inherit pkgs mkAbi;
+            inherit pkgs mkAbi mkSoldeerAbi;
             sources = {
-              inherit ethgild;
+              inherit ethgild st0x-deploy;
             };
           })
           abis
@@ -275,7 +284,9 @@
             prepSolArtifacts = pkgs.writeShellApplication {
               name = "prep-sol-artifacts";
               text = ''
-                ln -sfn ${abis.ethgild}/out abis
+                mkdir -p abis
+                ln -sfn ${abis.ethgild}/out abis/ethgild
+                ln -sfn ${abis.st0x-deploy}/out abis/st0x.deploy
               '';
             };
 
@@ -369,7 +380,9 @@
             inherit (rainix.devShells.${system}.default) nativeBuildInputs;
             shellHook = ''
               ${rainix.devShells.${system}.default.shellHook or ""}
-              ln -sfn ${abis.ethgild}/out abis
+              mkdir -p abis
+              ln -sfn ${abis.ethgild}/out abis/ethgild
+              ln -sfn ${abis.st0x-deploy}/out abis/st0x.deploy
             '';
 
             buildInputs =
