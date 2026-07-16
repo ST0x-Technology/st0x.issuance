@@ -44,6 +44,13 @@ Redemption recovery covers redemptions in `Detected`
 (`recover_stuck_reservations`). This runs with a **30-second timeout** before
 the HTTP server starts accepting requests.
 
+Persisted burn transactions are also reconciled every five minutes. Recovery
+confirms mined transactions, re-broadcasts the exact signed bytes while a
+transaction can still land, and signs a fresh-nonce replacement only after the
+old hash is provably dead. After five durable automatic actions across the
+redemption's lifetime, it logs `Automatic burn recovery exhausted` once with
+the request ID, transaction hash, nonce, and required operator action.
+
 - If recovery completes within 30 seconds, everything is handled automatically.
 - If recovery times out (e.g., the RPC is slow or unavailable), the remaining
   stuck transactions are left for manual intervention via the admin endpoints

@@ -241,6 +241,30 @@ pub(crate) enum RedemptionEvent {
         sendable_tx: SendableTxWithHash,
         planned_burns: Vec<BurnRecord>,
     },
+    BurnRecoveryAttempted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        action: super::BurnRecoveryAction,
+        attempted_at: DateTime<Utc>,
+    },
+    BurnPreparationRecoveryAttempted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempt: u32,
+        attempted_at: DateTime<Utc>,
+    },
+    BurnRecoveryExhausted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        tx_hash: B256,
+        nonce: u64,
+        attempts: u32,
+        exhausted_at: DateTime<Utc>,
+    },
+    BurnPreparationRecoveryExhausted {
+        issuer_request_id: IssuerRedemptionRequestId,
+        attempts: u32,
+        exhausted_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for RedemptionEvent {
@@ -285,6 +309,18 @@ impl DomainEvent for RedemptionEvent {
             }
             Self::BurnIntended { .. } => {
                 "RedemptionEvent::BurnIntended".to_string()
+            }
+            Self::BurnRecoveryAttempted { .. } => {
+                "RedemptionEvent::BurnRecoveryAttempted".to_string()
+            }
+            Self::BurnPreparationRecoveryAttempted { .. } => {
+                "RedemptionEvent::BurnPreparationRecoveryAttempted".to_string()
+            }
+            Self::BurnRecoveryExhausted { .. } => {
+                "RedemptionEvent::BurnRecoveryExhausted".to_string()
+            }
+            Self::BurnPreparationRecoveryExhausted { .. } => {
+                "RedemptionEvent::BurnPreparationRecoveryExhausted".to_string()
             }
         }
     }
