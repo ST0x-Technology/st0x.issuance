@@ -85,6 +85,17 @@ impl RedeemCallManager {
                         auto_failed += 1;
                     }
                 }
+                // The Alpaca call failed and `handle_redemption_detected`
+                // already recorded `RecordAlpacaFailure`, so the redemption is
+                // properly terminal-ized. Count it as auto-failed rather than a
+                // recovery failure that would be re-attempted every sweep.
+                Err(RedeemCallManagerError::Alpaca(err)) => {
+                    debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                        error = %err,
+                        "Auto-failed Detected redemption via Alpaca rejection"
+                    );
+                    auto_failed += 1;
+                }
                 Err(err) => {
                     debug!(target: "redemption", issuer_request_id = %issuer_request_id,
                         error = %err,
@@ -542,6 +553,7 @@ mod tests {
         store.load(issuer_request_id).await.unwrap().unwrap()
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_handle_redemption_detected_with_success() {
         let (store, pool) = setup_test_store().await;
@@ -582,8 +594,14 @@ mod tests {
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
             "Expected AlpacaCalled state, got {updated_aggregate:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Alpaca redeem API call succeeded"]
+        ));
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_handle_redemption_detected_with_alpaca_failure() {
         let (store, pool) = setup_test_store().await;
@@ -632,6 +650,11 @@ mod tests {
             reason.contains("API timeout"),
             "Expected error message to contain 'API timeout', got: {reason}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::WARN,
+            &["Alpaca redeem API call failed"]
+        ));
     }
 
     #[tokio::test]
@@ -773,6 +796,7 @@ mod tests {
         );
     }
 
+    #[traced_test]
     #[tokio::test]
     async fn test_recover_detected_redemptions_with_valid_redemption() {
         let harness = TestHarness::new().await;
@@ -820,6 +844,81 @@ mod tests {
             matches!(updated_aggregate, Redemption::AlpacaCalled { .. }),
             "Expected AlpacaCalled state, got {updated_aggregate:?}"
         );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Detected redemption recovery complete", "recovered=1"]
+        ));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_recover_detected_alpaca_failure_counts_auto_failed() {
+        // A recovery whose Alpaca call fails records `RecordAlpacaFailure` — the
+        // redemption is properly terminal-ized — so it must be counted as
+        // auto_failed, not as a recovery failure that would be re-attempted on
+        // every subsequent sweep.
+        let harness = TestHarness::new().await;
+        let alpaca_service_mock =
+            Arc::new(MockAlpacaService::new_failure("API timeout"));
+        let alpaca_service = alpaca_service_mock.clone()
+            as Arc<dyn crate::alpaca::AlpacaService>;
+        let manager = harness.create_manager(alpaca_service);
+
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let client_id = ClientId::new();
+        let alpaca_account = AlpacaAccountNumber("acc-recovery".to_string());
+        let underlying = UnderlyingSymbol::new("AAPL");
+        let network = Network::Base;
+
+        harness
+            .register_and_link_account(
+                client_id,
+                "test@example.com",
+                &alpaca_account,
+                wallet,
+            )
+            .await;
+        harness.add_asset(&underlying, &network).await;
+
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        harness
+            .detect_redemption(&issuer_request_id, &underlying, wallet)
+            .await;
+
+        manager.recover_detected_redemptions().await;
+
+        let updated_aggregate = harness
+            .redemption_store
+            .load(&issuer_request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(updated_aggregate, Redemption::Failed { .. }),
+            "Expected Failed state after Alpaca rejection, got {updated_aggregate:?}"
+        );
+
+        // Scoped by issuer_request_id: the tracing buffer is global across
+        // concurrently running tests, so the id pins the line to this test's
+        // redemption rather than a sibling test's.
+        let id_string = issuer_request_id.to_string();
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &[
+                "Auto-failed Detected redemption via Alpaca rejection",
+                "API timeout",
+                id_string.as_str()
+            ]
+        ));
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &[
+                "Detected redemption recovery complete",
+                "auto_failed=1",
+                "failed=0"
+            ]
+        ));
     }
 
     #[tokio::test]

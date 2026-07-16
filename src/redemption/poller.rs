@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -7,10 +7,11 @@ use event_sorcery::Store;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 
 use super::{
-    Redemption,
+    IssuerRedemptionRequestId, Redemption,
     burn_manager::BurnManager,
     journal_manager::JournalManager,
     redeem_call_manager::RedeemCallManager,
@@ -350,12 +351,34 @@ where
                 "Processed block range"
             );
 
+            let mut dropped_tx_hashes: Vec<Option<TxHash>> = Vec::new();
             for log in &logs {
-                self.process_log(assets, log).await?;
+                if let ProcessedLog::DroppedNonTransient { tx_hash } =
+                    self.process_log(assets, log).await?
+                {
+                    dropped_tx_hashes.push(tx_hash);
+                }
             }
 
             poll_checkpoint::advance(&self.pool, &checkpoint_name, chunk_to)
                 .await?;
+
+            // The advance above moved the cursor past these transfers, making
+            // the skip permanent: real user tokens in the redemption wallet
+            // that will never be redeemed automatically. The per-log detail is
+            // DEBUG (loop-body rule), so this per-chunk summary is the
+            // operator's only signal — emitted here, not after the loop, so a
+            // transient error in a later chunk cannot swallow it. Any earlier
+            // `?` abort leaves this chunk's checkpoint unadvanced, so its
+            // drops are re-detected on the next pass.
+            if !dropped_tx_hashes.is_empty() {
+                warn!(
+                    target: "redemption",
+                    count = dropped_tx_hashes.len(),
+                    tx_hashes = ?dropped_tx_hashes,
+                    "Permanently skipped non-retryable transfer logs; these transfers will not be redeemed automatically"
+                );
+            }
         }
 
         Ok(())
@@ -387,13 +410,14 @@ where
     ///
     /// Returns `Err` only for transient failures (DB/RPC errors that may
     /// succeed on retry). Non-transient failures (decode errors, missing
-    /// fields, no matching asset) are logged and skipped — retrying them
+    /// fields, no matching asset) are reported as
+    /// [`ProcessedLog::DroppedNonTransient`] and skipped — retrying them
     /// would freeze the checkpoint permanently.
     async fn process_log(
         &self,
         assets: &[TokenizedAssetView],
         log: &Log,
-    ) -> Result<(), TransferPollError> {
+    ) -> Result<ProcessedLog, TransferPollError> {
         let vault = log.address();
 
         let outcome =
@@ -402,13 +426,15 @@ where
             {
                 Ok(outcome) => outcome,
                 Err(err) if err.is_non_transient() => {
-                    warn!(
+                    debug!(
                         target: "redemption",
                         error = %err,
                         tx_hash = ?log.transaction_hash,
                         "Skipping non-retryable transfer log"
                     );
-                    return Ok(());
+                    return Ok(ProcessedLog::DroppedNonTransient {
+                        tx_hash: log.transaction_hash,
+                    });
                 }
                 Err(err) => return Err(err.into()),
             };
@@ -420,7 +446,8 @@ where
                 alpaca_account,
                 network,
             } => {
-                tokio::spawn(drive_redemption_flow(
+                let flow_issuer_request_id = issuer_request_id.clone();
+                let flow = tokio::spawn(drive_redemption_flow(
                     issuer_request_id,
                     client_id,
                     alpaca_account,
@@ -432,13 +459,55 @@ where
                         burn_manager: self.burn_manager.clone(),
                     },
                 ));
+
+                tokio::spawn(watch_redemption_flow(
+                    flow,
+                    flow_issuer_request_id,
+                    log.transaction_hash,
+                ));
             }
             TransferOutcome::AlreadyDetected
             | TransferOutcome::SkippedMint
             | TransferOutcome::SkippedNoAccount => {}
         }
 
-        Ok(())
+        Ok(ProcessedLog::Handled)
+    }
+}
+
+/// Outcome of processing a single Transfer log: either handled (including
+/// benign skips like already-detected) or permanently dropped because of a
+/// non-transient decode/detection failure.
+enum ProcessedLog {
+    Handled,
+    DroppedNonTransient { tx_hash: Option<TxHash> },
+}
+
+/// Watches a spawned redemption-flow task. A dropped `JoinHandle` swallows
+/// task panics silently, so a panic must surface in logs — with the redemption
+/// identity, so the operator does not have to correlate by timestamp — instead
+/// of only manifesting as a stuck aggregate the next recovery sweep has to
+/// clean up. Cancellation (runtime shutdown, abort) is expected teardown noise
+/// and logged at DEBUG so it cannot masquerade as a panic.
+async fn watch_redemption_flow(
+    flow: JoinHandle<()>,
+    issuer_request_id: IssuerRedemptionRequestId,
+    tx_hash: Option<TxHash>,
+) {
+    if let Err(err) = flow.await {
+        if err.is_panic() {
+            warn!(target: "redemption", issuer_request_id = %issuer_request_id,
+                tx_hash = ?tx_hash,
+                error = ?err,
+                "drive_redemption_flow task panicked"
+            );
+        } else {
+            debug!(target: "redemption", issuer_request_id = %issuer_request_id,
+                tx_hash = ?tx_hash,
+                error = ?err,
+                "drive_redemption_flow task cancelled"
+            );
+        }
     }
 }
 
@@ -515,16 +584,16 @@ mod tests {
     use std::sync::Arc;
     use tracing_test::traced_test;
 
-    use super::TransferPollError;
+    use super::{TransferPollError, watch_redemption_flow};
     use crate::alpaca::mock::MockAlpacaService;
     use crate::poll_checkpoint::{self, TRANSFER_POLL};
     use crate::receipt_inventory::{
         CqrsReceiptService, ReceiptInventory, ReceiptService,
     };
-    use crate::redemption::Redemption;
     use crate::redemption::test_utils::{
         create_transfer_log, setup_test_db_with_asset,
     };
+    use crate::redemption::{IssuerRedemptionRequestId, Redemption};
     use crate::test_utils::{log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
         Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
@@ -1251,6 +1320,55 @@ mod tests {
             None,
             "a vault added after the migration must have no checkpoint — it \
              scans from backfill_start_block, not the stale global block"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn watch_redemption_flow_logs_panic_with_identity() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let id_string = issuer_request_id.to_string();
+        let flow = tokio::spawn(async { panic!("redemption flow blew up") });
+
+        watch_redemption_flow(flow, issuer_request_id, None).await;
+
+        assert!(
+            logs_contain_at!(
+                tracing::Level::WARN,
+                &["drive_redemption_flow task panicked", id_string.as_str()]
+            ),
+            "a flow panic must be logged at WARN with the redemption identity"
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn watch_redemption_flow_logs_cancellation_at_debug() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let id_string = issuer_request_id.to_string();
+        let flow = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        flow.abort();
+
+        watch_redemption_flow(flow, issuer_request_id, None).await;
+
+        // Scope both assertions by this test's redemption id: the log buffer
+        // is global across concurrently running tests, so an unscoped negative
+        // match would trip on the sibling panic test's WARN line.
+        assert!(
+            !logs_contain_at!(
+                tracing::Level::WARN,
+                &["drive_redemption_flow task panicked", id_string.as_str()]
+            ),
+            "cancellation must not be reported as a panic"
+        );
+        assert!(
+            logs_contain_at!(
+                tracing::Level::DEBUG,
+                &["drive_redemption_flow task cancelled", id_string.as_str()]
+            ),
+            "cancellation must be logged at DEBUG"
         );
     }
 }
