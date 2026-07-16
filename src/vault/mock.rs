@@ -3,7 +3,11 @@ use alloy::consensus::{
 };
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256, b256};
+#[cfg(test)]
+use alloy::providers::{PendingTransactionError, WatchTxError};
 use alloy::rpc::types::TransactionReceipt;
+#[cfg(test)]
+use alloy::transports::TransportErrorKind;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -58,8 +62,7 @@ enum MockBehavior {
     InvalidPreparedMint,
 }
 
-/// Configured outcome for `verify_burn_tx` in tests, exercising the admin
-/// force-complete path's on-chain verification of an operator-supplied tx hash.
+/// Configured outcome for `verify_burn_tx` in tests.
 #[cfg(test)]
 #[derive(Clone)]
 enum MockVerifyBurn {
@@ -69,6 +72,19 @@ enum MockVerifyBurn {
     NotABurn,
     /// The tx reverted on-chain.
     Reverted,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+enum MockCheckTxOutcome {
+    Receipt(Box<TransactionReceipt>),
+    /// The prior tx is still pending.
+    Pending,
+    /// The prior tx lookup failed at the RPC boundary.
+    Rpc,
+    /// The prior tx cannot be verified from its identifier or receipt.
+    #[default]
+    InvalidReceipt,
 }
 
 #[cfg(test)]
@@ -107,14 +123,14 @@ pub(crate) struct MockVaultService {
     #[cfg(test)]
     last_multi_burn_params: Arc<Mutex<Option<MultiBurnParams>>>,
     /// Outcome returned by `verify_burn_tx`. Defaults to a successful
-    /// verification, exercising the admin force-complete happy path.
+    /// verification, exercising the force-complete happy path.
     #[cfg(test)]
     verify_burn: Arc<Mutex<MockVerifyBurn>>,
     /// Signed tx returned by `prepare_tx` when local signing is configured.
     #[cfg(test)]
     prepared_tx: Arc<Mutex<Option<SendableTxWithHash>>>,
     #[cfg(test)]
-    checked_tx_receipt: Arc<Mutex<Option<TransactionReceipt>>>,
+    checked_tx_outcome: Arc<Mutex<MockCheckTxOutcome>>,
 }
 
 impl MockVaultService {
@@ -141,7 +157,9 @@ impl MockVaultService {
             #[cfg(test)]
             prepared_tx: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -161,7 +179,9 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -181,7 +201,9 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -201,7 +223,9 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -228,7 +252,9 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -248,7 +274,9 @@ impl MockVaultService {
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             prepared_tx: Arc::new(Mutex::new(None)),
-            checked_tx_receipt: Arc::new(Mutex::new(None)),
+            checked_tx_outcome: Arc::new(Mutex::new(
+                MockCheckTxOutcome::default(),
+            )),
         }
     }
 
@@ -336,6 +364,25 @@ impl MockVaultService {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_pending_checked_tx(self) -> Self {
+        *self.checked_tx_outcome.lock().unwrap() = MockCheckTxOutcome::Pending;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rpc_checked_tx_error(self) -> Self {
+        *self.checked_tx_outcome.lock().unwrap() = MockCheckTxOutcome::Rpc;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_invalid_checked_tx(self) -> Self {
+        *self.checked_tx_outcome.lock().unwrap() =
+            MockCheckTxOutcome::InvalidReceipt;
+        self
+    }
+
     /// Configures `find_existing_burn` to return the given [`SubmittedTx`],
     /// simulating a burn that was already submitted on-chain before the current
     /// process started (crash-safe idempotency recovery path).
@@ -353,7 +400,8 @@ impl MockVaultService {
         self,
         receipt: TransactionReceipt,
     ) -> Self {
-        *self.checked_tx_receipt.lock().unwrap() = Some(receipt);
+        *self.checked_tx_outcome.lock().unwrap() =
+            MockCheckTxOutcome::Receipt(Box::new(receipt));
         self
     }
 }
@@ -710,17 +758,35 @@ impl VaultService for MockVaultService {
         _tx_id: &TxId,
     ) -> Result<TransactionReceipt, VaultError> {
         #[cfg(test)]
-        let checked_tx_receipt =
-            self.checked_tx_receipt.lock().unwrap().clone();
+        let checked_tx_outcome =
+            self.checked_tx_outcome.lock().unwrap().clone();
         #[cfg(test)]
-        if let Some(receipt) = checked_tx_receipt {
-            return Ok(receipt);
-        }
-        #[cfg(test)]
-        if matches!(*self.verify_burn.lock().unwrap(), MockVerifyBurn::Reverted)
         {
-            return Err(VaultError::Reverted { tx_hash: B256::ZERO });
+            use super::classify_checked_receipt;
+
+            match checked_tx_outcome {
+                MockCheckTxOutcome::Receipt(receipt) => {
+                    let tx_hash =
+                        _tx_id.to_hash().ok_or(VaultError::InvalidReceipt)?;
+                    return classify_checked_receipt(tx_hash, *receipt);
+                }
+                MockCheckTxOutcome::Pending => {
+                    return Err(PendingTransactionError::TxWatcher(
+                        WatchTxError::Timeout,
+                    )
+                    .into());
+                }
+                MockCheckTxOutcome::Rpc => {
+                    return Err(VaultError::Rpc(
+                        TransportErrorKind::custom_str("mock RPC failure"),
+                    ));
+                }
+                MockCheckTxOutcome::InvalidReceipt => {
+                    return Err(VaultError::InvalidReceipt);
+                }
+            }
         }
+        #[cfg(not(test))]
         Err(VaultError::InvalidReceipt)
     }
 
