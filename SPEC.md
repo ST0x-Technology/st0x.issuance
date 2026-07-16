@@ -240,6 +240,21 @@ initial request through journal confirmation to on-chain minting and callback.
   (carries tx details)
 - `MintRetryStarted` - Mint retry started during recovery
 
+Newly persisted transaction IDs use an explicitly tagged `hash` or `legacy`
+representation so replay preserves the original `TxId` variant, including a
+legacy ID whose text is valid 32-byte hex. Replay also accepts the historical
+flat-string representation; because those rows have no variant discriminator,
+32-byte hex flat strings retain the historical hash inference. Legacy
+`FireblocksSubmitted` events and their `fireblocks_tx_id` field replay as
+`MintTxSubmitted`.
+
+The tagged writer is a one-way persistence cutover. Deployment must stop event
+writers, back up the database, replace every service instance with the
+dual-format reader, and only then resume traffic. After the first tagged
+transaction ID is persisted, a binary that only understands flat strings must
+not be restored against that database; recovery is to roll forward with the
+dual-format reader or restore the pre-cutover backup.
+
 **Command -> Event Mappings:**
 
 | Command              | Events                  | Notes                                           |

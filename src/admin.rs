@@ -115,7 +115,7 @@ pub(crate) struct StuckAggregate {
     /// `MintTxSubmitted` event. For redemptions, populated only on
     /// `BurnFailed` (the view carries it for that variant).
     #[serde(skip_serializing_if = "Option::is_none")]
-    tx_id: Option<TxId>,
+    tx_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1254,7 +1254,7 @@ pub(crate) async fn list_stuck(
             underlying,
             quantity,
             tx_hash: mint_history.tx_hash,
-            tx_id: mint_history.tx_id,
+            tx_id: mint_history.tx_id.map(|tx_id| tx_id.to_string()),
         });
     }
 
@@ -1438,7 +1438,7 @@ fn stuck_redemption_entry(
         underlying,
         quantity,
         tx_hash,
-        tx_id,
+        tx_id: tx_id.map(|tx_id| tx_id.to_string()),
     })
 }
 
@@ -1776,7 +1776,7 @@ mod tests {
     use tracing::Level;
     use tracing_test::traced_test;
 
-    use super::AggregateKind;
+    use super::{AggregateKind, StuckAggregate};
     use super::{
         AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
         recover_post_alpaca,
@@ -1994,6 +1994,36 @@ mod tests {
     }
 
     #[test]
+    fn stuck_aggregate_serializes_tx_id_as_documented_string() {
+        let cases = [
+            TxId::Hash(b256!(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            )),
+            TxId::Legacy("07bdef3c-5314-4d1d-94f7-f3f346cd4c2f".to_string()),
+        ];
+
+        for tx_id in cases {
+            let expected = tx_id.to_string();
+            let entry = StuckAggregate {
+                aggregate_type: AggregateKind::Mint,
+                aggregate_id: "mint-id".to_string(),
+                tokenization_request_id: None,
+                state: "minting_failed".to_string(),
+                detail: "mint failed".to_string(),
+                timestamp: Utc::now(),
+                underlying: None,
+                quantity: None,
+                tx_hash: None,
+                tx_id: Some(expected.clone()),
+            };
+
+            let response = serde_json::to_value(entry).unwrap();
+
+            assert_eq!(response["tx_id"], expected);
+        }
+    }
+
+    #[test]
     fn failed_redemption_stuck_entry_uses_history_metadata() {
         let metadata = test_metadata();
         let tokenization_request_id = TokenizationRequestId::new("tok-red-1");
@@ -2028,7 +2058,7 @@ mod tests {
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
-        assert_eq!(entry.tx_id, Some(tx_id));
+        assert_eq!(entry.tx_id, Some(tx_id.to_string()));
         assert_eq!(entry.timestamp, failed_at);
     }
 
@@ -2070,7 +2100,7 @@ mod tests {
             Some(tokenization_request_id)
         );
         assert_eq!(entry.tx_hash, Some(metadata.detected_tx_hash));
-        assert_eq!(entry.tx_id, Some(tx_id));
+        assert_eq!(entry.tx_id, Some(tx_id.to_string()));
         assert_eq!(entry.underlying, Some(metadata.underlying));
         assert_eq!(entry.quantity, Some(metadata.quantity));
     }
@@ -3617,7 +3647,7 @@ mod tests {
         .expect("Burning view should produce a stuck entry");
         assert_eq!(entry.state, "Burning");
         assert_eq!(entry.detail, "Waiting for burn confirmation");
-        assert_eq!(entry.tx_id, Some(tx_id));
+        assert_eq!(entry.tx_id, Some(tx_id.to_string()));
     }
 
     #[test]

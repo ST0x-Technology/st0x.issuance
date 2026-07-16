@@ -1731,7 +1731,7 @@ impl EventSourced for Mint {
 
     const AGGREGATE_TYPE: &'static str = "Mint";
     const PROJECTION: Table = Table("mint_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     // Snapshots are disabled: the pre-migration wiring never wrote snapshots,
     // and event-sorcery hardwires snapshot-every-N with no off switch, so

@@ -129,6 +129,58 @@ impl DomainEvent for MintEvent {
     }
 
     fn event_version(&self) -> String {
-        "1.0".to_string()
+        match self {
+            Self::MintTxSubmitted { .. } => "2.0".to_string(),
+            _ => "1.0".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn raw_fireblocks_submitted_event_replays_populated_legacy_tx_id() {
+        let raw_event = json!({
+            "FireblocksSubmitted": {
+                "issuer_request_id": "550e8400-e29b-41d4-a716-446655440000",
+                "external_tx_id": "mint-550e8400-e29b-41d4-a716-446655440000",
+                "fireblocks_tx_id": "07bdef3c-5314-4d1d-94f7-f3f346cd4c2f",
+                "submitted_at": "2026-07-14T12:00:00Z"
+            }
+        });
+
+        let event: MintEvent = serde_json::from_value(raw_event).unwrap();
+
+        assert!(matches!(
+            event,
+            MintEvent::MintTxSubmitted {
+                tx_id: TxId::Legacy(ref value),
+                ref external_tx_id,
+                ..
+            } if value == "07bdef3c-5314-4d1d-94f7-f3f346cd4c2f"
+                && external_tx_id
+                    == "mint-550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn mint_tx_submitted_uses_tagged_tx_id_event_version() {
+        let event = MintEvent::MintTxSubmitted {
+            issuer_request_id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .unwrap(),
+            external_tx_id: "mint-550e8400-e29b-41d4-a716-446655440000"
+                .to_string(),
+            tx_id: TxId::Legacy(
+                "07bdef3c-5314-4d1d-94f7-f3f346cd4c2f".to_string(),
+            ),
+            submitted_at: Utc::now(),
+        };
+
+        assert_eq!(event.event_version(), "2.0");
     }
 }
