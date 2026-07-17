@@ -14,6 +14,7 @@ use tracing::{info, trace};
 use super::{
     ReceiptId, ReceiptInventory, ReceiptInventoryCommand,
     ReceiptInventoryError, ReceiptSource, Shares, determine_source,
+    send_receipt_inventory_command,
 };
 use crate::bindings::{OffchainAssetReceiptVault, Receipt};
 use crate::mint::IssuerMintRequestId;
@@ -456,33 +457,33 @@ where
             Some(discovery.receipt_information.clone())
         };
 
-        self.store
-            .send(
-                &self.vault,
-                ReceiptInventoryCommand::DiscoverReceipt {
-                    receipt_id: discovery.receipt_id,
-                    balance: Shares::from(current_balance),
-                    block_number: discovery.block_number,
-                    tx_hash: discovery.tx_hash,
-                    source: source.clone(),
-                    receipt_info: receipt_info.map(Box::new),
-                    receipt_info_bytes,
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &self.vault,
+            ReceiptInventoryCommand::DiscoverReceipt {
+                receipt_id: discovery.receipt_id,
+                balance: Shares::from(current_balance),
+                block_number: discovery.block_number,
+                tx_hash: discovery.tx_hash,
+                source: source.clone(),
+                receipt_info: receipt_info.map(Box::new),
+                receipt_info_bytes,
+            },
+        )
+        .await?;
 
         // For already-known receipts, DiscoverReceipt is a no-op. Reconcile
         // ensures the aggregate reflects the current on-chain balance (e.g.,
         // after an inbound transfer increases the balance).
-        self.store
-            .send(
-                &self.vault,
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id: discovery.receipt_id,
-                    on_chain_balance: Shares::from(current_balance),
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &self.vault,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id: discovery.receipt_id,
+                on_chain_balance: Shares::from(current_balance),
+            },
+        )
+        .await?;
 
         trace!(target: "receipt", receipt_id = %discovery.receipt_id,
             balance = %current_balance,
@@ -511,15 +512,15 @@ where
             .call()
             .await?;
 
-        self.store
-            .send(
-                &self.vault,
-                ReceiptInventoryCommand::ReconcileBalance {
-                    receipt_id,
-                    on_chain_balance: Shares::from(on_chain_balance),
-                },
-            )
-            .await?;
+        send_receipt_inventory_command(
+            &self.store,
+            &self.vault,
+            ReceiptInventoryCommand::ReconcileBalance {
+                receipt_id,
+                on_chain_balance: Shares::from(on_chain_balance),
+            },
+        )
+        .await?;
 
         trace!(target: "receipt", receipt_id = %receipt_id,
             on_chain_balance = %on_chain_balance,
