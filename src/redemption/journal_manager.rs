@@ -15,6 +15,8 @@ use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber};
 use crate::alpaca::{
     AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+    alpaca_tokenization_request_id, issuance_issuer_request_id,
+    issuance_quantity, issuance_token_symbol, issuance_underlying_symbol,
 };
 use crate::mint::TokenizationRequestId;
 
@@ -160,9 +162,11 @@ impl JournalManager {
                 "Polling Alpaca for journal status"
             );
 
+            let alpaca_tokenization_request_id =
+                alpaca_tokenization_request_id(&tokenization_request_id);
             let request_result = self
                 .alpaca_service
-                .poll_request_status(&tokenization_request_id)
+                .poll_request_status(&alpaca_tokenization_request_id)
                 .await;
 
             let should_continue = self
@@ -234,29 +238,46 @@ impl JournalManager {
                 }
             })?;
 
+        let req_issuer_id =
+            issuance_issuer_request_id(req_issuer_id).map_err(|error| {
+                JournalManagerError::ValidationFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        let req_underlying = issuance_underlying_symbol(req_underlying);
+        let req_token = issuance_token_symbol(req_token);
+        let req_quantity =
+            issuance_quantity(req_quantity).map_err(|error| {
+                JournalManagerError::ValidationFailed {
+                    issuer_request_id: issuer_request_id.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+
         Self::check_field_match(
             issuer_request_id,
             "Issuer request ID",
             &metadata.issuer_request_id,
-            req_issuer_id,
+            &req_issuer_id,
         )?;
         Self::check_field_match(
             issuer_request_id,
             "Underlying symbol",
             &metadata.underlying,
-            req_underlying,
+            &req_underlying,
         )?;
         Self::check_field_match(
             issuer_request_id,
             "Token symbol",
             &metadata.token,
-            req_token,
+            &req_token,
         )?;
         Self::check_field_match(
             issuer_request_id,
             "Quantity",
             alpaca_quantity,
-            req_quantity,
+            &req_quantity,
         )?;
         Self::check_field_match(
             issuer_request_id,
@@ -596,7 +617,8 @@ mod tests {
         Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
     };
     use crate::alpaca::{
-        AlpacaError, AlpacaService, RedeemRequestStatus, TokenizationRequest,
+        AlpacaError, AlpacaService, RedeemRequestStatus, TestRedeemResponse,
+        TokenizationRequest, test_redeem_response,
     };
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
@@ -732,8 +754,8 @@ mod tests {
             status: RedeemRequestStatus,
             tx_hash: Option<TxHash>,
         ) -> TokenizationRequest {
-            TokenizationRequest::Redeem {
-                id: TokenizationRequestId::new("mock-tok"),
+            test_redeem_response(TestRedeemResponse {
+                tokenization_request_id: TokenizationRequestId::new("mock-tok"),
                 issuer_request_id: self.issuer_request_id.clone(),
                 status,
                 underlying: UnderlyingSymbol::new("AAPL"),
@@ -742,7 +764,8 @@ mod tests {
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 tx_hash,
                 updated_at: Some(chrono::Utc::now()),
-            }
+            })
+            .unwrap()
         }
     }
 
@@ -764,7 +787,7 @@ mod tests {
 
         async fn poll_request_status(
             &self,
-            tokenization_request_id: &TokenizationRequestId,
+            tokenization_request_id: &crate::alpaca::TokenizationRequestId,
         ) -> Result<TokenizationRequest, AlpacaError> {
             let index = {
                 let mut count = self.call_count.lock().unwrap();
@@ -800,7 +823,9 @@ mod tests {
                 MockResponse::ResponseIdMismatch { returned_id } => {
                     Err(AlpacaError::ResponseIdMismatch {
                         requested: tokenization_request_id.clone(),
-                        returned: TokenizationRequestId::new(returned_id),
+                        returned: crate::alpaca::TokenizationRequestId::new(
+                            returned_id,
+                        ),
                     })
                 }
             }
@@ -1345,10 +1370,12 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                _tokenization_request_id: &TokenizationRequestId,
+                _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
-                Ok(TokenizationRequest::Redeem {
-                    id: TokenizationRequestId::new("mock-tok"),
+                Ok(test_redeem_response(TestRedeemResponse {
+                    tokenization_request_id: TokenizationRequestId::new(
+                        "mock-tok",
+                    ),
                     issuer_request_id: self.issuer_request_id.clone(),
                     status: RedeemRequestStatus::Completed,
                     underlying: UnderlyingSymbol::new("AAPL"),
@@ -1362,6 +1389,7 @@ mod tests {
                     )),
                     updated_at: Some(chrono::Utc::now()),
                 })
+                .unwrap())
             }
         }
 
@@ -1438,7 +1466,7 @@ mod tests {
 
             async fn poll_request_status(
                 &self,
-                _tokenization_request_id: &TokenizationRequestId,
+                _tokenization_request_id: &crate::alpaca::TokenizationRequestId,
             ) -> Result<TokenizationRequest, AlpacaError> {
                 Ok(TokenizationRequest::Mint {})
             }

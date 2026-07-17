@@ -105,7 +105,7 @@ impl Config {
             let signing_provider = ProviderBuilder::new()
                 .disable_recommended_fillers()
                 .with_gas_estimation()
-                .filler(BlobGasFiller)
+                .filler(BlobGasFiller::default())
                 .with_simple_nonce_management()
                 .with_chain_id(self.chain_id)
                 .wallet(resolved.wallet)

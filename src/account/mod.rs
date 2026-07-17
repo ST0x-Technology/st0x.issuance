@@ -118,6 +118,12 @@ impl ClientId {
     }
 }
 
+impl From<ClientId> for Uuid {
+    fn from(value: ClientId) -> Self {
+        value.0
+    }
+}
+
 impl std::fmt::Display for ClientId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)

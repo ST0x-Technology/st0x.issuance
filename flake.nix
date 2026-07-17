@@ -170,14 +170,19 @@
 
         crateSrc = craneLib.cleanCargoSource ./.;
 
-        # Vendoring reads the whole workspace lock, so the main crate's git dep
-        # (event-sorcery/sqlite-es) needs a pinned hash even though the dto
-        # crate never pulls it in.
+        # Vendoring reads the whole workspace lock, so every git dependency
+        # needs a pinned hash even though the dto crate never pulls them in.
         cargoVendorDir = craneLib.vendorCargoDeps {
           src = crateSrc;
           outputHashes = {
             "git+https://github.com/ST0X-Technology/event-sorcery.git?tag=0.1.2#8f5c81f3472ac4ca84bbcebbddaa0b3b01f2cfea" =
               "sha256-d0bl1jVmPeu9UPl4cNjY+cAaaLEDmLxw1BQhGrH5eV8=";
+            "git+https://github.com/ST0x-Technology/st0x.alpaca?rev=ab153b2abf254aa7e214a90f7ee53b2053bb9e0d#ab153b2abf254aa7e214a90f7ee53b2053bb9e0d" =
+              "sha256-h92VBB6TWs9a0ww/w5oVOD8Ydy3erAF6MGf7REKeUYs=";
+            "git+https://github.com/ST0x-Technology/st0x.finance?rev=819b6f6bd04c9dcd0f9c0cdded0a07038cd06139#819b6f6bd04c9dcd0f9c0cdded0a07038cd06139" =
+              "sha256-QPaJ5jFMHnWnVS5VAx4uhIH7k8cMLvdO2sCaqf/N+OA=";
+            "git+https://github.com/rainlanguage/rain.math.float?rev=e226e5a27125e75208e3e709e1c5eee128bd8b3b#e226e5a27125e75208e3e709e1c5eee128bd8b3b" =
+              "sha256-LALVrtIfJDLDo7HSK8eSPF5AqwpK9TWjTxT6rpYbWzs=";
           };
         };
 

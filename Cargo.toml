@@ -9,6 +9,10 @@ workspace = true
 
 [dependencies]
 st0x-issuance-dto = { path = "crates/dto", features = ["utoipa"] }
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", rev = "ab153b2abf254aa7e214a90f7ee53b2053bb9e0d", default-features = false, features = [
+  "issuer",
+] }
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", default-features = false }
 event-sorcery = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 sqlite-es = { git = "https://github.com/ST0X-Technology/event-sorcery.git", tag = "0.1.2" }
 cqrs-es = "0.5.0"
@@ -45,7 +49,6 @@ tracing-opentelemetry = "0.31.0"
 opentelemetry = "0.30.0"
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.30.0"
-backon = "1.6.0"
 futures = "0.3.31"
 url = { workspace = true }
 anyhow = "1.0.100"

@@ -1,461 +1,335 @@
-use alloy::primitives::{Address, B256, TxHash};
-use async_trait::async_trait;
+use alloy::primitives::{Address, B256};
+#[cfg(test)]
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
 
+use crate::Quantity;
 use crate::account::ClientId;
-use crate::mint::{Quantity, TokenizationRequestId};
+use crate::mint::TokenizationRequestId as IssuanceTokenizationRequestId;
 use crate::redemption::IssuerRedemptionRequestId;
-use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
+use crate::tokenized_asset::{
+    Network as IssuanceNetwork, TokenSymbol as IssuanceTokenSymbol,
+    UnderlyingSymbol as IssuanceUnderlyingSymbol,
+};
 
 pub(crate) mod mock;
 pub(crate) mod service;
 
 pub use service::AlpacaConfig;
+pub(crate) use st0x_alpaca::AlpacaError;
+pub(crate) use st0x_alpaca::core::TokenizationRequestId;
+#[cfg(test)]
+pub(crate) use st0x_alpaca::issuer::RedeemResponse;
+pub(crate) use st0x_alpaca::issuer::{
+    IssuerApi as AlpacaService, MintCallbackRequest, RedeemRequest,
+    RedeemRequestStatus, TokenizationRequest,
+};
 
-/// Service abstraction for Alpaca API operations.
-///
-/// This trait provides an interface for calling Alpaca's tokenization endpoints,
-/// particularly the mint callback endpoint. Implementations can be real HTTP-based
-/// services or mocks for testing.
-#[async_trait]
-pub(crate) trait AlpacaService: Send + Sync {
-    /// Sends a mint callback to Alpaca to confirm mint completion.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - Callback request containing mint details
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` on success (200 OK response from Alpaca).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AlpacaError`] if the HTTP request fails, authentication fails,
-    /// or Alpaca returns an error response.
-    async fn send_mint_callback(
-        &self,
-        request: MintCallbackRequest,
-    ) -> Result<(), AlpacaError>;
-
-    /// Calls Alpaca's redeem endpoint to initiate a redemption.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - Redeem request containing redemption details
-    async fn call_redeem_endpoint(
-        &self,
-        request: RedeemRequest,
-    ) -> Result<RedeemResponse, AlpacaError>;
-
-    /// Polls Alpaca's keyed request endpoint for a specific tokenization request.
-    ///
-    /// Calls `GET /v1/accounts/{account_id}/tokenization/requests/{tokenization_request_id}`
-    /// and deserializes the single-object response as [`TokenizationRequest`].
-    /// Maps HTTP 404 to [`AlpacaError::RequestNotFound`].
-    async fn poll_request_status(
-        &self,
-        tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, AlpacaError>;
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AlpacaBoundaryError {
+    #[error("Invalid Alpaca issuer request id: {0}")]
+    IssuerRequestId(String),
+    #[error("Invalid Alpaca symbol: {0}")]
+    Symbol(String),
+    #[error("Invalid Alpaca quantity: {0}")]
+    Quantity(String),
 }
 
-/// Request payload for Alpaca's mint callback endpoint.
-///
-/// This struct is serialized to JSON and sent to:
-/// `POST /v1/accounts/{account_id}/tokenization/callback/mint`
-///
-/// The JSON format uses snake_case field names per Alpaca's API convention.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct MintCallbackRequest {
-    pub(crate) tokenization_request_id: TokenizationRequestId,
+#[derive(Clone, Copy)]
+pub(crate) struct RedeemRequestInput<'a> {
+    pub(crate) issuer_request_id: &'a IssuerRedemptionRequestId,
+    pub(crate) underlying: &'a IssuanceUnderlyingSymbol,
+    pub(crate) token: &'a IssuanceTokenSymbol,
     pub(crate) client_id: ClientId,
-    pub(crate) wallet_address: Address,
-    pub(crate) tx_hash: B256,
-    pub(crate) network: Network,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct RedeemRequest {
-    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
-    #[serde(rename = "underlying_symbol")]
-    pub(crate) underlying: UnderlyingSymbol,
-    #[serde(rename = "token_symbol")]
-    pub(crate) token: TokenSymbol,
-    pub(crate) client_id: ClientId,
-    #[serde(rename = "qty")]
-    pub(crate) quantity: Quantity,
-    pub(crate) network: Network,
-    #[serde(rename = "wallet_address")]
+    pub(crate) quantity: &'a Quantity,
+    pub(crate) network: &'a IssuanceNetwork,
     pub(crate) wallet: Address,
     pub(crate) tx_hash: B256,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RedeemResponse {
-    pub(crate) tokenization_request_id: TokenizationRequestId,
-    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
-    pub(crate) created_at: DateTime<Utc>,
-    #[serde(rename = "type")]
-    pub(crate) r#type: TokenizationRequestType,
-    pub(crate) status: RedeemRequestStatus,
-    #[serde(rename = "underlying_symbol")]
-    pub(crate) underlying: UnderlyingSymbol,
-    #[serde(rename = "token_symbol")]
-    pub(crate) token: TokenSymbol,
-    #[serde(rename = "qty")]
-    pub(crate) quantity: Quantity,
-    pub(crate) issuer: String,
-    pub(crate) network: Network,
-    #[serde(rename = "wallet_address")]
-    pub(crate) wallet: Address,
-    pub(crate) tx_hash: B256,
-    pub(crate) fees: Option<Fees>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum TokenizationRequestType {
-    Mint,
-    Redeem,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum RedeemRequestStatus {
-    Pending,
-    Completed,
-    Rejected,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Fees(pub(crate) Decimal);
-
-/// A tokenization request returned by Alpaca's keyed request endpoint.
-///
-/// The endpoint returns a single object. This enum deserializes both Mint and
-/// Redeem variants via `#[serde(tag = "type")]`, with each variant carrying
-/// the appropriate `issuer_request_id` type.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub(crate) enum TokenizationRequest {
-    Mint {},
-    Redeem {
-        #[serde(rename = "tokenization_request_id")]
-        id: TokenizationRequestId,
-        #[serde(rename = "issuer_request_id")]
-        issuer_request_id: IssuerRedemptionRequestId,
-        status: RedeemRequestStatus,
-        #[serde(rename = "underlying_symbol")]
-        underlying: UnderlyingSymbol,
-        #[serde(rename = "token_symbol")]
-        token: TokenSymbol,
-        #[serde(rename = "qty")]
-        quantity: Quantity,
-        #[serde(rename = "wallet_address")]
-        wallet: Address,
-        #[serde(
-            rename = "tx_hash",
-            default,
-            deserialize_with = "deserialize_optional_b256"
-        )]
-        tx_hash: Option<TxHash>,
-        updated_at: Option<DateTime<Utc>>,
-    },
-}
-
-fn deserialize_optional_b256<'de, D>(
-    deserializer: D,
-) -> Result<Option<TxHash>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // Alpaca returns an empty string for a still-Pending redeem's tx_hash
-    // (observed in production polling); JSON `null` and an omitted field
-    // (handled by `#[serde(default)]` on the field) are tolerated defensively,
-    // not observed behavior. Treat all three as `None`; only a non-empty
-    // string is parsed as a hash. A type error here would surface as a
-    // non-retryable `Parse` error and stall an otherwise-healthy redemption.
-    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
-    match opt.as_deref() {
-        None | Some("") => Ok(None),
-        Some(value) => {
-            value.parse().map(Some).map_err(serde::de::Error::custom)
-        }
+pub(crate) fn mint_callback_request(
+    tokenization_request_id: &IssuanceTokenizationRequestId,
+    client_id: ClientId,
+    wallet_address: Address,
+    tx_hash: B256,
+    network: &IssuanceNetwork,
+) -> MintCallbackRequest {
+    MintCallbackRequest {
+        tokenization_request_id: alpaca_tokenization_request_id(
+            tokenization_request_id,
+        ),
+        client_id: st0x_alpaca::issuer::ClientId(client_id.into()),
+        wallet_address,
+        tx_hash,
+        network: alpaca_network(network),
     }
 }
 
-/// Errors that can occur during Alpaca API operations.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AlpacaError {
-    #[error("Reqwest error: {0}")]
-    Reqwest(#[from] reqwest::Error),
-    /// Failed to parse response after 200 OK - NOT retryable
-    #[error("Failed to parse response: {source}")]
-    Parse {
-        body: String,
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Authentication failed (401/403 response)
-    #[error("Authentication failed: {0}")]
-    Auth(String),
-    /// Alpaca API returned an error response
-    #[error("API error {status_code}: {body}")]
-    Api { status_code: u16, body: String },
-    /// HTTP 404 from the keyed endpoint. Treated as "definitively absent" for
-    /// recovery purposes (empirically verified 2026-06-12, not a published
-    /// Alpaca guarantee). `body` contains the raw 404 response for operator
-    /// diagnostics.
-    #[error("Tokenization request not found: {id}, body: {body}")]
-    RequestNotFound { id: TokenizationRequestId, body: String },
-    /// The keyed endpoint returned a request whose id differs from what was
-    /// requested — non-retryable data integrity violation.
-    #[error("Response id mismatch: requested {requested}, returned {returned}")]
-    ResponseIdMismatch {
-        requested: TokenizationRequestId,
-        returned: TokenizationRequestId,
-    },
+pub(crate) fn redeem_request(
+    input: RedeemRequestInput<'_>,
+) -> Result<RedeemRequest, AlpacaBoundaryError> {
+    Ok(RedeemRequest {
+        issuer_request_id: st0x_alpaca::issuer::IssuerRequestId(
+            input.issuer_request_id.to_string(),
+        ),
+        underlying: alpaca_underlying_symbol(input.underlying)?,
+        token: alpaca_token_symbol(input.token)?,
+        client_id: st0x_alpaca::issuer::ClientId(input.client_id.into()),
+        quantity: alpaca_quantity(input.quantity)?,
+        network: alpaca_network(input.network),
+        wallet: input.wallet,
+        tx_hash: input.tx_hash,
+    })
 }
 
-impl AlpacaError {
-    pub(crate) fn is_retryable(&self) -> bool {
-        match self {
-            Self::Reqwest(e) => !e.is_decode(),
-            Self::Api { status_code, .. } => {
-                matches!(status_code, 500..=599 | 429)
-            }
-            Self::Parse { .. }
-            | Self::Auth(_)
-            | Self::RequestNotFound { .. }
-            | Self::ResponseIdMismatch { .. } => false,
-        }
+pub(crate) fn alpaca_tokenization_request_id(
+    value: &IssuanceTokenizationRequestId,
+) -> TokenizationRequestId {
+    TokenizationRequestId::new(value.0.clone())
+}
+
+pub(crate) fn issuance_tokenization_request_id(
+    value: TokenizationRequestId,
+) -> IssuanceTokenizationRequestId {
+    IssuanceTokenizationRequestId(value.0)
+}
+
+pub(crate) fn issuance_issuer_request_id(
+    value: &st0x_alpaca::issuer::IssuerRequestId,
+) -> Result<IssuerRedemptionRequestId, AlpacaBoundaryError> {
+    value.0.parse().map_err(
+        |error: crate::redemption::IssuerRedemptionRequestIdParseError| {
+            AlpacaBoundaryError::IssuerRequestId(error.to_string())
+        },
+    )
+}
+
+pub(crate) fn issuance_underlying_symbol(
+    value: &st0x_alpaca::issuer::UnderlyingSymbol,
+) -> IssuanceUnderlyingSymbol {
+    IssuanceUnderlyingSymbol::new(value.0.as_str())
+}
+
+pub(crate) fn issuance_token_symbol(
+    value: &st0x_alpaca::issuer::TokenSymbol,
+) -> IssuanceTokenSymbol {
+    IssuanceTokenSymbol::new(value.0.as_str())
+}
+
+pub(crate) fn issuance_quantity(
+    value: &st0x_alpaca::issuer::Qty,
+) -> Result<Quantity, AlpacaBoundaryError> {
+    value
+        .0
+        .to_string()
+        .parse::<rust_decimal::Decimal>()
+        .map(Quantity::new)
+        .map_err(|error| AlpacaBoundaryError::Quantity(error.to_string()))
+}
+
+fn alpaca_underlying_symbol(
+    value: &IssuanceUnderlyingSymbol,
+) -> Result<st0x_alpaca::issuer::UnderlyingSymbol, AlpacaBoundaryError> {
+    st0x_alpaca::issuer::UnderlyingSymbol::new(value.0.clone())
+        .map_err(|error| AlpacaBoundaryError::Symbol(error.to_string()))
+}
+
+fn alpaca_token_symbol(
+    value: &IssuanceTokenSymbol,
+) -> Result<st0x_alpaca::issuer::TokenSymbol, AlpacaBoundaryError> {
+    st0x_alpaca::issuer::TokenSymbol::new(value.0.clone())
+        .map_err(|error| AlpacaBoundaryError::Symbol(error.to_string()))
+}
+
+fn alpaca_quantity(
+    value: &Quantity,
+) -> Result<st0x_alpaca::issuer::Qty, AlpacaBoundaryError> {
+    value
+        .to_string()
+        .parse::<st0x_finance::FractionalShares>()
+        .map(st0x_alpaca::issuer::Qty)
+        .map_err(|error| AlpacaBoundaryError::Quantity(error.to_string()))
+}
+
+const fn alpaca_network(value: &IssuanceNetwork) -> st0x_alpaca::core::Network {
+    match value {
+        IssuanceNetwork::Base => st0x_alpaca::core::Network::Base,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use alloy::primitives::{address, b256};
-    use rust_decimal::Decimal;
-    use serde_json::json;
+pub(crate) struct TestRedeemResponse {
+    pub(crate) tokenization_request_id: IssuanceTokenizationRequestId,
+    pub(crate) issuer_request_id: IssuerRedemptionRequestId,
+    pub(crate) status: RedeemRequestStatus,
+    pub(crate) underlying: IssuanceUnderlyingSymbol,
+    pub(crate) token: IssuanceTokenSymbol,
+    pub(crate) quantity: Quantity,
+    pub(crate) wallet: Address,
+    pub(crate) tx_hash: Option<B256>,
+    pub(crate) updated_at: Option<DateTime<Utc>>,
+}
 
+#[cfg(test)]
+pub(crate) fn test_redeem_response(
+    value: TestRedeemResponse,
+) -> Result<TokenizationRequest, AlpacaBoundaryError> {
+    Ok(TokenizationRequest::Redeem {
+        id: alpaca_tokenization_request_id(&value.tokenization_request_id),
+        issuer_request_id: st0x_alpaca::issuer::IssuerRequestId(
+            value.issuer_request_id.to_string(),
+        ),
+        status: value.status,
+        underlying: alpaca_underlying_symbol(&value.underlying)?,
+        token: alpaca_token_symbol(&value.token)?,
+        quantity: alpaca_quantity(&value.quantity)?,
+        wallet: value.wallet,
+        tx_hash: value.tx_hash,
+        updated_at: value.updated_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Address, B256};
+    use rust_decimal_macros::dec;
+
+    use super::{
+        AlpacaBoundaryError, RedeemRequestInput, TokenizationRequestId,
+        issuance_issuer_request_id, issuance_quantity, issuance_token_symbol,
+        issuance_tokenization_request_id, issuance_underlying_symbol,
+        mint_callback_request, redeem_request,
+    };
+    use crate::Quantity;
     use crate::account::ClientId;
-    use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::IssuerRedemptionRequestId;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 
-    use super::{MintCallbackRequest, RedeemRequest, TokenizationRequest};
-
     #[test]
-    fn test_mint_callback_request_serialization() {
-        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
+    fn redeem_request_preserves_the_truncated_issuance_boundary_values() {
+        let tx_hash = B256::repeat_byte(0x11);
+        let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
+        let client_id =
+            "00000000-0000-4000-8000-000000000001".parse::<ClientId>().unwrap();
+        let wallet = Address::repeat_byte(0x22);
+        let quantity = Quantity::new(dec!(1.234567891));
 
-        let request = MintCallbackRequest {
-            tokenization_request_id: TokenizationRequestId::new(
-                "12345-678-90AB",
-            ),
+        let underlying = UnderlyingSymbol::new("SPYM");
+        let token = TokenSymbol::new("tSPYM");
+        let network = Network::Base;
+
+        let request = redeem_request(RedeemRequestInput {
+            issuer_request_id: &issuer_request_id,
+            underlying: &underlying,
+            token: &token,
             client_id,
-            wallet_address: address!(
-                "0x1234567890abcdef1234567890abcdef12345678"
-            ),
-            tx_hash: b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            ),
-            network: Network::Base,
-        };
-
-        let serialized = serde_json::to_value(&request).unwrap();
-
-        assert_eq!(
-            serialized["tokenization_request_id"],
-            json!("12345-678-90AB")
-        );
-        assert_eq!(
-            serialized["client_id"],
-            json!("55051234-0000-4abc-9000-4aabcdef0045")
-        );
-        assert_eq!(
-            serialized["wallet_address"],
-            json!("0x1234567890abcdef1234567890abcdef12345678")
-        );
-        assert_eq!(
-            serialized["tx_hash"],
-            json!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            )
-        );
-        assert_eq!(serialized["network"], json!("base"));
-    }
-
-    #[test]
-    fn test_redeem_request_serialization() {
-        let client_id = "55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap();
-        let tx_hash = b256!(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-        );
-
-        let request = RedeemRequest {
-            issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            client_id,
-            quantity: Quantity::new(Decimal::new(10050, 2)),
-            network: Network::Base,
-            wallet: address!("0x9999999999999999999999999999999999999999"),
+            quantity: &quantity,
+            network: &network,
+            wallet,
             tx_hash,
-        };
+        })
+        .unwrap();
 
-        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(request.issuer_request_id.0, issuer_request_id.to_string());
+        assert_eq!(request.underlying.0.as_str(), "SPYM");
+        assert_eq!(request.token.0.as_str(), "tSPYM");
+        assert_eq!(request.client_id.0.to_string(), client_id.to_string());
+        assert_eq!(request.quantity.0.to_string(), "1.234567891");
+        assert_eq!(request.network, st0x_alpaca::core::Network::Base);
+        assert_eq!(request.wallet, wallet);
+        assert_eq!(request.tx_hash, tx_hash);
+    }
 
-        assert_eq!(
-            serialized["issuer_request_id"],
-            json!(
-                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            )
+    #[test]
+    fn mint_callback_request_preserves_the_issuance_boundary_values() {
+        let tokenization_request_id =
+            crate::mint::TokenizationRequestId::new("tok-mint-1");
+        let client_id =
+            "00000000-0000-4000-8000-000000000002".parse::<ClientId>().unwrap();
+        let wallet = Address::repeat_byte(0x33);
+        let tx_hash = B256::repeat_byte(0x44);
+
+        let request = mint_callback_request(
+            &tokenization_request_id,
+            client_id,
+            wallet,
+            tx_hash,
+            &Network::Base,
         );
-        assert_eq!(serialized["underlying_symbol"], json!("AAPL"));
-        assert_eq!(serialized["token_symbol"], json!("tAAPL"));
-        assert_eq!(
-            serialized["client_id"],
-            json!("55051234-0000-4abc-9000-4aabcdef0045")
+
+        assert_eq!(request.tokenization_request_id.0, "tok-mint-1");
+        assert_eq!(request.client_id.0.to_string(), client_id.to_string());
+        assert_eq!(request.wallet_address, wallet);
+        assert_eq!(request.tx_hash, tx_hash);
+        assert_eq!(request.network, st0x_alpaca::core::Network::Base);
+    }
+
+    #[test]
+    fn response_values_convert_back_to_issuance_domain_types() {
+        let tokenization_request_id = issuance_tokenization_request_id(
+            TokenizationRequestId::new("tok-redeem-1"),
         );
-        assert_eq!(serialized["qty"], json!("100.50"));
-        assert_eq!(serialized["network"], json!("base"));
+        let issuer_request_id =
+            IssuerRedemptionRequestId::new(B256::repeat_byte(0x55));
+        let shared_issuer_request_id =
+            st0x_alpaca::issuer::IssuerRequestId(issuer_request_id.to_string());
+        let shared_underlying =
+            st0x_alpaca::issuer::UnderlyingSymbol::new("SPYM").unwrap();
+        let shared_token =
+            st0x_alpaca::issuer::TokenSymbol::new("tSPYM").unwrap();
+        let shared_quantity = st0x_alpaca::issuer::Qty(
+            "1.234567891".parse::<st0x_finance::FractionalShares>().unwrap(),
+        );
+
+        assert_eq!(tokenization_request_id.0, "tok-redeem-1");
         assert_eq!(
-            serialized["wallet_address"],
-            json!("0x9999999999999999999999999999999999999999")
+            issuance_issuer_request_id(&shared_issuer_request_id).unwrap(),
+            issuer_request_id
         );
         assert_eq!(
-            serialized["tx_hash"],
-            json!(
-                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            )
+            issuance_underlying_symbol(&shared_underlying),
+            UnderlyingSymbol::new("SPYM")
+        );
+        assert_eq!(
+            issuance_token_symbol(&shared_token),
+            TokenSymbol::new("tSPYM")
+        );
+        assert_eq!(
+            issuance_quantity(&shared_quantity).unwrap(),
+            Quantity::new(dec!(1.234567891))
         );
     }
 
     #[test]
-    fn test_address_serialization_includes_0x_prefix() {
-        let request = MintCallbackRequest {
-            tokenization_request_id: TokenizationRequestId::new("test"),
-            client_id: ClientId::new(),
-            wallet_address: address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
-            tx_hash: b256!(
-                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ),
-            network: Network::Base,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-
-        assert!(
-            json.contains("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")
+    fn response_issuer_request_id_rejects_an_unknown_wire_format() {
+        let result = issuance_issuer_request_id(
+            &st0x_alpaca::issuer::IssuerRequestId("not-an-id".to_string()),
         );
-        assert!(json.contains("\"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\""));
+
+        assert!(matches!(result, Err(AlpacaBoundaryError::IssuerRequestId(_))));
     }
 
     #[test]
-    fn test_tokenization_request_deserializes_mint_variant() {
-        let json = json!({
-            "type": "mint",
-            "tokenization_request_id": "tok-123",
-            "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-            "status": "completed",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "100.00",
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-            "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    fn redeem_request_rejects_a_blank_symbol_at_the_shared_boundary() {
+        let issuer_request_id =
+            IssuerRedemptionRequestId::new(B256::repeat_byte(0x66));
+        let underlying = UnderlyingSymbol::new(" ");
+        let token = TokenSymbol::new("tSPYM");
+        let quantity = Quantity::new(dec!(1));
+        let network = Network::Base;
+
+        let result = redeem_request(RedeemRequestInput {
+            issuer_request_id: &issuer_request_id,
+            underlying: &underlying,
+            token: &token,
+            client_id: "00000000-0000-4000-8000-000000000003"
+                .parse::<ClientId>()
+                .unwrap(),
+            quantity: &quantity,
+            network: &network,
+            wallet: Address::repeat_byte(0x77),
+            tx_hash: B256::repeat_byte(0x88),
         });
 
-        let request: TokenizationRequest =
-            serde_json::from_value(json).unwrap();
-        assert!(matches!(request, TokenizationRequest::Mint { .. }));
-    }
-
-    #[test]
-    fn test_tokenization_request_deserializes_redeem_variant() {
-        let json = json!({
-            "type": "redeem",
-            "tokenization_request_id": "tok-456",
-            "issuer_request_id": "red-574378e0",
-            "status": "completed",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "50.00",
-            "wallet_address": "0x9999999999999999999999999999999999999999",
-            "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "updated_at": "2025-09-12T17:30:00.000000-04:00"
-        });
-
-        let request: TokenizationRequest =
-            serde_json::from_value(json).unwrap();
-        assert!(matches!(request, TokenizationRequest::Redeem { .. }));
-    }
-
-    #[test]
-    fn test_tokenization_request_list_deserializes_mixed_types() {
-        let json = json!([
-            {
-                "type": "mint",
-                "tokenization_request_id": "tok-mint-1",
-                "issuer_request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "100.00",
-                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            },
-            {
-                "type": "redeem",
-                "tokenization_request_id": "tok-red-2",
-                "issuer_request_id": "red-574378e0",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "50.00",
-                "wallet_address": "0x9999999999999999999999999999999999999999",
-                "tx_hash": "",
-                "updated_at": "2025-09-12T17:30:00.000000-04:00"
-            }
-        ]);
-
-        let requests: Vec<TokenizationRequest> =
-            serde_json::from_value(json).unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(matches!(requests[0], TokenizationRequest::Mint { .. }));
-        assert!(matches!(requests[1], TokenizationRequest::Redeem { .. }));
-    }
-
-    #[test]
-    fn test_redeem_deserializes_absent_null_and_empty_tx_hash_as_none() {
-        // A still-Pending redeem's tx_hash arrives as an empty string
-        // (observed); JSON null and an omitted field are tolerated
-        // defensively. All three must deserialize to None rather than a
-        // non-retryable Parse error that would stall the redemption.
-        let base = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000001","issuer_request_id":"0x1111111111111111111111111111111111111111111111111111111111111111","type":"redeem","status":"pending","underlying_symbol":"SPYM","token_symbol":"tSPYM","qty":"0.1","wallet_address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-06-11T04:02:33.530523Z""#;
-
-        for tx_hash_field in ["", r#","tx_hash":null"#, r#","tx_hash":"""#] {
-            let json = format!("{base}{tx_hash_field}}}");
-            let parsed: TokenizationRequest = serde_json::from_str(&json)
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "failed to parse with tx_hash `{tx_hash_field}`: {err}"
-                    )
-                });
-
-            match parsed {
-                TokenizationRequest::Redeem { tx_hash, .. } => assert_eq!(
-                    tx_hash, None,
-                    "tx_hash `{tx_hash_field}` should deserialize to None"
-                ),
-                other @ TokenizationRequest::Mint { .. } => {
-                    panic!("expected Redeem, got {other:?}")
-                }
-            }
-        }
+        assert!(matches!(result, Err(AlpacaBoundaryError::Symbol(_))));
     }
 }
