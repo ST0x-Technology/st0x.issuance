@@ -2543,7 +2543,7 @@ sorted by network wire string. Add-asset registers vaults per `network`.
 effects on that chain:
 
 - HTTP JSON-RPC provider (Alloy)
-- `VaultService` (Fireblocks or local signer, bound to that chain's `chain_id`)
+- `VaultService` (Turnkey or local signer, bound to that chain's `chain_id`)
 - `backfill_start_block` for receipt backfill
 - Subgraph URL for receipt indexing
 
@@ -2609,5 +2609,5 @@ rekey change itself.
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | One process per chain                                     | Duplicate SQLite/event store; Alpaca expects one issuer URL                                             |
 | Lazy provider connect                                     | Violates fail-fast; hung chain could block unrelated HTTP                                               |
-| Shared `VaultService` with runtime chain_id switch        | Fireblocks binds `chain_id` at construction; error-prone                                                |
+| Shared `VaultService` with runtime chain_id switch        | Signing backends bind `chain_id` at construction; a runtime switch is error-prone                       |
 | Optional `?network=` defaulting to `base` for one release | Would decouple the three deployables but hides misconfiguration; lockstep cutover preferred for clarity |
