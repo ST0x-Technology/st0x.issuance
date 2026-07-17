@@ -216,7 +216,14 @@ endpoints.
 1. AP sends tokens to our redemption wallet → we detect transfer
 2. We call Alpaca's redeem endpoint
 3. We poll for journal completion
-4. We burn tokens on-chain via `vault.withdraw()`
+4. We prepare and persist the exact signed vault burn multicall
+5. We broadcast that transaction and confirm the on-chain burn
+
+If the process stops after persisting or broadcasting a burn, startup and
+periodic recovery classify the persisted hash before acting. Recovery confirms
+a mined burn, re-broadcasts the same bytes while it can still land, and only
+signs a fresh-nonce replacement after the previous transaction is provably
+dead.
 
 Receipt and redemption transfer backfills use durable per-vault checkpoints.
 Periodic receipt backfill keeps receipt checkpoints current during long uptime,
