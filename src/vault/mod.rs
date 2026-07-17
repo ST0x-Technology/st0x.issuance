@@ -122,9 +122,11 @@ pub(crate) trait VaultService: Send + Sync {
     ///
     /// Fetches the receipt for `tx_hash` and confirms it proves a burn of
     /// `vault` shares by `owner` — a successful transaction emitting at least
-    /// one `Transfer(owner -> 0x0)` from the vault share token. Used by the
-    /// admin force-complete path to terminalize a redemption stuck in `Burning`
-    /// whose burn already landed on-chain but was never recorded.
+    /// one `Transfer(owner -> 0x0)` from the vault share token — and returns
+    /// the signer nonce, owner's per-receipt `Withdraw` entries, and share
+    /// transfers. Used by the admin
+    /// force-complete path to bind an alternate proving transaction to the
+    /// persisted burn plan before terminalizing the redemption.
     async fn verify_burn_tx(
         &self,
         vault: Address,
@@ -364,10 +366,34 @@ pub(crate) struct SendableTxWithHash {
 pub(crate) struct BurnVerification {
     /// Block number the burn transaction was included in.
     pub(crate) block_number: u64,
+    /// Signer nonce of the mined transaction. An alternate proof must replace
+    /// the persisted transaction at this exact nonce.
+    pub(crate) nonce: u64,
     /// Total shares burned by the owner in this transaction (sum of all
-    /// matching `Transfer(owner -> 0x0)` events). Reported for audit logging;
-    /// the operator is responsible for confirming the amount off-chain.
+    /// matching `Transfer(owner -> 0x0)` events). Alternate-burn recovery
+    /// requires this to equal the persisted burn plan's aggregate total.
     pub(crate) shares_burned: U256,
+    /// Per-receipt withdrawals emitted for this owner. Admin recovery uses
+    /// these to bind an alternate proving transaction to the redemption's
+    /// persisted burn plan.
+    pub(crate) burns: Vec<VerifiedBurn>,
+    /// Non-burn share transfers sent by the owner in the same transaction.
+    /// A redemption's dust return must match these exactly.
+    pub(crate) share_transfers: Vec<VerifiedShareTransfer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedBurn {
+    pub(crate) sender: Address,
+    pub(crate) receiver: Address,
+    pub(crate) receipt_id: U256,
+    pub(crate) shares_burned: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedShareTransfer {
+    pub(crate) recipient: Address,
+    pub(crate) shares: U256,
 }
 
 /// Verifies that `receipt` proves `owner` burned shares of the `vault` share
@@ -383,6 +409,7 @@ pub(crate) fn verify_burn_in_receipt(
     vault: Address,
     owner: Address,
     tx_hash: B256,
+    nonce: u64,
 ) -> Result<BurnVerification, VaultError> {
     if !receipt.status() {
         return Err(VaultError::Reverted { tx_hash });
@@ -390,24 +417,43 @@ pub(crate) fn verify_burn_in_receipt(
 
     let mut shares_burned = U256::ZERO;
     let mut found_burn = false;
+    let mut burns = Vec::new();
+    let mut share_transfers = Vec::new();
 
     for log in receipt.inner.logs() {
         if log.address() != vault {
             continue;
         }
 
-        let Ok(decoded) =
+        if let Ok(decoded) =
             log.log_decode::<OffchainAssetReceiptVault::Transfer>()
-        else {
-            continue;
-        };
+        {
+            let transfer = decoded.data();
+            if transfer.from == owner && transfer.to == Address::ZERO {
+                found_burn = true;
+                shares_burned = shares_burned
+                    .checked_add(transfer.value)
+                    .ok_or(VaultError::InvalidReceipt)?;
+            } else if transfer.from == owner {
+                share_transfers.push(VerifiedShareTransfer {
+                    recipient: transfer.to,
+                    shares: transfer.value,
+                });
+            }
+        }
 
-        let transfer = decoded.data();
-        if transfer.from == owner && transfer.to == Address::ZERO {
-            found_burn = true;
-            shares_burned = shares_burned
-                .checked_add(transfer.value)
-                .ok_or(VaultError::InvalidReceipt)?;
+        if let Ok(decoded) =
+            log.log_decode::<OffchainAssetReceiptVault::Withdraw>()
+        {
+            let withdrawal = decoded.data();
+            if withdrawal.owner == owner {
+                burns.push(VerifiedBurn {
+                    sender: withdrawal.sender,
+                    receiver: withdrawal.receiver,
+                    receipt_id: withdrawal.id,
+                    shares_burned: withdrawal.shares,
+                });
+            }
         }
     }
 
@@ -418,7 +464,13 @@ pub(crate) fn verify_burn_in_receipt(
     let block_number =
         receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
 
-    Ok(BurnVerification { block_number, shares_burned })
+    Ok(BurnVerification {
+        block_number,
+        nonce,
+        shares_burned,
+        burns,
+        share_transfers,
+    })
 }
 
 /// Result of a successful on-chain minting operation.
@@ -488,7 +540,7 @@ pub(crate) struct MultiBurnParams {
 }
 
 /// Result of a single burn within a multi-receipt burn operation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MultiBurnResultEntry {
     /// ERC-1155 receipt ID that was burned from
     pub(crate) receipt_id: U256,
@@ -819,7 +871,10 @@ impl<'de> Deserialize<'de> for TxId {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::consensus::{
+        Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
+    };
+    use alloy::primitives::{Bloom, Bytes, IntoLogData, address, b256};
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
@@ -959,11 +1014,6 @@ mod tests {
         block_number: u64,
         transfers: Vec<(Address, Address, Address, U256)>,
     ) -> TransactionReceipt {
-        use alloy::consensus::{
-            Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom,
-        };
-        use alloy::primitives::{Bloom, IntoLogData};
-
         let logs: Vec<alloy::rpc::types::Log> = transfers
             .into_iter()
             .enumerate()
@@ -987,6 +1037,14 @@ mod tests {
             })
             .collect();
 
+        receipt_with_logs(success, block_number, logs)
+    }
+
+    fn receipt_with_logs(
+        success: bool,
+        block_number: u64,
+        logs: Vec<alloy::rpc::types::Log>,
+    ) -> TransactionReceipt {
         let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
             status: Eip658Value::Eip658(success),
             cumulative_gas_used: 0x8000,
@@ -1021,11 +1079,78 @@ mod tests {
         );
 
         let verification =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
                 .unwrap();
 
         assert_eq!(verification.block_number, 45_989_009);
         assert_eq!(verification.shares_burned, U256::from(17u64));
+    }
+
+    #[test]
+    fn verify_burn_in_receipt_reports_owner_withdrawals_by_receipt() {
+        let transfer = OffchainAssetReceiptVault::Transfer {
+            from: BOT_WALLET,
+            to: Address::ZERO,
+            value: U256::from(17u64),
+        };
+        let withdrawal = OffchainAssetReceiptVault::Withdraw {
+            sender: BOT_WALLET,
+            receiver: address!("0x3333333333333333333333333333333333333333"),
+            owner: BOT_WALLET,
+            assets: U256::from(17u64),
+            shares: U256::from(17u64),
+            id: U256::from(42u64),
+            receiptInformation: Bytes::new(),
+        };
+        let dust_transfer = OffchainAssetReceiptVault::Transfer {
+            from: BOT_WALLET,
+            to: address!("0x3333333333333333333333333333333333333333"),
+            value: U256::from(3u64),
+        };
+        let logs = [
+            transfer.into_log_data(),
+            withdrawal.into_log_data(),
+            dust_transfer.into_log_data(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, data)| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: VAULT, data },
+            block_hash: None,
+            block_number: Some(45_989_009),
+            block_timestamp: None,
+            transaction_hash: Some(BURN_TX),
+            transaction_index: Some(0),
+            log_index: Some(index as u64),
+            removed: false,
+        })
+        .collect();
+        let receipt = receipt_with_logs(true, 45_989_009, logs);
+
+        let verification =
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
+                .unwrap();
+
+        assert_eq!(
+            verification.burns,
+            vec![VerifiedBurn {
+                sender: BOT_WALLET,
+                receiver: address!(
+                    "0x3333333333333333333333333333333333333333"
+                ),
+                receipt_id: U256::from(42u64),
+                shares_burned: U256::from(17u64),
+            }]
+        );
+        assert_eq!(
+            verification.share_transfers,
+            vec![VerifiedShareTransfer {
+                recipient: address!(
+                    "0x3333333333333333333333333333333333333333"
+                ),
+                shares: U256::from(3u64),
+            }]
+        );
     }
 
     #[test]
@@ -1051,7 +1176,7 @@ mod tests {
         );
 
         let verification =
-            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
                 .unwrap();
 
         assert_eq!(verification.shares_burned, U256::from(15u64));
@@ -1065,8 +1190,9 @@ mod tests {
             vec![(VAULT, BOT_WALLET, Address::ZERO, U256::from(17u64))],
         );
 
-        let err = verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
-            .unwrap_err();
+        let err =
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
+                .unwrap_err();
 
         assert!(matches!(err, VaultError::Reverted { .. }));
     }
@@ -1081,8 +1207,9 @@ mod tests {
             vec![(VAULT, BOT_WALLET, user, U256::from(17u64))],
         );
 
-        let err = verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX)
-            .unwrap_err();
+        let err =
+            verify_burn_in_receipt(&receipt, VAULT, BOT_WALLET, BURN_TX, 7)
+                .unwrap_err();
 
         assert!(matches!(err, VaultError::NotABurn { .. }));
     }

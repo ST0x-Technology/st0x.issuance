@@ -93,6 +93,10 @@ pub(crate) enum RedemptionCommand {
     CloseRedemption {
         issuer_request_id: IssuerRedemptionRequestId,
         reason: String,
+        /// Exact persisted signed burn hash the operator has reconciled and is
+        /// explicitly acknowledging may still land.
+        #[serde(default)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     },
     /// Admin-terminalizes a redemption stuck in
     /// `Burning`/`BurnIntended`/`BurnSubmitted` whose burn already landed
@@ -104,6 +108,10 @@ pub(crate) enum RedemptionCommand {
         burn_tx_hash: B256,
         block_number: u64,
         reason: String,
+        /// Exact persisted signed burn hash the operator has reconciled when
+        /// `burn_tx_hash` proves a different transaction.
+        #[serde(default)]
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     },
     /// Resumes a post-Alpaca failed redemption directly to Burning state.
     /// Only valid from `Failed` state when Alpaca was already called and

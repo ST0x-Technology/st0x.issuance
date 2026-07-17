@@ -1,6 +1,7 @@
 use alloy::consensus::Transaction;
+use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Encodable2718;
-use alloy::network::EthereumWallet;
+use alloy::network::{EthereumWallet, TransactionResponse};
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill,
@@ -356,13 +357,37 @@ impl VaultService for RealBlockchainService {
         owner: Address,
         tx_hash: B256,
     ) -> Result<BurnVerification, VaultError> {
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(VaultError::InvalidReceipt)?;
+        if transaction.tx_hash() != tx_hash {
+            return Err(VaultError::InvalidReceipt);
+        }
+        let recovered_signer = transaction.inner.inner().recover_signer()?;
+        if recovered_signer != owner {
+            return Err(VaultError::NotABurn { tx_hash });
+        }
+        if transaction.inner.signer() != recovered_signer {
+            return Err(VaultError::InvalidReceipt);
+        }
         let receipt = self
             .provider
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or(VaultError::InvalidReceipt)?;
+        if receipt.transaction_hash != tx_hash {
+            return Err(VaultError::InvalidReceipt);
+        }
 
-        verify_burn_in_receipt(&receipt, vault, owner, tx_hash)
+        verify_burn_in_receipt(
+            &receipt,
+            vault,
+            owner,
+            tx_hash,
+            transaction.nonce(),
+        )
     }
 
     /// Prepares a signed tx that can be sent on-chain via eth_sendRawTransaction
@@ -580,6 +605,7 @@ impl VaultService for RealBlockchainService {
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::transaction::Recovered;
     use alloy::consensus::{
         Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, Transaction,
         TxEnvelope,
@@ -594,7 +620,8 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::{
-        Block, FeeHistory, TransactionReceipt, TransactionRequest,
+        Block, FeeHistory, Transaction as RpcTransaction, TransactionReceipt,
+        TransactionRequest,
     };
     use alloy::signers::local::PrivateKeySigner;
     use chrono::Utc;
@@ -1150,6 +1177,131 @@ mod tests {
         }
     }
 
+    fn rpc_transaction(
+        persisted: &SendableTxWithHash,
+        reported_signer: Address,
+    ) -> RpcTransaction {
+        let mut encoded = persisted.tx.as_ref();
+        let envelope = TxEnvelope::decode_2718(&mut encoded)
+            .expect("test transaction should decode");
+
+        RpcTransaction {
+            inner: Recovered::new_unchecked(envelope, reported_signer),
+            block_hash: Some(fixed_bytes!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )),
+            block_number: Some(0x7d0),
+            transaction_index: Some(0),
+            effective_gas_price: Some(0x3b9a_ca00),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_burn_tx_returns_verified_nonce_from_matching_rpc_transaction()
+     {
+        let vault_address = test_vault_address();
+        let persisted = SendableTxWithHash::valid_for_test(
+            17,
+            vault_address,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = persisted.signer_for_test();
+        let receiver = test_receiver();
+        let transaction = rpc_transaction(&persisted, owner);
+        let receipt = create_multi_withdraw_receipt(
+            vault_address,
+            persisted.hash,
+            owner,
+            receiver,
+            vec![(U256::from(7), U256::from(50))],
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&transaction);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let verification = service
+            .verify_burn_tx(vault_address, owner, persisted.hash)
+            .await
+            .expect("matching transaction and receipt should verify");
+
+        assert_eq!(verification.nonce, persisted.nonce);
+        assert_eq!(verification.block_number, 0x9c4);
+        assert_eq!(verification.shares_burned, U256::from(50));
+        assert_eq!(verification.burns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_burn_tx_rejects_rpc_transaction_for_another_hash() {
+        let persisted = persisted_burn_tx(17);
+        let owner = persisted.signer_for_test();
+        let transaction = rpc_transaction(&persisted, owner);
+        let requested_tx_hash = B256::random();
+        let asserter = Asserter::new();
+        asserter.push_success(&transaction);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .verify_burn_tx(test_vault_address(), owner, requested_tx_hash)
+            .await;
+
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
+    }
+
+    #[tokio::test]
+    async fn verify_burn_tx_rejects_rpc_transaction_with_inconsistent_from() {
+        let persisted = persisted_burn_tx(17);
+        let owner = persisted.signer_for_test();
+        let transaction = rpc_transaction(&persisted, Address::random());
+        let asserter = Asserter::new();
+        asserter.push_success(&transaction);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .await;
+
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
+    }
+
+    #[tokio::test]
+    async fn verify_burn_tx_rejects_another_signature_when_rpc_reports_owner() {
+        let persisted = persisted_burn_tx(17);
+        let owner = Address::random();
+        let transaction = rpc_transaction(&persisted, owner);
+        let asserter = Asserter::new();
+        asserter.push_success(&transaction);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::NotABurn { tx_hash }) if tx_hash == persisted.hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_burn_tx_rejects_rpc_receipt_for_another_hash() {
+        let persisted = persisted_burn_tx(17);
+        let owner = persisted.signer_for_test();
+        let transaction = rpc_transaction(&persisted, owner);
+        let receipt =
+            create_empty_receipt(test_vault_address(), B256::random());
+        let asserter = Asserter::new();
+        asserter.push_success(&transaction);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result = service
+            .verify_burn_tx(test_vault_address(), owner, persisted.hash)
+            .await;
+
+        assert!(matches!(result, Err(VaultError::InvalidReceipt)));
+    }
+
     fn persisted_burn_tx(nonce: u64) -> SendableTxWithHash {
         SendableTxWithHash::valid_for_test(
             nonce,
@@ -1460,10 +1612,30 @@ mod tests {
         user: Address,
         burns: Vec<(U256, U256)>,
     ) -> TransactionReceipt {
-        let logs: Vec<alloy::rpc::types::Log> = burns
-            .into_iter()
-            .enumerate()
-            .map(|(i, (receipt_id, shares))| {
+        let shares_burned =
+            burns.iter().fold(U256::ZERO, |total, (_, shares)| total + shares);
+        let transfer_event = OffchainAssetReceiptVault::Transfer {
+            from: owner,
+            to: Address::ZERO,
+            value: shares_burned,
+        };
+        let mut logs = vec![alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: vault_address,
+                data: transfer_event.into_log_data(),
+            },
+            block_hash: Some(b256!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            )),
+            block_number: Some(0x9c4),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }];
+        logs.extend(burns.into_iter().enumerate().map(
+            |(index, (receipt_id, shares))| {
                 let withdraw_event = OffchainAssetReceiptVault::Withdraw {
                     sender: owner,
                     receiver: user,
@@ -1486,11 +1658,11 @@ mod tests {
                     block_timestamp: None,
                     transaction_hash: Some(tx_hash),
                     transaction_index: Some(0),
-                    log_index: Some(i as u64),
+                    log_index: Some(index as u64 + 1),
                     removed: false,
                 }
-            })
-            .collect();
+            },
+        ));
 
         let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
             status: Eip658Value::Eip658(true),

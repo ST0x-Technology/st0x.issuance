@@ -20,6 +20,8 @@ use super::{
     MultiBurnResult, MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
     SubmittedTx, VaultError, VaultService, WalletNonceGuard,
 };
+#[cfg(test)]
+use super::{VerifiedBurn, VerifiedShareTransfer};
 use crate::redemption::BurnExternalTxId;
 use crate::vault::{SendableTxWithHash, TxId};
 
@@ -82,7 +84,13 @@ enum MockBehavior {
 #[derive(Clone)]
 enum MockVerifyBurn {
     /// The tx proves a burn: return this block number and shares burned.
-    Verified { block_number: u64, shares_burned: U256 },
+    Verified {
+        block_number: u64,
+        nonce: u64,
+        shares_burned: U256,
+        burns: Vec<VerifiedBurn>,
+        share_transfers: Vec<VerifiedShareTransfer>,
+    },
     /// The tx succeeded but contains no matching burn.
     NotABurn,
     /// The tx reverted on-chain.
@@ -114,7 +122,10 @@ impl Default for MockVerifyBurn {
     fn default() -> Self {
         Self::Verified {
             block_number: 45_989_009,
+            nonce: 0,
             shares_burned: U256::from(1u8),
+            burns: vec![],
+            share_transfers: vec![],
         }
     }
 }
@@ -148,6 +159,8 @@ pub(crate) struct MockVaultService {
     /// verification, exercising the force-complete happy path.
     #[cfg(test)]
     verify_burn: Arc<Mutex<MockVerifyBurn>>,
+    #[cfg(test)]
+    verify_burn_call_count: Arc<AtomicUsize>,
     /// Signed tx returned by `prepare_tx` when local signing is configured.
     #[cfg(test)]
     prepared_tx: Arc<Mutex<Option<SendableTxWithHash>>>,
@@ -187,6 +200,8 @@ impl MockVaultService {
             #[cfg(test)]
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
             #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             prepared_tx: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             checked_tx_outcome: Arc::new(Mutex::new(
@@ -222,6 +237,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
+            #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
             prepared_tx: Arc::new(Mutex::new(None)),
             checked_tx_outcome: Arc::new(Mutex::new(
                 MockCheckTxOutcome::default(),
@@ -251,6 +268,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
+            #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
             prepared_tx: Arc::new(Mutex::new(None)),
             checked_tx_outcome: Arc::new(Mutex::new(
                 MockCheckTxOutcome::default(),
@@ -280,6 +299,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
+            #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
             prepared_tx: Arc::new(Mutex::new(None)),
             checked_tx_outcome: Arc::new(Mutex::new(
                 MockCheckTxOutcome::default(),
@@ -374,6 +395,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
+            #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
             prepared_tx: Arc::new(Mutex::new(None)),
             checked_tx_outcome: Arc::new(Mutex::new(
                 MockCheckTxOutcome::default(),
@@ -403,6 +426,8 @@ impl MockVaultService {
             share_balance: Arc::new(Mutex::new(U256::MAX)),
             last_multi_burn_params: Arc::new(Mutex::new(None)),
             verify_burn: Arc::new(Mutex::new(MockVerifyBurn::default())),
+            #[cfg(test)]
+            verify_burn_call_count: Arc::new(AtomicUsize::new(0)),
             prepared_tx: Arc::new(Mutex::new(None)),
             checked_tx_outcome: Arc::new(Mutex::new(
                 MockCheckTxOutcome::default(),
@@ -477,6 +502,11 @@ impl MockVaultService {
     }
 
     #[cfg(test)]
+    pub(crate) fn verify_burn_call_count(&self) -> usize {
+        self.verify_burn_call_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.wallet_lock_call_count.store(0, Ordering::Relaxed);
         self.call_count.store(0, Ordering::Relaxed);
@@ -506,8 +536,53 @@ impl MockVaultService {
         block_number: u64,
         shares_burned: U256,
     ) -> Self {
-        *self.verify_burn.lock().unwrap() =
-            MockVerifyBurn::Verified { block_number, shares_burned };
+        *self.verify_burn.lock().unwrap() = MockVerifyBurn::Verified {
+            block_number,
+            nonce: 0,
+            shares_burned,
+            burns: vec![],
+            share_transfers: vec![],
+        };
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_verified_burns(
+        self,
+        block_number: u64,
+        nonce: u64,
+        burns: Vec<VerifiedBurn>,
+        share_transfers: Vec<VerifiedShareTransfer>,
+    ) -> Self {
+        let shares_burned = burns
+            .iter()
+            .fold(U256::ZERO, |total, burn| total + burn.shares_burned);
+        *self.verify_burn.lock().unwrap() = MockVerifyBurn::Verified {
+            block_number,
+            nonce,
+            shares_burned,
+            burns,
+            share_transfers,
+        };
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_verified_burns_and_total(
+        self,
+        block_number: u64,
+        nonce: u64,
+        shares_burned: U256,
+        burns: Vec<VerifiedBurn>,
+        share_transfers: Vec<VerifiedShareTransfer>,
+    ) -> Self {
+        *self.verify_burn.lock().unwrap() = MockVerifyBurn::Verified {
+            block_number,
+            nonce,
+            shares_burned,
+            burns,
+            share_transfers,
+        };
         self
     }
 
@@ -918,11 +993,22 @@ impl VaultService for MockVaultService {
         {
             use MockVerifyBurn::{NotABurn, Reverted, Verified};
 
+            self.verify_burn_call_count.fetch_add(1, Ordering::Relaxed);
             let outcome = self.verify_burn.lock().unwrap().clone();
             match outcome {
-                Verified { block_number, shares_burned } => {
-                    Ok(BurnVerification { block_number, shares_burned })
-                }
+                Verified {
+                    block_number,
+                    nonce,
+                    shares_burned,
+                    burns,
+                    share_transfers,
+                } => Ok(BurnVerification {
+                    block_number,
+                    nonce,
+                    shares_burned,
+                    burns,
+                    share_transfers,
+                }),
                 NotABurn => Err(VaultError::NotABurn { tx_hash }),
                 Reverted => Err(VaultError::Reverted { tx_hash }),
             }
@@ -931,7 +1017,10 @@ impl VaultService for MockVaultService {
         {
             Ok(BurnVerification {
                 block_number: 0,
+                nonce: 0,
                 shares_burned: U256::from(1u8),
+                burns: vec![],
+                share_transfers: vec![],
             })
         }
     }

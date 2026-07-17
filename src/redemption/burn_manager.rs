@@ -29,7 +29,7 @@ use crate::tokenized_asset::view::{
 };
 use crate::vault::{
     BurnTxStatus, BurnVerification, MultiBurnEntry, SendableTxWithHash, TxId,
-    VaultError, VaultService,
+    VaultError, VaultService, VerifiedBurn, VerifiedShareTransfer,
 };
 
 const WALLET_INTENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -249,6 +249,7 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         reason: String,
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError> {
         let redemption =
             self.store.load(issuer_request_id).await?.ok_or_else(|| {
@@ -259,21 +260,16 @@ impl BurnManager {
 
         let persisted_burn_tx = redemption.persisted_burn_tx()?;
         persisted_burn_tx.validate_for_owner(self.bot_wallet)?;
-        let persisted_burn_hash = persisted_burn_tx.hash;
-        if persisted_burn_hash != burn_tx_hash {
-            return Err(BurnManagerError::Redemption(
-                RedemptionError::BurnHashMismatch {
-                    expected: persisted_burn_hash,
-                    provided: burn_tx_hash,
-                },
-            ));
-        }
+        let acknowledged_unresolved_burn_tx_hash = redemption
+            .validate_force_complete_burn_hash(
+                burn_tx_hash,
+                acknowledged_unresolved_burn_tx_hash,
+            )?;
 
-        let underlying = match &redemption {
-            Redemption::Burning { metadata, .. }
-            | Redemption::BurnIntended { metadata, .. }
-            | Redemption::BurnSubmitted { metadata, .. } => {
-                metadata.underlying.clone()
+        let (underlying, recipient, planned_burns) = match &redemption {
+            Redemption::BurnIntended { metadata, planned_burns, .. }
+            | Redemption::BurnSubmitted { metadata, planned_burns, .. } => {
+                (metadata.underlying.clone(), metadata.wallet, planned_burns)
             }
             other => {
                 return Err(BurnManagerError::InvalidAggregateState {
@@ -292,9 +288,39 @@ impl BurnManager {
             .vault_service
             .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
             .await?;
+        if burn_tx_hash != persisted_burn_tx.hash
+            && !burn_verification_matches_plan(
+                &verification,
+                planned_burns,
+                self.bot_wallet,
+                recipient,
+                persisted_burn_tx.dust_shares,
+                persisted_burn_tx.nonce,
+            )
+        {
+            let expected_shares_burned = planned_burns
+                .iter()
+                .try_fold(U256::ZERO, |total, burn| {
+                    total.checked_add(burn.shares_burned)
+                })
+                .ok_or(BurnManagerError::SharesOverflow)?;
+            return Err(BurnManagerError::AlternateBurnSemanticsMismatch {
+                expected_burns: planned_burns.clone(),
+                expected_shares_burned,
+                expected_recipient: recipient,
+                expected_dust_shares: persisted_burn_tx.dust_shares,
+                expected_nonce: persisted_burn_tx.nonce,
+                verified_burns: verification.burns.clone(),
+                verified_shares_burned: verification.shares_burned,
+                verified_nonce: verification.nonce,
+                verified_share_transfers: verification.share_transfers.clone(),
+            });
+        }
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_tx_hash = ?burn_tx_hash,
+            persisted_burn_tx_hash = ?persisted_burn_tx.hash,
+            acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
             block_number = verification.block_number,
             shares_burned = %verification.shares_burned,
             "Force-completing stuck Burning redemption: burn verified on-chain"
@@ -308,6 +334,7 @@ impl BurnManager {
                     burn_tx_hash,
                     block_number: verification.block_number,
                     reason,
+                    acknowledged_unresolved_burn_tx_hash,
                 },
             )
             .await?;
@@ -2370,6 +2397,20 @@ pub(crate) enum BurnManagerError {
     AssetNotFound { underlying: UnderlyingSymbol },
     #[error("Arithmetic overflow when computing total shares needed")]
     SharesOverflow,
+    #[error(
+        "Alternate proving transaction does not match the persisted burn semantics: expected nonce {expected_nonce}, total shares {expected_shares_burned}, burns {expected_burns:?}, recipient {expected_recipient}, dust {expected_dust_shares}; verified nonce {verified_nonce}, total shares {verified_shares_burned}, burns {verified_burns:?}, transfers {verified_share_transfers:?}"
+    )]
+    AlternateBurnSemanticsMismatch {
+        expected_burns: Vec<BurnRecord>,
+        expected_shares_burned: U256,
+        expected_recipient: Address,
+        expected_dust_shares: U256,
+        expected_nonce: u64,
+        verified_burns: Vec<VerifiedBurn>,
+        verified_shares_burned: U256,
+        verified_nonce: u64,
+        verified_share_transfers: Vec<VerifiedShareTransfer>,
+    },
     #[error("Receipt reservation error: {0}")]
     ReceiptRegistration(#[from] ReceiptRegistrationError),
     #[error(
@@ -2378,6 +2419,51 @@ pub(crate) enum BurnManagerError {
     WalletIntentWaitTimeout { issuer_request_id: IssuerRedemptionRequestId },
     #[error("Burn recovery attempt counter overflowed for {issuer_request_id}")]
     RecoveryAttemptOverflow { issuer_request_id: IssuerRedemptionRequestId },
+}
+
+fn burn_verification_matches_plan(
+    verification: &BurnVerification,
+    planned_burns: &[BurnRecord],
+    owner: Address,
+    recipient: Address,
+    dust_shares: U256,
+    expected_nonce: u64,
+) -> bool {
+    let Some(expected_shares_burned) =
+        planned_burns.iter().try_fold(U256::ZERO, |total, burn| {
+            total.checked_add(burn.shares_burned)
+        })
+    else {
+        return false;
+    };
+    let mut expected = planned_burns
+        .iter()
+        .map(|burn| (burn.receipt_id, burn.shares_burned))
+        .collect::<Vec<_>>();
+    let mut verified = verification
+        .burns
+        .iter()
+        .filter(|burn| burn.sender == owner && burn.receiver == recipient)
+        .map(|burn| (burn.receipt_id, burn.shares_burned))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    verified.sort_unstable();
+    let expected_share_transfers = if dust_shares.is_zero() {
+        vec![]
+    } else {
+        vec![(recipient, dust_shares)]
+    };
+    let verified_share_transfers = verification
+        .share_transfers
+        .iter()
+        .map(|transfer| (transfer.recipient, transfer.shares))
+        .collect::<Vec<_>>();
+
+    verification.nonce == expected_nonce
+        && verification.shares_burned == expected_shares_burned
+        && expected == verified
+        && verification.burns.len() == verified.len()
+        && expected_share_transfers == verified_share_transfers
 }
 
 #[cfg(test)]
@@ -2394,7 +2480,7 @@ mod tests {
     use super::{
         BurnManager, BurnManagerError, MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS,
         RecoveryOutcome, Redemption, RedemptionCommand,
-        should_release_reserved_burn,
+        burn_verification_matches_plan, should_release_reserved_burn,
     };
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Network, Quantity, TokenizationRequestId};
@@ -2414,8 +2500,9 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, ReceiptInformation, SendableTxWithHash,
-        TxId, VaultError, VaultService,
+        BurnTxStatus, BurnVerification, MultiBurnEntry, ReceiptInformation,
+        SendableTxWithHash, TxId, VaultError, VaultService, VerifiedBurn,
+        VerifiedShareTransfer,
     };
 
     const TEST_WALLET: Address =
@@ -2460,6 +2547,75 @@ mod tests {
             "ambiguous parse errors must not release the reservation"
         );
         assert!(!should_release_reserved_burn(&VaultError::InvalidReceipt));
+    }
+
+    #[test]
+    fn alternate_burn_semantics_require_recipient_and_dust_transfer() {
+        let owner = TEST_WALLET;
+        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let planned_burns = vec![BurnRecord {
+            receipt_id: uint!(42_U256),
+            shares_burned: uint!(17_U256),
+        }];
+        let verification = BurnVerification {
+            block_number: 45_989_009,
+            nonce: 7,
+            shares_burned: uint!(17_U256),
+            burns: vec![VerifiedBurn {
+                sender: owner,
+                receiver: recipient,
+                receipt_id: uint!(42_U256),
+                shares_burned: uint!(17_U256),
+            }],
+            share_transfers: vec![],
+        };
+
+        assert!(!burn_verification_matches_plan(
+            &verification,
+            &planned_burns,
+            owner,
+            recipient,
+            uint!(3_U256),
+            7,
+        ));
+
+        let verification = BurnVerification {
+            share_transfers: vec![VerifiedShareTransfer {
+                recipient,
+                shares: uint!(3_U256),
+            }],
+            ..verification
+        };
+        assert!(burn_verification_matches_plan(
+            &verification,
+            &planned_burns,
+            owner,
+            recipient,
+            uint!(3_U256),
+            7,
+        ));
+        let mismatched_total = BurnVerification {
+            shares_burned: uint!(18_U256),
+            ..verification.clone()
+        };
+        assert!(!burn_verification_matches_plan(
+            &mismatched_total,
+            &planned_burns,
+            owner,
+            recipient,
+            uint!(3_U256),
+            7,
+        ));
+        let replayed_at_another_nonce =
+            BurnVerification { nonce: 8, ..verification };
+        assert!(!burn_verification_matches_plan(
+            &replayed_at_another_nonce,
+            &planned_burns,
+            owner,
+            recipient,
+            uint!(3_U256),
+            7,
+        ));
     }
 
     struct TestHarness {
@@ -2648,6 +2804,7 @@ mod tests {
         issuer_request_id: &IssuerRedemptionRequestId,
         vault: Address,
         owner: Address,
+        dust_shares: U256,
     ) {
         store
             .send(
@@ -2661,7 +2818,7 @@ mod tests {
                         receipt_info: None,
                         receipt_info_bytes: None,
                     }],
-                    dust_shares: U256::ZERO,
+                    dust_shares,
                     owner,
                     external_tx_id: None,
                 },
@@ -2858,7 +3015,7 @@ mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn test_force_complete_burn_records_verified_burn() {
+    async fn force_complete_acknowledged_alternate_burn_settles_reservation() {
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let persisted_tx = SendableTxWithHash::valid_for_test(
             7,
@@ -2868,7 +3025,19 @@ mod tests {
         let owner = persisted_tx.signer_for_test();
         let vault_mock = Arc::new(
             MockVaultService::new_success()
-                .with_verified_burn(45_989_009, uint!(17_U256))
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: owner,
+                        receiver: address!(
+                            "0x1234567890abcdef1234567890abcdef12345678"
+                        ),
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_U256),
+                    }],
+                    vec![],
+                )
                 .with_prepared_tx(persisted_tx.clone()),
         );
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
@@ -2915,15 +3084,23 @@ mod tests {
             vec![issuer_request_id.clone()],
             "reservation should be held before force-complete"
         );
-        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
 
-        let burn_tx_hash = persisted_tx.hash;
+        let burn_tx_hash = B256::random();
 
         let verification = manager
             .force_complete_burn(
                 &issuer_request_id,
                 burn_tx_hash,
                 "burn confirmed on-chain".to_string(),
+                Some(persisted_tx.hash),
             )
             .await
             .expect("force-complete should succeed");
@@ -2951,10 +3128,215 @@ mod tests {
             "force-complete must leave no dangling reservation"
         );
 
+        let proving_hash = format!("{burn_tx_hash:?}");
+        let persisted_hash = format!("{:?}", persisted_tx.hash);
         assert!(logs_contain_at!(
             tracing::Level::INFO,
-            &["Force-completing stuck Burning redemption", "verified on-chain"]
+            &[
+                "Force-completing stuck Burning redemption",
+                "verified on-chain",
+                "acknowledged_unresolved_burn_tx_hash",
+                &proving_hash,
+                &persisted_hash,
+            ]
         ));
+    }
+
+    #[tokio::test]
+    async fn force_complete_rejects_alternate_burn_for_another_recipient() {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let persisted_tx = SendableTxWithHash::valid_for_test(
+            7,
+            vault,
+            Bytes::from_static(&[0xde, 0xad]),
+        );
+        let owner = persisted_tx.signer_for_test();
+        let vault_mock = Arc::new(
+            MockVaultService::new_success()
+                .with_verified_burns(
+                    45_989_009,
+                    persisted_tx.nonce,
+                    vec![VerifiedBurn {
+                        sender: owner,
+                        receiver: address!(
+                            "0x9999999999999999999999999999999999999999"
+                        ),
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_U256),
+                    }],
+                    vec![],
+                )
+                .with_prepared_tx(persisted_tx.clone()),
+        );
+        let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
+        let TestHarness { store, receipt_service, pool, .. } = &harness;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        let manager = BurnManager::new(
+            vault_mock.clone(),
+            pool.clone(),
+            store.clone(),
+            receipt_service.clone(),
+            owner,
+        );
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        create_test_redemption_in_burning_state(store, &issuer_request_id)
+            .await;
+        harness.discover_receipt(vault, uint!(42_U256), uint!(17_U256)).await;
+        receipt_service
+            .reserve_burn(
+                vault,
+                issuer_request_id.clone(),
+                vec![BurnRecord {
+                    receipt_id: uint!(42_U256),
+                    shares_burned: uint!(17_U256),
+                }],
+            )
+            .await
+            .expect("reservation should seed");
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
+
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                B256::random(),
+                "another redemption's burn".to_string(),
+                Some(persisted_tx.hash),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(BurnManagerError::AlternateBurnSemanticsMismatch { .. })
+        ));
+        assert!(matches!(
+            load_aggregate(store, &issuer_request_id).await,
+            Redemption::BurnIntended { .. }
+        ));
+        assert!(
+            receipt_service
+                .reserved_redemptions(vault)
+                .await
+                .unwrap()
+                .contains(&issuer_request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn force_complete_forwards_persisted_dust_and_nonce_to_verification()
+    {
+        let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let dust_shares = uint!(3_U256);
+
+        for (scenario, verified_nonce, verified_share_transfers) in [
+            ("missing dust transfer", 7, vec![]),
+            (
+                "different nonce",
+                8,
+                vec![VerifiedShareTransfer { recipient, shares: dust_shares }],
+            ),
+        ] {
+            let mut persisted_tx = SendableTxWithHash::valid_for_test(
+                7,
+                vault,
+                Bytes::from_static(&[0xde, 0xad]),
+            );
+            persisted_tx.dust_shares = dust_shares;
+            let owner = persisted_tx.signer_for_test();
+            let vault_mock = Arc::new(
+                MockVaultService::new_success()
+                    .with_verified_burns(
+                        45_989_009,
+                        verified_nonce,
+                        vec![VerifiedBurn {
+                            sender: owner,
+                            receiver: recipient,
+                            receipt_id: uint!(42_U256),
+                            shares_burned: uint!(17_U256),
+                        }],
+                        verified_share_transfers,
+                    )
+                    .with_prepared_tx(persisted_tx.clone()),
+            );
+            let harness =
+                TestHarness::with_vault_mock(vault_mock.clone()).await;
+            let TestHarness { store, receipt_service, pool, .. } = &harness;
+            harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+            let manager = BurnManager::new(
+                vault_mock.clone(),
+                pool.clone(),
+                store.clone(),
+                receipt_service.clone(),
+                owner,
+            );
+            let issuer_request_id = IssuerRedemptionRequestId::random();
+            create_test_redemption_in_burning_state(store, &issuer_request_id)
+                .await;
+            harness
+                .discover_receipt(vault, uint!(42_U256), uint!(17_U256))
+                .await;
+            receipt_service
+                .reserve_burn(
+                    vault,
+                    issuer_request_id.clone(),
+                    vec![BurnRecord {
+                        receipt_id: uint!(42_U256),
+                        shares_burned: uint!(17_U256),
+                    }],
+                )
+                .await
+                .expect("reservation should seed");
+            persist_test_burn_intent(
+                store,
+                &issuer_request_id,
+                vault,
+                owner,
+                dust_shares,
+            )
+            .await;
+
+            let result = manager
+                .force_complete_burn(
+                    &issuer_request_id,
+                    B256::random(),
+                    scenario.to_string(),
+                    Some(persisted_tx.hash),
+                )
+                .await;
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(BurnManagerError::AlternateBurnSemanticsMismatch {
+                        expected_dust_shares,
+                        expected_nonce,
+                        ..
+                    }) if *expected_dust_shares == dust_shares
+                        && *expected_nonce == persisted_tx.nonce
+                ),
+                "scenario {scenario} unexpectedly succeeded: {result:?}"
+            );
+            assert!(
+                matches!(
+                    load_aggregate(store, &issuer_request_id).await,
+                    Redemption::BurnIntended { .. }
+                ),
+                "scenario {scenario} changed the redemption"
+            );
+            assert_eq!(
+                receipt_service.reserved_redemptions(vault).await.unwrap(),
+                vec![issuer_request_id],
+                "scenario {scenario} released the reservation"
+            );
+            assert_eq!(vault_mock.verify_burn_call_count(), 1);
+        }
     }
 
     #[tokio::test]
@@ -2990,13 +3372,21 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
 
         let result = manager
             .force_complete_burn(
                 &issuer_request_id,
                 persisted_tx.hash,
                 "operator hash is not a burn".to_string(),
+                None,
             )
             .await;
 
@@ -3047,13 +3437,21 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
 
         let result = manager
             .force_complete_burn(
                 &issuer_request_id,
                 persisted_tx.hash,
                 "operator hash reverted".to_string(),
+                None,
             )
             .await;
 
@@ -3093,6 +3491,7 @@ mod tests {
                 &issuer_request_id,
                 B256::random(),
                 "another redemption's verified burn".to_string(),
+                None,
             )
             .await;
 
@@ -3135,6 +3534,7 @@ mod tests {
                     "0x3601e281d321344b9569b44159996ae179c44e8d733cab7f81cb0424d0375ccf"
                 ),
                 "wrong state".to_string(),
+                None,
             )
             .await;
 
@@ -4873,8 +5273,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, TEST_WALLET)
-            .await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            TEST_WALLET,
+            U256::ZERO,
+        )
+        .await;
 
         let stale = load_aggregate(store, &issuer_request_id).await;
         let Redemption::BurnIntended {
@@ -4977,8 +5383,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, TEST_WALLET)
-            .await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            TEST_WALLET,
+            U256::ZERO,
+        )
+        .await;
         let manager = BurnManager::new(
             vault_mock.clone(),
             pool.clone(),
@@ -5033,8 +5445,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, TEST_WALLET)
-            .await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            TEST_WALLET,
+            U256::ZERO,
+        )
+        .await;
         record_test_recovery_attempts(
             store,
             &issuer_request_id,
@@ -5117,7 +5535,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
         record_test_recovery_attempts(
             store,
             &issuer_request_id,
@@ -5207,7 +5632,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, owner).await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            owner,
+            U256::ZERO,
+        )
+        .await;
         record_test_recovery_attempts(
             store,
             &issuer_request_id,
@@ -5286,8 +5718,14 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         create_test_redemption_in_burning_state(store, &issuer_request_id)
             .await;
-        persist_test_burn_intent(store, &issuer_request_id, vault, TEST_WALLET)
-            .await;
+        persist_test_burn_intent(
+            store,
+            &issuer_request_id,
+            vault,
+            TEST_WALLET,
+            U256::ZERO,
+        )
+        .await;
         record_test_recovery_attempts(
             store,
             &issuer_request_id,
@@ -5944,7 +6382,7 @@ mod tests {
         let TestHarness { store, receipt_service, pool, .. } = &harness;
         harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
         let manager = BurnManager::new(
-            vault_mock,
+            vault_mock.clone(),
             pool.clone(),
             store.clone(),
             receipt_service.clone(),
@@ -5991,14 +6429,17 @@ mod tests {
                 &issuer_request_id,
                 other_redemption_hash,
                 "wrong redemption".to_string(),
+                None,
             )
             .await;
 
         assert!(matches!(
             result,
             Err(BurnManagerError::Redemption(
-                RedemptionError::BurnHashMismatch { expected, provided }
-            )) if expected == persisted_tx.hash && provided == other_redemption_hash
+                RedemptionError::UnresolvedBurnRequiresAcknowledgement {
+                    burn_tx_hash,
+                }
+            )) if burn_tx_hash == persisted_tx.hash
         ));
         assert!(matches!(
             load_aggregate(store, &issuer_request_id).await,
@@ -6011,6 +6452,27 @@ mod tests {
                 .unwrap()
                 .contains(&issuer_request_id)
         );
+
+        let wrong_acknowledgement = B256::random();
+        let result = manager
+            .force_complete_burn(
+                &issuer_request_id,
+                other_redemption_hash,
+                "wrong acknowledgement".to_string(),
+                Some(wrong_acknowledgement),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(BurnManagerError::Redemption(
+                RedemptionError::UnresolvedBurnAcknowledgementMismatch {
+                    expected,
+                    provided,
+                }
+            )) if expected == persisted_tx.hash
+                && provided == wrong_acknowledgement
+        ));
+        assert_eq!(vault_mock.verify_burn_call_count(), 0);
     }
 
     #[tokio::test]
@@ -6062,6 +6524,7 @@ mod tests {
                 &issuer_request_id,
                 persisted_tx.hash,
                 "untrusted persisted identity".to_string(),
+                None,
             )
             .await;
 
