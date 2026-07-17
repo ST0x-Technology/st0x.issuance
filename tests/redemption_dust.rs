@@ -149,11 +149,12 @@ async fn perform_mint_flow(
 }
 
 /// Sets up redemption mocks that capture the quantity sent to Alpaca.
-fn setup_redemption_mocks_with_qty_capture(
-    mock_alpaca: &MockServer,
+fn setup_redemption_mocks_with_qty_capture<'mock>(
+    mock_alpaca: &'mock MockServer,
     user_wallet: Address,
     captured_qty: Arc<Mutex<Option<String>>>,
-) -> (Mock<'_>, Mock<'_>) {
+    expected_qty: &str,
+) -> (Mock<'mock>, Mock<'mock>) {
     let (basic_auth, api_key, api_secret) = test_alpaca_legacy_auth();
     let shared_issuer_id = Arc::new(Mutex::new(String::new()));
     let shared_tx_hash = Arc::new(Mutex::new(String::new()));
@@ -212,6 +213,7 @@ fn setup_redemption_mocks_with_qty_capture(
         );
     });
 
+    let expected_qty = expected_qty.to_string();
     let poll_mock = mock_alpaca.mock(|when, then| {
         when.method(GET)
             .path_matches(
@@ -236,7 +238,7 @@ fn setup_redemption_mocks_with_qty_capture(
                     "status": "completed",
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
-                    "qty": TRUNCATED_QTY_STR,
+                    "qty": expected_qty,
                     "issuer": "test-issuer",
                     "network": "base",
                     "wallet_address": user_wallet,
@@ -278,6 +280,7 @@ async fn test_redemption_returns_dust_to_user()
         &mock_alpaca,
         user_wallet,
         Arc::clone(&captured_qty),
+        TRUNCATED_QTY_STR,
     );
 
     let temp_dir = tempfile::tempdir()?;
@@ -379,6 +382,7 @@ async fn test_redemption_no_dust_when_9_decimals()
         &mock_alpaca,
         user_wallet,
         Arc::clone(&captured_qty),
+        "0.123456789",
     );
 
     let temp_dir = tempfile::tempdir()?;
@@ -440,7 +444,7 @@ async fn test_redemption_no_dust_when_9_decimals()
     let qty_sent = captured_qty.lock().unwrap().clone();
     assert_eq!(qty_sent, Some(mint_qty.to_string()));
 
-    wait_for_balance(&vault, user_wallet, U256::ZERO, "zero balance (no dust)")
+    wait_for_balance(&vault, bot_wallet, U256::ZERO, "burned bot balance")
         .await?;
 
     Ok(())

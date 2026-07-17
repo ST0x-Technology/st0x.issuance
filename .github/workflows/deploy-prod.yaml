@@ -18,26 +18,34 @@ jobs:
       group: deploy-prod
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
           submodules: recursive
 
       - name: Verify tag is on main
+        env:
+          DEPLOY_TAG: ${{ inputs.tag }}
         run: |
           git fetch --tags origin main
-          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
-            echo "ERROR: '${{ inputs.tag }}' is not an existing tag" >&2
+          if ! git rev-parse -q --verify "refs/tags/$DEPLOY_TAG" >/dev/null; then
+            echo "ERROR: '$DEPLOY_TAG' is not an existing tag" >&2
             exit 1
           fi
-          tag_commit="$(git rev-list -n 1 "refs/tags/${{ inputs.tag }}")"
+          tag_commit="$(git rev-list -n 1 "refs/tags/$DEPLOY_TAG")"
+          checked_out_commit="$(git rev-parse HEAD)"
+          if [ "$checked_out_commit" != "$tag_commit" ]; then
+            echo "ERROR: checked-out commit does not match tag $DEPLOY_TAG" >&2
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "ERROR: tag ${{ inputs.tag }} is not on main" >&2
+            echo "ERROR: tag $DEPLOY_TAG is not on main" >&2
             exit 1
           fi
 
@@ -82,10 +90,12 @@ jobs:
       # (encrypted to roles.prod.ssh, which includes the CI key) and pins the
       # host key from keys.nix into known_hosts itself.
       - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
       - name: Deploy all profiles
