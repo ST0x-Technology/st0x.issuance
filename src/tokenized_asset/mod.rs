@@ -207,7 +207,7 @@ impl EventSourced for TokenizedAsset {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
     use chrono::Utc;
     use event_sorcery::{StoreBuilder, TestHarness, replay};
     use sqlx::sqlite::SqlitePoolOptions;

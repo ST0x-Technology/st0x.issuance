@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM mint_view\n        WHERE view_id = ?\n        ",
+  "query": "\n        SELECT json_extract(payload, '$.Live') as \"live: String\"\n        FROM underlying_view\n        WHERE view_id = ?\n        ",
   "describe": {
     "columns": [
       {
@@ -15,5 +15,5 @@
     },
     "nullable": [null]
   },
-  "hash": "d8bcc2b14df7ba7216daa9a71e304f26d52326819eaa95ab201916feb7aa077b"
+  "hash": "798274bf359f72e9afaa63f492c2c7655eec2b22f3fc7a0f950cf0a74567fc78"
 }
