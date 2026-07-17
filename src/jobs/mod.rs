@@ -15,6 +15,8 @@
 //! breaker, and test failure-injection arrive with their first
 //! request→outcome consumers.
 
+use std::error::Error as StdError;
+use std::sync::Arc;
 use apalis::prelude::{Data, TaskBuilder, TaskSink};
 use apalis_codec::json::JsonCodec;
 use apalis_core::backend::TaskSinkError;
@@ -22,8 +24,6 @@ use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{CompactType, SqlitePool, SqliteStorage, SqlxError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::error::Error as StdError;
-use std::sync::Arc;
 
 /// apalis-sqlite storage specialised to JSON-encoded tasks. This is exactly the
 /// concrete type `SqliteStorage::new` returns, so naming it here pins the same
