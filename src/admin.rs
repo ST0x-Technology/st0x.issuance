@@ -1169,7 +1169,7 @@ pub(crate) async fn reprocess_mint(
         }
     };
 
-    let vault_service = vault_services.get(network).map_err(|error| {
+    let vault_service = vault_services.service(network).map_err(|error| {
         error!(target: "admin", aggregate_id = aggregate_id,
             error = %error,
             "Cannot reprocess mint on an unconfigured network"
@@ -3271,10 +3271,11 @@ mod tests {
             .manage(store)
             .manage(pool)
             .manage(alpaca)
-            .manage(super::NetworkVaultServices::new(HashMap::from([(
+            .manage(super::NetworkVaultServices::with_single_vault(
                 Network::Base,
+                crate::test_utils::ANVIL_CHAIN_ID,
                 vault_service,
-            )])))
+            ))
             .manage(burn_recovery)
             .mount("/", rocket::routes![super::recover_redemption])
     }

@@ -96,7 +96,14 @@ impl BurnManager {
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
     ) -> Self {
-        Self { vaults, view_pool, store, receipt_service, bot_wallet }
+        Self {
+            vaults,
+            view_pool,
+            store,
+            receipt_service,
+            bot_wallet,
+            automatic_recovery_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     fn vault_for(
@@ -277,6 +284,7 @@ impl BurnManager {
         issuer_request_id: &IssuerRedemptionRequestId,
         burn_tx_hash: B256,
         reason: String,
+        acknowledged_unresolved_burn_tx_hash: Option<B256>,
     ) -> Result<BurnVerification, BurnManagerError> {
         let redemption =
             self.store.load(issuer_request_id).await?.ok_or_else(|| {
@@ -287,15 +295,11 @@ impl BurnManager {
 
         let persisted_burn_tx = redemption.persisted_burn_tx()?;
         persisted_burn_tx.validate_for_owner(self.bot_wallet)?;
-        let persisted_burn_hash = persisted_burn_tx.hash;
-        if persisted_burn_hash != burn_tx_hash {
-            return Err(BurnManagerError::Redemption(
-                RedemptionError::BurnHashMismatch {
-                    expected: persisted_burn_hash,
-                    provided: burn_tx_hash,
-                },
-            ));
-        }
+        let acknowledged_unresolved_burn_tx_hash = redemption
+            .validate_force_complete_burn_hash(
+                burn_tx_hash,
+                acknowledged_unresolved_burn_tx_hash,
+            )?;
 
         let (underlying, network) = match &redemption {
             Redemption::Burning { metadata, .. }
@@ -315,8 +319,6 @@ impl BurnManager {
                 BurnManagerError::AssetNotFound { underlying, network },
             )?;
 
-        // Verify the burn actually landed on-chain before recording a terminal
-        // success — never trust the operator-supplied hash blindly.
         let verification = self
             .vault_for(network)?
             .verify_burn_tx(vault, self.bot_wallet, burn_tx_hash)
@@ -324,6 +326,8 @@ impl BurnManager {
 
         info!(target: "redemption", issuer_request_id = %issuer_request_id,
             burn_tx_hash = ?burn_tx_hash,
+            persisted_burn_tx_hash = ?persisted_burn_tx.hash,
+            acknowledged_unresolved_burn_tx_hash = ?acknowledged_unresolved_burn_tx_hash,
             block_number = verification.block_number,
             shares_burned = %verification.shares_burned,
             "Force-completing stuck Burning redemption: burn verified on-chain"
@@ -337,6 +341,7 @@ impl BurnManager {
                     burn_tx_hash,
                     block_number: verification.block_number,
                     reason,
+                    acknowledged_unresolved_burn_tx_hash,
                 },
             )
             .await?;
@@ -896,7 +901,8 @@ impl BurnManager {
         external_tx_id: Option<BurnExternalTxId>,
         has_submitted: bool,
     ) -> Result<RecoveryOutcome, BurnManagerError> {
-        let wallet_guard = self.vault_service.lock_wallet().await;
+        let vault_service = self.vault_for(metadata.network)?;
+        let wallet_guard = vault_service.lock_wallet().await;
         if !self
             .recovery_budget_available(issuer_request_id, Some(sendable_tx))
             .await?
@@ -909,8 +915,7 @@ impl BurnManager {
             return Ok(RecoveryOutcome::SkippedManualIntervention);
         }
 
-        let status = self
-            .vault_service
+        let status = vault_service
             .classify_burn_tx(self.bot_wallet, sendable_tx)
             .await?;
         let tx_id = sendable_tx.hash.into();
@@ -927,10 +932,15 @@ impl BurnManager {
                 .await;
         }
 
-        let action = recovery_action_for_status(status)
-            .ok_or_else(terminal_classification_error)?;
-        let action_already_reserved =
-            pending_recovery == Some(PendingBurnRecovery::Reserved(action));
+        let action = match status {
+            BurnTxStatus::StillMineable => BurnRecoveryAction::Rebroadcast,
+            BurnTxStatus::ProvablyDead => BurnRecoveryAction::Replace,
+            BurnTxStatus::Mined | BurnTxStatus::Reverted => {
+                return Err(BurnManagerError::InvalidAggregateState {
+                    current_state: "terminal burn classification".to_string(),
+                });
+            }
+        };
         let vault = find_vault(
             &self.view_pool,
             &metadata.underlying,
@@ -941,14 +951,6 @@ impl BurnManager {
             underlying: metadata.underlying.clone(),
             network: metadata.network,
         })?;
-        if !action_already_reserved
-            && !self
-                .recovery_budget_available(issuer_request_id, Some(sendable_tx))
-                .await?
-        {
-            drop(wallet_guard);
-            return Ok(RecoveryOutcome::SkippedManualIntervention);
-        }
         if status == BurnTxStatus::ProvablyDead {
             let unresolved_mint =
                 has_unresolved_mint_intent(&self.view_pool, None).await?;
@@ -1050,56 +1052,6 @@ impl BurnManager {
             "Automatic burn recovery action accepted"
         );
         Ok(RecoveryOutcome::Executed)
-    }
-
-    async fn submit_prepared_replacement(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        metadata: &RedemptionMetadata,
-        planned_burns: &[BurnRecord],
-        sendable_tx: &SendableTxWithHash,
-        external_tx_id: Option<BurnExternalTxId>,
-    ) -> Result<(), BurnManagerError> {
-        let vault = find_vault(
-            &self.view_pool,
-            &metadata.underlying,
-            &metadata.network,
-        )
-        .await?
-        .ok_or_else(|| BurnManagerError::AssetNotFound {
-            underlying: metadata.underlying.clone(),
-            network: metadata.network,
-        })?;
-        self.store
-            .send(
-                issuer_request_id,
-                RedemptionCommand::BurnTokens {
-                    issuer_request_id: issuer_request_id.clone(),
-                    vault,
-                    burns: recovery_burn_entries(planned_burns),
-                    dust_shares: sendable_tx.dust_shares,
-                    owner: self.bot_wallet,
-                    external_tx_id,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn exhausted_recovery_outcome(
-        &self,
-        issuer_request_id: &IssuerRedemptionRequestId,
-        sendable_tx: &SendableTxWithHash,
-    ) -> Result<Option<RecoveryOutcome>, BurnManagerError> {
-        if !self.burn_recovery_budget(issuer_request_id).await?.exhausted {
-            return Ok(None);
-        }
-        debug!(target: "redemption",
-            issuer_request_id = %issuer_request_id,
-            tx_hash = %sendable_tx.hash,
-            "Skipping burn with exhausted automatic recovery budget"
-        );
-        Ok(Some(RecoveryOutcome::SkippedManualIntervention))
     }
 
     async fn recover_single_burning(

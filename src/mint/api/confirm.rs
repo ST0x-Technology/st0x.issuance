@@ -7,13 +7,12 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::admin::NetworkVaultServices;
 use crate::auth::IssuerAuth;
 use crate::mint::{
     IssuerMintRequestId, Mint, MintCommand, TokenizationRequestId,
     recovery::enqueue_scheduled_mint_recovery,
 };
-use crate::vault::VaultService;
+use crate::vault::{NetworkVaultServices, VaultService};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JournalConfirmationRequest {
@@ -112,8 +111,8 @@ pub(crate) async fn confirm_journal(
                 return rocket::http::Status::InternalServerError;
             };
 
-            let vault_service = match vault_services.get(network) {
-                Ok(vault) => vault.clone(),
+            let vault_service = match vault_services.service(network) {
+                Ok(vault_service) => vault_service.clone(),
                 Err(error) => {
                     error!(target: "mint",
                         issuer_request_id = %issuer_request_id,
