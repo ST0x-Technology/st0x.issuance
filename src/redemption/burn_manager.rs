@@ -2233,6 +2233,7 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
@@ -2264,8 +2265,8 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, NetworkVaultServices, ReceiptInformation,
-        SendableTxWithHash, TxId, VaultError, VaultService,
+        BurnTxStatus, MultiBurnEntry, ReceiptInformation, SendableTxWithHash,
+        TxId, VaultError, VaultService,
     };
 
     const TEST_WALLET: Address =
@@ -2320,12 +2321,12 @@ mod tests {
         asset_store: Arc<Store<TokenizedAsset>>,
     }
 
-    struct ReleaseFailingReceiptService {
+    struct SettleFailingReceiptService {
         inner: Arc<dyn ReceiptService>,
     }
 
     #[async_trait::async_trait]
-    impl ReceiptService for ReleaseFailingReceiptService {
+    impl ReceiptService for SettleFailingReceiptService {
         async fn register_minted_receipt(
             &self,
             params: MintedReceiptParams,
@@ -2371,6 +2372,17 @@ mod tests {
 
         async fn release_burn(
             &self,
+            chain_id: u64,
+            vault: Address,
+            redemption_issuer_request_id: IssuerRedemptionRequestId,
+        ) -> Result<(), ReceiptRegistrationError> {
+            self.inner
+                .release_burn(chain_id, vault, redemption_issuer_request_id)
+                .await
+        }
+
+        async fn settle_burn(
+            &self,
             _chain_id: u64,
             _vault: Address,
             _redemption_issuer_request_id: IssuerRedemptionRequestId,
@@ -2380,17 +2392,6 @@ mod tests {
                     receipt_id: ReceiptId::from(U256::ZERO),
                 },
             )))
-        }
-
-        async fn settle_burn(
-            &self,
-            chain_id: u64,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner
-                .settle_burn(chain_id, vault, redemption_issuer_request_id)
-                .await
         }
 
         async fn reserved_redemptions(
@@ -2411,84 +2412,6 @@ mod tests {
             self.inner
                 .find_by_issuer_request_id(chain_id, vault, issuer_request_id)
                 .await
-        }
-    }
-
-    struct SettleFailingReceiptService {
-        inner: Arc<dyn ReceiptService>,
-    }
-
-    #[async_trait::async_trait]
-    impl ReceiptService for SettleFailingReceiptService {
-        async fn register_minted_receipt(
-            &self,
-            params: MintedReceiptParams,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner.register_minted_receipt(params).await
-        }
-
-        async fn for_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: &IssuerRedemptionRequestId,
-            shares_to_burn: Shares,
-            dust: Shares,
-        ) -> Result<BurnPlan, BurnTrackingError> {
-            self.inner
-                .for_burn(
-                    vault,
-                    redemption_issuer_request_id,
-                    shares_to_burn,
-                    dust,
-                )
-                .await
-        }
-
-        async fn reserve_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-            burns: Vec<BurnRecord>,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner
-                .reserve_burn(vault, redemption_issuer_request_id, burns)
-                .await
-        }
-
-        async fn release_burn(
-            &self,
-            vault: Address,
-            redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            self.inner.release_burn(vault, redemption_issuer_request_id).await
-        }
-
-        async fn settle_burn(
-            &self,
-            _vault: Address,
-            _redemption_issuer_request_id: IssuerRedemptionRequestId,
-        ) -> Result<(), ReceiptRegistrationError> {
-            Err(ReceiptRegistrationError::Aggregate(AggregateError::UserError(
-                ReceiptInventoryError::UnknownReceipt {
-                    receipt_id: ReceiptId::from(U256::ZERO),
-                },
-            )))
-        }
-
-        async fn reserved_redemptions(
-            &self,
-            vault: Address,
-        ) -> Result<Vec<IssuerRedemptionRequestId>, ReceiptLookupError>
-        {
-            self.inner.reserved_redemptions(vault).await
-        }
-
-        async fn find_by_issuer_request_id(
-            &self,
-            vault: &Address,
-            issuer_request_id: &IssuerMintRequestId,
-        ) -> Result<Option<RecoveredReceipt>, ReceiptLookupError> {
-            self.inner.find_by_issuer_request_id(vault, issuer_request_id).await
         }
     }
 
@@ -6423,7 +6346,7 @@ mod tests {
         let vault_mock = Arc::new(MockVaultService::new_success());
         let harness = TestHarness::with_vault_mock(vault_mock.clone()).await;
         let vault = address!("0xcccccccccccccccccccccccccccccccccccccccc");
-        harness.add_asset(&UnderlyingSymbol::new("AAPL"), vault).await;
+        harness.add_asset(&UnderlyingSymbol::new("AAPL").unwrap(), vault).await;
 
         // Drive the redemption to `Completed` through the real receipt service
         // so the burn settles cleanly; recovery below runs against a
@@ -6431,7 +6354,8 @@ mod tests {
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let manager = BurnManager::new(
-            blockchain_service,
+            HashMap::from([(Network::Base, blockchain_service)]),
+            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
             harness.pool.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
@@ -6484,19 +6408,22 @@ mod tests {
         let recovery_blockchain: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let failing_manager = BurnManager::new(
-            recovery_blockchain,
+            HashMap::from([(Network::Base, recovery_blockchain)]),
+            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
             harness.pool.clone(),
             harness.store.clone(),
             settle_failing,
             TEST_WALLET,
         );
 
-        failing_manager.recover_stuck_reservations(&[vault]).await;
+        failing_manager
+            .recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)])
+            .await;
 
         assert!(
             harness
                 .receipt_service
-                .reserved_redemptions(vault)
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
                 .await
                 .unwrap()
                 .contains(&issuer_request_id),
@@ -6505,10 +6432,21 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::WARN,
             &[
-                "Failed to resolve stuck reservation",
+                "Failed to settle burn receipt reservation",
                 &issuer_request_id.to_string()
             ]
         ));
+
+        manager.recover_stuck_reservations(&[(ANVIL_CHAIN_ID, vault)]).await;
+        assert!(
+            harness
+                .receipt_service
+                .reserved_redemptions(ANVIL_CHAIN_ID, vault)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the next recovery pass must retry and settle the held reservation"
+        );
     }
 
     /// A reservation surviving on a `Failed` redemption is from an *ambiguous*

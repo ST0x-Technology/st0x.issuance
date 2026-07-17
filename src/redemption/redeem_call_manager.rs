@@ -671,19 +671,6 @@ mod tests {
             ) -> Result<TokenizationRequest, AlpacaError> {
                 unreachable!("redeem test should not poll request status")
             }
-
-            async fn list_dividend_announcements(
-                &self,
-                _since: chrono::NaiveDate,
-                _until: chrono::NaiveDate,
-            ) -> Result<
-                Vec<crate::alpaca::DividendAnnouncement>,
-                AlpacaError,
-            > {
-                unreachable!(
-                    "redeem test should not list dividend announcements"
-                )
-            }
         }
 
         let (store, pool) = setup_test_store().await;

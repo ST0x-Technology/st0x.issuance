@@ -1469,17 +1469,6 @@ mod tests {
                     updated_at: Some(chrono::Utc::now()),
                 })
             }
-
-            async fn list_dividend_announcements(
-                &self,
-                _since: chrono::NaiveDate,
-                _until: chrono::NaiveDate,
-            ) -> Result<
-                Vec<crate::alpaca::DividendAnnouncement>,
-                AlpacaError,
-            > {
-                unreachable!("not used in journal manager tests")
-            }
         }
 
         let mock = Arc::new(NetworkMismatchMock {
