@@ -116,15 +116,17 @@ Optionally, from an Alpaca-whitelisted IP, run
 merge (`networks[]` includes `ethereum` for the test row).
 
 **Then restart the issuance service before proceeding.** Transfer pollers are
-spawned once at startup, per network that has at least one **live** asset on
-that network at boot (`list_enabled_assets`: `Enabled` or `Frozen` — same set
-startup validation walks). The ethereum asset did not exist when the service
-came up, so no ethereum poller is running and the redeem in section 6 would
-never be detected. After the restart, confirm the startup log shows
-`Spawning transfer poller for network` with `network=ethereum`. Note the
-checkpoint behaviour: a first-ever ethereum poll has no `transfer_poll:ethereum`
-checkpoint and starts scanning from that chain's `backfill_start_block`, so set
-it near the current head block to avoid a long historic scan.
+spawned once at startup, per network that has at least one live listing on that
+network at boot (`list_enabled_assets` — same set startup validation walks;
+underlying freeze does not remove a listing from this set, so a frozen-only
+network still gets a poller and still blocks boot if unconfigured). The ethereum
+asset did not exist when the service came up, so no ethereum poller is running
+and the redeem in section 6 would never be detected. After the restart, confirm
+the startup log shows `Spawning transfer poller for network` with
+`network=ethereum`. Note the checkpoint behaviour: a first-ever ethereum poll
+has no `transfer_poll:ethereum` checkpoint and starts scanning from that chain's
+`backfill_start_block`, so set it near the current head block to avoid a long
+historic scan.
 
 ## 5. Alpaca sandbox mint on `ethereum`
 
