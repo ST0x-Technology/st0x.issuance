@@ -141,10 +141,10 @@ pub(crate) struct StuckAggregate {
     #[schema(value_type = String)]
     quantity: Option<Quantity>,
     /// Network the aggregate's on-chain activity lives on. Tells operators
-    /// which chain to inspect (and which signing backend the Fireblocks
-    /// enrichment queried). `None` when neither the view variant nor the
-    /// event history records a network (the redemption `Failed` view variant
-    /// carries none, so it falls back to the history's detection event).
+    /// which chain to inspect (and which Turnkey/local signing backend applies).
+    /// `None` when neither the view variant nor the event history records a
+    /// network (the redemption `Failed` view variant carries none, so it falls
+    /// back to the history's detection event).
     #[serde(skip_serializing_if = "Option::is_none")]
     network: Option<Network>,
     /// Primary on-chain transaction hash for this aggregate, when known.
@@ -3484,7 +3484,7 @@ mod tests {
             ),
             (
                 "legacy",
-                TxId::Legacy("legacy-fireblocks-id".to_string()),
+                TxId::Legacy("legacy-tx-id".to_string()),
                 MockVaultService::new_success().with_invalid_checked_tx(),
             ),
             (
