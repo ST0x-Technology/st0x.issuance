@@ -17,7 +17,7 @@ use super::{
     AutomaticRetryDecision, IssuerMintRequestId, Mint, MintCommand, MintError,
     MintRecoveryMode, find_all_recoverable_mints,
 };
-use crate::jobs::JobQueue;
+use crate::jobs::{Job, JobQueue};
 use crate::receipt_inventory::ItnReceiptHandler;
 use crate::vault::VaultService;
 
@@ -217,15 +217,27 @@ pub(crate) struct MintRecoveryJob {
     issuer_request_id: IssuerMintRequestId,
 }
 
-impl MintRecoveryJob {
-    pub(crate) async fn run(
-        self,
-        mint_store: Data<Arc<Store<Mint>>>,
-        vault_service: Data<Arc<dyn VaultService>>,
+/// Runtime dependencies injected into the [`MintRecoveryJob`] worker.
+///
+/// Bundled so the generic [`crate::jobs::work`] adapter can take a single
+/// `Data<Arc<Ctx>>` while recovery still needs both the mint store and the
+/// vault service for on-chain retry.
+pub(crate) struct MintRecoveryJobCtx {
+    pub(crate) mint_store: Arc<Store<Mint>>,
+    pub(crate) vault_service: Arc<dyn VaultService>,
+}
+
+impl Job<MintRecoveryJobCtx> for MintRecoveryJob {
+    type Output = ();
+    type Error = AbortError;
+
+    async fn perform(
+        &self,
+        ctx: &MintRecoveryJobCtx,
     ) -> Result<(), AbortError> {
         match recover_mint_until_automatic_budget_exhausted(
-            &mint_store,
-            &vault_service,
+            &ctx.mint_store,
+            &ctx.vault_service,
             &self.issuer_request_id,
             SCHEDULED_RECOVERY_BACKOFF,
         )
@@ -2516,10 +2528,10 @@ mod tests {
         let issuer_request_id = test_issuer_request_id();
 
         let result = MintRecoveryJob { issuer_request_id }
-            .run(
-                Data::new(fixture.mint_store.clone()),
-                Data::new(fixture.vault.clone()),
-            )
+            .perform(&MintRecoveryJobCtx {
+                mint_store: fixture.mint_store.clone(),
+                vault_service: fixture.vault.clone(),
+            })
             .await;
 
         assert!(
@@ -2562,10 +2574,10 @@ mod tests {
         fixture.seed_mint_events(&issuer_request_id, events).await;
 
         let error = MintRecoveryJob { issuer_request_id }
-            .run(
-                Data::new(fixture.mint_store.clone()),
-                Data::new(fixture.vault.clone()),
-            )
+            .perform(&MintRecoveryJobCtx {
+                mint_store: fixture.mint_store.clone(),
+                vault_service: fixture.vault.clone(),
+            })
             .await
             .expect_err("an exhausted mint must abort, not resolve");
 

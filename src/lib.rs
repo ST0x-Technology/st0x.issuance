@@ -25,14 +25,14 @@ use crate::auth::FailedAuthRateLimiter;
 use crate::chain::{
     ChainRegistry, ConfiguredNetworks, validate_configured_asset_networks,
 };
-use crate::jobs::JobQueue;
+use crate::jobs::{JobQueue, work};
 use crate::mint::{
     Mint, MintServices, MintView, find_all_recoverable_mints,
     recovery::{
         DriveOutcome, MintRecoveryHandler, MintRecoveryJob,
-        MintRecoveryWorkerId, enqueue_scheduled_mint_recovery,
-        prune_unreferenced_recovery_workers, reconcile_recoverable_mints,
-        recover_mint, reset_orphaned_recovery_jobs,
+        MintRecoveryJobCtx, MintRecoveryWorkerId,
+        enqueue_scheduled_mint_recovery, prune_unreferenced_recovery_workers,
+        reconcile_recoverable_mints, recover_mint, reset_orphaned_recovery_jobs,
         vacuum_terminal_recovery_jobs,
     },
 };
@@ -1548,9 +1548,11 @@ fn spawn_mint_recovery_worker(
                         JobQueue::<MintRecoveryJob>::new(&apalis_pool)
                             .into_storage(),
                     )
-                    .data(mint_store.clone())
-                    .data(vault_service.clone())
-                    .build(MintRecoveryJob::run)
+                    .data(Arc::new(MintRecoveryJobCtx {
+                        mint_store: mint_store.clone(),
+                        vault_service: vault_service.clone(),
+                    }))
+                    .build(work::<MintRecoveryJobCtx, MintRecoveryJob>)
             });
 
             match monitor.run().await {
