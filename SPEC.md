@@ -1703,20 +1703,24 @@ The configured `backfill_start_block` is only the first-run seed; after a
 successful range, the service persists a per-(network, vault)
 `transfer_poll:{network}:{vault_address_lowercase}` row in the
 `poll_checkpoints` SQL table and the next startup resumes at
-`last_processed_block + 1`. For Base only, `load_transfer_poll` falls back to
-the legacy global key `transfer_poll` when the per-vault row does not exist yet.
-The checkpoint advances only after the requested range succeeds, and writes are
-monotonic so a shorter later range cannot move progress backward. Idempotency is
-still guaranteed by the `IssuerRedemptionRequestId` derived from each
-transaction hash — the Redemption aggregate rejects duplicate detections.
+`last_processed_block + 1`. On upgrade from the pre-multichain global
+`transfer_poll` cursor, `TransferPoller::seed_per_vault_checkpoints` copies that
+legacy value onto vaults already monitored at startup and then deletes the
+global row — a one-shot migration. Runtime-added vaults deliberately do **not**
+inherit the legacy cursor (they scan from `backfill_start_block`) so history
+below the old global head is not skipped. The checkpoint advances only after the
+requested range succeeds, and writes are monotonic so a shorter later range
+cannot move progress backward. Idempotency is still guaranteed by the
+`IssuerRedemptionRequestId` derived from each transaction hash — the Redemption
+aggregate rejects duplicate detections.
 
 This mirrors the receipt backfill pattern, where per-(network, vault)
 checkpoints are tracked under `receipt_backfill:<network>:<vault_lowercase>` in
 the same `poll_checkpoints` table, with the legacy
-`receipt_backfill:<vault_lowercase>` fallback for Base. Both checkpoints are
-intentionally not event-sourced: they are single mutable values whose history
-has no audit worth keeping, and modeling them as aggregates was the root cause
-of the 2026-05-19 OOM (RAI-617).
+`receipt_backfill:<vault_lowercase>` load-time fallback for Base. Transfer-poll
+and receipt-backfill checkpoints are intentionally not event-sourced: they are
+single mutable values whose history has no audit worth keeping, and modeling
+them as aggregates was the root cause of the 2026-05-19 OOM (RAI-617).
 
 **Note:** The bot's wallet serves as the redemption destination. When users send
 shares to this wallet, they're initiating a redemption. Since the bot already
@@ -2617,10 +2621,12 @@ shape. Parsing those variables into `Config::chains` is its own change; until it
 lands, the flat legacy vars remain the only live config path. Checkpoints are
 keyed per `(network, vault)`: transfer polling under
 `transfer_poll:{network}:{vault_address_lowercase}` and receipt backfill under
-`receipt_backfill:<network>:<vault_address_lowercase>`, with the pre-multichain
-rows (`transfer_poll`, `receipt_backfill:<vault_lowercase>`) readable as
-Base-only fallbacks. Once staging and production migrate, the flat-var mapping
-and those legacy checkpoint fallbacks are deleted.
+`receipt_backfill:<network>:<vault_address_lowercase>`. The pre-multichain
+`transfer_poll` row is migrated once by
+`TransferPoller::seed_per_vault_checkpoints` (then deleted); receipt backfill
+still reads `receipt_backfill:<vault_lowercase>` as a Base-only load-time
+fallback. Once staging and production migrate, the flat-var mapping and that
+receipt-backfill legacy fallback are deleted.
 
 **Asset identity (breaking):** `TokenizedAsset` aggregate id becomes the
 `AssetKey` — `{underlying}:{network}` (e.g. `AAPL:base`), and freeze status
