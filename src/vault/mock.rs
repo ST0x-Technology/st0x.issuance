@@ -674,6 +674,17 @@ impl MockVaultService {
         *self.pending_burn_result.lock().unwrap() = Some(result);
         self
     }
+
+    /// Configures `confirm_orchestrator_burn` to fail with
+    /// `VaultError::OrchestratorReverted` carrying the given typed reason.
+    #[cfg(test)]
+    pub(crate) fn with_orchestrator_confirm_revert(
+        self,
+        reason: OrchestratorRevertReason,
+    ) -> Self {
+        *self.orchestrator.confirm_revert.lock().unwrap() = Some(reason);
+        self
+    }
 }
 
 const MOCK_MINT_TX_HASH: alloy::primitives::B256 =

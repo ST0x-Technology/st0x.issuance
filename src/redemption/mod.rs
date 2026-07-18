@@ -192,9 +192,9 @@ impl std::fmt::Display for BurnExternalTxId {
 }
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{
-    BurnRequestOrigin, BurnTxStatus, MultiBurnEntry, MultiBurnParams,
-    NetworkVaultServices, SendableTxWithHash, TxId, UnconfiguredNetworkError,
-    VaultError, VaultService,
+    BurnRequestOrigin, BurnTxStatus, MultiBurnParams, NetworkVaultServices,
+    OrchestratorBurnParams, OrchestratorRevertReason, SendableTxWithHash, TxId,
+    UnconfiguredNetworkError, VaultError, VaultService,
 };
 
 pub(super) const fn default_redemption_network() -> Network {
@@ -231,7 +231,7 @@ impl RedemptionServices {
     }
 }
 
-pub(crate) use cmd::RedemptionCommand;
+pub(crate) use cmd::{BurnParams, RedemptionCommand};
 pub(crate) use event::{
     BurnFailureClassification, BurnRecord, RedemptionEvent, TokensBurnedData,
 };
@@ -354,16 +354,55 @@ pub(crate) enum BurnRecoveryAction {
     Replace,
 }
 
-/// Input parameters for the BurnTokens command handler.
+/// Input parameters for the IntendBurn/BurnTokens command handlers.
 ///
 /// Groups burn-related parameters to reduce argument count. The `user` field
 /// is derived from aggregate state, not passed in the command.
 struct BurnInput {
-    vault: Address,
-    burns: Vec<MultiBurnEntry>,
-    dust_shares: U256,
-    owner: Address,
+    params: BurnParams,
     external_tx_id: Option<BurnExternalTxId>,
+}
+
+/// Maps a `VaultError` into the serializable `RedemptionError::Vault`,
+/// computing the reservation-release flag, recoverable tx id, and typed
+/// classification at the aggregate boundary where the typed error is last
+/// visible.
+fn vault_error_to_redemption(error: &VaultError) -> RedemptionError {
+    RedemptionError::Vault {
+        release_reservation: should_release_reserved_burn(error),
+        tx_id: extract_tx_hash(error).map(Into::into),
+        classification: burn_failure_classification(error),
+        message: error.to_string(),
+    }
+}
+
+/// Maps a typed `VaultError` to the burn-failure classification persisted on
+/// `BurningFailed`. Only decoded orchestrator reverts classify; everything
+/// else stays `Unclassified` (including `OrchestratorRevertReason::Unknown`,
+/// which proves a revert but not its reason).
+const fn burn_failure_classification(
+    error: &VaultError,
+) -> BurnFailureClassification {
+    match error {
+        VaultError::OrchestratorReverted { reason, .. } => match reason {
+            OrchestratorRevertReason::InsufficientReceipts {
+                shortfall,
+                ..
+            } => BurnFailureClassification::InsufficientReceipts {
+                shortfall: *shortfall,
+            },
+            OrchestratorRevertReason::VaultLogicMismatch => {
+                BurnFailureClassification::VaultLogicMismatch
+            }
+            OrchestratorRevertReason::ReceiptLogicMismatch => {
+                BurnFailureClassification::ReceiptLogicMismatch
+            }
+            OrchestratorRevertReason::Unknown => {
+                BurnFailureClassification::Unclassified
+            }
+        },
+        _ => BurnFailureClassification::Unclassified,
+    }
 }
 
 struct ResumeBurnInput {
@@ -514,8 +553,10 @@ impl Redemption {
         }])
     }
 
-    /// Submits the burn transaction to the signing backend.
-    /// Produces `BurnTxSubmitted` on success; failure is propagated to caller.
+    /// Broadcasts the persisted burn transaction.
+    /// Produces `BurnTxSubmitted` (vault-direct) or
+    /// `OrchestratorBurnSubmitted` (orchestrator) on success; failure is
+    /// propagated to the caller.
     async fn handle_burn_tokens(
         &self,
         services: &RedemptionServices,
@@ -531,50 +572,92 @@ impl Redemption {
             });
         };
 
-        let user_wallet = metadata.wallet;
-        let vault_service = services.vault_for(metadata.network)?;
+        match input.params {
+            BurnParams::VaultDirect { vault, burns, dust_shares, owner } => {
+                if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: "Orchestrator".to_string(),
+                        found: "VaultDirect".to_string(),
+                    });
+                }
 
-        let planned_burns: Vec<BurnRecord> = input
-            .burns
-            .iter()
-            .map(|entry| BurnRecord {
-                receipt_id: entry.receipt_id,
-                shares_burned: entry.burn_shares,
-            })
-            .collect();
+                let planned_burns: Vec<BurnRecord> = burns
+                    .iter()
+                    .map(|entry| BurnRecord {
+                        receipt_id: entry.receipt_id,
+                        shares_burned: entry.burn_shares,
+                    })
+                    .collect();
 
-        let params = MultiBurnParams {
-            vault: input.vault,
-            burns: input.burns,
-            dust_shares: input.dust_shares,
-            owner: input.owner,
-            user: user_wallet,
-            origin: BurnRequestOrigin::Redemption(issuer_request_id.clone()),
-            detected_tx_hash: metadata.detected_tx_hash,
-            external_tx_id: input.external_tx_id,
-        };
+                let params = MultiBurnParams {
+                    vault,
+                    burns,
+                    dust_shares,
+                    owner,
+                    user: metadata.wallet,
+                    origin: BurnRequestOrigin::Redemption(
+                        issuer_request_id.clone(),
+                    ),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: input.external_tx_id,
+                };
 
-        let submitted = vault_service
-            .submit_burn(params, sendable_tx.clone())
-            .await
-            .map_err(|error: VaultError| RedemptionError::Vault {
-                release_reservation: should_release_reserved_burn(&error),
-                tx_id: extract_tx_hash(&error).map(Into::into),
-                message: error.to_string(),
-            })?;
+                let submitted = services
+                    .vault_for(metadata.network)?
+                    .submit_burn(params, sendable_tx.clone())
+                    .await
+                    .map_err(|error| vault_error_to_redemption(&error))?;
 
-        Ok(vec![RedemptionEvent::BurnTxSubmitted {
-            issuer_request_id,
-            external_tx_id: BurnExternalTxId::from_string(
-                submitted.external_tx_id,
-            ),
-            tx_id: submitted.tx_id,
-            planned_burns,
-            submitted_at: Utc::now(),
-        }])
+                Ok(vec![RedemptionEvent::BurnTxSubmitted {
+                    issuer_request_id,
+                    external_tx_id: BurnExternalTxId::from_string(
+                        submitted.external_tx_id,
+                    ),
+                    tx_id: submitted.tx_id,
+                    planned_burns,
+                    submitted_at: Utc::now(),
+                }])
+            }
+            BurnParams::Orchestrator { token, amount, owner } => {
+                let VaultMode::Orchestrator { address: orchestrator } =
+                    metadata.burn_mode
+                else {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: "VaultDirect".to_string(),
+                        found: "Orchestrator".to_string(),
+                    });
+                };
+
+                let params = OrchestratorBurnParams {
+                    orchestrator,
+                    token,
+                    amount,
+                    owner,
+                    issuer_request_id: issuer_request_id.clone(),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: input.external_tx_id,
+                };
+
+                let submitted = services
+                    .vault_for(metadata.network)?
+                    .submit_orchestrator_burn(&params, sendable_tx)
+                    .await
+                    .map_err(|error| vault_error_to_redemption(&error))?;
+
+                Ok(vec![RedemptionEvent::OrchestratorBurnSubmitted {
+                    issuer_request_id,
+                    external_tx_id: BurnExternalTxId::from_string(
+                        submitted.external_tx_id,
+                    ),
+                    tx_id: submitted.tx_id,
+                    submitted_at: Utc::now(),
+                }])
+            }
+        }
     }
 
-    /// Confirms a previously submitted burn transaction.
+    /// Confirms a previously submitted burn transaction, branching on this
+    /// redemption's persisted `burn_mode` anchor.
     async fn handle_confirm_burn(
         &self,
         services: &RedemptionServices,
@@ -582,13 +665,13 @@ impl Redemption {
         tx_id: TxId,
         dust_shares: U256,
     ) -> Result<Vec<RedemptionEvent>, RedemptionError> {
-        let (metadata, stored_tx_id) = match self {
-            Self::BurnSubmitted { metadata, tx_id, .. } => {
-                (metadata, tx_id.clone())
+        let (stored_tx_id, metadata, dust_quantity) = match self {
+            Self::BurnSubmitted { tx_id, metadata, dust_quantity, .. } => {
+                (tx_id.clone(), metadata, dust_quantity)
             }
-            Self::BurnIntended { metadata, sendable_tx, .. } => {
-                (metadata, sendable_tx.hash.into())
-            }
+            Self::BurnIntended {
+                sendable_tx, metadata, dust_quantity, ..
+            } => (sendable_tx.hash.into(), metadata, dust_quantity),
             _ => {
                 return Err(RedemptionError::InvalidState {
                     expected: "BurnSubmitted or BurnIntended".to_string(),
@@ -604,25 +687,50 @@ impl Redemption {
             });
         }
 
-        let vault_service = services.vault_for(metadata.network)?;
+        let map_confirm_error = |error: VaultError| {
+            if is_pending_burn_confirmation(&error) {
+                return RedemptionError::BurnConfirmationPending {
+                    tx_id: tx_id.clone(),
+                    message: error.to_string(),
+                };
+            }
 
-        let result = vault_service
+            vault_error_to_redemption(&error)
+        };
+
+        if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
+            // `dust_shares` is vault-direct-shaped and always 0 here; dust
+            // is retained in the bot wallet and recorded from this
+            // redemption's own persisted `dust_quantity` (SPEC Decision 6).
+            let result = services
+                .vault_for(metadata.network)?
+                .confirm_orchestrator_burn(&tx_id)
+                .await
+                .map_err(map_confirm_error)?;
+
+            let dust_retained = dust_quantity
+                .to_u256_with_18_decimals()
+                .map_err(|error| RedemptionError::QuantityConversion {
+                    message: error.to_string(),
+                })?;
+
+            return Ok(vec![RedemptionEvent::OrchestratorTokensBurned {
+                issuer_request_id,
+                tx_hash: result.tx_hash,
+                shares_burned: result.shares_burned,
+                burn_range: result.burn_range,
+                dust_retained,
+                gas_used: result.gas_used,
+                block_number: result.block_number,
+                burned_at: Utc::now(),
+            }]);
+        }
+
+        let result = services
+            .vault_for(metadata.network)?
             .confirm_burn(&tx_id, dust_shares)
             .await
-            .map_err(|error| {
-                if is_pending_burn_confirmation(&error) {
-                    return RedemptionError::BurnConfirmationPending {
-                        tx_id: tx_id.clone(),
-                        message: error.to_string(),
-                    };
-                }
-
-                RedemptionError::Vault {
-                    release_reservation: should_release_reserved_burn(&error),
-                    tx_id: extract_tx_hash(&error).map(Into::into),
-                    message: error.to_string(),
-                }
-            })?;
+            .map_err(map_confirm_error)?;
 
         let burns = result
             .burns
@@ -1040,41 +1148,91 @@ impl Redemption {
             });
         };
 
-        let user_wallet = metadata.wallet;
-        let vault_service = services.vault_for(metadata.network)?;
+        match input.params {
+            BurnParams::VaultDirect { vault, burns, dust_shares, owner } => {
+                if let VaultMode::Orchestrator { .. } = metadata.burn_mode {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: "Orchestrator".to_string(),
+                        found: "VaultDirect".to_string(),
+                    });
+                }
 
-        let planned_burns: Vec<BurnRecord> = input
-            .burns
-            .iter()
-            .map(|entry| BurnRecord {
-                receipt_id: entry.receipt_id,
-                shares_burned: entry.burn_shares,
-            })
-            .collect();
+                let planned_burns: Vec<BurnRecord> = burns
+                    .iter()
+                    .map(|entry| BurnRecord {
+                        receipt_id: entry.receipt_id,
+                        shares_burned: entry.burn_shares,
+                    })
+                    .collect();
 
-        let params = MultiBurnParams {
-            vault: input.vault,
-            burns: input.burns,
-            dust_shares: input.dust_shares,
-            owner: input.owner,
-            user: user_wallet,
-            origin: BurnRequestOrigin::Redemption(issuer_request_id.clone()),
-            detected_tx_hash: metadata.detected_tx_hash,
-            external_tx_id: input.external_tx_id,
-        };
+                let params = MultiBurnParams {
+                    vault,
+                    burns,
+                    dust_shares,
+                    owner,
+                    user: metadata.wallet,
+                    origin: BurnRequestOrigin::Redemption(
+                        issuer_request_id.clone(),
+                    ),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: input.external_tx_id,
+                };
 
-        let sendable_tx =
-            vault_service.prepare_burn_tx(&params).await.map_err(
-                |error: VaultError| RedemptionError::PreparingBurnTxFailed {
-                    message: error.to_string(),
-                },
-            )?;
+                let sendable_tx = services
+                    .vault_for(metadata.network)?
+                    .prepare_burn_tx(&params)
+                    .await
+                    .map_err(|error: VaultError| {
+                        RedemptionError::PreparingBurnTxFailed {
+                            message: error.to_string(),
+                        }
+                    })?;
 
-        Ok(vec![RedemptionEvent::BurnIntended {
-            issuer_request_id,
-            sendable_tx,
-            planned_burns,
-        }])
+                Ok(vec![RedemptionEvent::BurnIntended {
+                    issuer_request_id,
+                    sendable_tx,
+                    planned_burns,
+                }])
+            }
+            BurnParams::Orchestrator { token, amount, owner } => {
+                let VaultMode::Orchestrator { address: orchestrator } =
+                    metadata.burn_mode
+                else {
+                    return Err(RedemptionError::BurnModeMismatch {
+                        expected: "VaultDirect".to_string(),
+                        found: "Orchestrator".to_string(),
+                    });
+                };
+
+                let params = OrchestratorBurnParams {
+                    orchestrator,
+                    token,
+                    amount,
+                    owner,
+                    issuer_request_id: issuer_request_id.clone(),
+                    detected_tx_hash: metadata.detected_tx_hash,
+                    external_tx_id: input.external_tx_id,
+                };
+
+                let sendable_tx = services
+                    .vault_for(metadata.network)?
+                    .prepare_orchestrator_burn_tx(&params)
+                    .await
+                    .map_err(|error: VaultError| {
+                        RedemptionError::PreparingBurnTxFailed {
+                            message: error.to_string(),
+                        }
+                    })?;
+
+                // No per-receipt plan: the orchestrator walks its own
+                // receipts on-chain.
+                Ok(vec![RedemptionEvent::BurnIntended {
+                    issuer_request_id,
+                    sendable_tx,
+                    planned_burns: vec![],
+                }])
+            }
+        }
     }
 
     const fn current_sendable_tx(&self) -> Option<&SendableTxWithHash> {
@@ -1342,12 +1500,14 @@ pub(crate) fn next_burn_retry_external_tx_id_from_history<'a>(
                 external_tx_id: Some(external_tx_id),
                 ..
             } => Some(Ok(external_tx_id.clone())),
-            RedemptionEvent::BurnTxSubmitted { external_tx_id, .. } => {
-                Some(Redemption::next_burn_retry_external_tx_id(
-                    detected_tx_hash,
-                    external_tx_id,
-                ))
-            }
+            RedemptionEvent::BurnTxSubmitted { external_tx_id, .. }
+            | RedemptionEvent::OrchestratorBurnSubmitted {
+                external_tx_id,
+                ..
+            } => Some(Redemption::next_burn_retry_external_tx_id(
+                detected_tx_hash,
+                external_tx_id,
+            )),
             _ => None,
         })
         .transpose()
@@ -1375,7 +1535,19 @@ pub(crate) enum RedemptionError {
         /// Transaction id pulled from the `VaultError`, if any, so a
         /// possibly-in-flight burn stays recoverable after the type is erased.
         tx_id: Option<TxId>,
+        /// Typed burn-failure classification derived from the `VaultError`
+        /// at the same boundary, so retry-exclusion and `BurningFailed`
+        /// recording key off it rather than parsing `message`.
+        #[serde(default)]
+        classification: BurnFailureClassification,
     },
+    #[error(
+        "Burn params mode does not match this redemption's persisted \
+         burn_mode anchor: expected {expected}, found {found}"
+    )]
+    BurnModeMismatch { expected: String, found: String },
+    #[error("Quantity conversion failed: {message}")]
+    QuantityConversion { message: String },
     #[error(
         "Transaction ID mismatch. Expected: {expected}, provided: {provided}"
     )]
@@ -1653,22 +1825,13 @@ impl EventSourced for Redemption {
             }
             RedemptionCommand::BurnTokens {
                 issuer_request_id,
-                vault,
-                burns,
-                dust_shares,
-                owner,
+                params,
                 external_tx_id,
             } => {
                 self.handle_burn_tokens(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                        external_tx_id,
-                    },
+                    BurnInput { params, external_tx_id },
                 )
                 .await
             }
@@ -1757,22 +1920,13 @@ impl EventSourced for Redemption {
             }),
             RedemptionCommand::IntendBurn {
                 issuer_request_id,
-                vault,
-                burns,
-                dust_shares,
-                owner,
+                params,
                 external_tx_id,
             } => {
                 self.handle_intend_burn(
                     services,
                     issuer_request_id,
-                    BurnInput {
-                        vault,
-                        burns,
-                        dust_shares,
-                        owner,
-                        external_tx_id,
-                    },
+                    BurnInput { params, external_tx_id },
                 )
                 .await
             }
@@ -1859,10 +2013,14 @@ impl Redemption {
             RedemptionEvent::BurnTxSubmitted { .. } => {
                 self.apply_burn_submitted_event(event);
             }
+            RedemptionEvent::OrchestratorBurnSubmitted { .. } => {
+                self.apply_orchestrator_burn_submitted_event(event);
+            }
             RedemptionEvent::BurnResumed { .. } => {
                 self.apply_burn_resumed_event(event);
             }
             RedemptionEvent::TokensBurned(_)
+            | RedemptionEvent::OrchestratorTokensBurned { .. }
             | RedemptionEvent::ExistingBurnRecovered { .. }
             | RedemptionEvent::RedemptionClosed { .. }
             | RedemptionEvent::BurnForceCompleted { .. } => {
@@ -2007,6 +2165,60 @@ impl Redemption {
         };
     }
 
+    /// Mirrors `apply_burn_submitted_event` for the orchestrator-mode
+    /// submission event, which carries no per-receipt plan.
+    fn apply_orchestrator_burn_submitted_event(
+        &mut self,
+        event: RedemptionEvent,
+    ) {
+        let RedemptionEvent::OrchestratorBurnSubmitted {
+            external_tx_id,
+            tx_id,
+            ..
+        } = event
+        else {
+            return;
+        };
+
+        let (Self::Burning {
+            metadata,
+            tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
+            called_at,
+            alpaca_journal_completed_at,
+            ..
+        }
+        | Self::BurnIntended {
+            metadata,
+            tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
+            called_at,
+            alpaca_journal_completed_at,
+            ..
+        }) = self.clone()
+        else {
+            return;
+        };
+
+        let sendable_tx =
+            self.current_sendable_tx().cloned().unwrap_or_default();
+
+        *self = Self::BurnSubmitted {
+            metadata,
+            tokenization_request_id,
+            alpaca_quantity,
+            dust_quantity,
+            called_at,
+            alpaca_journal_completed_at,
+            external_tx_id,
+            tx_id,
+            planned_burns: vec![],
+            sendable_tx,
+        };
+    }
+
     fn apply_burn_resumed_event(&mut self, event: RedemptionEvent) {
         let prior_burn_tx = match self {
             Self::Failed { unresolved_burn_tx, .. } => {
@@ -2067,7 +2279,13 @@ impl Redemption {
                 tx_hash,
                 burned_at,
                 ..
-            }) => {
+            })
+            | RedemptionEvent::OrchestratorTokensBurned {
+                issuer_request_id,
+                tx_hash,
+                burned_at,
+                ..
+            } => {
                 *self = Self::Completed {
                     issuer_request_id,
                     burn_tx_hash: tx_hash,
@@ -2222,21 +2440,22 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BurnExternalTxId, BurnRecord, BurnRecoveryAction,
-        IssuerRedemptionRequestId, Redemption, RedemptionCommand,
-        RedemptionError, RedemptionEvent, RedemptionMetadata,
-        RedemptionServices, TokensBurnedData, has_unresolved_signer_intent,
+        BurnExternalTxId, BurnFailureClassification, BurnParams, BurnRecord,
+        BurnRecoveryAction, IssuerRedemptionRequestId, Redemption,
+        RedemptionCommand, RedemptionError, RedemptionEvent,
+        RedemptionMetadata, RedemptionServices, TokensBurnedData,
+        has_unresolved_signer_intent,
         next_burn_retry_external_tx_id_from_history,
     };
     use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::prepare_event_sourced_startup;
-    use crate::redemption::BurnFailureClassification;
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, SendableTxWithHash, TxId, VaultService,
+        BurnTxStatus, MultiBurnEntry, OrchestratorRevertReason,
+        SendableTxWithHash, TxId, VaultService,
     };
 
     fn mock_services() -> RedemptionServices {
@@ -3455,15 +3674,17 @@ mod tests {
             ])
             .when(RedemptionCommand::IntendBurn {
                 issuer_request_id: issuer_request_id.clone(),
-                vault,
-                burns: vec![MultiBurnEntry {
-                    receipt_id,
-                    burn_shares,
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner,
+                params: BurnParams::VaultDirect {
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id,
+                        burn_shares,
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner,
+                },
                 external_tx_id: None,
             })
             .await
@@ -3509,15 +3730,17 @@ mod tests {
             }])
             .when(RedemptionCommand::IntendBurn {
                 issuer_request_id,
-                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                burns: vec![MultiBurnEntry {
-                    receipt_id: uint!(1_U256),
-                    burn_shares: uint!(25_000000000000000000_U256),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner: address!("0x1111111111111111111111111111111111111111"),
+                params: BurnParams::VaultDirect {
+                    vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(1_U256),
+                        burn_shares: uint!(25_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: address!("0x1111111111111111111111111111111111111111"),
+                },
                 external_tx_id: None,
             })
             .await
@@ -3957,15 +4180,17 @@ mod tests {
             ])
             .when(RedemptionCommand::BurnTokens {
                 issuer_request_id: issuer_request_id.clone(),
-                vault,
-                burns: vec![MultiBurnEntry {
-                    receipt_id,
-                    burn_shares,
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner,
+                params: BurnParams::VaultDirect {
+                    vault,
+                    burns: vec![MultiBurnEntry {
+                        receipt_id,
+                        burn_shares,
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner,
+                },
                 external_tx_id: None,
             })
             .await
@@ -4011,15 +4236,17 @@ mod tests {
             }])
             .when(RedemptionCommand::BurnTokens {
                 issuer_request_id,
-                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                burns: vec![MultiBurnEntry {
-                    receipt_id: uint!(1_U256),
-                    burn_shares: uint!(25_000000000000000000_U256),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner: address!("0x1111111111111111111111111111111111111111"),
+                params: BurnParams::VaultDirect {
+                    vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(1_U256),
+                        burn_shares: uint!(25_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: address!("0x1111111111111111111111111111111111111111"),
+                },
                 external_tx_id: None,
             })
             .await
@@ -4082,15 +4309,21 @@ mod tests {
             ))
             .when(RedemptionCommand::IntendBurn {
                 issuer_request_id,
-                vault: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                burns: vec![MultiBurnEntry {
-                    receipt_id: uint!(1_U256),
-                    burn_shares: uint!(17_000000000000000000_U256),
-                    receipt_info: None,
-                    receipt_info_bytes: None,
-                }],
-                dust_shares: U256::ZERO,
-                owner: address!("0x1111111111111111111111111111111111111111"),
+                params: BurnParams::VaultDirect {
+                    vault: address!(
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    burns: vec![MultiBurnEntry {
+                        receipt_id: uint!(1_U256),
+                        burn_shares: uint!(17_000000000000000000_U256),
+                        receipt_info: None,
+                        receipt_info_bytes: None,
+                    }],
+                    dust_shares: U256::ZERO,
+                    owner: address!(
+                        "0x1111111111111111111111111111111111111111"
+                    ),
+                },
                 external_tx_id: None,
             })
             .await
@@ -4294,6 +4527,433 @@ mod tests {
             planned_burns: vec![],
         });
         events
+    }
+
+    /// Orchestrator-anchored lifecycle up to `Burning`, with a non-zero dust
+    /// quantity so `dust_retained` derivation is observable.
+    fn orchestrator_burning_given_events(
+        issuer_request_id: &IssuerRedemptionRequestId,
+    ) -> Vec<RedemptionEvent> {
+        vec![
+            RedemptionEvent::Detected {
+                burn_mode: orchestrator_mode(),
+                issuer_request_id: issuer_request_id.clone(),
+                underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+                token: TokenSymbol::new("tRKLB"),
+                wallet: address!("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+                quantity: Quantity::new(Decimal::from(17)),
+                tx_hash: b256!(
+                    "0x4444444444444444444444444444444444444444444444444444444444444444"
+                ),
+                block_number: 45_000_000,
+                detected_at: Utc::now(),
+                network: Network::Base,
+            },
+            RedemptionEvent::AlpacaCalled {
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: TokenizationRequestId::new(
+                    "alp-rklb-799",
+                ),
+                alpaca_quantity: Quantity::new(Decimal::from(17)),
+                // 10⁻⁹ tokens of dust, retained in the bot wallet.
+                dust_quantity: Quantity::new(Decimal::new(1, 9)),
+                called_at: Utc::now(),
+            },
+            RedemptionEvent::AlpacaJournalCompleted {
+                issuer_request_id: issuer_request_id.clone(),
+                alpaca_journal_completed_at: Utc::now(),
+            },
+        ]
+    }
+
+    fn orchestrator_burn_intended_given_events(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_hash: B256,
+    ) -> Vec<RedemptionEvent> {
+        let mut events = orchestrator_burning_given_events(issuer_request_id);
+        events.push(RedemptionEvent::BurnIntended {
+            issuer_request_id: issuer_request_id.clone(),
+            sendable_tx: SendableTxWithHash {
+                tx: vec![1, 2, 3],
+                hash: tx_hash,
+                nonce: 7,
+                signed_at: Utc::now(),
+                dust_shares: U256::ZERO,
+            },
+            planned_burns: vec![],
+        });
+        events
+    }
+
+    fn orchestrator_burn_submitted_given_events(
+        issuer_request_id: &IssuerRedemptionRequestId,
+        tx_hash: B256,
+    ) -> Vec<RedemptionEvent> {
+        let mut events =
+            orchestrator_burn_intended_given_events(issuer_request_id, tx_hash);
+        events.push(RedemptionEvent::OrchestratorBurnSubmitted {
+            issuer_request_id: issuer_request_id.clone(),
+            external_tx_id: BurnExternalTxId::base(&b256!(
+                "0x4444444444444444444444444444444444444444444444444444444444444444"
+            )),
+            tx_id: TxId::Hash(tx_hash),
+            submitted_at: Utc::now(),
+        });
+        events
+    }
+
+    fn orchestrator_burn_params() -> BurnParams {
+        BurnParams::Orchestrator {
+            token: address!("0x1111111111111111111111111111111111111111"),
+            amount: uint!(17_000000000000000000_U256),
+            owner: address!("0x2222222222222222222222222222222222222222"),
+        }
+    }
+
+    fn vault_direct_burn_params() -> BurnParams {
+        BurnParams::VaultDirect {
+            vault: address!("0x1111111111111111111111111111111111111111"),
+            burns: vec![],
+            dust_shares: U256::ZERO,
+            owner: address!("0x2222222222222222222222222222222222222222"),
+        }
+    }
+
+    #[tokio::test]
+    async fn intend_burn_orchestrator_mode_persists_empty_plan() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(orchestrator_burning_given_events(&issuer_request_id))
+            .when(RedemptionCommand::IntendBurn {
+                issuer_request_id,
+                params: orchestrator_burn_params(),
+                external_tx_id: None,
+            })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RedemptionEvent::BurnIntended { planned_burns, .. }]
+                    if planned_burns.is_empty()
+            ),
+            "orchestrator intent must persist an empty receipt plan, \
+             got {events:?}"
+        );
+    }
+
+    /// The persisted `burn_mode` anchor is authoritative: params of the other
+    /// mode are rejected in both directions, for both `IntendBurn` and
+    /// `BurnTokens`.
+    #[tokio::test]
+    async fn burn_commands_reject_mode_mismatched_params() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let intend_cases = [
+            (
+                orchestrator_burning_given_events(&issuer_request_id),
+                vault_direct_burn_params(),
+            ),
+            (
+                burning_given_events(&issuer_request_id),
+                orchestrator_burn_params(),
+            ),
+        ];
+        for (given, params) in intend_cases {
+            let error = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(RedemptionCommand::IntendBurn {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params,
+                    external_tx_id: None,
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        RedemptionError::BurnModeMismatch { .. }
+                    )
+                ),
+                "expected BurnModeMismatch, got {error:?}"
+            );
+        }
+
+        let submit_cases = [
+            (
+                orchestrator_burn_intended_given_events(
+                    &issuer_request_id,
+                    tx_hash,
+                ),
+                vault_direct_burn_params(),
+            ),
+            (
+                burn_intended_given_events(&issuer_request_id, tx_hash),
+                orchestrator_burn_params(),
+            ),
+        ];
+        for (given, params) in submit_cases {
+            let error = TestHarness::<Redemption>::with(mock_services())
+                .given(given)
+                .when(RedemptionCommand::BurnTokens {
+                    issuer_request_id: issuer_request_id.clone(),
+                    params,
+                    external_tx_id: None,
+                })
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    &error,
+                    LifecycleError::Apply(
+                        RedemptionError::BurnModeMismatch { .. }
+                    )
+                ),
+                "expected BurnModeMismatch, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn burn_tokens_orchestrator_mode_emits_orchestrator_submitted() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let detected_tx_hash = b256!(
+            "0x4444444444444444444444444444444444444444444444444444444444444444"
+        );
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(orchestrator_burn_intended_given_events(
+                &issuer_request_id,
+                tx_hash,
+            ))
+            .when(RedemptionCommand::BurnTokens {
+                issuer_request_id,
+                params: orchestrator_burn_params(),
+                external_tx_id: None,
+            })
+            .await
+            .events();
+
+        let [
+            RedemptionEvent::OrchestratorBurnSubmitted {
+                external_tx_id,
+                tx_id,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected OrchestratorBurnSubmitted, got {events:?}");
+        };
+        assert_eq!(
+            *external_tx_id,
+            BurnExternalTxId::base(&detected_tx_hash),
+            "externalTxId must derive from the detected transfer hash"
+        );
+        assert_eq!(*tx_id, TxId::Hash(tx_hash));
+    }
+
+    /// `ConfirmBurn` in orchestrator mode ignores the vault-direct-shaped
+    /// `dust_shares` input and derives `dust_retained` from this redemption's
+    /// own persisted `AlpacaCalled.dust_quantity` (SPEC Decision 6).
+    #[tokio::test]
+    async fn confirm_burn_orchestrator_mode_derives_dust_retained_from_state() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let bogus_dust_shares = uint!(777_U256);
+
+        let events = TestHarness::<Redemption>::with(mock_services())
+            .given(orchestrator_burn_submitted_given_events(
+                &issuer_request_id,
+                tx_hash,
+            ))
+            .when(RedemptionCommand::ConfirmBurn {
+                issuer_request_id,
+                tx_id: TxId::Hash(tx_hash),
+                dust_shares: bogus_dust_shares,
+            })
+            .await
+            .events();
+
+        let [
+            RedemptionEvent::OrchestratorTokensBurned {
+                dust_retained,
+                shares_burned,
+                burn_range,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected OrchestratorTokensBurned, got {events:?}");
+        };
+        // 10⁻⁹ tokens of persisted dust_quantity in 18-decimal share-wei.
+        assert_eq!(*dust_retained, uint!(1_000_000_000_U256));
+        assert_ne!(
+            *dust_retained, bogus_dust_shares,
+            "dust must not come from the command input"
+        );
+        assert!(*shares_burned > U256::ZERO);
+        assert!(burn_range.1 > burn_range.0);
+    }
+
+    #[tokio::test]
+    async fn confirm_burn_orchestrator_revert_carries_classification() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+        let vault: Arc<dyn VaultService> = Arc::new(
+            MockVaultService::new_success().with_orchestrator_confirm_revert(
+                OrchestratorRevertReason::InsufficientReceipts {
+                    token: address!(
+                        "0x1111111111111111111111111111111111111111"
+                    ),
+                    shortfall: uint!(250_U256),
+                },
+            ),
+        );
+        let services =
+            RedemptionServices::with_single_vault(Network::Base, vault);
+
+        let error = TestHarness::<Redemption>::with(services)
+            .given(orchestrator_burn_submitted_given_events(
+                &issuer_request_id,
+                tx_hash,
+            ))
+            .when(RedemptionCommand::ConfirmBurn {
+                issuer_request_id,
+                tx_id: TxId::Hash(tx_hash),
+                dust_shares: U256::ZERO,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                &error,
+                LifecycleError::Apply(RedemptionError::Vault {
+                    classification:
+                        BurnFailureClassification::InsufficientReceipts {
+                            shortfall,
+                        },
+                    tx_id: Some(_),
+                    ..
+                }) if *shortfall == uint!(250_U256)
+            ),
+            "expected classified InsufficientReceipts carrying the reverted \
+             tx hash, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_events_replay_to_expected_states() {
+        let issuer_request_id = IssuerRedemptionRequestId::random();
+        let tx_hash = B256::random();
+
+        let submitted =
+            replay::<Redemption>(orchestrator_burn_submitted_given_events(
+                &issuer_request_id,
+                tx_hash,
+            ))
+            .unwrap()
+            .unwrap();
+        let Redemption::BurnSubmitted { metadata, planned_burns, .. } =
+            &submitted
+        else {
+            panic!("Expected BurnSubmitted, got {submitted:?}");
+        };
+        assert_eq!(metadata.burn_mode, orchestrator_mode());
+        assert!(planned_burns.is_empty());
+
+        let mut events = orchestrator_burn_submitted_given_events(
+            &issuer_request_id,
+            tx_hash,
+        );
+        events.push(RedemptionEvent::OrchestratorTokensBurned {
+            issuer_request_id,
+            tx_hash,
+            shares_burned: uint!(17_000000000000000000_U256),
+            burn_range: (uint!(3_U256), uint!(6_U256)),
+            dust_retained: uint!(1_000_000_000_U256),
+            gas_used: 50_000,
+            block_number: 45_000_100,
+            burned_at: Utc::now(),
+        });
+        let completed = replay::<Redemption>(events).unwrap().unwrap();
+        assert!(
+            matches!(
+                &completed,
+                Redemption::Completed { burn_tx_hash, .. }
+                    if *burn_tx_hash == tx_hash
+            ),
+            "expected Completed, got {completed:?}"
+        );
+    }
+
+    /// An `OrchestratorBurnSubmitted` following a `BurnIntended` resolves the
+    /// wallet-intent gate the same way `BurnTxSubmitted` does: it falls
+    /// outside the release trigger's exclusion list, so the signer
+    /// reservation is dropped on submission.
+    #[tokio::test]
+    async fn orchestrator_submission_resolves_wallet_intent_gate() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should run");
+        let aggregate_id = IssuerRedemptionRequestId::random().to_string();
+
+        for (sequence, event_type, payload) in [
+            (
+                1,
+                "RedemptionEvent::Detected",
+                r#"{"Detected":{"network":"base"}}"#,
+            ),
+            (2, "RedemptionEvent::BurnIntended", "{}"),
+        ] {
+            insert_redemption_event(
+                &pool,
+                &aggregate_id,
+                sequence,
+                event_type,
+                payload,
+            )
+            .await
+            .expect("test event should insert");
+        }
+
+        assert!(
+            has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "an intended orchestrator burn must hold the gate before \
+             submission"
+        );
+
+        insert_redemption_event(
+            &pool,
+            &aggregate_id,
+            3,
+            "RedemptionEvent::OrchestratorBurnSubmitted",
+            "{}",
+        )
+        .await
+        .expect("the submission event should insert");
+
+        assert!(
+            !has_unresolved_signer_intent(&pool, Network::Base, None)
+                .await
+                .expect("intent query should succeed"),
+            "orchestrator submission must resolve the wallet-intent gate"
+        );
     }
 
     #[test]

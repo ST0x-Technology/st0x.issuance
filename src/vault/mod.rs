@@ -233,7 +233,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// Builds and signs the `ST0xOrchestrator.burn()` transaction without
     /// broadcasting it. The returned bytes must be persisted (via
     /// `BurnIntended`) before [`VaultService::submit_orchestrator_burn`].
-    #[allow(dead_code)]
     async fn prepare_orchestrator_burn_tx(
         &self,
         _params: &OrchestratorBurnParams,
@@ -244,7 +243,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// Broadcasts the exact signed orchestrator burn persisted before this
     /// call. Repeated calls must rebroadcast the same bytes rather than sign
     /// a replacement.
-    #[allow(dead_code)]
     async fn submit_orchestrator_burn(
         &self,
         _params: &OrchestratorBurnParams,
@@ -257,7 +255,6 @@ pub(crate) trait VaultService: Send + Sync {
     /// orchestrator's `Burned` event. A mined-but-reverted burn fails with
     /// [`VaultError::OrchestratorReverted`] carrying the decoded typed
     /// reason.
-    #[allow(dead_code)]
     async fn confirm_orchestrator_burn(
         &self,
         _tx_id: &TxId,
