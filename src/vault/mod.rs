@@ -26,8 +26,13 @@ use crate::mint::{
 use crate::redemption::{BurnExternalTxId, IssuerRedemptionRequestId};
 
 pub(crate) mod mock;
+pub(crate) mod network_services;
 pub(crate) mod rain_meta;
 pub(crate) mod service;
+
+pub(crate) use network_services::{
+    NetworkVault, NetworkVaultServices, UnconfiguredNetworkError,
+};
 
 /// Service abstraction for vault operations.
 ///

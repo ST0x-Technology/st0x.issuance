@@ -2,7 +2,6 @@ use alloy::primitives::{Address, B256, U256};
 use cqrs_es::AggregateError;
 use event_sorcery::{LifecycleError, Store};
 use sqlx::{Pool, Sqlite};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -27,8 +26,9 @@ use crate::redemption::{
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
 use crate::vault::{
-    BurnTxStatus, BurnVerification, MultiBurnEntry, SendableTxWithHash, TxId,
-    VaultError, VaultService,
+    BurnTxStatus, BurnVerification, MultiBurnEntry, NetworkVaultServices,
+    SendableTxWithHash, TxId, UnconfiguredNetworkError, VaultError,
+    VaultService,
 };
 
 pub(crate) const MAX_AUTOMATIC_BURN_RECOVERY_ATTEMPTS: u32 = 5;
@@ -69,10 +69,8 @@ pub(crate) enum RecoveryOutcome {
 /// On burn failure, the manager issues a `RecordBurnFailure` command to record the error.
 #[derive(Clone)]
 pub(crate) struct BurnManager {
-    /// Per-network vault services for balance queries and Fireblocks recovery.
-    vault_services: HashMap<Network, Arc<dyn VaultService>>,
-    /// Per-network EVM chain ids for receipt inventory aggregate keys.
-    chain_ids: HashMap<Network, u64>,
+    /// Per-network vault services and chain ids for recovery paths.
+    vaults: NetworkVaultServices,
     view_pool: Pool<Sqlite>,
     store: Arc<Store<Redemption>>,
     receipt_service: Arc<dyn ReceiptService>,
@@ -85,24 +83,21 @@ impl BurnManager {
     ///
     /// # Arguments
     ///
-    /// * `vault_services` - Per-network vault services for recovery paths
+    /// * `vaults` - Per-network vault services and chain ids for recovery paths
     /// * `view_pool` - Database pool for querying views
     /// * `store` - Event-sorcery store for dispatching commands and loading
     ///   aggregate state during recovery
     /// * `receipt_service` - Service for finding receipts to burn
     /// * `bot_wallet` - Bot's wallet address that owns both shares and receipts
-    /// * `chain_ids` - Per-network EVM chain ids for receipt inventory keys
     pub(crate) fn new(
-        vault_services: HashMap<Network, Arc<dyn VaultService>>,
-        chain_ids: HashMap<Network, u64>,
+        vaults: NetworkVaultServices,
         view_pool: Pool<Sqlite>,
         store: Arc<Store<Redemption>>,
         receipt_service: Arc<dyn ReceiptService>,
         bot_wallet: Address,
     ) -> Self {
         Self {
-            vault_services,
-            chain_ids,
+            vaults,
             view_pool,
             store,
             receipt_service,
@@ -114,17 +109,15 @@ impl BurnManager {
     fn vault_for(
         &self,
         network: Network,
-    ) -> Result<&Arc<dyn VaultService>, RedemptionError> {
-        self.vault_services
-            .get(&network)
-            .ok_or(RedemptionError::NetworkNotConfigured { network })
+    ) -> Result<&Arc<dyn VaultService>, UnconfiguredNetworkError> {
+        self.vaults.service(network)
     }
 
-    fn chain_id_for(&self, network: Network) -> Result<u64, RedemptionError> {
-        self.chain_ids
-            .get(&network)
-            .copied()
-            .ok_or(RedemptionError::NetworkNotConfigured { network })
+    fn chain_id_for(
+        &self,
+        network: Network,
+    ) -> Result<u64, UnconfiguredNetworkError> {
+        self.vaults.chain_id(network)
     }
 
     /// Terminalizes a redemption whose network has no configured vault
@@ -171,8 +164,11 @@ impl BurnManager {
         receipt_chain_id: u64,
     ) -> Self {
         Self {
-            vault_services: HashMap::from([(Network::Base, vault_service)]),
-            chain_ids: HashMap::from([(Network::Base, receipt_chain_id)]),
+            vaults: NetworkVaultServices::with_single_vault(
+                Network::Base,
+                receipt_chain_id,
+                vault_service,
+            ),
             view_pool,
             store,
             receipt_service,
@@ -1163,7 +1159,7 @@ impl BurnManager {
                 // verified burn tx) for landed burns, or `close` for ambiguous cases.
                 let vault_service = match self.vault_for(metadata.network) {
                     Ok(vault_service) => vault_service,
-                    Err(RedemptionError::NetworkNotConfigured { network }) => {
+                    Err(UnconfiguredNetworkError { network }) => {
                         return self
                             .record_burn_failure_for_unconfigured_network(
                                 issuer_request_id,
@@ -1174,7 +1170,6 @@ impl BurnManager {
                             .await
                             .map(|()| RecoveryOutcome::Executed);
                     }
-                    Err(err) => return Err(err.into()),
                 };
 
                 let on_chain_balance = vault_service
@@ -2201,6 +2196,8 @@ pub(crate) enum BurnManagerError {
     Cqrs(#[from] AggregateError<LifecycleError<Redemption>>),
     #[error("Redemption error: {0}")]
     Redemption(#[from] RedemptionError),
+    #[error(transparent)]
+    UnconfiguredNetwork(#[from] UnconfiguredNetworkError),
     #[error("Invalid aggregate state: {current_state}")]
     InvalidAggregateState { current_state: String },
     #[error("Quantity conversion error: {0}")]
@@ -2233,7 +2230,6 @@ mod tests {
     use event_sorcery::{Store, StoreBuilder, test_store};
     use rust_decimal::Decimal;
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tracing_test::traced_test;
 
@@ -2265,8 +2261,8 @@ mod tests {
     };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
-        BurnTxStatus, MultiBurnEntry, ReceiptInformation, SendableTxWithHash,
-        TxId, VaultError, VaultService,
+        BurnTxStatus, MultiBurnEntry, NetworkVaultServices, ReceiptInformation,
+        SendableTxWithHash, TxId, VaultError, VaultService,
     };
 
     const TEST_WALLET: Address =
@@ -6354,8 +6350,11 @@ mod tests {
         let blockchain_service: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let manager = BurnManager::new(
-            HashMap::from([(Network::Base, blockchain_service)]),
-            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
+            NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                blockchain_service,
+            ),
             harness.pool.clone(),
             harness.store.clone(),
             harness.receipt_service.clone(),
@@ -6408,8 +6407,11 @@ mod tests {
         let recovery_blockchain: Arc<dyn crate::vault::VaultService> =
             vault_mock.clone();
         let failing_manager = BurnManager::new(
-            HashMap::from([(Network::Base, recovery_blockchain)]),
-            HashMap::from([(Network::Base, ANVIL_CHAIN_ID)]),
+            NetworkVaultServices::with_single_vault(
+                Network::Base,
+                ANVIL_CHAIN_ID,
+                recovery_blockchain,
+            ),
             harness.pool.clone(),
             harness.store.clone(),
             settle_failing,

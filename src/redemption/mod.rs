@@ -17,7 +17,6 @@ use chrono::{DateTime, Utc};
 use event_sorcery::{EventSourced, Nil};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -188,8 +187,9 @@ impl std::fmt::Display for BurnExternalTxId {
 }
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{
-    BurnTxStatus, MultiBurnEntry, MultiBurnParams, SendableTxWithHash, TxId,
-    VaultError, VaultService,
+    BurnTxStatus, MultiBurnEntry, MultiBurnParams, NetworkVaultServices,
+    SendableTxWithHash, TxId, UnconfiguredNetworkError, VaultError,
+    VaultService,
 };
 
 pub(super) const fn default_redemption_network() -> Network {
@@ -198,11 +198,11 @@ pub(super) const fn default_redemption_network() -> Network {
 
 /// Per-network vault services for redemption command handling ([RAI-1207]).
 pub(crate) struct RedemptionServices {
-    vaults: HashMap<Network, Arc<dyn VaultService>>,
+    vaults: NetworkVaultServices,
 }
 
 impl RedemptionServices {
-    pub(crate) fn new(vaults: HashMap<Network, Arc<dyn VaultService>>) -> Self {
+    pub(crate) const fn new(vaults: NetworkVaultServices) -> Self {
         Self { vaults }
     }
 
@@ -211,16 +211,18 @@ impl RedemptionServices {
         network: Network,
         vault: Arc<dyn VaultService>,
     ) -> Self {
-        Self { vaults: HashMap::from([(network, vault)]) }
+        Self::new(NetworkVaultServices::with_single_vault(
+            network,
+            crate::test_utils::ANVIL_CHAIN_ID,
+            vault,
+        ))
     }
 
     fn vault_for(
         &self,
         network: Network,
     ) -> Result<&Arc<dyn VaultService>, RedemptionError> {
-        self.vaults
-            .get(&network)
-            .ok_or(RedemptionError::NetworkNotConfigured { network })
+        Ok(self.vaults.service(network)?)
     }
 }
 
@@ -1386,6 +1388,12 @@ pub(crate) enum RedemptionError {
     PreparingBurnTxFailed { message: String },
     #[error("network {network} is not configured")]
     NetworkNotConfigured { network: Network },
+}
+
+impl From<UnconfiguredNetworkError> for RedemptionError {
+    fn from(error: UnconfiguredNetworkError) -> Self {
+        Self::NetworkNotConfigured { network: error.network }
+    }
 }
 
 #[async_trait]

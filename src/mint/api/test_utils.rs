@@ -2,7 +2,6 @@ use alloy::primitives::{Address, B256, address};
 use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use event_sorcery::{Store, StoreBuilder, test_store};
 use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +10,6 @@ use url::Url;
 use crate::account::{
     Account, AccountCommand, AlpacaAccountNumber, ClientId, Email,
 };
-use crate::admin::NetworkVaultServices;
 use crate::alpaca::mock::MockAlpacaService;
 use crate::alpaca::service::AlpacaConfig;
 use crate::auth::test_auth_config;
@@ -20,15 +18,19 @@ use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
 use crate::test_utils::ANVIL_CHAIN_ID;
 use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
-use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
+use crate::vault::{NetworkVaultServices, VaultService};
 use crate::wallet::SignerConfig;
 
 /// Wraps a single-network mock vault the way production Rocket state does.
 pub(crate) fn network_vault_services(
     vault: Arc<dyn VaultService>,
 ) -> NetworkVaultServices {
-    NetworkVaultServices::new(HashMap::from([(Network::Base, vault)]))
+    NetworkVaultServices::with_single_vault(
+        Network::Base,
+        ANVIL_CHAIN_ID,
+        vault,
+    )
 }
 
 pub(crate) fn test_config() -> Config {
