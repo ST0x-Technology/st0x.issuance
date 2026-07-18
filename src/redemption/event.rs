@@ -6,9 +6,34 @@ use serde::{Deserialize, Serialize};
 use super::{
     BurnExternalTxId, IssuerRedemptionRequestId, default_redemption_network,
 };
+use crate::config::VaultMode;
 use crate::mint::{Quantity, TokenizationRequestId};
 use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
 use crate::vault::{SendableTxWithHash, TxId};
+
+/// Typed classification of an on-chain or pre-submit burn failure.
+///
+/// Retry-exclusion, log-level selection, and admin grouping key off this
+/// typed field, never off parsing the free-text `error` string. Historical
+/// `BurningFailed` events predate the field and replay as `Unclassified`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum BurnFailureClassification {
+    #[default]
+    Unclassified,
+    /// The orchestrator's per-token receipt walk cannot cover the requested
+    /// burn amount. Token-global anomaly; never auto-retried — recovery is a
+    /// manual `EMERGENCY_ROLE` action followed by admin `ResumeBurn`.
+    InsufficientReceipts { shortfall: U256 },
+    /// The bot-side pre-submit `allowance(bot, orchestrator) >= amount` check
+    /// failed. Never auto-retried — ops must grant the approval first.
+    AllowanceInsufficient,
+    /// The orchestrator reverted because the production vault beacon was
+    /// upgraded ahead of its expectations. Environmental halt, not a burn
+    /// defect; never advances retry counters.
+    VaultLogicMismatch,
+    /// Same halt condition as `VaultLogicMismatch`, for the receipt beacon.
+    ReceiptLogicMismatch,
+}
 
 /// A single burn operation within a multi-receipt burn.
 ///
@@ -115,6 +140,12 @@ pub(crate) enum RedemptionEvent {
         tx_hash: B256,
         block_number: u64,
         detected_at: DateTime<Utc>,
+        /// The asset's resolved `VaultMode` at detection time. Anchors every
+        /// later burn step's mode derivation — never re-resolved from live
+        /// config. Historical events predate orchestrator mode and replay as
+        /// `VaultDirect`.
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     AlpacaCalled {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -154,6 +185,10 @@ pub(crate) enum RedemptionEvent {
         /// Absent for pre-enrichment events.
         #[serde(default)]
         planned_burns: Vec<BurnRecord>,
+        /// Typed failure classification. Absent for pre-orchestrator events,
+        /// which replay as `Unclassified`.
+        #[serde(default)]
+        classification: BurnFailureClassification,
     },
     /// Redemption reset to Detected state for reprocessing.
     /// Carries the original metadata so apply() can reconstruct Detected.
@@ -170,6 +205,10 @@ pub(crate) enum RedemptionEvent {
         detected_at: DateTime<Utc>,
         previous_state: String,
         reprocessed_at: DateTime<Utc>,
+        /// Preserves the redemption's mode anchor across a reset to
+        /// `Detected`. Absent on pre-orchestrator events (`VaultDirect`).
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     /// Burn transaction submitted to the signing backend.
     /// Persists the backend transaction ID so polling can resume after a restart.
@@ -247,6 +286,10 @@ pub(crate) enum RedemptionEvent {
         #[serde(default)]
         external_tx_id: Option<BurnExternalTxId>,
         resumed_at: DateTime<Utc>,
+        /// Preserves the redemption's mode anchor across a resume to
+        /// `Burning`. Absent on pre-orchestrator events (`VaultDirect`).
+        #[serde(default)]
+        burn_mode: VaultMode,
     },
     BurnIntended {
         issuer_request_id: IssuerRedemptionRequestId,
@@ -487,6 +530,7 @@ mod tests {
     #[test]
     fn test_burning_failed_event_type() {
         let event = RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: test_redemption_id(),
             error: "Blockchain error: timeout".to_string(),
             failed_at: Utc::now(),
@@ -528,6 +572,7 @@ mod tests {
     #[test]
     fn test_burning_failed_serialization() {
         let event = RedemptionEvent::BurningFailed {
+            classification: BurnFailureClassification::Unclassified,
             issuer_request_id: test_redemption_id(),
             error: "Network timeout".to_string(),
             failed_at: Utc::now(),
@@ -558,13 +603,19 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::BurningFailed { tx_id, planned_burns, .. } = event
+        let RedemptionEvent::BurningFailed {
+            tx_id,
+            planned_burns,
+            classification,
+            ..
+        } = event
         else {
             panic!("Expected BurningFailed variant");
         };
 
         assert_eq!(tx_id, None);
         assert!(planned_burns.is_empty());
+        assert_eq!(classification, BurnFailureClassification::Unclassified);
     }
 
     /// Old BurningFailed events stored the transaction id under `fireblocks_tx_id`.
@@ -714,6 +765,90 @@ mod tests {
         assert_eq!(network, Network::Base);
     }
 
+    /// Historical `Detected` events predate orchestrator mode; an absent
+    /// `burn_mode` must replay as `VaultDirect`.
+    #[test]
+    fn detected_without_burn_mode_replays_as_vault_direct() {
+        let json = r#"{
+            "Detected": {
+                "issuer_request_id": "red-abcdef12",
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "quantity": "1",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "block_number": 1,
+                "detected_at": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::Detected { burn_mode, .. } = event else {
+            panic!("Expected Detected variant");
+        };
+
+        assert_eq!(burn_mode, VaultMode::VaultDirect);
+    }
+
+    /// Historical `Reprocessed` events predate orchestrator mode; an absent
+    /// `burn_mode` must replay as `VaultDirect`.
+    #[test]
+    fn reprocessed_without_burn_mode_replays_as_vault_direct() {
+        let json = r#"{
+            "Reprocessed": {
+                "issuer_request_id": "red-abcdef12",
+                "underlying": "AAPL",
+                "token": "tAAPL",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "quantity": "1",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "block_number": 1,
+                "detected_at": "2025-01-01T00:00:00Z",
+                "previous_state": "Failed",
+                "reprocessed_at": "2025-01-02T00:00:00Z"
+            }
+        }"#;
+
+        let event: RedemptionEvent = serde_json::from_str(json).unwrap();
+
+        let RedemptionEvent::Reprocessed { burn_mode, .. } = event else {
+            panic!("Expected Reprocessed variant");
+        };
+
+        assert_eq!(burn_mode, VaultMode::VaultDirect);
+    }
+
+    /// Pins the persisted orchestrator wire format: the mode anchor including
+    /// the orchestrator address must round-trip through the event store.
+    #[test]
+    fn detected_with_orchestrator_burn_mode_round_trips() {
+        let event = RedemptionEvent::Detected {
+            issuer_request_id: test_redemption_id(),
+            underlying: UnderlyingSymbol::new("RKLB").unwrap(),
+            token: TokenSymbol::new("tRKLB"),
+            wallet: alloy::primitives::address!(
+                "0x1234567890abcdef1234567890abcdef12345678"
+            ),
+            quantity: Quantity::default(),
+            tx_hash: B256::random(),
+            block_number: 7,
+            detected_at: Utc::now(),
+            burn_mode: VaultMode::Orchestrator {
+                address: alloy::primitives::address!(
+                    "0x00000000000000000000000000000000000000aa"
+                ),
+            },
+            network: Network::Base,
+        };
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: RedemptionEvent =
+            serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(event, deserialized);
+    }
+
     /// Tests that old BurnResumed events without external_tx_id default to None.
     #[test]
     fn test_backwards_compat_burn_resumed_without_external_tx_id() {
@@ -738,13 +873,18 @@ mod tests {
 
         let event: RedemptionEvent = serde_json::from_str(json).unwrap();
 
-        let RedemptionEvent::BurnResumed { external_tx_id, network, .. } =
-            event
+        let RedemptionEvent::BurnResumed {
+            external_tx_id,
+            network,
+            burn_mode,
+            ..
+        } = event
         else {
             panic!("Expected BurnResumed variant");
         };
 
         assert_eq!(external_tx_id, None);
         assert_eq!(network, Network::Base);
+        assert_eq!(burn_mode, VaultMode::VaultDirect);
     }
 }

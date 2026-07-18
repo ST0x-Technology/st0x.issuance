@@ -362,10 +362,11 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::config::VaultMode;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::redemption::{
-        BurnRecord, IssuerRedemptionRequestId, Redemption, RedemptionEvent,
-        TokensBurnedData,
+        BurnFailureClassification, BurnRecord, IssuerRedemptionRequestId,
+        Redemption, RedemptionEvent, TokensBurnedData,
     };
     use crate::tokenized_asset::{Network, TokenSymbol, UnderlyingSymbol};
     use crate::vault::TxId;
@@ -515,6 +516,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let events = vec![
             RedemptionEvent::Detected {
+                burn_mode: VaultMode::VaultDirect,
                 issuer_request_id: issuer_request_id.clone(),
                 underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
@@ -535,6 +537,7 @@ mod tests {
                 called_at: Utc::now(),
             },
             RedemptionEvent::BurningFailed {
+                classification: BurnFailureClassification::Unclassified,
                 issuer_request_id: issuer_request_id.clone(),
                 error: "test error".to_string(),
                 failed_at: Utc::now(),

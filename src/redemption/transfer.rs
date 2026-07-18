@@ -14,6 +14,7 @@ use super::{
 use crate::account::view::{AccountViewError, find_by_wallet};
 use crate::account::{AccountView, AlpacaAccountNumber, ClientId};
 use crate::bindings;
+use crate::config::VaultModeConfig;
 use crate::tokenized_asset::{
     Network, TokenSymbol, TokenizedAssetView, UnderlyingSymbol,
 };
@@ -91,6 +92,7 @@ pub(crate) async fn detect_transfer(
     assets: &[TokenizedAssetView],
     store: &Store<Redemption>,
     pool: &Pool<Sqlite>,
+    vault_modes: &VaultModeConfig,
 ) -> Result<TransferOutcome, TransferProcessingError> {
     let transfer_event =
         bindings::OffchainAssetReceiptVault::Transfer::decode_log(&log.inner)?;
@@ -127,6 +129,11 @@ pub(crate) async fn detect_transfer(
     let issuer_request_id = IssuerRedemptionRequestId::new(tx_hash);
     let quantity = Quantity::from_u256_with_18_decimals(transfer_event.value)?;
 
+    // Anchor the asset's currently-configured mode on the Detected event:
+    // every later burn step derives from this persisted value, so an asset
+    // cutover mid-redemption never switches an in-flight redemption's path.
+    let burn_mode = vault_modes.mode_for(&underlying);
+
     let command = RedemptionCommand::Detect {
         issuer_request_id: issuer_request_id.clone(),
         underlying,
@@ -136,6 +143,7 @@ pub(crate) async fn detect_transfer(
         quantity,
         tx_hash,
         block_number,
+        burn_mode,
     };
 
     match store.send(&issuer_request_id, command).await {
@@ -151,6 +159,7 @@ pub(crate) async fn detect_transfer(
 
     info!(target: "redemption", %issuer_request_id,
         from = %transfer_event.from,
+        burn_mode = ?burn_mode,
         "Redemption transfer detected"
     );
 
@@ -342,6 +351,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{TransferOutcome, TransferProcessingError, detect_transfer};
+    use crate::config::{VaultMode, VaultModeConfig};
     use crate::redemption::Redemption;
     use crate::redemption::RedemptionServices;
     use crate::redemption::test_utils::{
@@ -386,9 +396,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         let outcome = result.expect("Expected success");
         assert!(
@@ -408,6 +425,73 @@ mod tests {
         assert!(logs_contain_at!(
             tracing::Level::INFO,
             &["Redemption transfer detected"]
+        ));
+    }
+
+    /// The asset's configured `VaultMode` is resolved at detection time and
+    /// persisted on the `Detected` event, anchoring the whole redemption to
+    /// that mode regardless of later config changes.
+    #[traced_test]
+    #[tokio::test]
+    async fn detect_transfer_anchors_configured_orchestrator_mode() {
+        let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bot_wallet = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let ap_wallet = address!("0x9999999999999999999999999999999999999999");
+        let orchestrator_mode = VaultMode::Orchestrator {
+            address: address!("0x00000000000000000000000000000000000000aa"),
+        };
+
+        let pool = setup_test_db_with_asset(vault, Some(ap_wallet)).await;
+        let store = setup_test_store(&pool);
+
+        // `setup_test_db_with_asset` seeds AAPL on `vault`.
+        let vault_modes = VaultModeConfig::new(
+            std::collections::HashMap::from([(
+                "AAPL".to_string(),
+                orchestrator_mode,
+            )]),
+            VaultMode::VaultDirect,
+        );
+
+        let value = U256::from_str_radix("100000000000000000000", 10).unwrap();
+        let tx_hash = b256!(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+
+        let log = create_transfer_log(
+            vault, ap_wallet, bot_wallet, value, tx_hash, 12345,
+        );
+
+        let assets = list_enabled_assets(&pool).await.unwrap();
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &vault_modes,
+        )
+        .await;
+
+        let TransferOutcome::Detected { issuer_request_id, .. } =
+            result.expect("Expected success")
+        else {
+            panic!("Expected Detected outcome");
+        };
+
+        let redemption = store.load(&issuer_request_id).await.unwrap().unwrap();
+        let Redemption::Detected { metadata } = redemption else {
+            panic!("Expected Detected state");
+        };
+        assert_eq!(
+            metadata.burn_mode, orchestrator_mode,
+            "detection must anchor the configured per-asset mode"
+        );
+
+        assert!(logs_contain_at!(
+            tracing::Level::INFO,
+            &["Redemption transfer detected", "Orchestrator"]
         ));
     }
 
@@ -448,9 +532,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         let outcome = result.expect("Expected success");
         assert!(
@@ -497,9 +588,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedMint)),
@@ -534,9 +632,16 @@ mod tests {
         log.transaction_hash = None;
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingTxHash)),
@@ -566,9 +671,16 @@ mod tests {
         log.block_number = None;
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(TransferProcessingError::MissingBlockNumber)),
@@ -602,9 +714,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(
@@ -663,9 +782,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(
@@ -707,9 +833,16 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let result =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let result = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
 
         assert!(
             matches!(result, Ok(TransferOutcome::SkippedNoAccount)),
@@ -742,17 +875,31 @@ mod tests {
         );
 
         let assets = list_enabled_assets(&pool).await.unwrap();
-        let first =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let first = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
         assert!(
             matches!(first, Ok(TransferOutcome::Detected { .. })),
             "First detection should succeed, got {first:?}"
         );
 
-        let second =
-            detect_transfer(&log, vault, Network::Base, &assets, &store, &pool)
-                .await;
+        let second = detect_transfer(
+            &log,
+            vault,
+            Network::Base,
+            &assets,
+            &store,
+            &pool,
+            &VaultModeConfig::default(),
+        )
+        .await;
         assert!(
             matches!(second, Ok(TransferOutcome::AlreadyDetected)),
             "Second detection should return AlreadyDetected, got {second:?}"

@@ -21,7 +21,8 @@ use crate::receipt_inventory::{
     Shares,
 };
 use crate::redemption::{
-    BurnRecord, RedemptionMetadata, has_unresolved_burn_intent,
+    BurnFailureClassification, BurnRecord, RedemptionMetadata,
+    has_unresolved_burn_intent,
 };
 use crate::tokenized_asset::view::{TokenizedAssetViewError, find_vault};
 use crate::tokenized_asset::{Network, UnderlyingSymbol};
@@ -147,6 +148,7 @@ impl BurnManager {
                     error,
                     tx_id,
                     planned_burns,
+                    classification: BurnFailureClassification::Unclassified,
                 },
             )
             .await?;
@@ -493,6 +495,7 @@ impl BurnManager {
             alpaca_journal_completed_at,
             tokenization_request_id,
             tx_id,
+            burn_mode,
             ..
         } = view
         else {
@@ -587,6 +590,7 @@ impl BurnManager {
             detected_tx_hash: *tx_hash,
             block_number: *block_number,
             detected_at: *detected_at,
+            burn_mode: *burn_mode,
         };
 
         self.store
@@ -854,6 +858,8 @@ impl BurnManager {
                         .send(
                             issuer_request_id,
                             RedemptionCommand::RecordBurnFailure {
+                                classification:
+                                    BurnFailureClassification::Unclassified,
                                 issuer_request_id: issuer_request_id.clone(),
                                 error: err.clone(),
                                 tx_id: exact_recovery
@@ -1291,6 +1297,7 @@ impl BurnManager {
                 .send(
                     issuer_request_id,
                     RedemptionCommand::RecordBurnFailure {
+                        classification: BurnFailureClassification::Unclassified,
                         issuer_request_id: issuer_request_id.clone(),
                         error: error_msg,
                         tx_id: None,
@@ -1597,6 +1604,7 @@ impl BurnManager {
             .send(
                 issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: error_msg.clone(),
                     tx_id: None,
@@ -1702,6 +1710,7 @@ impl BurnManager {
             .send(
                 issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: error.to_string(),
                     tx_id: None,
@@ -1759,6 +1768,8 @@ impl BurnManager {
                     .send(
                         issuer_request_id,
                         RedemptionCommand::RecordBurnFailure {
+                            classification:
+                                BurnFailureClassification::Unclassified,
                             issuer_request_id: issuer_request_id.clone(),
                             error: message.clone(),
                             tx_id: None,
@@ -1848,6 +1859,8 @@ impl BurnManager {
                     .send(
                         issuer_request_id,
                         RedemptionCommand::RecordBurnFailure {
+                            classification:
+                                BurnFailureClassification::Unclassified,
                             issuer_request_id: issuer_request_id.clone(),
                             error: message.clone(),
                             tx_id: tx_id.clone(),
@@ -1938,6 +1951,8 @@ impl BurnManager {
                         .send(
                             issuer_request_id,
                             RedemptionCommand::RecordBurnFailure {
+                                classification:
+                                    BurnFailureClassification::Unclassified,
                                 issuer_request_id: issuer_request_id.clone(),
                                 error: message.clone(),
                                 tx_id: exact_recovery
@@ -2184,6 +2199,7 @@ pub(crate) const fn is_pending_burn_confirmation(error: &VaultError) -> bool {
     )
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BurnManagerError {
     #[error("Vault error: {0}")]
@@ -2238,6 +2254,7 @@ mod tests {
         RecoveryOutcome, Redemption, RedemptionCommand,
         should_release_reserved_burn,
     };
+    use crate::config::VaultMode;
     use crate::mint::IssuerMintRequestId;
     use crate::mint::{Quantity, TokenizationRequestId};
     use crate::receipt_inventory::{
@@ -2251,8 +2268,8 @@ mod tests {
     use crate::redemption::RedemptionServices;
     use crate::redemption::view::{RedemptionViewReactor, find_burn_failed};
     use crate::redemption::{
-        BurnRecord, BurnRecoveryAction, IssuerRedemptionRequestId,
-        RedemptionError,
+        BurnFailureClassification, BurnRecord, BurnRecoveryAction,
+        IssuerRedemptionRequestId, RedemptionError,
     };
     use crate::test_utils::{ANVIL_CHAIN_ID, log_count_at, logs_contain_at};
     use crate::tokenized_asset::{
@@ -2545,6 +2562,7 @@ mod tests {
             .send(
                 issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -3041,6 +3059,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "burn failed".to_string(),
                     tx_id: None,
@@ -3592,6 +3611,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -3716,6 +3736,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying: underlying.clone(),
                     token,
@@ -3992,6 +4013,7 @@ mod tests {
                     quantity: quantity.clone(),
                     tx_hash,
                     block_number: 12345,
+                    burn_mode: VaultMode::VaultDirect,
                 },
             )
             .await
@@ -4156,6 +4178,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::Detect {
+                    burn_mode: VaultMode::VaultDirect,
                     issuer_request_id: issuer_request_id.clone(),
                     underlying,
                     token,
@@ -4224,6 +4247,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "Initial burn failed".to_string(),
                     tx_id: None,
@@ -4300,6 +4324,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "RPC timeout".to_string(),
                     tx_id: None,
@@ -4367,6 +4392,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "ERC1155: burn amount exceeds balance".to_string(),
                     tx_id: None,
@@ -4458,6 +4484,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "polling timeout".to_string(),
                     tx_id: Some(TxId::random()),
@@ -4556,6 +4583,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "polling timeout".to_string(),
                     tx_id: Some(tx_id.clone()),
@@ -4659,6 +4687,7 @@ mod tests {
             .send(
                 &issuer_request_id,
                 RedemptionCommand::RecordBurnFailure {
+                    classification: BurnFailureClassification::Unclassified,
                     issuer_request_id: issuer_request_id.clone(),
                     error: "rpc timeout".to_string(),
                     tx_id: Some(tx_id.clone()),
