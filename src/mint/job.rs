@@ -1042,6 +1042,7 @@ const fn is_uncertain_broadcast_error(error: &VaultError) -> bool {
         | VaultError::MissingBlockNumber { .. }
         | VaultError::EventNotFound { .. }
         | VaultError::Reverted { .. }
+        | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }
         | VaultError::PreparedMintHashMismatch { .. }
         | VaultError::PreparedMintNonceMismatch { .. }
@@ -1076,6 +1077,7 @@ const fn is_uncertain_confirm_observation(error: &VaultError) -> bool {
         | VaultError::MissingBlockNumber { .. } => true,
         VaultError::EventNotFound { .. }
         | VaultError::Reverted { .. }
+        | VaultError::OrchestratorReverted { .. }
         | VaultError::NotABurn { .. }
         | VaultError::BroadcastHashMismatch { .. }
         | VaultError::PreparedMintHashMismatch { .. }

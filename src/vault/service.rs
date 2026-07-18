@@ -10,6 +10,7 @@ use alloy::providers::fillers::{
 use alloy::providers::{
     Identity, PendingTransactionBuilder, Provider, RootProvider,
 };
+use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,11 +22,13 @@ use tracing::debug;
 use super::rain_meta::OaSchemaCache;
 use super::{
     BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnResult,
-    MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
-    SendableTxWithHash, SubmittedTx, TxId, VaultError, VaultService,
-    WalletNonceGuard, classify_checked_receipt, verify_burn_in_receipt,
+    MultiBurnResultEntry, OrchestratorBurnParams, OrchestratorBurnReadiness,
+    OrchestratorBurnResult, OrchestratorRevertReason, PreparedMintTx,
+    ReceiptInformation, SendableTxWithHash, SubmittedTx, TxId, VaultError,
+    VaultService, WalletNonceGuard, classify_checked_receipt,
+    verify_burn_in_receipt,
 };
-use crate::bindings::OffchainAssetReceiptVault;
+use crate::bindings::{IST0xOrchestratorV1, OffchainAssetReceiptVault};
 use crate::redemption::BurnExternalTxId;
 
 pub type RealBlockchainServiceProvider = FillProvider<
@@ -80,6 +83,100 @@ impl RealBlockchainService {
             provider,
             oa_schema_cache,
             wallet_nonce_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Decodes the typed revert reason of a mined-but-reverted orchestrator
+    /// transaction by replaying it as an `eth_call` pinned at the parent of
+    /// its mined block — the pre-transaction state a transaction in block N
+    /// executes against is post-block-N-1 (ignoring same-block predecessors;
+    /// the receipt itself carries no revert data). Best-effort: any lookup,
+    /// replay, or decode uncertainty yields
+    /// [`OrchestratorRevertReason::Unknown`], which downstream treats as an
+    /// unclassified definitive revert.
+    async fn decode_orchestrator_revert(
+        &self,
+        tx_hash: alloy::primitives::B256,
+        block_number: u64,
+    ) -> OrchestratorRevertReason {
+        use alloy::sol_types::SolInterface;
+
+        let Ok(Some(transaction)) =
+            self.provider.get_transaction_by_hash(tx_hash).await
+        else {
+            return OrchestratorRevertReason::Unknown;
+        };
+        let Some(to) = transaction.to() else {
+            return OrchestratorRevertReason::Unknown;
+        };
+
+        let request = TransactionRequest::default()
+            .from(transaction.inner.signer())
+            .to(to)
+            .input(transaction.input().clone().into())
+            .value(transaction.value());
+
+        let Err(error) =
+            self.provider.call(request).block(block_number.into()).await
+        else {
+            return OrchestratorRevertReason::Unknown;
+        };
+
+        error
+            .as_error_resp()
+            .and_then(ErrorPayload::as_revert_data)
+            .and_then(|data| {
+                IST0xOrchestratorV1::IST0xOrchestratorV1Errors::abi_decode(
+                    &data,
+                )
+                .ok()
+            })
+            .map_or(OrchestratorRevertReason::Unknown, |decoded| {
+                use IST0xOrchestratorV1::IST0xOrchestratorV1Errors::{
+                    InsufficientReceipts, ReceiptLogicMismatch,
+                    VaultLogicMismatch,
+                };
+                match decoded {
+                    InsufficientReceipts(error) => {
+                        OrchestratorRevertReason::InsufficientReceipts {
+                            token: error.token,
+                            shortfall: error.shortfall,
+                        }
+                    }
+                    VaultLogicMismatch(_) => {
+                        OrchestratorRevertReason::VaultLogicMismatch
+                    }
+                    ReceiptLogicMismatch(_) => {
+                        OrchestratorRevertReason::ReceiptLogicMismatch
+                    }
+                    _ => OrchestratorRevertReason::Unknown,
+                }
+            })
+    }
+
+    async fn try_broadcast_tx(
+        &self,
+        tx: &[u8],
+        hash: B256,
+    ) -> Result<Option<()>, VaultError> {
+        match self.provider.send_raw_transaction(tx).await {
+            Ok(pending_tx) => {
+                let returned = *pending_tx.tx_hash();
+                if returned != hash {
+                    return Err(VaultError::BroadcastHashMismatch {
+                        expected: hash,
+                        returned,
+                    });
+                }
+                Ok(Some(()))
+            }
+            Err(error) => {
+                if self.provider.get_transaction_by_hash(hash).await?.is_none()
+                {
+                    return Err(error.into());
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -146,33 +243,15 @@ impl VaultService for RealBlockchainService {
         prepared_tx: &PreparedMintTx,
     ) -> Result<SubmittedTx, VaultError> {
         prepared_tx.validate()?;
-
-        match self.provider.send_raw_transaction(&prepared_tx.tx).await {
-            Ok(pending_tx) => {
-                let returned = *pending_tx.tx_hash();
-                if returned != prepared_tx.hash {
-                    return Err(VaultError::BroadcastHashMismatch {
-                        expected: prepared_tx.hash,
-                        returned,
-                    });
-                }
-            }
-            Err(error) => {
-                if self
-                    .provider
-                    .get_transaction_by_hash(prepared_tx.hash)
-                    .await?
-                    .is_none()
-                {
-                    return Err(error.into());
-                }
-
-                debug!(target: "vault", tx_hash = %prepared_tx.hash,
-                    "Mint broadcast errored but the node holds the persisted transaction"
-                );
-            }
+        if self
+            .try_broadcast_tx(&prepared_tx.tx, prepared_tx.hash)
+            .await?
+            .is_none()
+        {
+            debug!(target: "vault", tx_hash = %prepared_tx.hash,
+                "Mint broadcast errored but the node holds the persisted transaction"
+            );
         }
-
         Ok(SubmittedTx {
             external_tx_id: prepared_tx.external_tx_id.clone(),
             tx_id: prepared_tx.hash.into(),
@@ -398,36 +477,19 @@ impl VaultService for RealBlockchainService {
         sendable_tx: SendableTxWithHash,
     ) -> Result<SubmittedTx, VaultError> {
         sendable_tx.validate_for_owner(params.owner)?;
-
-        match self.provider.send_raw_transaction(&sendable_tx.tx).await {
-            Ok(pending_tx) => {
-                let returned = *pending_tx.tx_hash();
-                if returned != sendable_tx.hash {
-                    return Err(VaultError::BroadcastHashMismatch {
-                        expected: sendable_tx.hash,
-                        returned,
-                    });
-                }
-            }
-            Err(error) => {
-                if self
-                    .provider
-                    .get_transaction_by_hash(sendable_tx.hash)
-                    .await?
-                    .is_none()
-                {
-                    return Err(error.into());
-                }
-
-                debug!(target: "vault", tx_hash = %sendable_tx.hash,
-                    "Burn broadcast errored but the node holds the persisted transaction"
-                );
-            }
+        if self
+            .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
+            .await?
+            .is_none()
+        {
+            debug!(target: "vault", tx_hash = %sendable_tx.hash,
+                "Burn broadcast errored but the node holds the persisted transaction"
+            );
         }
-
         Ok(SubmittedTx {
             external_tx_id: params
                 .external_tx_id
+                .clone()
                 .unwrap_or_else(|| {
                     BurnExternalTxId::base(&params.detected_tx_hash)
                 })
@@ -747,6 +809,163 @@ impl VaultService for RealBlockchainService {
 
     async fn lock_wallet(&self) -> WalletNonceGuard {
         Some(self.wallet_nonce_lock.clone().lock_owned().await)
+    }
+
+    async fn check_orchestrator_burn_readiness(
+        &self,
+        orchestrator: Address,
+        token: Address,
+        owner: Address,
+        amount: U256,
+    ) -> Result<OrchestratorBurnReadiness, VaultError> {
+        // Allowance first: an approval shortfall is an actionable ops failure
+        // and must be reported even while the orchestrator is halted.
+        let token_contract =
+            OffchainAssetReceiptVault::new(token, &self.provider);
+        let current =
+            token_contract.allowance(owner, orchestrator).call().await?;
+        if current < amount {
+            return Ok(OrchestratorBurnReadiness::AllowanceInsufficient {
+                required: amount,
+                current,
+            });
+        }
+
+        let orchestrator_contract =
+            IST0xOrchestratorV1::new(orchestrator, &self.provider);
+        if !orchestrator_contract.vaultLogicIsExpected().call().await? {
+            return Ok(OrchestratorBurnReadiness::VaultLogicMismatch);
+        }
+
+        Ok(OrchestratorBurnReadiness::Ready)
+    }
+
+    async fn prepare_orchestrator_burn_tx(
+        &self,
+        params: &OrchestratorBurnParams,
+    ) -> Result<SendableTxWithHash, VaultError> {
+        let orchestrator_contract =
+            IST0xOrchestratorV1::new(params.orchestrator, &self.provider);
+
+        let tx = orchestrator_contract
+            .burn(params.token, params.amount, Bytes::new())
+            .into_transaction_request();
+
+        let envelope = self
+            .provider
+            .fill(tx)
+            .await?
+            .try_into_envelope()
+            .map_err(Box::new)?;
+
+        Ok(SendableTxWithHash {
+            nonce: envelope.nonce(),
+            hash: *envelope.tx_hash(),
+            tx: envelope.encoded_2718(),
+            signed_at: Utc::now(),
+            // The orchestrator burn retains dust in the bot wallet; there is
+            // no on-chain dust return to encode.
+            dust_shares: U256::ZERO,
+        })
+    }
+
+    async fn submit_orchestrator_burn(
+        &self,
+        params: &OrchestratorBurnParams,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<SubmittedTx, VaultError> {
+        sendable_tx.validate_for_owner(params.owner)?;
+        if self
+            .try_broadcast_tx(&sendable_tx.tx, sendable_tx.hash)
+            .await?
+            .is_none()
+        {
+            debug!(target: "vault", tx_hash = %sendable_tx.hash,
+                "Orchestrator burn broadcast errored but the node holds \
+                    the persisted transaction"
+            );
+        }
+        Ok(SubmittedTx {
+            external_tx_id: params
+                .external_tx_id
+                .clone()
+                .unwrap_or_else(|| {
+                    BurnExternalTxId::base(&params.detected_tx_hash)
+                })
+                .into_string(),
+            tx_id: sendable_tx.hash.into(),
+        })
+    }
+
+    async fn confirm_orchestrator_burn(
+        &self,
+        tx_id: &TxId,
+    ) -> Result<OrchestratorBurnResult, VaultError> {
+        debug!(target: "vault", tx_hash = %tx_id,
+            "Getting orchestrator burn tx data from chain"
+        );
+
+        let tx_hash = tx_id.to_hash().ok_or(VaultError::InvalidReceipt)?;
+
+        let receipt = PendingTransactionBuilder::new(
+            self.provider.root().clone(),
+            tx_hash,
+        )
+        .with_timeout(Some(Duration::from_secs(120)))
+        .get_receipt()
+        .await
+        .map_err(|error| VaultError::ConfirmationPending {
+            tx_id: TxId::Hash(tx_hash),
+            message: error.to_string(),
+        })?;
+
+        let block_number =
+            receipt.block_number.ok_or(VaultError::InvalidReceipt)?;
+
+        // A mined-but-reverted orchestrator burn is a definitive failure;
+        // decode its typed reason so the aggregate records the right
+        // classification.
+        if !receipt.status() {
+            let reason = self
+                .decode_orchestrator_revert(
+                    tx_hash,
+                    block_number.saturating_sub(1),
+                )
+                .await;
+            return Err(VaultError::OrchestratorReverted { tx_hash, reason });
+        }
+
+        // Bind the decoded event to OUR burn before terminalizing
+        // accounting: it must be emitted by the orchestrator this persisted
+        // transaction targeted (`receipt.to`), for the transaction's own
+        // sender as `caller` — a same-signature event emitted by any other
+        // contract in the call tree must never be mistaken for it. Token and
+        // amount are then bound transitively: the orchestrator emits exactly
+        // one `Burned` per `burn()` call, with fields taken from our own
+        // persisted calldata.
+        let orchestrator = receipt.to.ok_or(VaultError::InvalidReceipt)?;
+        let burned = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                if log.address() != orchestrator {
+                    return None;
+                }
+                let decoded =
+                    log.log_decode::<IST0xOrchestratorV1::Burned>().ok()?;
+                (decoded.data().caller == receipt.from).then_some(decoded)
+            })
+            .ok_or(VaultError::EventNotFound { tx_hash })?;
+        let burned = burned.data();
+
+        Ok(OrchestratorBurnResult {
+            tx_hash,
+            shares_burned: burned.amount,
+            burn_range: (burned.firstReceiptId, burned.nextBurnReceiptIdAfter),
+            gas_used: receipt.gas_used,
+            block_number,
+        })
     }
 }
 
@@ -2384,5 +2603,410 @@ mod tests {
 
         assert_eq!(sendable.dust_shares, U256::ZERO);
         assert!(!sendable.tx.is_empty());
+    }
+
+    fn test_orchestrator_address() -> Address {
+        address!("0x00000000000000000000000000000000000000aa")
+    }
+
+    fn test_orchestrator_burn_params(
+        owner: Address,
+    ) -> super::OrchestratorBurnParams {
+        super::OrchestratorBurnParams {
+            orchestrator: test_orchestrator_address(),
+            token: test_vault_address(),
+            amount: U256::from(1_000_000u64),
+            owner,
+            issuer_request_id: test_issuer_redemption_id(),
+            detected_tx_hash: b256!(
+                "0xabababababababababababababababababababababababababababababababab"
+            ),
+            external_tx_id: None,
+        }
+    }
+
+    fn create_burned_receipt(
+        tx_hash: B256,
+        caller: Address,
+        amount: U256,
+        burn_range: (U256, U256),
+        succeeded: bool,
+    ) -> TransactionReceipt {
+        create_burned_receipt_from(
+            tx_hash,
+            caller,
+            amount,
+            burn_range,
+            succeeded,
+            test_orchestrator_address(),
+        )
+    }
+
+    /// Like [`create_burned_receipt`], with the `Burned` log's emitting
+    /// contract chosen by the caller — for pinning that the confirm path
+    /// binds the event to the orchestrator the transaction targeted.
+    fn create_burned_receipt_from(
+        tx_hash: B256,
+        caller: Address,
+        amount: U256,
+        burn_range: (U256, U256),
+        succeeded: bool,
+        emitter: Address,
+    ) -> TransactionReceipt {
+        let burned_event = crate::bindings::IST0xOrchestratorV1::Burned {
+            caller,
+            token: test_vault_address(),
+            amount,
+            firstReceiptId: burn_range.0,
+            nextBurnReceiptIdAfter: burn_range.1,
+        };
+
+        let logs = if succeeded {
+            vec![alloy::rpc::types::Log {
+                inner: alloy::primitives::Log {
+                    address: emitter,
+                    data: burned_event.into_log_data(),
+                },
+                block_hash: Some(b256!(
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )),
+                block_number: Some(0x9c4),
+                block_timestamp: None,
+                transaction_hash: Some(tx_hash),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                removed: false,
+            }]
+        } else {
+            vec![]
+        };
+
+        let consensus_receipt: Receipt<alloy::rpc::types::Log> = Receipt {
+            status: Eip658Value::Eip658(succeeded),
+            cumulative_gas_used: 0x8000,
+            logs,
+        };
+
+        TransactionReceipt {
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(fixed_bytes!(
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            )),
+            block_number: Some(0x9c4),
+            // The sender is the burn's `caller` — the confirm path binds the
+            // decoded event's `caller` to `receipt.from`.
+            from: caller,
+            to: Some(test_orchestrator_address()),
+            gas_used: 0x8000,
+            effective_gas_price: 0x3b9a_ca00,
+            contract_address: None,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+                consensus_receipt,
+                Bloom::default(),
+            )),
+        }
+    }
+
+    /// A same-signature `Burned` event emitted by a contract other than the
+    /// orchestrator the transaction targeted must never terminalize the
+    /// burn's accounting: the confirm path binds the log to `receipt.to` and
+    /// reads anything else as `EventNotFound`.
+    #[tokio::test]
+    async fn confirm_orchestrator_burn_ignores_foreign_burned_logs() {
+        let tx_hash = b256!(
+            "0x7777777777777777777777777777777777777777777777777777777777777777"
+        );
+        let receipt = create_burned_receipt_from(
+            tx_hash,
+            address!("2222222222222222222222222222222222222222"),
+            U256::from(5u8),
+            (U256::ZERO, U256::ONE),
+            true,
+            test_vault_address(),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_orchestrator_burn(&TxId::Hash(tx_hash)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::EventNotFound { tx_hash: hash })
+                    if hash == tx_hash
+            ),
+            "a foreign contract's Burned log must not confirm the burn, \
+             got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_burn_prepare_submit_confirm_round_trip() {
+        use alloy::sol_types::SolCall;
+
+        let asserter = Asserter::new();
+        setup_asserter_for_fill(&asserter, 7);
+        let signer = PrivateKeySigner::random();
+        let owner = signer.address();
+        let service = create_service_with_signer(asserter.clone(), signer);
+
+        let params = test_orchestrator_burn_params(owner);
+
+        let prepared = service
+            .prepare_orchestrator_burn_tx(&params)
+            .await
+            .expect("expected SendableTxWithHash");
+
+        assert_eq!(prepared.nonce, 7);
+        assert_eq!(
+            prepared.dust_shares,
+            U256::ZERO,
+            "orchestrator burns never encode a dust return"
+        );
+        let envelope = TxEnvelope::decode_2718(&mut prepared.tx.as_slice())
+            .expect("prepared orchestrator burn must decode");
+        assert_eq!(*envelope.tx_hash(), prepared.hash);
+        assert_eq!(envelope.to(), Some(test_orchestrator_address()));
+        let expected_calldata =
+            crate::bindings::IST0xOrchestratorV1::burnCall {
+                token: params.token,
+                amount: params.amount,
+                burnInfo: Bytes::new(),
+            }
+            .abi_encode();
+        assert_eq!(
+            envelope.input().as_ref(),
+            expected_calldata.as_slice(),
+            "calldata must be burn(token, amount, empty burnInfo)"
+        );
+
+        let receipt = create_burned_receipt(
+            prepared.hash,
+            owner,
+            params.amount,
+            (U256::from(3u8), U256::from(6u8)),
+            true,
+        );
+        setup_asserter_for_transaction(&asserter, prepared.hash, &receipt);
+
+        let submitted = service
+            .submit_orchestrator_burn(&params, &prepared)
+            .await
+            .expect("expected SubmittedTx");
+        assert_eq!(submitted.tx_id, TxId::Hash(prepared.hash));
+        assert_eq!(
+            submitted.external_tx_id,
+            format!("burn-{}", params.detected_tx_hash),
+            "deterministic externalTxId must derive from the detected transfer"
+        );
+
+        let result = service
+            .confirm_orchestrator_burn(&submitted.tx_id)
+            .await
+            .expect("expected OrchestratorBurnResult");
+        assert_eq!(result.tx_hash, prepared.hash);
+        assert_eq!(result.shares_burned, params.amount);
+        assert_eq!(result.burn_range, (U256::from(3u8), U256::from(6u8)));
+        assert_eq!(result.gas_used, 0x8000);
+        assert_eq!(result.block_number, 0x9c4);
+    }
+
+    #[tokio::test]
+    async fn confirm_orchestrator_burn_without_burned_event_is_not_found() {
+        let tx_hash = b256!(
+            "0x9999999999999999999999999999999999999999999999999999999999999999"
+        );
+        let mut receipt = create_burned_receipt(
+            tx_hash,
+            test_receiver(),
+            U256::from(1u8),
+            (U256::ZERO, U256::ZERO),
+            true,
+        );
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
+            Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 0x8000,
+                logs: vec![],
+            },
+            Bloom::default(),
+        ));
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let service = create_service_with_asserter(asserter);
+
+        let result =
+            service.confirm_orchestrator_burn(&TxId::Hash(tx_hash)).await;
+
+        assert!(matches!(
+            result,
+            Err(VaultError::EventNotFound { tx_hash: hash }) if hash == tx_hash
+        ));
+    }
+
+    /// A mined-but-reverted orchestrator burn replays the transaction as an
+    /// `eth_call` at its mined block and decodes the typed revert reason.
+    #[tokio::test]
+    async fn confirm_orchestrator_burn_decodes_typed_revert_reasons() {
+        use alloy::rpc::json_rpc::ErrorPayload;
+        use alloy::sol_types::SolError;
+
+        let shortfall_error =
+            crate::bindings::IST0xOrchestratorV1::InsufficientReceipts {
+                token: test_vault_address(),
+                shortfall: U256::from(250u64),
+            };
+        let cases = [
+            (
+                Bytes::from(shortfall_error.abi_encode()),
+                super::OrchestratorRevertReason::InsufficientReceipts {
+                    token: test_vault_address(),
+                    shortfall: U256::from(250u64),
+                },
+            ),
+            (
+                Bytes::from(
+                    crate::bindings::IST0xOrchestratorV1::VaultLogicMismatch {
+                        expected: test_receiver(),
+                        actual: test_vault_address(),
+                    }
+                    .abi_encode(),
+                ),
+                super::OrchestratorRevertReason::VaultLogicMismatch,
+            ),
+            (
+                Bytes::from(
+                    crate::bindings::IST0xOrchestratorV1::ReceiptLogicMismatch {
+                        expected: test_receiver(),
+                        actual: test_vault_address(),
+                    }
+                    .abi_encode(),
+                ),
+                super::OrchestratorRevertReason::ReceiptLogicMismatch,
+            ),
+            (
+                Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                super::OrchestratorRevertReason::Unknown,
+            ),
+        ];
+
+        for (revert_data, expected_reason) in cases {
+            let persisted = SendableTxWithHash::valid_for_test(
+                17,
+                test_orchestrator_address(),
+                Bytes::from_static(&[0xde, 0xad]),
+            );
+            let owner = persisted.signer_for_test();
+            let receipt = create_burned_receipt(
+                persisted.hash,
+                owner,
+                U256::ZERO,
+                (U256::ZERO, U256::ZERO),
+                false,
+            );
+            let transaction = rpc_transaction(&persisted.tx, owner);
+
+            let asserter = Asserter::new();
+            asserter.push_success(&receipt); // eth_getTransactionReceipt
+            asserter.push_success(&receipt); // eth_getTransactionReceipt (polling)
+            asserter.push_success(&transaction); // eth_getTransactionByHash
+            asserter.push_failure(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(
+                    serde_json::value::to_raw_value(&format!("{revert_data}"))
+                        .expect("revert data must serialize"),
+                ),
+            }); // eth_call replay
+            let service = create_service_with_asserter(asserter);
+
+            let result = service
+                .confirm_orchestrator_burn(&TxId::Hash(persisted.hash))
+                .await;
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(VaultError::OrchestratorReverted { tx_hash, reason })
+                        if *tx_hash == persisted.hash
+                            && *reason == expected_reason
+                ),
+                "expected {expected_reason:?}, got {result:?}"
+            );
+        }
+    }
+
+    /// The allowance gate is evaluated before the orchestrator health gate,
+    /// so an approval shortfall is reported even while the orchestrator is
+    /// halted.
+    #[tokio::test]
+    async fn orchestrator_readiness_checks_allowance_before_health() {
+        let owner = test_receiver();
+        let amount = U256::from(1_000u64);
+
+        // Allowance below the amount: readiness must report the shortfall
+        // without ever querying vaultLogicIsExpected (a second eth_call
+        // would fail the asserter with a missing response).
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:064x}", 999u64));
+        let service = create_service_with_asserter(asserter);
+        let readiness = service
+            .check_orchestrator_burn_readiness(
+                test_orchestrator_address(),
+                test_vault_address(),
+                owner,
+                amount,
+            )
+            .await
+            .expect("readiness check should succeed");
+        assert_eq!(
+            readiness,
+            super::OrchestratorBurnReadiness::AllowanceInsufficient {
+                required: amount,
+                current: U256::from(999u64),
+            }
+        );
+
+        // Sufficient allowance but halted orchestrator.
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{}", "f".repeat(64)));
+        asserter.push_success(&format!("0x{:064x}", 0u64));
+        let service = create_service_with_asserter(asserter);
+        let readiness = service
+            .check_orchestrator_burn_readiness(
+                test_orchestrator_address(),
+                test_vault_address(),
+                owner,
+                amount,
+            )
+            .await
+            .expect("readiness check should succeed");
+        assert_eq!(
+            readiness,
+            super::OrchestratorBurnReadiness::VaultLogicMismatch
+        );
+
+        // Sufficient allowance and healthy orchestrator.
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{}", "f".repeat(64)));
+        asserter.push_success(&format!("0x{:064x}", 1u64));
+        let service = create_service_with_asserter(asserter);
+        let readiness = service
+            .check_orchestrator_burn_readiness(
+                test_orchestrator_address(),
+                test_vault_address(),
+                owner,
+                amount,
+            )
+            .await
+            .expect("readiness check should succeed");
+        assert_eq!(readiness, super::OrchestratorBurnReadiness::Ready);
     }
 }

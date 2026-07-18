@@ -17,11 +17,13 @@ use tokio::sync::Notify;
 
 use super::{
     BurnTxStatus, BurnVerification, MintResult, MintTxStatus, MultiBurnParams,
-    MultiBurnResult, MultiBurnResultEntry, PreparedMintTx, ReceiptInformation,
-    SubmittedTx, VaultError, VaultService, WalletNonceGuard,
+    MultiBurnResult, MultiBurnResultEntry, OrchestratorBurnParams,
+    OrchestratorBurnReadiness, OrchestratorBurnResult, PreparedMintTx,
+    ReceiptInformation, SubmittedTx, VaultError, VaultService,
+    WalletNonceGuard,
 };
 #[cfg(test)]
-use super::{VerifiedBurn, VerifiedShareTransfer};
+use super::{OrchestratorRevertReason, VerifiedBurn, VerifiedShareTransfer};
 use crate::redemption::BurnExternalTxId;
 use crate::vault::{SendableTxWithHash, TxId};
 
@@ -135,6 +137,31 @@ impl Default for MockVerifyBurn {
     }
 }
 
+/// Shared mock state for the orchestrator burn methods, grouped so every
+/// constructor initializes it with a single field.
+#[derive(Default)]
+struct OrchestratorMockState {
+    /// Cached result from `submit_orchestrator_burn` for retrieval in
+    /// `confirm_orchestrator_burn`.
+    pending_result: Mutex<Option<OrchestratorBurnResult>>,
+    /// Readiness returned by `check_orchestrator_burn_readiness`;
+    /// `None` means `Ready`.
+    #[cfg(test)]
+    readiness: Mutex<Option<OrchestratorBurnReadiness>>,
+    /// When set, `confirm_orchestrator_burn` fails with
+    /// `VaultError::OrchestratorReverted` carrying this reason.
+    #[cfg(test)]
+    confirm_revert: Mutex<Option<OrchestratorRevertReason>>,
+    #[cfg(test)]
+    last_params: Mutex<Option<OrchestratorBurnParams>>,
+    #[cfg(test)]
+    preparation_call_count: AtomicUsize,
+    #[cfg(test)]
+    submit_call_count: AtomicUsize,
+    #[cfg(test)]
+    readiness_call_count: AtomicUsize,
+}
+
 /// Mock blockchain service for testing.
 ///
 /// This mock is NOT behind `#[cfg(test)]` because `setup_test_rocket()` (used by E2E tests
@@ -143,6 +170,7 @@ impl Default for MockVerifyBurn {
 /// without `#[cfg(test)]` enabled. Unit tests (inside the crate) can access `#[cfg(test)]`
 /// code, so they get full mock functionality including failures and timing behavior.
 pub(crate) struct MockVaultService {
+    orchestrator: Arc<OrchestratorMockState>,
     behavior: MockBehavior,
     mint_delay_ms: u64,
     wallet_nonce_lock: Arc<tokio::sync::Mutex<()>>,
@@ -205,6 +233,7 @@ impl MockVaultService {
         Self {
             behavior: MockBehavior::Success,
             mint_delay_ms: 0,
+            orchestrator: Arc::new(OrchestratorMockState::default()),
             wallet_nonce_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             wallet_lock_call_count: Arc::new(AtomicUsize::new(0)),
@@ -652,6 +681,16 @@ const MOCK_MINT_TX_HASH: alloy::primitives::B256 =
 
 const MOCK_BURN_TX_HASH: alloy::primitives::B256 =
     b256!("0x4545454545454545454545454545454545454545454545454545454545454545");
+
+fn default_orchestrator_burn_result() -> OrchestratorBurnResult {
+    OrchestratorBurnResult {
+        tx_hash: MOCK_BURN_TX_HASH,
+        shares_burned: U256::from(100_000_000_000_000_000_000u128),
+        burn_range: (U256::from(1u8), U256::from(2u8)),
+        gas_used: 50000,
+        block_number: 5000,
+    }
+}
 
 fn default_multi_burn_result(dust_shares: U256) -> MultiBurnResult {
     MultiBurnResult {
@@ -1167,6 +1206,168 @@ impl VaultService for MockVaultService {
         }
 
         Some(self.wallet_nonce_lock.clone().lock_owned().await)
+    }
+
+    async fn check_orchestrator_burn_readiness(
+        &self,
+        _orchestrator: Address,
+        _token: Address,
+        _owner: Address,
+        _amount: U256,
+    ) -> Result<OrchestratorBurnReadiness, VaultError> {
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .readiness_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            let readiness_opt = *self.orchestrator.readiness.lock().unwrap();
+            if let Some(readiness) = readiness_opt {
+                return Ok(readiness);
+            }
+        }
+
+        Ok(OrchestratorBurnReadiness::Ready)
+    }
+
+    async fn prepare_orchestrator_burn_tx(
+        &self,
+        _params: &OrchestratorBurnParams,
+    ) -> Result<SendableTxWithHash, VaultError> {
+        #[cfg(test)]
+        {
+            self.orchestrator
+                .preparation_call_count
+                .fetch_add(1, Ordering::Relaxed);
+            if matches!(self.behavior, MockBehavior::PrepareTxFails) {
+                return Err(VaultError::InvalidReceipt);
+            }
+            // Use configured tx if present, otherwise fall back to default.
+            // Cloned (not taken) so retries can re-use the same configured tx.
+            let prepared = self.prepared_tx.lock().unwrap().clone();
+            return Ok(prepared.unwrap_or_default());
+        }
+        #[cfg(not(test))]
+        Ok(SendableTxWithHash::default())
+    }
+
+    async fn submit_orchestrator_burn(
+        &self,
+        params: &OrchestratorBurnParams,
+        sendable_tx: &SendableTxWithHash,
+    ) -> Result<SubmittedTx, VaultError> {
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitFailure) {
+            return Err(VaultError::InvalidReceipt);
+        }
+
+        #[cfg(test)]
+        if matches!(self.behavior, MockBehavior::SubmitRevert) {
+            return Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH });
+        }
+
+        #[cfg(test)]
+        {
+            self.orchestrator.submit_call_count.fetch_add(1, Ordering::Relaxed);
+            *self.orchestrator.last_params.lock().unwrap() =
+                Some(params.clone());
+        }
+
+        // Pre-compute the OrchestratorBurnResult for confirm to return: the
+        // orchestrator burns the full amount from a single-receipt walk.
+        {
+            let mut pending = self
+                .orchestrator
+                .pending_result
+                .lock()
+                .expect("orchestrator pending_result mutex poisoned");
+            // Preserve a pre-seeded pending result configured by a test;
+            // only fill the cache when empty.
+            if pending.is_none() {
+                *pending = Some(OrchestratorBurnResult {
+                    tx_hash: MOCK_BURN_TX_HASH,
+                    shares_burned: params.amount,
+                    burn_range: (U256::from(1u8), U256::from(2u8)),
+                    gas_used: 50000,
+                    block_number: 5000,
+                });
+            }
+        }
+
+        Ok(SubmittedTx {
+            external_tx_id: params
+                .external_tx_id
+                .clone()
+                .unwrap_or_else(|| {
+                    BurnExternalTxId::base(&params.detected_tx_hash)
+                })
+                .into_string(),
+            tx_id: sendable_tx.hash.into(),
+        })
+    }
+
+    async fn confirm_orchestrator_burn(
+        &self,
+        _tx_id: &TxId,
+    ) -> Result<OrchestratorBurnResult, VaultError> {
+        #[cfg(test)]
+        let reason_opt = *self.orchestrator.confirm_revert.lock().unwrap();
+        #[cfg(test)]
+        if let Some(reason) = reason_opt {
+            return Err(VaultError::OrchestratorReverted {
+                tx_hash: MOCK_BURN_TX_HASH,
+                reason,
+            });
+        }
+
+        match &self.behavior {
+            MockBehavior::Success => {
+                let result = self
+                    .orchestrator
+                    .pending_result
+                    .lock()
+                    .expect("orchestrator pending_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(default_orchestrator_burn_result);
+
+                Ok(result)
+            }
+            #[cfg(test)]
+            MockBehavior::Failure => Err(VaultError::InvalidReceipt),
+            #[cfg(test)]
+            MockBehavior::ConfirmRevert => {
+                Err(VaultError::Reverted { tx_hash: MOCK_BURN_TX_HASH })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPending => {
+                Err(VaultError::ConfirmationPending {
+                    tx_id: _tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::ConfirmPendingBlocked { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Err(VaultError::ConfirmationPending {
+                    tx_id: _tx_id.clone(),
+                    message: "receipt polling timed out".to_string(),
+                })
+            }
+            #[cfg(test)]
+            MockBehavior::SubmitFailure
+            | MockBehavior::WalletLockBlocked { .. }
+            | MockBehavior::SubmitRevert
+            | MockBehavior::PrepareTxFails => {
+                let result = self
+                    .orchestrator
+                    .pending_result
+                    .lock()
+                    .expect("orchestrator pending_result mutex poisoned")
+                    .take()
+                    .unwrap_or_else(default_orchestrator_burn_result);
+                Ok(result)
+            }
+        }
     }
 }
 
