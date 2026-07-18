@@ -1013,7 +1013,9 @@ mod tests {
         ReceiptInventoryCommand, ReceiptSource, Shares,
     };
     use crate::test_utils::{log_count_at, logs_contain_at};
-    use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+    use crate::tokenized_asset::{
+        AssetKey, TokenizedAsset, TokenizedAssetCommand,
+    };
     use crate::vault::mock::MockVaultService;
     use crate::vault::{
         PreparedMintTx, ReceiptInformation, TxId, VaultService,
@@ -1023,7 +1025,7 @@ mod tests {
     /// SQLite pool, wired with the same services the production recovery flow
     /// uses (vault, Alpaca, receipt inventory). The [`TokenizedAsset`]
     /// projection is populated with the AAPL -> [`VAULT`] mapping so the
-    /// recovery vault lookup (`find_vault_by_underlying`) resolves.
+    /// recovery vault lookup (`find_vault`) resolves.
     struct MintRecoveryFixture {
         mint_store: Arc<Store<Mint>>,
         receipt_store: Arc<Store<ReceiptInventory>>,
@@ -1065,9 +1067,12 @@ mod tests {
 
             asset_store
                 .send(
-                    &UnderlyingSymbol::new("AAPL"),
+                    &AssetKey::new(
+                        UnderlyingSymbol::new("AAPL").unwrap(),
+                        Network::Base,
+                    ),
                     TokenizedAssetCommand::Add {
-                        underlying: UnderlyingSymbol::new("AAPL"),
+                        underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                         token: TokenSymbol::new("tAAPL"),
                         network: Network::Base,
                         vault: VAULT,
@@ -1167,7 +1172,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("tok-123"),
                 quantity: Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -1301,7 +1306,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-123"),
             issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity::new(Decimal::from(100)),
             Utc::now(),
             None,

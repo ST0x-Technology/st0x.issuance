@@ -946,7 +946,7 @@ async fn run_all_receipt_backfills<P: Provider + Clone>(
                     &provider,
                     vault,
                     backfill_start_block,
-                    &underlying.0,
+                    underlying.as_str(),
                     receipt_inventory_store,
                     bot_wallet,
                 )

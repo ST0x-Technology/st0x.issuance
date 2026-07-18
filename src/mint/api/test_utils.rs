@@ -16,7 +16,7 @@ use crate::auth::test_auth_config;
 use crate::config::{Config, Environment, LogLevel};
 use crate::mint::{Mint, MintServices, Network, TokenSymbol, UnderlyingSymbol};
 use crate::receipt_inventory::{CqrsReceiptService, ReceiptInventory};
-use crate::tokenized_asset::{TokenizedAsset, TokenizedAssetCommand};
+use crate::tokenized_asset::{AssetKey, TokenizedAsset, TokenizedAssetCommand};
 use crate::vault::VaultService;
 use crate::vault::mock::MockVaultService;
 use crate::wallet::SignerConfig;
@@ -190,7 +190,7 @@ impl TestHarness {
             .await
             .expect("Failed to whitelist wallet");
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let vault = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -203,7 +203,7 @@ impl TestHarness {
         };
 
         self.asset_store
-            .send(&underlying, asset_cmd)
+            .send(&AssetKey::new(underlying.clone(), network), asset_cmd)
             .await
             .expect("Failed to add asset");
 

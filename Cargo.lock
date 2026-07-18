@@ -5804,8 +5804,10 @@ name = "st0x-issuance-dto"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "proptest",
  "serde",
  "serde_json",
+ "thiserror",
  "ts-rs",
  "utoipa",
 ]

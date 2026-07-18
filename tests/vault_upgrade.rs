@@ -31,7 +31,7 @@ async fn test_vault_upgrade_via_add_endpoint()
 
     // Query the internal detail endpoint to verify the vault was updated
     let response = client
-        .get("/tokenized-assets/AAPL")
+        .get("/tokenized-assets/AAPL?network=base")
         .header(rocket::http::Header::new(
             "X-API-KEY",
             "test-key-12345678901234567890123456",

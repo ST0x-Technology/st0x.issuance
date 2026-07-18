@@ -2169,7 +2169,7 @@ mod tests {
                 issuer_request_id: IssuerRedemptionRequestId::new(
                     detected_tx_hash,
                 ),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 quantity: Quantity::new(Decimal::from(1)),
@@ -2198,7 +2198,7 @@ mod tests {
     #[tokio::test]
     async fn test_detect_redemption_creates_event() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -2250,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn test_detect_redemption_when_already_detected_returns_error() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
         let quantity = Quantity::new(Decimal::from(50));
@@ -2296,7 +2296,7 @@ mod tests {
         assert!(replay::<Redemption>(vec![]).unwrap().is_none());
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("NVDA");
+        let underlying = UnderlyingSymbol::new("NVDA").unwrap();
         let token = TokenSymbol::new("tNVDA");
         let wallet = address!("0xfedcbafedcbafedcbafedcbafedcbafedcbafedc");
         let quantity = Quantity::new(Decimal::from(25));
@@ -2345,7 +2345,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 wallet: address!(
                     "0x1234567890abcdef1234567890abcdef12345678"
@@ -2419,7 +2419,7 @@ mod tests {
         let events = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("TSLA"),
+                underlying: UnderlyingSymbol::new("TSLA").unwrap(),
                 token: TokenSymbol::new("tTSLA"),
                 wallet: address!(
                     "0x9876543210fedcba9876543210fedcba98765432"
@@ -2489,7 +2489,7 @@ mod tests {
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -2561,7 +2561,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
         let quantity = Quantity::new(Decimal::from(50));
@@ -2636,7 +2636,7 @@ mod tests {
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -2691,7 +2691,7 @@ mod tests {
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -2757,7 +2757,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("NVDA"),
+                underlying: UnderlyingSymbol::new("NVDA").unwrap(),
                 token: TokenSymbol::new("tNVDA"),
                 wallet: address!(
                     "0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"
@@ -2804,7 +2804,7 @@ mod tests {
         vec![
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 quantity: Quantity::new(Decimal::from(100)),
@@ -3081,7 +3081,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-intended-456");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -3169,7 +3169,7 @@ mod tests {
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("TSLA"),
+                    underlying: UnderlyingSymbol::new("TSLA").unwrap(),
                     token: TokenSymbol::new("tTSLA"),
                     wallet: user_wallet,
                     quantity: Quantity::new(Decimal::from(100)),
@@ -3239,7 +3239,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("NVDA"),
+                underlying: UnderlyingSymbol::new("NVDA").unwrap(),
                 token: TokenSymbol::new("tNVDA"),
                 wallet: address!(
                     "0xfedcbafedcbafedcbafedcbafedcbafedcbafedc"
@@ -3288,7 +3288,7 @@ mod tests {
             .given(vec![
                 RedemptionEvent::Detected {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("GOOG"),
+                    underlying: UnderlyingSymbol::new("GOOG").unwrap(),
                     token: TokenSymbol::new("tGOOG"),
                     wallet: address!(
                         "0xabababababababababababababababababababab"
@@ -3373,7 +3373,7 @@ mod tests {
         vec![
             RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("ARKK"),
+                underlying: UnderlyingSymbol::new("ARKK").unwrap(),
                 token: TokenSymbol::new("tARKK"),
                 wallet: address!("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
                 quantity: Quantity::new(Decimal::from(17)),
@@ -3850,7 +3850,7 @@ mod tests {
         let error = TestHarness::<Redemption>::with(mock_services())
             .given(vec![RedemptionEvent::Detected {
                 issuer_request_id: issuer_request_id.clone(),
-                underlying: UnderlyingSymbol::new("ARKK"),
+                underlying: UnderlyingSymbol::new("ARKK").unwrap(),
                 token: TokenSymbol::new("tARKK"),
                 wallet: address!(
                     "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
@@ -4154,7 +4154,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-complete-456");
-        let underlying = UnderlyingSymbol::new("AMZN");
+        let underlying = UnderlyingSymbol::new("AMZN").unwrap();
         let token = TokenSymbol::new("tAMZN");
         let wallet = address!("0xefefefefefefefefefefefefefefefefefefefef");
         let quantity = Quantity::new(Decimal::from(200));
@@ -4222,7 +4222,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-failed-456");
-        let underlying = UnderlyingSymbol::new("NFLX");
+        let underlying = UnderlyingSymbol::new("NFLX").unwrap();
         let token = TokenSymbol::new("tNFLX");
         let wallet = address!("0x1212121212121212121212121212121212121212");
         let quantity = Quantity::new(Decimal::from(150));
@@ -4283,7 +4283,7 @@ mod tests {
     #[tokio::test]
     async fn test_mark_failed_from_failed_state_succeeds() {
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -4477,7 +4477,7 @@ mod tests {
     fn test_metadata() -> RedemptionMetadata {
         RedemptionMetadata {
             issuer_request_id: IssuerRedemptionRequestId::random(),
-            underlying: UnderlyingSymbol::new("RKLB"),
+            underlying: UnderlyingSymbol::new("RKLB").unwrap(),
             token: TokenSymbol::new("tRKLB"),
             wallet: address!("0x9876543210fedcba9876543210fedcba98765432"),
             quantity: Quantity::new(Decimal::from(100)),
@@ -5002,7 +5002,7 @@ mod tests {
 
         history.push(RedemptionEvent::BurnResumed {
             issuer_request_id,
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: Quantity::new(Decimal::from(100)),

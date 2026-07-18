@@ -400,7 +400,7 @@ mod tests {
                         "alp-888",
                     ),
                     quantity: Quantity::new(Decimal::from(50)),
-                    underlying: UnderlyingSymbol::new("TSLA"),
+                    underlying: UnderlyingSymbol::new("TSLA").unwrap(),
                     token: TokenSymbol::new("tTSLA"),
                     network: Network::Base,
                     client_id: ClientId::new(),
@@ -437,7 +437,7 @@ mod tests {
             TokenizationRequestId::new("alp-888")
         );
         assert_eq!(found_quantity, Quantity::new(Decimal::from(50)));
-        assert_eq!(found_underlying, UnderlyingSymbol::new("TSLA"));
+        assert_eq!(found_underlying, UnderlyingSymbol::new("TSLA").unwrap());
         assert_eq!(found_token, TokenSymbol::new("tTSLA"));
         assert_eq!(found_network, Network::Base);
     }
@@ -460,7 +460,7 @@ mod tests {
             issuer_request_id: IssuerMintRequestId::random(),
             tokenization_request_id: TokenizationRequestId::new("alp-1"),
             quantity: Quantity::new(Decimal::from(100)),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             network: Network::Base,
             client_id: ClientId::new(),

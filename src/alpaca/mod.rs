@@ -297,7 +297,7 @@ mod tests {
 
         let request = RedeemRequest {
             issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             client_id,
             quantity: Quantity::new(Decimal::new(10050, 2)),

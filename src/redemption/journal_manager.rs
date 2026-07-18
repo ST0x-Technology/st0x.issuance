@@ -652,7 +652,7 @@ mod tests {
                 issuer_request_id,
                 RedemptionCommand::Detect {
                     issuer_request_id: issuer_request_id.clone(),
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     wallet: address!(
                         "0x1234567890abcdef1234567890abcdef12345678"
@@ -736,7 +736,7 @@ mod tests {
                 id: TokenizationRequestId::new("mock-tok"),
                 issuer_request_id: self.issuer_request_id.clone(),
                 status,
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 quantity: Quantity::new(Decimal::from(100)),
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -1351,7 +1351,7 @@ mod tests {
                     id: TokenizationRequestId::new("mock-tok"),
                     issuer_request_id: self.issuer_request_id.clone(),
                     status: RedeemRequestStatus::Completed,
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     quantity: Quantity::new(Decimal::from(999)),
                     wallet: address!(
@@ -1770,7 +1770,7 @@ mod tests {
         let view = RedemptionView::AlpacaCalled {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id,
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: quantity.clone(),

@@ -13,14 +13,40 @@ use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Underlying equity symbol, e.g. `SGOV`. Also the `TokenizedAsset` aggregate id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+/// Underlying equity symbol, e.g. `SGOV`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, TS)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-pub struct UnderlyingSymbol(pub String);
+#[ts(type = "string")]
+pub struct UnderlyingSymbol(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnderlyingSymbolError {
+    #[error("underlying symbol must not be empty")]
+    Empty,
+}
 
 impl UnderlyingSymbol {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// Constructs an underlying symbol from a non-empty wire value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnderlyingSymbolError::Empty`] when `value` is empty or
+    /// whitespace-only after trimming. Surrounding whitespace is stripped from
+    /// the stored symbol.
+    pub fn new(
+        value: impl Into<String>,
+    ) -> Result<Self, UnderlyingSymbolError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(UnderlyingSymbolError::Empty);
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -31,15 +57,44 @@ impl std::fmt::Display for UnderlyingSymbol {
 }
 
 impl FromStr for UnderlyingSymbol {
-    type Err = std::convert::Infallible;
+    type Err = UnderlyingSymbolError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(value))
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for UnderlyingSymbol {
+    type Error = UnderlyingSymbolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnderlyingSymbol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
 /// Tokenized share symbol, e.g. `tSGOV`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    TS,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenSymbol(pub String);
 
@@ -84,6 +139,103 @@ impl Network {
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NetworkParseError {
+    #[error("unsupported network: {value}")]
+    Unsupported { value: String },
+}
+
+impl FromStr for Network {
+    type Err = NetworkParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "base" => Ok(Self::Base),
+            other => {
+                Err(NetworkParseError::Unsupported { value: other.to_string() })
+            }
+        }
+    }
+}
+
+/// Composite `TokenizedAsset` aggregate id and lookup key: `{underlying}:{network}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TS)]
+#[ts(type = "string")]
+pub struct AssetKey {
+    pub underlying: UnderlyingSymbol,
+    pub network: Network,
+}
+
+/// `AssetKey` serializes as the plain `{underlying}:{network}` string, so its
+/// OpenAPI schema must be a string as well -- the derived `ToSchema` would
+/// advertise an object with `underlying`/`network` properties that never
+/// appears on the wire.
+#[cfg(feature = "utoipa")]
+impl utoipa::PartialSchema for AssetKey {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+#[cfg(feature = "utoipa")]
+impl utoipa::ToSchema for AssetKey {}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AssetKeyParseError {
+    #[error("asset key must be {{underlying}}:{{network}}, got: {value}")]
+    InvalidFormat { value: String },
+    #[error(transparent)]
+    UnderlyingSymbol(#[from] UnderlyingSymbolError),
+    #[error(transparent)]
+    Network(#[from] NetworkParseError),
+}
+
+impl AssetKey {
+    #[must_use]
+    pub const fn new(underlying: UnderlyingSymbol, network: Network) -> Self {
+        Self { underlying, network }
+    }
+}
+
+impl std::fmt::Display for AssetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.underlying, self.network)
+    }
+}
+
+impl FromStr for AssetKey {
+    type Err = AssetKeyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (underlying, network_str) =
+            value.rsplit_once(':').ok_or_else(|| {
+                AssetKeyParseError::InvalidFormat { value: value.to_string() }
+            })?;
+        let underlying = UnderlyingSymbol::new(underlying)?;
+        let network = network_str.parse()?;
+        Ok(Self::new(underlying, network))
+    }
+}
+
+impl Serialize for AssetKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -176,6 +328,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     UnderlyingSymbol::export_all_to(out_dir)?;
     TokenSymbol::export_all_to(out_dir)?;
     Network::export_all_to(out_dir)?;
+    AssetKey::export_all_to(out_dir)?;
     TokenizedAssetDetailResponse::export_all_to(out_dir)?;
     TokenizedAssetStatus::export_all_to(out_dir)?;
     TokenizedAssetStatusResponse::export_all_to(out_dir)?;
@@ -188,6 +341,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -197,9 +351,84 @@ mod tests {
     }
 
     #[test]
+    fn underlying_symbol_rejects_empty_and_whitespace() {
+        assert!(UnderlyingSymbol::new("").is_err());
+        assert!(UnderlyingSymbol::new("   ").is_err());
+        assert_eq!(UnderlyingSymbol::new("AAPL").unwrap().as_str(), "AAPL");
+        assert_eq!(UnderlyingSymbol::new(" AAPL ").unwrap().as_str(), "AAPL");
+        assert_eq!(
+            serde_json::from_value::<UnderlyingSymbol>(json!(" AAPL "))
+                .unwrap(),
+            UnderlyingSymbol::new("AAPL").unwrap()
+        );
+    }
+
+    prop_compose! {
+        fn arb_trimmed_symbol()(core in "[A-Z0-9][A-Z0-9._/-]{0,9}") -> String {
+            core
+        }
+    }
+
+    prop_compose! {
+        fn arb_whitespace()(ws in "[ \t]{0,8}") -> String {
+            ws
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn underlying_symbol_stores_trimmed_value(
+            core in arb_trimmed_symbol(),
+            prefix in arb_whitespace(),
+            suffix in arb_whitespace(),
+        ) {
+            let padded = format!("{prefix}{core}{suffix}");
+            let symbol = UnderlyingSymbol::new(&padded).unwrap();
+            prop_assert_eq!(symbol.as_str(), core);
+            prop_assert_eq!(symbol.as_str().trim(), symbol.as_str());
+        }
+
+        #[test]
+        fn underlying_symbol_rejects_whitespace_only(ws in "[ \t]+") {
+            prop_assert!(UnderlyingSymbol::new(ws).is_err());
+        }
+
+        #[test]
+        fn underlying_symbol_from_str_agrees_with_new(
+            core in arb_trimmed_symbol(),
+            prefix in arb_whitespace(),
+            suffix in arb_whitespace(),
+        ) {
+            let padded = format!("{prefix}{core}{suffix}");
+            prop_assert_eq!(
+                UnderlyingSymbol::from_str(&padded).unwrap(),
+                UnderlyingSymbol::new(&padded).unwrap(),
+            );
+        }
+
+        #[test]
+        fn underlying_symbol_serde_preserves_trimmed_value(
+            core in arb_trimmed_symbol(),
+            prefix in arb_whitespace(),
+            suffix in arb_whitespace(),
+        ) {
+            let symbol = UnderlyingSymbol::new(&core).unwrap();
+            let serialized = serde_json::to_value(&symbol).unwrap();
+            prop_assert_eq!(serialized, json!(core));
+
+            let from_padded = serde_json::from_value::<UnderlyingSymbol>(
+                json!(format!("{prefix}{core}{suffix}"))
+            )
+            .unwrap();
+            prop_assert_eq!(from_padded, symbol);
+        }
+    }
+
+    #[test]
     fn newtypes_serialize_as_bare_strings() {
         assert_eq!(
-            serde_json::to_value(UnderlyingSymbol::new("SGOV")).unwrap(),
+            serde_json::to_value(UnderlyingSymbol::new("SGOV").unwrap())
+                .unwrap(),
             json!("SGOV")
         );
         assert_eq!(
@@ -213,7 +442,7 @@ mod tests {
     fn newtypes_deserialize_from_bare_strings() {
         assert_eq!(
             serde_json::from_value::<UnderlyingSymbol>(json!("SGOV")).unwrap(),
-            UnderlyingSymbol::new("SGOV")
+            UnderlyingSymbol::new("SGOV").unwrap()
         );
         assert_eq!(
             serde_json::from_value::<TokenSymbol>(json!("tSGOV")).unwrap(),
@@ -238,19 +467,33 @@ mod tests {
                 "{invalid} must not deserialize as Network"
             );
         }
+        assert!(
+            serde_json::from_value::<UnderlyingSymbol>(json!("")).is_err(),
+            "empty underlying must not deserialize"
+        );
+        assert!(
+            serde_json::from_value::<UnderlyingSymbol>(json!("   ")).is_err(),
+            "whitespace-only underlying must not deserialize"
+        );
     }
 
     #[test]
     fn newtypes_display_their_inner_value() {
-        assert_eq!(UnderlyingSymbol::new("SGOV").to_string(), "SGOV");
+        assert_eq!(UnderlyingSymbol::new("SGOV").unwrap().to_string(), "SGOV");
         assert_eq!(TokenSymbol::new("tSGOV").to_string(), "tSGOV");
         assert_eq!(Network::Base.to_string(), "base");
     }
 
     #[test]
+    fn network_from_str_parses_wire_values() {
+        assert_eq!("base".parse::<Network>().unwrap(), Network::Base);
+        assert!("ethereum".parse::<Network>().is_err());
+    }
+
+    #[test]
     fn status_response_uses_snake_case_wire_format() {
         let response = TokenizedAssetStatusResponse {
-            underlying: UnderlyingSymbol::new("SGOV"),
+            underlying: UnderlyingSymbol::new("SGOV").unwrap(),
             status: TokenizedAssetStatus::Frozen,
         };
 
@@ -267,7 +510,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.underlying, UnderlyingSymbol::new("SGOV"));
+        assert_eq!(response.underlying, UnderlyingSymbol::new("SGOV").unwrap());
         assert_eq!(response.status, TokenizedAssetStatus::Enabled);
     }
 
@@ -308,7 +551,7 @@ mod tests {
     fn list_response_uses_snake_case_wire_format() {
         let response = TokenizedAssetsListResponse {
             tokens: vec![TokenizedAssetResponse {
-                underlying: UnderlyingSymbol::new("SGOV"),
+                underlying: UnderlyingSymbol::new("SGOV").unwrap(),
                 token: TokenSymbol::new("tSGOV"),
                 networks: vec![Network::Base],
             }],
@@ -329,7 +572,7 @@ mod tests {
     #[test]
     fn detail_response_serializes_vault_as_string_and_round_trips() {
         let response = TokenizedAssetDetailResponse {
-            underlying: UnderlyingSymbol::new("SGOV"),
+            underlying: UnderlyingSymbol::new("SGOV").unwrap(),
             token: TokenSymbol::new("tSGOV"),
             network: Network::Base,
             vault: vault(),
@@ -364,16 +607,47 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(request.underlying, UnderlyingSymbol::new("SGOV"));
+        assert_eq!(request.underlying, UnderlyingSymbol::new("SGOV").unwrap());
         assert_eq!(request.token, TokenSymbol::new("tSGOV"));
         assert_eq!(request.network, Network::Base);
         assert_eq!(request.vault, vault());
     }
 
     #[test]
+    fn asset_key_serializes_as_underlying_colon_network() {
+        let key = AssetKey::new(
+            UnderlyingSymbol::new("SGOV").unwrap(),
+            Network::Base,
+        );
+        assert_eq!(key.to_string(), "SGOV:base");
+        assert_eq!(serde_json::to_value(&key).unwrap(), json!("SGOV:base"));
+        assert_eq!("SGOV:base".parse::<AssetKey>().unwrap(), key);
+    }
+
+    #[test]
+    fn asset_key_from_str_rejects_invalid_inputs() {
+        assert!(matches!(
+            "SGOV".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::InvalidFormat { .. }
+        ));
+        assert!(matches!(
+            ":base".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::UnderlyingSymbol(UnderlyingSymbolError::Empty)
+        ));
+        assert!(matches!(
+            "SGOV:".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::Network(NetworkParseError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            "SGOV:ethereum".parse::<AssetKey>().unwrap_err(),
+            AssetKeyParseError::Network(NetworkParseError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
     fn add_response_uses_snake_case_wire_format() {
         let response = AddTokenizedAssetResponse {
-            underlying: UnderlyingSymbol::new("SGOV"),
+            underlying: UnderlyingSymbol::new("SGOV").unwrap(),
         };
 
         assert_eq!(
@@ -424,6 +698,15 @@ mod tests {
         assert!(
             network_ts.contains("\"base\""),
             "Network must be a \"base\" string-literal union in TS:\n{network_ts}"
+        );
+
+        // `AssetKey` serializes as `"underlying:network"`; pin the TS alias so
+        // ts_rs can't regress to a struct shape the dashboard can't consume.
+        let asset_key_ts =
+            std::fs::read_to_string(out_dir.join("AssetKey.ts")).unwrap();
+        assert!(
+            asset_key_ts.contains("= string"),
+            "AssetKey must be a string alias in TS:\n{asset_key_ts}"
         );
 
         // The newtypes must resolve to a bare `string`, matching their

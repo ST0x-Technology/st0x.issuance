@@ -1375,7 +1375,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-roundtrip"),
             issuer_request_id.clone(),
-            UnderlyingSymbol::new("TSLA"),
+            UnderlyingSymbol::new("TSLA").unwrap(),
             Quantity(Decimal::new(5050, 2)),
             Utc::now(),
             Some("test notes".to_string()),
@@ -1623,7 +1623,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-cbor-test"),
             expected_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity(Decimal::new(1005, 1)),
             Utc.timestamp_opt(1_704_067_200, 0).unwrap(),
             Some("cbor test".to_string()),
@@ -2778,7 +2778,7 @@ mod tests {
         ReceiptInformation::new(
             TokenizationRequestId::new("tok-test"),
             issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity(Decimal::new(100, 0)),
             Utc::now(),
             None,
@@ -2797,7 +2797,7 @@ mod tests {
             ReceiptInformation::new(
                 TokenizationRequestId::new(tok_id),
                 issuer_request_id,
-                UnderlyingSymbol::new(symbol),
+                UnderlyingSymbol::new(symbol).unwrap(),
                 Quantity(Decimal::new(qty, 2)),
                 Utc.timestamp_opt(timestamp_secs, 0).unwrap(),
                 notes,
@@ -2838,7 +2838,7 @@ mod tests {
         let receipt_info = ReceiptInformation::new(
             TokenizationRequestId::new("tok-anvil-test"),
             original_issuer_request_id.clone(),
-            UnderlyingSymbol::new("AAPL"),
+            UnderlyingSymbol::new("AAPL").unwrap(),
             Quantity(Decimal::new(10050, 2)),
             chrono::Utc::now(),
             Some("Anvil integration test".to_string()),

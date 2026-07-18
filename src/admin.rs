@@ -1894,7 +1894,7 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
@@ -2158,7 +2158,7 @@ mod tests {
     fn test_metadata() -> RedemptionMetadata {
         RedemptionMetadata {
             issuer_request_id: IssuerRedemptionRequestId::random(),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: Quantity::new(Decimal::from(100)),
@@ -2722,7 +2722,7 @@ mod tests {
         if let TokenizationRequest::Redeem { ref mut underlying, .. } =
             mismatched
         {
-            *underlying = UnderlyingSymbol::new("WRONG");
+            *underlying = UnderlyingSymbol::new("WRONG").unwrap();
         }
 
         let alpaca: Arc<dyn AlpacaService> =
@@ -4124,10 +4124,11 @@ mod tests {
                 .build(())
                 .await
                 .expect("tokenized asset store should build");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let key = AssetKey::new(underlying.clone(), Network::Base);
         asset_store
             .send(
-                &underlying,
+                &key,
                 TokenizedAssetCommand::Add {
                     underlying: underlying.clone(),
                     token: TokenSymbol::new("tAAPL"),
@@ -5135,7 +5136,7 @@ mod tests {
 
         let issuer_request_id = crate::mint::IssuerMintRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-stuck-1");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let network = Network::Base;
         let client_id = ClientId::new();
@@ -5281,7 +5282,7 @@ mod tests {
                 issuer_request_id: issuer_request_id.clone(),
                 tokenization_request_id: TokenizationRequestId::new("alp-completed"),
                 quantity: crate::mint::Quantity::new(Decimal::from(100)),
-                underlying: UnderlyingSymbol::new("AAPL"),
+                underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                 token: TokenSymbol::new("tAAPL"),
                 network: Network::Base,
                 client_id: ClientId::new(),
@@ -5322,7 +5323,7 @@ mod tests {
         use crate::redemption::{BurnExternalTxId, RedemptionEvent};
 
         let issuer = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));

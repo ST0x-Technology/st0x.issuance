@@ -239,7 +239,7 @@ impl RedeemCallManager {
                     status = ?response.status,
                     created_at = %response.created_at,
                     issuer = %response.issuer,
-                    underlying = %response.underlying.0,
+                    underlying = %response.underlying.as_str(),
                     token = %response.token.0,
                     quantity = %response.quantity.0,
                     network = %response.network,
@@ -351,7 +351,7 @@ mod tests {
     };
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
     };
     use crate::vault::VaultService;
     use crate::vault::mock::MockVaultService;
@@ -446,10 +446,13 @@ mod tests {
         ) {
             self.asset_store
                 .send(
-                    underlying,
+                    &AssetKey::new(underlying.clone(), *network),
                     TokenizedAssetCommand::Add {
                         underlying: underlying.clone(),
-                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        token: TokenSymbol::new(format!(
+                            "t{}",
+                            underlying.as_str()
+                        )),
                         network: *network,
                         vault: address!(
                             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -472,7 +475,7 @@ mod tests {
                     RedemptionCommand::Detect {
                         issuer_request_id: issuer_request_id.clone(),
                         underlying: underlying.clone(),
-                        token: TokenSymbol::new(format!("t{}", underlying.0)),
+                        token: TokenSymbol::new(format!("t{}", underlying.as_str())),
                         wallet,
                         quantity: Quantity::new(Decimal::from(100)),
                         tx_hash: b256!(
@@ -525,7 +528,7 @@ mod tests {
         store: &Store<Redemption>,
         issuer_request_id: &IssuerRedemptionRequestId,
     ) -> Redemption {
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -751,7 +754,7 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = harness.create_manager(alpaca_service);
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let network = Network::Base;
 
         harness.add_asset(&underlying, &network).await;
@@ -769,7 +772,7 @@ mod tests {
             as Arc<dyn crate::alpaca::AlpacaService>;
         let manager = RedeemCallManager::new(alpaca_service, store, pool);
 
-        let underlying = UnderlyingSymbol::new("UNKNOWN");
+        let underlying = UnderlyingSymbol::new("UNKNOWN").unwrap();
 
         let result = manager.lookup_network_for_asset(&underlying).await;
 
@@ -808,7 +811,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-recovery".to_string());
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let network = Network::Base;
 
         harness
@@ -868,7 +871,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-recovery".to_string());
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let network = Network::Base;
 
         harness
@@ -955,7 +958,7 @@ mod tests {
         let manager = harness.create_manager(alpaca_service);
 
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         harness
@@ -998,7 +1001,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let client_id = ClientId::new();
         let alpaca_account = AlpacaAccountNumber("acc-no-asset".to_string());
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
 
         harness
             .register_and_link_account(

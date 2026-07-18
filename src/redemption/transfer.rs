@@ -347,7 +347,7 @@ mod tests {
     use crate::test_utils::logs_contain_at;
     use crate::tokenized_asset::view::list_enabled_assets;
     use crate::tokenized_asset::{
-        Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
+        AssetKey, Network, TokenSymbol, TokenizedAsset, TokenizedAssetCommand,
         UnderlyingSymbol,
     };
     use crate::vault::mock::MockVaultService;
@@ -419,7 +419,13 @@ mod tests {
                 .await
                 .unwrap();
         asset_store
-            .send(&UnderlyingSymbol::new("AAPL"), TokenizedAssetCommand::Freeze)
+            .send(
+                &AssetKey::new(
+                    UnderlyingSymbol::new("AAPL").unwrap(),
+                    Network::Base,
+                ),
+                TokenizedAssetCommand::Freeze,
+            )
             .await
             .expect("Failed to freeze asset");
 
@@ -612,12 +618,13 @@ mod tests {
                 .build(())
                 .await
                 .unwrap();
-        let tsla = UnderlyingSymbol::new("TSLA");
+        let tsla = UnderlyingSymbol::new("TSLA").unwrap();
+        let key = AssetKey::new(tsla.clone(), Network::Base);
         asset_store
             .send(
-                &tsla,
+                &key,
                 TokenizedAssetCommand::Add {
-                    underlying: tsla.clone(),
+                    underlying: tsla,
                     token: TokenSymbol::new("tTSLA"),
                     network: Network::Base,
                     vault,

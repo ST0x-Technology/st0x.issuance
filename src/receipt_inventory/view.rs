@@ -375,7 +375,7 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let mint_id = IssuerMintRequestId::random();
 
@@ -415,7 +415,7 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let receipt_id = uint!(42_U256);
         let shares_minted = uint!(100_000000000000000000_U256);
@@ -484,7 +484,7 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let underlying = UnderlyingSymbol::new("NVDA");
+        let underlying = UnderlyingSymbol::new("NVDA").unwrap();
         let token = TokenSymbol::new("tNVDA");
         let mint_id = IssuerMintRequestId::random();
 
@@ -519,7 +519,7 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let underlying = UnderlyingSymbol::new("AMD");
+        let underlying = UnderlyingSymbol::new("AMD").unwrap();
         let token = TokenSymbol::new("tAMD");
         let receipt_id = uint!(7_U256);
         let shares_minted = uint!(250_500000000000000000_U256);
@@ -583,7 +583,7 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let underlying = UnderlyingSymbol::new("MSTR");
+        let underlying = UnderlyingSymbol::new("MSTR").unwrap();
         let token = TokenSymbol::new("tMSTR");
         let receipt_id = uint!(136_U256);
         let shares_minted = uint!(4_028802626000000000_U256);
@@ -651,8 +651,8 @@ mod tests {
         let harness =
             ReactorHarness::new(ReceiptInventoryViewReactor::new(pool.clone()));
 
-        let aapl_underlying = UnderlyingSymbol::new("AAPL");
-        let tsla_underlying = UnderlyingSymbol::new("TSLA");
+        let aapl_underlying = UnderlyingSymbol::new("AAPL").unwrap();
+        let tsla_underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let aapl_mint_id = IssuerMintRequestId::random();
         let tsla_mint_id = IssuerMintRequestId::random();
 
@@ -709,7 +709,7 @@ mod tests {
             .receive::<Mint>(
                 mint_id.clone(),
                 initiated_event(
-                    UnderlyingSymbol::new("AAPL"),
+                    UnderlyingSymbol::new("AAPL").unwrap(),
                     TokenSymbol::new("tAAPL"),
                     "alp-other",
                     address!("0x4444444444444444444444444444444444444444"),
@@ -804,7 +804,7 @@ mod tests {
         let pool = migrated_pool().await;
 
         let mint_id = IssuerMintRequestId::random();
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let receipt_id = uint!(42_U256);
         let shares_minted = uint!(100_000000000000000000_U256);
@@ -835,7 +835,7 @@ mod tests {
 
         // A stale pre-rebuild row must be replaced by the replay, not kept.
         let stale = ReceiptInventoryView::Pending {
-            underlying: UnderlyingSymbol::new("STALE"),
+            underlying: UnderlyingSymbol::new("STALE").unwrap(),
             token: TokenSymbol::new("tSTALE"),
         };
         seed_view_row(&pool, &aggregate_id, &stale).await;
@@ -867,7 +867,7 @@ mod tests {
         // Existing view content that must survive a failed rebuild.
         let survivor_id = IssuerMintRequestId::random();
         let survivor_view = ReceiptInventoryView::Pending {
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
         };
         seed_view_row(&pool, &survivor_id.to_string(), &survivor_view).await;
@@ -897,14 +897,14 @@ mod tests {
 
         let survivor_id = IssuerMintRequestId::random();
         let survivor_view = ReceiptInventoryView::Pending {
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
         };
         seed_view_row(&pool, &survivor_id.to_string(), &survivor_view).await;
 
         let replay_id = IssuerMintRequestId::random();
         let initiated = serde_json::to_string(&initiated_event(
-            UnderlyingSymbol::new("TSLA"),
+            UnderlyingSymbol::new("TSLA").unwrap(),
             TokenSymbol::new("tTSLA"),
             "alp-rebuild-write-failure",
             address!("0x1234567890abcdef1234567890abcdef12345678"),

@@ -7,6 +7,7 @@ use httpmock::MockServer;
 use st0x_issuance::test_utils::LocalEvm;
 use st0x_issuance::tokenized_asset::{TokenizedAssetStatus, UnderlyingSymbol};
 use st0x_issuance_client::IssuanceClient;
+use st0x_issuance_dto::Network;
 
 const UNDERLYING: &str = "TSLA";
 const TOKEN: &str = "tTSLA";
@@ -51,10 +52,13 @@ async fn tokenized_asset_status_via_client()
     let client = IssuanceClient::new(base_url, INTERNAL_API_KEY)?;
 
     let status = client
-        .tokenized_asset_status(&UnderlyingSymbol::new(UNDERLYING))
+        .tokenized_asset_status(
+            &UnderlyingSymbol::new(UNDERLYING).unwrap(),
+            &Network::Base,
+        )
         .await?
         .expect("seeded asset has a status");
-    assert_eq!(status.underlying, UnderlyingSymbol::new(UNDERLYING));
+    assert_eq!(status.underlying, UnderlyingSymbol::new(UNDERLYING).unwrap());
     assert_eq!(
         status.status,
         TokenizedAssetStatus::Enabled,
@@ -62,18 +66,28 @@ async fn tokenized_asset_status_via_client()
     );
 
     let frozen = client
-        .tokenized_asset_status(&UnderlyingSymbol::new(FROZEN_UNDERLYING))
+        .tokenized_asset_status(
+            &UnderlyingSymbol::new(FROZEN_UNDERLYING).unwrap(),
+            &Network::Base,
+        )
         .await?
         .expect("seeded frozen asset has a status");
-    assert_eq!(frozen.underlying, UnderlyingSymbol::new(FROZEN_UNDERLYING));
+    assert_eq!(
+        frozen.underlying,
+        UnderlyingSymbol::new(FROZEN_UNDERLYING).unwrap()
+    );
     assert_eq!(
         frozen.status,
         TokenizedAssetStatus::Frozen,
         "asset with a Frozen event should report frozen through the client"
     );
 
-    let unknown =
-        client.tokenized_asset_status(&UnderlyingSymbol::new("NOPE")).await?;
+    let unknown = client
+        .tokenized_asset_status(
+            &UnderlyingSymbol::new("NOPE").unwrap(),
+            &Network::Base,
+        )
+        .await?;
     assert!(unknown.is_none(), "unknown asset should have no status");
 
     Ok(())

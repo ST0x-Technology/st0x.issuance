@@ -178,7 +178,7 @@ impl AlpacaService for MockAlpacaService {
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
                     )),
                     status: RedeemRequestStatus::Completed,
-                    underlying: UnderlyingSymbol::new("AAPL"),
+                    underlying: UnderlyingSymbol::new("AAPL").unwrap(),
                     token: TokenSymbol::new("tAAPL"),
                     quantity: Quantity::new(Decimal::from(100)),
                     wallet: address!(
@@ -202,21 +202,31 @@ impl AlpacaService for MockAlpacaService {
         }
 
         #[cfg(not(test))]
-        Ok(TokenizationRequest::Redeem {
-            id: tokenization_request_id.clone(),
-            issuer_request_id: IssuerRedemptionRequestId::new(b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            )),
-            status: RedeemRequestStatus::Completed,
-            underlying: UnderlyingSymbol::new("AAPL"),
-            token: TokenSymbol::new("tAAPL"),
-            quantity: Quantity::new(rust_decimal::Decimal::from(100)),
-            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            tx_hash: Some(b256!(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-            )),
-            updated_at: Some(Utc::now()),
-        })
+        {
+            let underlying = UnderlyingSymbol::new("AAPL").map_err(|_| {
+                AlpacaError::Api {
+                    status_code: 500,
+                    body: "mock misconfigured: AAPL is not a valid underlying"
+                        .to_string(),
+                }
+            })?;
+
+            return Ok(TokenizationRequest::Redeem {
+                id: tokenization_request_id.clone(),
+                issuer_request_id: IssuerRedemptionRequestId::new(b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                )),
+                status: RedeemRequestStatus::Completed,
+                underlying,
+                token: TokenSymbol::new("tAAPL"),
+                quantity: Quantity::new(rust_decimal::Decimal::from(100)),
+                wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+                tx_hash: Some(b256!(
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                )),
+                updated_at: Some(Utc::now()),
+            });
+        }
     }
 }
 
@@ -314,7 +324,7 @@ mod tests {
         );
         RedeemRequest {
             issuer_request_id: IssuerRedemptionRequestId::new(tx_hash),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             client_id: ClientId::new(),
             quantity: Quantity::new(Decimal::from(100)),

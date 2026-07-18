@@ -849,7 +849,7 @@ mod tests {
                 id,
                 RedemptionEvent::Detected {
                     issuer_request_id: id.clone(),
-                    underlying: UnderlyingSymbol::new(underlying),
+                    underlying: UnderlyingSymbol::new(underlying).unwrap(),
                     token: TokenSymbol::new(format!("t{underlying}")),
                     wallet,
                     quantity: Quantity::new(Decimal::from(quantity)),
@@ -981,7 +981,7 @@ mod tests {
             ReactorHarness::new(RedemptionViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1044,7 +1044,7 @@ mod tests {
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id = TokenizationRequestId::new("alp-tok-456");
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
         let quantity = Quantity::new(Decimal::from(50));
@@ -1127,7 +1127,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burning-456");
-        let underlying = UnderlyingSymbol::new("NVDA");
+        let underlying = UnderlyingSymbol::new("NVDA").unwrap();
         let token = TokenSymbol::new("tNVDA");
         let wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let quantity = Quantity::new(Decimal::from(25));
@@ -1230,7 +1230,7 @@ mod tests {
             ReactorHarness::new(RedemptionViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("META");
+        let underlying = UnderlyingSymbol::new("META").unwrap();
         let token = TokenSymbol::new("tMETA");
         let wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let quantity = Quantity::new(Decimal::from(75));
@@ -1292,7 +1292,7 @@ mod tests {
             ReactorHarness::new(RedemptionViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("GOOGL");
+        let underlying = UnderlyingSymbol::new("GOOGL").unwrap();
         let token = TokenSymbol::new("tGOOGL");
         let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let quantity = Quantity::new(Decimal::from(10));
@@ -1647,7 +1647,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("alp-burn-failed-456");
-        let underlying = UnderlyingSymbol::new("AAPL");
+        let underlying = UnderlyingSymbol::new("AAPL").unwrap();
         let token = TokenSymbol::new("tAAPL");
         let wallet = address!("0xdddddddddddddddddddddddddddddddddddddddd");
         let quantity = Quantity::new(Decimal::from(100));
@@ -1827,7 +1827,7 @@ mod tests {
 
         let detected_event = RedemptionEvent::Detected {
             issuer_request_id: issuer_request_id.clone(),
-            underlying: UnderlyingSymbol::new("AAPL"),
+            underlying: UnderlyingSymbol::new("AAPL").unwrap(),
             token: TokenSymbol::new("tAAPL"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             quantity: quantity.clone(),
@@ -2053,7 +2053,7 @@ mod tests {
             ReactorHarness::new(RedemptionViewReactor::new(pool.clone()));
 
         let issuer_request_id = IssuerRedemptionRequestId::random();
-        let underlying = UnderlyingSymbol::new("RKLB");
+        let underlying = UnderlyingSymbol::new("RKLB").unwrap();
         let token = TokenSymbol::new("tRKLB");
         let wallet = address!("0x9876543210fedcba9876543210fedcba98765432");
         let quantity = Quantity::new(Decimal::from(100));
@@ -2150,7 +2150,7 @@ mod tests {
         let issuer_request_id = IssuerRedemptionRequestId::random();
         let tokenization_request_id =
             TokenizationRequestId::new("tok-resumed-789");
-        let underlying = UnderlyingSymbol::new("TSLA");
+        let underlying = UnderlyingSymbol::new("TSLA").unwrap();
         let token = TokenSymbol::new("tTSLA");
         let wallet = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let quantity = Quantity::new(Decimal::from(42));
