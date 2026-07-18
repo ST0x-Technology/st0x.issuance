@@ -1072,7 +1072,6 @@ mod tests {
                 harness.pool.clone(),
                 (),
             ));
-            let vault_services = network_vault_services(harness.vault.clone());
 
             let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
                 harness;
