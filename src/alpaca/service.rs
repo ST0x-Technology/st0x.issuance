@@ -417,10 +417,7 @@ impl AlpacaService for RealAlpacaService {
                 }
                 status => {
                     let body = response.text().await?;
-                    Err(AlpacaError::Api {
-                        status_code: status.as_u16(),
-                        body,
-                    })
+                    Err(AlpacaError::Api { status_code: status.as_u16(), body })
                 }
             }
         })
@@ -433,7 +430,9 @@ impl AlpacaService for RealAlpacaService {
         .notify(|err: &AlpacaError, dur: std::time::Duration| {
             tracing::debug!(
                 target: "alpaca",
-                "Alpaca announcements API call failed with {err}, retrying after {dur:?}"
+                error = %err,
+                retry_after = ?dur,
+                "Alpaca announcements API call failed; retrying"
             );
         })
         .await
@@ -1761,6 +1760,7 @@ mod tests {
     // The announcements fetch sends the dividend/ex-date filters and the
     // requested range, and deserializes the documented wire shape — including
     // announcements whose ex_date is not set yet.
+    #[traced_test]
     #[tokio::test]
     async fn test_list_dividend_announcements_success() {
         let server = MockServer::start();
@@ -1842,10 +1842,15 @@ mod tests {
             ]
         );
         mock.assert();
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Listing Alpaca dividend announcements", "2026-07-13"]
+        ));
     }
 
     // A 5xx from the announcements endpoint is retried up to the budget and
     // then surfaced as a retryable Api error for the sync loop to log.
+    #[traced_test]
     #[tokio::test]
     async fn test_list_dividend_announcements_server_error_retries() {
         let server = MockServer::start();
@@ -1875,5 +1880,9 @@ mod tests {
 
         assert!(matches!(err, AlpacaError::Api { status_code: 500, .. }));
         mock.assert_calls(3);
+        assert!(logs_contain_at!(
+            tracing::Level::DEBUG,
+            &["Alpaca announcements API call failed; retrying"]
+        ));
     }
 }
