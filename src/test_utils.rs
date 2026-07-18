@@ -14,6 +14,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use event_sorcery::{Store, StoreBuilder};
 use rocket::routes;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
 
@@ -36,6 +37,31 @@ use crate::tokenized_asset::{
 };
 use crate::vault::mock::MockVaultService;
 use crate::wallet::SignerConfig;
+
+/// Builds Anvil with startup output enabled when stdout is piped by Alloy.
+///
+/// Foundry 1.6 suppresses its startup banner for non-TTY stdout in `auto`
+/// color mode. Alloy 1.0.42 waits for that banner to discover the bound port,
+/// so force non-colored output for every test instance. Nix wraps Anvil to
+/// inject Git into `PATH`; on macOS, expanding a large `PATH` in that Bash
+/// wrapper can exceed Alloy's startup timeout. The adjacent wrapped executable
+/// is the real Anvil binary and does not need Git for these local test nodes.
+pub(crate) fn test_anvil() -> Anvil {
+    let builder = find_anvil().map_or_else(Anvil::new, |path| {
+        let wrapped = path.with_file_name(".anvil-wrapped");
+        if wrapped.is_file() { Anvil::at(wrapped) } else { Anvil::at(path) }
+    });
+
+    builder.args(["--color", "never"])
+}
+
+fn find_anvil() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("anvil"))
+            .find(|candidate| candidate.is_file())
+    })
+}
 
 /// Returns test Alpaca legacy auth credentials for mock Alpaca API requests.
 ///
@@ -254,7 +280,7 @@ impl LocalEvm {
     /// Returns an error if Anvil startup, provider connection, or contract
     /// deployment fails.
     pub async fn with_chain_id(chain_id: u64) -> Result<Self, LocalEvmError> {
-        let anvil = Anvil::new().chain_id(chain_id).spawn();
+        let anvil = test_anvil().chain_id(chain_id).spawn();
         let endpoint = anvil.ws_endpoint();
 
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
