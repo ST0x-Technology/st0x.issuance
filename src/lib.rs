@@ -5,7 +5,7 @@ use apalis_sqlite::SqlitePool as ApalisSqlitePool;
 use event_sorcery::{
     EventSourced, ReconcileError, Reconciler, Store, StoreBuilder,
 };
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use rocket::routes;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::{future::Future, sync::Arc, time::Duration};
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -369,72 +370,43 @@ pub async fn initialize_rocket(
     run_recovery_with_timeout(&pool, &apalis_pool, &managers, &receipt_vaults)
         .await;
 
-    // Drain MintRecoveryJobs in the background: the worker runs the per-mint
-    // recovery budget loop for each enqueued job. Spawned only AFTER the
-    // synchronous startup re-scan above finishes, so a mint is never driven by
-    // two recovery drivers at once: the re-scan reads recoverable mints
-    // independently of the Jobs table, so a worker draining a leftover job
-    // from t=0 would execute the same external side effects (transaction
-    // submission, Alpaca callback) for the same mint concurrently with the
-    // re-scan. The only cost is that jobs enqueued by the re-scan start
-    // draining moments later.
-    spawn_mint_recovery_worker(
-        apalis_pool.clone(),
-        pool.clone(),
-        mint_store.clone(),
-        network_vault_services.clone(),
-        Arc::new(CqrsReceiptService::new(receipt_inventory_store.clone())),
-    );
-
-    // Drain the per-step mint side-effect jobs (submit -> confirm -> callback).
-    // Each job performs one external call off the command handler and enqueues
-    // the next; the handlers stay pure. Spawned after the startup re-scan for
-    // the same single-driver reason as the recovery worker: a leftover
-    // submit/confirm/callback job row from a crash and the re-scan would
-    // otherwise drive the same mint's side effects concurrently.
-    spawn_mint_job_workers(MintJobWorkers {
-        pool: pool.clone(),
-        apalis_pool: apalis_pool.clone(),
-        mint_store: mint_store.clone(),
-        vaults: network_vault_services.clone(),
-        alpaca: alpaca_service.clone(),
-        receipts: Arc::new(CqrsReceiptService::new(
-            receipt_inventory_store.clone(),
-        )),
-        bot: bot_wallet,
-    });
-
-    // Periodically re-enqueue recoverable mints that lost their recovery job
-    // (e.g. an enqueue that failed during a transient SQLite outage at confirm
-    // time), so a stranded mint is picked up promptly at startup and then once
-    // per interval instead of waiting for the next process restart.
-    spawn_mint_recovery_reconciler(pool.clone(), apalis_pool.clone());
-    spawn_burn_recovery_reconciler(managers.burn.clone());
-
-    // Flipped by the rocket shutdown fairing so the spawned chain-scanning
-    // loops stop with the server instead of outliving it. In production the
-    // whole process exits and takes them along; this matters when a server is
-    // shut down in-process — the cutover e2e stops and restarts services on
-    // one database, and a leaked poller from a "stopped" service keeps
-    // scanning and races the replacement.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut background_task_handles = Vec::new();
+
+    background_task_handles.extend(spawn_mint_background_tasks(
+        MintJobWorkers {
+            pool: pool.clone(),
+            apalis_pool: apalis_pool.clone(),
+            mint_store: mint_store.clone(),
+            vaults: network_vault_services.clone(),
+            alpaca: alpaca_service.clone(),
+            receipts: Arc::new(CqrsReceiptService::new(
+                receipt_inventory_store.clone(),
+            )),
+            bot: bot_wallet,
+        },
+        managers.burn.clone(),
+        shutdown_rx.clone(),
+    ));
 
     for (network, runtime) in chain_registry.runtimes() {
-        spawn_periodic_receipt_backfills(PeriodicBackfillSpawn {
-            pool: pool.clone(),
-            provider: runtime.http_provider.clone(),
-            network: *network,
-            chain_id: runtime.chain_id,
-            receipt_inventory_store: receipt_inventory_store.clone(),
-            bot_wallet,
-            backfill_start_block: runtime.backfill_start_block,
-            receipt_poll_interval: config.receipt_poll_interval,
-            handler: MintRecoveryHandler::new(
-                pool.clone(),
-                apalis_pool.clone(),
-            ),
-            shutdown: shutdown_rx.clone(),
-        });
+        background_task_handles.push(spawn_periodic_receipt_backfills(
+            PeriodicBackfillSpawn {
+                pool: pool.clone(),
+                provider: runtime.http_provider.clone(),
+                network: *network,
+                chain_id: runtime.chain_id,
+                receipt_inventory_store: receipt_inventory_store.clone(),
+                bot_wallet,
+                backfill_start_block: runtime.backfill_start_block,
+                receipt_poll_interval: config.receipt_poll_interval,
+                handler: MintRecoveryHandler::new(
+                    pool.clone(),
+                    apalis_pool.clone(),
+                ),
+                shutdown: shutdown_rx.clone(),
+            },
+        ));
     }
 
     {
@@ -459,35 +431,40 @@ pub async fn initialize_rocket(
             });
 
             let mut poller_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            background_task_handles.push(tokio::spawn(async move {
                 tokio::select! {
                     () = poller.run() => {}
                     _ = poller_shutdown.changed() => {}
                 }
-            });
+            }));
         }
     }
 
     maintain_background_job_tables(&pool).await;
 
-    spawn_terminal_unfreeze_recovery(pool.clone(), shutdown_rx.clone());
-    spawn_freeze_schedule_worker(
+    background_task_handles.push(spawn_terminal_unfreeze_recovery(
+        pool.clone(),
+        shutdown_rx.clone(),
+    ));
+    background_task_handles.push(spawn_freeze_schedule_worker(
         apalis_pool.clone(),
         pool.clone(),
         underlying_store,
         lifecycle_notifier.clone(),
-    );
-    spawn_lifecycle_notification_worker(
+        shutdown_rx.clone(),
+    ));
+    background_task_handles.push(spawn_lifecycle_notification_worker(
         apalis_pool.clone(),
         lifecycle_notifier.clone(),
-    );
+        shutdown_rx.clone(),
+    ));
 
     let freeze_scheduler = tokenized_asset::schedule::FreezeScheduler::new(
         &apalis_pool,
         pool.clone(),
     );
 
-    let _corporate_actions_sync =
+    background_task_handles.push(
         tokenized_asset::corporate_actions::spawn_corporate_actions_sync(
             tokenized_asset::corporate_actions::CorporateActionsSync {
                 alpaca: alpaca_service.clone(),
@@ -497,7 +474,8 @@ pub async fn initialize_rocket(
                 notifier: lifecycle_notifier.clone(),
             },
             shutdown_rx.clone(),
-        );
+        ),
+    );
 
     Ok(build_rocket(RocketState {
         rate_limiter: FailedAuthRateLimiter::new()?,
@@ -515,7 +493,10 @@ pub async fn initialize_rocket(
         configured_networks,
         freeze_scheduler,
         receipts: Arc::new(CqrsReceiptService::new(receipt_inventory_store)),
-        shutdown: shutdown_tx,
+        background_tasks: BackgroundTasks {
+            shutdown: shutdown_tx,
+            handles: background_task_handles,
+        },
     }))
 }
 
@@ -609,8 +590,83 @@ struct RocketState {
     /// Receipt inventory reads for the admin close-mint safety gate (the
     /// vault-direct landed check).
     receipts: Arc<dyn ReceiptService>,
-    /// Stops the spawned chain-scanning loops when the server shuts down.
+    background_tasks: BackgroundTasks,
+}
+
+struct BackgroundTasks {
     shutdown: tokio::sync::watch::Sender<bool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+const BACKGROUND_TASK_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+impl BackgroundTasks {
+    async fn stop(self) {
+        self.stop_with_grace(BACKGROUND_TASK_SHUTDOWN_GRACE_PERIOD).await;
+    }
+
+    /// Bounds the combined graceful and post-abort drains by `grace_period`.
+    async fn stop_with_grace(self, grace_period: Duration) {
+        let _ = self.shutdown.send(true);
+        let abort_drain_budget = grace_period / 4;
+        let graceful_drain_budget =
+            grace_period.saturating_sub(abort_drain_budget);
+
+        let mut handles: FuturesUnordered<_> =
+            self.handles.into_iter().collect();
+        let graceful_drain = async {
+            while let Some(result) = handles.next().await {
+                log_background_task_failures(std::iter::once(result));
+            }
+        };
+
+        if tokio::time::timeout(graceful_drain_budget, graceful_drain)
+            .await
+            .is_err()
+        {
+            let aborted_tasks = handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .inspect(|handle| handle.abort())
+                .count();
+            warn!(
+                target: "startup",
+                aborted_tasks,
+                "Background task shutdown grace period expired"
+            );
+            let aborted_drain = async {
+                while let Some(result) = handles.next().await {
+                    log_background_task_failures(std::iter::once(result));
+                }
+            };
+            if tokio::time::timeout(abort_drain_budget, aborted_drain)
+                .await
+                .is_err()
+            {
+                let unresolved_tasks = handles
+                    .iter()
+                    .filter(|handle| !handle.is_finished())
+                    .count();
+                warn!(
+                    target: "startup",
+                    unresolved_tasks,
+                    "Background task abort drain timed out"
+                );
+            }
+        }
+    }
+}
+
+fn log_background_task_failures(
+    results: impl IntoIterator<Item = Result<(), tokio::task::JoinError>>,
+) {
+    for error in results
+        .into_iter()
+        .filter_map(Result::err)
+        .filter(|error| !error.is_cancelled())
+    {
+        warn!(%error, "Background task failed during shutdown");
+    }
 }
 
 fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
@@ -626,13 +682,13 @@ fn build_rocket(state: RocketState) -> rocket::Rocket<rocket::Build> {
     // Read before `state.config` is moved into management below.
     let environment = state.config.environment;
 
-    let stop_pollers = state.shutdown;
+    let background_tasks = state.background_tasks;
     let rocket = rocket::custom(figment)
         .attach(rocket::fairing::AdHoc::on_shutdown(
-            "stop background pollers",
+            "stop background tasks",
             |_| {
                 Box::pin(async move {
-                    let _ = stop_pollers.send(true);
+                    background_tasks.stop().await;
                 })
             },
         ))
@@ -989,36 +1045,51 @@ const TERMINAL_UNFREEZE_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
 fn spawn_mint_recovery_reconciler(
     pool: Pool<Sqlite>,
     apalis_pool: ApalisSqlitePool,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             reconcile_recoverable_mints(&pool, &apalis_pool).await;
-            tokio::time::sleep(MINT_RECOVERY_RECONCILE_INTERVAL).await;
+            tokio::select! {
+                () = tokio::time::sleep(MINT_RECOVERY_RECONCILE_INTERVAL) => {}
+                _ = shutdown.changed() => break,
+            }
         }
-    });
+    })
 }
 
 async fn run_burn_recovery_reconciler<Recover, RecoveryFuture>(
     interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut recover: Recover,
 ) where
     Recover: FnMut() -> RecoveryFuture,
     RecoveryFuture: Future<Output = ()>,
 {
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => break,
+        }
         recover().await;
     }
 }
 
-fn spawn_burn_recovery_reconciler(burn: Arc<BurnManager>) {
+fn spawn_burn_recovery_reconciler(
+    burn: Arc<BurnManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_burn_recovery_reconciler(BURN_RECOVERY_RECONCILE_INTERVAL, || {
-            let burn = burn.clone();
-            async move { burn.recover_unresolved_burns().await }
-        })
+        run_burn_recovery_reconciler(
+            BURN_RECOVERY_RECONCILE_INTERVAL,
+            shutdown,
+            || {
+                let burn = burn.clone();
+                async move { burn.recover_unresolved_burns().await }
+            },
+        )
         .await;
-    });
+    })
 }
 
 async fn run_redemption_recovery(
@@ -1445,7 +1516,9 @@ struct PeriodicBackfillSpawn<P, H> {
 /// re-pointed at runtime is reconciled without a restart. Receipt-contract
 /// addresses are resolved once per vault and cached, since a vault's receipt
 /// contract is immutable on-chain.
-fn spawn_periodic_receipt_backfills<P, H>(spawn: PeriodicBackfillSpawn<P, H>)
+fn spawn_periodic_receipt_backfills<P, H>(
+    spawn: PeriodicBackfillSpawn<P, H>,
+) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + Sync + 'static,
     H: ItnReceiptHandler + 'static,
@@ -1592,7 +1665,7 @@ where
                 );
             }
         }
-    });
+    })
 }
 
 /// A vault's own address, as opposed to the address of the ERC-1155 receipt
@@ -1673,6 +1746,30 @@ async fn create_apalis_pool(
 /// while still recovering quickly from a transient blip.
 const MINT_RECOVERY_WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+enum WorkerRestartDecision {
+    Restart,
+    Shutdown,
+}
+
+async fn wait_for_shutdown(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    if !*shutdown.borrow() {
+        let _ = shutdown.changed().await;
+    }
+    Ok(())
+}
+
+async fn restart_after_backoff(
+    backoff: Duration,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> WorkerRestartDecision {
+    tokio::select! {
+        () = tokio::time::sleep(backoff) => WorkerRestartDecision::Restart,
+        _ = shutdown.changed() => WorkerRestartDecision::Shutdown,
+    }
+}
+
 /// Spawns the apalis worker that drains [`MintRecoveryJob`]s. Each job runs the
 /// per-mint recovery budget loop to a terminal or exhausted state.
 ///
@@ -1681,17 +1778,16 @@ const MINT_RECOVERY_WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 /// loop rebuilds and re-runs it after a bounded backoff. Without this a single
 /// transient apalis/SQLite failure would permanently strand every queued
 /// recovery job until the whole process restarted, even while HTTP endpoints
-/// keep accepting traffic and enqueueing new jobs. No shutdown signal is wired
-/// in, so the SQLite-polling worker runs until the process exits; a clean
-/// `Ok(())` exit is therefore unexpected and treated like a crash — the loop
-/// restarts the monitor after the same backoff.
+/// keep accepting traffic and enqueueing new jobs. Rocket shutdown is forwarded
+/// through apalis so an in-flight job completes before the task exits.
 fn spawn_mint_recovery_worker(
     apalis_pool: ApalisSqlitePool,
     pool: Pool<Sqlite>,
     mint_store: Arc<Store<Mint>>,
     vault_services: NetworkVaultServices,
     receipts: Arc<dyn ReceiptService>,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let apalis_pool = apalis_pool.clone();
@@ -1722,20 +1818,21 @@ fn spawn_mint_recovery_worker(
                     .build(work::<MintRecoveryContext, MintRecoveryJob>)
             });
 
-            match monitor.run().await {
-                // No shutdown signal is wired in, so a clean exit is as
-                // unexpected as a crash; breaking here would permanently
-                // strand every queued recovery job. Restart instead.
+            let result = monitor
+                .run_with_signal(wait_for_shutdown(shutdown.clone()))
+                .await;
+            if *shutdown.borrow() {
+                break;
+            }
+
+            match result {
                 Ok(()) => {
                     warn!(
                         target: "mint",
                         backoff_secs =
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
-                        "Recovery worker monitor exited cleanly without a \
-                         shutdown signal; restarting"
+                        "Recovery worker monitor exited cleanly; restarting"
                     );
-                    tokio::time::sleep(MINT_RECOVERY_WORKER_RESTART_BACKOFF)
-                        .await;
                 }
                 Err(error) => {
                     // Degraded but self-recovering (the loop restarts the
@@ -1749,20 +1846,28 @@ fn spawn_mint_recovery_worker(
                             MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                         "Mint recovery worker crashed; restarting after backoff"
                     );
-                    tokio::time::sleep(MINT_RECOVERY_WORKER_RESTART_BACKOFF)
-                        .await;
                 }
             }
+
+            if matches!(
+                restart_after_backoff(
+                    MINT_RECOVERY_WORKER_RESTART_BACKOFF,
+                    &mut shutdown,
+                )
+                .await,
+                WorkerRestartDecision::Shutdown
+            ) {
+                break;
+            }
         }
-    });
+    })
 }
 
 /// Spawns a drainer worker for one durable job type, mirroring
 /// [`spawn_mint_recovery_worker`]: a fresh worker id per registration
 /// (load-bearing for crash recovery) and an in-process restart loop on transient
-/// apalis/SQLite failures. No shutdown signal is wired, so a clean `Ok(())`
-/// exit is unexpected and restarts after the same backoff — breaking would
-/// permanently strand that job stage's queue. A macro (not a generic fn)
+/// apalis/SQLite failures. Rocket shutdown is forwarded through apalis so
+/// current jobs complete before the monitor exits. A macro (not a generic fn)
 /// because apalis's `.build()` yields a deeply-nested worker type with no
 /// public alias, so the concrete job/context types must appear at the
 /// expansion site. Drainer-style: no apalis retry layer — the mint jobs record
@@ -1774,11 +1879,13 @@ macro_rules! spawn_drainer_worker {
         ::<$ctx:ty, $job:ty>,
         $apalis_pool:expr,
         $ctx_val:expr,
+        $shutdown:expr,
         $worker_name:expr,
         target: $target:literal $(,)?
     ) => {{
         let apalis_pool: ApalisSqlitePool = $apalis_pool;
         let ctx: Arc<$ctx> = $ctx_val;
+        let mut shutdown: tokio::sync::watch::Receiver<bool> = $shutdown;
         let worker_name: &'static str = $worker_name;
         tokio::spawn(async move {
             loop {
@@ -1797,22 +1904,22 @@ macro_rules! spawn_drainer_worker {
                     .build(work::<$ctx, $job>)
                 });
 
-                match monitor.run().await {
-                    // Unexpected without a shutdown signal; breaking here
-                    // would permanently strand every queued job for this stage.
+                let result = monitor
+                    .run_with_signal(wait_for_shutdown(shutdown.clone()))
+                    .await;
+                if *shutdown.borrow() {
+                    break;
+                }
+
+                match result {
                     Ok(()) => {
                         warn!(
                             target: $target,
                             worker = worker_name,
                             backoff_secs =
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
-                            "Job worker monitor exited cleanly without a \
-                             shutdown signal; restarting"
+                            "Job worker monitor exited cleanly; restarting"
                         );
-                        tokio::time::sleep(
-                            MINT_RECOVERY_WORKER_RESTART_BACKOFF,
-                        )
-                        .await;
                     }
                     Err(error) => {
                         warn!(
@@ -1823,14 +1930,22 @@ macro_rules! spawn_drainer_worker {
                                 MINT_RECOVERY_WORKER_RESTART_BACKOFF.as_secs(),
                             "Job worker crashed; restarting after backoff"
                         );
-                        tokio::time::sleep(
-                            MINT_RECOVERY_WORKER_RESTART_BACKOFF,
-                        )
-                        .await;
                     }
                 }
+
+                if matches!(
+                    restart_after_backoff(
+                        MINT_RECOVERY_WORKER_RESTART_BACKOFF,
+                        &mut shutdown,
+                    )
+                    .await,
+                    WorkerRestartDecision::Shutdown
+                )
+                {
+                    break;
+                }
             }
-        });
+        })
     }};
 }
 
@@ -1845,10 +1960,41 @@ struct MintJobWorkers {
     bot: Address,
 }
 
+/// Starts mint recovery, per-step mint jobs, and burn reconciliation only after
+/// the synchronous startup recovery pass has completed. This prevents a stale
+/// durable job and startup recovery from driving the same side effect at once.
+fn spawn_mint_background_tasks(
+    workers: MintJobWorkers,
+    burn: Arc<BurnManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
+    let mut handles = vec![
+        spawn_mint_recovery_worker(
+            workers.apalis_pool.clone(),
+            workers.pool.clone(),
+            workers.mint_store.clone(),
+            workers.vaults.clone(),
+            workers.receipts.clone(),
+            shutdown.clone(),
+        ),
+        spawn_mint_recovery_reconciler(
+            workers.pool.clone(),
+            workers.apalis_pool.clone(),
+            shutdown.clone(),
+        ),
+        spawn_burn_recovery_reconciler(burn, shutdown.clone()),
+    ];
+    handles.extend(spawn_mint_job_workers(workers, shutdown));
+    handles
+}
+
 /// Spawns the three drainer workers for the mint side-effect job chain. Each
 /// gets the per-step context its job needs to perform its external call and
 /// enqueue the next step.
-fn spawn_mint_job_workers(workers: MintJobWorkers) {
+fn spawn_mint_job_workers(
+    workers: MintJobWorkers,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Vec<JoinHandle<()>> {
     let MintJobWorkers {
         pool,
         apalis_pool,
@@ -1859,45 +2005,48 @@ fn spawn_mint_job_workers(workers: MintJobWorkers) {
         bot,
     } = workers;
 
-    spawn_drainer_worker!(
-        ::<SubmitMintContext, SubmitMintJob>,
-        apalis_pool.clone(),
-        Arc::new(SubmitMintContext {
-            mint_store: mint_store.clone(),
-            vaults: vaults.clone(),
-            receipts: receipts.clone(),
-            bot,
-            confirm_queue: JobQueue::new(&apalis_pool),
-            callback_queue: JobQueue::new(&apalis_pool),
-            pool: pool.clone(),
-            apalis_pool: apalis_pool.clone(),
-        }),
-        "mint-submit-worker",
-        target: "mint",
-    );
-
-    spawn_drainer_worker!(
-        ::<ConfirmMintContext, ConfirmMintJob>,
-        apalis_pool.clone(),
-        Arc::new(ConfirmMintContext {
-            mint_store: mint_store.clone(),
-            vaults,
-            receipts,
-            callback_queue: JobQueue::new(&apalis_pool),
-            pool,
-            apalis_pool: apalis_pool.clone(),
-        }),
-        "mint-confirm-worker",
-        target: "mint",
-    );
-
-    spawn_drainer_worker!(
-        ::<SendCallbackContext, SendCallbackJob>,
-        apalis_pool,
-        Arc::new(SendCallbackContext { mint_store, alpaca }),
-        "mint-callback-worker",
-        target: "mint",
-    );
+    vec![
+        spawn_drainer_worker!(
+            ::<SubmitMintContext, SubmitMintJob>,
+            apalis_pool.clone(),
+            Arc::new(SubmitMintContext {
+                mint_store: mint_store.clone(),
+                vaults: vaults.clone(),
+                receipts: receipts.clone(),
+                bot,
+                confirm_queue: JobQueue::new(&apalis_pool),
+                callback_queue: JobQueue::new(&apalis_pool),
+                pool: pool.clone(),
+                apalis_pool: apalis_pool.clone(),
+            }),
+            shutdown.clone(),
+            "mint-submit-worker",
+            target: "mint",
+        ),
+        spawn_drainer_worker!(
+            ::<ConfirmMintContext, ConfirmMintJob>,
+            apalis_pool.clone(),
+            Arc::new(ConfirmMintContext {
+                mint_store: mint_store.clone(),
+                vaults,
+                receipts,
+                callback_queue: JobQueue::new(&apalis_pool),
+                pool,
+                apalis_pool: apalis_pool.clone(),
+            }),
+            shutdown.clone(),
+            "mint-confirm-worker",
+            target: "mint",
+        ),
+        spawn_drainer_worker!(
+            ::<SendCallbackContext, SendCallbackJob>,
+            apalis_pool,
+            Arc::new(SendCallbackContext { mint_store, alpaca }),
+            shutdown,
+            "mint-callback-worker",
+            target: "mint",
+        ),
+    ]
 }
 
 /// Spawns the drainer worker for scheduled freeze/unfreeze transitions armed
@@ -1909,7 +2058,8 @@ fn spawn_freeze_schedule_worker(
     pool: Pool<Sqlite>,
     underlying_store: Arc<Store<Underlying>>,
     notifier: Arc<dyn LifecycleNotifier>,
-) {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
     let ctx_apalis_pool = apalis_pool.clone();
     spawn_drainer_worker!(
         ::<tokenized_asset::schedule::FreezeScheduleCtx,
@@ -1923,34 +2073,37 @@ fn spawn_freeze_schedule_worker(
             #[cfg(test)]
             before_dispatch_barriers: None,
         }),
+        shutdown,
         "freeze-schedule-worker",
         target: "asset",
-    );
+    )
 }
 
 fn spawn_terminal_unfreeze_recovery(
     pool: Pool<Sqlite>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(tokenized_asset::schedule::run_terminal_unfreeze_recovery(
         pool,
         TERMINAL_UNFREEZE_RECOVERY_INTERVAL,
         shutdown,
-    ));
+    ))
 }
 
 fn spawn_lifecycle_notification_worker(
     apalis_pool: ApalisSqlitePool,
     notifier: Arc<dyn LifecycleNotifier>,
-) {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
     spawn_drainer_worker!(
         ::<notifications::LifecycleNotificationJobCtx,
             notifications::SendLifecycleNotification>,
         apalis_pool,
         Arc::new(notifications::LifecycleNotificationJobCtx { notifier }),
+        shutdown,
         "lifecycle-notification-worker",
         target: "notifications",
-    );
+    )
 }
 
 #[cfg(test)]
@@ -1971,8 +2124,8 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::{
-        BURN_RECOVERY_RECONCILE_INTERVAL, Environment, Quantity,
-        QuantityConversionError, ReceiptContractAddress,
+        BURN_RECOVERY_RECONCILE_INTERVAL, BackgroundTasks, Environment,
+        Quantity, QuantityConversionError, ReceiptContractAddress,
         ReconciliationFailures, VaultAddress, VaultBackfillConfig,
         cached_receipt_contract, mount_api_docs, next_receipt_backfill_block,
         run_burn_recovery_reconciler, run_startup_reconciliation_for_vaults,
@@ -1982,14 +2135,84 @@ mod tests {
     use crate::test_utils::{log_count_at, logs_contain_at};
 
     #[tokio::test]
+    #[traced_test]
+    async fn background_task_shutdown_aborts_after_grace_period() {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let tasks = BackgroundTasks {
+            shutdown,
+            handles: vec![tokio::spawn(std::future::pending())],
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tasks.stop_with_grace(Duration::from_millis(10)),
+        )
+        .await
+        .expect("shutdown should finish after its grace period");
+
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &[
+                "Background task shutdown grace period expired",
+                "aborted_tasks=1"
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn background_task_shutdown_does_not_repoll_completed_handles() {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let completed = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        let tasks = BackgroundTasks {
+            shutdown,
+            handles: vec![completed, tokio::spawn(std::future::pending())],
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tasks.stop_with_grace(Duration::from_millis(10)),
+        )
+        .await
+        .expect("shutdown should finish after its grace period");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[traced_test]
+    async fn background_task_shutdown_bounds_handles_that_ignore_abort() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let blocked = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        started_rx.await.unwrap();
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let tasks = BackgroundTasks { shutdown, handles: vec![blocked] };
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tasks.stop_with_grace(Duration::from_millis(10)),
+        )
+        .await
+        .expect("post-abort draining must have its own bound");
+
+        assert!(logs_contain_at!(
+            Level::WARN,
+            &["Background task abort drain timed out", "unresolved_tasks=1"]
+        ));
+    }
+
+    #[tokio::test]
     async fn burn_recovery_reconciler_repeats_after_each_interval() {
         assert_eq!(BURN_RECOVERY_RECONCILE_INTERVAL, Duration::from_secs(300));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let calls = Arc::new(AtomicUsize::new(0));
         let two_calls = Arc::new(Notify::new());
         let task_calls = calls.clone();
         let task_two_calls = two_calls.clone();
         let task = tokio::spawn(run_burn_recovery_reconciler(
             Duration::from_millis(20),
+            shutdown_rx,
             move || {
                 let task_calls = task_calls.clone();
                 let task_two_calls = task_two_calls.clone();
@@ -2014,7 +2237,11 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), two_calls.notified())
             .await
             .expect("reconciler should run more than once");
-        task.abort();
+        shutdown_tx.send(true).expect("reconciler is still running");
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("shutdown must stop the reconciler")
+            .expect("reconciler task must exit cleanly");
 
         assert!(calls.load(Ordering::SeqCst) >= 2);
     }

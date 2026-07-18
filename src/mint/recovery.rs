@@ -1947,7 +1947,6 @@ mod tests {
                 harness.pool.clone(),
                 (),
             ));
-            let vault_services = network_vault_services(harness.vault.clone());
 
             let TestHarness { pool, apalis_pool, mint_store, vault, .. } =
                 harness;
@@ -3016,17 +3015,30 @@ mod tests {
 
         reset_orphaned_mint_jobs(&harness.pool).await.unwrap();
 
-        let jobs: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
-            "
-                SELECT status, lock_at, lock_by
+        let jobs: Vec<(String, String, Option<i64>, Option<String>)> =
+            sqlx::query_as(
+                "
+                SELECT job_type, status, lock_at, lock_by
                 FROM Jobs
                 WHERE idempotency_key = ?
                 ",
-        )
-        .bind(&idempotency_key)
-        .fetch_all(&harness.pool)
-        .await
-        .unwrap();
+            )
+            .bind(&idempotency_key)
+            .fetch_all(&harness.pool)
+            .await
+            .unwrap();
+
+        let mut actual_types: Vec<String> =
+            jobs.iter().map(|(job_type, ..)| job_type.clone()).collect();
+        actual_types.sort();
+        let mut expected_types = vec![
+            mint_recovery_job_type().to_owned(),
+            job_type::<SubmitMintJob>().to_owned(),
+            job_type::<ConfirmMintJob>().to_owned(),
+            job_type::<SendCallbackJob>().to_owned(),
+        ];
+        expected_types.sort();
+        assert_eq!(actual_types, expected_types);
 
         assert_eq!(
             jobs.len(),
@@ -3034,9 +3046,10 @@ mod tests {
             "the fixture must cover the recovery and three side-effect jobs"
         );
         assert!(
-            jobs.iter().all(|(status, lock_at, lock_by)| status == "Pending"
-                && lock_at.is_none()
-                && lock_by.is_none()),
+            jobs.iter()
+                .all(|(_, status, lock_at, lock_by)| status == "Pending"
+                    && lock_at.is_none()
+                    && lock_by.is_none()),
             "the reset must make every orphaned mint job pending and unlocked; \
              got {jobs:?}"
         );
