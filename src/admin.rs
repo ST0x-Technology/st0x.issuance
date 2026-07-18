@@ -2017,6 +2017,7 @@ mod tests {
         AlpacaCalledData, PostAlpacaRecoveryInput, load_reprocess_context,
         recover_post_alpaca,
     };
+    use crate::VaultModeConfig;
     use crate::admin::BurningFailedData;
     use crate::alpaca::{
         AlpacaError, AlpacaService, MintCallbackRequest, RedeemRequest,
@@ -2033,7 +2034,7 @@ mod tests {
     };
     use crate::redemption::{BurnExternalTxId, RedemptionServices};
     use crate::redemption::{
-        BurnFailureClassification, BurnRecord, BurnRecoveryAction,
+        BurnFailureClassification, BurnParams, BurnRecord, BurnRecoveryAction,
         IssuerRedemptionRequestId, Redemption, RedemptionCommand,
         RedemptionEvent, RedemptionMetadata, RedemptionView,
     };
@@ -2612,17 +2613,19 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(99),
+                            burn_shares: U256::from(100),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: Some(BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     )),
@@ -2636,17 +2639,19 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(99),
-                        burn_shares: U256::from(100),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(99),
+                            burn_shares: U256::from(100),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: Some(BurnExternalTxId::base(
                         &metadata.detected_tx_hash,
                     )),
@@ -3203,12 +3208,14 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns: burns.clone(),
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns: burns.clone(),
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id: external_tx_id.clone(),
                 },
             )
@@ -3220,12 +3227,14 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::BurnTokens {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault: address!(
-                        "0xcccccccccccccccccccccccccccccccccccccccc"
-                    ),
-                    burns,
-                    dust_shares: U256::ZERO,
-                    owner: Address::ZERO,
+                    params: BurnParams::VaultDirect {
+                        vault: address!(
+                            "0xcccccccccccccccccccccccccccccccccccccccc"
+                        ),
+                        burns,
+                        dust_shares: U256::ZERO,
+                        owner: Address::ZERO,
+                    },
                     external_tx_id,
                 },
             )
@@ -4292,7 +4301,7 @@ mod tests {
             subgraph_url: Url::parse("http://localhost:0/subgraph").unwrap(),
             receipt_poll_interval: crate::RECEIPT_POLL_INTERVAL,
             chains: Vec::new(),
-            vault_mode_config: crate::config::VaultModeConfig::default(),
+            vault_mode_config: VaultModeConfig::default(),
         };
 
         rocket::build()
@@ -4351,15 +4360,17 @@ mod tests {
                 &metadata.issuer_request_id,
                 RedemptionCommand::IntendBurn {
                     issuer_request_id: metadata.issuer_request_id.clone(),
-                    vault,
-                    burns: vec![MultiBurnEntry {
-                        receipt_id: U256::from(42),
-                        burn_shares: U256::from(17),
-                        receipt_info: None,
-                        receipt_info_bytes: None,
-                    }],
-                    dust_shares: U256::ZERO,
-                    owner: persisted_tx.signer_for_test(),
+                    params: BurnParams::VaultDirect {
+                        vault,
+                        burns: vec![MultiBurnEntry {
+                            receipt_id: U256::from(42),
+                            burn_shares: U256::from(17),
+                            receipt_info: None,
+                            receipt_info_bytes: None,
+                        }],
+                        dust_shares: U256::ZERO,
+                        owner: persisted_tx.signer_for_test(),
+                    },
                     external_tx_id: None,
                 },
             )
