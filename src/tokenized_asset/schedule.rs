@@ -1514,17 +1514,12 @@ mod tests {
             .await
             .unwrap();
 
-        let window_jobs: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*) FROM Jobs
-            WHERE idempotency_key LIKE ? OR idempotency_key LIKE ?
-            ",
-        )
-        .bind("freeze:%")
-        .bind("unfreeze:%")
-        .fetch_one(&harness.pool)
-        .await
-        .unwrap();
+        let window_jobs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(job_type::<ApplyFreezeTransition>())
+                .fetch_one(&harness.pool)
+                .await
+                .unwrap();
         assert_eq!(
             window_jobs, 2,
             "re-arming the same window must dedup to one freeze and one \
