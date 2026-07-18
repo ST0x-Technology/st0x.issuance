@@ -454,6 +454,7 @@ pub async fn initialize_rocket(
                 redeem_call_manager: managers.redeem_call.clone(),
                 journal_manager: managers.journal.clone(),
                 burn_manager: managers.burn.clone(),
+                vault_mode_config: config.vault_mode_config.clone(),
             });
 
             let mut poller_shutdown = shutdown_rx.clone();

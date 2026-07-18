@@ -425,10 +425,10 @@ mod tests {
     use super::*;
     use crate::bindings::OffchainAssetReceiptVault;
     use crate::receipt_inventory::{ReceiptSource, ReceiptVaultKey};
-    use crate::redemption::TxId;
+    use crate::redemption::{BurnFailureClassification, TxId};
     use crate::test_utils::{ANVIL_CHAIN_ID, LocalEvm};
     use crate::tokenized_asset::TokenSymbol;
-    use crate::{Network, Quantity};
+    use crate::{Network, Quantity, VaultMode};
 
     async fn pool_with_migrations() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -486,6 +486,7 @@ mod tests {
             ),
             block_number: 30_000_000,
             detected_at: Utc::now(),
+            burn_mode: VaultMode::VaultDirect,
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
             failed_at: Utc::now(),
             tx_id: Some(TxId::Legacy("fb-1417".to_string())),
             planned_burns,
+            classification: BurnFailureClassification::Unclassified,
         }
     }
 
